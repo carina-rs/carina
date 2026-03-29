@@ -262,7 +262,7 @@ async fn run_destroy_locked(
             if let Some(backend_rt) = backend.resource_type()
                 && r.id.resource_type == backend_rt
                 && let Some(ref bucket_name) = protected_bucket
-                && let Some(Value::String(name)) = r.attributes.get("bucket")
+                && let Some(Value::String(name)) = r.get_attr("bucket")
                 && name == bucket_name
             {
                 protected_resources.push(r);
@@ -886,7 +886,10 @@ fn build_orphan_resource(sf: &carina_state::StateFile, id: &ResourceId) -> Resou
         .collect();
     Resource {
         id: id.clone(),
-        attributes,
+        attributes: attributes
+            .into_iter()
+            .map(|(k, v)| (k, carina_core::resource::Expr(v)))
+            .collect(),
         kind: carina_core::resource::ResourceKind::Real,
         lifecycle: rs.lifecycle.clone(),
         prefixes: rs.prefixes.clone(),

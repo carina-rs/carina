@@ -96,7 +96,7 @@ impl AwsccProvider {
                 continue;
             }
             if let Some(aws_name) = &attr_schema.provider_name
-                && let Some(value) = resource.attributes.get(dsl_name.as_str())
+                && let Some(value) = resource.get_attr(dsl_name.as_str())
             {
                 let aws_value = dsl_value_to_aws(
                     value,
@@ -115,7 +115,7 @@ impl AwsccProvider {
 
         // Handle tags
         if config.has_tags {
-            let tags = self.build_tags(resource.attributes.get("tags"));
+            let tags = self.build_tags(resource.get_attr("tags"));
             if !tags.is_empty() {
                 desired_state.insert("Tags".to_string(), json!(tags));
             }
@@ -146,7 +146,7 @@ impl AwsccProvider {
         // Carry them forward from the desired state.
         for dsl_name in config.schema.attributes.keys() {
             if !state.attributes.contains_key(dsl_name)
-                && let Some(value) = resource.attributes.get(dsl_name.as_str())
+                && let Some(value) = resource.get_attr(dsl_name.as_str())
             {
                 state.attributes.insert(dsl_name.to_string(), value.clone());
             }
@@ -192,7 +192,7 @@ impl AwsccProvider {
         // by the API but aren't included in the read response.
         for dsl_name in config.schema.attributes.keys() {
             if !state.attributes.contains_key(dsl_name)
-                && let Some(value) = to.attributes.get(dsl_name.as_str())
+                && let Some(value) = to.get_attr(dsl_name.as_str())
             {
                 state.attributes.insert(dsl_name.to_string(), value.clone());
             }

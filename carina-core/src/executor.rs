@@ -15,7 +15,7 @@ use crate::effect::Effect;
 use crate::plan::Plan;
 use crate::provider::Provider;
 use crate::resolver::resolve_ref_value;
-use crate::resource::{Resource, ResourceId, State, Value};
+use crate::resource::{Expr, Resource, ResourceId, State, Value};
 
 /// Input data required to execute a plan.
 pub struct ExecutionInput<'a> {
@@ -292,11 +292,11 @@ fn resolve_resource(
     binding_map: &HashMap<String, HashMap<String, Value>>,
 ) -> Result<Resource, String> {
     let mut resolved = resource.clone();
-    for (key, value) in &resource.attributes {
-        let resolved_value = resolve_ref_value(value, binding_map)?;
+    for (key, expr) in &resource.attributes {
+        let resolved_value = resolve_ref_value(&expr.0, binding_map)?;
         resolved
             .attributes
-            .insert(key.clone(), unwrap_secret(resolved_value));
+            .insert(key.clone(), Expr(unwrap_secret(resolved_value)));
     }
     Ok(resolved)
 }
@@ -309,11 +309,11 @@ fn resolve_resource_with_source(
     binding_map: &HashMap<String, HashMap<String, Value>>,
 ) -> Result<Resource, String> {
     let mut resolved = target.clone();
-    for (key, value) in &source.attributes {
-        let resolved_value = resolve_ref_value(value, binding_map)?;
+    for (key, expr) in &source.attributes {
+        let resolved_value = resolve_ref_value(&expr.0, binding_map)?;
         resolved
             .attributes
-            .insert(key.clone(), unwrap_secret(resolved_value));
+            .insert(key.clone(), Expr(unwrap_secret(resolved_value)));
     }
     Ok(resolved)
 }
@@ -550,7 +550,7 @@ async fn execute_basic_effect<'a>(
                     BasicEffectResult::Success {
                         state: Some(state),
                         resource_id: resource.id.clone(),
-                        resolved_attrs: Some(resolved.attributes),
+                        resolved_attrs: Some(resolved.resolved_attributes()),
                         binding: resource.binding.clone(),
                     }
                 }
@@ -598,7 +598,7 @@ async fn execute_basic_effect<'a>(
                     BasicEffectResult::Success {
                         state: Some(state),
                         resource_id: id.clone(),
-                        resolved_attrs: Some(resolved_to.attributes),
+                        resolved_attrs: Some(resolved_to.resolved_attributes()),
                         binding: to.binding.clone(),
                     }
                 }
@@ -1072,7 +1072,7 @@ async fn execute_cbd_replace_parallel(
             let mut local_binding_map = ctx.binding_map.clone();
             update_binding_map(
                 &mut local_binding_map,
-                &resolved.attributes,
+                &resolved.resolved_attributes(),
                 ctx.to.binding.as_deref(),
                 &state,
             );
@@ -1103,7 +1103,7 @@ async fn execute_cbd_replace_parallel(
                             .on_event(&ExecutionEvent::CascadeUpdateSucceeded { id: &cascade.id });
                         update_binding_map(
                             &mut local_binding_map,
-                            &resolved_to.attributes,
+                            &resolved_to.resolved_attributes(),
                             cascade.to.binding.as_deref(),
                             &cascade_state,
                         );
@@ -1151,7 +1151,7 @@ async fn execute_cbd_replace_parallel(
                     {
                         let new_identifier = state.identifier.as_deref().unwrap_or("");
                         let mut rename_to = ctx.to.clone();
-                        rename_to.attributes.insert(
+                        rename_to.set_attr(
                             temp.attribute.clone(),
                             Value::String(temp.original_value.clone()),
                         );
@@ -1195,7 +1195,7 @@ async fn execute_cbd_replace_parallel(
                             success: false,
                             state: Some(final_state),
                             resource_id: ctx.to.id.clone(),
-                            resolved_attrs: Some(resolved.attributes),
+                            resolved_attrs: Some(resolved.resolved_attributes()),
                             binding: ctx.effect.binding_name(),
                             refreshes,
 
@@ -1212,7 +1212,7 @@ async fn execute_cbd_replace_parallel(
                             success: true,
                             state: Some(final_state),
                             resource_id: ctx.to.id.clone(),
-                            resolved_attrs: Some(resolved.attributes),
+                            resolved_attrs: Some(resolved.resolved_attributes()),
                             binding: ctx.to.binding.clone(),
                             refreshes,
 
@@ -1313,7 +1313,7 @@ async fn execute_dbd_replace_parallel(
                         success: true,
                         state: Some(state),
                         resource_id: ctx.to.id.clone(),
-                        resolved_attrs: Some(resolved.attributes),
+                        resolved_attrs: Some(resolved.resolved_attributes()),
                         binding: ctx.to.binding.clone(),
                         refreshes,
 
@@ -1703,7 +1703,7 @@ async fn execute_effects_phased(
                                 let mut local_binding_map = binding_snapshot.clone();
                                 update_binding_map(
                                     &mut local_binding_map,
-                                    &resolved.attributes,
+                                    &resolved.resolved_attributes(),
                                     to.binding.as_deref(),
                                     &state,
                                 );
@@ -1754,14 +1754,14 @@ async fn execute_effects_phased(
                                             );
                                             update_binding_map(
                                                 &mut local_binding_map,
-                                                &resolved_to.attributes,
+                                                &resolved_to.resolved_attributes(),
                                                 cascade.to.binding.as_deref(),
                                                 &cascade_state,
                                             );
                                             cascade_states.push((
                                                 cascade.id.clone(),
                                                 cascade_state,
-                                                resolved_to.attributes,
+                                                resolved_to.resolved_attributes(),
                                                 cascade.to.binding.clone(),
                                             ));
                                         }
@@ -1849,7 +1849,7 @@ async fn execute_effects_phased(
                     if let Effect::Replace { to, .. } = effect {
                         update_binding_map(
                             &mut input.binding_map,
-                            &to.attributes,
+                            &to.resolved_attributes(),
                             to.binding.as_deref(),
                             &state,
                         );
@@ -2165,7 +2165,7 @@ async fn execute_effects_phased(
                             {
                                 let new_identifier = state.identifier.as_deref().unwrap_or("");
                                 let mut rename_to = to.clone();
-                                rename_to.attributes.insert(
+                                rename_to.set_attr(
                                     temp.attribute.clone(),
                                     Value::String(temp.original_value.clone()),
                                 );
@@ -2297,7 +2297,7 @@ async fn execute_effects_phased(
                                             PhaseEffectResult::NonCbdCreateSuccess {
                                                 state,
                                                 resource_id: to.id.clone(),
-                                                resolved_attrs: resolved.attributes,
+                                                resolved_attrs: resolved.resolved_attributes(),
                                                 binding: to.binding.clone(),
                                             },
                                         )
@@ -2600,7 +2600,7 @@ mod tests {
         let mut r = Resource::new("test", binding);
         r.binding = Some(binding.to_string());
         for dep in deps {
-            r.attributes.insert(
+            r.set_attr(
                 format!("ref_{}", dep),
                 Value::ResourceRef {
                     binding_name: dep.to_string(),
@@ -3186,7 +3186,7 @@ mod tests {
         // route depends on rt and tgw_attach (but after partial resolution,
         // transit_gateway_id points to ResourceRef { binding: "tgw" })
         let mut route = Resource::new("ec2.route", "my-route");
-        route.attributes.insert(
+        route.set_attr(
             "transit_gateway_id".to_string(),
             Value::ResourceRef {
                 binding_name: "tgw".to_string(),

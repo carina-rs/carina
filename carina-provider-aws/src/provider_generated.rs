@@ -101,8 +101,13 @@ impl AwsProvider {
         from: &State,
         to: Resource,
     ) -> ProviderResult<State> {
-        self.apply_ec2_tags(&id, identifier, &to.attributes, Some(&from.attributes))
-            .await?;
+        self.apply_ec2_tags(
+            &id,
+            identifier,
+            &to.resolved_attributes(),
+            Some(&from.attributes),
+        )
+        .await?;
         self.read_ec2_internet_gateway(&id, Some(identifier)).await
     }
 
@@ -114,8 +119,13 @@ impl AwsProvider {
         from: &State,
         to: Resource,
     ) -> ProviderResult<State> {
-        self.apply_ec2_tags(&id, identifier, &to.attributes, Some(&from.attributes))
-            .await?;
+        self.apply_ec2_tags(
+            &id,
+            identifier,
+            &to.resolved_attributes(),
+            Some(&from.attributes),
+        )
+        .await?;
         self.read_ec2_route_table(&id, Some(identifier)).await
     }
 
@@ -127,8 +137,13 @@ impl AwsProvider {
         from: &State,
         to: Resource,
     ) -> ProviderResult<State> {
-        self.apply_ec2_tags(&id, identifier, &to.attributes, Some(&from.attributes))
-            .await?;
+        self.apply_ec2_tags(
+            &id,
+            identifier,
+            &to.resolved_attributes(),
+            Some(&from.attributes),
+        )
+        .await?;
         self.read_ec2_security_group(&id, Some(identifier)).await
     }
 

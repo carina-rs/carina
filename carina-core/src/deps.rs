@@ -301,7 +301,7 @@ mod tests {
         let mut r = Resource::new("test", binding);
         r.binding = Some(binding.to_string());
         for dep in deps {
-            r.attributes.insert(
+            r.set_attr(
                 format!("ref_{}", dep),
                 Value::ResourceRef {
                     binding_name: dep.to_string(),
@@ -336,7 +336,7 @@ mod tests {
         let mut resource = Resource::new("ec2.route", "my-route");
         // After partial resolution: transit_gateway_id resolved to a ResourceRef
         // pointing at "tgw" (the transitive target), not "tgw_attach" (the direct dep)
-        resource.attributes.insert(
+        resource.set_attr(
             "transit_gateway_id".to_string(),
             Value::ResourceRef {
                 binding_name: "tgw".to_string(),
@@ -345,7 +345,7 @@ mod tests {
             },
         );
         // route_table_id resolved to a ResourceRef pointing at "rt"
-        resource.attributes.insert(
+        resource.set_attr(
             "route_table_id".to_string(),
             Value::ResourceRef {
                 binding_name: "rt".to_string(),

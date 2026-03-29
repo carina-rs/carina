@@ -6,7 +6,7 @@ use crate::deps::get_resource_dependencies;
 use crate::effect::{CascadingUpdate, Effect, TemporaryName};
 use crate::identifier::generate_random_suffix;
 use crate::plan::Plan;
-use crate::resource::{LifecycleConfig, Resource, ResourceId, ResourceKind, State, Value};
+use crate::resource::{Expr, LifecycleConfig, Resource, ResourceId, ResourceKind, State, Value};
 use crate::schema::ResourceSchema;
 
 use super::{Diff, diff};
@@ -106,7 +106,7 @@ fn generate_temporary_name(
     }
 
     // Get the current value of the name attribute
-    let original_value = match resource.attributes.get(name_attr) {
+    let original_value = match resource.get_attr(name_attr) {
         Some(Value::String(s)) => s.clone(),
         _ => return None,
     };
@@ -249,7 +249,7 @@ pub fn create_plan(
                     // If a temporary name is generated, modify the `to` resource
                     let to = if let Some(ref temp) = temporary_name {
                         let mut modified = to;
-                        modified.attributes.insert(
+                        modified.set_attr(
                             temp.attribute.clone(),
                             Value::String(temp.temporary_value.clone()),
                         );
@@ -306,7 +306,11 @@ pub fn create_plan(
             } else {
                 let temp_resource = Resource {
                     id: id.clone(),
-                    attributes: state.attributes.clone(),
+                    attributes: state
+                        .attributes
+                        .iter()
+                        .map(|(k, v)| (k.clone(), Expr(v.clone())))
+                        .collect(),
                     kind: ResourceKind::Real,
                     lifecycle: lifecycle.clone(),
                     prefixes: HashMap::new(),
@@ -465,7 +469,7 @@ pub fn cascade_dependent_updates(
                 .attributes
                 .iter()
                 .filter(|(_, v)| {
-                    matches!(v, Value::ResourceRef { binding_name, .. } if binding_name == dep)
+                    matches!(&v.0, Value::ResourceRef { binding_name, .. } if binding_name == dep)
                 })
                 .map(|(k, _)| k.clone())
                 .collect();
@@ -473,7 +477,7 @@ pub fn cascade_dependent_updates(
             let ref_hints: Vec<(String, String)> = resource
                 .attributes
                 .iter()
-                .filter_map(|(k, v)| match v {
+                .filter_map(|(k, v)| match &v.0 {
                     Value::ResourceRef {
                         binding_name,
                         attribute_name,
@@ -543,7 +547,7 @@ pub fn cascade_dependent_updates(
                     .attributes
                     .iter()
                     .filter(|(_, v)| {
-                        matches!(v, Value::ResourceRef { binding_name, .. } if binding_name == replaced_binding)
+                        matches!(&v.0, Value::ResourceRef { binding_name, .. } if binding_name == replaced_binding)
                     })
                     .map(|(k, _)| k.clone())
                     .collect();
@@ -571,7 +575,7 @@ pub fn cascade_dependent_updates(
                     let ref_hints: Vec<(String, String)> = unresolved
                         .attributes
                         .iter()
-                        .filter_map(|(k, v)| match v {
+                        .filter_map(|(k, v)| match &v.0 {
                             Value::ResourceRef {
                                 binding_name,
                                 attribute_name,

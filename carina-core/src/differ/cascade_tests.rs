@@ -83,7 +83,7 @@ fn cascade_dependent_updates_adds_update_for_dependent() {
         assert_eq!(cascading_updates[0].id, subnet_id);
         // The `to` should have unresolved ResourceRef
         assert!(matches!(
-            cascading_updates[0].to.attributes.get("vpc_id"),
+            cascading_updates[0].to.get_attr("vpc_id"),
             Some(Value::ResourceRef { .. })
         ));
         // The `from` should have the current state

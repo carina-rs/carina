@@ -59,7 +59,7 @@ impl AwsProvider {
 
     /// Create an EC2 Flow Log
     pub(crate) async fn create_ec2_flow_log(&self, resource: Resource) -> ProviderResult<State> {
-        let resource_id_val = match resource.attributes.get("resource_id") {
+        let resource_id_val = match resource.get_attr("resource_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(
@@ -68,7 +68,7 @@ impl AwsProvider {
             }
         };
 
-        let resource_type_val = match resource.attributes.get("resource_type") {
+        let resource_type_val = match resource.get_attr("resource_type") {
             Some(Value::String(s)) => extract_enum_value(s).to_string(),
             _ => {
                 return Err(ProviderError::new("resource_type is required")
@@ -84,14 +84,13 @@ impl AwsProvider {
                 resource_type_val.as_str(),
             ));
 
-        if let Some(Value::String(traffic_type)) = resource.attributes.get("traffic_type") {
+        if let Some(Value::String(traffic_type)) = resource.get_attr("traffic_type") {
             use aws_sdk_ec2::types::TrafficType;
             let tt = TrafficType::from(extract_enum_value(traffic_type));
             req = req.traffic_type(tt);
         }
 
-        if let Some(Value::String(log_dest_type)) = resource.attributes.get("log_destination_type")
-        {
+        if let Some(Value::String(log_dest_type)) = resource.get_attr("log_destination_type") {
             use aws_sdk_ec2::types::LogDestinationType;
             let raw = extract_enum_value(log_dest_type);
             // Map DSL snake_case enum values back to API hyphenated format
@@ -104,30 +103,28 @@ impl AwsProvider {
             req = req.log_destination_type(ldt);
         }
 
-        if let Some(Value::String(log_dest)) = resource.attributes.get("log_destination") {
+        if let Some(Value::String(log_dest)) = resource.get_attr("log_destination") {
             req = req.log_destination(log_dest);
         }
 
-        if let Some(Value::String(log_group)) = resource.attributes.get("log_group_name") {
+        if let Some(Value::String(log_group)) = resource.get_attr("log_group_name") {
             req = req.log_group_name(log_group);
         }
 
-        if let Some(Value::String(perm_arn)) =
-            resource.attributes.get("deliver_logs_permission_arn")
-        {
+        if let Some(Value::String(perm_arn)) = resource.get_attr("deliver_logs_permission_arn") {
             req = req.deliver_logs_permission_arn(perm_arn);
         }
 
-        if let Some(Value::String(log_format)) = resource.attributes.get("log_format") {
+        if let Some(Value::String(log_format)) = resource.get_attr("log_format") {
             req = req.log_format(log_format);
         }
 
-        if let Some(Value::Int(interval)) = resource.attributes.get("max_aggregation_interval") {
+        if let Some(Value::Int(interval)) = resource.get_attr("max_aggregation_interval") {
             req = req.max_aggregation_interval(*interval as i32);
         }
 
         // Apply tags via TagSpecifications
-        if let Some(Value::Map(tags)) = resource.attributes.get("tags") {
+        if let Some(Value::Map(tags)) = resource.get_attr("tags") {
             use aws_sdk_ec2::types::{Tag, TagSpecification};
             let mut tag_spec = TagSpecification::builder()
                 .resource_type(aws_sdk_ec2::types::ResourceType::VpcFlowLog);
@@ -217,8 +214,13 @@ impl AwsProvider {
         from: &State,
         to: Resource,
     ) -> ProviderResult<State> {
-        self.apply_ec2_tags(&id, identifier, &to.attributes, Some(&from.attributes))
-            .await?;
+        self.apply_ec2_tags(
+            &id,
+            identifier,
+            &to.resolved_attributes(),
+            Some(&from.attributes),
+        )
+        .await?;
         self.read_ec2_flow_log(&id, Some(identifier)).await
     }
 

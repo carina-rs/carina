@@ -33,7 +33,7 @@ pub fn resolve_enum_identifiers_impl(resources: &mut [Resource]) {
             if let Some(attr_schema) = config.schema.attributes.get(key.as_str())
                 && let Some((type_name, ns, to_dsl)) = attr_schema.attr_type.namespaced_enum_parts()
             {
-                let resolved = match value {
+                let resolved = match &value.0 {
                     Value::String(s) if !s.contains('.') => {
                         // bare identifier or plain string: "advanced" -> awscc.ec2.ipam.Tier.advanced
                         let dsl_val = to_dsl.map_or_else(|| s.clone(), |f| f(s));
@@ -49,7 +49,7 @@ pub fn resolve_enum_identifiers_impl(resources: &mut [Resource]) {
                         let dsl_val = to_dsl.map_or_else(|| member.to_string(), |f| f(member));
                         Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
                     }
-                    _ => value.clone(),
+                    _ => value.0.clone(),
                 };
                 resolved_attrs.insert(key.clone(), resolved);
                 continue;
@@ -70,15 +70,17 @@ pub fn resolve_enum_identifiers_impl(resources: &mut [Resource]) {
                 };
 
                 if let Some(fields) = struct_fields {
-                    let resolved = resolve_struct_enum_values(value, fields);
+                    let resolved = resolve_struct_enum_values(&value.0, fields);
                     resolved_attrs.insert(key.clone(), resolved);
                     continue;
                 }
             }
 
-            resolved_attrs.insert(key.clone(), value.clone());
+            resolved_attrs.insert(key.clone(), value.0.clone());
         }
-        resource.attributes = resolved_attrs;
+        for (key, value) in resolved_attrs {
+            resource.set_attr(key, value);
+        }
     }
 }
 
@@ -228,14 +230,14 @@ mod tests {
     #[test]
     fn test_resolve_enum_identifiers_bare_ident() {
         let mut resource = Resource::with_provider("awscc", "ec2.vpc", "test");
-        resource.attributes.insert(
+        resource.set_attr(
             "instance_tenancy".to_string(),
             Value::String("dedicated".to_string()),
         );
 
         let mut resources = vec![resource];
         resolve_enum_identifiers_impl(&mut resources);
-        match &resources[0].attributes["instance_tenancy"] {
+        match resources[0].get_attr("instance_tenancy").unwrap() {
             Value::String(s) => assert!(
                 s.contains("InstanceTenancy") && s.contains("dedicated"),
                 "Expected namespaced enum, got: {}",
@@ -248,14 +250,14 @@ mod tests {
     #[test]
     fn test_resolve_enum_identifiers_typename_value() {
         let mut resource = Resource::with_provider("awscc", "ec2.vpc", "test");
-        resource.attributes.insert(
+        resource.set_attr(
             "instance_tenancy".to_string(),
             Value::String("InstanceTenancy.dedicated".to_string()),
         );
 
         let mut resources = vec![resource];
         resolve_enum_identifiers_impl(&mut resources);
-        match &resources[0].attributes["instance_tenancy"] {
+        match resources[0].get_attr("instance_tenancy").unwrap() {
             Value::String(s) => assert!(
                 s.contains("InstanceTenancy") && s.contains("dedicated"),
                 "Expected namespaced enum, got: {}",
@@ -268,7 +270,7 @@ mod tests {
     #[test]
     fn test_resolve_enum_identifiers_skips_non_awscc() {
         let mut resource = Resource::with_provider("aws", "s3.bucket", "test");
-        resource.attributes.insert(
+        resource.set_attr(
             "instance_tenancy".to_string(),
             Value::String("dedicated".to_string()),
         );
@@ -276,7 +278,7 @@ mod tests {
         let mut resources = vec![resource];
         resolve_enum_identifiers_impl(&mut resources);
         assert!(matches!(
-            &resources[0].attributes["instance_tenancy"],
+            resources[0].get_attr("instance_tenancy").unwrap(),
             Value::String(_)
         ));
     }
@@ -284,14 +286,14 @@ mod tests {
     #[test]
     fn test_resolve_enum_identifiers_hyphen_to_underscore() {
         let mut resource = Resource::with_provider("awscc", "ec2.flow_log", "test");
-        resource.attributes.insert(
+        resource.set_attr(
             "log_destination_type".to_string(),
             Value::String("cloud_watch_logs".to_string()),
         );
 
         let mut resources = vec![resource];
         resolve_enum_identifiers_impl(&mut resources);
-        match &resources[0].attributes["log_destination_type"] {
+        match resources[0].get_attr("log_destination_type").unwrap() {
             Value::String(s) => {
                 assert_eq!(
                     s, "awscc.ec2.flow_log.LogDestinationType.cloud_watch_logs",
@@ -306,14 +308,14 @@ mod tests {
     #[test]
     fn test_resolve_enum_identifiers_hyphen_string_to_underscore() {
         let mut resource = Resource::with_provider("awscc", "ec2.flow_log", "test");
-        resource.attributes.insert(
+        resource.set_attr(
             "log_destination_type".to_string(),
             Value::String("cloud-watch-logs".to_string()),
         );
 
         let mut resources = vec![resource];
         resolve_enum_identifiers_impl(&mut resources);
-        match &resources[0].attributes["log_destination_type"] {
+        match resources[0].get_attr("log_destination_type").unwrap() {
             Value::String(s) => {
                 assert_eq!(
                     s, "awscc.ec2.flow_log.LogDestinationType.cloud_watch_logs",
@@ -431,13 +433,11 @@ mod tests {
     #[test]
     fn test_resolve_enum_identifiers_ip_protocol_all_alias() {
         let mut resource = Resource::with_provider("awscc", "ec2.security_group_egress", "test");
-        resource
-            .attributes
-            .insert("ip_protocol".to_string(), Value::String("all".to_string()));
+        resource.set_attr("ip_protocol".to_string(), Value::String("all".to_string()));
 
         let mut resources = vec![resource];
         resolve_enum_identifiers_impl(&mut resources);
-        match &resources[0].attributes["ip_protocol"] {
+        match resources[0].get_attr("ip_protocol").unwrap() {
             Value::String(s) => {
                 assert_eq!(
                     s, "awscc.ec2.security_group_egress.IpProtocol.all",
@@ -452,13 +452,11 @@ mod tests {
     #[test]
     fn test_resolve_enum_identifiers_ip_protocol_tcp() {
         let mut resource = Resource::with_provider("awscc", "ec2.security_group_egress", "test");
-        resource
-            .attributes
-            .insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
+        resource.set_attr("ip_protocol".to_string(), Value::String("tcp".to_string()));
 
         let mut resources = vec![resource];
         resolve_enum_identifiers_impl(&mut resources);
-        match &resources[0].attributes["ip_protocol"] {
+        match resources[0].get_attr("ip_protocol").unwrap() {
             Value::String(s) => {
                 assert_eq!(
                     s, "awscc.ec2.security_group_egress.IpProtocol.tcp",
@@ -575,7 +573,7 @@ mod tests {
     #[test]
     fn test_resolve_enum_identifiers_impl_struct_field() {
         let mut resource = Resource::with_provider("awscc", "ec2.security_group", "test-sg");
-        resource.attributes.insert(
+        resource.set_attr(
             "group_description".to_string(),
             Value::String("test".to_string()),
         );
@@ -585,7 +583,7 @@ mod tests {
             "cidr_ip".to_string(),
             Value::String("0.0.0.0/0".to_string()),
         );
-        resource.attributes.insert(
+        resource.set_attr(
             "security_group_egress".to_string(),
             Value::List(vec![Value::Map(egress_map)]),
         );
@@ -593,7 +591,7 @@ mod tests {
         let mut resources = vec![resource];
         resolve_enum_identifiers_impl(&mut resources);
 
-        if let Value::List(items) = &resources[0].attributes["security_group_egress"] {
+        if let Value::List(items) = resources[0].get_attr("security_group_egress").unwrap() {
             if let Value::Map(m) = &items[0] {
                 match &m["ip_protocol"] {
                     Value::String(s) => {

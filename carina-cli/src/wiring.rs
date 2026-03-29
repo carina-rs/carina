@@ -258,11 +258,12 @@ pub fn resolve_enum_aliases_with_ctx(ctx: &WiringContext, resources: &mut [Resou
             Some(f) => f,
             None => continue,
         };
-        resolve_attrs_aliases(
-            &mut resource.attributes,
-            &resource.id.resource_type,
-            factory,
-        );
+        let mut value_attrs = resource.resolved_attributes();
+        resolve_attrs_aliases(&mut value_attrs, &resource.id.resource_type, factory);
+        resource.attributes = value_attrs
+            .into_iter()
+            .map(|(k, v)| (k, carina_core::resource::Expr(v)))
+            .collect();
     }
 }
 
@@ -832,7 +833,7 @@ mod tests {
         // resolve_enum_aliases should resolve the alias "all" -> "-1".
         let mut resource =
             Resource::with_provider("awscc", "ec2.security_group_egress", "test-rule");
-        resource.attributes.insert(
+        resource.set_attr(
             "ip_protocol".to_string(),
             Value::String("awscc.ec2.security_group_egress.IpProtocol.all".to_string()),
         );
@@ -841,7 +842,7 @@ mod tests {
         resolve_enum_aliases(&mut resources);
 
         assert_eq!(
-            resources[0].attributes.get("ip_protocol"),
+            resources[0].get_attr("ip_protocol"),
             Some(&Value::String("-1".to_string())),
             "Alias 'all' should be resolved to canonical AWS value '-1'"
         );
@@ -853,7 +854,7 @@ mod tests {
         // to its raw form by convert_enum_value but not further changed.
         let mut resource =
             Resource::with_provider("awscc", "ec2.security_group_egress", "test-rule");
-        resource.attributes.insert(
+        resource.set_attr(
             "ip_protocol".to_string(),
             Value::String("awscc.ec2.security_group_egress.IpProtocol.tcp".to_string()),
         );
@@ -863,7 +864,7 @@ mod tests {
 
         // "tcp" has no alias, so it remains as the namespaced DSL value
         assert_eq!(
-            resources[0].attributes.get("ip_protocol"),
+            resources[0].get_attr("ip_protocol"),
             Some(&Value::String(
                 "awscc.ec2.security_group_egress.IpProtocol.tcp".to_string()
             )),
@@ -875,7 +876,7 @@ mod tests {
         // Same alias resolution should work for the aws provider
         let mut resource =
             Resource::with_provider("aws", "ec2.security_group_ingress", "test-rule");
-        resource.attributes.insert(
+        resource.set_attr(
             "ip_protocol".to_string(),
             Value::String("aws.ec2.security_group_ingress.IpProtocol.all".to_string()),
         );
@@ -884,7 +885,7 @@ mod tests {
         resolve_enum_aliases(&mut resources);
 
         assert_eq!(
-            resources[0].attributes.get("ip_protocol"),
+            resources[0].get_attr("ip_protocol"),
             Some(&Value::String("-1".to_string())),
         );
     }
@@ -924,7 +925,7 @@ mod tests {
             "cidr_ip".to_string(),
             Value::String("0.0.0.0/0".to_string()),
         );
-        resource.attributes.insert(
+        resource.set_attr(
             "security_group_egress".to_string(),
             Value::List(vec![Value::Map(egress_map)]),
         );
@@ -932,7 +933,7 @@ mod tests {
         let mut resources = vec![resource];
         resolve_enum_aliases(&mut resources);
 
-        if let Value::List(items) = &resources[0].attributes["security_group_egress"] {
+        if let Value::List(items) = resources[0].get_attr("security_group_egress").unwrap() {
             if let Value::Map(m) = &items[0] {
                 assert_eq!(
                     m.get("ip_protocol"),
@@ -972,7 +973,7 @@ mod tests {
 
         // Desired resource with normalized DSL enum value (after normalize_desired)
         let mut resource = Resource::with_provider("awscc", "ec2.vpc", "test-vpc");
-        resource.attributes.insert(
+        resource.set_attr(
             "instance_tenancy".to_string(),
             Value::String("awscc.ec2.vpc.InstanceTenancy.default".to_string()),
         );
@@ -1138,23 +1139,21 @@ mod tests {
     fn test_resolve_enum_aliases_non_enum_values_unchanged() {
         // Non-DSL-enum strings should not be affected
         let mut resource = Resource::with_provider("awscc", "ec2.security_group", "test-sg");
-        resource.attributes.insert(
+        resource.set_attr(
             "group_description".to_string(),
             Value::String("My security group".to_string()),
         );
-        resource
-            .attributes
-            .insert("vpc_id".to_string(), Value::String("vpc-12345".to_string()));
+        resource.set_attr("vpc_id".to_string(), Value::String("vpc-12345".to_string()));
 
         let mut resources = vec![resource];
         resolve_enum_aliases(&mut resources);
 
         assert_eq!(
-            resources[0].attributes.get("group_description"),
+            resources[0].get_attr("group_description"),
             Some(&Value::String("My security group".to_string())),
         );
         assert_eq!(
-            resources[0].attributes.get("vpc_id"),
+            resources[0].get_attr("vpc_id"),
             Some(&Value::String("vpc-12345".to_string())),
         );
     }

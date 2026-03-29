@@ -247,7 +247,7 @@ fn build_create_rows(
     let default_tag_keys: HashSet<String> = r
         .attributes
         .get("_default_tag_keys")
-        .and_then(|v| match v {
+        .and_then(|v| match &v.0 {
             Value::List(items) => Some(
                 items
                     .iter()
@@ -273,17 +273,17 @@ fn build_create_rows(
         // Expand tags map into individual rows with default_tags annotation
         if key.as_str() == "tags"
             && !default_tag_keys.is_empty()
-            && let Value::Map(map) = value
+            && let Value::Map(map) = &value.0
         {
             rows.push(build_expanded_tags_row(map, &default_tag_keys));
             continue;
         }
         if is_list_of_maps(value) {
             rows.push(build_list_of_maps_row(key, value));
-        } else if let Value::Map(map) = value {
+        } else if let Value::Map(map) = &value.0 {
             rows.push(build_expanded_map_row(key, map));
         } else {
-            let ref_binding = match value {
+            let ref_binding = match &value.0 {
                 Value::ResourceRef { binding_name, .. } => Some(binding_name.clone()),
                 _ => None,
             };
@@ -460,7 +460,8 @@ fn build_update_rows(
 
     // In Full mode, show count of unchanged attributes hidden
     if detail == DetailLevel::Full {
-        let unchanged_count = compute_unchanged_count(&from.attributes, &to.attributes, None);
+        let unchanged_count =
+            compute_unchanged_count(&from.attributes, &to.resolved_attributes(), None);
         if unchanged_count > 0 {
             rows.push(DetailRow::HiddenUnchanged {
                 count: unchanged_count,
@@ -552,8 +553,11 @@ fn build_replace_rows(
     // In Full mode, show count of unchanged attributes hidden
     if detail == DetailLevel::Full {
         let changed_set: HashSet<&str> = changed_create_only.iter().map(|s| s.as_str()).collect();
-        let unchanged_count =
-            compute_unchanged_count(&from.attributes, &to.attributes, Some(&changed_set));
+        let unchanged_count = compute_unchanged_count(
+            &from.attributes,
+            &to.resolved_attributes(),
+            Some(&changed_set),
+        );
         if unchanged_count > 0 {
             rows.push(DetailRow::HiddenUnchanged {
                 count: unchanged_count,

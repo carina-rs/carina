@@ -6,7 +6,7 @@ mod config;
 
 pub use config::{DecryptorFn, ProviderContext, ValidatorFn};
 
-use crate::resource::{LifecycleConfig, Resource, ResourceId, ResourceKind, Value};
+use crate::resource::{Expr, LifecycleConfig, Resource, ResourceId, ResourceKind, Value};
 use crate::schema::{
     validate_ipv4_address, validate_ipv4_cidr, validate_ipv6_address, validate_ipv6_cidr,
 };
@@ -269,7 +269,7 @@ impl ParsedFile {
     ) -> Option<&Resource> {
         self.resources.iter().find(|r| {
             r.id.resource_type == resource_type
-                && matches!(r.attributes.get(attr_name), Some(Value::String(n)) if n == attr_value)
+                && matches!(r.get_attr(attr_name), Some(Value::String(n)) if n == attr_value)
         })
     }
 }
@@ -2113,7 +2113,7 @@ fn parse_anonymous_resource(
 
     Ok(Resource {
         id: ResourceId::with_provider(provider, resource_type, resource_name),
-        attributes,
+        attributes: attributes.into_iter().map(|(k, v)| (k, Expr(v))).collect(),
         kind: ResourceKind::Real,
         lifecycle,
         prefixes: HashMap::new(),
@@ -2259,7 +2259,7 @@ fn parse_resource_expr(
 
     Ok(Resource {
         id: ResourceId::with_provider(provider, resource_type, resource_name),
-        attributes,
+        attributes: attributes.into_iter().map(|(k, v)| (k, Expr(v))).collect(),
         kind: ResourceKind::Real,
         lifecycle,
         prefixes: HashMap::new(),
@@ -2305,7 +2305,7 @@ fn parse_read_resource_expr(
 
     Ok(Resource {
         id: ResourceId::with_provider(provider, resource_type, resource_name),
-        attributes,
+        attributes: attributes.into_iter().map(|(k, v)| (k, Expr(v))).collect(),
         kind: ResourceKind::DataSource,
         lifecycle,
         prefixes: HashMap::new(),
@@ -2711,9 +2711,9 @@ fn resolve_forward_references(
     for resource in resources.iter_mut() {
         let keys: Vec<String> = resource.attributes.keys().cloned().collect();
         for key in keys {
-            if let Some(value) = resource.attributes.remove(&key) {
-                let resolved = resolve_forward_ref_in_value(value, resource_bindings);
-                resource.attributes.insert(key, resolved);
+            if let Some(expr) = resource.attributes.remove(&key) {
+                let resolved = resolve_forward_ref_in_value(expr.0, resource_bindings);
+                resource.attributes.insert(key, Expr(resolved));
             }
         }
     }
@@ -2824,7 +2824,14 @@ pub fn resolve_resource_refs_with_config(
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
     for resource in &parsed.resources {
         if let Some(ref binding_name) = resource.binding {
-            binding_map.insert(binding_name.clone(), resource.attributes.clone());
+            binding_map.insert(
+                binding_name.clone(),
+                resource
+                    .attributes
+                    .iter()
+                    .map(|(k, e)| (k.clone(), e.0.clone()))
+                    .collect(),
+            );
         }
     }
 
@@ -2843,11 +2850,11 @@ pub fn resolve_resource_refs_with_config(
 
     // Resolve references in each resource
     for resource in &mut parsed.resources {
-        let mut resolved_attrs: HashMap<String, Value> = HashMap::new();
+        let mut resolved_attrs: HashMap<String, Expr> = HashMap::new();
 
-        for (key, value) in &resource.attributes {
-            let resolved = resolve_value_with_config(value, &binding_map, config)?;
-            resolved_attrs.insert(key.clone(), resolved);
+        for (key, expr) in &resource.attributes {
+            let resolved = resolve_value_with_config(&expr.0, &binding_map, config)?;
+            resolved_attrs.insert(key.clone(), Expr(resolved));
         }
 
         resource.attributes = resolved_attrs;
@@ -2985,11 +2992,11 @@ mod tests {
         assert_eq!(resource.id.resource_type, "s3_bucket");
         assert_eq!(resource.id.name, "my_bucket"); // binding name becomes the resource ID
         assert_eq!(
-            resource.attributes.get("name"),
+            resource.get_attr("name"),
             Some(&Value::String("my-bucket".to_string()))
         );
         assert_eq!(
-            resource.attributes.get("region"),
+            resource.get_attr("region"),
             Some(&Value::String("aws.Region.ap_northeast_1".to_string()))
         );
     }
@@ -3026,7 +3033,7 @@ mod tests {
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
-            result.resources[0].attributes.get("region"),
+            result.resources[0].get_attr("region"),
             Some(&Value::String("aws.Region.ap_northeast_1".to_string()))
         );
     }
@@ -3060,11 +3067,11 @@ mod tests {
         assert_eq!(result.providers.len(), 1);
         assert_eq!(result.resources.len(), 2);
         assert_eq!(
-            result.resources[0].attributes.get("versioning"),
+            result.resources[0].get_attr("versioning"),
             Some(&Value::Bool(true))
         );
         assert_eq!(
-            result.resources[0].attributes.get("expiration_days"),
+            result.resources[0].get_attr("expiration_days"),
             Some(&Value::Int(90))
         );
     }
@@ -3080,7 +3087,7 @@ mod tests {
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
-            result.resources[0].attributes.get("name"),
+            result.resources[0].get_attr("name"),
             Some(&Value::FunctionCall {
                 name: "env".to_string(),
                 args: vec![Value::String("SOME_VAR".to_string())],
@@ -3176,7 +3183,7 @@ mod tests {
         // Before resolution, the attribute should be a ResourceRef
         let policy = &result.resources[1];
         assert_eq!(
-            policy.attributes.get("bucket"),
+            policy.get_attr("bucket"),
             Some(&Value::ResourceRef {
                 binding_name: "bucket".to_string(),
                 attribute_name: "name".to_string(),
@@ -3206,11 +3213,11 @@ mod tests {
         // After resolution, the attribute should be the actual value
         let policy = &result.resources[1];
         assert_eq!(
-            policy.attributes.get("bucket"),
+            policy.get_attr("bucket"),
             Some(&Value::String("my-bucket".to_string()))
         );
         assert_eq!(
-            policy.attributes.get("bucket_region"),
+            policy.get_attr("bucket_region"),
             Some(&Value::String("aws.Region.ap_northeast_1".to_string()))
         );
     }
@@ -3231,7 +3238,7 @@ mod tests {
         assert!(result.is_ok());
         let parsed = result.unwrap();
         assert_eq!(
-            parsed.resources[0].attributes.get("bucket"),
+            parsed.resources[0].get_attr("bucket"),
             Some(&Value::String("nonexistent.name".to_string()))
         );
     }
@@ -3248,7 +3255,7 @@ mod tests {
 
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
-            result.resources[0].attributes.get("instance_tenancy"),
+            result.resources[0].get_attr("instance_tenancy"),
             Some(&Value::String("dedicated".to_string()))
         );
     }
@@ -3265,7 +3272,7 @@ mod tests {
 
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
-            result.resources[0].attributes.get("region"),
+            result.resources[0].get_attr("region"),
             Some(&Value::String("aws.Region.ap_northeast_1".to_string()))
         );
     }
@@ -3282,7 +3289,7 @@ mod tests {
 
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
-            result.resources[0].attributes.get("type"),
+            result.resources[0].get_attr("type"),
             Some(&Value::String(
                 "awscc.ec2.vpn_gateway.Type.ipsec.1".to_string()
             ))
@@ -3328,7 +3335,7 @@ mod tests {
         assert_eq!(sg.id.resource_type, "security_group");
 
         // Check ingress is a list with 2 items
-        let ingress = sg.attributes.get("ingress").unwrap();
+        let ingress = sg.get_attr("ingress").unwrap();
         if let Value::List(items) = ingress {
             assert_eq!(items.len(), 2);
 
@@ -3347,7 +3354,7 @@ mod tests {
         }
 
         // Check egress is a list with 1 item
-        let egress = sg.attributes.get("egress").unwrap();
+        let egress = sg.get_attr("egress").unwrap();
         if let Value::List(items) = egress {
             assert_eq!(items.len(), 1);
         } else {
@@ -3373,7 +3380,7 @@ mod tests {
         assert_eq!(result.resources.len(), 1);
 
         let rt = &result.resources[0];
-        let routes = rt.attributes.get("routes").unwrap();
+        let routes = rt.get_attr("routes").unwrap();
         if let Value::List(items) = routes {
             assert_eq!(items.len(), 2);
 
@@ -3433,7 +3440,7 @@ mod tests {
         assert_eq!(result.resources.len(), 1);
         let sg = &result.resources[0];
         assert_eq!(
-            sg.attributes.get("vpc_id"),
+            sg.get_attr("vpc_id"),
             Some(&Value::ResourceRef {
                 binding_name: "vpc_id".to_string(),
                 attribute_name: String::new(),
@@ -3676,7 +3683,7 @@ mod tests {
 
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
-            result.resources[0].attributes.get("weight"),
+            result.resources[0].get_attr("weight"),
             Some(&Value::Float(2.5))
         );
     }
@@ -3692,7 +3699,7 @@ mod tests {
 
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
-            result.resources[0].attributes.get("offset"),
+            result.resources[0].get_attr("offset"),
             Some(&Value::Float(-0.5))
         );
     }
@@ -3800,10 +3807,7 @@ mod tests {
         assert_eq!(resource.id.resource_type, "s3_bucket");
         assert_eq!(resource.id.name, "existing"); // binding name becomes the resource ID
         assert!(resource.is_data_source());
-        assert_eq!(
-            resource.attributes.get("_data_source"),
-            Some(&Value::Bool(true))
-        );
+        assert_eq!(resource.get_attr("_data_source"), Some(&Value::Bool(true)));
     }
 
     #[test]
@@ -3916,7 +3920,7 @@ mod tests {
         assert!(
             !resource.attributes.contains_key("name"),
             "Anonymous AWSCC resource should not have 'name' in attributes, but found: {:?}",
-            resource.attributes.get("name")
+            resource.get_attr("name")
         );
     }
 
@@ -3939,7 +3943,7 @@ mod tests {
         assert!(
             !resource.attributes.contains_key("name"),
             "Let-bound AWSCC resource should not have 'name' in attributes, but found: {:?}",
-            resource.attributes.get("name")
+            resource.get_attr("name")
         );
     }
 
@@ -4003,7 +4007,7 @@ mod tests {
         assert_eq!(result.resources.len(), 1);
 
         let role = &result.resources[0];
-        let doc = role.attributes.get("assume_role_policy_document").unwrap();
+        let doc = role.get_attr("assume_role_policy_document").unwrap();
         if let Value::Map(map) = doc {
             assert_eq!(
                 map.get("version"),
@@ -4053,7 +4057,7 @@ mod tests {
 
         let result = parse(input, &ProviderContext::default()).unwrap();
         let role = &result.resources[0];
-        let doc = role.attributes.get("policy_document").unwrap();
+        let doc = role.get_attr("policy_document").unwrap();
         if let Value::Map(map) = doc {
             let statement = map.get("statement").unwrap();
             if let Value::List(stmts) = statement {
@@ -4086,7 +4090,7 @@ mod tests {
 
         let result = parse(input, &ProviderContext::default()).unwrap();
         let role = &result.resources[0];
-        let doc = role.attributes.get("assume_role_policy_document").unwrap();
+        let doc = role.get_attr("assume_role_policy_document").unwrap();
         if let Value::Map(map) = doc {
             let statement = map.get("statement").unwrap();
             if let Value::List(stmts) = statement {
@@ -4115,7 +4119,7 @@ mod tests {
         let result = parse(input, &ProviderContext::default()).unwrap();
         let r = &result.resources[0];
 
-        let outer = r.attributes.get("outer").unwrap();
+        let outer = r.get_attr("outer").unwrap();
         if let Value::List(outer_items) = outer {
             assert_eq!(outer_items.len(), 1);
             if let Value::Map(outer_map) = &outer_items[0] {
@@ -4158,7 +4162,7 @@ mod tests {
         let result = parse(input, &ProviderContext::default()).unwrap();
         let role = &result.resources[0];
 
-        let doc = role.attributes.get("policy_document").unwrap();
+        let doc = role.get_attr("policy_document").unwrap();
         if let Value::Map(map) = doc {
             let statement = map.get("statement").unwrap();
             if let Value::List(items) = statement {
@@ -4258,7 +4262,7 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
-            result.resources[0].attributes.get("name"),
+            result.resources[0].get_attr("name"),
             Some(&Value::FunctionCall {
                 name: "lower".to_string(),
                 args: vec![Value::String("test".to_string())],
@@ -4277,7 +4281,7 @@ aws.s3.bucket {
         assert_eq!(result.resources.len(), 1);
         // At parse time, function calls remain as FunctionCall values
         assert_eq!(
-            result.resources[0].attributes.get("name"),
+            result.resources[0].get_attr("name"),
             Some(&Value::FunctionCall {
                 name: "join".to_string(),
                 args: vec![
@@ -4303,7 +4307,7 @@ aws.s3.bucket {
         assert_eq!(result.resources.len(), 1);
         // ["a", "b", "c"] |> join("-") desugars to join("-", ["a", "b", "c"])
         assert_eq!(
-            result.resources[0].attributes.get("name"),
+            result.resources[0].get_attr("name"),
             Some(&Value::FunctionCall {
                 name: "join".to_string(),
                 args: vec![
@@ -4370,7 +4374,7 @@ aws.s3.bucket {
         let mut result = parse(input, &ProviderContext::default()).unwrap();
         resolve_resource_refs(&mut result).unwrap();
         assert_eq!(
-            result.resources[0].attributes.get("name"),
+            result.resources[0].get_attr("name"),
             Some(&Value::String("my-bucket-name".to_string()))
         );
     }
@@ -4385,7 +4389,7 @@ aws.s3.bucket {
         let mut result = parse(input, &ProviderContext::default()).unwrap();
         resolve_resource_refs(&mut result).unwrap();
         assert_eq!(
-            result.resources[0].attributes.get("name"),
+            result.resources[0].get_attr("name"),
             Some(&Value::String("my-bucket".to_string()))
         );
     }
@@ -4411,14 +4415,14 @@ aws.s3.bucket {
         let subnet = &result.resources[0];
         // Forward reference vpc.vpc_id should be a ResourceRef, not a plain String
         assert_eq!(
-            subnet.attributes.get("vpc_id"),
+            subnet.get_attr("vpc_id"),
             Some(&Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "vpc_id".to_string(),
                 field_path: vec![],
             }),
             "Forward reference should be parsed as ResourceRef, got: {:?}",
-            subnet.attributes.get("vpc_id")
+            subnet.get_attr("vpc_id")
         );
     }
 
@@ -4487,7 +4491,7 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         let subnet = &result.resources[0];
         // Check nested reference in list > map
-        if let Some(Value::List(items)) = subnet.attributes.get("tags") {
+        if let Some(Value::List(items)) = subnet.get_attr("tags") {
             if let Some(Value::Map(map)) = items.first() {
                 assert_eq!(
                     map.get("vpc_ref"),
@@ -4524,7 +4528,7 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         let subnet = &result.resources[0];
         assert_eq!(
-            subnet.attributes.get("vpc_id"),
+            subnet.get_attr("vpc_id"),
             Some(&Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "encryption_specification".to_string(),
@@ -4552,7 +4556,7 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         let subnet = &result.resources[0];
         assert_eq!(
-            subnet.attributes.get("vpc_id"),
+            subnet.get_attr("vpc_id"),
             Some(&Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "config".to_string(),
@@ -4693,7 +4697,7 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
-            result.resources[0].attributes.get("cidr_block"),
+            result.resources[0].get_attr("cidr_block"),
             Some(&Value::String("10.0.0.0/16".to_string()))
         );
     }
@@ -4712,7 +4716,7 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
-            result.resources[0].attributes.get("cidr_block"),
+            result.resources[0].get_attr("cidr_block"),
             Some(&Value::String("10.0.0.0/16".to_string()))
         );
     }
@@ -4776,7 +4780,7 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
-            result.resources[0].attributes.get("cidr_block"),
+            result.resources[0].get_attr("cidr_block"),
             Some(&Value::String("10.0.0.0/16".to_string()))
         );
     }
@@ -4918,7 +4922,7 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         let sg = &result.resources[0];
         assert_eq!(
-            sg.attributes.get("group_name"),
+            sg.get_attr("group_name"),
             Some(&Value::ResourceRef {
                 binding_name: "web".to_string(),
                 attribute_name: "security_group".to_string(),
@@ -4939,7 +4943,7 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         let vpc = &result.resources[0];
         assert_eq!(
-            vpc.attributes.get("name"),
+            vpc.get_attr("name"),
             Some(&Value::Interpolation(vec![
                 InterpolationPart::Literal("vpc-".to_string()),
                 InterpolationPart::Expr(Value::String("prod".to_string())),
@@ -4960,7 +4964,7 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         let vpc = &result.resources[0];
         assert_eq!(
-            vpc.attributes.get("name"),
+            vpc.get_attr("name"),
             Some(&Value::Interpolation(vec![
                 InterpolationPart::Literal("vpc-".to_string()),
                 InterpolationPart::Expr(Value::String("prod".to_string())),
@@ -4984,7 +4988,7 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         let subnet = &result.resources[1];
         assert_eq!(
-            subnet.attributes.get("name"),
+            subnet.get_attr("name"),
             Some(&Value::Interpolation(vec![
                 InterpolationPart::Literal("subnet-".to_string()),
                 InterpolationPart::Expr(Value::ResourceRef {
@@ -5008,7 +5012,7 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         let vpc = &result.resources[0];
         assert_eq!(
-            vpc.attributes.get("name"),
+            vpc.get_attr("name"),
             Some(&Value::String("my-vpc".to_string()))
         );
     }
@@ -5025,7 +5029,7 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         let vpc = &result.resources[0];
         assert_eq!(
-            vpc.attributes.get("name"),
+            vpc.get_attr("name"),
             Some(&Value::String("price$100".to_string()))
         );
     }
@@ -5042,7 +5046,7 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         let vpc = &result.resources[0];
         assert_eq!(
-            vpc.attributes.get("name"),
+            vpc.get_attr("name"),
             Some(&Value::String("literal${expr}".to_string()))
         );
     }
@@ -5058,7 +5062,7 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         let vpc = &result.resources[0];
         assert_eq!(
-            vpc.attributes.get("name"),
+            vpc.get_attr("name"),
             Some(&Value::Interpolation(vec![
                 InterpolationPart::Literal("enabled-".to_string()),
                 InterpolationPart::Expr(Value::Bool(true)),
@@ -5077,7 +5081,7 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         let vpc = &result.resources[0];
         assert_eq!(
-            vpc.attributes.get("name"),
+            vpc.get_attr("name"),
             Some(&Value::Interpolation(vec![
                 InterpolationPart::Literal("port-".to_string()),
                 InterpolationPart::Expr(Value::Int(8080)),
@@ -5098,7 +5102,7 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         let vpc = &result.resources[0];
         assert_eq!(
-            vpc.attributes.get("tag"),
+            vpc.get_attr("tag"),
             Some(&Value::Interpolation(vec![InterpolationPart::Expr(
                 Value::String("prod".to_string())
             ),]))
@@ -5123,11 +5127,11 @@ aws.s3.bucket {
 
         // The local binding value should be resolved in subsequent attributes
         assert_eq!(
-            subnet.attributes.get("tag_name"),
+            subnet.get_attr("tag_name"),
             Some(&Value::String("my-subnet".to_string()))
         );
         assert_eq!(
-            subnet.attributes.get("cidr_block"),
+            subnet.get_attr("cidr_block"),
             Some(&Value::String("10.0.1.0/24".to_string()))
         );
     }
@@ -5148,7 +5152,7 @@ aws.s3.bucket {
 
         // Local binding should resolve outer scope variable in interpolation
         assert_eq!(
-            subnet.attributes.get("tag_name"),
+            subnet.get_attr("tag_name"),
             Some(&Value::Interpolation(vec![
                 InterpolationPart::Literal("app-".to_string()),
                 InterpolationPart::Expr(Value::String("prod".to_string())),
@@ -5172,7 +5176,7 @@ aws.s3.bucket {
 
         // Chained local bindings should resolve correctly
         assert_eq!(
-            subnet.attributes.get("tag_name"),
+            subnet.get_attr("tag_name"),
             Some(&Value::Interpolation(vec![
                 InterpolationPart::Expr(Value::String("app".to_string())),
                 InterpolationPart::Literal("-subnet".to_string()),
@@ -5199,7 +5203,7 @@ aws.s3.bucket {
 
         // Local binding used inside function call
         assert_eq!(
-            subnet.attributes.get("tag_name"),
+            subnet.get_attr("tag_name"),
             Some(&Value::FunctionCall {
                 name: "upper".to_string(),
                 args: vec![Value::String("my-subnet".to_string())],
@@ -5223,7 +5227,7 @@ aws.s3.bucket {
         // Local let binding should work in anonymous resources too
         assert!(!subnet.attributes.contains_key("name"));
         assert_eq!(
-            subnet.attributes.get("tag_name"),
+            subnet.get_attr("tag_name"),
             Some(&Value::String("my-subnet".to_string()))
         );
     }
@@ -5244,7 +5248,7 @@ aws.s3.bucket {
         let subnet = &result.resources[0];
 
         // Local binding should be visible in nested blocks
-        if let Some(Value::List(tags_list)) = subnet.attributes.get("tags") {
+        if let Some(Value::List(tags_list)) = subnet.get_attr("tags") {
             if let Some(Value::Map(tags)) = tags_list.first() {
                 assert_eq!(tags.get("Name"), Some(&Value::String("prod".to_string())));
             } else {
@@ -5275,11 +5279,11 @@ aws.s3.bucket {
 
         // Each resource should have the loop variable substituted
         assert_eq!(
-            result.resources[0].attributes.get("availability_zone"),
+            result.resources[0].get_attr("availability_zone"),
             Some(&Value::String("ap-northeast-1a".to_string()))
         );
         assert_eq!(
-            result.resources[1].attributes.get("availability_zone"),
+            result.resources[1].get_attr("availability_zone"),
             Some(&Value::String("ap-northeast-1c".to_string()))
         );
     }
@@ -5302,17 +5306,13 @@ aws.s3.bucket {
         assert_eq!(result.resources[1].id.name, "subnets[1]");
 
         // Check index variable is substituted
-        if let Some(Value::FunctionCall { args, .. }) =
-            result.resources[0].attributes.get("cidr_block")
-        {
+        if let Some(Value::FunctionCall { args, .. }) = result.resources[0].get_attr("cidr_block") {
             assert_eq!(args[2], Value::Int(0));
         } else {
             panic!("Expected FunctionCall for cidr_block");
         }
 
-        if let Some(Value::FunctionCall { args, .. }) =
-            result.resources[1].attributes.get("cidr_block")
-        {
+        if let Some(Value::FunctionCall { args, .. }) = result.resources[1].get_attr("cidr_block") {
             assert_eq!(args[2], Value::Int(1));
         } else {
             panic!("Expected FunctionCall for cidr_block");
@@ -5363,8 +5363,7 @@ aws.s3.bucket {
         assert_eq!(result.resources.len(), 2);
 
         // Local binding should be resolved within each iteration
-        if let Some(Value::FunctionCall { name, args }) =
-            result.resources[0].attributes.get("cidr_block")
+        if let Some(Value::FunctionCall { name, args }) = result.resources[0].get_attr("cidr_block")
         {
             assert_eq!(name, "cidr_subnet");
             assert_eq!(args[2], Value::Int(0));
@@ -5481,7 +5480,7 @@ aws.s3.bucket {
 
         let result = parse(input, &ProviderContext::default()).unwrap();
         let subnet = &result.resources[1];
-        let vpc_id = subnet.attributes.get("vpc_id").expect("vpc_id attribute");
+        let vpc_id = subnet.get_attr("vpc_id").expect("vpc_id attribute");
         match vpc_id {
             Value::ResourceRef {
                 binding_name,
@@ -5512,7 +5511,7 @@ aws.s3.bucket {
 
         let result = parse(input, &ProviderContext::default()).unwrap();
         let subnet = &result.resources[1];
-        let vpc_id = subnet.attributes.get("vpc_id").expect("vpc_id attribute");
+        let vpc_id = subnet.get_attr("vpc_id").expect("vpc_id attribute");
         match vpc_id {
             Value::ResourceRef {
                 binding_name,
@@ -5548,7 +5547,7 @@ aws.s3.bucket {
 
         let result = parse(input, &ProviderContext::default()).unwrap();
         let rt = result.resources.last().expect("route_table resource");
-        let subnet_id = rt.attributes.get("subnet_id").expect("subnet_id attribute");
+        let subnet_id = rt.get_attr("subnet_id").expect("subnet_id attribute");
         match subnet_id {
             Value::ResourceRef {
                 binding_name,
@@ -5586,7 +5585,7 @@ aws.s3.bucket {
 
         let result = parse(input, &ProviderContext::default()).unwrap();
         let subnet = result.resources.last().expect("subnet resource");
-        let vpc_id = subnet.attributes.get("vpc_id").expect("vpc_id attribute");
+        let vpc_id = subnet.get_attr("vpc_id").expect("vpc_id attribute");
         match vpc_id {
             Value::ResourceRef {
                 binding_name,
@@ -5624,7 +5623,7 @@ aws.s3.bucket {
 
         let result = parse(input, &ProviderContext::default()).unwrap();
         let subnet = result.resources.last().expect("subnet resource");
-        let sg_id = subnet.attributes.get("sg_id").expect("sg_id attribute");
+        let sg_id = subnet.get_attr("sg_id").expect("sg_id attribute");
         match sg_id {
             Value::ResourceRef {
                 binding_name,
@@ -5726,11 +5725,11 @@ aws.s3.bucket {
         assert_eq!(result.resources[0].id.name, "resources[0]");
         assert_eq!(result.resources[1].id.name, "resources[1]");
         assert_eq!(
-            result.resources[0].attributes.get("name"),
+            result.resources[0].get_attr("name"),
             Some(&Value::String("Env".to_string()))
         );
         assert_eq!(
-            result.resources[1].attributes.get("name"),
+            result.resources[1].get_attr("name"),
             Some(&Value::String("Name".to_string()))
         );
     }
@@ -5754,11 +5753,11 @@ aws.s3.bucket {
         // values() returns values sorted by key: prod, staging
         assert_eq!(result.resources.len(), 2);
         assert_eq!(
-            result.resources[0].attributes.get("cidr_block"),
+            result.resources[0].get_attr("cidr_block"),
             Some(&Value::String("10.0.0.0/16".to_string()))
         );
         assert_eq!(
-            result.resources[1].attributes.get("cidr_block"),
+            result.resources[1].get_attr("cidr_block"),
             Some(&Value::String("10.1.0.0/16".to_string()))
         );
     }
@@ -5778,11 +5777,11 @@ aws.s3.bucket {
         // concat(items, base_list) => base_list ++ items
         // So concat(["10.0.0.0/16"], ["10.1.0.0/16"]) => ["10.1.0.0/16", "10.0.0.0/16"]
         assert_eq!(
-            result.resources[0].attributes.get("cidr_block"),
+            result.resources[0].get_attr("cidr_block"),
             Some(&Value::String("10.1.0.0/16".to_string()))
         );
         assert_eq!(
-            result.resources[1].attributes.get("cidr_block"),
+            result.resources[1].get_attr("cidr_block"),
             Some(&Value::String("10.0.0.0/16".to_string()))
         );
     }
@@ -5828,7 +5827,7 @@ aws.s3.bucket {
         assert_eq!(result.resources.len(), 1);
         assert_eq!(result.resources[0].id.name, "alarm");
         assert_eq!(
-            result.resources[0].attributes.get("alarm_name"),
+            result.resources[0].get_attr("alarm_name"),
             Some(&Value::String("cpu-high".to_string()))
         );
     }
@@ -5864,7 +5863,7 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
-            result.resources[0].attributes.get("cidr_block"),
+            result.resources[0].get_attr("cidr_block"),
             Some(&Value::String("10.0.0.0/16".to_string()))
         );
     }
@@ -5886,7 +5885,7 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
-            result.resources[0].attributes.get("cidr_block"),
+            result.resources[0].get_attr("cidr_block"),
             Some(&Value::String("172.16.0.0/16".to_string()))
         );
     }
@@ -5919,7 +5918,7 @@ aws.s3.bucket {
 
         let result2 = parse(input2, &ProviderContext::default()).unwrap();
         assert_eq!(
-            result2.resources[0].attributes.get("instance_type"),
+            result2.resources[0].get_attr("instance_type"),
             Some(&Value::String("m5.xlarge".to_string()))
         );
     }
@@ -5940,7 +5939,7 @@ aws.s3.bucket {
 
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
-            result.resources[0].attributes.get("instance_type"),
+            result.resources[0].get_attr("instance_type"),
             Some(&Value::String("t3.micro".to_string()))
         );
     }
@@ -6048,7 +6047,7 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
-            result.resources[0].attributes.get("alarm_name"),
+            result.resources[0].get_attr("alarm_name"),
             Some(&Value::String("cpu-high".to_string()))
         );
     }
@@ -6066,7 +6065,7 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
-            result.resources[0].attributes.get("cidr_block"),
+            result.resources[0].get_attr("cidr_block"),
             Some(&Value::String("10.0.0.0/16".to_string()))
         );
     }
@@ -6084,7 +6083,7 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
-            result.resources[0].attributes.get("cidr_block"),
+            result.resources[0].get_attr("cidr_block"),
             Some(&Value::String("172.16.0.0/16".to_string()))
         );
     }
@@ -6101,7 +6100,7 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
-            result.resources[0].attributes.get("cidr_block"),
+            result.resources[0].get_attr("cidr_block"),
             Some(&Value::String("10.0.0.0/16".to_string()))
         );
     }
@@ -6140,11 +6139,11 @@ aws.s3.bucket {
 
         // Each resource should have the loop variable substituted
         assert_eq!(
-            result.resources[0].attributes.get("availability_zone"),
+            result.resources[0].get_attr("availability_zone"),
             Some(&Value::String("ap-northeast-1a".to_string()))
         );
         assert_eq!(
-            result.resources[1].attributes.get("availability_zone"),
+            result.resources[1].get_attr("availability_zone"),
             Some(&Value::String("ap-northeast-1c".to_string()))
         );
     }
@@ -6163,7 +6162,7 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
-            result.resources[0].attributes.get("alarm_name"),
+            result.resources[0].get_attr("alarm_name"),
             Some(&Value::String("cpu-high".to_string()))
         );
     }
@@ -6421,7 +6420,7 @@ aws.s3.bucket {
         let result = parse_and_resolve(input).unwrap();
         let resource = &result.resources[0];
         assert_eq!(
-            resource.attributes.get("name"),
+            resource.get_attr("name"),
             Some(&Value::String("a-b-c".to_string())),
         );
     }
@@ -6443,7 +6442,7 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
-            result.resources[0].attributes.get("name"),
+            result.resources[0].get_attr("name"),
             Some(&Value::String("hello world".to_string())),
         );
     }
@@ -6466,11 +6465,11 @@ aws.s3.bucket {
 
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
-            result.resources[0].attributes.get("name"),
+            result.resources[0].get_attr("name"),
             Some(&Value::String("prod-default".to_string())),
         );
         assert_eq!(
-            result.resources[1].attributes.get("name"),
+            result.resources[1].get_attr("name"),
             Some(&Value::String("prod-web".to_string())),
         );
     }
@@ -6490,7 +6489,7 @@ aws.s3.bucket {
 
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
-            result.resources[0].attributes.get("name"),
+            result.resources[0].get_attr("name"),
             Some(&Value::String("prod-subnet-a".to_string())),
         );
     }
@@ -6509,7 +6508,7 @@ aws.s3.bucket {
 
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
-            result.resources[0].attributes.get("name"),
+            result.resources[0].get_attr("name"),
             Some(&Value::String("HELLO".to_string())),
         );
     }
@@ -6532,7 +6531,7 @@ aws.s3.bucket {
 
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
-            result.resources[0].attributes.get("name"),
+            result.resources[0].get_attr("name"),
             Some(&Value::String("prod-app-web".to_string())),
         );
     }
@@ -6668,7 +6667,7 @@ aws.s3.bucket {
 
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
-            result.resources[0].attributes.get("name"),
+            result.resources[0].get_attr("name"),
             Some(&Value::String("hello".to_string())),
         );
     }
@@ -6729,7 +6728,7 @@ aws.s3.bucket {
 
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
-            result.resources[0].attributes.get("name"),
+            result.resources[0].get_attr("name"),
             Some(&Value::String("hello-world".to_string())),
         );
     }
@@ -6748,7 +6747,7 @@ aws.s3.bucket {
 
         // At parse time, fn is evaluated but interpolation is not fully resolved
         let result = parse(input, &ProviderContext::default()).unwrap();
-        let name = result.resources[0].attributes.get("name").unwrap();
+        let name = result.resources[0].get_attr("name").unwrap();
         match name {
             Value::Interpolation(parts) => {
                 // The greet() call is evaluated to "hello world"
@@ -6778,7 +6777,7 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
-            result.resources[0].attributes.get("name"),
+            result.resources[0].get_attr("name"),
             Some(&Value::String("hello world".to_string())),
         );
     }
@@ -6837,7 +6836,7 @@ aws.s3.bucket {
 
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
-            result.resources[0].attributes.get("name"),
+            result.resources[0].get_attr("name"),
             Some(&Value::String("prod-default".to_string())),
         );
     }
@@ -6856,7 +6855,7 @@ aws.s3.bucket {
 
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
-            result.resources[0].attributes.get("name"),
+            result.resources[0].get_attr("name"),
             Some(&Value::String("prod-web".to_string())),
         );
     }
@@ -7337,7 +7336,7 @@ aws.s3.bucket {
         let mut parsed = parse(input, &config).unwrap();
         resolve_resource_refs_with_config(&mut parsed, &config).unwrap();
         assert_eq!(parsed.resources.len(), 1);
-        let secret_val = parsed.resources[0].attributes.get("secret").unwrap();
+        let secret_val = parsed.resources[0].get_attr("secret").unwrap();
         assert_eq!(*secret_val, Value::String("decrypted:AQICAHh".to_string()));
     }
 

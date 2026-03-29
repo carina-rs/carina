@@ -97,7 +97,7 @@ impl AwsProvider {
 
     /// Create a CloudWatch Logs Log Group
     pub(crate) async fn create_logs_log_group(&self, resource: Resource) -> ProviderResult<State> {
-        let log_group_name = match resource.attributes.get("log_group_name") {
+        let log_group_name = match resource.get_attr("log_group_name") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(ProviderError::new("log_group_name is required")
@@ -110,17 +110,17 @@ impl AwsProvider {
             .create_log_group()
             .log_group_name(&log_group_name);
 
-        if let Some(Value::String(kms_key)) = resource.attributes.get("kms_key_id") {
+        if let Some(Value::String(kms_key)) = resource.get_attr("kms_key_id") {
             req = req.kms_key_id(kms_key);
         }
 
-        if let Some(Value::String(class)) = resource.attributes.get("log_group_class") {
+        if let Some(Value::String(class)) = resource.get_attr("log_group_class") {
             use aws_sdk_cloudwatchlogs::types::LogGroupClass;
             let class_value = extract_enum_value(class);
             req = req.log_group_class(LogGroupClass::from(class_value));
         }
 
-        if let Some(Value::Map(tag_map)) = resource.attributes.get("tags") {
+        if let Some(Value::Map(tag_map)) = resource.get_attr("tags") {
             let mut tags = HashMap::new();
             for (key, value) in tag_map {
                 if let Value::String(val) = value {
@@ -137,7 +137,7 @@ impl AwsProvider {
         })?;
 
         // Set retention if specified
-        if let Some(Value::Int(days)) = resource.attributes.get("retention_in_days") {
+        if let Some(Value::Int(days)) = resource.get_attr("retention_in_days") {
             self.logs_client
                 .put_retention_policy()
                 .log_group_name(&log_group_name)
@@ -164,7 +164,7 @@ impl AwsProvider {
         to: Resource,
     ) -> ProviderResult<State> {
         // Update retention
-        match to.attributes.get("retention_in_days") {
+        match to.get_attr("retention_in_days") {
             Some(Value::Int(days)) => {
                 self.logs_client
                     .put_retention_policy()
@@ -197,7 +197,7 @@ impl AwsProvider {
         }
 
         // Update KMS key
-        if let Some(Value::String(kms_key)) = to.attributes.get("kms_key_id") {
+        if let Some(Value::String(kms_key)) = to.get_attr("kms_key_id") {
             self.logs_client
                 .associate_kms_key()
                 .log_group_name(identifier)
@@ -223,8 +223,13 @@ impl AwsProvider {
         }
 
         // Update tags
-        self.apply_logs_tags(&id, identifier, &to.attributes, Some(&from.attributes))
-            .await?;
+        self.apply_logs_tags(
+            &id,
+            identifier,
+            &to.resolved_attributes(),
+            Some(&from.attributes),
+        )
+        .await?;
 
         self.read_logs_log_group(&id, Some(identifier)).await
     }

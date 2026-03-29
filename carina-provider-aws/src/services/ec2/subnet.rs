@@ -67,7 +67,7 @@ impl AwsProvider {
 
     /// Create an EC2 Subnet
     pub(crate) async fn create_ec2_subnet(&self, resource: Resource) -> ProviderResult<State> {
-        let cidr_block = match resource.attributes.get("cidr_block") {
+        let cidr_block = match resource.get_attr("cidr_block") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(
@@ -76,7 +76,7 @@ impl AwsProvider {
             }
         };
 
-        let vpc_id = match resource.attributes.get("vpc_id") {
+        let vpc_id = match resource.get_attr("vpc_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(
@@ -91,7 +91,7 @@ impl AwsProvider {
             .vpc_id(&vpc_id)
             .cidr_block(&cidr_block);
 
-        if let Some(Value::String(az)) = resource.attributes.get("availability_zone") {
+        if let Some(Value::String(az)) = resource.get_attr("availability_zone") {
             req = req.availability_zone(convert_enum_value(az));
         }
 
@@ -107,11 +107,16 @@ impl AwsProvider {
         })?;
 
         // Apply tags
-        self.apply_ec2_tags(&resource.id, subnet_id, &resource.attributes, None)
-            .await?;
+        self.apply_ec2_tags(
+            &resource.id,
+            subnet_id,
+            &resource.resolved_attributes(),
+            None,
+        )
+        .await?;
 
         // Apply subnet attributes that require ModifySubnetAttribute
-        self.modify_subnet_attributes(&resource.id, subnet_id, &resource.attributes)
+        self.modify_subnet_attributes(&resource.id, subnet_id, &resource.resolved_attributes())
             .await?;
 
         // Read back using subnet ID (reliable identifier)
@@ -127,12 +132,17 @@ impl AwsProvider {
         to: Resource,
     ) -> ProviderResult<State> {
         // Apply subnet attributes that require ModifySubnetAttribute
-        self.modify_subnet_attributes(&id, identifier, &to.attributes)
+        self.modify_subnet_attributes(&id, identifier, &to.resolved_attributes())
             .await?;
 
         // Update tags
-        self.apply_ec2_tags(&id, identifier, &to.attributes, Some(&from.attributes))
-            .await?;
+        self.apply_ec2_tags(
+            &id,
+            identifier,
+            &to.resolved_attributes(),
+            Some(&from.attributes),
+        )
+        .await?;
 
         self.read_ec2_subnet(&id, Some(identifier)).await
     }

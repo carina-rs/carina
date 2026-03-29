@@ -91,11 +91,11 @@ impl AwsProvider {
             })?;
 
         // Apply tags
-        self.apply_ec2_tags(&resource.id, igw_id, &resource.attributes, None)
+        self.apply_ec2_tags(&resource.id, igw_id, &resource.resolved_attributes(), None)
             .await?;
 
         // Attach to VPC if specified
-        if let Some(Value::String(vpc_id)) = resource.attributes.get("vpc_id") {
+        if let Some(Value::String(vpc_id)) = resource.get_attr("vpc_id") {
             self.ec2_client
                 .attach_internet_gateway()
                 .internet_gateway_id(igw_id)

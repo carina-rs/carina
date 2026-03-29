@@ -204,7 +204,7 @@ fn extract_compact_hint(
 
     // Priority 1: First distinguishing string attribute (most identifying)
     for key in &keys {
-        if let Some(Value::String(s)) = resource.attributes.get(*key)
+        if let Some(Value::String(s)) = resource.get_attr(key)
             && !s.is_empty()
         {
             let short_key = shorten_attr_name(key);
@@ -221,7 +221,7 @@ fn extract_compact_hint(
 
     // Priority 2: First non-parent ResourceRef attribute (direct or inside a List)
     for key in &keys {
-        match resource.attributes.get(*key) {
+        match resource.get_attr(key) {
             Some(Value::ResourceRef { binding_name, .. }) => {
                 if parent_binding == Some(binding_name.as_str()) {
                     continue;
@@ -1846,7 +1846,7 @@ mod tests {
         let mut r = Resource::new(resource_type, name);
         r.binding = Some(binding.to_string());
         for dep in deps {
-            r.attributes.insert(
+            r.set_attr(
                 format!("ref_{}", dep),
                 Value::ResourceRef {
                     binding_name: dep.to_string(),
@@ -2280,7 +2280,7 @@ mod tests {
     #[test]
     fn test_extract_compact_hint_resource_ref() {
         let mut r = Resource::new("ec2.subnet_route_table_association", "hash123");
-        r.attributes.insert(
+        r.set_attr(
             "route_table_id".to_string(),
             Value::ResourceRef {
                 binding_name: "public_rt".to_string(),
@@ -2288,7 +2288,7 @@ mod tests {
                 field_path: vec![],
             },
         );
-        r.attributes.insert(
+        r.set_attr(
             "subnet_id".to_string(),
             Value::ResourceRef {
                 binding_name: "public_subnet_1a".to_string(),
@@ -2306,7 +2306,7 @@ mod tests {
     #[test]
     fn test_extract_compact_hint_skips_parent_ref() {
         let mut r = Resource::new("ec2.subnet_route_table_association", "hash123");
-        r.attributes.insert(
+        r.set_attr(
             "route_table_id".to_string(),
             Value::ResourceRef {
                 binding_name: "database_rt".to_string(),
@@ -2314,7 +2314,7 @@ mod tests {
                 field_path: vec![],
             },
         );
-        r.attributes.insert(
+        r.set_attr(
             "subnet_id".to_string(),
             Value::ResourceRef {
                 binding_name: "database_subnet_1a".to_string(),
@@ -2332,7 +2332,7 @@ mod tests {
     #[test]
     fn test_extract_compact_hint_string_fallback() {
         let mut r = Resource::new("ec2.route", "hash456");
-        r.attributes.insert(
+        r.set_attr(
             "destination_cidr_block".to_string(),
             Value::String("0.0.0.0/0".to_string()),
         );
@@ -2353,11 +2353,11 @@ mod tests {
     #[test]
     fn test_extract_compact_hint_prefers_string_over_resource_ref() {
         let mut r = Resource::new("ec2.route", "hash_mixed");
-        r.attributes.insert(
+        r.set_attr(
             "destination".to_string(),
             Value::String("10.0.0.0/8".to_string()),
         );
-        r.attributes.insert(
+        r.set_attr(
             "gateway_id".to_string(),
             Value::ResourceRef {
                 binding_name: "igw".to_string(),
@@ -2375,7 +2375,7 @@ mod tests {
     #[test]
     fn test_extract_compact_hint_service_name_shortening() {
         let mut r = Resource::new("ec2.vpc_endpoint", "hash_svc");
-        r.attributes.insert(
+        r.set_attr(
             "service_name".to_string(),
             Value::String("com.amazonaws.ap-northeast-1.ecr.dkr".to_string()),
         );
@@ -2385,7 +2385,7 @@ mod tests {
 
         // Single service component
         let mut r2 = Resource::new("ec2.vpc_endpoint", "hash_svc2");
-        r2.attributes.insert(
+        r2.set_attr(
             "service_name".to_string(),
             Value::String("com.amazonaws.ap-northeast-1.s3".to_string()),
         );
@@ -2398,7 +2398,7 @@ mod tests {
     #[test]
     fn test_extract_compact_hint_all_refs_match_parent() {
         let mut r = Resource::new("ec2.security_group_ingress", "hash_sg");
-        r.attributes.insert(
+        r.set_attr(
             "group_id".to_string(),
             Value::ResourceRef {
                 binding_name: "endpoint_sg".to_string(),
@@ -2406,7 +2406,7 @@ mod tests {
                 field_path: vec![],
             },
         );
-        r.attributes.insert(
+        r.set_attr(
             "description".to_string(),
             Value::String("Allow HTTPS from VPC".to_string()),
         );
@@ -2420,11 +2420,11 @@ mod tests {
     #[test]
     fn test_extract_compact_hint_prefers_string_for_vpc_endpoint() {
         let mut r = Resource::new("ec2.vpc_endpoint", "hash_ep");
-        r.attributes.insert(
+        r.set_attr(
             "service_name".to_string(),
             Value::String("com.amazonaws.ap-northeast-1.ecr.dkr".to_string()),
         );
-        r.attributes.insert(
+        r.set_attr(
             "security_group_ids".to_string(),
             Value::List(vec![Value::ResourceRef {
                 binding_name: "endpoint_sg".to_string(),
@@ -2432,7 +2432,7 @@ mod tests {
                 field_path: vec![],
             }]),
         );
-        r.attributes.insert(
+        r.set_attr(
             "vpc_id".to_string(),
             Value::ResourceRef {
                 binding_name: "vpc".to_string(),
@@ -2475,7 +2475,7 @@ mod tests {
     #[test]
     fn test_format_compact_name_anonymous_with_hint() {
         let mut r = Resource::new("ec2.subnet_route_table_association", "hash123");
-        r.attributes.insert(
+        r.set_attr(
             "subnet_id".to_string(),
             Value::ResourceRef {
                 binding_name: "database_subnet_1a".to_string(),
@@ -2521,11 +2521,11 @@ mod tests {
     #[test]
     fn test_print_plan_compact_with_anonymous_resources() {
         let mut anon = Resource::new("ec2.route", "hash_anon");
-        anon.attributes.insert(
+        anon.set_attr(
             "destination_cidr_block".to_string(),
             Value::String("0.0.0.0/0".to_string()),
         );
-        anon.attributes.insert(
+        anon.set_attr(
             "route_table_id".to_string(),
             Value::ResourceRef {
                 binding_name: "public_rt".to_string(),
@@ -2552,7 +2552,7 @@ mod tests {
     #[test]
     fn test_extract_compact_hint_list_containing_resource_ref() {
         let mut r = Resource::new("ec2.vpc_endpoint", "hash_list_ref");
-        r.attributes.insert(
+        r.set_attr(
             "security_group_ids".to_string(),
             Value::List(vec![Value::ResourceRef {
                 binding_name: "endpoint_sg".to_string(),
@@ -2573,7 +2573,7 @@ mod tests {
     #[test]
     fn test_extract_compact_hint_list_ref_skips_parent() {
         let mut r = Resource::new("ec2.vpc_endpoint", "hash_list_parent");
-        r.attributes.insert(
+        r.set_attr(
             "security_group_ids".to_string(),
             Value::List(vec![Value::ResourceRef {
                 binding_name: "endpoint_sg".to_string(),
@@ -2604,7 +2604,7 @@ mod tests {
     #[test]
     fn test_extract_compact_hint_resolves_dsl_enum() {
         let mut r = Resource::new("ec2.subnet", "hash_enum");
-        r.attributes.insert(
+        r.set_attr(
             "availability_zone".to_string(),
             Value::String("awscc.AvailabilityZone.ap_northeast_1a".to_string()),
         );
@@ -2622,8 +2622,7 @@ mod tests {
     fn test_extract_compact_hint_skips_internal_attributes() {
         let mut r = Resource::new("ec2.vpc", "hash_internal");
         r.binding = Some("vpc".to_string());
-        r.attributes
-            .insert("_hash".to_string(), Value::String("abc123".to_string()));
+        r.set_attr("_hash".to_string(), Value::String("abc123".to_string()));
 
         let hint = extract_compact_hint(&r, None);
         assert_eq!(hint, None, "Internal attributes should be skipped");
@@ -3111,11 +3110,11 @@ mod tests {
         let mut sg = Resource::new("ec2.security_group", "sg");
         sg.binding = Some("sg".to_string());
         // This is the resolved value — a plain string, NOT a ResourceRef
-        sg.attributes.insert(
+        sg.set_attr(
             "vpc_id".to_string(),
             Value::String("vpc-0123456789abcdef0".to_string()),
         );
-        sg.attributes.insert(
+        sg.set_attr(
             "group_description".to_string(),
             Value::String("Test security group".to_string()),
         );

@@ -57,6 +57,19 @@ impl std::fmt::Display for ResourceId {
     }
 }
 
+/// An unevaluated expression in the DSL.
+///
+/// `Expr` represents values that may need resolution before becoming final `Value`s.
+/// The parser produces `Expr` values for resource attributes; the resolver converts
+/// them to `Expr::Literal(Value)` by resolving references, interpolations, and function calls.
+///
+/// `Expr` wraps `Value` to enforce a type-level distinction between pre-resolution
+/// and post-resolution data. This prevents downstream code from accidentally receiving
+/// unresolved expressions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Expr(pub Value);
+
 /// Attribute value of a resource
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
@@ -99,6 +112,76 @@ pub enum InterpolationPart {
     Literal(String),
     /// An expression to be evaluated and converted to string
     Expr(Value),
+}
+
+/// Alias for ExprPart (legacy name)
+pub type ExprPart = InterpolationPart;
+
+impl Expr {
+    /// Returns a reference to the inner `Value`.
+    pub fn as_value(&self) -> &Value {
+        &self.0
+    }
+
+    /// Consumes self and returns the inner `Value`.
+    pub fn into_value(self) -> Value {
+        self.0
+    }
+
+    /// Returns true if the inner value is a resolved (non-expression) type.
+    /// A resolved value has no ResourceRef, Interpolation, or FunctionCall variants.
+    pub fn is_resolved(&self) -> bool {
+        !contains_resource_ref(&self.0)
+    }
+
+    /// Extract a resolved `HashMap<String, Value>` from an `Expr` attribute map.
+    pub fn resolve_map(attrs: &HashMap<String, Expr>) -> HashMap<String, Value> {
+        attrs
+            .iter()
+            .map(|(k, e)| (k.clone(), e.0.clone()))
+            .collect()
+    }
+}
+
+impl From<Value> for Expr {
+    fn from(value: Value) -> Self {
+        Expr(value)
+    }
+}
+
+impl PartialEq<Value> for Expr {
+    fn eq(&self, other: &Value) -> bool {
+        self.0 == *other
+    }
+}
+
+impl std::ops::Deref for Expr {
+    type Target = Value;
+    fn deref(&self) -> &Value {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Expr {
+    fn deref_mut(&mut self) -> &mut Value {
+        &mut self.0
+    }
+}
+
+/// Check if a Value contains any ResourceRef (possibly nested)
+pub fn contains_resource_ref(value: &Value) -> bool {
+    match value {
+        Value::ResourceRef { .. } => true,
+        Value::List(items) => items.iter().any(contains_resource_ref),
+        Value::Map(map) => map.values().any(contains_resource_ref),
+        Value::Interpolation(parts) => parts.iter().any(|p| match p {
+            InterpolationPart::Expr(v) => contains_resource_ref(v),
+            _ => false,
+        }),
+        Value::FunctionCall { args, .. } => args.iter().any(contains_resource_ref),
+        Value::Secret(inner) => contains_resource_ref(inner),
+        _ => false,
+    }
 }
 
 impl Value {
@@ -492,7 +575,7 @@ pub enum ResourceKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Resource {
     pub id: ResourceId,
-    pub attributes: HashMap<String, Value>,
+    pub attributes: HashMap<String, Expr>,
     /// Classification of this resource (real, virtual, or data source)
     #[serde(default)]
     pub kind: ResourceKind,
@@ -545,8 +628,41 @@ impl Resource {
         }
     }
 
+    /// Returns the resolved attributes as a `HashMap<String, Value>`.
+    pub fn resolved_attributes(&self) -> HashMap<String, Value> {
+        Expr::resolve_map(&self.attributes)
+    }
+
+    /// Get an attribute value by key, returning `Option<&Value>`.
+    ///
+    /// Convenience method that unwraps the `Expr` wrapper.
+    pub fn get_attr(&self, key: &str) -> Option<&Value> {
+        self.attributes.get(key).map(|e| &e.0)
+    }
+
+    /// Get a mutable attribute value by key, returning `Option<&mut Value>`.
+    pub fn get_attr_mut(&mut self, key: &str) -> Option<&mut Value> {
+        self.attributes.get_mut(key).map(|e| &mut e.0)
+    }
+
+    /// Set an attribute value, wrapping it in `Expr`.
+    pub fn set_attr(&mut self, key: impl Into<String>, value: Value) {
+        self.attributes.insert(key.into(), Expr(value));
+    }
+
     pub fn with_attribute(mut self, key: impl Into<String>, value: Value) -> Self {
-        self.attributes.insert(key.into(), value);
+        self.attributes.insert(key.into(), Expr(value));
+        self
+    }
+
+    pub fn with_expr_attribute(mut self, key: impl Into<String>, expr: Expr) -> Self {
+        self.attributes.insert(key.into(), expr);
+        self
+    }
+
+    /// Set attributes from a `HashMap<String, Value>`, wrapping each value in `Expr`.
+    pub fn with_value_attributes(mut self, attrs: HashMap<String, Value>) -> Self {
+        self.attributes = attrs.into_iter().map(|(k, v)| (k, Expr(v))).collect();
         self
     }
 
@@ -648,16 +764,6 @@ mod tests {
             Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "id".to_string(),
-                field_path: vec![],
-            },
-            Value::ResourceRef {
-                binding_name: "web_sg".to_string(),
-                attribute_name: "id".to_string(),
-                field_path: vec![],
-            },
-            Value::ResourceRef {
-                binding_name: "bucket".to_string(),
-                attribute_name: "arn".to_string(),
                 field_path: vec![],
             },
             Value::String("dedicated".to_string()),
@@ -1148,6 +1254,154 @@ mod tests {
         let resource = Resource::new("s3.bucket", "my-bucket").with_kind(ResourceKind::DataSource);
         assert!(resource.is_data_source());
         assert!(!resource.is_virtual());
+    }
+
+    #[test]
+    fn expr_wraps_value() {
+        let expr = Expr(Value::String("hello".to_string()));
+        assert!(matches!(*expr, Value::String(_)));
+    }
+
+    #[test]
+    fn expr_wraps_resource_ref() {
+        let expr = Expr(Value::ResourceRef {
+            binding_name: "vpc".to_string(),
+            attribute_name: "id".to_string(),
+            field_path: vec![],
+        });
+        assert!(matches!(*expr, Value::ResourceRef { .. }));
+        assert!(!expr.is_resolved());
+    }
+
+    #[test]
+    fn expr_wraps_interpolation() {
+        let expr = Expr(Value::Interpolation(vec![
+            InterpolationPart::Literal("prefix-".to_string()),
+            InterpolationPart::Expr(Value::ResourceRef {
+                binding_name: "vpc".to_string(),
+                attribute_name: "id".to_string(),
+                field_path: vec![],
+            }),
+        ]));
+        assert!(matches!(*expr, Value::Interpolation(_)));
+        assert!(!expr.is_resolved());
+    }
+
+    #[test]
+    fn expr_wraps_function_call() {
+        let expr = Expr(Value::FunctionCall {
+            name: "join".to_string(),
+            args: vec![
+                Value::String("-".to_string()),
+                Value::List(vec![
+                    Value::String("a".to_string()),
+                    Value::String("b".to_string()),
+                ]),
+            ],
+        });
+        assert!(matches!(*expr, Value::FunctionCall { .. }));
+    }
+
+    #[test]
+    fn resource_attributes_use_expr_type() {
+        let resource = Resource::new("s3.bucket", "test")
+            .with_expr_attribute("name", Expr(Value::String("my-bucket".to_string())))
+            .with_expr_attribute(
+                "vpc_id",
+                Expr(Value::ResourceRef {
+                    binding_name: "vpc".to_string(),
+                    attribute_name: "id".to_string(),
+                    field_path: vec![],
+                }),
+            );
+        assert!(matches!(resource.get_attr("name"), Some(Value::String(_))));
+        assert!(matches!(
+            resource.get_attr("vpc_id"),
+            Some(Value::ResourceRef { .. })
+        ));
+    }
+
+    #[test]
+    fn expr_serde_round_trip() {
+        let exprs = vec![
+            Expr(Value::String("hello".to_string())),
+            Expr(Value::Int(42)),
+            Expr(Value::ResourceRef {
+                binding_name: "vpc".to_string(),
+                attribute_name: "id".to_string(),
+                field_path: vec![],
+            }),
+            Expr(Value::Interpolation(vec![
+                InterpolationPart::Literal("prefix-".to_string()),
+                InterpolationPart::Expr(Value::ResourceRef {
+                    binding_name: "vpc".to_string(),
+                    attribute_name: "id".to_string(),
+                    field_path: vec![],
+                }),
+            ])),
+            Expr(Value::FunctionCall {
+                name: "join".to_string(),
+                args: vec![
+                    Value::String("-".to_string()),
+                    Value::List(vec![
+                        Value::String("a".to_string()),
+                        Value::String("b".to_string()),
+                    ]),
+                ],
+            }),
+        ];
+
+        for expr in exprs {
+            let json = serde_json::to_string(&expr).unwrap();
+            let deserialized: Expr = serde_json::from_str(&json).unwrap();
+            assert_eq!(expr, deserialized, "Round-trip failed for {:?}", expr);
+        }
+    }
+
+    #[test]
+    fn expr_is_resolved_for_plain_values() {
+        assert!(Expr(Value::String("hello".to_string())).is_resolved());
+        assert!(Expr(Value::Int(42)).is_resolved());
+        assert!(Expr(Value::Bool(true)).is_resolved());
+    }
+
+    #[test]
+    fn expr_is_not_resolved_for_refs() {
+        assert!(
+            !Expr(Value::ResourceRef {
+                binding_name: "vpc".to_string(),
+                attribute_name: "id".to_string(),
+                field_path: vec![],
+            })
+            .is_resolved()
+        );
+    }
+
+    #[test]
+    fn expr_deref_to_value() {
+        let expr = Expr(Value::String("hello".to_string()));
+        let val: &Value = &expr;
+        assert!(matches!(val, Value::String(s) if s == "hello"));
+    }
+
+    #[test]
+    fn expr_from_value() {
+        let value = Value::Int(42);
+        let expr: Expr = value.into();
+        assert_eq!(expr.0, Value::Int(42));
+    }
+
+    #[test]
+    fn expr_resolve_map() {
+        let mut attrs = HashMap::new();
+        attrs.insert("name".to_string(), Expr(Value::String("test".to_string())));
+        attrs.insert("count".to_string(), Expr(Value::Int(5)));
+        let resolved = Expr::resolve_map(&attrs);
+        assert_eq!(
+            resolved.get("name"),
+            Some(&Value::String("test".to_string()))
+        );
+        assert_eq!(resolved.get("count"), Some(&Value::Int(5)));
     }
 
     #[test]

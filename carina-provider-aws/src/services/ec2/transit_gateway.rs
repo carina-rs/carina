@@ -63,7 +63,7 @@ impl AwsProvider {
     ) -> ProviderResult<State> {
         let mut req = self.ec2_client.create_transit_gateway();
 
-        if let Some(Value::String(desc)) = resource.attributes.get("description") {
+        if let Some(Value::String(desc)) = resource.get_attr("description") {
             req = req.description(desc);
         }
 
@@ -71,12 +71,12 @@ impl AwsProvider {
         let mut options = aws_sdk_ec2::types::TransitGatewayRequestOptions::builder();
         let mut has_options = false;
 
-        if let Some(Value::Int(asn)) = resource.attributes.get("amazon_side_asn") {
+        if let Some(Value::Int(asn)) = resource.get_attr("amazon_side_asn") {
             options = options.amazon_side_asn(*asn);
             has_options = true;
         }
 
-        if let Some(Value::String(v)) = resource.attributes.get("auto_accept_shared_attachments") {
+        if let Some(Value::String(v)) = resource.get_attr("auto_accept_shared_attachments") {
             use aws_sdk_ec2::types::AutoAcceptSharedAttachmentsValue;
             options = options.auto_accept_shared_attachments(
                 AutoAcceptSharedAttachmentsValue::from(extract_enum_value(v)),
@@ -84,7 +84,7 @@ impl AwsProvider {
             has_options = true;
         }
 
-        if let Some(Value::String(v)) = resource.attributes.get("default_route_table_association") {
+        if let Some(Value::String(v)) = resource.get_attr("default_route_table_association") {
             use aws_sdk_ec2::types::DefaultRouteTableAssociationValue;
             options = options.default_route_table_association(
                 DefaultRouteTableAssociationValue::from(extract_enum_value(v)),
@@ -92,7 +92,7 @@ impl AwsProvider {
             has_options = true;
         }
 
-        if let Some(Value::String(v)) = resource.attributes.get("default_route_table_propagation") {
+        if let Some(Value::String(v)) = resource.get_attr("default_route_table_propagation") {
             use aws_sdk_ec2::types::DefaultRouteTablePropagationValue;
             options = options.default_route_table_propagation(
                 DefaultRouteTablePropagationValue::from(extract_enum_value(v)),
@@ -100,13 +100,13 @@ impl AwsProvider {
             has_options = true;
         }
 
-        if let Some(Value::String(v)) = resource.attributes.get("dns_support") {
+        if let Some(Value::String(v)) = resource.get_attr("dns_support") {
             use aws_sdk_ec2::types::DnsSupportValue;
             options = options.dns_support(DnsSupportValue::from(extract_enum_value(v)));
             has_options = true;
         }
 
-        if let Some(Value::String(v)) = resource.attributes.get("vpn_ecmp_support") {
+        if let Some(Value::String(v)) = resource.get_attr("vpn_ecmp_support") {
             use aws_sdk_ec2::types::VpnEcmpSupportValue;
             options = options.vpn_ecmp_support(VpnEcmpSupportValue::from(extract_enum_value(v)));
             has_options = true;
@@ -117,7 +117,7 @@ impl AwsProvider {
         }
 
         // Apply tags via TagSpecifications
-        if let Some(Value::Map(tags)) = resource.attributes.get("tags") {
+        if let Some(Value::Map(tags)) = resource.get_attr("tags") {
             use aws_sdk_ec2::types::{Tag, TagSpecification};
             let mut tag_spec = TagSpecification::builder()
                 .resource_type(aws_sdk_ec2::types::ResourceType::TransitGateway);
@@ -160,8 +160,13 @@ impl AwsProvider {
         from: &State,
         to: Resource,
     ) -> ProviderResult<State> {
-        self.apply_ec2_tags(&id, identifier, &to.attributes, Some(&from.attributes))
-            .await?;
+        self.apply_ec2_tags(
+            &id,
+            identifier,
+            &to.resolved_attributes(),
+            Some(&from.attributes),
+        )
+        .await?;
         self.read_ec2_transit_gateway(&id, Some(identifier)).await
     }
 

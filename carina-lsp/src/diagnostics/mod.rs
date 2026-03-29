@@ -239,7 +239,7 @@ impl DiagnosticEngine {
                             if matches!(
                                 &attr_schema.attr_type,
                                 carina_core::schema::AttributeType::Struct { .. }
-                            ) && matches!(attr_value, Value::List(_))
+                            ) && matches!(&attr_value.0, Value::List(_))
                             {
                                 let search_name =
                                     attr_schema.block_name.as_deref().unwrap_or(attr_name);
@@ -259,7 +259,7 @@ impl DiagnosticEngine {
                                 }
                             }
 
-                            let type_error = match (&attr_schema.attr_type, attr_value) {
+                            let type_error = match (&attr_schema.attr_type, &attr_value.0) {
                                 // Bool type should not receive String
                                 (carina_core::schema::AttributeType::Bool, Value::String(s)) => {
                                     Some(format!(
@@ -440,7 +440,7 @@ impl DiagnosticEngine {
                     }
 
                     // Run resource-level validator (e.g., mutually exclusive required fields)
-                    if let Err(errors) = schema.validate(&resource.attributes) {
+                    if let Err(errors) = schema.validate(&resource.resolved_attributes()) {
                         for error in errors {
                             // Skip errors that are already reported with precise positions
                             // by the attribute-level checks above.
@@ -478,7 +478,7 @@ impl DiagnosticEngine {
                     // Lint: prefer block syntax for List<Struct> attributes
                     diagnostics.extend(self.check_list_struct_syntax(
                         doc,
-                        &resource.attributes,
+                        &resource.resolved_attributes(),
                         &schema,
                     ));
                 }

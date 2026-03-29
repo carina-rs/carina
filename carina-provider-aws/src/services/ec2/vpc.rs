@@ -90,7 +90,7 @@ impl AwsProvider {
 
     /// Create an EC2 VPC
     pub(crate) async fn create_ec2_vpc(&self, resource: Resource) -> ProviderResult<State> {
-        let cidr_block = match resource.attributes.get("cidr_block") {
+        let cidr_block = match resource.get_attr("cidr_block") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(
@@ -103,7 +103,7 @@ impl AwsProvider {
         let mut create_vpc_builder = self.ec2_client.create_vpc().cidr_block(&cidr_block);
 
         // Handle instance_tenancy if specified
-        if let Some(Value::String(tenancy)) = resource.attributes.get("instance_tenancy") {
+        if let Some(Value::String(tenancy)) = resource.get_attr("instance_tenancy") {
             // Convert DSL format (aws.vpc.InstanceTenancy.dedicated) to API value (dedicated)
             let tenancy_value = extract_enum_value(tenancy);
 
@@ -126,11 +126,11 @@ impl AwsProvider {
         })?;
 
         // Apply tags
-        self.apply_ec2_tags(&resource.id, vpc_id, &resource.attributes, None)
+        self.apply_ec2_tags(&resource.id, vpc_id, &resource.resolved_attributes(), None)
             .await?;
 
         // Configure DNS support
-        if let Some(Value::Bool(enabled)) = resource.attributes.get("enable_dns_support") {
+        if let Some(Value::Bool(enabled)) = resource.get_attr("enable_dns_support") {
             self.ec2_client
                 .modify_vpc_attribute()
                 .vpc_id(vpc_id)
@@ -149,7 +149,7 @@ impl AwsProvider {
         }
 
         // Configure DNS hostnames
-        if let Some(Value::Bool(enabled)) = resource.attributes.get("enable_dns_hostnames") {
+        if let Some(Value::Bool(enabled)) = resource.get_attr("enable_dns_hostnames") {
             self.ec2_client
                 .modify_vpc_attribute()
                 .vpc_id(vpc_id)
@@ -183,7 +183,7 @@ impl AwsProvider {
         let vpc_id = identifier.to_string();
 
         // Update DNS support
-        if let Some(Value::Bool(enabled)) = to.attributes.get("enable_dns_support") {
+        if let Some(Value::Bool(enabled)) = to.get_attr("enable_dns_support") {
             self.ec2_client
                 .modify_vpc_attribute()
                 .vpc_id(&vpc_id)
@@ -202,7 +202,7 @@ impl AwsProvider {
         }
 
         // Update DNS hostnames
-        if let Some(Value::Bool(enabled)) = to.attributes.get("enable_dns_hostnames") {
+        if let Some(Value::Bool(enabled)) = to.get_attr("enable_dns_hostnames") {
             self.ec2_client
                 .modify_vpc_attribute()
                 .vpc_id(&vpc_id)
@@ -221,8 +221,13 @@ impl AwsProvider {
         }
 
         // Update tags
-        self.apply_ec2_tags(&id, &vpc_id, &to.attributes, Some(&from.attributes))
-            .await?;
+        self.apply_ec2_tags(
+            &id,
+            &vpc_id,
+            &to.resolved_attributes(),
+            Some(&from.attributes),
+        )
+        .await?;
 
         self.read_ec2_vpc(&id, Some(identifier)).await
     }

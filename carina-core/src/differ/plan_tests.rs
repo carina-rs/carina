@@ -65,7 +65,7 @@ fn create_before_destroy_generates_temporary_name_for_name_attribute() {
             assert!(!temp.can_rename);
             // The `to` resource should have the temporary name
             assert_eq!(
-                to.attributes.get("bucket_name"),
+                to.get_attr("bucket_name"),
                 Some(&Value::String(temp.temporary_value.clone()))
             );
         }
@@ -681,7 +681,7 @@ fn virtual_resources_are_skipped_in_plan() {
         instance: "web".to_string(),
     });
     virtual_resource.binding = Some("web".to_string());
-    virtual_resource.attributes.insert(
+    virtual_resource.set_attr(
         "security_group".to_string(),
         Value::String("sg-123".to_string()),
     );

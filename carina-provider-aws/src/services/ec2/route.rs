@@ -61,7 +61,7 @@ impl AwsProvider {
 
     /// Create an EC2 Route
     pub(crate) async fn create_ec2_route(&self, resource: Resource) -> ProviderResult<State> {
-        let route_table_id = match resource.attributes.get("route_table_id") {
+        let route_table_id = match resource.get_attr("route_table_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(ProviderError::new("route_table_id is required")
@@ -69,7 +69,7 @@ impl AwsProvider {
             }
         };
 
-        let destination_cidr = match resource.attributes.get("destination_cidr_block") {
+        let destination_cidr = match resource.get_attr("destination_cidr_block") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(ProviderError::new("destination_cidr_block is required")
@@ -84,12 +84,12 @@ impl AwsProvider {
             .destination_cidr_block(&destination_cidr);
 
         // Add gateway_id if specified
-        if let Some(Value::String(gw_id)) = resource.attributes.get("gateway_id") {
+        if let Some(Value::String(gw_id)) = resource.get_attr("gateway_id") {
             req = req.gateway_id(gw_id);
         }
 
         // Add nat_gateway_id if specified
-        if let Some(Value::String(nat_gw_id)) = resource.attributes.get("nat_gateway_id") {
+        if let Some(Value::String(nat_gw_id)) = resource.get_attr("nat_gateway_id") {
             req = req.nat_gateway_id(nat_gw_id);
         }
 
@@ -101,7 +101,10 @@ impl AwsProvider {
 
         // Route identifier is route_table_id|destination_cidr_block
         let identifier = format!("{}|{}", route_table_id, destination_cidr);
-        Ok(State::existing(resource.id, resource.attributes).with_identifier(identifier))
+        Ok(
+            State::existing(resource.id.clone(), resource.resolved_attributes())
+                .with_identifier(identifier),
+        )
     }
 
     /// Update an EC2 Route (replace the route)
@@ -111,7 +114,7 @@ impl AwsProvider {
         _identifier: &str,
         to: Resource,
     ) -> ProviderResult<State> {
-        let route_table_id = match to.attributes.get("route_table_id") {
+        let route_table_id = match to.get_attr("route_table_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(
@@ -120,7 +123,7 @@ impl AwsProvider {
             }
         };
 
-        let destination_cidr = match to.attributes.get("destination_cidr_block") {
+        let destination_cidr = match to.get_attr("destination_cidr_block") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(ProviderError::new("destination_cidr_block is required")
@@ -135,12 +138,12 @@ impl AwsProvider {
             .destination_cidr_block(&destination_cidr);
 
         // Add gateway_id if specified
-        if let Some(Value::String(gw_id)) = to.attributes.get("gateway_id") {
+        if let Some(Value::String(gw_id)) = to.get_attr("gateway_id") {
             req = req.gateway_id(gw_id);
         }
 
         // Add nat_gateway_id if specified
-        if let Some(Value::String(nat_gw_id)) = to.attributes.get("nat_gateway_id") {
+        if let Some(Value::String(nat_gw_id)) = to.get_attr("nat_gateway_id") {
             req = req.nat_gateway_id(nat_gw_id);
         }
 
@@ -152,7 +155,7 @@ impl AwsProvider {
 
         // Route identifier is route_table_id|destination_cidr_block
         let identifier = format!("{}|{}", route_table_id, destination_cidr);
-        Ok(State::existing(id, to.attributes.clone()).with_identifier(identifier))
+        Ok(State::existing(id, to.resolved_attributes()).with_identifier(identifier))
     }
 
     /// Delete an EC2 Route

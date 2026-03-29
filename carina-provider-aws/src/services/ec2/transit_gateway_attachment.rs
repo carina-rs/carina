@@ -60,7 +60,7 @@ impl AwsProvider {
         &self,
         resource: Resource,
     ) -> ProviderResult<State> {
-        let transit_gateway_id = match resource.attributes.get("transit_gateway_id") {
+        let transit_gateway_id = match resource.get_attr("transit_gateway_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(ProviderError::new("transit_gateway_id is required")
@@ -68,7 +68,7 @@ impl AwsProvider {
             }
         };
 
-        let vpc_id = match resource.attributes.get("vpc_id") {
+        let vpc_id = match resource.get_attr("vpc_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(
@@ -77,7 +77,7 @@ impl AwsProvider {
             }
         };
 
-        let subnet_ids = match resource.attributes.get("subnet_ids") {
+        let subnet_ids = match resource.get_attr("subnet_ids") {
             Some(Value::List(ids)) => {
                 let mut result = Vec::new();
                 for id_val in ids {
@@ -109,7 +109,7 @@ impl AwsProvider {
         }
 
         // Apply tags via TagSpecifications
-        if let Some(Value::Map(tags)) = resource.attributes.get("tags") {
+        if let Some(Value::Map(tags)) = resource.get_attr("tags") {
             use aws_sdk_ec2::types::{Tag, TagSpecification};
             let mut tag_spec = TagSpecification::builder()
                 .resource_type(aws_sdk_ec2::types::ResourceType::TransitGatewayAttachment);
@@ -152,8 +152,13 @@ impl AwsProvider {
         from: &State,
         to: Resource,
     ) -> ProviderResult<State> {
-        self.apply_ec2_tags(&id, identifier, &to.attributes, Some(&from.attributes))
-            .await?;
+        self.apply_ec2_tags(
+            &id,
+            identifier,
+            &to.resolved_attributes(),
+            Some(&from.attributes),
+        )
+        .await?;
         self.read_ec2_transit_gateway_attachment(&id, Some(identifier))
             .await
     }

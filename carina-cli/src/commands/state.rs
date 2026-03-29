@@ -353,7 +353,7 @@ fn build_plan_from_state(state: &StateFile) -> Plan {
         // Convert JSON attributes to DSL values
         for (key, json_val) in &rs.attributes {
             if let Some(dsl_val) = json_to_dsl_value(json_val) {
-                resource.attributes.insert(key.clone(), dsl_val);
+                resource.set_attr(key.clone(), dsl_val);
             }
         }
 

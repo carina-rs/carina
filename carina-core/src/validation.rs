@@ -37,7 +37,7 @@ pub fn validate_resources(
                         schema.resource_type, schema.resource_type
                     ));
                 }
-                if let Err(errors) = schema.validate(&resource.attributes) {
+                if let Err(errors) = schema.validate(&resource.resolved_attributes()) {
                     for error in errors {
                         all_errors.push(format!("{}: {}", resource.id, error));
                     }
@@ -88,7 +88,7 @@ pub fn validate_resource_ref_types(
                 continue;
             }
 
-            let (ref_binding, ref_attr) = match attr_value {
+            let (ref_binding, ref_attr) = match &attr_value.0 {
                 Value::ResourceRef {
                     binding_name,
                     attribute_name,
@@ -571,7 +571,7 @@ let route = awscc.ec2.route {
             .iter()
             .find(|r| r.id.name == "route")
             .unwrap();
-        let gateway_id = route.attributes.get("gateway_id").unwrap();
+        let gateway_id = route.get_attr("gateway_id").unwrap();
         match gateway_id {
             Value::ResourceRef {
                 binding_name,

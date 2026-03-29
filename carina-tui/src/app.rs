@@ -845,7 +845,7 @@ fn extract_compact_hint(
 
     // Priority 1: First distinguishing string attribute
     for key in &keys {
-        if let Some(Value::String(s)) = resource.attributes.get(*key)
+        if let Some(Value::String(s)) = resource.attributes.get(*key).map(|e| &e.0)
             && !s.is_empty()
         {
             let short_key = shorten_attr_name(key);
@@ -862,7 +862,7 @@ fn extract_compact_hint(
 
     // Priority 2: First non-parent ResourceRef attribute
     for key in &keys {
-        match resource.attributes.get(*key) {
+        match resource.attributes.get(*key).map(|e| &e.0) {
             Some(Value::ResourceRef { binding_name, .. }) => {
                 if parent_binding == Some(binding_name.as_str()) {
                     continue;

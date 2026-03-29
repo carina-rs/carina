@@ -67,7 +67,7 @@ impl AwsProvider {
         &self,
         resource: Resource,
     ) -> ProviderResult<State> {
-        let vpc_id = match resource.attributes.get("vpc_id") {
+        let vpc_id = match resource.get_attr("vpc_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(
@@ -76,7 +76,7 @@ impl AwsProvider {
             }
         };
 
-        let peer_vpc_id = match resource.attributes.get("peer_vpc_id") {
+        let peer_vpc_id = match resource.get_attr("peer_vpc_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(
@@ -91,16 +91,16 @@ impl AwsProvider {
             .vpc_id(&vpc_id)
             .peer_vpc_id(&peer_vpc_id);
 
-        if let Some(Value::String(owner_id)) = resource.attributes.get("peer_owner_id") {
+        if let Some(Value::String(owner_id)) = resource.get_attr("peer_owner_id") {
             req = req.peer_owner_id(owner_id);
         }
 
-        if let Some(Value::String(region)) = resource.attributes.get("peer_region") {
+        if let Some(Value::String(region)) = resource.get_attr("peer_region") {
             req = req.peer_region(region);
         }
 
         // Apply tags via TagSpecifications
-        if let Some(Value::Map(tags)) = resource.attributes.get("tags") {
+        if let Some(Value::Map(tags)) = resource.get_attr("tags") {
             use aws_sdk_ec2::types::{Tag, TagSpecification};
             let mut tag_spec = TagSpecification::builder()
                 .resource_type(aws_sdk_ec2::types::ResourceType::VpcPeeringConnection);
@@ -139,8 +139,13 @@ impl AwsProvider {
         from: &State,
         to: Resource,
     ) -> ProviderResult<State> {
-        self.apply_ec2_tags(&id, identifier, &to.attributes, Some(&from.attributes))
-            .await?;
+        self.apply_ec2_tags(
+            &id,
+            identifier,
+            &to.resolved_attributes(),
+            Some(&from.attributes),
+        )
+        .await?;
         self.read_ec2_vpc_peering_connection(&id, Some(identifier))
             .await
     }

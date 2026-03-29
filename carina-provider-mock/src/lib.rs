@@ -92,7 +92,7 @@ impl Provider for MockProvider {
                 .map_err(|e| ProviderError::new("Failed to save state").with_cause(e))?;
 
             Ok(
-                State::existing(resource.id.clone(), resource.attributes.clone())
+                State::existing(resource.id.clone(), resource.resolved_attributes())
                     .with_identifier("mock-id"),
             )
         })
@@ -122,7 +122,7 @@ impl Provider for MockProvider {
             self.save_states(&states)
                 .map_err(|e| ProviderError::new("Failed to save state").with_cause(e))?;
 
-            Ok(State::existing(id, to.attributes.clone()))
+            Ok(State::existing(id, to.resolved_attributes()))
         })
     }
 

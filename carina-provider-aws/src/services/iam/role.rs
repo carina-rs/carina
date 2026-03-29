@@ -70,7 +70,7 @@ impl AwsProvider {
 
     /// Create an IAM Role
     pub(crate) async fn create_iam_role(&self, resource: Resource) -> ProviderResult<State> {
-        let role_name = match resource.attributes.get("role_name") {
+        let role_name = match resource.get_attr("role_name") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(
@@ -79,23 +79,22 @@ impl AwsProvider {
             }
         };
 
-        let assume_role_policy_document =
-            match resource.attributes.get("assume_role_policy_document") {
-                Some(Value::String(s)) => s.clone(),
-                Some(value @ Value::Map(_)) => value_to_iam_policy_json(value).map_err(|e| {
-                    ProviderError::new(format!(
-                        "Failed to convert assume_role_policy_document: {}",
-                        e
-                    ))
-                    .for_resource(resource.id.clone())
-                })?,
-                _ => {
-                    return Err(
-                        ProviderError::new("assume_role_policy_document is required")
-                            .for_resource(resource.id.clone()),
-                    );
-                }
-            };
+        let assume_role_policy_document = match resource.get_attr("assume_role_policy_document") {
+            Some(Value::String(s)) => s.clone(),
+            Some(value @ Value::Map(_)) => value_to_iam_policy_json(value).map_err(|e| {
+                ProviderError::new(format!(
+                    "Failed to convert assume_role_policy_document: {}",
+                    e
+                ))
+                .for_resource(resource.id.clone())
+            })?,
+            _ => {
+                return Err(
+                    ProviderError::new("assume_role_policy_document is required")
+                        .for_resource(resource.id.clone()),
+                );
+            }
+        };
 
         let mut req = self
             .iam_client
@@ -103,20 +102,20 @@ impl AwsProvider {
             .role_name(&role_name)
             .assume_role_policy_document(&assume_role_policy_document);
 
-        if let Some(Value::String(desc)) = resource.attributes.get("description") {
+        if let Some(Value::String(desc)) = resource.get_attr("description") {
             req = req.description(desc);
         }
 
-        if let Some(Value::String(path)) = resource.attributes.get("path") {
+        if let Some(Value::String(path)) = resource.get_attr("path") {
             req = req.path(path);
         }
 
-        if let Some(Value::Int(duration)) = resource.attributes.get("max_session_duration") {
+        if let Some(Value::Int(duration)) = resource.get_attr("max_session_duration") {
             req = req.max_session_duration(*duration as i32);
         }
 
         // Apply tags at creation time
-        if let Some(Value::Map(tag_map)) = resource.attributes.get("tags") {
+        if let Some(Value::Map(tag_map)) = resource.get_attr("tags") {
             for (key, value) in tag_map {
                 if let Value::String(val) = value {
                     let tag = aws_sdk_iam::types::Tag::builder()
@@ -150,7 +149,7 @@ impl AwsProvider {
         to: Resource,
     ) -> ProviderResult<State> {
         // Update assume role policy document
-        if let Some(policy_value) = to.attributes.get("assume_role_policy_document") {
+        if let Some(policy_value) = to.get_attr("assume_role_policy_document") {
             let policy_doc = match policy_value {
                 Value::String(s) => s.clone(),
                 Value::Map(_) => value_to_iam_policy_json(policy_value).map_err(|e| {
@@ -184,12 +183,12 @@ impl AwsProvider {
         let mut needs_update = false;
         let mut req = self.iam_client.update_role().role_name(identifier);
 
-        if let Some(Value::String(desc)) = to.attributes.get("description") {
+        if let Some(Value::String(desc)) = to.get_attr("description") {
             req = req.description(desc);
             needs_update = true;
         }
 
-        if let Some(Value::Int(duration)) = to.attributes.get("max_session_duration") {
+        if let Some(Value::Int(duration)) = to.get_attr("max_session_duration") {
             req = req.max_session_duration(*duration as i32);
             needs_update = true;
         }
@@ -203,8 +202,13 @@ impl AwsProvider {
         }
 
         // Update tags
-        self.apply_iam_tags(&id, identifier, &to.attributes, Some(&from.attributes))
-            .await?;
+        self.apply_iam_tags(
+            &id,
+            identifier,
+            &to.resolved_attributes(),
+            Some(&from.attributes),
+        )
+        .await?;
 
         self.read_iam_role(&id, Some(identifier)).await
     }
