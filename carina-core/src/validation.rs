@@ -328,6 +328,12 @@ pub fn validate_type_expr_value(type_expr: &TypeExpr, value: &Value) -> Option<S
         (TypeExpr::Float, Value::String(s)) => {
             Some(format!("expected float, got string \"{}\".", s))
         }
+        (TypeExpr::String, Value::Bool(b)) => Some(format!("expected string, got bool ({}).", b)),
+        (TypeExpr::String, Value::Int(n)) => Some(format!("expected string, got int ({}).", n)),
+        (TypeExpr::String, Value::Float(f)) => Some(format!("expected string, got float ({}).", f)),
+        (TypeExpr::Bool, Value::Int(n)) => Some(format!("expected bool, got int ({}).", n)),
+        (TypeExpr::Int, Value::Bool(b)) => Some(format!("expected int, got bool ({}).", b)),
+        (TypeExpr::Float, Value::Bool(b)) => Some(format!("expected float, got bool ({}).", b)),
         _ => None,
     }
 }
@@ -955,5 +961,47 @@ let route = awscc.ec2.route {
         let result =
             validate_type_expr_value(&TypeExpr::String, &Value::String("hello".to_string()));
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn validate_type_expr_value_string_got_bool() {
+        let result = validate_type_expr_value(&TypeExpr::String, &Value::Bool(true));
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("expected string, got bool"));
+    }
+
+    #[test]
+    fn validate_type_expr_value_string_got_int() {
+        let result = validate_type_expr_value(&TypeExpr::String, &Value::Int(42));
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("expected string, got int"));
+    }
+
+    #[test]
+    fn validate_type_expr_value_string_got_float() {
+        let result = validate_type_expr_value(&TypeExpr::String, &Value::Float(1.5));
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("expected string, got float"));
+    }
+
+    #[test]
+    fn validate_type_expr_value_bool_got_int() {
+        let result = validate_type_expr_value(&TypeExpr::Bool, &Value::Int(1));
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("expected bool, got int"));
+    }
+
+    #[test]
+    fn validate_type_expr_value_int_got_bool() {
+        let result = validate_type_expr_value(&TypeExpr::Int, &Value::Bool(true));
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("expected int, got bool"));
+    }
+
+    #[test]
+    fn validate_type_expr_value_float_got_bool() {
+        let result = validate_type_expr_value(&TypeExpr::Float, &Value::Bool(false));
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("expected float, got bool"));
     }
 }
