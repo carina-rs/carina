@@ -458,11 +458,6 @@ pub enum ModuleSource {
 }
 
 impl ModuleSource {
-    /// Create a Root source
-    pub fn root() -> Self {
-        Self::Root
-    }
-
     /// Create a Module source
     pub fn module(name: impl Into<String>, instance: impl Into<String>) -> Self {
         Self::Module {
