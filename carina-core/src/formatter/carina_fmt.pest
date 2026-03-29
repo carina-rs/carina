@@ -11,7 +11,7 @@ ws = @{ (" " | "\t")+ }
 newline = @{ NEWLINE }
 comment = @{ "#" ~ (!NEWLINE ~ ANY)* }
 
-statement = { backend_block | provider_block | arguments_block | attributes_block | import_state_block | removed_block | moved_block | if_expr | for_expr | fn_def | let_binding | module_call | function_call | anonymous_resource }
+statement = { backend_block | provider_block | arguments_block | attributes_block | import_state_block | removed_block | moved_block | if_expr | for_expr | fn_def | let_binding | module_call | anonymous_resource }
 
 // Backend block: backend s3 { ... }
 backend_block = {
@@ -120,7 +120,7 @@ fn_def = {
 }
 fn_params_content = _{ trivia | comma | fn_param }
 fn_param = { identifier ~ (trivia* ~ colon ~ trivia* ~ type_expr)? ~ (trivia* ~ equals ~ trivia* ~ expression)? }
-fn_body_content = _{ trivia | fn_local_let | read_resource_expr | resource_expr | expression }
+fn_body_content = _{ trivia | fn_local_let | expression }
 fn_local_let = { kw_let ~ trivia+ ~ identifier ~ trivia* ~ equals ~ trivia* ~ expression }
 
 // Variable/resource definition: let name = value
