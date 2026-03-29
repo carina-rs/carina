@@ -216,7 +216,7 @@ fn create_provider_context() -> carina_core::parser::ProviderContext {
                 })
             })
         })),
-        validators: std::collections::HashMap::new(),
+        validators: carina_provider_awscc::schemas::awscc_types::awscc_validators(),
     }
 }
 

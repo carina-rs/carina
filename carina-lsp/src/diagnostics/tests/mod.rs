@@ -1,12 +1,15 @@
+use std::sync::Arc;
+
 use super::*;
 use crate::document::Document;
+use carina_core::parser::ProviderContext;
 use carina_core::provider::{self as provider_mod, ProviderFactory};
 
 mod basic;
 mod extended;
 
 pub(super) fn create_document(content: &str) -> Document {
-    Document::new(content.to_string())
+    Document::new(content.to_string(), Arc::new(ProviderContext::default()))
 }
 
 pub(super) fn test_engine() -> DiagnosticEngine {

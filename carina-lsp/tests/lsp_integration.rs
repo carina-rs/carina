@@ -3,10 +3,12 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower_lsp::{LspService, Server};
 
+use carina_core::parser::ProviderContext;
 use carina_core::provider::ProviderFactory;
 use carina_lsp::Backend;
 use carina_provider_aws::AwsProviderFactory;
 use carina_provider_awscc::AwsccProviderFactory;
+use carina_provider_awscc::schemas::awscc_types::awscc_validators;
 
 struct TestClient {
     writer: tokio::io::DuplexStream,
@@ -23,7 +25,11 @@ impl TestClient {
         let (service, socket) = LspService::new(|client| {
             let factories: Vec<Box<dyn ProviderFactory>> =
                 vec![Box::new(AwsProviderFactory), Box::new(AwsccProviderFactory)];
-            Backend::new(client, factories)
+            let provider_context = ProviderContext {
+                decryptor: None,
+                validators: awscc_validators(),
+            };
+            Backend::new(client, factories, provider_context)
         });
 
         tokio::spawn(async move {

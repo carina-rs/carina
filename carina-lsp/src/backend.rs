@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use carina_core::formatter::{self, FormatConfig};
+use carina_core::parser::ProviderContext;
 use carina_core::provider::{self as provider_mod, ProviderFactory};
 use carina_core::schema::CompletionValue;
 use dashmap::DashMap;
@@ -35,10 +36,15 @@ pub struct Backend {
     completion_provider: CompletionProvider,
     hover_provider: HoverProvider,
     semantic_tokens_provider: SemanticTokensProvider,
+    provider_context: Arc<ProviderContext>,
 }
 
 impl Backend {
-    pub fn new(client: Client, factories: Vec<Box<dyn ProviderFactory>>) -> Self {
+    pub fn new(
+        client: Client,
+        factories: Vec<Box<dyn ProviderFactory>>,
+        provider_context: ProviderContext,
+    ) -> Self {
         // Build shared schema map from all factories
         let schemas = Arc::new(provider_mod::collect_schemas(&factories));
 
@@ -53,6 +59,8 @@ impl Backend {
 
         // Wrap factories in Arc for sharing
         let factories: Arc<Vec<Box<dyn ProviderFactory>>> = Arc::new(factories);
+
+        let provider_context = Arc::new(provider_context);
 
         Self {
             client,
@@ -69,6 +77,7 @@ impl Backend {
             ),
             semantic_tokens_provider: SemanticTokensProvider::new(&region_completions),
             hover_provider: HoverProvider::new(Arc::clone(&schemas), region_completions),
+            provider_context,
         }
     }
 
@@ -134,7 +143,10 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri.clone();
-        let doc = Document::new(params.text_document.text);
+        let doc = Document::new(
+            params.text_document.text,
+            Arc::clone(&self.provider_context),
+        );
         self.documents.insert(uri.clone(), doc);
         self.update_diagnostics(uri).await;
     }
