@@ -10,7 +10,7 @@ use carina_core::config_loader::{
 use carina_core::lint::{
     TagKeyEntry, collect_tag_keys, find_duplicate_attrs, find_list_literal_attrs,
     find_mixed_tag_key_styles, find_non_snake_case_bindings, find_pipe_preferred_direct_calls,
-    find_redundant_type_in_binding, list_struct_attr_names,
+    list_struct_attr_names,
 };
 use carina_core::module_resolver;
 use carina_core::parser::ProviderContext;
@@ -135,19 +135,6 @@ pub fn run_lint(path: &PathBuf, provider_context: &ProviderContext) -> Result<()
                 message: format!(
                     "Binding '{}' is not snake_case. Use snake_case for binding names (e.g., 'my_resource').",
                     nw.name
-                ),
-            });
-        }
-
-        // Check for binding names that redundantly include the resource type
-        let redundant_warnings = find_redundant_type_in_binding(source);
-        for rw in redundant_warnings {
-            warnings.push(LintWarning {
-                file: file_path.clone(),
-                line: rw.line,
-                message: format!(
-                    "Binding '{}' redundantly includes the resource type '{}'. Use a shorter, descriptive name.",
-                    rw.binding, rw.resource_type
                 ),
             });
         }
