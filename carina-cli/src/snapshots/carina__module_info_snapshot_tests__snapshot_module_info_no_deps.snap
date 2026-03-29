@@ -1,0 +1,20 @@
+---
+source: carina-cli/src/module_info_snapshot_tests.rs
+expression: display
+---
+Module: no_deps
+
+=== ARGUMENTS ===
+
+  region: string  (required)
+    AWS region
+
+=== CREATES ===
+
+  logs_bucket: awscc.s3.bucket
+  event_queue: awscc.sqs.queue
+
+=== ATTRIBUTES ===
+
+  bucket_id: awscc.s3.bucket
+  queue_url: awscc.sqs.queue

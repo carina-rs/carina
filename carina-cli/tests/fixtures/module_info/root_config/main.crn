@@ -1,0 +1,12 @@
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+}
+
+let subnet = awscc.ec2.subnet {
+  vpc_id     = vpc.id
+  cidr_block = "10.0.1.0/24"
+}

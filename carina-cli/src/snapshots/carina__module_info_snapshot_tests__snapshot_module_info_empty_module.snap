@@ -1,0 +1,20 @@
+---
+source: carina-cli/src/module_info_snapshot_tests.rs
+expression: display
+---
+Module: empty_module
+
+=== ARGUMENTS ===
+
+  name: string  (required)
+    Resource name prefix
+  env: string = "dev"  
+    Environment label
+
+=== CREATES ===
+
+  (none)
+
+=== ATTRIBUTES ===
+
+  (none)

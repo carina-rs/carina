@@ -1,0 +1,17 @@
+---
+source: carina-cli/src/module_info_snapshot_tests.rs
+expression: display
+---
+Module: no_args
+
+=== ARGUMENTS ===
+
+  (none)
+
+=== CREATES ===
+
+  my_bucket: awscc.s3.bucket
+
+=== ATTRIBUTES ===
+
+  bucket_arn: awscc.s3.bucket
