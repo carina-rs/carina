@@ -236,10 +236,13 @@ pub fn validate_module_calls(
 /// A binding is unused if its name never appears as a `ResourceRef.binding_name`
 /// in any resource attribute, module call argument, or attribute parameter value.
 pub fn check_unused_bindings(parsed: &ParsedFile) -> Vec<String> {
-    // Collect all defined binding names
+    // Collect all defined binding names (skip discard pattern `_`)
     let mut defined_bindings: Vec<String> = Vec::new();
     for resource in &parsed.resources {
         if let Some(ref binding_name) = resource.binding {
+            if binding_name == "_" {
+                continue;
+            }
             defined_bindings.push(binding_name.clone());
         }
     }
@@ -1044,5 +1047,16 @@ let route = awscc.ec2.route {
         let result = validate_type_expr_value(&schema_type, &Value::Int(42));
         assert!(result.is_some());
         assert!(result.unwrap().contains("expected awscc.ec2.VpcId"));
+    }
+
+    #[test]
+    fn discard_binding_no_warning() {
+        let mut parsed = empty_parsed();
+
+        let caller = Resource::with_provider("aws", "sts.caller_identity", "caller_identity")
+            .with_binding("_");
+        parsed.resources.push(caller);
+
+        assert!(check_unused_bindings(&parsed).is_empty());
     }
 }
