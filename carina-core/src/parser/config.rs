@@ -1,6 +1,6 @@
-//! Parser configuration for provider-injected validators and decryptor
+//! Provider context for provider-injected validators and decryptor
 //!
-//! `ParserConfig` allows CLI/providers to inject custom type validators
+//! `ProviderContext` allows CLI/providers to inject custom type validators
 //! and a decryptor function into the parser without using global mutable state.
 
 use std::collections::HashMap;
@@ -21,16 +21,16 @@ pub type DecryptorFn = Box<dyn Fn(&str, Option<&str>) -> Result<String, String> 
 /// provider-specific validators (e.g., ARN, availability_zone) to be injected
 /// from provider crates while being callable during parsing.
 #[derive(Default)]
-pub struct ParserConfig {
+pub struct ProviderContext {
     /// Optional decryptor for the `decrypt()` built-in function.
     pub decryptor: Option<DecryptorFn>,
     /// Custom type validators keyed by type name (e.g., "arn", "availability_zone").
     pub custom_validators: HashMap<String, ValidatorFn>,
 }
 
-impl std::fmt::Debug for ParserConfig {
+impl std::fmt::Debug for ProviderContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ParserConfig")
+        f.debug_struct("ProviderContext")
             .field("decryptor", &self.decryptor.as_ref().map(|_| "..."))
             .field(
                 "custom_validators",

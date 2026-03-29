@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::effect::Effect;
-use carina_core::parser::{BackendConfig, ParserConfig, ProviderConfig};
+use carina_core::parser::{BackendConfig, ProviderConfig, ProviderContext};
 use carina_core::plan::Plan;
 use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::value::{
@@ -68,12 +68,12 @@ pub async fn run_plan(
     detail: DetailLevel,
     tui: bool,
     refresh: bool,
-    parser_config: &ParserConfig,
+    provider_context: &ProviderContext,
 ) -> Result<bool, AppError> {
-    let mut parsed = load_configuration_with_config(path, parser_config)?.parsed;
+    let mut parsed = load_configuration_with_config(path, provider_context)?.parsed;
 
     let base_dir = get_base_dir(path);
-    validate_and_resolve_with_config(&mut parsed, base_dir, false, parser_config)?;
+    validate_and_resolve_with_config(&mut parsed, base_dir, false, provider_context)?;
 
     // Check for backend configuration and load state
     // Use local backend by default if no backend is configured

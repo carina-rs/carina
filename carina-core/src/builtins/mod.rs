@@ -20,7 +20,7 @@ mod split;
 mod trim;
 mod upper_lower;
 
-use crate::parser::ParserConfig;
+use crate::parser::ProviderContext;
 use crate::resource::Value;
 
 /// Metadata for a built-in function, used by the LSP for completion, hover, and validation.
@@ -155,7 +155,7 @@ register_builtins! {
 pub fn evaluate_builtin_with_config(
     name: &str,
     args: &[Value],
-    config: &ParserConfig,
+    config: &ProviderContext,
 ) -> Result<Value, String> {
     match name {
         "decrypt" => decrypt::builtin_decrypt_with_config(args, config),

@@ -1263,7 +1263,7 @@ mod tests {
 
     #[test]
     fn test_module_signature_display() {
-        use crate::parser::{ParserConfig, parse};
+        use crate::parser::{ProviderContext, parse};
 
         let input = r#"
             arguments {
@@ -1288,7 +1288,7 @@ mod tests {
             }
         "#;
 
-        let parsed = parse(input, &ParserConfig::default()).unwrap();
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
         let signature = ModuleSignature::from_directory_module(&parsed, "web_tier");
         let display = signature.display_with_color(false);
 
@@ -1332,7 +1332,7 @@ mod tests {
 
     #[test]
     fn test_directory_based_module() {
-        use crate::parser::{ParserConfig, parse};
+        use crate::parser::{ProviderContext, parse};
 
         // Parse a directory-based module (no module {} wrapper)
         let input = r#"
@@ -1351,7 +1351,7 @@ mod tests {
             }
         "#;
 
-        let parsed = parse(input, &ParserConfig::default()).unwrap();
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
 
         // Verify parsed file has top-level inputs and outputs
         assert_eq!(parsed.arguments.len(), 2);
@@ -1379,7 +1379,7 @@ mod tests {
 
     #[test]
     fn test_file_signature_from_directory_module() {
-        use crate::parser::{ParserConfig, parse};
+        use crate::parser::{ProviderContext, parse};
 
         // Directory-based module (top-level arguments/attributes)
         let input = r#"
@@ -1395,7 +1395,7 @@ mod tests {
             }
         "#;
 
-        let parsed = parse(input, &ParserConfig::default()).unwrap();
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
         let signature = FileSignature::from_parsed_file(&parsed, "web_tier");
 
         // Should be detected as a Module, not a RootConfig
@@ -1410,7 +1410,7 @@ mod tests {
 
     #[test]
     fn test_file_signature_from_root_config() {
-        use crate::parser::{ParserConfig, parse};
+        use crate::parser::{ProviderContext, parse};
 
         // Root config (no arguments/attributes, no module wrapper)
         let input = r#"
@@ -1424,7 +1424,7 @@ mod tests {
             }
         "#;
 
-        let parsed = parse(input, &ParserConfig::default()).unwrap();
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
         let signature = FileSignature::from_parsed_file(&parsed, "main");
 
         // Should be detected as a RootConfig

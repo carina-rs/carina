@@ -242,10 +242,10 @@ mod tests {
     }
 
     #[test]
-    fn test_backend_config_from_parser_config() {
+    fn test_backend_config_from_provider_context() {
         use carina_core::resource::Value;
 
-        let parser_config = carina_core::parser::BackendConfig {
+        let provider_context = carina_core::parser::BackendConfig {
             backend_type: "s3".to_string(),
             attributes: [
                 ("bucket".to_string(), Value::String("my-bucket".to_string())),
@@ -255,7 +255,7 @@ mod tests {
             .collect(),
         };
 
-        let state_config = BackendConfig::from(&parser_config);
+        let state_config = BackendConfig::from(&provider_context);
         assert_eq!(state_config.backend_type, "s3");
         assert_eq!(state_config.get_string("bucket"), Some("my-bucket"));
         assert_eq!(state_config.get_string("key"), Some("state.json"));

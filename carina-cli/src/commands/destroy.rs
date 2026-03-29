@@ -22,7 +22,7 @@ use carina_state::{
     create_local_backend,
 };
 
-use carina_core::parser::ParserConfig;
+use carina_core::parser::ProviderContext;
 
 use super::validate_and_resolve_with_config;
 use crate::DetailLevel;
@@ -42,12 +42,12 @@ pub async fn run_destroy(
     auto_approve: bool,
     lock: bool,
     refresh: bool,
-    parser_config: &ParserConfig,
+    provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let mut parsed = load_configuration_with_config(path, parser_config)?.parsed;
+    let mut parsed = load_configuration_with_config(path, provider_context)?.parsed;
 
     let base_dir = get_base_dir(path);
-    validate_and_resolve_with_config(&mut parsed, base_dir, true, parser_config)?;
+    validate_and_resolve_with_config(&mut parsed, base_dir, true, provider_context)?;
 
     // Don't exit early when resources are empty -- orphaned resources in the
     // state file may still need to be destroyed.

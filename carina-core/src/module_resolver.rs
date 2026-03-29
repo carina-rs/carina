@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::parser::{ImportStatement, ModuleCall, ParseError, ParsedFile, ParserConfig};
+use crate::parser::{ImportStatement, ModuleCall, ParseError, ParsedFile, ProviderContext};
 use crate::resource::{LifecycleConfig, Resource, ResourceId, Value};
 
 /// Module resolution error
@@ -61,19 +61,19 @@ pub struct ModuleResolver<'cfg> {
     /// Imported module definitions by alias
     imported_modules: HashMap<String, ParsedFile>,
     /// Parser configuration (decryptor, custom validators)
-    config: &'cfg ParserConfig,
+    config: &'cfg ProviderContext,
 }
 
 impl<'cfg> ModuleResolver<'cfg> {
     /// Create a new resolver with the given base directory and default config
     pub fn new(base_dir: impl AsRef<Path>) -> Self {
-        static DEFAULT_CONFIG: std::sync::LazyLock<ParserConfig> =
-            std::sync::LazyLock::new(ParserConfig::default);
+        static DEFAULT_CONFIG: std::sync::LazyLock<ProviderContext> =
+            std::sync::LazyLock::new(ProviderContext::default);
         Self::with_config(base_dir, &DEFAULT_CONFIG)
     }
 
     /// Create a new resolver with the given base directory and parser configuration
-    pub fn with_config(base_dir: impl AsRef<Path>, config: &'cfg ParserConfig) -> Self {
+    pub fn with_config(base_dir: impl AsRef<Path>, config: &'cfg ProviderContext) -> Self {
         Self {
             base_dir: base_dir.as_ref().to_path_buf(),
             module_cache: HashMap::new(),
@@ -541,14 +541,14 @@ fn rewrite_intra_module_refs(
 
 /// Resolve all modules in a parsed file
 pub fn resolve_modules(parsed: &mut ParsedFile, base_dir: &Path) -> Result<(), ModuleError> {
-    resolve_modules_with_config(parsed, base_dir, &ParserConfig::default())
+    resolve_modules_with_config(parsed, base_dir, &ProviderContext::default())
 }
 
 /// Resolve all modules in a parsed file with the given parser configuration.
 pub fn resolve_modules_with_config(
     parsed: &mut ParsedFile,
     base_dir: &Path,
-    config: &ParserConfig,
+    config: &ProviderContext,
 ) -> Result<(), ModuleError> {
     let mut resolver = ModuleResolver::with_config(base_dir, config);
 
@@ -573,7 +573,7 @@ pub fn resolve_modules_with_config(
 /// Get parsed file info for display (supports both module definitions and root configs)
 pub fn get_parsed_file(path: &Path) -> Result<ParsedFile, ModuleError> {
     let content = fs::read_to_string(path)?;
-    let parsed = crate::parser::parse(&content, &ParserConfig::default())?;
+    let parsed = crate::parser::parse(&content, &ProviderContext::default())?;
     Ok(parsed)
 }
 
@@ -587,13 +587,13 @@ pub fn load_module(path: &Path) -> Option<ParsedFile> {
         let main_path = path.join("main.crn");
         if main_path.exists() {
             let content = fs::read_to_string(&main_path).ok()?;
-            crate::parser::parse(&content, &ParserConfig::default()).ok()
+            crate::parser::parse(&content, &ProviderContext::default()).ok()
         } else {
             load_directory_module(path)
         }
     } else {
         let content = fs::read_to_string(path).ok()?;
-        crate::parser::parse(&content, &ParserConfig::default()).ok()
+        crate::parser::parse(&content, &ProviderContext::default()).ok()
     }
 }
 
@@ -619,7 +619,7 @@ pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
         let path = entry.path();
         if path.extension().is_some_and(|ext| ext == "crn")
             && let Ok(content) = fs::read_to_string(&path)
-            && let Ok(parsed) = crate::parser::parse(&content, &ParserConfig::default())
+            && let Ok(parsed) = crate::parser::parse(&content, &ProviderContext::default())
         {
             merged.providers.extend(parsed.providers);
             merged.resources.extend(parsed.resources);
@@ -701,7 +701,7 @@ pub fn load_module_from_directory(dir: &Path) -> Result<ParsedFile, String> {
             let content = fs::read_to_string(&path)
                 .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
 
-            let parsed = crate::parser::parse(&content, &ParserConfig::default())
+            let parsed = crate::parser::parse(&content, &ProviderContext::default())
                 .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
 
             merged.providers.extend(parsed.providers);
@@ -1451,7 +1451,7 @@ mod tests {
         let fixtures_dir =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nested_modules");
         let content = fs::read_to_string(fixtures_dir.join("root.crn")).unwrap();
-        let mut parsed = crate::parser::parse(&content, &ParserConfig::default()).unwrap();
+        let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
 
         resolve_modules(&mut parsed, &fixtures_dir).unwrap();
 
@@ -1485,7 +1485,7 @@ mod tests {
         let fixtures_dir =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nested_modules");
         let content = fs::read_to_string(fixtures_dir.join("root_three_level.crn")).unwrap();
-        let mut parsed = crate::parser::parse(&content, &ParserConfig::default()).unwrap();
+        let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
 
         resolve_modules(&mut parsed, &fixtures_dir).unwrap();
 
@@ -1514,7 +1514,7 @@ mod tests {
         let fixtures_dir =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nested_modules");
         let content = fs::read_to_string(fixtures_dir.join("root_cycle.crn")).unwrap();
-        let mut parsed = crate::parser::parse(&content, &ParserConfig::default()).unwrap();
+        let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
 
         let result = resolve_modules(&mut parsed, &fixtures_dir);
         assert!(

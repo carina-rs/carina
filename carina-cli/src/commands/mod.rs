@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use carina_core::module_resolver;
-use carina_core::parser::{ParsedFile, ParserConfig};
+use carina_core::parser::{ParsedFile, ProviderContext};
 
 use crate::error::AppError;
 use crate::wiring::{
@@ -43,7 +43,7 @@ pub fn validate_and_resolve(
         parsed,
         base_dir,
         skip_resource_validation,
-        &ParserConfig::default(),
+        &ProviderContext::default(),
     )
 }
 
@@ -51,7 +51,7 @@ pub fn validate_and_resolve_with_config(
     parsed: &mut ParsedFile,
     base_dir: &Path,
     skip_resource_validation: bool,
-    parser_config: &ParserConfig,
+    provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
     let ctx = WiringContext::new();
 
@@ -62,7 +62,7 @@ pub fn validate_and_resolve_with_config(
     validate_module_calls(parsed, base_dir)?;
 
     // Resolve module imports and expand module calls
-    module_resolver::resolve_modules_with_config(parsed, base_dir, parser_config)
+    module_resolver::resolve_modules_with_config(parsed, base_dir, provider_context)
         .map_err(|e| format!("Module resolution error: {}", e))?;
 
     // Resolve names (let bindings -> resource names)

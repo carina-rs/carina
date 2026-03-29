@@ -171,11 +171,11 @@ enum Commands {
 /// Uses the tokio runtime to call KMS synchronously from within the parse-time
 /// builtin evaluation. AWS credentials are loaded from the default chain
 /// (environment variables, profiles, instance metadata, etc.).
-fn create_parser_config() -> carina_core::parser::ParserConfig {
+fn create_provider_context() -> carina_core::parser::ProviderContext {
     static KMS_CLIENT: tokio::sync::OnceCell<aws_sdk_kms::Client> =
         tokio::sync::OnceCell::const_new();
 
-    carina_core::parser::ParserConfig {
+    carina_core::parser::ProviderContext {
         decryptor: Some(Box::new(|ciphertext, key| {
             let ciphertext = ciphertext.to_string();
             let key = key.map(|k| k.to_string());
@@ -228,7 +228,7 @@ async fn main() {
 
     // Create parser configuration with AWS KMS decryptor.
     // This must happen before any .crn parsing so that decrypt() calls can be evaluated.
-    let parser_config = create_parser_config();
+    let provider_context = create_provider_context();
 
     let cli = Cli::parse();
 
@@ -242,7 +242,7 @@ async fn main() {
         refresh,
     } = cli.command
     {
-        match run_plan(&path, out.as_ref(), detail, tui, refresh, &parser_config).await {
+        match run_plan(&path, out.as_ref(), detail, tui, refresh, &provider_context).await {
             Ok(has_changes) => {
                 if detailed_exitcode && has_changes {
                     std::process::exit(2);
@@ -257,7 +257,7 @@ async fn main() {
     }
 
     let result = match cli.command {
-        Commands::Validate { path } => run_validate(&path, &parser_config),
+        Commands::Validate { path } => run_validate(&path, &provider_context),
         Commands::Plan { .. } => unreachable!(),
         Commands::Apply {
             path,
@@ -267,7 +267,7 @@ async fn main() {
             if path.extension().is_some_and(|ext| ext == "json") {
                 run_apply_from_plan(&path, auto_approve, lock).await
             } else {
-                run_apply(&path, auto_approve, lock, &parser_config).await
+                run_apply(&path, auto_approve, lock, &provider_context).await
             }
         }
         Commands::Destroy {
@@ -275,19 +275,19 @@ async fn main() {
             auto_approve,
             lock,
             refresh,
-        } => run_destroy(&path, auto_approve, lock, refresh, &parser_config).await,
+        } => run_destroy(&path, auto_approve, lock, refresh, &provider_context).await,
         Commands::Fmt {
             path,
             check,
             diff,
             recursive,
         } => run_fmt(&path, check, diff, recursive),
-        Commands::Module { command } => run_module_command(command, &parser_config),
+        Commands::Module { command } => run_module_command(command, &provider_context),
         Commands::ForceUnlock { lock_id, path } => {
-            run_force_unlock(&lock_id, &path, &parser_config).await
+            run_force_unlock(&lock_id, &path, &provider_context).await
         }
-        Commands::State { command } => run_state_command(command, &parser_config).await,
-        Commands::Lint { path } => run_lint(&path, &parser_config),
+        Commands::State { command } => run_state_command(command, &provider_context).await,
+        Commands::Lint { path } => run_lint(&path, &provider_context),
         Commands::Completions { shell } => {
             generate(shell, &mut Cli::command(), "carina", &mut std::io::stdout());
             Ok(())

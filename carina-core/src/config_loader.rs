@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::parser::{self, ParsedFile, ParserConfig};
+use crate::parser::{self, ParsedFile, ProviderContext};
 
 /// Result of loading configuration, includes the file path containing backend block
 pub struct LoadedConfig {
@@ -18,13 +18,13 @@ pub struct LoadedConfig {
 
 /// Load configuration from a file or directory
 pub fn load_configuration(path: &PathBuf) -> Result<LoadedConfig, String> {
-    load_configuration_with_config(path, &ParserConfig::default())
+    load_configuration_with_config(path, &ProviderContext::default())
 }
 
 /// Load configuration from a file or directory with the given parser configuration.
 pub fn load_configuration_with_config(
     path: &PathBuf,
-    config: &ParserConfig,
+    config: &ProviderContext,
 ) -> Result<LoadedConfig, String> {
     if path.is_file() {
         // Single file mode (existing behavior)

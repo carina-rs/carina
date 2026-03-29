@@ -29,7 +29,7 @@ use carina_state::{
     create_backend, create_local_backend,
 };
 
-use carina_core::parser::ParserConfig;
+use carina_core::parser::ProviderContext;
 
 use super::validate_and_resolve_with_config;
 use crate::DetailLevel;
@@ -744,15 +744,15 @@ pub async fn run_apply(
     path: &PathBuf,
     auto_approve: bool,
     lock: bool,
-    parser_config: &ParserConfig,
+    provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
     let ctx = WiringContext::new();
-    let loaded = load_configuration_with_config(path, parser_config)?;
+    let loaded = load_configuration_with_config(path, provider_context)?;
     let mut parsed = loaded.parsed;
     let backend_file = loaded.backend_file;
 
     let base_dir = get_base_dir(path);
-    validate_and_resolve_with_config(&mut parsed, base_dir, false, parser_config)?;
+    validate_and_resolve_with_config(&mut parsed, base_dir, false, provider_context)?;
 
     // Check for backend configuration - use local backend by default
     let backend_config = parsed.backend.as_ref();
@@ -905,11 +905,11 @@ pub async fn run_apply(
                     );
 
                     // Re-parse the updated configuration to include the new resource
-                    parsed = load_configuration_with_config(path, parser_config)?.parsed;
+                    parsed = load_configuration_with_config(path, provider_context)?.parsed;
                     if let Err(e) = module_resolver::resolve_modules_with_config(
                         &mut parsed,
                         get_base_dir(path),
-                        parser_config,
+                        provider_context,
                     ) {
                         return Err(AppError::Config(format!("Module resolution error: {}", e)));
                     }

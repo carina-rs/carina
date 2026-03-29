@@ -1,10 +1,10 @@
 //! `decrypt(ciphertext)` / `decrypt(ciphertext, key)` built-in function
 //!
-//! Decrypts ciphertext using a decryptor function injected via [`ParserConfig`].
-//! The CLI wires in the concrete implementation (e.g., AWS KMS) via `ParserConfig::decryptor`
+//! Decrypts ciphertext using a decryptor function injected via [`ProviderContext`].
+//! The CLI wires in the concrete implementation (e.g., AWS KMS) via `ProviderContext::decryptor`
 //! before parsing begins.
 
-use crate::parser::ParserConfig;
+use crate::parser::ProviderContext;
 use crate::resource::Value;
 
 use super::value_type_name;
@@ -12,7 +12,7 @@ use super::value_type_name;
 /// `decrypt(ciphertext)` or `decrypt(ciphertext, key)` - Decrypt an encrypted value.
 ///
 /// This is the fallback entry point used by `evaluate_builtin` (no config).
-/// It always returns an error since the decryptor is only available via `ParserConfig`.
+/// It always returns an error since the decryptor is only available via `ProviderContext`.
 /// Use `builtin_decrypt_with_config` for the config-aware version.
 pub(crate) fn builtin_decrypt(args: &[Value]) -> Result<Value, String> {
     // Validate arguments for better error messages
@@ -25,10 +25,10 @@ pub(crate) fn builtin_decrypt(args: &[Value]) -> Result<Value, String> {
     )
 }
 
-/// `decrypt()` implementation that uses the decryptor from [`ParserConfig`].
+/// `decrypt()` implementation that uses the decryptor from [`ProviderContext`].
 pub(crate) fn builtin_decrypt_with_config(
     args: &[Value],
-    config: &ParserConfig,
+    config: &ProviderContext,
 ) -> Result<Value, String> {
     let (ciphertext, key) = parse_decrypt_args(args)?;
     let decryptor = config.decryptor.as_ref().ok_or_else(|| {
@@ -83,13 +83,13 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::builtins::evaluate_builtin_with_config;
-    use crate::parser::ParserConfig;
+    use crate::parser::ProviderContext;
     use crate::resource::Value;
 
     use super::builtin_decrypt;
 
-    fn mock_config(decrypt_fn: crate::parser::DecryptorFn) -> ParserConfig {
-        ParserConfig {
+    fn mock_config(decrypt_fn: crate::parser::DecryptorFn) -> ProviderContext {
+        ProviderContext {
             decryptor: Some(decrypt_fn),
             custom_validators: HashMap::new(),
         }
@@ -126,7 +126,7 @@ mod tests {
 
     #[test]
     fn decrypt_without_decryptor_returns_error() {
-        let config = ParserConfig::default();
+        let config = ProviderContext::default();
 
         let args = vec![Value::String("AQICAHh".to_string())];
         let result = evaluate_builtin_with_config("decrypt", &args, &config);
@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn decrypt_error_on_no_args() {
-        let config = ParserConfig::default();
+        let config = ProviderContext::default();
         let args = vec![];
         let result = evaluate_builtin_with_config("decrypt", &args, &config);
         assert!(result.is_err());
@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn decrypt_error_on_too_many_args() {
-        let config = ParserConfig::default();
+        let config = ProviderContext::default();
         let args = vec![
             Value::String("a".to_string()),
             Value::String("b".to_string()),
@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn decrypt_error_on_non_string_ciphertext() {
-        let config = ParserConfig::default();
+        let config = ProviderContext::default();
         let args = vec![Value::Int(42)];
         let result = evaluate_builtin_with_config("decrypt", &args, &config);
         assert!(result.is_err());
@@ -187,7 +187,7 @@ mod tests {
 
     #[test]
     fn decrypt_error_on_non_string_key() {
-        let config = ParserConfig::default();
+        let config = ProviderContext::default();
         let args = vec![Value::String("cipher".to_string()), Value::Int(42)];
         let result = evaluate_builtin_with_config("decrypt", &args, &config);
         assert!(result.is_err());

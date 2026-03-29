@@ -12,7 +12,7 @@ use carina_core::lint::{
     find_pipe_preferred_direct_calls, list_struct_attr_names,
 };
 use carina_core::module_resolver;
-use carina_core::parser::ParserConfig;
+use carina_core::parser::ProviderContext;
 use carina_core::provider::{self as provider_mod};
 
 use crate::error::AppError;
@@ -25,13 +25,13 @@ struct LintWarning {
     message: String,
 }
 
-pub fn run_lint(path: &PathBuf, parser_config: &ParserConfig) -> Result<(), AppError> {
-    let mut parsed = load_configuration_with_config(path, parser_config)?.parsed;
+pub fn run_lint(path: &PathBuf, provider_context: &ProviderContext) -> Result<(), AppError> {
+    let mut parsed = load_configuration_with_config(path, provider_context)?.parsed;
 
     let base_dir = get_base_dir(path);
 
     // Resolve modules
-    module_resolver::resolve_modules_with_config(&mut parsed, base_dir, parser_config)
+    module_resolver::resolve_modules_with_config(&mut parsed, base_dir, provider_context)
         .map_err(|e| format!("Module resolution error: {}", e))?;
 
     let ctx = WiringContext::new();
