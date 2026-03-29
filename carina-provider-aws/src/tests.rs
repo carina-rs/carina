@@ -710,6 +710,216 @@ fn test_extract_ec2_nat_gateway_attributes_private() {
     assert_eq!(attributes.get("allocation_id"), None);
 }
 
+// --- extract_ec2_vpc_endpoint_attributes tests ---
+
+#[test]
+fn test_extract_ec2_vpc_endpoint_attributes() {
+    let group = aws_sdk_ec2::types::SecurityGroupIdentifier::builder()
+        .group_id("sg-12345678")
+        .build();
+    let endpoint = aws_sdk_ec2::types::VpcEndpoint::builder()
+        .vpc_endpoint_id("vpce-12345678")
+        .vpc_endpoint_type(aws_sdk_ec2::types::VpcEndpointType::Gateway)
+        .vpc_id("vpc-12345678")
+        .service_name("com.amazonaws.ap-northeast-1.s3")
+        .private_dns_enabled(false)
+        .route_table_ids("rtb-12345678")
+        .groups(group)
+        .build();
+    let mut attributes = HashMap::new();
+    let identifier = AwsProvider::extract_ec2_vpc_endpoint_attributes(&endpoint, &mut attributes);
+    assert_eq!(identifier, Some("vpce-12345678".to_string()));
+    assert_eq!(
+        attributes.get("vpc_endpoint_id"),
+        Some(&Value::String("vpce-12345678".to_string()))
+    );
+    assert_eq!(
+        attributes.get("vpc_endpoint_type"),
+        Some(&Value::String("Gateway".to_string()))
+    );
+    assert_eq!(
+        attributes.get("vpc_id"),
+        Some(&Value::String("vpc-12345678".to_string()))
+    );
+    assert_eq!(
+        attributes.get("service_name"),
+        Some(&Value::String(
+            "com.amazonaws.ap-northeast-1.s3".to_string()
+        ))
+    );
+    assert_eq!(
+        attributes.get("private_dns_enabled"),
+        Some(&Value::Bool(false))
+    );
+    assert_eq!(
+        attributes.get("route_table_ids"),
+        Some(&Value::List(vec![Value::String(
+            "rtb-12345678".to_string()
+        )]))
+    );
+    assert_eq!(
+        attributes.get("security_group_ids"),
+        Some(&Value::List(vec![Value::String("sg-12345678".to_string())]))
+    );
+}
+
+#[test]
+fn test_extract_ec2_vpc_endpoint_attributes_minimal() {
+    let endpoint = aws_sdk_ec2::types::VpcEndpoint::builder().build();
+    let mut attributes = HashMap::new();
+    let identifier = AwsProvider::extract_ec2_vpc_endpoint_attributes(&endpoint, &mut attributes);
+    assert_eq!(identifier, None);
+}
+
+#[test]
+fn test_extract_ec2_vpc_endpoint_attributes_interface() {
+    let group = aws_sdk_ec2::types::SecurityGroupIdentifier::builder()
+        .group_id("sg-99999999")
+        .build();
+    let endpoint = aws_sdk_ec2::types::VpcEndpoint::builder()
+        .vpc_endpoint_id("vpce-99999999")
+        .vpc_endpoint_type(aws_sdk_ec2::types::VpcEndpointType::Interface)
+        .vpc_id("vpc-12345678")
+        .service_name("com.amazonaws.ap-northeast-1.execute-api")
+        .private_dns_enabled(true)
+        .subnet_ids("subnet-12345678")
+        .groups(group)
+        .build();
+    let mut attributes = HashMap::new();
+    let identifier = AwsProvider::extract_ec2_vpc_endpoint_attributes(&endpoint, &mut attributes);
+    assert_eq!(identifier, Some("vpce-99999999".to_string()));
+    assert_eq!(
+        attributes.get("vpc_endpoint_type"),
+        Some(&Value::String("Interface".to_string()))
+    );
+    assert_eq!(
+        attributes.get("private_dns_enabled"),
+        Some(&Value::Bool(true))
+    );
+    assert_eq!(
+        attributes.get("subnet_ids"),
+        Some(&Value::List(vec![Value::String(
+            "subnet-12345678".to_string()
+        )]))
+    );
+}
+
+// --- extract_ec2_flow_log_attributes tests ---
+
+#[test]
+fn test_extract_ec2_flow_log_attributes() {
+    let fl = aws_sdk_ec2::types::FlowLog::builder()
+        .flow_log_id("fl-12345678")
+        .resource_id("vpc-12345678")
+        .traffic_type(aws_sdk_ec2::types::TrafficType::All)
+        .log_destination_type(aws_sdk_ec2::types::LogDestinationType::S3)
+        .log_destination("arn:aws:s3:::my-bucket")
+        .max_aggregation_interval(600)
+        .flow_log_status("ACTIVE")
+        .build();
+    let mut attributes = HashMap::new();
+    let identifier = AwsProvider::extract_ec2_flow_log_attributes(&fl, &mut attributes);
+    assert_eq!(identifier, Some("fl-12345678".to_string()));
+    assert_eq!(
+        attributes.get("flow_log_id"),
+        Some(&Value::String("fl-12345678".to_string()))
+    );
+    assert_eq!(
+        attributes.get("resource_id"),
+        Some(&Value::String("vpc-12345678".to_string()))
+    );
+    assert_eq!(
+        attributes.get("traffic_type"),
+        Some(&Value::String("ALL".to_string()))
+    );
+    assert_eq!(
+        attributes.get("log_destination_type"),
+        Some(&Value::String("s3".to_string()))
+    );
+    assert_eq!(
+        attributes.get("log_destination"),
+        Some(&Value::String("arn:aws:s3:::my-bucket".to_string()))
+    );
+    assert_eq!(
+        attributes.get("max_aggregation_interval"),
+        Some(&Value::Int(600))
+    );
+    assert_eq!(
+        attributes.get("resource_type"),
+        Some(&Value::String("VPC".to_string()))
+    );
+}
+
+#[test]
+fn test_extract_ec2_flow_log_attributes_minimal() {
+    let fl = aws_sdk_ec2::types::FlowLog::builder().build();
+    let mut attributes = HashMap::new();
+    let identifier = AwsProvider::extract_ec2_flow_log_attributes(&fl, &mut attributes);
+    assert_eq!(identifier, None);
+}
+
+#[test]
+fn test_extract_ec2_flow_log_attributes_cloudwatch() {
+    let fl = aws_sdk_ec2::types::FlowLog::builder()
+        .flow_log_id("fl-87654321")
+        .resource_id("subnet-12345678")
+        .traffic_type(aws_sdk_ec2::types::TrafficType::Accept)
+        .log_destination_type(aws_sdk_ec2::types::LogDestinationType::CloudWatchLogs)
+        .log_group_name("/aws/vpc/flow-logs")
+        .deliver_logs_permission_arn("arn:aws:iam::123456789012:role/flow-log-role")
+        .flow_log_status("ACTIVE")
+        .build();
+    let mut attributes = HashMap::new();
+    let identifier = AwsProvider::extract_ec2_flow_log_attributes(&fl, &mut attributes);
+    assert_eq!(identifier, Some("fl-87654321".to_string()));
+    assert_eq!(
+        attributes.get("log_group_name"),
+        Some(&Value::String("/aws/vpc/flow-logs".to_string()))
+    );
+    assert_eq!(
+        attributes.get("deliver_logs_permission_arn"),
+        Some(&Value::String(
+            "arn:aws:iam::123456789012:role/flow-log-role".to_string()
+        ))
+    );
+    assert_eq!(
+        attributes.get("resource_type"),
+        Some(&Value::String("Subnet".to_string()))
+    );
+}
+
+// --- extract_ec2_vpn_gateway_attributes tests ---
+
+#[test]
+fn test_extract_ec2_vpn_gateway_attributes() {
+    let vgw = aws_sdk_ec2::types::VpnGateway::builder()
+        .vpn_gateway_id("vgw-12345678")
+        .r#type(aws_sdk_ec2::types::GatewayType::Ipsec1)
+        .amazon_side_asn(64512)
+        .build();
+    let mut attributes = HashMap::new();
+    let identifier = AwsProvider::extract_ec2_vpn_gateway_attributes(&vgw, &mut attributes);
+    assert_eq!(identifier, Some("vgw-12345678".to_string()));
+    assert_eq!(
+        attributes.get("vpn_gateway_id"),
+        Some(&Value::String("vgw-12345678".to_string()))
+    );
+    assert_eq!(
+        attributes.get("type"),
+        Some(&Value::String("ipsec.1".to_string()))
+    );
+    assert_eq!(attributes.get("amazon_side_asn"), Some(&Value::Int(64512)));
+}
+
+#[test]
+fn test_extract_ec2_vpn_gateway_attributes_minimal() {
+    let vgw = aws_sdk_ec2::types::VpnGateway::builder().build();
+    let mut attributes = HashMap::new();
+    let identifier = AwsProvider::extract_ec2_vpn_gateway_attributes(&vgw, &mut attributes);
+    assert_eq!(identifier, None);
+    assert!(attributes.is_empty());
+}
+
 // --- extract_iam_role_attributes tests ---
 
 #[test]

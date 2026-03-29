@@ -1,0 +1,59 @@
+# EC2 Flow Log - CloudWatch Logs destination test
+#
+# Tests: VPC Flow Log creation with CloudWatch Logs destination,
+#        log_group_name, deliver_logs_permission_arn, IAM role
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = aws.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}
+
+let log_group = aws.logs.log_group {
+  log_group_name    = "/acceptance-test/vpc-flow-logs"
+  retention_in_days = 1
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}
+
+let flow_log_role = aws.iam.role {
+  role_name = "acceptance-test-flow-log-role"
+
+  assume_role_policy_document = {
+    version = "2012-10-17"
+    statement {
+      effect = "Allow"
+
+      principal = {
+        service = "vpc-flow-logs.amazonaws.com"
+      }
+
+      action = "sts:AssumeRole"
+    }
+  }
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}
+
+aws.ec2.flow_log {
+  resource_id                 = vpc.vpc_id
+  resource_type               = aws.ec2.flow_log.ResourceType.VPC
+  traffic_type                = aws.ec2.flow_log.TrafficType.ALL
+  log_destination_type        = aws.ec2.flow_log.LogDestinationType.cloud_watch_logs
+  log_group_name              = log_group.log_group_name
+  deliver_logs_permission_arn = flow_log_role.arn
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}
