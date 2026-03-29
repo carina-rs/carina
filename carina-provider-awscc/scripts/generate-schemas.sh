@@ -170,6 +170,9 @@ cat > "$OUTPUT_DIR/mod.rs" << 'EOF'
 //! DO NOT EDIT MANUALLY - regenerate with:
 //!   aws-vault exec <profile> -- ./carina-provider-awscc/scripts/generate-schemas.sh
 
+use std::collections::HashMap;
+use std::sync::LazyLock;
+
 // Re-export all types and validators from awscc_types so that
 // generated schema files can use `super::` to access them.
 pub use super::awscc_types::*;
@@ -181,11 +184,72 @@ for SVC in $SERVICES; do
     echo "pub mod ${SVC};" >> "$OUTPUT_DIR/mod.rs"
 done
 
-# Add configs() function
+# --- SCHEMA_CONFIGS LazyLock ---
 cat >> "$OUTPUT_DIR/mod.rs" << 'EOF'
 
-/// Returns all generated schema configs
-pub fn configs() -> Vec<AwsccSchemaConfig> {
+/// Cached schema configs, initialized once on first access.
+static SCHEMA_CONFIGS: LazyLock<Vec<AwsccSchemaConfig>> = LazyLock::new(build_configs);
+
+/// Index from resource_type_name (e.g., "ec2.vpc") to position in SCHEMA_CONFIGS.
+static SCHEMA_CONFIG_INDEX: LazyLock<HashMap<&'static str, usize>> = LazyLock::new(|| {
+    SCHEMA_CONFIGS
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.resource_type_name, i))
+        .collect()
+});
+
+/// Cached enum valid values: resource_type -> (attr_name -> valid values slice).
+static ENUM_VALID_VALUES: LazyLock<
+    HashMap<&'static str, HashMap<&'static str, &'static [&'static str]>>,
+> = LazyLock::new(|| {
+    #[allow(clippy::type_complexity)]
+    let modules: &[(&str, &[(&str, &[&str])])] = &[
+EOF
+
+# Add enum_valid_values() calls for ENUM_VALID_VALUES
+for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
+    SVC=$(service_name "$TYPE_NAME")
+    RESOURCE=$(resource_module_name "$TYPE_NAME")
+    echo "        ${SVC}::${RESOURCE}::enum_valid_values()," >> "$OUTPUT_DIR/mod.rs"
+done
+
+cat >> "$OUTPUT_DIR/mod.rs" << 'EOF'
+    ];
+    let mut map: HashMap<&str, HashMap<&str, &[&str]>> = HashMap::new();
+    for (rt, attrs) in modules {
+        let attr_map = map.entry(rt).or_default();
+        for (attr, values) in *attrs {
+            attr_map.insert(attr, values);
+        }
+    }
+    map
+});
+
+/// Function signature for enum alias reverse lookups.
+type EnumAliasReverseFn = fn(&str, &str) -> Option<&'static str>;
+
+/// Enum alias reverse dispatch table: resource_type -> dispatch function.
+static ENUM_ALIAS_DISPATCH: LazyLock<HashMap<&'static str, EnumAliasReverseFn>> =
+    LazyLock::new(|| {
+        let entries: Vec<(&str, EnumAliasReverseFn)> = vec![
+EOF
+
+# Add enum_alias_reverse dispatch entries
+for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
+    SVC=$(service_name "$TYPE_NAME")
+    RESOURCE=$(resource_module_name "$TYPE_NAME")
+    DSL_NAME=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-dsl-resource-name)
+    echo "            (\"${DSL_NAME}\", ${SVC}::${RESOURCE}::enum_alias_reverse)," >> "$OUTPUT_DIR/mod.rs"
+done
+
+cat >> "$OUTPUT_DIR/mod.rs" << 'EOF'
+        ];
+        entries.into_iter().collect()
+    });
+
+/// Build all schema configs (called once by LazyLock).
+fn build_configs() -> Vec<AwsccSchemaConfig> {
     vec![
 EOF
 
@@ -203,56 +267,35 @@ cat >> "$OUTPUT_DIR/mod.rs" << 'EOF'
     ]
 }
 
-/// Get valid enum values for a given resource type and attribute name.
+/// Returns a reference to the cached schema configs slice.
+pub fn configs() -> &'static [AwsccSchemaConfig] {
+    &SCHEMA_CONFIGS
+}
+
+/// Look up a schema config by resource_type_name (e.g., "ec2.vpc"). O(1).
+pub fn get_config_by_type(resource_type: &str) -> Option<&'static AwsccSchemaConfig> {
+    SCHEMA_CONFIG_INDEX
+        .get(resource_type)
+        .map(|&i| &SCHEMA_CONFIGS[i])
+}
+
+/// Get valid enum values for a given resource type and attribute name. O(1).
 /// Used during read-back to normalize AWS-returned values to canonical DSL form.
 ///
 /// Auto-generated from schema enum constants.
-#[allow(clippy::type_complexity)]
 pub fn get_enum_valid_values(resource_type: &str, attr_name: &str) -> Option<&'static [&'static str]> {
-    let modules: &[(&str, &[(&str, &[&str])])] = &[
-EOF
-
-# Add enum_valid_values() calls dynamically
-for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
-    SVC=$(service_name "$TYPE_NAME")
-    RESOURCE=$(resource_module_name "$TYPE_NAME")
-    echo "        ${SVC}::${RESOURCE}::enum_valid_values()," >> "$OUTPUT_DIR/mod.rs"
-done
-
-cat >> "$OUTPUT_DIR/mod.rs" << 'EOF'
-    ];
-    for (rt, attrs) in modules {
-        if *rt == resource_type {
-            for (attr, values) in *attrs {
-                if *attr == attr_name {
-                    return Some(values);
-                }
-            }
-            return None;
-        }
-    }
-    None
+    ENUM_VALID_VALUES
+        .get(resource_type)
+        .and_then(|attrs| attrs.get(attr_name))
+        .copied()
 }
 
-/// Maps DSL alias values back to canonical AWS values.
+/// Maps DSL alias values back to canonical AWS values. O(1) dispatch.
 /// Dispatches to per-module enum_alias_reverse() functions.
 pub fn get_enum_alias_reverse(resource_type: &str, attr_name: &str, value: &str) -> Option<&'static str> {
-EOF
-
-# Add enum_alias_reverse() dispatches dynamically
-for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
-    SVC=$(service_name "$TYPE_NAME")
-    RESOURCE=$(resource_module_name "$TYPE_NAME")
-    DSL_NAME=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-dsl-resource-name)
-    cat >> "$OUTPUT_DIR/mod.rs" << INNEREOF
-    if resource_type == "${DSL_NAME}" {
-        return ${SVC}::${RESOURCE}::enum_alias_reverse(attr_name, value);
-    }
-INNEREOF
-done
-
-cat >> "$OUTPUT_DIR/mod.rs" << 'EOF'
-    None
+    ENUM_ALIAS_DISPATCH
+        .get(resource_type)
+        .and_then(|f| f(attr_name, value))
 }
 EOF
 

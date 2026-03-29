@@ -177,7 +177,7 @@ impl AwsccProvider {
             .for_resource(id));
         }
 
-        let patch_ops = build_update_patches(&config, from, &to);
+        let patch_ops = build_update_patches(config, from, &to);
 
         self.cc_update_resource(config.aws_type_name, identifier, patch_ops)
             .await
@@ -214,7 +214,7 @@ impl AwsccProvider {
         })?;
 
         // Handle special pre-delete operations
-        self.pre_delete_operations(id, &config, identifier).await?;
+        self.pre_delete_operations(id, config, identifier).await?;
 
         // Handle force_delete for S3 buckets: empty the bucket before deletion
         if lifecycle.force_delete && id.resource_type == "s3.bucket" {

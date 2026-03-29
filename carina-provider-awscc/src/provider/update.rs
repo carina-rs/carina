@@ -124,11 +124,11 @@ mod tests {
     use super::*;
     use carina_core::resource::ResourceId;
 
-    fn get_schema_config(resource_type: &str) -> Option<AwsccSchemaConfig> {
+    fn get_schema_config(resource_type: &str) -> Option<&'static AwsccSchemaConfig> {
         super::super::get_schema_config(resource_type)
     }
 
-    fn get_vpc_config() -> AwsccSchemaConfig {
+    fn get_vpc_config() -> &'static AwsccSchemaConfig {
         get_schema_config("ec2.vpc").expect("ec2.vpc schema should exist")
     }
 
@@ -183,7 +183,7 @@ mod tests {
             Value::String("10.0.0.0/16".to_string()),
         );
 
-        let patches = build_update_patches(&config, &from, &to);
+        let patches = build_update_patches(config, &from, &to);
 
         let has_remove_instance_tenancy = patches.iter().any(|p| {
             p.get("op").and_then(|v| v.as_str()) == Some("remove")
@@ -217,7 +217,7 @@ mod tests {
             Value::String("10.0.0.0/16".to_string()),
         );
 
-        let patches = build_update_patches(&config, &from, &to);
+        let patches = build_update_patches(config, &from, &to);
 
         let has_remove_tags = patches.iter().any(|p| {
             p.get("op").and_then(|v| v.as_str()) == Some("remove")
@@ -244,7 +244,7 @@ mod tests {
 
         let to = Resource::new("ec2.vpc", "test");
 
-        let patches = build_update_patches(&config, &from, &to);
+        let patches = build_update_patches(config, &from, &to);
 
         let has_remove_cidr = patches.iter().any(|p| {
             p.get("op").and_then(|v| v.as_str()) == Some("remove")
@@ -283,7 +283,7 @@ mod tests {
             Value::String("awscc.ec2.vpc.InstanceTenancy.dedicated".to_string()),
         );
 
-        let patches = build_update_patches(&config, &from, &to);
+        let patches = build_update_patches(config, &from, &to);
 
         let has_remove = patches
             .iter()
@@ -321,7 +321,7 @@ mod tests {
             Value::String("awscc.ec2.vpc.InstanceTenancy.dedicated".to_string()),
         );
 
-        let patches = build_update_patches(&config, &from, &to);
+        let patches = build_update_patches(config, &from, &to);
 
         let has_cidr_replace = patches.iter().any(|p| {
             p.get("op").and_then(|v| v.as_str()) == Some("add")
@@ -362,7 +362,7 @@ mod tests {
             Value::String("10.0.0.0/16".to_string()),
         );
 
-        let patches = build_update_patches(&config, &from, &to);
+        let patches = build_update_patches(config, &from, &to);
 
         assert!(
             patches.is_empty(),
@@ -393,7 +393,7 @@ mod tests {
         );
         to.attributes.insert("tags".to_string(), Value::Map(tags));
 
-        let patches = build_update_patches(&config, &from, &to);
+        let patches = build_update_patches(config, &from, &to);
 
         assert!(
             patches.is_empty(),
@@ -431,7 +431,7 @@ mod tests {
             Value::String("awscc.ec2.vpc.InstanceTenancy.dedicated".to_string()),
         );
 
-        let patches = build_update_patches(&config, &from, &to);
+        let patches = build_update_patches(config, &from, &to);
 
         // All value-setting operations should use "add", not "replace"
         for patch in &patches {
@@ -471,7 +471,7 @@ mod tests {
             Value::String("/carina/test-group".to_string()),
         );
 
-        let patches = build_update_patches(&config, &from, &to);
+        let patches = build_update_patches(config, &from, &to);
 
         assert_eq!(
             patches.len(),
@@ -524,7 +524,7 @@ mod tests {
             Value::String("/carina/test-group".to_string()),
         );
 
-        let patches = build_update_patches(&config, &from, &to);
+        let patches = build_update_patches(config, &from, &to);
 
         // Should only have the retention_in_days patch, not Arn
         let has_arn_patch = patches
@@ -588,7 +588,7 @@ mod tests {
             Value::String("{\"Version\":\"2012-10-17\",\"Statement\":[]}".to_string()),
         );
 
-        let patches = build_update_patches(&config, &from, &to);
+        let patches = build_update_patches(config, &from, &to);
 
         // Should not include DnsOptions in patches (it has create-only sub-properties)
         let has_dns_options_patch = patches
