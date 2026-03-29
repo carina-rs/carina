@@ -877,4 +877,68 @@ mod tests {
         assert_eq!(app.selected, prev_selected);
         assert!(app.nav_stack.is_empty());
     }
+
+    // ---- Module info key handler tests ----
+
+    fn make_module_info_app() -> ModuleInfoApp {
+        use carina_core::parser::{ProviderContext, parse};
+        let input = r#"
+            arguments {
+                vpc: aws.vpc
+                enable_https: bool = true
+            }
+            attributes {
+                sg: aws.security_group = web_sg.id
+            }
+            let web_sg = aws.security_group {
+                name = "web-sg"
+                vpc_id = vpc
+            }
+        "#;
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        let sig = FileSignature::from_parsed_file_with_name(&parsed, "test_module");
+        ModuleInfoApp::new(&sig)
+    }
+
+    #[test]
+    fn module_info_q_quits() {
+        let mut app = make_module_info_app();
+        assert_eq!(
+            handle_module_info_key(&mut app, KeyCode::Char('q')),
+            KeyAction::Quit
+        );
+    }
+
+    #[test]
+    fn module_info_esc_quits() {
+        let mut app = make_module_info_app();
+        assert_eq!(
+            handle_module_info_key(&mut app, KeyCode::Esc),
+            KeyAction::Quit
+        );
+    }
+
+    #[test]
+    fn module_info_navigation() {
+        let mut app = make_module_info_app();
+        assert_eq!(app.selected, 0);
+        handle_module_info_key(&mut app, KeyCode::Down);
+        assert_eq!(app.selected, 1);
+        handle_module_info_key(&mut app, KeyCode::Up);
+        assert_eq!(app.selected, 0);
+        handle_module_info_key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.selected, 1);
+        handle_module_info_key(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn module_info_tab_toggles_focus() {
+        let mut app = make_module_info_app();
+        assert_eq!(app.focused_panel, module_info_app::FocusedPanel::Tree);
+        handle_module_info_key(&mut app, KeyCode::Tab);
+        assert_eq!(app.focused_panel, module_info_app::FocusedPanel::Detail);
+        handle_module_info_key(&mut app, KeyCode::Tab);
+        assert_eq!(app.focused_panel, module_info_app::FocusedPanel::Tree);
+    }
 }
