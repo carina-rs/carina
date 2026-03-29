@@ -5,7 +5,10 @@ use std::collections::{HashMap, HashSet};
 use crate::parser::{ModuleCall, ParsedFile, TypeExpr};
 use crate::provider::ProviderFactory;
 use crate::resource::{Resource, Value};
-use crate::schema::{AttributeType, ResourceSchema, suggest_similar_name, validate_ipv4_cidr};
+use crate::schema::{
+    AttributeType, ResourceSchema, suggest_similar_name, validate_ipv4_address, validate_ipv4_cidr,
+    validate_ipv6_address, validate_ipv6_cidr,
+};
 
 /// Validate resources against their schemas.
 ///
@@ -293,34 +296,69 @@ fn collect_resource_refs(value: &Value, refs: &mut HashSet<String>) {
     }
 }
 
-/// Validate a module argument value against its expected type.
-pub fn validate_module_arg_type(type_expr: &TypeExpr, value: &Value) -> Option<String> {
+/// Validate a value against a TypeExpr, returning an error message if invalid.
+///
+/// This is the shared validation logic used by both `validate_module_arg_type`
+/// (CLI module call validation) and the LSP diagnostics. It handles:
+/// - Custom types: cidr, ipv4_address, ipv6_cidr, ipv6_address
+/// - List of custom types
+/// - Basic type mismatches (bool/int/float vs string)
+pub fn validate_type_expr_value(type_expr: &TypeExpr, value: &Value) -> Option<String> {
     match (type_expr, value) {
-        (TypeExpr::Simple(name), Value::String(s)) if name == "cidr" => validate_ipv4_cidr(s).err(),
+        // Custom type validation
+        (TypeExpr::Simple(name), Value::String(s)) => {
+            simple_type_validator(name).and_then(|validate_fn| validate_fn(s).err())
+        }
+        // List of custom type validation
         (TypeExpr::List(inner), Value::List(items)) => {
-            if let TypeExpr::Simple(name) = inner.as_ref() {
-                if name != "cidr" {
-                    return None;
-                }
+            if let TypeExpr::Simple(name) = inner.as_ref()
+                && let Some(validate_fn) = simple_type_validator(name)
+            {
                 for (i, item) in items.iter().enumerate() {
                     if let Value::String(s) = item {
-                        if let Err(e) = validate_ipv4_cidr(s) {
-                            return Some(format!("element {}: {}", i, e));
+                        if let Err(e) = validate_fn(s) {
+                            return Some(format!("Element {}: {}", i, e));
                         }
                     } else {
-                        return Some(format!("element {}: expected string", i));
+                        return Some(format!("Element {}: expected string, got {:?}", i, item));
                     }
                 }
             }
             None
         }
+        // Bool type mismatch
         (TypeExpr::Bool, Value::String(s)) => Some(format!(
             "expected bool, got string \"{}\". Use true or false.",
             s
         )),
+        // Int type mismatch
         (TypeExpr::Int, Value::String(s)) => Some(format!("expected int, got string \"{}\".", s)),
+        // Float type mismatch
+        (TypeExpr::Float, Value::String(s)) => {
+            Some(format!("expected float, got string \"{}\".", s))
+        }
         _ => None,
     }
+}
+
+type ValidateFn = fn(&str) -> Result<(), String>;
+
+/// Return the validator function for a custom simple type name, if any.
+fn simple_type_validator(name: &str) -> Option<ValidateFn> {
+    match name {
+        "cidr" => Some(validate_ipv4_cidr),
+        "ipv4_address" => Some(validate_ipv4_address),
+        "ipv6_cidr" => Some(validate_ipv6_cidr),
+        "ipv6_address" => Some(validate_ipv6_address),
+        _ => None,
+    }
+}
+
+/// Validate a module argument value against its expected type.
+///
+/// Delegates to [`validate_type_expr_value`] for the actual validation logic.
+pub fn validate_module_arg_type(type_expr: &TypeExpr, value: &Value) -> Option<String> {
+    validate_type_expr_value(type_expr, value)
 }
 
 #[cfg(test)]
@@ -817,5 +855,121 @@ let route = awscc.ec2.route {
 
         let result = validate_no_provider_in_module(&parsed);
         assert!(result.is_ok());
+    }
+
+    // --- validate_type_expr_value tests ---
+
+    #[test]
+    fn validate_type_expr_value_cidr_valid() {
+        let result = validate_type_expr_value(
+            &TypeExpr::Simple("cidr".to_string()),
+            &Value::String("10.0.0.0/16".to_string()),
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn validate_type_expr_value_cidr_invalid() {
+        let result = validate_type_expr_value(
+            &TypeExpr::Simple("cidr".to_string()),
+            &Value::String("not-a-cidr".to_string()),
+        );
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn validate_type_expr_value_ipv4_address_valid() {
+        let result = validate_type_expr_value(
+            &TypeExpr::Simple("ipv4_address".to_string()),
+            &Value::String("192.168.1.1".to_string()),
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn validate_type_expr_value_ipv4_address_invalid() {
+        let result = validate_type_expr_value(
+            &TypeExpr::Simple("ipv4_address".to_string()),
+            &Value::String("999.999.999.999".to_string()),
+        );
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn validate_type_expr_value_ipv6_cidr_valid() {
+        let result = validate_type_expr_value(
+            &TypeExpr::Simple("ipv6_cidr".to_string()),
+            &Value::String("2001:db8::/32".to_string()),
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn validate_type_expr_value_ipv6_cidr_invalid() {
+        let result = validate_type_expr_value(
+            &TypeExpr::Simple("ipv6_cidr".to_string()),
+            &Value::String("not-ipv6-cidr".to_string()),
+        );
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn validate_type_expr_value_ipv6_address_valid() {
+        let result = validate_type_expr_value(
+            &TypeExpr::Simple("ipv6_address".to_string()),
+            &Value::String("2001:db8::1".to_string()),
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn validate_type_expr_value_ipv6_address_invalid() {
+        let result = validate_type_expr_value(
+            &TypeExpr::Simple("ipv6_address".to_string()),
+            &Value::String("zzz::zzz".to_string()),
+        );
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn validate_type_expr_value_bool_mismatch() {
+        let result = validate_type_expr_value(&TypeExpr::Bool, &Value::String("yes".to_string()));
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("expected bool"));
+    }
+
+    #[test]
+    fn validate_type_expr_value_int_mismatch() {
+        let result = validate_type_expr_value(&TypeExpr::Int, &Value::String("42".to_string()));
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("expected int"));
+    }
+
+    #[test]
+    fn validate_type_expr_value_float_mismatch() {
+        let result = validate_type_expr_value(&TypeExpr::Float, &Value::String("3.14".to_string()));
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("expected float"));
+    }
+
+    #[test]
+    fn validate_type_expr_value_list_of_ipv4_address() {
+        let items = vec![
+            Value::String("192.168.1.1".to_string()),
+            Value::String("999.0.0.1".to_string()),
+        ];
+        let result = validate_type_expr_value(
+            &TypeExpr::List(Box::new(TypeExpr::Simple("ipv4_address".to_string()))),
+            &Value::List(items),
+        );
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("Element 1"));
+    }
+
+    #[test]
+    fn validate_type_expr_value_string_type_accepts_string() {
+        let result =
+            validate_type_expr_value(&TypeExpr::String, &Value::String("hello".to_string()));
+        assert!(result.is_none());
     }
 }

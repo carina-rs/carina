@@ -9,10 +9,7 @@ use crate::position;
 use carina_core::builtins;
 use carina_core::parser::{ArgumentParameter, ParsedFile, TypeExpr};
 use carina_core::resource::Value;
-use carina_core::schema::{
-    ResourceSchema, suggest_similar_name, validate_ipv4_address, validate_ipv4_cidr,
-    validate_ipv6_address, validate_ipv6_cidr,
-};
+use carina_core::schema::{ResourceSchema, suggest_similar_name};
 
 use super::DiagnosticEngine;
 
@@ -248,66 +245,15 @@ impl DiagnosticEngine {
         diagnostics
     }
 
-    /// Validate a module argument value against its expected type
+    /// Validate a module argument value against its expected type.
+    ///
+    /// Delegates to `carina_core::validation::validate_type_expr_value`.
     pub(super) fn validate_module_arg_type(
         &self,
         type_expr: &TypeExpr,
         value: &Value,
     ) -> Option<String> {
-        match (type_expr, value) {
-            // Custom type validation (cidr, ipv4_address, ipv6_cidr, ipv6_address)
-            (TypeExpr::Simple(name), Value::String(s)) => match name.as_str() {
-                "cidr" => validate_ipv4_cidr(s).err(),
-                "ipv4_address" => validate_ipv4_address(s).err(),
-                "ipv6_cidr" => validate_ipv6_cidr(s).err(),
-                "ipv6_address" => validate_ipv6_address(s).err(),
-                _ => None,
-            },
-            // List of custom type validation
-            (TypeExpr::List(inner), Value::List(items)) => {
-                if let TypeExpr::Simple(name) = inner.as_ref() {
-                    type ValidateFn = fn(&str) -> Result<(), String>;
-                    let validator: Option<ValidateFn> = match name.as_str() {
-                        "cidr" => Some(validate_ipv4_cidr),
-                        "ipv4_address" => Some(validate_ipv4_address),
-                        "ipv6_cidr" => Some(validate_ipv6_cidr),
-                        "ipv6_address" => Some(validate_ipv6_address),
-                        _ => None,
-                    };
-                    if let Some(validate_fn) = validator {
-                        for (i, item) in items.iter().enumerate() {
-                            if let Value::String(s) = item {
-                                if let Err(e) = validate_fn(s) {
-                                    return Some(format!("Element {}: {}", i, e));
-                                }
-                            } else {
-                                return Some(format!(
-                                    "Element {}: expected string, got {:?}",
-                                    i, item
-                                ));
-                            }
-                        }
-                    }
-                }
-                None
-            }
-            // Bool type validation
-            (TypeExpr::Bool, Value::String(s)) => Some(format!(
-                "Type mismatch: expected bool, got string \"{}\". Use true or false.",
-                s
-            )),
-            // Int type validation
-            (TypeExpr::Int, Value::String(s)) => Some(format!(
-                "Type mismatch: expected int, got string \"{}\".",
-                s
-            )),
-            // Float type validation
-            (TypeExpr::Float, Value::String(s)) => Some(format!(
-                "Type mismatch: expected float, got string \"{}\".",
-                s
-            )),
-            _ => None,
-        }
+        carina_core::validation::validate_type_expr_value(type_expr, value)
     }
 
     /// Find the position of a module call in the document
@@ -527,52 +473,28 @@ impl DiagnosticEngine {
     }
 
     /// Validate an attributes value against its declared type.
+    ///
+    /// Delegates to `carina_core::validation::validate_type_expr_value` for custom types
+    /// and basic type mismatches, then handles attributes-specific cross-type checks
+    /// (e.g., String vs Bool, Int vs Bool) with contextual error messages.
     fn validate_attributes_type(
         &self,
         type_expr: &TypeExpr,
         value: &Value,
         attr_name: &str,
     ) -> Option<String> {
+        // ResourceRef is always allowed (type is resolved at runtime)
+        if matches!(value, Value::ResourceRef { .. }) {
+            return None;
+        }
+
+        // Delegate shared validation (custom types, basic mismatches)
+        if let Some(err) = carina_core::validation::validate_type_expr_value(type_expr, value) {
+            return Some(err);
+        }
+
+        // Attributes-specific cross-type checks with contextual messages
         match (type_expr, value) {
-            // ResourceRef is always allowed (type is resolved at runtime)
-            (_, Value::ResourceRef { .. }) => None,
-            // Custom type validation (cidr, ipv4_address, ipv6_cidr, ipv6_address)
-            (TypeExpr::Simple(name), Value::String(s)) => match name.as_str() {
-                "cidr" => validate_ipv4_cidr(s).err(),
-                "ipv4_address" => validate_ipv4_address(s).err(),
-                "ipv6_cidr" => validate_ipv6_cidr(s).err(),
-                "ipv6_address" => validate_ipv6_address(s).err(),
-                _ => None,
-            },
-            // List of custom type validation
-            (TypeExpr::List(inner), Value::List(items)) => {
-                if let TypeExpr::Simple(name) = inner.as_ref() {
-                    type ValidateFn = fn(&str) -> Result<(), String>;
-                    let validator: Option<ValidateFn> = match name.as_str() {
-                        "cidr" => Some(validate_ipv4_cidr),
-                        "ipv4_address" => Some(validate_ipv4_address),
-                        "ipv6_cidr" => Some(validate_ipv6_cidr),
-                        "ipv6_address" => Some(validate_ipv6_address),
-                        _ => None,
-                    };
-                    if let Some(validate_fn) = validator {
-                        for (i, item) in items.iter().enumerate() {
-                            if let Value::String(s) = item {
-                                if let Err(e) = validate_fn(s) {
-                                    return Some(format!("Element {}: {}", i, e));
-                                }
-                            } else {
-                                return Some(format!(
-                                    "Element {}: expected string, got {:?}",
-                                    i, item
-                                ));
-                            }
-                        }
-                    }
-                }
-                None
-            }
-            // String type checks
             (TypeExpr::String, Value::Bool(b)) => Some(format!(
                 "Type mismatch in attributes '{}': expected string, got bool ({})",
                 attr_name, b
@@ -585,28 +507,13 @@ impl DiagnosticEngine {
                 "Type mismatch in attributes '{}': expected string, got float ({})",
                 attr_name, f
             )),
-            // Bool type checks
-            (TypeExpr::Bool, Value::String(s)) => Some(format!(
-                "Type mismatch in attributes '{}': expected bool, got string \"{}\". Use true or false.",
-                attr_name, s
-            )),
             (TypeExpr::Bool, Value::Int(n)) => Some(format!(
                 "Type mismatch in attributes '{}': expected bool, got int ({})",
                 attr_name, n
             )),
-            // Int type checks
-            (TypeExpr::Int, Value::String(s)) => Some(format!(
-                "Type mismatch in attributes '{}': expected int, got string \"{}\"",
-                attr_name, s
-            )),
             (TypeExpr::Int, Value::Bool(b)) => Some(format!(
                 "Type mismatch in attributes '{}': expected int, got bool ({})",
                 attr_name, b
-            )),
-            // Float type checks
-            (TypeExpr::Float, Value::String(s)) => Some(format!(
-                "Type mismatch in attributes '{}': expected float, got string \"{}\"",
-                attr_name, s
             )),
             (TypeExpr::Float, Value::Bool(b)) => Some(format!(
                 "Type mismatch in attributes '{}': expected float, got bool ({})",
