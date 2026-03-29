@@ -241,10 +241,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-cloudwatchlogs"
+version = "1.115.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2becbc454e9480856a012b98b65a274d0f658dc26353503e91a4885e0dcb674f"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-eventstream",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-ec2"
 version = "1.202.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fe3e45a7ada98c52972f50409fac4325d180399f202176d554c46ad7501ff94e"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-query",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
+ "fastrand",
+ "http 0.2.12",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-iam"
+version = "1.102.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af77c0858631193f0f8e4e6efee061b14a2dfa0da97d4329dd511e709285e517"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -797,7 +845,9 @@ name = "carina-provider-aws"
 version = "0.1.0"
 dependencies = [
  "aws-config",
+ "aws-sdk-cloudwatchlogs",
  "aws-sdk-ec2",
+ "aws-sdk-iam",
  "aws-sdk-s3",
  "aws-sdk-sts",
  "carina-aws-types",
@@ -807,6 +857,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "urlencoding",
 ]
 
 [[package]]

@@ -9,3 +9,4 @@ pub mod security_group_ingress;
 pub mod subnet;
 pub mod subnet_route_table_association;
 pub mod vpc;
+pub mod vpc_gateway_attachment;
