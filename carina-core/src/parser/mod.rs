@@ -453,19 +453,24 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
                                     expanded_module_calls,
                                     maybe_import,
                                 ) = parse_let_binding_extended(stmt, &ctx)?;
-                                if ctx.variables.contains_key(&name)
-                                    || ctx.resource_bindings.contains_key(&name)
-                                {
-                                    return Err(ParseError::DuplicateBinding { name, line });
+                                let is_discard = name == "_";
+                                if !is_discard {
+                                    if ctx.variables.contains_key(&name)
+                                        || ctx.resource_bindings.contains_key(&name)
+                                    {
+                                        return Err(ParseError::DuplicateBinding { name, line });
+                                    }
+                                    ctx.set_variable(name.clone(), value);
                                 }
-                                ctx.set_variable(name.clone(), value);
                                 if !expanded_resources.is_empty() {
-                                    // Register the binding name as a resource binding
-                                    // (use the first resource as placeholder)
-                                    ctx.set_resource_binding(
-                                        name.clone(),
-                                        expanded_resources[0].clone(),
-                                    );
+                                    if !is_discard {
+                                        // Register the binding name as a resource binding
+                                        // (use the first resource as placeholder)
+                                        ctx.set_resource_binding(
+                                            name.clone(),
+                                            expanded_resources[0].clone(),
+                                        );
+                                    }
                                     resources.extend(expanded_resources);
                                 }
                                 if !expanded_module_calls.is_empty() {
@@ -475,10 +480,12 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
                                         }
                                         module_calls.push(call);
                                     }
-                                    // Register as a resource binding so that
-                                    // `name.attr` resolves as ResourceRef
-                                    let placeholder = Resource::new("_module_binding", &name);
-                                    ctx.set_resource_binding(name.clone(), placeholder);
+                                    if !is_discard {
+                                        // Register as a resource binding so that
+                                        // `name.attr` resolves as ResourceRef
+                                        let placeholder = Resource::new("_module_binding", &name);
+                                        ctx.set_resource_binding(name.clone(), placeholder);
+                                    }
                                 }
                                 if let Some(import) = maybe_import {
                                     ctx.imported_modules
@@ -7510,5 +7517,24 @@ arguments {
             },
             other => panic!("Expected List, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn parse_let_discard_read_resource() {
+        let input = r#"
+            provider aws {
+                region = aws.Region.ap_northeast_1
+            }
+
+            let _ = read aws.sts.caller_identity {}
+        "#;
+
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        assert_eq!(result.resources[0].id.resource_type, "sts.caller_identity");
+        assert_eq!(
+            result.resources[0].kind,
+            crate::resource::ResourceKind::DataSource
+        );
     }
 }

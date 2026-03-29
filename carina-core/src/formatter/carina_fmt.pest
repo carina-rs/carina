@@ -124,8 +124,10 @@ fn_body_content = _{ trivia | fn_local_let | expression }
 fn_local_let = { kw_let ~ trivia+ ~ identifier ~ trivia* ~ equals ~ trivia* ~ expression }
 
 // Variable/resource definition: let name = value
+// discard_pattern allows `let _ = expr` to suppress unused binding warnings
+discard_pattern = @{ "_" }
 let_binding = {
-    kw_let ~ trivia+ ~ identifier ~ trivia* ~ equals ~ trivia* ~ expression
+    kw_let ~ trivia+ ~ (discard_pattern | identifier) ~ trivia* ~ equals ~ trivia* ~ expression
 }
 
 // Block content: local let bindings, attributes, trivia, nested blocks, or nested elements

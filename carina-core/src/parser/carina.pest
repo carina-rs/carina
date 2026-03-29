@@ -102,7 +102,9 @@ provider_block = {
 }
 
 // Variable/resource definition: let name = value
-let_binding = { "let" ~ identifier ~ "=" ~ expression }
+// discard_pattern allows `let _ = expr` to suppress unused binding warnings
+let_binding = { "let" ~ (discard_pattern | identifier) ~ "=" ~ expression }
+discard_pattern = @{ "_" }
 
 // Block content: a local let binding, an attribute (key = value), or a nested block (key { ... })
 block_content = { local_binding | attribute | nested_block }

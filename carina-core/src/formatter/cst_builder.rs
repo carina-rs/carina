@@ -210,7 +210,9 @@ impl<'a> CstBuilder<'a> {
             Rule::namespaced_id => {
                 Some(CstChild::Token(Token::new(pair.as_str().to_string(), span)))
             }
-            Rule::identifier => Some(CstChild::Token(Token::new(pair.as_str().to_string(), span))),
+            Rule::identifier | Rule::discard_pattern => {
+                Some(CstChild::Token(Token::new(pair.as_str().to_string(), span)))
+            }
             Rule::string => Some(CstChild::Token(Token::new(pair.as_str().to_string(), span))),
             Rule::float => Some(CstChild::Token(Token::new(pair.as_str().to_string(), span))),
             Rule::number => Some(CstChild::Token(Token::new(pair.as_str().to_string(), span))),

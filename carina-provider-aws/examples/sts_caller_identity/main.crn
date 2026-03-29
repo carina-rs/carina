@@ -7,4 +7,4 @@ provider aws {
   region = aws.Region.ap_northeast_1
 }
 
-let caller = read aws.sts.caller_identity {}
+let _ = read aws.sts.caller_identity {}
