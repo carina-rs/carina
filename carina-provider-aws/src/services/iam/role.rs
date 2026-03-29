@@ -330,6 +330,58 @@ fn value_to_json_pascal(value: &Value) -> serde_json::Value {
     }
 }
 
+/// Convert an IAM policy JSON string (PascalCase keys) to a Carina Value::Map (snake_case keys).
+pub fn iam_policy_json_to_value(json_str: &str) -> Result<Value, String> {
+    let json: serde_json::Value =
+        serde_json::from_str(json_str).map_err(|e| format!("JSON parse failed: {}", e))?;
+    Ok(json_to_value_snake(&json))
+}
+
+/// Recursively convert serde_json::Value (PascalCase keys) to Carina Value (snake_case keys).
+fn json_to_value_snake(json: &serde_json::Value) -> Value {
+    match json {
+        serde_json::Value::String(s) => Value::String(s.clone()),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Value::Int(i)
+            } else if let Some(f) = n.as_f64() {
+                Value::Float(f)
+            } else {
+                Value::String(n.to_string())
+            }
+        }
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Array(items) => {
+            Value::List(items.iter().map(json_to_value_snake).collect())
+        }
+        serde_json::Value::Object(obj) => {
+            let map: HashMap<String, Value> = obj
+                .iter()
+                .map(|(k, v)| (pascal_to_snake(k), json_to_value_snake(v)))
+                .collect();
+            Value::Map(map)
+        }
+        serde_json::Value::Null => Value::String(String::new()),
+    }
+}
+
+/// Convert PascalCase to snake_case (e.g., "AssumeRole" -> "assume_role").
+fn pascal_to_snake(s: &str) -> String {
+    let mut result = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            // Don't insert underscore between consecutive uppercase (e.g., "AWS" -> "aws")
+            let prev_upper = s.chars().nth(i - 1).is_some_and(|p| p.is_uppercase());
+            let next_lower = s.chars().nth(i + 1).is_some_and(|n| n.is_lowercase());
+            if !prev_upper || next_lower {
+                result.push('_');
+            }
+        }
+        result.push(c.to_lowercase().next().unwrap_or(c));
+    }
+    result
+}
+
 /// Convert snake_case to PascalCase (e.g., "assume_role" -> "AssumeRole").
 fn snake_to_pascal(s: &str) -> String {
     s.split('_')

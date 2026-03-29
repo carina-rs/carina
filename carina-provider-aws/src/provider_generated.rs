@@ -203,10 +203,13 @@ impl AwsProvider {
         if let Some(v) = obj.assume_role_policy_document() {
             // The SDK URL-encodes the policy document
             let decoded = urlencoding::decode(v).unwrap_or_else(|_| v.into());
-            attributes.insert(
-                "assume_role_policy_document".to_string(),
-                Value::String(decoded.into_owned()),
-            );
+            // Convert JSON string to Value::Map with snake_case keys for struct comparison
+            let policy_value = crate::services::iam::role::iam_policy_json_to_value(&decoded)
+                .unwrap_or_else(|_| {
+                    // Fallback to raw string if JSON parsing fails
+                    Value::String(decoded.into_owned())
+                });
+            attributes.insert("assume_role_policy_document".to_string(), policy_value);
         }
         if let Some(v) = obj.description() {
             attributes.insert("description".to_string(), Value::String(v.to_string()));

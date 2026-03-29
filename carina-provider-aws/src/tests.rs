@@ -756,16 +756,20 @@ fn test_extract_iam_role_attributes() {
         attributes.get("max_session_duration"),
         Some(&Value::Int(7200))
     );
-    // Verify that the assume_role_policy_document is URL-decoded
+    // Verify that the assume_role_policy_document is converted to a Map with snake_case keys
     let policy_doc = attributes
         .get("assume_role_policy_document")
         .expect("assume_role_policy_document should be present");
-    if let Value::String(s) = policy_doc {
-        assert!(s.contains("Version"));
-        assert!(s.contains("sts:AssumeRole"));
-        assert!(!s.contains('%')); // Should be decoded
+    if let Value::Map(map) = policy_doc {
+        assert!(map.contains_key("version"), "should have 'version' key");
+        assert!(map.contains_key("statement"), "should have 'statement' key");
+        if let Some(Value::String(v)) = map.get("version") {
+            assert_eq!(v, "2012-10-17");
+        } else {
+            panic!("Expected version to be String");
+        }
     } else {
-        panic!("Expected String");
+        panic!("Expected Map, got {:?}", policy_doc);
     }
 }
 
