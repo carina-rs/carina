@@ -1,0 +1,15 @@
+# EC2 EIP - Basic test
+#
+# Tests: Elastic IP allocation with tags
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+let eip = aws.ec2.eip {
+  domain = aws.ec2.eip.Domain.vpc
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}

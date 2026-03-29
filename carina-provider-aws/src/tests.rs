@@ -614,3 +614,98 @@ fn test_subnet_dns_options_fields_parsed_separately() {
         panic!("enable_resource_name_dns_aaaa_record should be present and a Bool");
     }
 }
+
+// --- extract_ec2_eip_attributes tests ---
+
+#[test]
+fn test_extract_ec2_eip_attributes() {
+    let addr = aws_sdk_ec2::types::Address::builder()
+        .allocation_id("eipalloc-12345678")
+        .domain(aws_sdk_ec2::types::DomainType::Vpc)
+        .public_ip("203.0.113.1")
+        .build();
+    let mut attributes = HashMap::new();
+    let identifier = AwsProvider::extract_ec2_eip_attributes(&addr, &mut attributes);
+    assert_eq!(identifier, Some("eipalloc-12345678".to_string()));
+    assert_eq!(
+        attributes.get("allocation_id"),
+        Some(&Value::String("eipalloc-12345678".to_string()))
+    );
+    assert_eq!(
+        attributes.get("domain"),
+        Some(&Value::String("vpc".to_string()))
+    );
+    assert_eq!(
+        attributes.get("public_ip"),
+        Some(&Value::String("203.0.113.1".to_string()))
+    );
+}
+
+#[test]
+fn test_extract_ec2_eip_attributes_minimal() {
+    let addr = aws_sdk_ec2::types::Address::builder().build();
+    let mut attributes = HashMap::new();
+    let identifier = AwsProvider::extract_ec2_eip_attributes(&addr, &mut attributes);
+    assert_eq!(identifier, None);
+    assert!(attributes.is_empty());
+}
+
+// --- extract_ec2_nat_gateway_attributes tests ---
+
+#[test]
+fn test_extract_ec2_nat_gateway_attributes() {
+    let nat_addr = aws_sdk_ec2::types::NatGatewayAddress::builder()
+        .allocation_id("eipalloc-12345678")
+        .build();
+    let ngw = aws_sdk_ec2::types::NatGateway::builder()
+        .nat_gateway_id("nat-12345678")
+        .subnet_id("subnet-12345678")
+        .connectivity_type(aws_sdk_ec2::types::ConnectivityType::Public)
+        .nat_gateway_addresses(nat_addr)
+        .build();
+    let mut attributes = HashMap::new();
+    let identifier = AwsProvider::extract_ec2_nat_gateway_attributes(&ngw, &mut attributes);
+    assert_eq!(identifier, Some("nat-12345678".to_string()));
+    assert_eq!(
+        attributes.get("nat_gateway_id"),
+        Some(&Value::String("nat-12345678".to_string()))
+    );
+    assert_eq!(
+        attributes.get("subnet_id"),
+        Some(&Value::String("subnet-12345678".to_string()))
+    );
+    assert_eq!(
+        attributes.get("connectivity_type"),
+        Some(&Value::String("public".to_string()))
+    );
+    assert_eq!(
+        attributes.get("allocation_id"),
+        Some(&Value::String("eipalloc-12345678".to_string()))
+    );
+}
+
+#[test]
+fn test_extract_ec2_nat_gateway_attributes_minimal() {
+    let ngw = aws_sdk_ec2::types::NatGateway::builder().build();
+    let mut attributes = HashMap::new();
+    let identifier = AwsProvider::extract_ec2_nat_gateway_attributes(&ngw, &mut attributes);
+    assert_eq!(identifier, None);
+}
+
+#[test]
+fn test_extract_ec2_nat_gateway_attributes_private() {
+    let ngw = aws_sdk_ec2::types::NatGateway::builder()
+        .nat_gateway_id("nat-87654321")
+        .subnet_id("subnet-87654321")
+        .connectivity_type(aws_sdk_ec2::types::ConnectivityType::Private)
+        .build();
+    let mut attributes = HashMap::new();
+    let identifier = AwsProvider::extract_ec2_nat_gateway_attributes(&ngw, &mut attributes);
+    assert_eq!(identifier, Some("nat-87654321".to_string()));
+    assert_eq!(
+        attributes.get("connectivity_type"),
+        Some(&Value::String("private".to_string()))
+    );
+    // Private NAT gateways don't have allocation_id
+    assert_eq!(attributes.get("allocation_id"), None);
+}
