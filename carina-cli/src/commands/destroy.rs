@@ -892,6 +892,7 @@ fn build_orphan_resource(sf: &carina_state::StateFile, id: &ResourceId) -> Resou
         prefixes: rs.prefixes.clone(),
         binding: rs.binding.clone(),
         dependency_bindings: rs.dependency_bindings.clone(),
+        module_source: None,
     }
 }
 

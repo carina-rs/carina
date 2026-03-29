@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::effect::Effect;
 use crate::module::DependencyGraph;
-use crate::resource::Value;
+pub use crate::resource::ModuleSource;
 
 /// Plan containing Effects to be executed
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -206,40 +206,6 @@ impl std::fmt::Display for PlanSummary {
     }
 }
 
-/// Source of a resource (root or from a module)
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum ModuleSource {
-    /// Resource defined at the root level
-    Root,
-    /// Resource from a module instantiation
-    Module {
-        /// Module name (e.g., "web_tier")
-        name: String,
-        /// Instance binding name (e.g., "web")
-        instance: String,
-    },
-}
-
-impl ModuleSource {
-    /// Create a Root source
-    pub fn root() -> Self {
-        Self::Root
-    }
-
-    /// Create a Module source
-    pub fn module(name: impl Into<String>, instance: impl Into<String>) -> Self {
-        Self::Module {
-            name: name.into(),
-            instance: instance.into(),
-        }
-    }
-
-    /// Check if this is the root source
-    pub fn is_root(&self) -> bool {
-        matches!(self, Self::Root)
-    }
-}
-
 /// A Plan with module source information
 #[derive(Debug, Clone, Default)]
 pub struct ModularPlan {
@@ -268,10 +234,10 @@ impl ModularPlan {
         // Extract module sources from effect resources
         for (idx, effect) in plan.effects().iter().enumerate() {
             let source = match effect {
-                Effect::Create(r) => Self::extract_source(&r.attributes),
-                Effect::Update { to, .. } => Self::extract_source(&to.attributes),
-                Effect::Replace { to, .. } => Self::extract_source(&to.attributes),
-                Effect::Read { resource } => Self::extract_source(&resource.attributes),
+                Effect::Create(r) => Self::extract_source(r),
+                Effect::Update { to, .. } => Self::extract_source(to),
+                Effect::Replace { to, .. } => Self::extract_source(to),
+                Effect::Read { resource } => Self::extract_source(resource),
                 Effect::Delete { .. }
                 | Effect::Import { .. }
                 | Effect::Remove { .. }
@@ -283,20 +249,8 @@ impl ModularPlan {
         modular
     }
 
-    fn extract_source(attrs: &HashMap<String, Value>) -> ModuleSource {
-        let module_name = attrs.get("_module").and_then(|v| match v {
-            Value::String(s) => Some(s.clone()),
-            _ => None,
-        });
-        let instance_name = attrs.get("_module_instance").and_then(|v| match v {
-            Value::String(s) => Some(s.clone()),
-            _ => None,
-        });
-
-        match (module_name, instance_name) {
-            (Some(name), Some(instance)) => ModuleSource::Module { name, instance },
-            _ => ModuleSource::Root,
-        }
+    fn extract_source(resource: &crate::resource::Resource) -> ModuleSource {
+        resource.module_source.clone().unwrap_or(ModuleSource::Root)
     }
 
     /// Get the source for an effect by index
@@ -445,14 +399,11 @@ mod tests {
         plan.add(Effect::Create(Resource::new("vpc", "main")));
 
         // Module resource
-        let mut module_resource = Resource::new("security_group", "web_sg");
-        module_resource
-            .attributes
-            .insert("_module".to_string(), Value::String("web_tier".to_string()));
-        module_resource.attributes.insert(
-            "_module_instance".to_string(),
-            Value::String("web".to_string()),
-        );
+        let module_resource =
+            Resource::new("security_group", "web_sg").with_module_source(ModuleSource::Module {
+                name: "web_tier".to_string(),
+                instance: "web".to_string(),
+            });
         plan.add(Effect::Create(module_resource));
 
         let modular = ModularPlan::from_plan(plan);
@@ -476,14 +427,11 @@ mod tests {
         plan.add(Effect::Create(Resource::new("subnet", "public")));
 
         // Module resource
-        let mut module_resource = Resource::new("security_group", "web_sg");
-        module_resource
-            .attributes
-            .insert("_module".to_string(), Value::String("web_tier".to_string()));
-        module_resource.attributes.insert(
-            "_module_instance".to_string(),
-            Value::String("web".to_string()),
-        );
+        let module_resource =
+            Resource::new("security_group", "web_sg").with_module_source(ModuleSource::Module {
+                name: "web_tier".to_string(),
+                instance: "web".to_string(),
+            });
         plan.add(Effect::Create(module_resource));
 
         let modular = ModularPlan::from_plan(plan);

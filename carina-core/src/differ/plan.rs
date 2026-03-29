@@ -312,6 +312,7 @@ pub fn create_plan(
                     prefixes: HashMap::new(),
                     binding: None,
                     dependency_bindings: Vec::new(),
+                    module_source: None,
                 };
                 get_resource_dependencies(&temp_resource)
             };

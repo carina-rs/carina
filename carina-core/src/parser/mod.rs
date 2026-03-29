@@ -892,7 +892,7 @@ enum ForBinding {
 
 /// Result of parsing a for expression body: either a resource or a module call
 enum ForBodyResult {
-    Resource(Resource),
+    Resource(Box<Resource>),
     ModuleCall(ModuleCall),
 }
 
@@ -931,7 +931,7 @@ fn parse_for_expr(
                    resources: &mut Vec<Resource>,
                    module_calls: &mut Vec<ModuleCall>| {
         match result {
-            ForBodyResult::Resource(r) => resources.push(r),
+            ForBodyResult::Resource(r) => resources.push(*r),
             ForBodyResult::ModuleCall(c) => module_calls.push(c),
         }
     };
@@ -1101,11 +1101,11 @@ fn parse_for_body(
             }
             Rule::resource_expr => {
                 let resource = parse_resource_expr(inner, &local_ctx, address)?;
-                return Ok(ForBodyResult::Resource(resource));
+                return Ok(ForBodyResult::Resource(Box::new(resource)));
             }
             Rule::read_resource_expr => {
                 let resource = parse_read_resource_expr(inner, &local_ctx, address)?;
-                return Ok(ForBodyResult::Resource(resource));
+                return Ok(ForBodyResult::Resource(Box::new(resource)));
             }
             Rule::module_call => {
                 let mut call = parse_module_call(inner, &local_ctx)?;
@@ -1124,7 +1124,7 @@ fn parse_for_body(
 
 /// Result of parsing an if expression body: a resource, a module call, or a value
 enum IfBodyResult {
-    Resource(Resource),
+    Resource(Box<Resource>),
     ModuleCall(ModuleCall),
     Value(Value),
 }
@@ -1199,7 +1199,7 @@ fn parse_if_body_to_rhs(
     match result {
         IfBodyResult::Resource(r) => {
             let ref_value = Value::String(format!("${{{}}}", binding_name));
-            Ok((ref_value, vec![r], vec![], None))
+            Ok((ref_value, vec![*r], vec![], None))
         }
         IfBodyResult::ModuleCall(c) => {
             let value = Value::String(format!("${{module:{}}}", c.module_name));
@@ -1232,11 +1232,11 @@ fn parse_if_body(
             }
             Rule::resource_expr => {
                 let resource = parse_resource_expr(inner, &local_ctx, binding_name)?;
-                return Ok(IfBodyResult::Resource(resource));
+                return Ok(IfBodyResult::Resource(Box::new(resource)));
             }
             Rule::read_resource_expr => {
                 let resource = parse_read_resource_expr(inner, &local_ctx, binding_name)?;
-                return Ok(IfBodyResult::Resource(resource));
+                return Ok(IfBodyResult::Resource(Box::new(resource)));
             }
             Rule::module_call => {
                 let mut call = parse_module_call(inner, &local_ctx)?;
@@ -2119,6 +2119,7 @@ fn parse_anonymous_resource(
         prefixes: HashMap::new(),
         binding: None,
         dependency_bindings: Vec::new(),
+        module_source: None,
     })
 }
 
@@ -2264,6 +2265,7 @@ fn parse_resource_expr(
         prefixes: HashMap::new(),
         binding: Some(binding_name.to_string()),
         dependency_bindings: Vec::new(),
+        module_source: None,
     })
 }
 
@@ -2309,6 +2311,7 @@ fn parse_read_resource_expr(
         prefixes: HashMap::new(),
         binding: Some(binding_name.to_string()),
         dependency_bindings: Vec::new(),
+        module_source: None,
     })
 }
 
