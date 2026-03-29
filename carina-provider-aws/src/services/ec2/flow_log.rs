@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use carina_core::provider::{ProviderError, ProviderResult};
 use carina_core::resource::{Resource, ResourceId, State, Value};
-use carina_core::utils::extract_enum_value;
+use carina_core::utils::{extract_enum_value, extract_enum_value_with_values};
 
 use crate::AwsProvider;
 
@@ -93,7 +93,9 @@ impl AwsProvider {
         if let Some(Value::String(log_dest_type)) = resource.attributes.get("log_destination_type")
         {
             use aws_sdk_ec2::types::LogDestinationType;
-            let ldt = LogDestinationType::from(extract_enum_value(log_dest_type));
+            let valid = &["cloud-watch-logs", "s3", "kinesis-data-firehose"];
+            let ldt =
+                LogDestinationType::from(extract_enum_value_with_values(log_dest_type, valid));
             req = req.log_destination_type(ldt);
         }
 
@@ -144,6 +146,7 @@ impl AwsProvider {
                 Ok(resp) => resp,
                 Err(e) => {
                     let err_str = format!("{}", e);
+                    // IAM propagation or authorization error — will retry
                     last_error = err_str.clone();
                     if err_str.contains("Unable to assume") || err_str.contains("Not authorized") {
                         continue;
