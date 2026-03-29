@@ -213,6 +213,224 @@ pub fn find_non_snake_case_bindings(source: &str) -> Vec<NamingWarning> {
     warnings
 }
 
+/// A warning for binding names that redundantly include the resource type.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RedundantTypeWarning {
+    /// The binding name
+    pub binding: String,
+    /// The resource type that is redundantly included
+    pub resource_type: String,
+    /// 1-indexed line number
+    pub line: usize,
+}
+
+/// Find `let` bindings whose names redundantly include the resource type.
+///
+/// Detects patterns like `let security_group_sg = aws.ec2.security_group { ... }`
+/// where the binding name contains the full resource type as a word-boundary
+/// substring. Short resource types (4 chars or less, e.g., "vpc", "eip") are
+/// excluded because they are commonly used as binding names themselves.
+pub fn find_redundant_type_in_binding(source: &str) -> Vec<RedundantTypeWarning> {
+    let mut warnings = Vec::new();
+
+    for (line_idx, line) in source.lines().enumerate() {
+        let trimmed = line.trim_start();
+
+        // Skip comment lines
+        if trimmed.starts_with("//") || trimmed.starts_with('#') {
+            continue;
+        }
+
+        // Match `let <name> = <provider>.<service>.<resource_type> {`
+        if let Some(rest) = trimmed.strip_prefix("let ") {
+            let rest = rest.trim_start();
+            // Extract binding name (until whitespace or '=')
+            let binding: String = rest
+                .chars()
+                .take_while(|c| !c.is_whitespace() && *c != '=')
+                .collect();
+            if binding.is_empty() || binding.starts_with('_') {
+                continue;
+            }
+
+            // Find the resource expression after '='
+            let after_name = &rest[binding.len()..];
+            let after_eq = after_name.trim_start();
+            if let Some(after_eq) = after_eq.strip_prefix('=') {
+                let expr = after_eq.trim_start();
+                // Match provider.service.resource_type pattern
+                if let Some(resource_type) = extract_resource_type_from_expr(expr) {
+                    // Skip short resource types (4 chars or fewer)
+                    if resource_type.len() <= 4 {
+                        continue;
+                    }
+                    // Check if binding contains the resource type as word-boundary match
+                    if contains_as_word_segment(&binding, &resource_type) {
+                        warnings.push(RedundantTypeWarning {
+                            binding,
+                            resource_type,
+                            line: line_idx + 1,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    warnings
+}
+
+/// Extract the resource type (last segment) from a `provider.service.resource_type` expression.
+/// Returns `None` if the expression does not match the expected pattern.
+fn extract_resource_type_from_expr(expr: &str) -> Option<String> {
+    // Take characters that form the dotted identifier
+    let ident: String = expr
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
+        .collect();
+
+    let parts: Vec<&str> = ident.split('.').collect();
+    // Expect at least provider.service.resource_type (3 parts)
+    if parts.len() >= 3 {
+        // Resource type is everything after service (may contain underscores)
+        // e.g., "aws.ec2.security_group" -> "security_group"
+        // e.g., "awscc.ec2.vpc_gateway_attachment" -> "vpc_gateway_attachment"
+        Some(parts[2..].join("_"))
+    } else {
+        None
+    }
+}
+
+/// Check if `haystack` contains `needle` as a whole word segment,
+/// using underscore and string boundaries as word delimiters.
+///
+/// For example:
+/// - `contains_as_word_segment("security_group_sg", "security_group")` -> true
+/// - `contains_as_word_segment("vpcflow", "vpc")` -> false (no boundary after "vpc")
+/// - `contains_as_word_segment("security_group", "security_group")` -> true (exact match)
+fn contains_as_word_segment(haystack: &str, needle: &str) -> bool {
+    if haystack == needle {
+        return true;
+    }
+
+    // Split both by underscores and check if needle segments appear consecutively
+    let haystack_parts: Vec<&str> = haystack.split('_').collect();
+    let needle_parts: Vec<&str> = needle.split('_').collect();
+
+    if needle_parts.len() > haystack_parts.len() {
+        return false;
+    }
+
+    for start in 0..=(haystack_parts.len() - needle_parts.len()) {
+        if haystack_parts[start..start + needle_parts.len()] == needle_parts[..] {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// A warning for tag keys that don't follow PascalCase convention.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TagKeyWarning {
+    /// The tag key that is not PascalCase
+    pub key: String,
+    /// 1-indexed line number
+    pub line: usize,
+}
+
+/// Check whether a tag key follows PascalCase convention.
+///
+/// PascalCase means: starts with an uppercase letter, no underscores,
+/// no consecutive uppercase letters (simple heuristic).
+fn is_pascal_case(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    if !name.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return false;
+    }
+    // Must not contain underscores or hyphens
+    if name.contains('_') || name.contains('-') {
+        return false;
+    }
+    // All chars must be alphanumeric
+    name.chars().all(|c| c.is_alphanumeric())
+}
+
+/// Find tag keys that don't follow PascalCase convention within `tags = { ... }` blocks.
+///
+/// Scans source text for `tags = {` blocks and checks each key assignment inside.
+/// Tag keys are expected to be PascalCase (e.g., `Name`, `Environment`, `ManagedBy`).
+pub fn find_inconsistent_tag_keys(source: &str) -> Vec<TagKeyWarning> {
+    let mut warnings = Vec::new();
+    let mut in_tags_block = false;
+    let mut brace_depth: usize = 0;
+
+    for (line_idx, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        let line_number = line_idx + 1;
+
+        // Skip comment lines
+        if trimmed.starts_with("//") || trimmed.starts_with('#') {
+            continue;
+        }
+
+        // Detect start of a tags block: `tags = {`
+        if !in_tags_block {
+            let tag_pattern = trimmed.strip_prefix("tags");
+            if let Some(after) = tag_pattern {
+                let after = after.trim_start();
+                if let Some(after_eq) = after.strip_prefix('=') {
+                    let after_eq = after_eq.trim_start();
+                    if after_eq.starts_with('{') {
+                        in_tags_block = true;
+                        brace_depth = 1;
+                        // Check for keys on the same line after `{`
+                        // (unlikely in practice but handle it)
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if in_tags_block {
+            // Count braces
+            for ch in trimmed.chars() {
+                match ch {
+                    '{' => brace_depth += 1,
+                    '}' => {
+                        brace_depth = brace_depth.saturating_sub(1);
+                        if brace_depth == 0 {
+                            in_tags_block = false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Check for key = value pattern
+            if !trimmed.starts_with('}')
+                && let Some(eq_pos) = trimmed.find('=')
+            {
+                let key = trimmed[..eq_pos].trim();
+                // Must be a simple identifier
+                if !key.is_empty()
+                    && key.chars().all(|c| c.is_alphanumeric() || c == '_')
+                    && !is_pascal_case(key)
+                {
+                    warnings.push(TagKeyWarning {
+                        key: key.to_string(),
+                        line: line_number,
+                    });
+                }
+            }
+        }
+    }
+
+    warnings
+}
+
 /// Rough heuristic to check if a byte position is inside a string literal.
 fn is_inside_string(line: &str, pos: usize) -> bool {
     let mut in_string = false;
@@ -718,5 +936,170 @@ let e = replace("old", "new", str)
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "badName");
         assert_eq!(results[0].line, 2);
+    }
+
+    // --- Resource type redundancy in binding name tests ---
+
+    #[test]
+    fn test_redundant_type_in_binding_warns() {
+        // "security_group_sg" contains "security_group" which is the resource type
+        let source = r#"let security_group_sg = aws.ec2.security_group {
+    group_name = "test"
+}"#;
+        let results = find_redundant_type_in_binding(source);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].binding, "security_group_sg");
+        assert_eq!(results[0].resource_type, "security_group");
+        assert_eq!(results[0].line, 1);
+    }
+
+    #[test]
+    fn test_redundant_type_full_match_warns() {
+        // Binding name is exactly the resource type
+        let source = r#"let security_group = aws.ec2.security_group {
+    group_name = "test"
+}"#;
+        let results = find_redundant_type_in_binding(source);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].binding, "security_group");
+    }
+
+    #[test]
+    fn test_redundant_type_abbreviated_no_warning() {
+        // "sg" does not contain the full resource type "security_group"
+        let source = r#"let sg = aws.ec2.security_group {
+    group_name = "test"
+}"#;
+        let results = find_redundant_type_in_binding(source);
+        assert!(results.is_empty(), "Abbreviated binding should not warn");
+    }
+
+    #[test]
+    fn test_redundant_type_descriptive_no_warning() {
+        // "web_server" does not contain "instance" as a substring
+        let source = r#"let web_server = aws.ec2.instance {
+    instance_type = "t3.micro"
+}"#;
+        let results = find_redundant_type_in_binding(source);
+        assert!(results.is_empty(), "Descriptive binding should not warn");
+    }
+
+    #[test]
+    fn test_redundant_type_partial_word_no_warning() {
+        // "vpcflow" contains "vpc" but not as a whole word segment
+        let source = r#"let vpcflow = aws.ec2.vpc {
+    cidr_block = "10.0.0.0/16"
+}"#;
+        let results = find_redundant_type_in_binding(source);
+        assert!(results.is_empty(), "Partial word match should not warn");
+    }
+
+    #[test]
+    fn test_redundant_type_multiword_resource_warns() {
+        // "route_table_main" contains "route_table"
+        let source = r#"let route_table_main = awscc.ec2.route_table {
+    vpc_id = vpc.vpc_id
+}"#;
+        let results = find_redundant_type_in_binding(source);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].binding, "route_table_main");
+        assert_eq!(results[0].resource_type, "route_table");
+    }
+
+    #[test]
+    fn test_redundant_type_short_resource_type_no_warning() {
+        // Short resource types like "vpc" (3 chars) are commonly used in binding names
+        // and should not trigger warnings
+        let source = r#"let vpc = awscc.ec2.vpc {
+    cidr_block = "10.0.0.0/16"
+}"#;
+        let results = find_redundant_type_in_binding(source);
+        assert!(
+            results.is_empty(),
+            "Short resource types used as binding names should not warn"
+        );
+    }
+
+    #[test]
+    fn test_redundant_type_comment_line_no_warning() {
+        let source = r#"// let security_group_sg = aws.ec2.security_group {"#;
+        let results = find_redundant_type_in_binding(source);
+        assert!(results.is_empty(), "Comment lines should not warn");
+    }
+
+    // --- Tag key casing consistency tests ---
+
+    #[test]
+    fn test_tag_mixed_casing_warns() {
+        let source = r#"
+let vpc = awscc.ec2.vpc {
+    cidr_block = "10.0.0.0/16"
+    tags = {
+        Name = "my-vpc"
+        environment = "prod"
+    }
+}"#;
+        let results = find_inconsistent_tag_keys(source);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].line, 6); // "environment" line
+        assert_eq!(results[0].key, "environment");
+    }
+
+    #[test]
+    fn test_tag_all_pascal_case_no_warning() {
+        let source = r#"
+let vpc = awscc.ec2.vpc {
+    cidr_block = "10.0.0.0/16"
+    tags = {
+        Name = "my-vpc"
+        Environment = "prod"
+        ManagedBy = "carina"
+    }
+}"#;
+        let results = find_inconsistent_tag_keys(source);
+        assert!(results.is_empty(), "All PascalCase should not warn");
+    }
+
+    #[test]
+    fn test_tag_snake_case_warns() {
+        let source = r#"
+tags = {
+    managed_by = "carina"
+    env_name = "prod"
+}"#;
+        let results = find_inconsistent_tag_keys(source);
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_tag_comment_line_no_warning() {
+        let source = r#"
+// tags = {
+//     bad_key = "value"
+// }"#;
+        let results = find_inconsistent_tag_keys(source);
+        assert!(results.is_empty(), "Comment lines should not warn");
+    }
+
+    #[test]
+    fn test_tag_multiple_tag_blocks() {
+        let source = r#"
+let vpc = awscc.ec2.vpc {
+    tags = {
+        Name = "vpc"
+        environment = "prod"
+    }
+}
+
+let subnet = awscc.ec2.subnet {
+    tags = {
+        Name = "subnet"
+        managed_by = "carina"
+    }
+}"#;
+        let results = find_inconsistent_tag_keys(source);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].key, "environment");
+        assert_eq!(results[1].key, "managed_by");
     }
 }
