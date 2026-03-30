@@ -5128,6 +5128,40 @@ aws.s3.bucket {
     }
 
     #[test]
+    fn partial_application_closure_in_resource_attribute() {
+        // Closure variable used in resource attribute via pipe
+        let input = r#"
+            let dash_join = join("-")
+            let bucket = aws.s3_bucket {
+                name = ["my", "bucket"] |> dash_join()
+            }
+        "#;
+        let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+        resolve_resource_refs(&mut parsed).unwrap();
+        assert_eq!(
+            parsed.resources[0].get_attr("name"),
+            Some(&Value::String("my-bucket".to_string()))
+        );
+    }
+
+    #[test]
+    fn partial_application_closure_direct_call_in_resource_attribute() {
+        // Closure variable used in resource attribute via direct call
+        let input = r#"
+            let dash_join = join("-")
+            let bucket = aws.s3_bucket {
+                name = dash_join(["my", "bucket"])
+            }
+        "#;
+        let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+        resolve_resource_refs(&mut parsed).unwrap();
+        assert_eq!(
+            parsed.resources[0].get_attr("name"),
+            Some(&Value::String("my-bucket".to_string()))
+        );
+    }
+
+    #[test]
     fn forward_reference_parsed_as_resource_ref() {
         // Issue #866: Forward references should be resolved as ResourceRef,
         // not silently left as a plain string.
