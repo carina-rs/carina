@@ -275,7 +275,7 @@ pub async fn run_plan(
 /// map of resource bindings to their attributes. The result maps each remote_state
 /// binding name to a `HashMap<String, Value>` where keys are resource binding names
 /// and values are `Value::Map` of that resource's attributes.
-fn load_remote_states(
+pub(crate) fn load_remote_states(
     remote_states: &[RemoteState],
     base_dir: &Path,
 ) -> Result<HashMap<String, HashMap<String, Value>>, AppError> {

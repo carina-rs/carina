@@ -20,7 +20,7 @@ use carina_core::executor::{
 use carina_core::module_resolver;
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
-use carina_core::resolver::resolve_refs_with_state;
+use carina_core::resolver::resolve_refs_with_state_and_remote;
 use carina_core::resource::{Expr, Resource, ResourceId, State, Value};
 use carina_core::schema::ResourceSchema;
 use carina_core::value::format_value;
@@ -966,6 +966,7 @@ pub async fn run_apply(
         auto_approve,
         backend.as_ref(),
         lock_info.as_ref(),
+        base_dir,
     )
     .await;
 
@@ -990,6 +991,7 @@ async fn run_apply_locked(
     auto_approve: bool,
     backend: &dyn StateBackend,
     lock: Option<&LockInfo>,
+    base_dir: &std::path::Path,
 ) -> Result<(), AppError> {
     // Read current state from backend
     let state_file = backend.read_state().await.map_err(AppError::Backend)?;
@@ -1079,9 +1081,12 @@ async fn run_apply_locked(
         }
     }
 
+    // Load remote state data sources
+    let remote_bindings = super::plan::load_remote_states(&parsed.remote_states, base_dir)?;
+
     // Resolve references and enum identifiers, then create initial plan for display
     let mut resources_for_plan = sorted_resources.clone();
-    resolve_refs_with_state(&mut resources_for_plan, &current_states)?;
+    resolve_refs_with_state_and_remote(&mut resources_for_plan, &current_states, &remote_bindings)?;
     provider.normalize_desired(&mut resources_for_plan);
 
     // Normalize state enum values to match the DSL format produced by normalize_desired.
