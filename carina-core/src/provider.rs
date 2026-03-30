@@ -751,7 +751,7 @@ mod tests {
                 // Prefix all string attribute values with "normalized:"
                 for resource in resources.iter_mut() {
                     for value in resource.attributes.values_mut() {
-                        if let Value::String(s) = &mut value.0 {
+                        if let Value::String(s) = &mut **value {
                             *s = format!("normalized:{}", s);
                         }
                     }
@@ -856,7 +856,7 @@ mod tests {
                 for resource in resources.iter_mut() {
                     if resource.id.provider == "normalizing" {
                         for value in resource.attributes.values_mut() {
-                            if let Value::String(s) = &mut value.0 {
+                            if let Value::String(s) = &mut **value {
                                 *s = format!("norm:{}", s);
                             }
                         }
