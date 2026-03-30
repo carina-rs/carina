@@ -13,6 +13,7 @@ export default defineConfig({
       social: {
         github: 'https://github.com/carina-rs/carina',
       },
+      customCss: ['./src/styles/custom.css'],
       expressiveCode: {
         shiki: {
           langs: [crnGrammar],
