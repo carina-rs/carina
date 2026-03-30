@@ -142,6 +142,53 @@ pub struct ArgumentParameter {
     pub default: Option<Value>,
     /// Optional description (from block form)
     pub description: Option<String>,
+    /// Optional validation expression (from block form)
+    pub validate: Option<ValidateExpr>,
+    /// Optional validation error message (from block form)
+    pub message: Option<String>,
+}
+
+/// Comparison operator in a validate expression
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompareOp {
+    Gte,
+    Lte,
+    Gt,
+    Lt,
+    Eq,
+    Ne,
+}
+
+/// Validate expression AST node
+#[derive(Debug, Clone, PartialEq)]
+pub enum ValidateExpr {
+    /// Boolean literal
+    Bool(bool),
+    /// Integer literal
+    Int(i64),
+    /// Float literal
+    Float(f64),
+    /// String literal
+    String(String),
+    /// Variable reference (argument name)
+    Var(String),
+    /// Comparison: lhs op rhs
+    Compare {
+        lhs: Box<ValidateExpr>,
+        op: CompareOp,
+        rhs: Box<ValidateExpr>,
+    },
+    /// Logical AND
+    And(Box<ValidateExpr>, Box<ValidateExpr>),
+    /// Logical OR
+    Or(Box<ValidateExpr>, Box<ValidateExpr>),
+    /// Logical NOT
+    Not(Box<ValidateExpr>),
+    /// Function call (e.g., len(x))
+    FunctionCall {
+        name: String,
+        args: Vec<ValidateExpr>,
+    },
 }
 
 /// Attribute parameter definition (in `attributes { ... }` block)
@@ -585,26 +632,46 @@ fn parse_arguments_block(
             // Check if the next element is a block form or simple default
             if let Some(next) = param_inner.next() {
                 if next.as_rule() == Rule::arguments_param_block {
-                    // Block form: parse description and default from attrs
+                    // Block form: parse description, default, validate, message from attrs
                     let mut description = None;
                     let mut default = None;
+                    let mut validate = None;
+                    let mut message = None;
                     for attr in next.into_inner() {
                         if attr.as_rule() == Rule::arguments_param_attr {
-                            let mut attr_inner = attr.into_inner();
-                            if let Some(first) = attr_inner.next() {
-                                match first.as_rule() {
-                                    Rule::string => {
-                                        // description = "..."
-                                        let value = parse_string_value(first, &ctx)?;
-                                        if let Value::String(s) = value {
-                                            description = Some(s);
-                                        }
-                                    }
-                                    _ => {
-                                        // default = expression
-                                        default = Some(parse_expression(first, &ctx)?);
+                            let inner_attr =
+                                first_inner(attr, "attribute", "arguments_param_attr")?;
+                            match inner_attr.as_rule() {
+                                Rule::arg_description_attr => {
+                                    let string_pair =
+                                        first_inner(inner_attr, "string", "arg_description_attr")?;
+                                    let value = parse_string_value(string_pair, &ctx)?;
+                                    if let Value::String(s) = value {
+                                        description = Some(s);
                                     }
                                 }
+                                Rule::arg_default_attr => {
+                                    let expr_pair =
+                                        first_inner(inner_attr, "expression", "arg_default_attr")?;
+                                    default = Some(parse_expression(expr_pair, &ctx)?);
+                                }
+                                Rule::arg_validate_attr => {
+                                    let validate_pair = first_inner(
+                                        inner_attr,
+                                        "validate_expr",
+                                        "arg_validate_attr",
+                                    )?;
+                                    validate = Some(parse_validate_expr(validate_pair)?);
+                                }
+                                Rule::arg_message_attr => {
+                                    let string_pair =
+                                        first_inner(inner_attr, "string", "arg_message_attr")?;
+                                    let value = parse_string_value(string_pair, &ctx)?;
+                                    if let Value::String(s) = value {
+                                        message = Some(s);
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -613,6 +680,8 @@ fn parse_arguments_block(
                         type_expr,
                         default,
                         description,
+                        validate,
+                        message,
                     });
                 } else {
                     // Simple form: the next element is the default expression
@@ -622,6 +691,8 @@ fn parse_arguments_block(
                         type_expr,
                         default,
                         description: None,
+                        validate: None,
+                        message: None,
                     });
                 }
             } else {
@@ -631,12 +702,140 @@ fn parse_arguments_block(
                     type_expr,
                     default: None,
                     description: None,
+                    validate: None,
+                    message: None,
                 });
             }
         }
     }
 
     Ok(arguments)
+}
+
+/// Parse a validate expression (boolean expression with comparisons and logical operators)
+fn parse_validate_expr(pair: pest::iterators::Pair<Rule>) -> Result<ValidateExpr, ParseError> {
+    match pair.as_rule() {
+        Rule::validate_expr => {
+            let inner = first_inner(pair, "validate_or_expr", "validate_expr")?;
+            parse_validate_expr(inner)
+        }
+        Rule::validate_or_expr => {
+            let mut inner = pair.into_inner();
+            let first = next_pair(&mut inner, "validate_and_expr", "validate_or_expr")?;
+            let mut result = parse_validate_expr(first)?;
+            for next in inner {
+                let right = parse_validate_expr(next)?;
+                result = ValidateExpr::Or(Box::new(result), Box::new(right));
+            }
+            Ok(result)
+        }
+        Rule::validate_and_expr => {
+            let mut inner = pair.into_inner();
+            let first = next_pair(&mut inner, "validate_not_expr", "validate_and_expr")?;
+            let mut result = parse_validate_expr(first)?;
+            for next in inner {
+                let right = parse_validate_expr(next)?;
+                result = ValidateExpr::And(Box::new(result), Box::new(right));
+            }
+            Ok(result)
+        }
+        Rule::validate_not_expr => {
+            let mut inner = pair.into_inner();
+            let first = next_pair(&mut inner, "operand", "validate_not_expr")?;
+            if first.as_rule() == Rule::validate_not_expr {
+                // This is the "!" ~ validate_not_expr branch
+                let operand = parse_validate_expr(first)?;
+                Ok(ValidateExpr::Not(Box::new(operand)))
+            } else {
+                // This is the validate_comparison branch
+                parse_validate_expr(first)
+            }
+        }
+        Rule::validate_comparison => {
+            let mut inner = pair.into_inner();
+            let lhs_pair = next_pair(&mut inner, "validate_primary", "validate_comparison")?;
+            let lhs = parse_validate_expr(lhs_pair)?;
+            if let Some(op_pair) = inner.next() {
+                let op = match op_pair.as_str() {
+                    ">=" => CompareOp::Gte,
+                    "<=" => CompareOp::Lte,
+                    ">" => CompareOp::Gt,
+                    "<" => CompareOp::Lt,
+                    "==" => CompareOp::Eq,
+                    "!=" => CompareOp::Ne,
+                    other => {
+                        return Err(ParseError::InvalidExpression {
+                            line: 0,
+                            message: format!("Unknown comparison operator: {}", other),
+                        });
+                    }
+                };
+                let rhs_pair =
+                    next_pair(&mut inner, "validate_primary", "validate_comparison rhs")?;
+                let rhs = parse_validate_expr(rhs_pair)?;
+                Ok(ValidateExpr::Compare {
+                    lhs: Box::new(lhs),
+                    op,
+                    rhs: Box::new(rhs),
+                })
+            } else {
+                Ok(lhs)
+            }
+        }
+        Rule::validate_primary => {
+            let inner = first_inner(pair, "value", "validate_primary")?;
+            parse_validate_expr(inner)
+        }
+        Rule::validate_function_call => {
+            let mut inner = pair.into_inner();
+            let name = next_pair(&mut inner, "function name", "validate_function_call")?
+                .as_str()
+                .to_string();
+            let mut args = Vec::new();
+            for arg_pair in inner {
+                args.push(parse_validate_expr(arg_pair)?);
+            }
+            Ok(ValidateExpr::FunctionCall { name, args })
+        }
+        Rule::boolean => Ok(ValidateExpr::Bool(pair.as_str() == "true")),
+        Rule::float => {
+            let f: f64 = pair
+                .as_str()
+                .parse()
+                .map_err(|e| ParseError::InvalidExpression {
+                    line: 0,
+                    message: format!("Invalid float: {}", e),
+                })?;
+            Ok(ValidateExpr::Float(f))
+        }
+        Rule::number => {
+            let n: i64 = pair
+                .as_str()
+                .parse()
+                .map_err(|e| ParseError::InvalidExpression {
+                    line: 0,
+                    message: format!("Invalid number: {}", e),
+                })?;
+            Ok(ValidateExpr::Int(n))
+        }
+        Rule::string => {
+            // Simple string parsing (no interpolation support in validate expressions)
+            let raw = pair.as_str();
+            // Strip surrounding quotes
+            let s = &raw[1..raw.len() - 1];
+            Ok(ValidateExpr::String(s.to_string()))
+        }
+        Rule::variable_ref => {
+            // Variable reference - just the identifier name
+            // For validate expressions, we only support simple variable names
+            let inner = first_inner(pair, "identifier", "variable_ref")?;
+            Ok(ValidateExpr::Var(inner.as_str().to_string()))
+        }
+        other => Err(ParseError::InvalidExpression {
+            line: 0,
+            message: format!("Unexpected rule in validate expression: {:?}", other),
+        }),
+    }
 }
 
 /// Parse attributes block
@@ -6495,6 +6694,129 @@ aws.s3.bucket {
         assert_eq!(
             result.arguments[0].default,
             Some(Value::String("my-resource".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_arguments_block_form_validate_and_message() {
+        let input = r#"
+            arguments {
+                port: int {
+                    description = "Web server port"
+                    default     = 8080
+                    validate    = port >= 1 && port <= 65535
+                    message     = "Port must be between 1 and 65535"
+                }
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(result.arguments.len(), 1);
+        let arg = &result.arguments[0];
+        assert_eq!(arg.name, "port");
+        assert_eq!(arg.type_expr, TypeExpr::Int);
+        assert_eq!(arg.default, Some(Value::Int(8080)));
+        assert_eq!(arg.description.as_deref(), Some("Web server port"));
+        assert!(arg.validate.is_some());
+        assert_eq!(
+            arg.message.as_deref(),
+            Some("Port must be between 1 and 65535")
+        );
+
+        // Verify the validate expression structure:
+        // port >= 1 && port <= 65535
+        let validate = arg.validate.as_ref().unwrap();
+        match validate {
+            ValidateExpr::And(left, right) => {
+                match left.as_ref() {
+                    ValidateExpr::Compare { lhs, op, rhs } => {
+                        assert_eq!(*lhs, Box::new(ValidateExpr::Var("port".to_string())));
+                        assert_eq!(*op, CompareOp::Gte);
+                        assert_eq!(*rhs, Box::new(ValidateExpr::Int(1)));
+                    }
+                    other => panic!("Expected Compare, got {:?}", other),
+                }
+                match right.as_ref() {
+                    ValidateExpr::Compare { lhs, op, rhs } => {
+                        assert_eq!(*lhs, Box::new(ValidateExpr::Var("port".to_string())));
+                        assert_eq!(*op, CompareOp::Lte);
+                        assert_eq!(*rhs, Box::new(ValidateExpr::Int(65535)));
+                    }
+                    other => panic!("Expected Compare, got {:?}", other),
+                }
+            }
+            other => panic!("Expected And, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_arguments_block_form_validate_only() {
+        let input = r#"
+            arguments {
+                count: int {
+                    validate = count > 0
+                }
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(result.arguments.len(), 1);
+        let arg = &result.arguments[0];
+        assert!(arg.validate.is_some());
+        assert!(arg.message.is_none());
+        assert!(arg.description.is_none());
+        assert!(arg.default.is_none());
+    }
+
+    #[test]
+    fn parse_arguments_block_form_validate_with_not() {
+        let input = r#"
+            arguments {
+                enabled: bool {
+                    validate = !enabled == false
+                }
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert!(result.arguments[0].validate.is_some());
+    }
+
+    #[test]
+    fn parse_arguments_block_form_validate_with_or() {
+        let input = r#"
+            arguments {
+                port: int {
+                    validate = port == 80 || port == 443
+                    message  = "Port must be 80 or 443"
+                }
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        let validate = result.arguments[0].validate.as_ref().unwrap();
+        match validate {
+            ValidateExpr::Or(_, _) => {}
+            other => panic!("Expected Or, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_arguments_block_form_validate_with_len() {
+        let input = r#"
+            arguments {
+                name: string {
+                    validate = len(name) >= 1 && len(name) <= 64
+                    message  = "Name must be between 1 and 64 characters"
+                }
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert!(result.arguments[0].validate.is_some());
+        assert_eq!(
+            result.arguments[0].message.as_deref(),
+            Some("Name must be between 1 and 64 characters")
         );
     }
 

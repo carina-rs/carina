@@ -769,6 +769,8 @@ let route = awscc.ec2.route {
             type_expr: TypeExpr::String,
             default: None,
             description: None,
+            validate: None,
+            message: None,
         });
 
         let result = validate_no_provider_in_module(&parsed);
@@ -820,6 +822,8 @@ let route = awscc.ec2.route {
             type_expr: TypeExpr::String,
             default: None,
             description: None,
+            validate: None,
+            message: None,
         });
 
         let result = validate_no_provider_in_module(&parsed);

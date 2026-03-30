@@ -10,7 +10,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::parser::{ImportStatement, ModuleCall, ParseError, ParsedFile, ProviderContext};
+use crate::parser::{
+    CompareOp, ImportStatement, ModuleCall, ParseError, ParsedFile, ProviderContext, ValidateExpr,
+};
 use crate::resource::{Expr, LifecycleConfig, Resource, ResourceId, ResourceKind, Value};
 
 /// Module resolution error
@@ -48,6 +50,16 @@ pub enum ModuleError {
         "provider blocks are not allowed inside modules. Define providers at the root configuration level."
     )]
     ProviderInModule,
+
+    #[error(
+        "Validation failed for argument '{argument}' in module '{module}': {message} (got {actual})"
+    )]
+    ArgumentValidationFailed {
+        module: String,
+        argument: String,
+        message: String,
+        actual: String,
+    },
 }
 
 /// Context for module resolution
@@ -334,6 +346,35 @@ impl<'cfg> ModuleResolver<'cfg> {
             argument_values.insert(arg.name.clone(), value);
         }
 
+        // Validate argument values against validate expressions
+        for arg in &module.arguments {
+            if let Some(ref validate_expr) = arg.validate {
+                let value = argument_values.get(&arg.name).unwrap();
+                match evaluate_validate_expr(validate_expr, &arg.name, value) {
+                    Ok(true) => {} // Validation passed
+                    Ok(false) => {
+                        let message = arg.message.clone().unwrap_or_else(|| {
+                            format!("validation failed for argument '{}'", arg.name)
+                        });
+                        return Err(ModuleError::ArgumentValidationFailed {
+                            module: call.module_name.clone(),
+                            argument: arg.name.clone(),
+                            message,
+                            actual: format_value_for_error(value),
+                        });
+                    }
+                    Err(e) => {
+                        return Err(ModuleError::ArgumentValidationFailed {
+                            module: call.module_name.clone(),
+                            argument: arg.name.clone(),
+                            message: format!("error evaluating validate expression: {}", e),
+                            actual: format_value_for_error(value),
+                        });
+                    }
+                }
+            }
+        }
+
         // Collect intra-module binding names so we can rewrite ResourceRefs
         let intra_module_bindings: HashSet<String> = module
             .resources
@@ -416,6 +457,231 @@ impl<'cfg> ModuleResolver<'cfg> {
         }
 
         Ok(expanded_resources)
+    }
+}
+
+/// Format a Value for use in error messages.
+fn format_value_for_error(value: &Value) -> String {
+    match value {
+        Value::String(s) => format!("\"{}\"", s),
+        Value::Int(n) => n.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::List(items) => format!("[...] (length {})", items.len()),
+        Value::Map(map) => format!("{{...}} (length {})", map.len()),
+        _ => format!("{:?}", value),
+    }
+}
+
+/// Evaluate a validate expression with the given argument name and value.
+/// Returns Ok(true) if validation passes, Ok(false) if it fails.
+fn evaluate_validate_expr(
+    expr: &ValidateExpr,
+    arg_name: &str,
+    arg_value: &Value,
+) -> Result<bool, String> {
+    let result = eval_validate(expr, arg_name, arg_value)?;
+    match result {
+        ValidateValue::Bool(b) => Ok(b),
+        other => Err(format!(
+            "validate expression must return a boolean, got {:?}",
+            other
+        )),
+    }
+}
+
+/// Internal value type for validate expression evaluation
+#[derive(Debug, Clone)]
+enum ValidateValue {
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    String(String),
+}
+
+/// Evaluate a validate expression node, returning a ValidateValue
+fn eval_validate(
+    expr: &ValidateExpr,
+    arg_name: &str,
+    arg_value: &Value,
+) -> Result<ValidateValue, String> {
+    match expr {
+        ValidateExpr::Bool(b) => Ok(ValidateValue::Bool(*b)),
+        ValidateExpr::Int(n) => Ok(ValidateValue::Int(*n)),
+        ValidateExpr::Float(f) => Ok(ValidateValue::Float(*f)),
+        ValidateExpr::String(s) => Ok(ValidateValue::String(s.clone())),
+        ValidateExpr::Var(name) => {
+            if name == arg_name {
+                match arg_value {
+                    Value::Int(n) => Ok(ValidateValue::Int(*n)),
+                    Value::Float(f) => Ok(ValidateValue::Float(*f)),
+                    Value::Bool(b) => Ok(ValidateValue::Bool(*b)),
+                    Value::String(s) => Ok(ValidateValue::String(s.clone())),
+                    other => Err(format!(
+                        "unsupported value type for validation: {:?}",
+                        other
+                    )),
+                }
+            } else {
+                Err(format!(
+                    "unknown variable '{}' in validate expression (expected '{}')",
+                    name, arg_name
+                ))
+            }
+        }
+        ValidateExpr::Compare { lhs, op, rhs } => {
+            let left = eval_validate(lhs, arg_name, arg_value)?;
+            let right = eval_validate(rhs, arg_name, arg_value)?;
+            let result = compare_validate_values(&left, op, &right)?;
+            Ok(ValidateValue::Bool(result))
+        }
+        ValidateExpr::And(lhs, rhs) => {
+            let left = eval_validate(lhs, arg_name, arg_value)?;
+            match left {
+                ValidateValue::Bool(false) => Ok(ValidateValue::Bool(false)),
+                ValidateValue::Bool(true) => {
+                    let right = eval_validate(rhs, arg_name, arg_value)?;
+                    match right {
+                        ValidateValue::Bool(b) => Ok(ValidateValue::Bool(b)),
+                        _ => Err("right operand of && must be boolean".to_string()),
+                    }
+                }
+                _ => Err("left operand of && must be boolean".to_string()),
+            }
+        }
+        ValidateExpr::Or(lhs, rhs) => {
+            let left = eval_validate(lhs, arg_name, arg_value)?;
+            match left {
+                ValidateValue::Bool(true) => Ok(ValidateValue::Bool(true)),
+                ValidateValue::Bool(false) => {
+                    let right = eval_validate(rhs, arg_name, arg_value)?;
+                    match right {
+                        ValidateValue::Bool(b) => Ok(ValidateValue::Bool(b)),
+                        _ => Err("right operand of || must be boolean".to_string()),
+                    }
+                }
+                _ => Err("left operand of || must be boolean".to_string()),
+            }
+        }
+        ValidateExpr::Not(inner) => {
+            let val = eval_validate(inner, arg_name, arg_value)?;
+            match val {
+                ValidateValue::Bool(b) => Ok(ValidateValue::Bool(!b)),
+                _ => Err("operand of ! must be boolean".to_string()),
+            }
+        }
+        ValidateExpr::FunctionCall { name, args } => {
+            eval_validate_function(name, args, arg_name, arg_value)
+        }
+    }
+}
+
+/// Compare two ValidateValues with the given operator
+fn compare_validate_values(
+    left: &ValidateValue,
+    op: &CompareOp,
+    right: &ValidateValue,
+) -> Result<bool, String> {
+    match (left, right) {
+        (ValidateValue::Int(a), ValidateValue::Int(b)) => Ok(match op {
+            CompareOp::Gte => a >= b,
+            CompareOp::Lte => a <= b,
+            CompareOp::Gt => a > b,
+            CompareOp::Lt => a < b,
+            CompareOp::Eq => a == b,
+            CompareOp::Ne => a != b,
+        }),
+        (ValidateValue::Float(a), ValidateValue::Float(b)) => Ok(match op {
+            CompareOp::Gte => a >= b,
+            CompareOp::Lte => a <= b,
+            CompareOp::Gt => a > b,
+            CompareOp::Lt => a < b,
+            CompareOp::Eq => a == b,
+            CompareOp::Ne => a != b,
+        }),
+        (ValidateValue::Int(a), ValidateValue::Float(b)) => {
+            let a = *a as f64;
+            Ok(match op {
+                CompareOp::Gte => a >= *b,
+                CompareOp::Lte => a <= *b,
+                CompareOp::Gt => a > *b,
+                CompareOp::Lt => a < *b,
+                CompareOp::Eq => a == *b,
+                CompareOp::Ne => a != *b,
+            })
+        }
+        (ValidateValue::Float(a), ValidateValue::Int(b)) => {
+            let b = *b as f64;
+            Ok(match op {
+                CompareOp::Gte => *a >= b,
+                CompareOp::Lte => *a <= b,
+                CompareOp::Gt => *a > b,
+                CompareOp::Lt => *a < b,
+                CompareOp::Eq => *a == b,
+                CompareOp::Ne => *a != b,
+            })
+        }
+        (ValidateValue::String(a), ValidateValue::String(b)) => Ok(match op {
+            CompareOp::Eq => a == b,
+            CompareOp::Ne => a != b,
+            _ => return Err("strings only support == and != comparisons".to_string()),
+        }),
+        (ValidateValue::Bool(a), ValidateValue::Bool(b)) => Ok(match op {
+            CompareOp::Eq => a == b,
+            CompareOp::Ne => a != b,
+            _ => return Err("booleans only support == and != comparisons".to_string()),
+        }),
+        _ => Err(format!("cannot compare {:?} with {:?}", left, right)),
+    }
+}
+
+/// Evaluate a function call in a validate expression
+fn eval_validate_function(
+    name: &str,
+    args: &[ValidateExpr],
+    arg_name: &str,
+    arg_value: &Value,
+) -> Result<ValidateValue, String> {
+    match name {
+        "len" | "length" => {
+            if args.len() != 1 {
+                return Err(format!("{}() expects 1 argument, got {}", name, args.len()));
+            }
+            let val = eval_validate(&args[0], arg_name, arg_value)?;
+            match val {
+                ValidateValue::String(s) => Ok(ValidateValue::Int(s.len() as i64)),
+                _ => {
+                    // Try using the original Value if the arg refers to a list/map
+                    if let ValidateExpr::Var(var_name) = &args[0] {
+                        if var_name == arg_name {
+                            match arg_value {
+                                Value::List(items) => Ok(ValidateValue::Int(items.len() as i64)),
+                                Value::Map(map) => Ok(ValidateValue::Int(map.len() as i64)),
+                                Value::String(s) => Ok(ValidateValue::Int(s.len() as i64)),
+                                _ => Err(format!(
+                                    "{}() argument must be a string, list, or map",
+                                    name
+                                )),
+                            }
+                        } else {
+                            Err(format!(
+                                "{}() argument must be a string, list, or map",
+                                name
+                            ))
+                        }
+                    } else {
+                        Err(format!(
+                            "{}() argument must be a string, list, or map",
+                            name
+                        ))
+                    }
+                }
+            }
+        }
+        _ => Err(format!(
+            "unknown function '{}' in validate expression",
+            name
+        )),
     }
 }
 
@@ -745,12 +1011,16 @@ mod tests {
                     type_expr: TypeExpr::String,
                     default: None,
                     description: None,
+                    validate: None,
+                    message: None,
                 },
                 ArgumentParameter {
                     name: "enable_flag".to_string(),
                     type_expr: TypeExpr::Bool,
                     default: Some(Value::Bool(true)),
                     description: None,
+                    validate: None,
+                    message: None,
                 },
             ],
             attribute_params: vec![],
@@ -882,6 +1152,8 @@ mod tests {
                 type_expr: TypeExpr::String,
                 default: None,
                 description: None,
+                validate: None,
+                message: None,
             }],
             attribute_params: vec![],
             backend: None,
@@ -1340,12 +1612,16 @@ mod tests {
                     type_expr: TypeExpr::String,
                     default: None,
                     description: None,
+                    validate: None,
+                    message: None,
                 },
                 ArgumentParameter {
                     name: "env_name".to_string(),
                     type_expr: TypeExpr::String,
                     default: None,
                     description: None,
+                    validate: None,
+                    message: None,
                 },
             ],
             attribute_params: vec![],
@@ -1598,5 +1874,232 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// Helper to create a module with a validated port argument
+    fn create_module_with_port_validation() -> ParsedFile {
+        use crate::parser::{CompareOp, ValidateExpr};
+        ParsedFile {
+            providers: vec![],
+            resources: vec![],
+            variables: HashMap::new(),
+            imports: vec![],
+            module_calls: vec![],
+            arguments: vec![ArgumentParameter {
+                name: "port".to_string(),
+                type_expr: TypeExpr::Int,
+                default: Some(Value::Int(8080)),
+                description: Some("Web server port".to_string()),
+                validate: Some(ValidateExpr::And(
+                    Box::new(ValidateExpr::Compare {
+                        lhs: Box::new(ValidateExpr::Var("port".to_string())),
+                        op: CompareOp::Gte,
+                        rhs: Box::new(ValidateExpr::Int(1)),
+                    }),
+                    Box::new(ValidateExpr::Compare {
+                        lhs: Box::new(ValidateExpr::Var("port".to_string())),
+                        op: CompareOp::Lte,
+                        rhs: Box::new(ValidateExpr::Int(65535)),
+                    }),
+                )),
+                message: Some("Port must be between 1 and 65535".to_string()),
+            }],
+            attribute_params: vec![],
+            backend: None,
+            state_blocks: vec![],
+            user_functions: HashMap::new(),
+            remote_states: vec![],
+        }
+    }
+
+    #[test]
+    fn test_argument_validation_passes_with_valid_value() {
+        let resolver = {
+            let mut r = ModuleResolver::new(".");
+            r.imported_modules.insert(
+                "web_server".to_string(),
+                create_module_with_port_validation(),
+            );
+            r
+        };
+
+        let call = ModuleCall {
+            module_name: "web_server".to_string(),
+            binding_name: Some("web".to_string()),
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert("port".to_string(), Value::Int(443));
+                args
+            },
+        };
+
+        let result = resolver.expand_module_call(&call, "web");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_argument_validation_passes_with_default_value() {
+        let resolver = {
+            let mut r = ModuleResolver::new(".");
+            r.imported_modules.insert(
+                "web_server".to_string(),
+                create_module_with_port_validation(),
+            );
+            r
+        };
+
+        let call = ModuleCall {
+            module_name: "web_server".to_string(),
+            binding_name: Some("web".to_string()),
+            arguments: HashMap::new(), // Uses default 8080
+        };
+
+        let result = resolver.expand_module_call(&call, "web");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_argument_validation_fails_with_invalid_value() {
+        let resolver = {
+            let mut r = ModuleResolver::new(".");
+            r.imported_modules.insert(
+                "web_server".to_string(),
+                create_module_with_port_validation(),
+            );
+            r
+        };
+
+        let call = ModuleCall {
+            module_name: "web_server".to_string(),
+            binding_name: Some("web".to_string()),
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert("port".to_string(), Value::Int(0));
+                args
+            },
+        };
+
+        let result = resolver.expand_module_call(&call, "web");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            ModuleError::ArgumentValidationFailed {
+                module,
+                argument,
+                message,
+                actual,
+            } => {
+                assert_eq!(module, "web_server");
+                assert_eq!(argument, "port");
+                assert_eq!(message, "Port must be between 1 and 65535");
+                assert_eq!(actual, "0");
+            }
+            other => panic!("Expected ArgumentValidationFailed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_argument_validation_fails_with_negative_value() {
+        let resolver = {
+            let mut r = ModuleResolver::new(".");
+            r.imported_modules.insert(
+                "web_server".to_string(),
+                create_module_with_port_validation(),
+            );
+            r
+        };
+
+        let call = ModuleCall {
+            module_name: "web_server".to_string(),
+            binding_name: Some("web".to_string()),
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert("port".to_string(), Value::Int(-1));
+                args
+            },
+        };
+
+        let result = resolver.expand_module_call(&call, "web");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_argument_validation_fails_too_large() {
+        let resolver = {
+            let mut r = ModuleResolver::new(".");
+            r.imported_modules.insert(
+                "web_server".to_string(),
+                create_module_with_port_validation(),
+            );
+            r
+        };
+
+        let call = ModuleCall {
+            module_name: "web_server".to_string(),
+            binding_name: Some("web".to_string()),
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert("port".to_string(), Value::Int(70000));
+                args
+            },
+        };
+
+        let result = resolver.expand_module_call(&call, "web");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_argument_validation_no_message_uses_default() {
+        use crate::parser::{CompareOp, ValidateExpr};
+        let module = ParsedFile {
+            providers: vec![],
+            resources: vec![],
+            variables: HashMap::new(),
+            imports: vec![],
+            module_calls: vec![],
+            arguments: vec![ArgumentParameter {
+                name: "count".to_string(),
+                type_expr: TypeExpr::Int,
+                default: None,
+                description: None,
+                validate: Some(ValidateExpr::Compare {
+                    lhs: Box::new(ValidateExpr::Var("count".to_string())),
+                    op: CompareOp::Gt,
+                    rhs: Box::new(ValidateExpr::Int(0)),
+                }),
+                message: None, // No custom message
+            }],
+            attribute_params: vec![],
+            backend: None,
+            state_blocks: vec![],
+            user_functions: HashMap::new(),
+            remote_states: vec![],
+        };
+
+        let resolver = {
+            let mut r = ModuleResolver::new(".");
+            r.imported_modules.insert("counter".to_string(), module);
+            r
+        };
+
+        let call = ModuleCall {
+            module_name: "counter".to_string(),
+            binding_name: Some("c".to_string()),
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert("count".to_string(), Value::Int(0));
+                args
+            },
+        };
+
+        let result = resolver.expand_module_call(&call, "c");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            ModuleError::ArgumentValidationFailed { message, .. } => {
+                assert_eq!(message, "validation failed for argument 'count'");
+            }
+            other => panic!("Expected ArgumentValidationFailed, got {:?}", other),
+        }
     }
 }
