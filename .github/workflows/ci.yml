@@ -73,6 +73,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: bash scripts/validate-crn-files.sh
 
+  check-example-warnings:
+    name: Check Example Warnings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: bash scripts/check-example-warnings.sh
+
   test:
     name: Test
     runs-on: ubuntu-latest
