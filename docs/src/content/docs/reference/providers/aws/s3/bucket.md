@@ -3,8 +3,6 @@ title: "aws.s3.bucket"
 description: "AWS S3 bucket resource reference"
 ---
 
-# aws.s3.bucket
-
 CloudFormation Type: `AWS::S3::Bucket`
 
 ## Example

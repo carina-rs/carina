@@ -42,7 +42,8 @@ for DOC_FILE in "$DOCS_DIR"/*/*.md; do
         echo "description: \"AWS $SERVICE_DISPLAY $RESOURCE_NAME resource reference\""
         echo "---"
         echo ""
-        cat "$DOC_FILE"
+        # Strip H1 line (Starlight renders frontmatter title as heading)
+        sed '/^# /d' "$DOC_FILE"
     } > "$FRONTMATTER_TMPFILE"
     mv "$FRONTMATTER_TMPFILE" "$DOC_FILE"
 done

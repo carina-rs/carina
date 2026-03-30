@@ -3,8 +3,6 @@ title: "awscc.s3.bucket"
 description: "AWSCC S3 bucket resource reference"
 ---
 
-# awscc.s3.bucket
-
 CloudFormation Type: `AWS::S3::Bucket`
 
 The ``AWS::S3::Bucket`` resource creates an Amazon S3 bucket in the same AWS Region where you create the AWS CloudFormation stack.

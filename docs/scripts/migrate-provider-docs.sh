@@ -26,7 +26,8 @@ migrate_provider() {
             echo "title: \"${PROVIDER_UPPER} Provider\""
             echo "---"
             echo ""
-            cat "$SRC_DIR/index.md"
+            # Strip H1 line (Starlight renders frontmatter title as heading)
+            sed '/^# /d' "$SRC_DIR/index.md"
         } > "$DST_DIR/index.md"
         echo "Migrated $DST_DIR/index.md"
     fi
@@ -67,7 +68,8 @@ migrate_provider() {
             echo "description: \"${PROVIDER_UPPER} $SERVICE_DISPLAY ${RESOURCE_NAME} resource reference\""
             echo "---"
             echo ""
-            cat "$DOC_FILE"
+            # Strip H1 line (Starlight renders frontmatter title as heading)
+            sed '/^# /d' "$DOC_FILE"
         } > "$DST_FILE"
         echo "Migrated $DST_FILE"
     done

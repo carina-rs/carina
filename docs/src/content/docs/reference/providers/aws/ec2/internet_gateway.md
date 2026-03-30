@@ -3,8 +3,6 @@ title: "aws.ec2.internet_gateway"
 description: "AWS EC2 internet_gateway resource reference"
 ---
 
-# aws.ec2.internet_gateway
-
 CloudFormation Type: `AWS::EC2::InternetGateway`
 
 Describes an internet gateway.

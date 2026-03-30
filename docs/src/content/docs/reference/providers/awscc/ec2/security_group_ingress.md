@@ -3,8 +3,6 @@ title: "awscc.ec2.security_group_ingress"
 description: "AWSCC EC2 security_group_ingress resource reference"
 ---
 
-# awscc.ec2.security_group_ingress
-
 CloudFormation Type: `AWS::EC2::SecurityGroupIngress`
 
 Resource Type definition for AWS::EC2::SecurityGroupIngress

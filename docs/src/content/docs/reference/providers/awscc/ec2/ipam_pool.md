@@ -3,8 +3,6 @@ title: "awscc.ec2.ipam_pool"
 description: "AWSCC EC2 ipam_pool resource reference"
 ---
 
-# awscc.ec2.ipam_pool
-
 CloudFormation Type: `AWS::EC2::IPAMPool`
 
 Resource Schema of AWS::EC2::IPAMPool Type

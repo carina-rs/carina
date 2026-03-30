@@ -3,8 +3,6 @@ title: "awscc.ec2.subnet"
 description: "AWSCC EC2 subnet resource reference"
 ---
 
-# awscc.ec2.subnet
-
 CloudFormation Type: `AWS::EC2::Subnet`
 
 Specifies a subnet for the specified VPC.

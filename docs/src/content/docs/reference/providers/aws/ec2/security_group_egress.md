@@ -3,8 +3,6 @@ title: "aws.ec2.security_group_egress"
 description: "AWS EC2 security_group_egress resource reference"
 ---
 
-# aws.ec2.security_group_egress
-
 CloudFormation Type: `AWS::EC2::SecurityGroupEgress`
 
 Describes a security group rule.

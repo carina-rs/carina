@@ -3,8 +3,6 @@ title: "awscc.ec2.ipam"
 description: "AWSCC EC2 ipam resource reference"
 ---
 
-# awscc.ec2.ipam
-
 CloudFormation Type: `AWS::EC2::IPAM`
 
 Resource Schema of AWS::EC2::IPAM Type

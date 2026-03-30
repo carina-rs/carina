@@ -3,8 +3,6 @@ title: "awscc.iam.role"
 description: "AWSCC IAM role resource reference"
 ---
 
-# awscc.iam.role
-
 CloudFormation Type: `AWS::IAM::Role`
 
 Creates a new role for your AWS-account.
