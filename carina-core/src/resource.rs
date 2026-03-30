@@ -165,14 +165,15 @@ impl AccessPath {
 impl Serialize for AccessPath {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
+        let field_path: Vec<&str> = self.field_path();
+        // Always serialize all 3 fields to match the old derived Serialize behavior.
+        // The old code's `#[serde(default)]` was deserialization-only, so old state
+        // files always have `field_path: []`. We preserve this for consistency.
         let mut map = serializer.serialize_map(Some(3))?;
         map.serialize_entry("binding_name", self.binding())?;
         map.serialize_entry("attribute_name", self.attribute())?;
-        let field_path: Vec<&str> = self.field_path();
-        if !field_path.is_empty() {
-            let owned: Vec<String> = field_path.into_iter().map(|s| s.to_string()).collect();
-            map.serialize_entry("field_path", &owned)?;
-        }
+        let owned: Vec<String> = field_path.into_iter().map(|s| s.to_string()).collect();
+        map.serialize_entry("field_path", &owned)?;
         map.end()
     }
 }
@@ -1666,6 +1667,8 @@ mod tests {
             .expect("should have ResourceRef key");
         assert_eq!(inner.get("binding_name").unwrap(), "vpc");
         assert_eq!(inner.get("attribute_name").unwrap(), "id");
+        // field_path should always be present (matching old derived Serialize behavior)
+        assert_eq!(inner.get("field_path").unwrap(), &serde_json::json!([]));
     }
 
     #[test]
