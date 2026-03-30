@@ -5,6 +5,7 @@ use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::utils::extract_enum_value;
 
 use crate::AwsProvider;
+use crate::helpers::{build_tag_specification, require_string_attr};
 
 impl AwsProvider {
     /// Read an EC2 Flow Log
@@ -59,14 +60,7 @@ impl AwsProvider {
 
     /// Create an EC2 Flow Log
     pub(crate) async fn create_ec2_flow_log(&self, resource: Resource) -> ProviderResult<State> {
-        let resource_id_val = match resource.get_attr("resource_id") {
-            Some(Value::String(s)) => s.clone(),
-            _ => {
-                return Err(
-                    ProviderError::new("resource_id is required").for_resource(resource.id.clone())
-                );
-            }
-        };
+        let resource_id_val = require_string_attr(&resource, "resource_id")?;
 
         let resource_type_val = match resource.get_attr("resource_type") {
             Some(Value::String(s)) => extract_enum_value(s).to_string(),
@@ -124,16 +118,10 @@ impl AwsProvider {
         }
 
         // Apply tags via TagSpecifications
-        if let Some(Value::Map(tags)) = resource.get_attr("tags") {
-            use aws_sdk_ec2::types::{Tag, TagSpecification};
-            let mut tag_spec = TagSpecification::builder()
-                .resource_type(aws_sdk_ec2::types::ResourceType::VpcFlowLog);
-            for (key, val) in tags {
-                if let Value::String(v) = val {
-                    tag_spec = tag_spec.tags(Tag::builder().key(key).value(v).build());
-                }
-            }
-            req = req.tag_specifications(tag_spec.build());
+        if let Some(tag_spec) =
+            build_tag_specification(&resource, aws_sdk_ec2::types::ResourceType::VpcFlowLog)
+        {
+            req = req.tag_specifications(tag_spec);
         }
 
         // Retry loop for IAM eventual consistency: newly created IAM roles may

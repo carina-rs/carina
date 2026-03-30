@@ -7,6 +7,7 @@ use carina_core::utils::extract_enum_value;
 use aws_sdk_ec2::types::NatGatewayState;
 
 use crate::AwsProvider;
+use crate::helpers::{PollState, require_string_attr, wait_for_ec2_state};
 
 impl AwsProvider {
     /// Read an EC2 NAT Gateway
@@ -67,14 +68,7 @@ impl AwsProvider {
 
     /// Create an EC2 NAT Gateway
     pub(crate) async fn create_ec2_nat_gateway(&self, resource: Resource) -> ProviderResult<State> {
-        let subnet_id = match resource.get_attr("subnet_id") {
-            Some(Value::String(s)) => s.clone(),
-            _ => {
-                return Err(
-                    ProviderError::new("subnet_id is required").for_resource(resource.id.clone())
-                );
-            }
-        };
+        let subnet_id = require_string_attr(&resource, "subnet_id")?;
 
         let mut req = self.ec2_client.create_nat_gateway().subnet_id(&subnet_id);
 
@@ -161,43 +155,41 @@ impl AwsProvider {
         id: &ResourceId,
         nat_gateway_id: &str,
     ) -> ProviderResult<()> {
-        use std::time::Duration;
-        use tokio::time::sleep;
-
-        for _ in 0..60 {
-            let result = self
-                .ec2_client
-                .describe_nat_gateways()
-                .nat_gateway_ids(nat_gateway_id)
-                .send()
-                .await
-                .map_err(|e| {
-                    ProviderError::new("Failed to describe NAT gateway")
-                        .with_cause(e)
-                        .for_resource(id.clone())
-                })?;
-
-            if let Some(ngw) = result.nat_gateways().first()
-                && let Some(state) = ngw.state()
-            {
-                if *state == NatGatewayState::Available {
-                    return Ok(());
-                }
-                if *state == NatGatewayState::Failed {
-                    return Err(
-                        ProviderError::new("NAT gateway creation failed").for_resource(id.clone())
-                    );
-                }
-                // "pending" - keep waiting
-            }
-
-            sleep(Duration::from_secs(5)).await;
-        }
-
-        Err(
-            ProviderError::new("Timeout waiting for NAT gateway to become available")
-                .for_resource(id.clone()),
+        let ec2 = &self.ec2_client;
+        let rid = id.clone();
+        wait_for_ec2_state(
+            id,
+            || async {
+                let result = ec2
+                    .describe_nat_gateways()
+                    .nat_gateway_ids(nat_gateway_id)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        ProviderError::new("Failed to describe NAT gateway")
+                            .with_cause(e)
+                            .for_resource(rid.clone())
+                    })?;
+                Ok(
+                    if let Some(ngw) = result.nat_gateways().first()
+                        && let Some(state) = ngw.state()
+                    {
+                        if *state == NatGatewayState::Available {
+                            PollState::Ready
+                        } else if *state == NatGatewayState::Failed {
+                            PollState::Failed
+                        } else {
+                            PollState::Pending
+                        }
+                    } else {
+                        PollState::Pending
+                    },
+                )
+            },
+            "Timeout waiting for NAT gateway to become available",
+            "NAT gateway creation failed",
         )
+        .await
     }
 
     /// Wait for a NAT gateway to be deleted
@@ -206,36 +198,34 @@ impl AwsProvider {
         id: &ResourceId,
         nat_gateway_id: &str,
     ) -> ProviderResult<()> {
-        use std::time::Duration;
-        use tokio::time::sleep;
-
-        for _ in 0..60 {
-            let result = self
-                .ec2_client
-                .describe_nat_gateways()
-                .nat_gateway_ids(nat_gateway_id)
-                .send()
-                .await
-                .map_err(|e| {
-                    ProviderError::new("Failed to describe NAT gateway")
-                        .with_cause(e)
-                        .for_resource(id.clone())
-                })?;
-
-            if let Some(ngw) = result.nat_gateways().first() {
-                if ngw.state() == Some(&NatGatewayState::Deleted) {
-                    return Ok(());
-                }
-            } else {
-                return Ok(());
-            }
-
-            sleep(Duration::from_secs(5)).await;
-        }
-
-        Err(
-            ProviderError::new("Timeout waiting for NAT gateway to be deleted")
-                .for_resource(id.clone()),
+        let ec2 = &self.ec2_client;
+        let rid = id.clone();
+        wait_for_ec2_state(
+            id,
+            || async {
+                let result = ec2
+                    .describe_nat_gateways()
+                    .nat_gateway_ids(nat_gateway_id)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        ProviderError::new("Failed to describe NAT gateway")
+                            .with_cause(e)
+                            .for_resource(rid.clone())
+                    })?;
+                Ok(if let Some(ngw) = result.nat_gateways().first() {
+                    if ngw.state() == Some(&NatGatewayState::Deleted) {
+                        PollState::Gone
+                    } else {
+                        PollState::Pending
+                    }
+                } else {
+                    PollState::Gone
+                })
+            },
+            "Timeout waiting for NAT gateway to be deleted",
+            "NAT gateway deletion failed",
         )
+        .await
     }
 }

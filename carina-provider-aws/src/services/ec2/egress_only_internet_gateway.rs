@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 
 use carina_core::provider::{ProviderError, ProviderResult};
-use carina_core::resource::{Resource, ResourceId, State, Value};
+use carina_core::resource::{Resource, ResourceId, State};
 
 use crate::AwsProvider;
+use crate::helpers::{build_tag_specification, require_string_attr};
 
 impl AwsProvider {
     /// Read an EC2 Egress-Only Internet Gateway
@@ -55,14 +56,7 @@ impl AwsProvider {
         &self,
         resource: Resource,
     ) -> ProviderResult<State> {
-        let vpc_id = match resource.get_attr("vpc_id") {
-            Some(Value::String(s)) => s.clone(),
-            _ => {
-                return Err(
-                    ProviderError::new("vpc_id is required").for_resource(resource.id.clone())
-                );
-            }
-        };
+        let vpc_id = require_string_attr(&resource, "vpc_id")?;
 
         let mut req = self
             .ec2_client
@@ -70,16 +64,11 @@ impl AwsProvider {
             .vpc_id(&vpc_id);
 
         // Apply tags via TagSpecifications
-        if let Some(Value::Map(tags)) = resource.get_attr("tags") {
-            use aws_sdk_ec2::types::{Tag, TagSpecification};
-            let mut tag_spec = TagSpecification::builder()
-                .resource_type(aws_sdk_ec2::types::ResourceType::EgressOnlyInternetGateway);
-            for (key, val) in tags {
-                if let Value::String(v) = val {
-                    tag_spec = tag_spec.tags(Tag::builder().key(key).value(v).build());
-                }
-            }
-            req = req.tag_specifications(tag_spec.build());
+        if let Some(tag_spec) = build_tag_specification(
+            &resource,
+            aws_sdk_ec2::types::ResourceType::EgressOnlyInternetGateway,
+        ) {
+            req = req.tag_specifications(tag_spec);
         }
 
         let result = req.send().await.map_err(|e| {

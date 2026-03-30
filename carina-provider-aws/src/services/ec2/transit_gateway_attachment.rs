@@ -4,6 +4,7 @@ use carina_core::provider::{ProviderError, ProviderResult};
 use carina_core::resource::{Resource, ResourceId, State, Value};
 
 use crate::AwsProvider;
+use crate::helpers::{PollState, build_tag_specification, require_string_attr, wait_for_ec2_state};
 
 impl AwsProvider {
     /// Read an EC2 Transit Gateway VPC Attachment
@@ -60,22 +61,8 @@ impl AwsProvider {
         &self,
         resource: Resource,
     ) -> ProviderResult<State> {
-        let transit_gateway_id = match resource.get_attr("transit_gateway_id") {
-            Some(Value::String(s)) => s.clone(),
-            _ => {
-                return Err(ProviderError::new("transit_gateway_id is required")
-                    .for_resource(resource.id.clone()));
-            }
-        };
-
-        let vpc_id = match resource.get_attr("vpc_id") {
-            Some(Value::String(s)) => s.clone(),
-            _ => {
-                return Err(
-                    ProviderError::new("vpc_id is required").for_resource(resource.id.clone())
-                );
-            }
-        };
+        let transit_gateway_id = require_string_attr(&resource, "transit_gateway_id")?;
+        let vpc_id = require_string_attr(&resource, "vpc_id")?;
 
         let subnet_ids = match resource.get_attr("subnet_ids") {
             Some(Value::List(ids)) => {
@@ -109,16 +96,11 @@ impl AwsProvider {
         }
 
         // Apply tags via TagSpecifications
-        if let Some(Value::Map(tags)) = resource.get_attr("tags") {
-            use aws_sdk_ec2::types::{Tag, TagSpecification};
-            let mut tag_spec = TagSpecification::builder()
-                .resource_type(aws_sdk_ec2::types::ResourceType::TransitGatewayAttachment);
-            for (key, val) in tags {
-                if let Value::String(v) = val {
-                    tag_spec = tag_spec.tags(Tag::builder().key(key).value(v).build());
-                }
-            }
-            req = req.tag_specifications(tag_spec.build());
+        if let Some(tag_spec) = build_tag_specification(
+            &resource,
+            aws_sdk_ec2::types::ResourceType::TransitGatewayAttachment,
+        ) {
+            req = req.tag_specifications(tag_spec);
         }
 
         let result = req.send().await.map_err(|e| {
@@ -193,43 +175,39 @@ impl AwsProvider {
         id: &ResourceId,
         attachment_id: &str,
     ) -> ProviderResult<()> {
-        use std::time::Duration;
-        use tokio::time::sleep;
-
-        for _ in 0..60 {
-            let result = self
-                .ec2_client
-                .describe_transit_gateway_vpc_attachments()
-                .transit_gateway_attachment_ids(attachment_id)
-                .send()
-                .await
-                .map_err(|e| {
-                    ProviderError::new("Failed to describe transit gateway VPC attachment")
-                        .with_cause(e)
-                        .for_resource(id.clone())
-                })?;
-
-            if let Some(att) = result.transit_gateway_vpc_attachments().first()
-                && let Some(state) = att.state()
-            {
-                if state.as_str() == "available" {
-                    return Ok(());
-                }
-                if state.as_str() == "failed" || state.as_str() == "deleted" {
-                    return Err(
-                        ProviderError::new("Transit gateway attachment creation failed")
-                            .for_resource(id.clone()),
-                    );
-                }
-            }
-
-            sleep(Duration::from_secs(5)).await;
-        }
-
-        Err(ProviderError::new(
+        let ec2 = &self.ec2_client;
+        let rid = id.clone();
+        wait_for_ec2_state(
+            id,
+            || async {
+                let result = ec2
+                    .describe_transit_gateway_vpc_attachments()
+                    .transit_gateway_attachment_ids(attachment_id)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        ProviderError::new("Failed to describe transit gateway VPC attachment")
+                            .with_cause(e)
+                            .for_resource(rid.clone())
+                    })?;
+                Ok(
+                    if let Some(att) = result.transit_gateway_vpc_attachments().first()
+                        && let Some(state) = att.state()
+                    {
+                        match state.as_str() {
+                            "available" => PollState::Ready,
+                            "failed" | "deleted" => PollState::Failed,
+                            _ => PollState::Pending,
+                        }
+                    } else {
+                        PollState::Pending
+                    },
+                )
+            },
             "Timeout waiting for transit gateway attachment to become available",
+            "Transit gateway attachment creation failed",
         )
-        .for_resource(id.clone()))
+        .await
     }
 
     /// Wait for a transit gateway attachment to be deleted
@@ -238,36 +216,36 @@ impl AwsProvider {
         id: &ResourceId,
         attachment_id: &str,
     ) -> ProviderResult<()> {
-        use std::time::Duration;
-        use tokio::time::sleep;
-
-        for _ in 0..60 {
-            let result = self
-                .ec2_client
-                .describe_transit_gateway_vpc_attachments()
-                .transit_gateway_attachment_ids(attachment_id)
-                .send()
-                .await
-                .map_err(|e| {
-                    ProviderError::new("Failed to describe transit gateway VPC attachment")
-                        .with_cause(e)
-                        .for_resource(id.clone())
-                })?;
-
-            if let Some(att) = result.transit_gateway_vpc_attachments().first() {
-                if att.state().map(|s| s.as_str()) == Some("deleted") {
-                    return Ok(());
-                }
-            } else {
-                return Ok(());
-            }
-
-            sleep(Duration::from_secs(5)).await;
-        }
-
-        Err(
-            ProviderError::new("Timeout waiting for transit gateway attachment to be deleted")
-                .for_resource(id.clone()),
+        let ec2 = &self.ec2_client;
+        let rid = id.clone();
+        wait_for_ec2_state(
+            id,
+            || async {
+                let result = ec2
+                    .describe_transit_gateway_vpc_attachments()
+                    .transit_gateway_attachment_ids(attachment_id)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        ProviderError::new("Failed to describe transit gateway VPC attachment")
+                            .with_cause(e)
+                            .for_resource(rid.clone())
+                    })?;
+                Ok(
+                    if let Some(att) = result.transit_gateway_vpc_attachments().first() {
+                        if att.state().map(|s| s.as_str()) == Some("deleted") {
+                            PollState::Gone
+                        } else {
+                            PollState::Pending
+                        }
+                    } else {
+                        PollState::Gone
+                    },
+                )
+            },
+            "Timeout waiting for transit gateway attachment to be deleted",
+            "Transit gateway attachment deletion failed",
         )
+        .await
     }
 }

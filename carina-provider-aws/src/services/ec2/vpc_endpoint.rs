@@ -5,6 +5,7 @@ use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::utils::extract_enum_value;
 
 use crate::AwsProvider;
+use crate::helpers::require_string_attr;
 
 impl AwsProvider {
     /// Read an EC2 VPC Endpoint
@@ -61,22 +62,8 @@ impl AwsProvider {
         &self,
         resource: Resource,
     ) -> ProviderResult<State> {
-        let vpc_id = match resource.get_attr("vpc_id") {
-            Some(Value::String(s)) => s.clone(),
-            _ => {
-                return Err(
-                    ProviderError::new("vpc_id is required").for_resource(resource.id.clone())
-                );
-            }
-        };
-
-        let service_name = match resource.get_attr("service_name") {
-            Some(Value::String(s)) => s.clone(),
-            _ => {
-                return Err(ProviderError::new("service_name is required")
-                    .for_resource(resource.id.clone()));
-            }
-        };
+        let vpc_id = require_string_attr(&resource, "vpc_id")?;
+        let service_name = require_string_attr(&resource, "service_name")?;
 
         let mut req = self
             .ec2_client

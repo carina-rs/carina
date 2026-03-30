@@ -5,6 +5,7 @@ use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::utils::extract_enum_value;
 
 use crate::AwsProvider;
+use crate::helpers::{PollState, build_tag_specification, wait_for_ec2_state};
 
 impl AwsProvider {
     /// Read an EC2 Transit Gateway
@@ -117,16 +118,10 @@ impl AwsProvider {
         }
 
         // Apply tags via TagSpecifications
-        if let Some(Value::Map(tags)) = resource.get_attr("tags") {
-            use aws_sdk_ec2::types::{Tag, TagSpecification};
-            let mut tag_spec = TagSpecification::builder()
-                .resource_type(aws_sdk_ec2::types::ResourceType::TransitGateway);
-            for (key, val) in tags {
-                if let Value::String(v) = val {
-                    tag_spec = tag_spec.tags(Tag::builder().key(key).value(v).build());
-                }
-            }
-            req = req.tag_specifications(tag_spec.build());
+        if let Some(tag_spec) =
+            build_tag_specification(&resource, aws_sdk_ec2::types::ResourceType::TransitGateway)
+        {
+            req = req.tag_specifications(tag_spec);
         }
 
         let result = req.send().await.map_err(|e| {
@@ -200,41 +195,39 @@ impl AwsProvider {
         id: &ResourceId,
         transit_gateway_id: &str,
     ) -> ProviderResult<()> {
-        use std::time::Duration;
-        use tokio::time::sleep;
-
-        for _ in 0..60 {
-            let result = self
-                .ec2_client
-                .describe_transit_gateways()
-                .transit_gateway_ids(transit_gateway_id)
-                .send()
-                .await
-                .map_err(|e| {
-                    ProviderError::new("Failed to describe transit gateway")
-                        .with_cause(e)
-                        .for_resource(id.clone())
-                })?;
-
-            if let Some(tgw) = result.transit_gateways().first()
-                && let Some(state) = tgw.state()
-            {
-                if state.as_str() == "available" {
-                    return Ok(());
-                }
-                if state.as_str() == "failed" || state.as_str() == "deleted" {
-                    return Err(ProviderError::new("Transit gateway creation failed")
-                        .for_resource(id.clone()));
-                }
-            }
-
-            sleep(Duration::from_secs(5)).await;
-        }
-
-        Err(
-            ProviderError::new("Timeout waiting for transit gateway to become available")
-                .for_resource(id.clone()),
+        let ec2 = &self.ec2_client;
+        let rid = id.clone();
+        wait_for_ec2_state(
+            id,
+            || async {
+                let result = ec2
+                    .describe_transit_gateways()
+                    .transit_gateway_ids(transit_gateway_id)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        ProviderError::new("Failed to describe transit gateway")
+                            .with_cause(e)
+                            .for_resource(rid.clone())
+                    })?;
+                Ok(
+                    if let Some(tgw) = result.transit_gateways().first()
+                        && let Some(state) = tgw.state()
+                    {
+                        match state.as_str() {
+                            "available" => PollState::Ready,
+                            "failed" | "deleted" => PollState::Failed,
+                            _ => PollState::Pending,
+                        }
+                    } else {
+                        PollState::Pending
+                    },
+                )
+            },
+            "Timeout waiting for transit gateway to become available",
+            "Transit gateway creation failed",
         )
+        .await
     }
 
     /// Wait for a transit gateway to be deleted
@@ -243,36 +236,34 @@ impl AwsProvider {
         id: &ResourceId,
         transit_gateway_id: &str,
     ) -> ProviderResult<()> {
-        use std::time::Duration;
-        use tokio::time::sleep;
-
-        for _ in 0..60 {
-            let result = self
-                .ec2_client
-                .describe_transit_gateways()
-                .transit_gateway_ids(transit_gateway_id)
-                .send()
-                .await
-                .map_err(|e| {
-                    ProviderError::new("Failed to describe transit gateway")
-                        .with_cause(e)
-                        .for_resource(id.clone())
-                })?;
-
-            if let Some(tgw) = result.transit_gateways().first() {
-                if tgw.state().map(|s| s.as_str()) == Some("deleted") {
-                    return Ok(());
-                }
-            } else {
-                return Ok(());
-            }
-
-            sleep(Duration::from_secs(5)).await;
-        }
-
-        Err(
-            ProviderError::new("Timeout waiting for transit gateway to be deleted")
-                .for_resource(id.clone()),
+        let ec2 = &self.ec2_client;
+        let rid = id.clone();
+        wait_for_ec2_state(
+            id,
+            || async {
+                let result = ec2
+                    .describe_transit_gateways()
+                    .transit_gateway_ids(transit_gateway_id)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        ProviderError::new("Failed to describe transit gateway")
+                            .with_cause(e)
+                            .for_resource(rid.clone())
+                    })?;
+                Ok(if let Some(tgw) = result.transit_gateways().first() {
+                    if tgw.state().map(|s| s.as_str()) == Some("deleted") {
+                        PollState::Gone
+                    } else {
+                        PollState::Pending
+                    }
+                } else {
+                    PollState::Gone
+                })
+            },
+            "Timeout waiting for transit gateway to be deleted",
+            "Transit gateway deletion failed",
         )
+        .await
     }
 }

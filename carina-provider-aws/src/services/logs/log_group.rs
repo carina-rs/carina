@@ -5,6 +5,7 @@ use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::utils::extract_enum_value;
 
 use crate::AwsProvider;
+use crate::helpers::require_string_attr;
 
 impl AwsProvider {
     /// Read a CloudWatch Logs Log Group
@@ -97,13 +98,7 @@ impl AwsProvider {
 
     /// Create a CloudWatch Logs Log Group
     pub(crate) async fn create_logs_log_group(&self, resource: Resource) -> ProviderResult<State> {
-        let log_group_name = match resource.get_attr("log_group_name") {
-            Some(Value::String(s)) => s.clone(),
-            _ => {
-                return Err(ProviderError::new("log_group_name is required")
-                    .for_resource(resource.id.clone()));
-            }
-        };
+        let log_group_name = require_string_attr(&resource, "log_group_name")?;
 
         let mut req = self
             .logs_client
