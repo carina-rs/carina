@@ -2385,6 +2385,11 @@ fn known_string_type_overrides() -> &'static HashMap<&'static str, &'static str>
         m.insert("BucketAccountId", "super::aws_account_id()");
         m.insert("PublicIp", "types::ipv4_address()");
         m.insert("LogDestination", "super::arn()");
+        m.insert("GrantFullControl", "super::s3_grantee()");
+        m.insert("GrantRead", "super::s3_grantee()");
+        m.insert("GrantReadACP", "super::s3_grantee()");
+        m.insert("GrantWrite", "super::s3_grantee()");
+        m.insert("GrantWriteACP", "super::s3_grantee()");
         m
     });
     &OVERRIDES

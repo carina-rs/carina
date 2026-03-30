@@ -82,6 +82,47 @@ pub fn availability_zone() -> AttributeType {
     }
 }
 
+/// S3 grantee specification type with validation
+///
+/// Validates that the value contains at least one grantee spec in the format:
+/// - `id="canonical-user-id"`
+/// - `emailAddress="user@example.com"`
+/// - `uri="http://acs.amazonaws.com/groups/global/AllUsers"`
+///
+/// Multiple grantees can be comma-separated.
+pub fn s3_grantee() -> AttributeType {
+    AttributeType::Custom {
+        name: "S3Grantee".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                if s.is_empty() {
+                    return Err("Grantee specification must not be empty".to_string());
+                }
+                // Split by comma and validate each grantee spec
+                for part in s.split(',') {
+                    let trimmed = part.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let valid_prefixes = ["id=", "emailAddress=", "uri="];
+                    if !valid_prefixes.iter().any(|p| trimmed.starts_with(p)) {
+                        return Err(format!(
+                            "Invalid grantee spec '{}': must start with id=, emailAddress=, or uri=",
+                            trimmed
+                        ));
+                    }
+                }
+                Ok(())
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
 // iam_policy_document() is provided by `pub use carina_aws_types::*` above
 
 #[cfg(test)]
@@ -231,6 +272,68 @@ mod tests {
         } else {
             panic!("Expected Custom type");
         }
+    }
+
+    // S3 grantee validation tests
+
+    #[test]
+    fn grantee_accepts_id_format() {
+        let t = s3_grantee();
+        assert!(
+            t.validate(&Value::String(
+                "id=\"79a59df900b949e55d96a1e698fbacedfd6e09d98eacf8f8d5218e7cd47ef2be\""
+                    .to_string()
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn grantee_accepts_email_format() {
+        let t = s3_grantee();
+        assert!(
+            t.validate(&Value::String(
+                "emailAddress=\"user@example.com\"".to_string()
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn grantee_accepts_uri_format() {
+        let t = s3_grantee();
+        assert!(
+            t.validate(&Value::String(
+                "uri=\"http://acs.amazonaws.com/groups/global/AllUsers\"".to_string()
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn grantee_accepts_multiple_specs() {
+        let t = s3_grantee();
+        assert!(
+            t.validate(&Value::String(
+                "id=\"abc123\", emailAddress=\"user@example.com\"".to_string()
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn grantee_rejects_empty_string() {
+        let t = s3_grantee();
+        assert!(t.validate(&Value::String("".to_string())).is_err());
+    }
+
+    #[test]
+    fn grantee_rejects_invalid_prefix() {
+        let t = s3_grantee();
+        let result = t.validate(&Value::String("foo=\"bar\"".to_string()));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("must start with id=, emailAddress=, or uri="));
     }
 
     #[test]
