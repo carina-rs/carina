@@ -31,27 +31,13 @@ pub fn resolve_enum_identifiers_impl(resources: &mut [Resource]) {
         let mut resolved_attrs = HashMap::new();
         for (key, value) in &resource.attributes {
             if let Some(attr_schema) = config.schema.attributes.get(key.as_str())
-                && let Some((type_name, ns, to_dsl)) = attr_schema.attr_type.namespaced_enum_parts()
+                && let Some(parts) = attr_schema.attr_type.namespaced_enum_parts()
             {
-                let resolved = match &value.0 {
-                    Value::String(s) if !s.contains('.') => {
-                        // bare identifier or plain string: "advanced" -> awscc.ec2.ipam.Tier.advanced
-                        let dsl_val = to_dsl.map_or_else(|| s.clone(), |f| f(s));
-                        Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
-                    }
-                    Value::String(s)
-                        if s.split_once('.').is_some_and(|(ident, member)| {
-                            ident == type_name && !member.contains('.')
-                        }) =>
-                    {
-                        // TypeName.value: "Tier.advanced" -> awscc.ec2.ipam.Tier.advanced
-                        let member = s.split_once('.').unwrap().1;
-                        let dsl_val = to_dsl.map_or_else(|| member.to_string(), |f| f(member));
-                        Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
-                    }
-                    _ => value.0.clone(),
-                };
-                resolved_attrs.insert(key.clone(), resolved);
+                if let Some(resolved) = carina_core::utils::resolve_enum_value(&value.0, &parts) {
+                    resolved_attrs.insert(key.clone(), resolved);
+                } else {
+                    resolved_attrs.insert(key.clone(), value.0.clone());
+                }
                 continue;
             }
 
@@ -100,24 +86,10 @@ fn resolve_struct_enum_values(value: &Value, fields: &[StructField]) -> Value {
             let mut resolved_map = HashMap::new();
             for (field_key, field_value) in map {
                 if let Some(field) = fields.iter().find(|f| f.name == *field_key)
-                    && let Some((type_name, ns, to_dsl)) = field.field_type.namespaced_enum_parts()
+                    && let Some(parts) = field.field_type.namespaced_enum_parts()
+                    && let Some(resolved) =
+                        carina_core::utils::resolve_enum_value(field_value, &parts)
                 {
-                    let resolved = match field_value {
-                        Value::String(s) if !s.contains('.') => {
-                            let dsl_val = to_dsl.map_or_else(|| s.clone(), |f| f(s));
-                            Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
-                        }
-                        Value::String(s)
-                            if s.split_once('.').is_some_and(|(ident, member)| {
-                                ident == type_name && !member.contains('.')
-                            }) =>
-                        {
-                            let member = s.split_once('.').unwrap().1;
-                            let dsl_val = to_dsl.map_or_else(|| member.to_string(), |f| f(member));
-                            Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
-                        }
-                        _ => field_value.clone(),
-                    };
                     resolved_map.insert(field_key.clone(), resolved);
                     continue;
                 }
@@ -151,16 +123,14 @@ pub fn normalize_state_enums_impl(current_states: &mut HashMap<ResourceId, State
         let mut resolved_attrs = HashMap::new();
         for (key, value) in &state.attributes {
             if let Some(attr_schema) = config.schema.attributes.get(key.as_str())
-                && let Some((type_name, ns, to_dsl)) = attr_schema.attr_type.namespaced_enum_parts()
+                && let Some(parts) = attr_schema.attr_type.namespaced_enum_parts()
             {
-                let resolved = match value {
-                    Value::String(s) if !s.contains('.') => {
-                        let dsl_val = to_dsl.map_or_else(|| s.clone(), |f| f(s));
-                        Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
-                    }
-                    _ => value.clone(),
-                };
-                resolved_attrs.insert(key.clone(), resolved);
+                // AWSCC state normalization: only resolve bare values (no dots)
+                if let Some(resolved) = carina_core::utils::resolve_enum_value(value, &parts) {
+                    resolved_attrs.insert(key.clone(), resolved);
+                } else {
+                    resolved_attrs.insert(key.clone(), value.clone());
+                }
                 continue;
             }
 

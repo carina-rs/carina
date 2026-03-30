@@ -10,6 +10,8 @@ use aws_sdk_s3::types::{
     VersioningConfiguration,
 };
 
+use carina_core::utils::convert_region_value;
+
 use crate::backend::{BackendConfig, BackendError, BackendResult, StateBackend};
 use crate::lock::LockInfo;
 use crate::state::{self, StateFile};
@@ -440,19 +442,6 @@ impl StateBackend for S3Backend {
             .map_err(|e| BackendError::Aws(format!("Failed to block public access: {}", e)))?;
 
         Ok(())
-    }
-}
-
-/// Convert region value from DSL format to AWS format
-/// e.g., "aws.Region.ap_northeast_1" -> "ap-northeast-1"
-///       "awscc.Region.ap_northeast_1" -> "ap-northeast-1"
-fn convert_region_value(value: &str) -> String {
-    if let Some(rest) = value.strip_prefix("aws.Region.") {
-        rest.replace('_', "-")
-    } else if let Some(rest) = value.strip_prefix("awscc.Region.") {
-        rest.replace('_', "-")
-    } else {
-        value.to_string()
     }
 }
 

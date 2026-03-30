@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use carina_core::provider::ProviderNormalizer;
+use carina_core::provider::{self, ProviderNormalizer};
 use carina_core::resource::{Resource, Value};
 use carina_core::schema::ResourceSchema;
 
@@ -22,53 +22,7 @@ impl ProviderNormalizer for AwsNormalizer {
         default_tags: &HashMap<String, Value>,
         schemas: &HashMap<String, ResourceSchema>,
     ) {
-        if default_tags.is_empty() {
-            return;
-        }
-
-        for resource in resources.iter_mut() {
-            if resource.id.provider != "aws" {
-                continue;
-            }
-
-            // Check if the resource schema has a `tags` attribute
-            let schema_key = format!("aws.{}", resource.id.resource_type);
-            let has_tags = schemas
-                .get(&schema_key)
-                .is_some_and(|s| s.attributes.contains_key("tags"));
-
-            if !has_tags {
-                continue;
-            }
-
-            // Merge default_tags into the resource's tags
-            let mut default_tag_keys: Vec<String> = Vec::new();
-            match resource.get_attr_mut("tags") {
-                Some(Value::Map(existing_tags)) => {
-                    for (key, value) in default_tags {
-                        if !existing_tags.contains_key(key) {
-                            existing_tags.insert(key.clone(), value.clone());
-                            default_tag_keys.push(key.clone());
-                        }
-                    }
-                }
-                None => {
-                    default_tag_keys = default_tags.keys().cloned().collect();
-                    resource.set_attr("tags".to_string(), Value::Map(default_tags.clone()));
-                }
-                _ => {
-                    continue;
-                }
-            }
-
-            if !default_tag_keys.is_empty() {
-                default_tag_keys.sort();
-                resource.set_attr(
-                    "_default_tag_keys".to_string(),
-                    Value::List(default_tag_keys.into_iter().map(Value::String).collect()),
-                );
-            }
-        }
+        provider::merge_default_tags_for_provider("aws", resources, default_tags, schemas);
     }
 }
 
@@ -102,26 +56,9 @@ pub(crate) fn resolve_enum_identifiers(resources: &mut [Resource]) {
         let mut resolved_attrs = HashMap::new();
         for (key, value) in &resource.attributes {
             if let Some(attr_schema) = config.schema.attributes.get(key.as_str())
-                && let Some((type_name, ns, to_dsl)) = attr_schema.attr_type.namespaced_enum_parts()
+                && let Some(parts) = attr_schema.attr_type.namespaced_enum_parts()
+                && let Some(resolved) = carina_core::utils::resolve_enum_value(&value.0, &parts)
             {
-                let resolved = match &value.0 {
-                    Value::String(s) if !s.contains('.') => {
-                        // bare identifier or plain string: "Enabled" → aws.s3.bucket.VersioningStatus.Enabled
-                        let dsl_val = to_dsl.map_or_else(|| s.clone(), |f| f(s));
-                        Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
-                    }
-                    Value::String(s)
-                        if s.split_once('.').is_some_and(|(ident, member)| {
-                            ident == type_name && !member.contains('.')
-                        }) =>
-                    {
-                        // TypeName.value: "VersioningStatus.Enabled" → aws.s3.bucket.VersioningStatus.Enabled
-                        let member = s.split_once('.').unwrap().1;
-                        let dsl_val = to_dsl.map_or_else(|| member.to_string(), |f| f(member));
-                        Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
-                    }
-                    _ => value.0.clone(),
-                };
                 resolved_attrs.insert(key.clone(), resolved);
             }
         }
@@ -154,21 +91,18 @@ pub(crate) fn normalize_state_enums(resource_type: &str, attributes: &mut HashMa
     let mut resolved = HashMap::new();
     for (key, value) in attributes.iter() {
         if let Some(attr_schema) = config.schema.attributes.get(key.as_str()) {
-            if let Some((type_name, ns, to_dsl)) = attr_schema.attr_type.namespaced_enum_parts()
-                && let Value::String(s) = value
-            {
-                // Skip values already in namespaced DSL format (e.g., "aws.ec2.vpn_gateway.Type.ipsec.1").
-                // A value that contains '.' but is not already namespaced is a raw enum value
-                // like "ipsec.1" — check if it matches a known valid enum value.
-                let already_namespaced =
-                    s.contains('.')
-                        && !attr_schema.attr_type.string_enum_parts().is_some_and(
-                            |(_, vals, _, _)| vals.iter().any(|v| v.eq_ignore_ascii_case(s)),
-                        );
-                if !already_namespaced {
-                    let dsl_val = to_dsl.map_or_else(|| s.clone(), |f| f(s));
-                    let namespaced = format!("{}.{}.{}", ns, type_name, dsl_val);
-                    resolved.insert(key.clone(), Value::String(namespaced));
+            if let Some(parts) = attr_schema.attr_type.namespaced_enum_parts() {
+                let enum_vals = attr_schema
+                    .attr_type
+                    .string_enum_parts()
+                    .map(|(_, v, _, _)| v);
+                let check = |s: &str| {
+                    enum_vals.is_some_and(|vals| vals.iter().any(|v| v.eq_ignore_ascii_case(s)))
+                };
+                if let Some(normalized) =
+                    carina_core::utils::normalize_state_enum_value(value, &parts, Some(&check))
+                {
+                    resolved.insert(key.clone(), normalized);
                 }
             }
             // Normalize enum fields within struct (Map) values
@@ -178,13 +112,15 @@ pub(crate) fn normalize_state_enums(resource_type: &str, attributes: &mut HashMa
             {
                 let mut normalized_map = map_fields.clone();
                 for field in fields {
-                    if let Some((type_name, ns, to_dsl)) = field.field_type.namespaced_enum_parts()
-                        && let Some(Value::String(s)) = map_fields.get(&field.name)
-                        && !s.contains('.')
+                    if let Some(parts) = field.field_type.namespaced_enum_parts()
+                        && let Some(field_value) = map_fields.get(&field.name)
                     {
-                        let dsl_val = to_dsl.map_or_else(|| s.clone(), |f| f(s));
-                        let namespaced = format!("{}.{}.{}", ns, type_name, dsl_val);
-                        normalized_map.insert(field.name.clone(), Value::String(namespaced));
+                        // Struct field state normalization: bare values only (no dot-check needed)
+                        if let Some(normalized) =
+                            carina_core::utils::resolve_enum_value(field_value, &parts)
+                        {
+                            normalized_map.insert(field.name.clone(), normalized);
+                        }
                     }
                 }
                 if normalized_map != *map_fields {
