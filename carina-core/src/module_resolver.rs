@@ -647,35 +647,29 @@ fn eval_validate_function(
             if args.len() != 1 {
                 return Err(format!("{}() expects 1 argument, got {}", name, args.len()));
             }
+            // For Var references, access the original Value directly to support
+            // List and Map types (which can't be represented as ValidateValue).
+            if let ValidateExpr::Var(var_name) = &args[0]
+                && var_name == arg_name
+            {
+                return match arg_value {
+                    Value::String(s) => Ok(ValidateValue::Int(s.len() as i64)),
+                    Value::List(items) => Ok(ValidateValue::Int(items.len() as i64)),
+                    Value::Map(map) => Ok(ValidateValue::Int(map.len() as i64)),
+                    _ => Err(format!(
+                        "{}() argument must be a string, list, or map",
+                        name
+                    )),
+                };
+            }
+            // For non-Var expressions (e.g., string literals), evaluate normally
             let val = eval_validate(&args[0], arg_name, arg_value)?;
             match val {
                 ValidateValue::String(s) => Ok(ValidateValue::Int(s.len() as i64)),
-                _ => {
-                    // Try using the original Value if the arg refers to a list/map
-                    if let ValidateExpr::Var(var_name) = &args[0] {
-                        if var_name == arg_name {
-                            match arg_value {
-                                Value::List(items) => Ok(ValidateValue::Int(items.len() as i64)),
-                                Value::Map(map) => Ok(ValidateValue::Int(map.len() as i64)),
-                                Value::String(s) => Ok(ValidateValue::Int(s.len() as i64)),
-                                _ => Err(format!(
-                                    "{}() argument must be a string, list, or map",
-                                    name
-                                )),
-                            }
-                        } else {
-                            Err(format!(
-                                "{}() argument must be a string, list, or map",
-                                name
-                            ))
-                        }
-                    } else {
-                        Err(format!(
-                            "{}() argument must be a string, list, or map",
-                            name
-                        ))
-                    }
-                }
+                _ => Err(format!(
+                    "{}() argument must be a string, list, or map",
+                    name
+                )),
             }
         }
         _ => Err(format!(
@@ -2098,6 +2092,78 @@ mod tests {
         match err {
             ModuleError::ArgumentValidationFailed { message, .. } => {
                 assert_eq!(message, "validation failed for argument 'count'");
+            }
+            other => panic!("Expected ArgumentValidationFailed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_argument_validation_len_with_list() {
+        use crate::parser::{CompareOp, ValidateExpr};
+        let module = ParsedFile {
+            providers: vec![],
+            resources: vec![],
+            variables: HashMap::new(),
+            imports: vec![],
+            module_calls: vec![],
+            arguments: vec![ArgumentParameter {
+                name: "tags".to_string(),
+                type_expr: TypeExpr::List(Box::new(TypeExpr::String)),
+                default: None,
+                description: None,
+                validate: Some(ValidateExpr::Compare {
+                    lhs: Box::new(ValidateExpr::FunctionCall {
+                        name: "len".to_string(),
+                        args: vec![ValidateExpr::Var("tags".to_string())],
+                    }),
+                    op: CompareOp::Gte,
+                    rhs: Box::new(ValidateExpr::Int(1)),
+                }),
+                message: Some("At least one tag is required".to_string()),
+            }],
+            attribute_params: vec![],
+            backend: None,
+            state_blocks: vec![],
+            user_functions: HashMap::new(),
+            remote_states: vec![],
+        };
+
+        let resolver = {
+            let mut r = ModuleResolver::new(".");
+            r.imported_modules.insert("tagged".to_string(), module);
+            r
+        };
+
+        // Valid: non-empty list
+        let call = ModuleCall {
+            module_name: "tagged".to_string(),
+            binding_name: Some("t".to_string()),
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert(
+                    "tags".to_string(),
+                    Value::List(vec![Value::String("env:prod".to_string())]),
+                );
+                args
+            },
+        };
+        assert!(resolver.expand_module_call(&call, "t").is_ok());
+
+        // Invalid: empty list
+        let call = ModuleCall {
+            module_name: "tagged".to_string(),
+            binding_name: Some("t".to_string()),
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert("tags".to_string(), Value::List(vec![]));
+                args
+            },
+        };
+        let result = resolver.expand_module_call(&call, "t");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ModuleError::ArgumentValidationFailed { message, .. } => {
+                assert_eq!(message, "At least one tag is required");
             }
             other => panic!("Expected ArgumentValidationFailed, got {:?}", other),
         }
