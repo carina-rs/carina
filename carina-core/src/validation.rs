@@ -88,7 +88,7 @@ pub fn validate_resource_ref_types(
                 continue;
             }
 
-            let (ref_binding, ref_attr) = match &attr_value.0 {
+            let (ref_binding, ref_attr) = match attr_value.as_value() {
                 Value::ResourceRef {
                     binding_name,
                     attribute_name,

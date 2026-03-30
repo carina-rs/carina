@@ -110,7 +110,7 @@ pub async fn run_plan(
                 r.id.resource_type == backend_resource_type
                     && r.attributes
                         .get("bucket")
-                        .is_some_and(|v| matches!(&v.0, Value::String(s) if s == &bucket_name))
+                        .is_some_and(|v| matches!(&**v, Value::String(s) if s == &bucket_name))
             });
 
             if !has_bucket_resource {

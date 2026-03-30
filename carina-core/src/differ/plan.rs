@@ -306,11 +306,7 @@ pub fn create_plan(
             } else {
                 let temp_resource = Resource {
                     id: id.clone(),
-                    attributes: state
-                        .attributes
-                        .iter()
-                        .map(|(k, v)| (k.clone(), Expr(v.clone())))
-                        .collect(),
+                    attributes: Expr::wrap_map(state.attributes.clone()),
                     kind: ResourceKind::Real,
                     lifecycle: lifecycle.clone(),
                     prefixes: HashMap::new(),
@@ -469,7 +465,7 @@ pub fn cascade_dependent_updates(
                 .attributes
                 .iter()
                 .filter(|(_, v)| {
-                    matches!(&v.0, Value::ResourceRef { binding_name, .. } if binding_name == dep)
+                    matches!(v.as_value(), Value::ResourceRef { binding_name, .. } if binding_name == dep)
                 })
                 .map(|(k, _)| k.clone())
                 .collect();
@@ -477,7 +473,7 @@ pub fn cascade_dependent_updates(
             let ref_hints: Vec<(String, String)> = resource
                 .attributes
                 .iter()
-                .filter_map(|(k, v)| match &v.0 {
+                .filter_map(|(k, v)| match v.as_value() {
                     Value::ResourceRef {
                         binding_name,
                         attribute_name,
@@ -547,7 +543,7 @@ pub fn cascade_dependent_updates(
                     .attributes
                     .iter()
                     .filter(|(_, v)| {
-                        matches!(&v.0, Value::ResourceRef { binding_name, .. } if binding_name == replaced_binding)
+                        matches!(v.as_value(), Value::ResourceRef { binding_name, .. } if binding_name == replaced_binding)
                     })
                     .map(|(k, _)| k.clone())
                     .collect();
@@ -575,7 +571,7 @@ pub fn cascade_dependent_updates(
                     let ref_hints: Vec<(String, String)> = unresolved
                         .attributes
                         .iter()
-                        .filter_map(|(k, v)| match &v.0 {
+                        .filter_map(|(k, v)| match v.as_value() {
                             Value::ResourceRef {
                                 binding_name,
                                 attribute_name,

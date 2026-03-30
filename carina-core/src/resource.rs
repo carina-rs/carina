@@ -146,6 +146,13 @@ impl Expr {
             .map(|(k, e)| (k.clone(), e.0.clone()))
             .collect()
     }
+
+    /// Wrap a `HashMap<String, Value>` into a `HashMap<String, Expr>`.
+    ///
+    /// This is the inverse of `resolve_map()`.
+    pub fn wrap_map(attrs: HashMap<String, Value>) -> HashMap<String, Expr> {
+        attrs.into_iter().map(|(k, v)| (k, Expr(v))).collect()
+    }
 }
 
 impl From<Value> for Expr {
