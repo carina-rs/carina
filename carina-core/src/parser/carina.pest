@@ -32,9 +32,36 @@ arguments_param_block = {
 }
 
 arguments_param_attr = {
-    "description" ~ "=" ~ string
-  | "default" ~ "=" ~ expression
+    arg_description_attr
+  | arg_default_attr
+  | arg_validation_block
 }
+
+arg_description_attr = { "description" ~ "=" ~ string }
+arg_default_attr = { "default" ~ "=" ~ expression }
+arg_validation_block = { "validation" ~ "{" ~ validation_block_attr* ~ "}" }
+validation_block_attr = { validation_condition_attr | validation_error_message_attr }
+validation_condition_attr = { "condition" ~ "=" ~ validate_expr }
+validation_error_message_attr = { "error_message" ~ "=" ~ string }
+
+// Validate expression: boolean expression with comparison and logical operators
+// Used in arguments block to validate argument values at module call time
+validate_expr = { validate_or_expr }
+validate_or_expr = { validate_and_expr ~ ("||" ~ validate_and_expr)* }
+validate_and_expr = { validate_not_expr ~ ("&&" ~ validate_not_expr)* }
+validate_not_expr = { "!" ~ validate_not_expr | validate_comparison }
+validate_comparison = { validate_primary ~ (compare_op ~ validate_primary)? }
+compare_op = { ">=" | "<=" | "!=" | "==" | ">" | "<" }
+validate_primary = {
+    validate_function_call
+  | boolean
+  | float
+  | number
+  | string
+  | variable_ref
+  | "(" ~ validate_expr ~ ")"
+}
+validate_function_call = { identifier ~ "(" ~ (validate_expr ~ ("," ~ validate_expr)*)? ~ ")" }
 
 // Attributes block: attributes { subnet_ids: list(string), ... }
 attributes_block = {

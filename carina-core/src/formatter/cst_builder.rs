@@ -257,12 +257,38 @@ impl<'a> CstBuilder<'a> {
                 Some(CstChild::Token(Token::new("description".to_string(), span)))
             }
             Rule::kw_default => Some(CstChild::Token(Token::new("default".to_string(), span))),
+            Rule::kw_validation => {
+                Some(CstChild::Token(Token::new("validation".to_string(), span)))
+            }
+            Rule::kw_condition => Some(CstChild::Token(Token::new("condition".to_string(), span))),
+            Rule::kw_error_message => Some(CstChild::Token(Token::new(
+                "error_message".to_string(),
+                span,
+            ))),
+
+            // Validate expression rules - treat as opaque node preserving source text
+            Rule::validate_expr => Some(CstChild::Node(
+                self.build_node(NodeKind::ValidateExpr, pair),
+            )),
+            Rule::validate_or_expr
+            | Rule::validate_and_expr
+            | Rule::validate_not_expr
+            | Rule::validate_comparison
+            | Rule::validate_primary
+            | Rule::validate_function_call => {
+                Some(CstChild::Token(Token::new(pair.as_str().to_string(), span)))
+            }
+            Rule::compare_op | Rule::op_and | Rule::op_or | Rule::op_not => {
+                Some(CstChild::Token(Token::new(pair.as_str().to_string(), span)))
+            }
 
             // Skip file_content (it's a silent rule wrapper)
             Rule::file_content => None,
             Rule::block_content => None,
             Rule::arguments_block_content => None,
             Rule::attributes_block_content => None,
+            Rule::validation_block_content => None,
+            Rule::validation_block_attr => None,
 
             Rule::file => None,
         }

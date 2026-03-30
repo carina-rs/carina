@@ -55,10 +55,42 @@ arguments_param_block_content = _{ trivia | arguments_param_attr }
 arguments_param_attr = {
     kw_description ~ trivia* ~ equals ~ trivia* ~ string
   | kw_default ~ trivia* ~ equals ~ trivia* ~ expression
+  | kw_validation ~ trivia* ~ open_brace ~ validation_block_content* ~ close_brace
+}
+
+validation_block_content = _{ trivia | validation_block_attr }
+
+validation_block_attr = {
+    kw_condition ~ trivia* ~ equals ~ trivia* ~ validate_expr
+  | kw_error_message ~ trivia* ~ equals ~ trivia* ~ string
 }
 
 kw_description = { "description" }
 kw_default = { "default" }
+kw_validation = { "validation" }
+kw_condition = { "condition" }
+kw_error_message = { "error_message" }
+
+// Validate expression for formatter (preserves tokens)
+validate_expr = { validate_or_expr }
+validate_or_expr = { validate_and_expr ~ (trivia* ~ op_or ~ trivia* ~ validate_and_expr)* }
+validate_and_expr = { validate_not_expr ~ (trivia* ~ op_and ~ trivia* ~ validate_not_expr)* }
+validate_not_expr = { op_not ~ trivia* ~ validate_not_expr | validate_comparison }
+validate_comparison = { validate_primary ~ (trivia* ~ compare_op ~ trivia* ~ validate_primary)? }
+compare_op = { ">=" | "<=" | "!=" | "==" | ">" | "<" }
+op_and = { "&&" }
+op_or = { "||" }
+op_not = { "!" }
+validate_primary = {
+    validate_function_call
+  | boolean
+  | float
+  | number
+  | string
+  | variable_ref
+  | open_paren ~ trivia* ~ validate_expr ~ trivia* ~ close_paren
+}
+validate_function_call = { identifier ~ open_paren ~ (trivia* ~ validate_expr ~ (trivia* ~ comma ~ trivia* ~ validate_expr)*)? ~ trivia* ~ close_paren }
 
 // Attributes block: attributes { name: type = value }
 attributes_block = {

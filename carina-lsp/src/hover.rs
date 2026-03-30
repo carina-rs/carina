@@ -904,6 +904,7 @@ awscc.ec2.vpc_gateway_attachment {
             )),
             default: None,
             description: Some("The VPC to deploy into".to_string()),
+            validations: vec![],
         };
 
         let hover = provider
@@ -947,6 +948,7 @@ awscc.ec2.vpc_gateway_attachment {
             type_expr: TypeExpr::Int,
             default: Some(Value::Int(8080)),
             description: Some("Web server port".to_string()),
+            validations: vec![],
         };
 
         let hover = provider
@@ -980,6 +982,7 @@ awscc.ec2.vpc_gateway_attachment {
             type_expr: TypeExpr::String,
             default: None,
             description: None,
+            validations: vec![],
         };
 
         let hover = provider
