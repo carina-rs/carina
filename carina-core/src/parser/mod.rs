@@ -8524,4 +8524,24 @@ arguments {
             other => panic!("Expected And expression, got {:?}", other),
         }
     }
+
+    #[test]
+    fn test_parse_require_null_prefixed_variable() {
+        // Ensure variables with names starting with "null" (e.g., "nullable")
+        // are not mis-parsed as null_literal
+        let input = r#"
+            arguments {
+                nullable: bool = true
+            }
+            require nullable, "must be true"
+        "#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(result.requires.len(), 1);
+        match &result.requires[0].condition {
+            ValidateExpr::Var(name) => {
+                assert_eq!(name, "nullable");
+            }
+            other => panic!("Expected Var('nullable'), got {:?}", other),
+        }
+    }
 }

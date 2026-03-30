@@ -65,7 +65,7 @@ validate_primary = {
   | variable_ref
   | "(" ~ validate_expr ~ ")"
 }
-null_literal = { "null" }
+null_literal = { "null" ~ !(ASCII_ALPHANUMERIC | "_") }
 validate_function_call = { identifier ~ "(" ~ (validate_expr ~ ("," ~ validate_expr)*)? ~ ")" }
 
 // Attributes block: attributes { subnet_ids: list(string), ... }
