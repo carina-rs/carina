@@ -194,6 +194,16 @@ pub enum ValidateExpr {
         name: String,
         args: Vec<ValidateExpr>,
     },
+    /// Null literal
+    Null,
+}
+
+/// A require block: `require <condition>, "error message"`
+/// Used for cross-argument constraints at the module top level.
+#[derive(Debug, Clone)]
+pub struct RequireBlock {
+    pub condition: ValidateExpr,
+    pub error_message: String,
 }
 
 /// Attribute parameter definition (in `attributes { ... }` block)
@@ -333,6 +343,8 @@ pub struct ParsedFile {
     pub user_functions: HashMap<String, UserFunction>,
     /// Remote state references (data sources)
     pub remote_states: Vec<RemoteState>,
+    /// Require blocks (cross-argument constraints)
+    pub requires: Vec<RequireBlock>,
 }
 
 impl ParsedFile {
@@ -438,6 +450,7 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
     let mut backend = None;
     let mut state_blocks = Vec::new();
     let mut remote_states = Vec::new();
+    let mut requires = Vec::new();
     let mut anon_for_counter = 0usize;
     let mut anon_if_counter = 0usize;
 
@@ -484,6 +497,9 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
                             }
                             Rule::moved_block => {
                                 state_blocks.push(parse_moved_block(stmt)?);
+                            }
+                            Rule::require_statement => {
+                                requires.push(parse_require_statement(stmt)?);
                             }
                             Rule::for_expr => {
                                 let binding_name = format!("_for{}", anon_for_counter);
@@ -624,6 +640,7 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
         state_blocks,
         user_functions: ctx.user_functions,
         remote_states,
+        requires,
     })
 }
 
@@ -753,6 +770,20 @@ fn parse_arguments_block(
     Ok(arguments)
 }
 
+/// Parse a require statement: `require <validate_expr>, "error message"`
+fn parse_require_statement(pair: pest::iterators::Pair<Rule>) -> Result<RequireBlock, ParseError> {
+    let mut inner = pair.into_inner();
+    let condition_pair = next_pair(&mut inner, "validate_expr", "require statement")?;
+    let condition = parse_validate_expr(condition_pair)?;
+    let message_pair = next_pair(&mut inner, "string", "require statement")?;
+    let raw = message_pair.as_str();
+    let error_message = raw[1..raw.len() - 1].to_string();
+    Ok(RequireBlock {
+        condition,
+        error_message,
+    })
+}
+
 /// Parse a validate expression (boolean expression with comparisons and logical operators)
 fn parse_validate_expr(pair: pest::iterators::Pair<Rule>) -> Result<ValidateExpr, ParseError> {
     match pair.as_rule() {
@@ -838,6 +869,7 @@ fn parse_validate_expr(pair: pest::iterators::Pair<Rule>) -> Result<ValidateExpr
             }
             Ok(ValidateExpr::FunctionCall { name, args })
         }
+        Rule::null_literal => Ok(ValidateExpr::Null),
         Rule::boolean => Ok(ValidateExpr::Bool(pair.as_str() == "true")),
         Rule::float => {
             let f: f64 = pair
@@ -8383,6 +8415,113 @@ arguments {
                 assert_eq!(path, "../network/carina.state.json");
             }
             other => panic!("Expected Local backend, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_require_statement() {
+        let input = r#"
+            arguments {
+                enable_https: bool = true
+                has_cert: bool = false
+            }
+            require !enable_https || has_cert, "cert is required when HTTPS is enabled"
+        "#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(result.requires.len(), 1);
+        assert_eq!(
+            result.requires[0].error_message,
+            "cert is required when HTTPS is enabled"
+        );
+        // Verify the condition is an Or expression
+        match &result.requires[0].condition {
+            ValidateExpr::Or(_, _) => {}
+            other => panic!("Expected Or expression, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_require_with_len_function() {
+        let input = r#"
+            arguments {
+                subnet_ids: list(string)
+            }
+            require len(subnet_ids) >= 2, "ALB requires at least two subnets"
+        "#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(result.requires.len(), 1);
+        assert_eq!(
+            result.requires[0].error_message,
+            "ALB requires at least two subnets"
+        );
+        match &result.requires[0].condition {
+            ValidateExpr::Compare { lhs, op, rhs } => {
+                assert!(
+                    matches!(lhs.as_ref(), ValidateExpr::FunctionCall { name, .. } if name == "len")
+                );
+                assert_eq!(*op, CompareOp::Gte);
+                assert_eq!(**rhs, ValidateExpr::Int(2));
+            }
+            other => panic!("Expected Compare expression, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_require_with_null() {
+        let input = r#"
+            arguments {
+                cert_arn: string = "default"
+            }
+            require cert_arn != null, "cert_arn must not be null"
+        "#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(result.requires.len(), 1);
+        match &result.requires[0].condition {
+            ValidateExpr::Compare { lhs, op, rhs } => {
+                assert!(matches!(lhs.as_ref(), ValidateExpr::Var(name) if name == "cert_arn"));
+                assert_eq!(*op, CompareOp::Ne);
+                assert_eq!(**rhs, ValidateExpr::Null);
+            }
+            other => panic!("Expected Compare expression, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_multiple_require_statements() {
+        let input = r#"
+            arguments {
+                min_size: int
+                max_size: int
+                subnet_ids: list(string)
+            }
+            require min_size <= max_size, "min_size must be <= max_size"
+            require len(subnet_ids) >= 2, "need at least two subnets"
+        "#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(result.requires.len(), 2);
+        assert_eq!(
+            result.requires[0].error_message,
+            "min_size must be <= max_size"
+        );
+        assert_eq!(
+            result.requires[1].error_message,
+            "need at least two subnets"
+        );
+    }
+
+    #[test]
+    fn test_parse_require_with_and_operator() {
+        let input = r#"
+            arguments {
+                port: int = 80
+            }
+            require port >= 1 && port <= 65535, "port must be between 1 and 65535"
+        "#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(result.requires.len(), 1);
+        match &result.requires[0].condition {
+            ValidateExpr::And(_, _) => {}
+            other => panic!("Expected And expression, got {:?}", other),
         }
     }
 }

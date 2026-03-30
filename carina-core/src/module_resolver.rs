@@ -60,6 +60,9 @@ pub enum ModuleError {
         message: String,
         actual: String,
     },
+
+    #[error("Require constraint failed in module '{module}': {message}")]
+    RequireConstraintFailed { module: String, message: String },
 }
 
 /// Context for module resolution
@@ -187,6 +190,7 @@ impl<'cfg> ModuleResolver<'cfg> {
             state_blocks: vec![],
             user_functions: HashMap::new(),
             remote_states: vec![],
+            requires: vec![],
         };
 
         // Read all .crn files in the directory
@@ -213,6 +217,7 @@ impl<'cfg> ModuleResolver<'cfg> {
             merged.attribute_params.extend(parsed.attribute_params);
             merged.user_functions.extend(parsed.user_functions);
             merged.remote_states.extend(parsed.remote_states);
+            merged.requires.extend(parsed.requires);
         }
 
         Ok(merged)
@@ -375,6 +380,25 @@ impl<'cfg> ModuleResolver<'cfg> {
             }
         }
 
+        // Evaluate require blocks (cross-argument constraints)
+        for require in &module.requires {
+            match evaluate_require_expr(&require.condition, &argument_values) {
+                Ok(true) => {} // Constraint satisfied
+                Ok(false) => {
+                    return Err(ModuleError::RequireConstraintFailed {
+                        module: call.module_name.clone(),
+                        message: require.error_message.clone(),
+                    });
+                }
+                Err(e) => {
+                    return Err(ModuleError::RequireConstraintFailed {
+                        module: call.module_name.clone(),
+                        message: format!("error evaluating require expression: {}", e),
+                    });
+                }
+            }
+        }
+
         // Collect intra-module binding names so we can rewrite ResourceRefs
         let intra_module_bindings: HashSet<String> = module
             .resources
@@ -510,6 +534,9 @@ fn eval_validate(
         ValidateExpr::Int(n) => Ok(ValidateValue::Int(*n)),
         ValidateExpr::Float(f) => Ok(ValidateValue::Float(*f)),
         ValidateExpr::String(s) => Ok(ValidateValue::String(s.clone())),
+        ValidateExpr::Null => {
+            Err("null is not supported in per-argument validation expressions".to_string())
+        }
         ValidateExpr::Var(name) => {
             if name == arg_name {
                 match arg_value {
@@ -676,6 +703,221 @@ fn eval_validate_function(
             "unknown function '{}' in validate expression",
             name
         )),
+    }
+}
+
+/// Evaluate a require expression with access to all argument values.
+/// Returns Ok(true) if the constraint is satisfied, Ok(false) if it fails.
+fn evaluate_require_expr(
+    expr: &ValidateExpr,
+    args: &HashMap<String, Value>,
+) -> Result<bool, String> {
+    let result = eval_require(expr, args)?;
+    match result {
+        RequireValue::Bool(b) => Ok(b),
+        other => Err(format!(
+            "require expression must return a boolean, got {:?}",
+            other
+        )),
+    }
+}
+
+/// Internal value type for require expression evaluation
+#[derive(Debug, Clone)]
+enum RequireValue {
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    String(String),
+    Null,
+}
+
+/// Evaluate a require expression node with access to all argument values
+fn eval_require(
+    expr: &ValidateExpr,
+    args: &HashMap<String, Value>,
+) -> Result<RequireValue, String> {
+    match expr {
+        ValidateExpr::Bool(b) => Ok(RequireValue::Bool(*b)),
+        ValidateExpr::Int(n) => Ok(RequireValue::Int(*n)),
+        ValidateExpr::Float(f) => Ok(RequireValue::Float(*f)),
+        ValidateExpr::String(s) => Ok(RequireValue::String(s.clone())),
+        ValidateExpr::Null => Ok(RequireValue::Null),
+        ValidateExpr::Var(name) => {
+            if let Some(value) = args.get(name) {
+                match value {
+                    Value::Int(n) => Ok(RequireValue::Int(*n)),
+                    Value::Float(f) => Ok(RequireValue::Float(*f)),
+                    Value::Bool(b) => Ok(RequireValue::Bool(*b)),
+                    Value::String(s) => Ok(RequireValue::String(s.clone())),
+                    other => Err(format!(
+                        "unsupported value type for require expression: {:?}",
+                        other
+                    )),
+                }
+            } else {
+                Err(format!("unknown variable '{}' in require expression", name))
+            }
+        }
+        ValidateExpr::Compare { lhs, op, rhs } => {
+            let left = eval_require(lhs, args)?;
+            let right = eval_require(rhs, args)?;
+            let result = compare_require_values(&left, op, &right)?;
+            Ok(RequireValue::Bool(result))
+        }
+        ValidateExpr::And(lhs, rhs) => {
+            let left = eval_require(lhs, args)?;
+            match left {
+                RequireValue::Bool(false) => Ok(RequireValue::Bool(false)),
+                RequireValue::Bool(true) => {
+                    let right = eval_require(rhs, args)?;
+                    match right {
+                        RequireValue::Bool(b) => Ok(RequireValue::Bool(b)),
+                        _ => Err("right operand of && must be boolean".to_string()),
+                    }
+                }
+                _ => Err("left operand of && must be boolean".to_string()),
+            }
+        }
+        ValidateExpr::Or(lhs, rhs) => {
+            let left = eval_require(lhs, args)?;
+            match left {
+                RequireValue::Bool(true) => Ok(RequireValue::Bool(true)),
+                RequireValue::Bool(false) => {
+                    let right = eval_require(rhs, args)?;
+                    match right {
+                        RequireValue::Bool(b) => Ok(RequireValue::Bool(b)),
+                        _ => Err("right operand of || must be boolean".to_string()),
+                    }
+                }
+                _ => Err("left operand of || must be boolean".to_string()),
+            }
+        }
+        ValidateExpr::Not(inner) => {
+            let val = eval_require(inner, args)?;
+            match val {
+                RequireValue::Bool(b) => Ok(RequireValue::Bool(!b)),
+                _ => Err("operand of ! must be boolean".to_string()),
+            }
+        }
+        ValidateExpr::FunctionCall {
+            name,
+            args: fn_args,
+        } => eval_require_function(name, fn_args, args),
+    }
+}
+
+/// Compare two RequireValues with the given operator
+fn compare_require_values(
+    left: &RequireValue,
+    op: &CompareOp,
+    right: &RequireValue,
+) -> Result<bool, String> {
+    // Handle null comparisons
+    match (left, right) {
+        (RequireValue::Null, RequireValue::Null) => {
+            return Ok(matches!(op, CompareOp::Eq));
+        }
+        (RequireValue::Null, _) | (_, RequireValue::Null) => {
+            return Ok(matches!(op, CompareOp::Ne));
+        }
+        _ => {}
+    }
+
+    match (left, right) {
+        (RequireValue::Int(a), RequireValue::Int(b)) => Ok(match op {
+            CompareOp::Gte => a >= b,
+            CompareOp::Lte => a <= b,
+            CompareOp::Gt => a > b,
+            CompareOp::Lt => a < b,
+            CompareOp::Eq => a == b,
+            CompareOp::Ne => a != b,
+        }),
+        (RequireValue::Float(a), RequireValue::Float(b)) => Ok(match op {
+            CompareOp::Gte => a >= b,
+            CompareOp::Lte => a <= b,
+            CompareOp::Gt => a > b,
+            CompareOp::Lt => a < b,
+            CompareOp::Eq => a == b,
+            CompareOp::Ne => a != b,
+        }),
+        (RequireValue::Int(a), RequireValue::Float(b)) => {
+            let a = *a as f64;
+            Ok(match op {
+                CompareOp::Gte => a >= *b,
+                CompareOp::Lte => a <= *b,
+                CompareOp::Gt => a > *b,
+                CompareOp::Lt => a < *b,
+                CompareOp::Eq => a == *b,
+                CompareOp::Ne => a != *b,
+            })
+        }
+        (RequireValue::Float(a), RequireValue::Int(b)) => {
+            let b = *b as f64;
+            Ok(match op {
+                CompareOp::Gte => *a >= b,
+                CompareOp::Lte => *a <= b,
+                CompareOp::Gt => *a > b,
+                CompareOp::Lt => *a < b,
+                CompareOp::Eq => *a == b,
+                CompareOp::Ne => *a != b,
+            })
+        }
+        (RequireValue::String(a), RequireValue::String(b)) => Ok(match op {
+            CompareOp::Eq => a == b,
+            CompareOp::Ne => a != b,
+            _ => return Err("strings only support == and != comparisons".to_string()),
+        }),
+        (RequireValue::Bool(a), RequireValue::Bool(b)) => Ok(match op {
+            CompareOp::Eq => a == b,
+            CompareOp::Ne => a != b,
+            _ => return Err("booleans only support == and != comparisons".to_string()),
+        }),
+        _ => Err(format!("cannot compare {:?} with {:?}", left, right)),
+    }
+}
+
+/// Evaluate a function call in a require expression
+fn eval_require_function(
+    name: &str,
+    fn_args: &[ValidateExpr],
+    args: &HashMap<String, Value>,
+) -> Result<RequireValue, String> {
+    match name {
+        "len" | "length" => {
+            if fn_args.len() != 1 {
+                return Err(format!(
+                    "{}() expects 1 argument, got {}",
+                    name,
+                    fn_args.len()
+                ));
+            }
+            // For Var references, access the original Value directly to support
+            // List and Map types (which can't be represented as RequireValue).
+            if let ValidateExpr::Var(var_name) = &fn_args[0]
+                && let Some(value) = args.get(var_name)
+            {
+                return match value {
+                    Value::String(s) => Ok(RequireValue::Int(s.len() as i64)),
+                    Value::List(items) => Ok(RequireValue::Int(items.len() as i64)),
+                    Value::Map(map) => Ok(RequireValue::Int(map.len() as i64)),
+                    _ => Err(format!(
+                        "{}() argument must be a string, list, or map",
+                        name
+                    )),
+                };
+            }
+            // For non-Var expressions, evaluate normally
+            let val = eval_require(&fn_args[0], args)?;
+            match val {
+                RequireValue::String(s) => Ok(RequireValue::Int(s.len() as i64)),
+                _ => Err(format!(
+                    "{}() argument must be a string, list, or map",
+                    name
+                )),
+            }
+        }
+        _ => Err(format!("unknown function '{}' in require expression", name)),
     }
 }
 
@@ -857,6 +1099,7 @@ pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
         state_blocks: vec![],
         user_functions: HashMap::new(),
         remote_states: vec![],
+        requires: vec![],
     };
 
     for entry in entries.flatten() {
@@ -874,6 +1117,7 @@ pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
             merged.attribute_params.extend(parsed.attribute_params);
             merged.user_functions.extend(parsed.user_functions);
             merged.remote_states.extend(parsed.remote_states);
+            merged.requires.extend(parsed.requires);
         }
     }
 
@@ -937,6 +1181,7 @@ pub fn load_module_from_directory(dir: &Path) -> Result<ParsedFile, String> {
         state_blocks: vec![],
         user_functions: HashMap::new(),
         remote_states: vec![],
+        requires: vec![],
     };
 
     for entry in entries {
@@ -959,6 +1204,7 @@ pub fn load_module_from_directory(dir: &Path) -> Result<ParsedFile, String> {
             merged.attribute_params.extend(parsed.attribute_params);
             merged.user_functions.extend(parsed.user_functions);
             merged.remote_states.extend(parsed.remote_states);
+            merged.requires.extend(parsed.requires);
         }
     }
 
@@ -1020,6 +1266,7 @@ mod tests {
             state_blocks: vec![],
             user_functions: HashMap::new(),
             remote_states: vec![],
+            requires: vec![],
         }
     }
 
@@ -1151,6 +1398,7 @@ mod tests {
             state_blocks: vec![],
             user_functions: HashMap::new(),
             remote_states: vec![],
+            requires: vec![],
         }
     }
 
@@ -1273,6 +1521,7 @@ mod tests {
             state_blocks: vec![],
             user_functions: HashMap::new(),
             remote_states: vec![],
+            requires: vec![],
         }
     }
 
@@ -1618,6 +1867,7 @@ mod tests {
             state_blocks: vec![],
             user_functions: HashMap::new(),
             remote_states: vec![],
+            requires: vec![],
         }
     }
 
@@ -1900,6 +2150,7 @@ mod tests {
             state_blocks: vec![],
             user_functions: HashMap::new(),
             remote_states: vec![],
+            requires: vec![],
         }
     }
 
@@ -2067,6 +2318,7 @@ mod tests {
             state_blocks: vec![],
             user_functions: HashMap::new(),
             remote_states: vec![],
+            requires: vec![],
         };
 
         let resolver = {
@@ -2127,6 +2379,7 @@ mod tests {
             state_blocks: vec![],
             user_functions: HashMap::new(),
             remote_states: vec![],
+            requires: vec![],
         };
 
         let resolver = {
@@ -2167,6 +2420,309 @@ mod tests {
                 assert_eq!(message, "At least one tag is required");
             }
             other => panic!("Expected ArgumentValidationFailed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_require_block_passes() {
+        use crate::parser::{RequireBlock, ValidateExpr};
+        let module = ParsedFile {
+            providers: vec![],
+            resources: vec![],
+            variables: HashMap::new(),
+            imports: vec![],
+            module_calls: vec![],
+            arguments: vec![
+                ArgumentParameter {
+                    name: "enable_https".to_string(),
+                    type_expr: TypeExpr::Bool,
+                    default: Some(Value::Bool(true)),
+                    description: None,
+                    validations: Vec::new(),
+                },
+                ArgumentParameter {
+                    name: "cert_arn".to_string(),
+                    type_expr: TypeExpr::String,
+                    default: Some(Value::String(
+                        "arn:aws:acm:us-east-1:123:cert/abc".to_string(),
+                    )),
+                    description: None,
+                    validations: Vec::new(),
+                },
+            ],
+            attribute_params: vec![],
+            backend: None,
+            state_blocks: vec![],
+            user_functions: HashMap::new(),
+            remote_states: vec![],
+            requires: vec![RequireBlock {
+                // !enable_https || cert_arn != null
+                condition: ValidateExpr::Or(
+                    Box::new(ValidateExpr::Not(Box::new(ValidateExpr::Var(
+                        "enable_https".to_string(),
+                    )))),
+                    Box::new(ValidateExpr::Compare {
+                        lhs: Box::new(ValidateExpr::Var("cert_arn".to_string())),
+                        op: CompareOp::Ne,
+                        rhs: Box::new(ValidateExpr::Null),
+                    }),
+                ),
+                error_message: "cert_arn is required when HTTPS is enabled".to_string(),
+            }],
+        };
+
+        let resolver = {
+            let mut r = ModuleResolver::new(".");
+            r.imported_modules.insert("web".to_string(), module);
+            r
+        };
+
+        // HTTPS enabled with cert_arn provided: should pass
+        let call = ModuleCall {
+            module_name: "web".to_string(),
+            binding_name: Some("w".to_string()),
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert("enable_https".to_string(), Value::Bool(true));
+                args.insert(
+                    "cert_arn".to_string(),
+                    Value::String("arn:aws:acm:us-east-1:123:cert/abc".to_string()),
+                );
+                args
+            },
+        };
+        assert!(resolver.expand_module_call(&call, "w").is_ok());
+    }
+
+    #[test]
+    fn test_require_block_fails_with_not_expr() {
+        use crate::parser::{RequireBlock, ValidateExpr};
+        let module = ParsedFile {
+            providers: vec![],
+            resources: vec![],
+            variables: HashMap::new(),
+            imports: vec![],
+            module_calls: vec![],
+            arguments: vec![
+                ArgumentParameter {
+                    name: "enable_https".to_string(),
+                    type_expr: TypeExpr::Bool,
+                    default: Some(Value::Bool(true)),
+                    description: None,
+                    validations: Vec::new(),
+                },
+                ArgumentParameter {
+                    name: "has_cert".to_string(),
+                    type_expr: TypeExpr::Bool,
+                    default: Some(Value::Bool(false)),
+                    description: None,
+                    validations: Vec::new(),
+                },
+            ],
+            attribute_params: vec![],
+            backend: None,
+            state_blocks: vec![],
+            user_functions: HashMap::new(),
+            remote_states: vec![],
+            requires: vec![RequireBlock {
+                // !enable_https || has_cert
+                condition: ValidateExpr::Or(
+                    Box::new(ValidateExpr::Not(Box::new(ValidateExpr::Var(
+                        "enable_https".to_string(),
+                    )))),
+                    Box::new(ValidateExpr::Var("has_cert".to_string())),
+                ),
+                error_message: "cert is required when HTTPS is enabled".to_string(),
+            }],
+        };
+
+        let resolver = {
+            let mut r = ModuleResolver::new(".");
+            r.imported_modules.insert("web".to_string(), module);
+            r
+        };
+
+        // HTTPS enabled but has_cert is false: should fail
+        let call = ModuleCall {
+            module_name: "web".to_string(),
+            binding_name: Some("w".to_string()),
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert("enable_https".to_string(), Value::Bool(true));
+                args.insert("has_cert".to_string(), Value::Bool(false));
+                args
+            },
+        };
+        let result = resolver.expand_module_call(&call, "w");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ModuleError::RequireConstraintFailed { message, .. } => {
+                assert_eq!(message, "cert is required when HTTPS is enabled");
+            }
+            other => panic!("Expected RequireConstraintFailed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_require_block_len_function() {
+        use crate::parser::{RequireBlock, ValidateExpr};
+        let module = ParsedFile {
+            providers: vec![],
+            resources: vec![],
+            variables: HashMap::new(),
+            imports: vec![],
+            module_calls: vec![],
+            arguments: vec![ArgumentParameter {
+                name: "subnet_ids".to_string(),
+                type_expr: TypeExpr::List(Box::new(TypeExpr::String)),
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attribute_params: vec![],
+            backend: None,
+            state_blocks: vec![],
+            user_functions: HashMap::new(),
+            remote_states: vec![],
+            requires: vec![RequireBlock {
+                // len(subnet_ids) >= 2
+                condition: ValidateExpr::Compare {
+                    lhs: Box::new(ValidateExpr::FunctionCall {
+                        name: "len".to_string(),
+                        args: vec![ValidateExpr::Var("subnet_ids".to_string())],
+                    }),
+                    op: CompareOp::Gte,
+                    rhs: Box::new(ValidateExpr::Int(2)),
+                },
+                error_message: "ALB requires at least two subnets".to_string(),
+            }],
+        };
+
+        let resolver = {
+            let mut r = ModuleResolver::new(".");
+            r.imported_modules.insert("alb".to_string(), module);
+            r
+        };
+
+        // Two subnets: should pass
+        let call = ModuleCall {
+            module_name: "alb".to_string(),
+            binding_name: Some("lb".to_string()),
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert(
+                    "subnet_ids".to_string(),
+                    Value::List(vec![
+                        Value::String("subnet-a".to_string()),
+                        Value::String("subnet-b".to_string()),
+                    ]),
+                );
+                args
+            },
+        };
+        assert!(resolver.expand_module_call(&call, "lb").is_ok());
+
+        // One subnet: should fail
+        let call = ModuleCall {
+            module_name: "alb".to_string(),
+            binding_name: Some("lb".to_string()),
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert(
+                    "subnet_ids".to_string(),
+                    Value::List(vec![Value::String("subnet-a".to_string())]),
+                );
+                args
+            },
+        };
+        let result = resolver.expand_module_call(&call, "lb");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ModuleError::RequireConstraintFailed { message, .. } => {
+                assert_eq!(message, "ALB requires at least two subnets");
+            }
+            other => panic!("Expected RequireConstraintFailed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_require_block_multiple_constraints() {
+        use crate::parser::{RequireBlock, ValidateExpr};
+        let module = ParsedFile {
+            providers: vec![],
+            resources: vec![],
+            variables: HashMap::new(),
+            imports: vec![],
+            module_calls: vec![],
+            arguments: vec![
+                ArgumentParameter {
+                    name: "min_size".to_string(),
+                    type_expr: TypeExpr::Int,
+                    default: None,
+                    description: None,
+                    validations: Vec::new(),
+                },
+                ArgumentParameter {
+                    name: "max_size".to_string(),
+                    type_expr: TypeExpr::Int,
+                    default: None,
+                    description: None,
+                    validations: Vec::new(),
+                },
+            ],
+            attribute_params: vec![],
+            backend: None,
+            state_blocks: vec![],
+            user_functions: HashMap::new(),
+            remote_states: vec![],
+            requires: vec![RequireBlock {
+                // min_size <= max_size
+                condition: ValidateExpr::Compare {
+                    lhs: Box::new(ValidateExpr::Var("min_size".to_string())),
+                    op: CompareOp::Lte,
+                    rhs: Box::new(ValidateExpr::Var("max_size".to_string())),
+                },
+                error_message: "min_size must be <= max_size".to_string(),
+            }],
+        };
+
+        let resolver = {
+            let mut r = ModuleResolver::new(".");
+            r.imported_modules.insert("asg".to_string(), module);
+            r
+        };
+
+        // min_size < max_size: should pass
+        let call = ModuleCall {
+            module_name: "asg".to_string(),
+            binding_name: Some("a".to_string()),
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert("min_size".to_string(), Value::Int(1));
+                args.insert("max_size".to_string(), Value::Int(5));
+                args
+            },
+        };
+        assert!(resolver.expand_module_call(&call, "a").is_ok());
+
+        // min_size > max_size: should fail
+        let call = ModuleCall {
+            module_name: "asg".to_string(),
+            binding_name: Some("a".to_string()),
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert("min_size".to_string(), Value::Int(10));
+                args.insert("max_size".to_string(), Value::Int(5));
+                args
+            },
+        };
+        let result = resolver.expand_module_call(&call, "a");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ModuleError::RequireConstraintFailed { message, .. } => {
+                assert_eq!(message, "min_size must be <= max_size");
+            }
+            other => panic!("Expected RequireConstraintFailed, got {:?}", other),
         }
     }
 }

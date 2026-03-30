@@ -381,6 +381,7 @@ mod tests {
             state_blocks: Vec::new(),
             user_functions: HashMap::new(),
             remote_states: Vec::new(),
+            requires: Vec::new(),
         }
     }
 
