@@ -16,7 +16,7 @@ use carina_core::provider::{
     self as provider_mod, Provider, ProviderError, ProviderFactory, ProviderNormalizer,
     ProviderRouter,
 };
-use carina_core::resolver::resolve_refs_with_state;
+use carina_core::resolver::resolve_refs_with_state_and_remote;
 use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::schema::{ResourceSchema, resolve_block_names};
 use carina_core::utils;
@@ -409,10 +409,24 @@ pub async fn create_providers_from_configs(configs: &[ProviderConfig]) -> Provid
     router
 }
 
+/// Create a plan from parsed configuration (without remote state bindings).
+///
+/// This is a convenience wrapper around `create_plan_from_parsed_with_remote`
+/// for callers that don't use remote_state data sources.
+#[allow(dead_code)]
 pub async fn create_plan_from_parsed(
     parsed: &ParsedFile,
     state_file: &Option<StateFile>,
     refresh: bool,
+) -> Result<PlanContext, AppError> {
+    create_plan_from_parsed_with_remote(parsed, state_file, refresh, &HashMap::new()).await
+}
+
+pub async fn create_plan_from_parsed_with_remote(
+    parsed: &ParsedFile,
+    state_file: &Option<StateFile>,
+    refresh: bool,
+    remote_bindings: &HashMap<String, HashMap<String, Value>>,
 ) -> Result<PlanContext, AppError> {
     let ctx = WiringContext::new();
     let sorted_resources =
@@ -526,7 +540,7 @@ pub async fn create_plan_from_parsed(
 
     // Resolve ResourceRef values and enum identifiers using AWS state
     let mut resources = sorted_resources.clone();
-    resolve_refs_with_state(&mut resources, &current_states)?;
+    resolve_refs_with_state_and_remote(&mut resources, &current_states, remote_bindings)?;
     provider.normalize_desired(&mut resources);
 
     // Normalize state enum values to match the DSL format produced by normalize_desired.

@@ -246,6 +246,29 @@ impl StateFile {
         result
     }
 
+    /// Build a map of resource bindings for use as a remote state data source.
+    ///
+    /// Returns a map where each key is a resource binding name and the value is a
+    /// `Value::Map` containing that resource's attributes (converted from JSON to DSL values).
+    /// Resources without a binding name are skipped.
+    ///
+    /// This is used by `remote_state` blocks to expose another project's state
+    /// as a nested map: `remote_binding.resource_binding.attribute`.
+    pub fn build_remote_bindings(&self) -> HashMap<String, Value> {
+        let mut result = HashMap::new();
+        for rs in &self.resources {
+            if let Some(ref binding) = rs.binding {
+                let attrs: HashMap<String, Value> = rs
+                    .attributes
+                    .iter()
+                    .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
+                    .collect();
+                result.insert(binding.clone(), Value::Map(attrs));
+            }
+        }
+        result
+    }
+
     /// Remove a resource from the state
     pub fn remove_resource(
         &mut self,

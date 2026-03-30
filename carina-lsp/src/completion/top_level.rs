@@ -136,6 +136,14 @@ impl CompletionProvider {
                 detail: Some("Configure state backend (S3)".to_string()),
                 ..Default::default()
             },
+            CompletionItem {
+                label: "remote_state".to_string(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                insert_text: Some("let ${1:name} = remote_state {\n    path = \"${2:../other-project/carina.state.json}\"\n}".to_string()),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                detail: Some("Reference another project's state".to_string()),
+                ..Default::default()
+            },
         ];
 
         // Generate resource type completions from schemas

@@ -658,6 +658,7 @@ fn test_find_state_bucket_resource_matching_type() {
         attribute_params: vec![],
         state_blocks: vec![],
         user_functions: HashMap::new(),
+        remote_states: vec![],
     };
 
     // Matching resource type
@@ -1932,6 +1933,7 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
         attribute_params: vec![],
         state_blocks: vec![],
         user_functions: HashMap::new(),
+        remote_states: vec![],
     };
 
     // MockProvider returns not_found for both resources (simulates external deletion)

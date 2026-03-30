@@ -174,6 +174,7 @@ impl<'cfg> ModuleResolver<'cfg> {
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
+            remote_states: vec![],
         };
 
         // Read all .crn files in the directory
@@ -199,6 +200,7 @@ impl<'cfg> ModuleResolver<'cfg> {
             merged.arguments.extend(parsed.arguments);
             merged.attribute_params.extend(parsed.attribute_params);
             merged.user_functions.extend(parsed.user_functions);
+            merged.remote_states.extend(parsed.remote_states);
         }
 
         Ok(merged)
@@ -594,6 +596,7 @@ pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
         backend: None,
         state_blocks: vec![],
         user_functions: HashMap::new(),
+        remote_states: vec![],
     };
 
     for entry in entries.flatten() {
@@ -610,6 +613,7 @@ pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
             merged.arguments.extend(parsed.arguments);
             merged.attribute_params.extend(parsed.attribute_params);
             merged.user_functions.extend(parsed.user_functions);
+            merged.remote_states.extend(parsed.remote_states);
         }
     }
 
@@ -672,6 +676,7 @@ pub fn load_module_from_directory(dir: &Path) -> Result<ParsedFile, String> {
         backend: None,
         state_blocks: vec![],
         user_functions: HashMap::new(),
+        remote_states: vec![],
     };
 
     for entry in entries {
@@ -693,6 +698,7 @@ pub fn load_module_from_directory(dir: &Path) -> Result<ParsedFile, String> {
             merged.arguments.extend(parsed.arguments);
             merged.attribute_params.extend(parsed.attribute_params);
             merged.user_functions.extend(parsed.user_functions);
+            merged.remote_states.extend(parsed.remote_states);
         }
     }
 
@@ -751,6 +757,7 @@ mod tests {
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
+            remote_states: vec![],
         }
     }
 
@@ -880,6 +887,7 @@ mod tests {
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
+            remote_states: vec![],
         }
     }
 
@@ -1001,6 +1009,7 @@ mod tests {
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
+            remote_states: vec![],
         }
     }
 
@@ -1343,6 +1352,7 @@ mod tests {
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
+            remote_states: vec![],
         }
     }
 
