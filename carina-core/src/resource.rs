@@ -108,7 +108,7 @@ impl std::fmt::Display for PathSegment {
 /// This replaces the asymmetric `binding_name` / `attribute_name` / `field_path`
 /// representation where the 2nd segment was named differently but treated the same
 /// as subsequent segments.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AccessPath(pub Vec<PathSegment>);
 
 impl AccessPath {
@@ -162,40 +162,6 @@ impl AccessPath {
     }
 }
 
-impl Serialize for AccessPath {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        let field_path: Vec<&str> = self.field_path();
-        // Always serialize all 3 fields to match the old derived Serialize behavior.
-        // The old code's `#[serde(default)]` was deserialization-only, so old state
-        // files always have `field_path: []`. We preserve this for consistency.
-        let mut map = serializer.serialize_map(Some(3))?;
-        map.serialize_entry("binding_name", self.binding())?;
-        map.serialize_entry("attribute_name", self.attribute())?;
-        let owned: Vec<String> = field_path.into_iter().map(|s| s.to_string()).collect();
-        map.serialize_entry("field_path", &owned)?;
-        map.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for AccessPath {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        struct LegacyRef {
-            binding_name: String,
-            attribute_name: String,
-            #[serde(default)]
-            field_path: Vec<String>,
-        }
-        let legacy = LegacyRef::deserialize(deserializer)?;
-        Ok(AccessPath::from_ref(
-            legacy.binding_name,
-            legacy.attribute_name,
-            legacy.field_path,
-        ))
-    }
-}
-
 impl std::fmt::Display for AccessPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.to_dot_string())
@@ -217,11 +183,7 @@ pub enum Value {
     /// - segment 0: binding name (e.g., "vpc")
     /// - segment 1: attribute name (e.g., "vpc_id")
     /// - segments 2+: nested field path
-    ///
-    /// Serialized with legacy field names (`binding_name`, `attribute_name`, `field_path`)
-    /// for backward compatibility with existing state files.
     ResourceRef {
-        #[serde(flatten)]
         path: AccessPath,
     },
     /// String interpolation: `"prefix-${expr}-suffix"`
@@ -1637,38 +1599,6 @@ mod tests {
         let json = serde_json::to_string(&value).unwrap();
         let deserialized: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value, deserialized);
-    }
-
-    #[test]
-    fn resource_ref_deserialize_legacy_format() {
-        // Simulate a state file with the old serialization format
-        let json = r#"{"ResourceRef":{"binding_name":"vpc","attribute_name":"id"}}"#;
-        let deserialized: Value = serde_json::from_str(json).unwrap();
-        assert_eq!(deserialized, Value::resource_ref("vpc", "id", vec![]));
-    }
-
-    #[test]
-    fn resource_ref_deserialize_legacy_format_with_field_path() {
-        let json = r#"{"ResourceRef":{"binding_name":"web","attribute_name":"network","field_path":["vpc_id"]}}"#;
-        let deserialized: Value = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            deserialized,
-            Value::resource_ref("web", "network", vec!["vpc_id".to_string()])
-        );
-    }
-
-    #[test]
-    fn resource_ref_serialize_produces_legacy_format() {
-        let value = Value::resource_ref("vpc", "id", vec![]);
-        let json = serde_json::to_value(&value).unwrap();
-        // Should produce the same JSON structure as the old format
-        let inner = json
-            .get("ResourceRef")
-            .expect("should have ResourceRef key");
-        assert_eq!(inner.get("binding_name").unwrap(), "vpc");
-        assert_eq!(inner.get("attribute_name").unwrap(), "id");
-        // field_path should always be present (matching old derived Serialize behavior)
-        assert_eq!(inner.get("field_path").unwrap(), &serde_json::json!([]));
     }
 
     #[test]
