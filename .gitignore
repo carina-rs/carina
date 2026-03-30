@@ -29,5 +29,10 @@ Thumbs.db
 # mdbook build output
 docs/book/
 
+# Starlight build output
+docs/node_modules/
+docs/dist/
+docs/.astro/
+
 # CloudFormation schema cache
 carina-provider-awscc/cfn-schema-cache/
