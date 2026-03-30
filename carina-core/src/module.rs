@@ -1300,20 +1300,43 @@ mod tests {
         let signature = ModuleSignature::from_directory_module(&parsed, "web_tier");
         let display = signature.display_with_color(false);
 
-        // Simple form has no description
+        // Simple form has no description line
         assert!(display.contains("enable_https: bool"));
+        // The line after enable_https should not contain a description
+        let lines: Vec<&str> = display.lines().collect();
+        let enable_idx = lines
+            .iter()
+            .position(|l| l.contains("enable_https"))
+            .expect("enable_https should be in display");
+        // Next line should be vpc_id (not a description for enable_https)
         assert!(
-            !display.contains("enable_https")
-                || !display
-                    .lines()
-                    .any(|l| l.contains("enable_https") && l.contains("description"))
+            lines[enable_idx + 1].contains("vpc_id"),
+            "Simple-form argument should not have a description line, got: {}",
+            lines[enable_idx + 1]
         );
 
-        // Block form descriptions are shown
+        // Block form descriptions are shown on the line after the argument
         assert!(display.contains("vpc_id: string"));
-        assert!(display.contains("The VPC to deploy into"));
+        let vpc_idx = lines
+            .iter()
+            .position(|l| l.contains("vpc_id"))
+            .expect("vpc_id should be in display");
+        assert!(
+            lines[vpc_idx + 1].contains("The VPC to deploy into"),
+            "Description should appear on line after vpc_id, got: {}",
+            lines[vpc_idx + 1]
+        );
+
         assert!(display.contains("port: int"));
-        assert!(display.contains("Web server port"));
+        let port_idx = lines
+            .iter()
+            .position(|l| l.contains("port:"))
+            .expect("port should be in display");
+        assert!(
+            lines[port_idx + 1].contains("Web server port"),
+            "Description should appear on line after port, got: {}",
+            lines[port_idx + 1]
+        );
 
         // Required/optional indicators
         assert!(display.contains("(required)")); // vpc_id has no default
