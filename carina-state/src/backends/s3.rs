@@ -10,6 +10,8 @@ use aws_sdk_s3::types::{
     VersioningConfiguration,
 };
 
+use carina_core::utils::convert_region_value;
+
 use crate::backend::{BackendConfig, BackendError, BackendResult, StateBackend};
 use crate::lock::LockInfo;
 use crate::state::{self, StateFile};
@@ -442,8 +444,6 @@ impl StateBackend for S3Backend {
         Ok(())
     }
 }
-
-use carina_core::utils::convert_region_value;
 
 /// Check if an S3 error is a "not found" error
 fn is_not_found_error<E: std::fmt::Debug>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
