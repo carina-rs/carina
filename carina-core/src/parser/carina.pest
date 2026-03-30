@@ -5,9 +5,9 @@ file = { SOI ~ statement* ~ EOI }
 
 statement = { backend_block | provider_block | arguments_block | attributes_block | import_state_block | removed_block | moved_block | if_expr | for_expr | fn_def | let_binding | module_call | anonymous_resource }
 
-// Remote state block: remote_state { path = "..." }
+// Remote state block: remote_state { path = "..." } or remote_state "s3" { bucket = "...", ... }
 // Only valid as a let binding RHS: let network = remote_state { path = "..." }
-remote_state_block = { "remote_state" ~ "{" ~ attribute* ~ "}" }
+remote_state_block = { "remote_state" ~ string? ~ "{" ~ attribute* ~ "}" }
 
 // User-defined function: fn name(params) { body }
 fn_def = { "fn" ~ identifier ~ "(" ~ fn_params? ~ ")" ~ (":" ~ type_expr)? ~ "{" ~ fn_body ~ "}" }

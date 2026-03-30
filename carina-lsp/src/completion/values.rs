@@ -319,10 +319,22 @@ impl CompletionProvider {
                 if let Some(after_rs) = after_eq.strip_prefix("remote_state")
                     && (after_rs.is_empty()
                         || after_rs.starts_with(char::is_whitespace)
-                        || after_rs.starts_with('{'))
+                        || after_rs.starts_with('{')
+                        || after_rs.starts_with('"'))
                 {
+                    // Skip optional backend name string (e.g., "s3")
                     let after_rs = after_rs.trim();
-                    if let Some(after_brace) = after_rs.strip_prefix('{') {
+                    let after_backend = if let Some(stripped) = after_rs.strip_prefix('"') {
+                        // Skip past the closing quote of the backend name
+                        if let Some(end_quote) = stripped.find('"') {
+                            stripped[end_quote + 1..].trim()
+                        } else {
+                            after_rs
+                        }
+                    } else {
+                        after_rs
+                    };
+                    if let Some(after_brace) = after_backend.strip_prefix('{') {
                         current_binding = Some(name.to_string());
                         in_remote_state_block = true;
                         brace_depth = 1;
