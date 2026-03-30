@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use super::*;
 use tower_lsp::lsp_types::InsertTextFormat;
 
@@ -787,6 +789,261 @@ awscc.ec2.vpc_gateway_attachment {
     assert!(
         !labels.contains(&"join"),
         "Should NOT suggest built-in function 'join' after 'igw.'. Got: {:?}",
+        labels
+    );
+}
+
+/// Helper to create a temporary state file for remote_state completion tests.
+fn create_test_state_file(dir: &std::path::Path, filename: &str) -> std::path::PathBuf {
+    let state_path = dir.join(filename);
+    let state_json = serde_json::json!({
+        "version": 4,
+        "serial": 1,
+        "lineage": "test-lineage",
+        "carina_version": "0.1.0",
+        "resources": [
+            {
+                "resource_type": "ec2.vpc",
+                "name": "main-vpc",
+                "provider": "awscc",
+                "attributes": {
+                    "vpc_id": "vpc-12345",
+                    "cidr_block": "10.0.0.0/16"
+                },
+                "binding": "vpc",
+                "dependency_bindings": []
+            },
+            {
+                "resource_type": "ec2.subnet",
+                "name": "main-subnet",
+                "provider": "awscc",
+                "attributes": {
+                    "subnet_id": "subnet-67890",
+                    "vpc_id": "vpc-12345",
+                    "availability_zone": "ap-northeast-1a"
+                },
+                "binding": "subnet",
+                "dependency_bindings": ["vpc"]
+            }
+        ]
+    });
+    let mut f = std::fs::File::create(&state_path).unwrap();
+    f.write_all(
+        serde_json::to_string_pretty(&state_json)
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    state_path
+}
+
+#[test]
+fn remote_state_first_segment_completes_resource_bindings() {
+    let provider = test_provider();
+    let tmp_dir = tempfile::tempdir().unwrap();
+    create_test_state_file(tmp_dir.path(), "network.state.json");
+
+    let doc = create_document(
+        r#"let network = remote_state {
+    path = "network.state.json"
+}
+
+awscc.ec2.security_group {
+    vpc_id = network.
+}"#,
+    );
+
+    // Cursor after "network." on line 5 (character 22)
+    let position = Position {
+        line: 5,
+        character: 22,
+    };
+
+    let completions = provider.complete(&doc, position, Some(tmp_dir.path()));
+
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"network.vpc"),
+        "Should suggest 'network.vpc' from remote state. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"network.subnet"),
+        "Should suggest 'network.subnet' from remote state. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn remote_state_second_segment_completes_resource_attributes() {
+    let provider = test_provider();
+    let tmp_dir = tempfile::tempdir().unwrap();
+    create_test_state_file(tmp_dir.path(), "network.state.json");
+
+    let doc = create_document(
+        r#"let network = remote_state {
+    path = "network.state.json"
+}
+
+awscc.ec2.security_group {
+    vpc_id = network.vpc.
+}"#,
+    );
+
+    // Cursor after "network.vpc." on line 5 (character 26)
+    let position = Position {
+        line: 5,
+        character: 26,
+    };
+
+    let completions = provider.complete(&doc, position, Some(tmp_dir.path()));
+
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"network.vpc.vpc_id"),
+        "Should suggest 'network.vpc.vpc_id' from remote state. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"network.vpc.cidr_block"),
+        "Should suggest 'network.vpc.cidr_block' from remote state. Got: {:?}",
+        labels
+    );
+    // Should NOT contain subnet attributes
+    assert!(
+        !labels.iter().any(|l| l.contains("subnet_id")),
+        "Should NOT suggest subnet attributes when completing vpc. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn remote_state_missing_file_returns_no_completions() {
+    let provider = test_provider();
+    let tmp_dir = tempfile::tempdir().unwrap();
+    // Do NOT create the state file
+
+    let doc = create_document(
+        r#"let network = remote_state {
+    path = "nonexistent.state.json"
+}
+
+awscc.ec2.security_group {
+    vpc_id = network.
+}"#,
+    );
+
+    let position = Position {
+        line: 5,
+        character: 22,
+    };
+
+    let completions = provider.complete(&doc, position, Some(tmp_dir.path()));
+
+    assert!(
+        completions.is_empty(),
+        "Should return no completions when state file is missing. Got: {:?}",
+        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn remote_state_first_segment_triggers_suggest() {
+    // After selecting a resource binding (first segment), the LSP should
+    // trigger another completion to show attributes (second segment).
+    let provider = test_provider();
+    let tmp_dir = tempfile::tempdir().unwrap();
+    create_test_state_file(tmp_dir.path(), "network.state.json");
+
+    let doc = create_document(
+        r#"let network = remote_state {
+    path = "network.state.json"
+}
+
+awscc.ec2.security_group {
+    vpc_id = network.
+}"#,
+    );
+
+    let position = Position {
+        line: 5,
+        character: 22,
+    };
+
+    let completions = provider.complete(&doc, position, Some(tmp_dir.path()));
+
+    let vpc_completion = completions
+        .iter()
+        .find(|c| c.label == "network.vpc")
+        .expect("Should have network.vpc completion");
+
+    assert!(
+        vpc_completion.command.is_some(),
+        "First segment completion should trigger suggest command"
+    );
+    assert_eq!(
+        vpc_completion.command.as_ref().unwrap().command,
+        "editor.action.triggerSuggest"
+    );
+}
+
+#[test]
+fn remote_state_no_base_path_returns_relative_no_completions() {
+    // When base_path is None and the state path is relative, no completions.
+    let provider = test_provider();
+
+    let doc = create_document(
+        r#"let network = remote_state {
+    path = "network.state.json"
+}
+
+awscc.ec2.security_group {
+    vpc_id = network.
+}"#,
+    );
+
+    let position = Position {
+        line: 5,
+        character: 22,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+
+    assert!(
+        completions.is_empty(),
+        "Should return no completions when base_path is None for relative path"
+    );
+}
+
+#[test]
+fn remote_state_single_line_syntax() {
+    // Single-line remote_state syntax should also work.
+    let provider = test_provider();
+    let tmp_dir = tempfile::tempdir().unwrap();
+    create_test_state_file(tmp_dir.path(), "network.state.json");
+
+    let doc = create_document(
+        r#"let network = remote_state { path = "network.state.json" }
+
+awscc.ec2.security_group {
+    vpc_id = network.
+}"#,
+    );
+
+    let position = Position {
+        line: 3,
+        character: 22,
+    };
+
+    let completions = provider.complete(&doc, position, Some(tmp_dir.path()));
+
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"network.vpc"),
+        "Should suggest 'network.vpc' from single-line remote_state. Got: {:?}",
         labels
     );
 }

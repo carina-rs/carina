@@ -829,6 +829,7 @@ dependencies = [
  "carina-core",
  "carina-provider-aws",
  "carina-provider-awscc",
+ "carina-state",
  "dashmap 6.1.0",
  "env_logger",
  "log",
