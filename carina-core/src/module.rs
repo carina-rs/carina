@@ -1269,6 +1269,57 @@ mod tests {
     }
 
     #[test]
+    fn test_module_signature_display_with_descriptions() {
+        use crate::parser::{ProviderContext, parse};
+
+        let input = r#"
+            arguments {
+                enable_https: bool = true
+
+                vpc_id: string {
+                    description = "The VPC to deploy into"
+                }
+
+                port: int {
+                    description = "Web server port"
+                    default     = 8080
+                }
+            }
+
+            attributes {
+                sg_id: string = web_sg.id
+            }
+
+            let web_sg = aws.security_group {
+                name   = "web-sg"
+                vpc_id = vpc_id
+            }
+        "#;
+
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        let signature = ModuleSignature::from_directory_module(&parsed, "web_tier");
+        let display = signature.display_with_color(false);
+
+        // Simple form has no description
+        assert!(display.contains("enable_https: bool"));
+        assert!(
+            !display.contains("enable_https")
+                || !display
+                    .lines()
+                    .any(|l| l.contains("enable_https") && l.contains("description"))
+        );
+
+        // Block form descriptions are shown
+        assert!(display.contains("vpc_id: string"));
+        assert!(display.contains("The VPC to deploy into"));
+        assert!(display.contains("port: int"));
+        assert!(display.contains("Web server port"));
+
+        // Required/optional indicators
+        assert!(display.contains("(required)")); // vpc_id has no default
+    }
+
+    #[test]
     fn test_typed_dependency_graph() {
         use crate::parser::ResourceTypePath;
 
