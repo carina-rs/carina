@@ -9046,9 +9046,9 @@ arguments {
 
     #[test]
     fn test_compose_three_functions() {
-        // split >> map >> join — three-way composition
+        // Three-way composition structure check
         let input = r#"
-            let transform = split(",") >> map(".") >> join("-")
+            let transform = split(",") >> join("-") >> split("-")
         "#;
         let result = parse(input, &ProviderContext::default()).unwrap();
         match result.variables.get("transform").unwrap() {
@@ -9063,5 +9063,24 @@ arguments {
             }
             other => panic!("Expected Closure, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_compose_three_functions_execution() {
+        // Three-way composition applied end-to-end:
+        // split(",") >> join("-") >> split("-") — split, rejoin, then split again
+        let input = r#"
+            let transform = split(",") >> join("-") >> split("-")
+            let result = "a,b,c" |> transform()
+        "#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(
+            result.variables.get("result").unwrap(),
+            &Value::List(vec![
+                Value::String("a".to_string()),
+                Value::String("b".to_string()),
+                Value::String("c".to_string()),
+            ])
+        );
     }
 }
