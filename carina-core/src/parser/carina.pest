@@ -166,7 +166,10 @@ namespaced_id = @{ identifier ~ ("." ~ (identifier | ASCII_DIGIT+))+ }
 expression = { pipe_expr }
 
 // Pipe operator: value |> func |> func
-pipe_expr = { primary ~ ("|>" ~ function_call)* }
+pipe_expr = { compose_expr ~ ("|>" ~ function_call)* }
+
+// Compose operator: f >> g (function composition, binds tighter than |>)
+compose_expr = { primary ~ (">>" ~ primary)* }
 
 // Function call: func(args)
 function_call = { identifier ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }

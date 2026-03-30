@@ -83,6 +83,7 @@ pub enum NodeKind {
     NestedBlock,
     Expression,
     PipeExpr,
+    ComposeExpr,
     FunctionCall,
     VariableRef,
     NamespacedId,
@@ -103,6 +104,7 @@ pub enum NodeKind {
     Equals,
     Colon,
     PipeOperator,
+    ComposeOperator,
     Comma,
     // Keywords
     KwImport,

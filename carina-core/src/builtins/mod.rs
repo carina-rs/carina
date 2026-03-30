@@ -183,6 +183,33 @@ pub fn apply_closure(
     remaining_arity: usize,
     new_args: &[Value],
 ) -> Result<Value, String> {
+    // Handle composed closures: pipe the argument through each function in sequence
+    if name == "__compose__" {
+        if new_args.len() != 1 {
+            return Err(format!(
+                "composed function expects exactly 1 argument, got {}",
+                new_args.len(),
+            ));
+        }
+        let mut result = new_args[0].clone();
+        for func in captured_args {
+            if let Value::Closure {
+                name: fn_name,
+                captured_args: fn_captured,
+                remaining_arity: fn_remaining,
+            } = func
+            {
+                result = apply_closure(fn_name, fn_captured, *fn_remaining, &[result])?;
+            } else {
+                return Err(format!(
+                    "composed function chain contains a non-Closure value: {:?}",
+                    func
+                ));
+            }
+        }
+        return Ok(result);
+    }
+
     if new_args.len() > remaining_arity {
         return Err(format!(
             "{}() closure expects {} more argument{}, got {}",
@@ -216,6 +243,39 @@ pub fn apply_closure_with_config(
     new_args: &[Value],
     config: &ProviderContext,
 ) -> Result<Value, String> {
+    // Handle composed closures: pipe the argument through each function in sequence
+    if name == "__compose__" {
+        if new_args.len() != 1 {
+            return Err(format!(
+                "composed function expects exactly 1 argument, got {}",
+                new_args.len(),
+            ));
+        }
+        let mut result = new_args[0].clone();
+        for func in captured_args {
+            if let Value::Closure {
+                name: fn_name,
+                captured_args: fn_captured,
+                remaining_arity: fn_remaining,
+            } = func
+            {
+                result = apply_closure_with_config(
+                    fn_name,
+                    fn_captured,
+                    *fn_remaining,
+                    &[result],
+                    config,
+                )?;
+            } else {
+                return Err(format!(
+                    "composed function chain contains a non-Closure value: {:?}",
+                    func
+                ));
+            }
+        }
+        return Ok(result);
+    }
+
     if new_args.len() > remaining_arity {
         return Err(format!(
             "{}() closure expects {} more argument{}, got {}",
