@@ -181,6 +181,7 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::Interpolation(_) => "Interpolation",
         Value::FunctionCall { .. } => "FunctionCall",
         Value::Secret(_) => "Secret",
+        Value::Closure { .. } => "Closure",
     }
 }
 

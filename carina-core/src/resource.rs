@@ -200,6 +200,19 @@ pub enum Value {
     /// A secret value. The inner value is sent to the provider but stored as a
     /// SHA256 hash in state. Plan output displays `(secret)` instead of the value.
     Secret(Box<Value>),
+    /// A partially applied function (closure).
+    ///
+    /// Exists only during expression evaluation; never serialized to state.
+    /// Created when a function receives fewer arguments than it needs.
+    #[serde(skip)]
+    Closure {
+        /// Original function name
+        name: String,
+        /// Arguments already provided
+        captured_args: Vec<Value>,
+        /// How many more arguments are needed
+        remaining_arity: usize,
+    },
 }
 
 /// A part of a string interpolation expression
@@ -227,6 +240,24 @@ impl Value {
         Value::ResourceRef {
             path: AccessPath::from_ref(binding_name, attribute_name, field_path),
         }
+    }
+
+    /// Create a `Closure` value representing a partially applied function.
+    pub fn closure(
+        name: impl Into<String>,
+        captured_args: Vec<Value>,
+        remaining_arity: usize,
+    ) -> Self {
+        Value::Closure {
+            name: name.into(),
+            captured_args,
+            remaining_arity,
+        }
+    }
+
+    /// Returns true if this value is a `Closure`.
+    pub fn is_closure(&self) -> bool {
+        matches!(self, Value::Closure { .. })
     }
 
     /// If this is a `ResourceRef`, returns the binding name.
@@ -328,6 +359,7 @@ pub fn contains_resource_ref(value: &Value) -> bool {
         }),
         Value::FunctionCall { args, .. } => args.iter().any(contains_resource_ref),
         Value::Secret(inner) => contains_resource_ref(inner),
+        Value::Closure { captured_args, .. } => captured_args.iter().any(contains_resource_ref),
         _ => false,
     }
 }
@@ -413,6 +445,18 @@ impl Value {
             }
             Value::Secret(inner) => {
                 inner.hash_into(hasher);
+            }
+            Value::Closure {
+                name,
+                captured_args,
+                remaining_arity,
+            } => {
+                name.hash(hasher);
+                captured_args.len().hash(hasher);
+                for arg in captured_args {
+                    arg.hash_into(hasher);
+                }
+                remaining_arity.hash(hasher);
             }
         }
     }
@@ -1610,5 +1654,60 @@ mod tests {
 
         let non_ref = Value::String("hello".to_string());
         assert_eq!(non_ref.ref_binding(), None);
+    }
+
+    #[test]
+    fn closure_constructor() {
+        let closure = Value::closure("map", vec![Value::String(".subnet_id".to_string())], 1);
+        match &closure {
+            Value::Closure {
+                name,
+                captured_args,
+                remaining_arity,
+            } => {
+                assert_eq!(name, "map");
+                assert_eq!(captured_args.len(), 1);
+                assert_eq!(*remaining_arity, 1);
+            }
+            _ => panic!("Expected Closure variant"),
+        }
+    }
+
+    #[test]
+    fn closure_is_closure_helper() {
+        let closure = Value::closure("map", vec![], 2);
+        assert!(closure.is_closure());
+
+        let not_closure = Value::String("hello".to_string());
+        assert!(!not_closure.is_closure());
+    }
+
+    #[test]
+    fn closure_serde_serialize_fails() {
+        // Closure with #[serde(skip)] cannot be serialized — serde rejects it.
+        let closure = Value::closure("map", vec![Value::String(".id".to_string())], 1);
+        let result = serde_json::to_string(&closure);
+        assert!(result.is_err(), "Closure must not be serializable");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("cannot be serialized"),
+            "Error should mention serialization: {err}"
+        );
+    }
+
+    #[test]
+    fn closure_not_in_contains_resource_ref() {
+        let closure = Value::closure("map", vec![Value::String(".id".to_string())], 1);
+        assert!(!contains_resource_ref(&closure));
+    }
+
+    #[test]
+    fn closure_with_resource_ref_in_captured_args() {
+        let closure = Value::Closure {
+            name: "map".to_string(),
+            captured_args: vec![Value::resource_ref("vpc", "id", vec![])],
+            remaining_arity: 1,
+        };
+        assert!(contains_resource_ref(&closure));
     }
 }
