@@ -145,15 +145,12 @@ impl AwsProvider {
         })?;
 
         // Configure versioning
-        self.write_s3_bucket_versioning(
-            &resource.id,
-            &bucket_name,
-            &resource.resolved_attributes(),
-        )
-        .await?;
+        let attrs = resource.resolved_attributes();
+        self.write_s3_bucket_versioning(&resource.id, &bucket_name, &attrs)
+            .await?;
 
         // Set tags
-        self.write_s3_bucket_tags(&resource.id, &bucket_name, &resource.resolved_attributes())
+        self.write_s3_bucket_tags(&resource.id, &bucket_name, &attrs)
             .await?;
 
         // Return state after creation
@@ -171,16 +168,16 @@ impl AwsProvider {
         let bucket_name = identifier.to_string();
 
         // Update versioning status
-        self.write_s3_bucket_versioning(&id, &bucket_name, &to.resolved_attributes())
+        let attrs = to.resolved_attributes();
+        self.write_s3_bucket_versioning(&id, &bucket_name, &attrs)
             .await?;
 
         // Update object ownership
-        self.write_s3_bucket_ownership_controls(&id, &bucket_name, &to.resolved_attributes())
+        self.write_s3_bucket_ownership_controls(&id, &bucket_name, &attrs)
             .await?;
 
         // Update ACL
-        self.write_s3_bucket_acl(&id, &bucket_name, &to.resolved_attributes())
-            .await?;
+        self.write_s3_bucket_acl(&id, &bucket_name, &attrs).await?;
 
         // Update tags: if tags were removed entirely, delete all tags
         if from.attributes.contains_key("tags") && !to.attributes.contains_key("tags") {
@@ -195,8 +192,7 @@ impl AwsProvider {
                         .for_resource(id.clone())
                 })?;
         } else {
-            self.write_s3_bucket_tags(&id, &bucket_name, &to.resolved_attributes())
-                .await?;
+            self.write_s3_bucket_tags(&id, &bucket_name, &attrs).await?;
         }
 
         self.read_s3_bucket(&id, Some(&bucket_name)).await
