@@ -17,6 +17,7 @@ pub mod module;
 pub mod module_resolver;
 pub mod parser;
 pub mod plan;
+pub mod plan_tree;
 pub mod provider;
 pub mod resolver;
 pub mod resource;
