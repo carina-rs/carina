@@ -105,6 +105,9 @@ impl<'a> CstBuilder<'a> {
                 self.build_node(NodeKind::RemovedFromAttr, pair),
             )),
             Rule::moved_block => Some(CstChild::Node(self.build_node(NodeKind::MovedBlock, pair))),
+            Rule::require_statement => Some(CstChild::Node(
+                self.build_node(NodeKind::RequireStatement, pair),
+            )),
             Rule::moved_content => None, // Silent rule
             Rule::moved_from_attr => Some(CstChild::Node(
                 self.build_node(NodeKind::MovedFromAttr, pair),
@@ -266,6 +269,8 @@ impl<'a> CstBuilder<'a> {
                 span,
             ))),
 
+            Rule::kw_require => Some(CstChild::Token(Token::new("require".to_string(), span))),
+
             // Validate expression rules - treat as opaque node preserving source text
             Rule::validate_expr => Some(CstChild::Node(
                 self.build_node(NodeKind::ValidateExpr, pair),
@@ -275,7 +280,8 @@ impl<'a> CstBuilder<'a> {
             | Rule::validate_not_expr
             | Rule::validate_comparison
             | Rule::validate_primary
-            | Rule::validate_function_call => {
+            | Rule::validate_function_call
+            | Rule::null_literal => {
                 Some(CstChild::Token(Token::new(pair.as_str().to_string(), span)))
             }
             Rule::compare_op | Rule::op_and | Rule::op_or | Rule::op_not => {

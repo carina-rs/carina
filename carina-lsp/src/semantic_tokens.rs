@@ -316,6 +316,8 @@ impl SemanticTokensProvider {
             }
         } else if trimmed.starts_with("if ") {
             tokens.push((indent, 2, 0)); // KEYWORD: if
+        } else if trimmed.starts_with("require ") {
+            tokens.push((indent, 7, 0)); // KEYWORD: require
         }
 
         // "else" keyword can appear after "}" on a line like "} else {"

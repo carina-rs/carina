@@ -136,6 +136,7 @@ impl Formatter {
             NodeKind::ImportStateBlock => self.format_state_block(node, "import"),
             NodeKind::RemovedBlock => self.format_state_block(node, "removed"),
             NodeKind::MovedBlock => self.format_state_block(node, "moved"),
+            NodeKind::RequireStatement => self.format_require_statement(node),
             NodeKind::ImportToAttr
             | NodeKind::ImportIdAttr
             | NodeKind::RemovedFromAttr
@@ -211,6 +212,41 @@ impl Formatter {
     }
 
     /// Format a state block (import, removed, moved)
+    fn format_require_statement(&mut self, node: &CstNode) {
+        self.write_indent();
+        self.write("require ");
+
+        // Write children: validate_expr, comma, string
+        let mut wrote_expr = false;
+        for child in &node.children {
+            match child {
+                CstChild::Token(token) => {
+                    if token.text == "require" {
+                        continue;
+                    }
+                    if token.text == "," {
+                        self.write(", ");
+                        continue;
+                    }
+                    self.write(&token.text);
+                }
+                CstChild::Node(n) => {
+                    if n.kind == NodeKind::ValidateExpr {
+                        if wrote_expr {
+                            continue;
+                        }
+                        self.format_default(n);
+                        wrote_expr = true;
+                    } else {
+                        self.format_node(n);
+                    }
+                }
+                CstChild::Trivia(_) => {}
+            }
+        }
+        self.write_newline();
+    }
+
     fn format_state_block(&mut self, node: &CstNode, keyword: &str) {
         self.write_indent();
         self.write(keyword);
@@ -2820,6 +2856,24 @@ mod tests {
         assert!(
             result.contains("addr: arn"),
             "Expected 'addr: arn' in:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_require_statement() {
+        let input = r#"arguments {
+  port: int
+}
+require   port >= 1 && port <= 65535  , "port must be valid"
+"#;
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        // The formatter normalizes spacing around "require" keyword and comma,
+        // but preserves validate expression content as-is (opaque)
+        assert!(
+            result.contains("require port >= 1 && port <= 65535, \"port must be valid\""),
+            "Unexpected output:\n{}",
             result
         );
     }

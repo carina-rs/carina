@@ -3,7 +3,10 @@
 // Entry point
 file = { SOI ~ statement* ~ EOI }
 
-statement = { backend_block | provider_block | arguments_block | attributes_block | import_state_block | removed_block | moved_block | if_expr | for_expr | fn_def | let_binding | module_call | anonymous_resource }
+statement = { backend_block | provider_block | arguments_block | attributes_block | import_state_block | removed_block | moved_block | require_statement | if_expr | for_expr | fn_def | let_binding | module_call | anonymous_resource }
+
+// Require statement: require <validate_expr>, "error message"
+require_statement = { "require" ~ validate_expr ~ "," ~ string }
 
 // Remote state block: remote_state { path = "..." } or remote_state "s3" { bucket = "...", ... }
 // Only valid as a let binding RHS: let network = remote_state { path = "..." }
@@ -54,6 +57,7 @@ validate_comparison = { validate_primary ~ (compare_op ~ validate_primary)? }
 compare_op = { ">=" | "<=" | "!=" | "==" | ">" | "<" }
 validate_primary = {
     validate_function_call
+  | null_literal
   | boolean
   | float
   | number
@@ -61,6 +65,7 @@ validate_primary = {
   | variable_ref
   | "(" ~ validate_expr ~ ")"
 }
+null_literal = { "null" ~ !(ASCII_ALPHANUMERIC | "_") }
 validate_function_call = { identifier ~ "(" ~ (validate_expr ~ ("," ~ validate_expr)*)? ~ ")" }
 
 // Attributes block: attributes { subnet_ids: list(string), ... }
