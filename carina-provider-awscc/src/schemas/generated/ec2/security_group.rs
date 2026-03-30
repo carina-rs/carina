@@ -138,7 +138,6 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
             }).with_provider_name("ToPort")
                     ],
                 }))
-                .write_only()
                 .with_description("The inbound rules associated with the security group. There is a short interruption during which you cannot connect to the security group.")
                 .with_provider_name("SecurityGroupIngress")
                 .with_block_name("security_group_ingress"),
