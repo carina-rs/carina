@@ -11,7 +11,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-DOCS_DIR="docs/src/providers/aws"
+DOCS_DIR="docs/src/content/docs/reference/providers/aws"
 EXAMPLES_DIR="carina-provider-aws/examples"
 mkdir -p "$DOCS_DIR"
 
@@ -27,6 +27,25 @@ cargo run -p carina-codegen-aws --bin smithy-codegen -- \
   --model-dir "$SCRIPT_DIR/../tests/fixtures/smithy" \
   --output-dir "$DOCS_DIR" \
   --format markdown
+
+# Prepend Starlight frontmatter to all generated docs
+for DOC_FILE in "$DOCS_DIR"/*/*.md; do
+    [ -f "$DOC_FILE" ] || continue
+    DSL_NAME=$(head -1 "$DOC_FILE" | sed 's/^# *//')
+    SERVICE_DIR=$(basename "$(dirname "$DOC_FILE")")
+    SERVICE_DISPLAY=$(echo "$SERVICE_DIR" | tr '[:lower:]' '[:upper:]')
+    RESOURCE_NAME=$(basename "$DOC_FILE" .md)
+    FRONTMATTER_TMPFILE=$(mktemp)
+    {
+        echo "---"
+        echo "title: \"$DSL_NAME\""
+        echo "description: \"AWS $SERVICE_DISPLAY $RESOURCE_NAME resource reference\""
+        echo "---"
+        echo ""
+        cat "$DOC_FILE"
+    } > "$FRONTMATTER_TMPFILE"
+    mv "$FRONTMATTER_TMPFILE" "$DOC_FILE"
+done
 
 # Insert examples into generated docs (after description, before Argument Reference)
 for DOC_FILE in "$DOCS_DIR"/*/*.md; do
@@ -58,10 +77,6 @@ for DOC_FILE in "$DOCS_DIR"/*/*.md; do
         rm -f "$EXAMPLE_TMPFILE"
     fi
 done
-
-# Generate SUMMARY.md (shared across all providers)
-echo ""
-"$PROJECT_ROOT/docs/scripts/generate-summary.sh"
 
 echo ""
 echo "Done! Generated documentation in $DOCS_DIR"

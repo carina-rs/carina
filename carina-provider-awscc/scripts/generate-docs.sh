@@ -35,7 +35,7 @@ for arg in "$@"; do
 done
 
 CACHE_DIR="carina-provider-awscc/cfn-schema-cache"
-DOCS_DIR="docs/src/providers/awscc"
+DOCS_DIR="docs/src/content/docs/reference/providers/awscc"
 EXAMPLES_DIR="carina-provider-awscc/examples"
 mkdir -p "$CACHE_DIR"
 mkdir -p "$DOCS_DIR"
@@ -118,6 +118,19 @@ for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
         continue
     fi
 
+    # Prepend Starlight frontmatter
+    DSL_NAME=$(head -1 "$OUTPUT_FILE" | sed 's/^# *//')
+    FRONTMATTER_TMPFILE=$(mktemp)
+    {
+        echo "---"
+        echo "title: \"$DSL_NAME\""
+        echo "description: \"AWSCC $SERVICE $RESOURCE resource reference\""
+        echo "---"
+        echo ""
+        cat "$OUTPUT_FILE"
+    } > "$FRONTMATTER_TMPFILE"
+    mv "$FRONTMATTER_TMPFILE" "$OUTPUT_FILE"
+
     # Insert example from hand-written example file (after description, before Argument Reference)
     EXAMPLE_FILE="$EXAMPLES_DIR/${FULL_RESOURCE}/main.crn"
     if [ -f "$EXAMPLE_FILE" ]; then
@@ -146,15 +159,15 @@ for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
     fi
 done
 
-# Generate SUMMARY.md (shared across all providers)
-echo ""
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-"$(cd "$SCRIPT_DIR/../.." && pwd)/docs/scripts/generate-summary.sh"
-
 # Auto-generate index.md with categorized resource listing
 echo "Generating $DOCS_DIR/index.md"
 
 cat > "$DOCS_DIR/index.md" << 'EOF'
+---
+title: "AWSCC Provider"
+description: "AWSCC provider resource reference"
+---
+
 # AWSCC Provider
 
 The `awscc` provider manages AWS resources through the [AWS Cloud Control API](https://docs.aws.amazon.com/cloudcontrolapi/latest/userguide/what-is-cloudcontrolapi.html).
@@ -203,10 +216,3 @@ EOF
 
 echo ""
 echo "Done! Generated documentation in $DOCS_DIR"
-echo ""
-echo "To build the book:"
-echo "  cargo install mdbook"
-echo "  cd docs && mdbook build"
-echo ""
-echo "To preview:"
-echo "  cd docs && mdbook serve"
