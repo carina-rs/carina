@@ -6,7 +6,7 @@
 
 use super::AwsSchemaConfig;
 use super::tags_type;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
 
 /// Returns the schema config for ec2.eip (Smithy: com.amazonaws.ec2)
 pub fn ec2_eip_config() -> AwsSchemaConfig {
@@ -36,7 +36,7 @@ pub fn ec2_eip_config() -> AwsSchemaConfig {
                 .with_provider_name("Domain"),
             )
             .attribute(
-                AttributeSchema::new("public_ip", AttributeType::String)
+                AttributeSchema::new("public_ip", types::ipv4_address())
                     .with_description("The Elastic IP address. (read-only)")
                     .with_provider_name("PublicIp"),
             )

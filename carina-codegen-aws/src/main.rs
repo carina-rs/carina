@@ -2383,6 +2383,8 @@ fn known_string_type_overrides() -> &'static HashMap<&'static str, &'static str>
         m.insert("SecurityGroupRuleId", "super::security_group_rule_id()");
         m.insert("Locale", "super::aws_region()");
         m.insert("BucketAccountId", "super::aws_account_id()");
+        m.insert("PublicIp", "types::ipv4_address()");
+        m.insert("LogDestination", "super::arn()");
         m
     });
     &OVERRIDES

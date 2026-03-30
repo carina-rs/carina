@@ -30,7 +30,7 @@ pub fn ec2_flow_log_config() -> AwsSchemaConfig {
                     .with_provider_name("FlowLogId"),
             )
             .attribute(
-                AttributeSchema::new("log_destination", AttributeType::String)
+                AttributeSchema::new("log_destination", super::arn())
                     .create_only()
                     .with_description(
                         "The destination to which the flow log data is to be published.",
