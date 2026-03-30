@@ -43,7 +43,7 @@ for DOC_FILE in "$DOCS_DIR"/*/*.md; do
         echo "---"
         echo ""
         # Strip H1 line (Starlight renders frontmatter title as heading)
-        sed '/^# /d' "$DOC_FILE"
+        sed '1{/^# /d;}' "$DOC_FILE"
     } > "$FRONTMATTER_TMPFILE"
     mv "$FRONTMATTER_TMPFILE" "$DOC_FILE"
 done

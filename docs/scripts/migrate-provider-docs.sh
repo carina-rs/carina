@@ -27,7 +27,7 @@ migrate_provider() {
             echo "---"
             echo ""
             # Strip H1 line (Starlight renders frontmatter title as heading)
-            sed '/^# /d' "$SRC_DIR/index.md"
+            sed '1{/^# /d;}' "$SRC_DIR/index.md"
         } > "$DST_DIR/index.md"
         echo "Migrated $DST_DIR/index.md"
     fi
@@ -69,7 +69,7 @@ migrate_provider() {
             echo "---"
             echo ""
             # Strip H1 line (Starlight renders frontmatter title as heading)
-            sed '/^# /d' "$DOC_FILE"
+            sed '1{/^# /d;}' "$DOC_FILE"
         } > "$DST_FILE"
         echo "Migrated $DST_FILE"
     done

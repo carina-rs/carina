@@ -127,7 +127,7 @@ for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
         echo "description: \"AWSCC $SERVICE $RESOURCE resource reference\""
         echo "---"
         echo ""
-        sed '/^# /d' "$OUTPUT_FILE"
+        sed '1{/^# /d;}' "$OUTPUT_FILE"
     } > "$FRONTMATTER_TMPFILE"
     mv "$FRONTMATTER_TMPFILE" "$OUTPUT_FILE"
 
