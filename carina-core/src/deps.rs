@@ -35,8 +35,8 @@ pub fn get_resource_dependencies(resource: &Resource) -> HashSet<String> {
 /// Recursively collect resource reference dependencies from a value
 fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
     match value {
-        Value::ResourceRef { binding_name, .. } => {
-            deps.insert(binding_name.clone());
+        Value::ResourceRef { path } => {
+            deps.insert(path.binding().to_string());
         }
         Value::List(items) => {
             for item in items {
@@ -303,11 +303,7 @@ mod tests {
         for dep in deps {
             r.set_attr(
                 format!("ref_{}", dep),
-                Value::ResourceRef {
-                    binding_name: dep.to_string(),
-                    attribute_name: "id".to_string(),
-                    field_path: vec![],
-                },
+                Value::resource_ref(dep.to_string(), "id", vec![]),
             );
         }
         r
@@ -338,20 +334,12 @@ mod tests {
         // pointing at "tgw" (the transitive target), not "tgw_attach" (the direct dep)
         resource.set_attr(
             "transit_gateway_id".to_string(),
-            Value::ResourceRef {
-                binding_name: "tgw".to_string(),
-                attribute_name: "id".to_string(),
-                field_path: vec![],
-            },
+            Value::resource_ref("tgw", "id", vec![]),
         );
         // route_table_id resolved to a ResourceRef pointing at "rt"
         resource.set_attr(
             "route_table_id".to_string(),
-            Value::ResourceRef {
-                binding_name: "rt".to_string(),
-                attribute_name: "route_table_id".to_string(),
-                field_path: vec![],
-            },
+            Value::resource_ref("rt", "route_table_id", vec![]),
         );
         // dependency_bindings was saved before resolution with the CORRECT deps
         resource.dependency_bindings = vec!["rt".to_string(), "tgw_attach".to_string()];

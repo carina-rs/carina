@@ -929,11 +929,7 @@ mod tests {
                 .with_binding("subnet")
                 .with_attribute(
                     "vpc_id",
-                    Value::ResourceRef {
-                        binding_name: "vpc".to_string(),
-                        attribute_name: "vpc_id".to_string(),
-                        field_path: vec![],
-                    },
+                    Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
                 ),
         ));
 
@@ -1101,11 +1097,7 @@ mod tests {
                 .with_binding("subnet")
                 .with_attribute(
                     "vpc_id",
-                    Value::ResourceRef {
-                        binding_name: "vpc".to_string(),
-                        attribute_name: "vpc_id".to_string(),
-                        field_path: vec![],
-                    },
+                    Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
                 ),
         ));
         plan.add(Effect::Create(
@@ -1347,11 +1339,11 @@ mod tests {
 
         // ResourceRef should NOT be resolved (not a DSL enum)
         assert_eq!(
-            format_value(&Value::ResourceRef {
-                binding_name: "vpc".to_string(),
-                attribute_name: "vpc_id".to_string(),
-                field_path: vec![],
-            }),
+            format_value(&Value::resource_ref(
+                "vpc".to_string(),
+                "vpc_id".to_string(),
+                vec![]
+            )),
             "vpc.vpc_id"
         );
     }
@@ -1367,11 +1359,7 @@ mod tests {
                 )
                 .with_attribute(
                     "vpc_id",
-                    Value::ResourceRef {
-                        binding_name: "vpc".to_string(),
-                        attribute_name: "vpc_id".to_string(),
-                        field_path: vec![],
-                    },
+                    Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
                 ),
         ));
 

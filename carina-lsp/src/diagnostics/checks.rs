@@ -360,19 +360,19 @@ impl DiagnosticEngine {
         for attr_param in &parsed.attribute_params {
             if let Some(value) = &attr_param.value {
                 // Check for undefined binding references
-                if let Value::ResourceRef { binding_name, .. } = value
-                    && !defined_bindings.contains(binding_name.as_str())
+                if let Value::ResourceRef { path } = value
+                    && !defined_bindings.contains(path.binding())
                     && let Some((line, col)) =
                         self.find_attributes_value_position(doc, &attr_param.name)
                 {
                     diagnostics.push(carina_diagnostic(
                         line,
                         col,
-                        col + binding_name.len() as u32,
+                        col + path.binding().len() as u32,
                         DiagnosticSeverity::ERROR,
                         format!(
                             "Undefined resource '{}' in attributes '{}'. Define it with 'let {} = ...'",
-                            binding_name, attr_param.name, binding_name
+                            path.binding(), attr_param.name, path.binding()
                         ),
                     ));
                 }
@@ -697,15 +697,13 @@ impl DiagnosticEngine {
         diagnostics: &mut Vec<Diagnostic>,
     ) {
         match value {
-            Value::ResourceRef {
-                binding_name,
-                attribute_name,
-                ..
-            } => {
-                let Some(ref_schema) = binding_schema_map.get(binding_name.as_str()) else {
+            Value::ResourceRef { path } => {
+                let binding_name = path.binding();
+                let attribute_name = path.attribute();
+                let Some(ref_schema) = binding_schema_map.get(binding_name) else {
                     return;
                 };
-                if ref_schema.attributes.contains_key(attribute_name.as_str()) {
+                if ref_schema.attributes.contains_key(attribute_name) {
                     return;
                 }
                 // Attribute not found - build "did you mean" suggestion

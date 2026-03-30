@@ -1053,11 +1053,7 @@ mod tests {
                 .with_binding("subnet")
                 .with_attribute(
                     "vpc_id",
-                    Value::ResourceRef {
-                        binding_name: "vpc".to_string(),
-                        attribute_name: "vpc_id".to_string(),
-                        field_path: vec![],
-                    },
+                    Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
                 ),
         ));
         let app = App::new(&plan, &std::collections::HashMap::new());
@@ -1078,11 +1074,7 @@ mod tests {
                 .with_binding("subnet_a")
                 .with_attribute(
                     "vpc_id",
-                    Value::ResourceRef {
-                        binding_name: "vpc".to_string(),
-                        attribute_name: "vpc_id".to_string(),
-                        field_path: vec![],
-                    },
+                    Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
                 ),
         ));
         plan.add(Effect::Create(
@@ -1090,11 +1082,7 @@ mod tests {
                 .with_binding("subnet_b")
                 .with_attribute(
                     "vpc_id",
-                    Value::ResourceRef {
-                        binding_name: "vpc".to_string(),
-                        attribute_name: "vpc_id".to_string(),
-                        field_path: vec![],
-                    },
+                    Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
                 ),
         ));
         let app = App::new(&plan, &std::collections::HashMap::new());

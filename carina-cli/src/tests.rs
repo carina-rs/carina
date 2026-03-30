@@ -989,11 +989,7 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
     let mut resource_run1 = Resource::with_provider("awscc", "ec2.flow_log", "");
     resource_run1.set_attr(
         "resource_id".to_string(),
-        Value::ResourceRef {
-            binding_name: "vpc".to_string(),
-            attribute_name: "vpc_id".to_string(),
-            field_path: vec![],
-        },
+        Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
     );
     resource_run1.set_attr(
         "resource_type".to_string(),
@@ -1006,11 +1002,7 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
     );
     resource_run1.set_attr(
         "log_destination".to_string(),
-        Value::ResourceRef {
-            binding_name: "bucket".to_string(),
-            attribute_name: "arn".to_string(),
-            field_path: vec![],
-        },
+        Value::resource_ref("bucket".to_string(), "arn".to_string(), vec![]),
     );
     resource_run1.set_attr(
         "destination_options".to_string(),
@@ -1045,11 +1037,7 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
     let mut resource_run2 = Resource::with_provider("awscc", "ec2.flow_log", "");
     resource_run2.set_attr(
         "resource_id".to_string(),
-        Value::ResourceRef {
-            binding_name: "vpc".to_string(),
-            attribute_name: "vpc_id".to_string(),
-            field_path: vec![],
-        },
+        Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
     );
     resource_run2.set_attr(
         "resource_type".to_string(),
@@ -1062,11 +1050,7 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
     );
     resource_run2.set_attr(
         "log_destination".to_string(),
-        Value::ResourceRef {
-            binding_name: "bucket".to_string(),
-            attribute_name: "arn".to_string(),
-            field_path: vec![],
-        },
+        Value::resource_ref("bucket".to_string(), "arn".to_string(), vec![]),
     );
     resource_run2.set_attr(
         "destination_options".to_string(),
@@ -1723,11 +1707,7 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
-            Value::ResourceRef {
-                binding_name: "vpc".to_string(),
-                attribute_name: "vpc_id".to_string(),
-                field_path: vec![],
-            },
+            Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         )
         .with_attribute("cidr_block", Value::String("10.1.2.0/24".to_string()));
 

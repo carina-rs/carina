@@ -2602,11 +2602,7 @@ mod tests {
         for dep in deps {
             r.set_attr(
                 format!("ref_{}", dep),
-                Value::ResourceRef {
-                    binding_name: dep.to_string(),
-                    attribute_name: "id".to_string(),
-                    field_path: vec![],
-                },
+                Value::resource_ref(dep.to_string(), "id".to_string(), vec![]),
             );
         }
         // Save dependency bindings as metadata (normally done by resolver)
@@ -3188,11 +3184,7 @@ mod tests {
         let mut route = Resource::new("ec2.route", "my-route");
         route.set_attr(
             "transit_gateway_id".to_string(),
-            Value::ResourceRef {
-                binding_name: "tgw".to_string(),
-                attribute_name: "id".to_string(),
-                field_path: vec![],
-            },
+            Value::resource_ref("tgw".to_string(), "id".to_string(), vec![]),
         );
         route.dependency_bindings = vec!["rt".to_string(), "tgw_attach".to_string()];
 

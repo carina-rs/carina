@@ -284,7 +284,7 @@ fn build_create_rows(
             rows.push(build_expanded_map_row(key, map));
         } else {
             let ref_binding = match &**value {
-                Value::ResourceRef { binding_name, .. } => Some(binding_name.clone()),
+                Value::ResourceRef { path } => Some(path.binding().to_string()),
                 _ => None,
             };
             rows.push(DetailRow::Attribute {
@@ -628,7 +628,7 @@ fn build_delete_rows(
                 rows.push(build_expanded_map_row(key, map));
             } else {
                 let ref_binding = match value {
-                    Value::ResourceRef { binding_name, .. } => Some(binding_name.clone()),
+                    Value::ResourceRef { path } => Some(path.binding().to_string()),
                     _ => None,
                 };
                 rows.push(DetailRow::Attribute {
@@ -890,7 +890,7 @@ fn is_both_maps(old_value: Option<&Value>, new_value: &Value) -> bool {
 /// Check whether a Value references the given binding name.
 fn value_references_binding(value: &Value, binding: &str) -> bool {
     match value {
-        Value::ResourceRef { binding_name, .. } => binding_name == binding,
+        Value::ResourceRef { path } => path.binding() == binding,
         Value::List(items) => items.iter().any(|v| value_references_binding(v, binding)),
         Value::Map(map) => map.values().any(|v| value_references_binding(v, binding)),
         _ => false,

@@ -939,11 +939,7 @@ mod tests {
         resource.binding = Some("my_subnet".to_string());
         resource.set_attr(
             "vpc_id".to_string(),
-            Value::ResourceRef {
-                binding_name: "my_vpc".to_string(),
-                attribute_name: "vpc_id".to_string(),
-                field_path: vec![],
-            },
+            Value::resource_ref("my_vpc".to_string(), "vpc_id".to_string(), vec![]),
         );
 
         let provider_state = ProviderState {

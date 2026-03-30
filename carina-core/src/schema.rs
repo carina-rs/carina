@@ -494,21 +494,8 @@ impl Value {
             Value::Bool(_) => "Bool".to_string(),
             Value::List(_) => "List".to_string(),
             Value::Map(_) => "Map".to_string(),
-            Value::ResourceRef {
-                binding_name,
-                attribute_name,
-                field_path,
-            } => {
-                if field_path.is_empty() {
-                    format!("ResourceRef({}.{})", binding_name, attribute_name)
-                } else {
-                    format!(
-                        "ResourceRef({}.{}.{})",
-                        binding_name,
-                        attribute_name,
-                        field_path.join(".")
-                    )
-                }
+            Value::ResourceRef { path } => {
+                format!("ResourceRef({})", path.to_dot_string())
             }
             Value::Interpolation(_) => "Interpolation".to_string(),
             Value::FunctionCall { name, .. } => format!("FunctionCall({})", name),
@@ -1975,21 +1962,21 @@ mod tests {
         // ResourceRef values resolve to strings at runtime, so Custom types should accept them
         let ipv4 = types::ipv4_cidr();
         assert!(
-            ipv4.validate(&Value::ResourceRef {
-                binding_name: "vpc".to_string(),
-                attribute_name: "cidr_block".to_string(),
-                field_path: vec![],
-            })
+            ipv4.validate(&Value::resource_ref(
+                "vpc".to_string(),
+                "cidr_block".to_string(),
+                vec![]
+            ))
             .is_ok()
         );
 
         let ipv6 = types::ipv6_cidr();
         assert!(
-            ipv6.validate(&Value::ResourceRef {
-                binding_name: "subnet".to_string(),
-                attribute_name: "ipv6_cidr".to_string(),
-                field_path: vec![],
-            })
+            ipv6.validate(&Value::resource_ref(
+                "subnet".to_string(),
+                "ipv6_cidr".to_string(),
+                vec![]
+            ))
             .is_ok()
         );
     }
@@ -2265,11 +2252,11 @@ mod tests {
         // Valid: ResourceRef is accepted by Custom members
         assert!(
             union_type
-                .validate(&Value::ResourceRef {
-                    binding_name: "gw".to_string(),
-                    attribute_name: "id".to_string(),
-                    field_path: vec![],
-                })
+                .validate(&Value::resource_ref(
+                    "gw".to_string(),
+                    "id".to_string(),
+                    vec![]
+                ))
                 .is_ok()
         );
     }

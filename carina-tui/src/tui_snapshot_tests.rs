@@ -55,11 +55,7 @@ fn build_all_create_plan() -> Plan {
             .with_binding("rt")
             .with_attribute(
                 "vpc_id",
-                Value::ResourceRef {
-                    binding_name: "vpc".to_string(),
-                    attribute_name: "vpc_id".to_string(),
-                    field_path: vec![],
-                },
+                Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
             ),
     ));
     plan.add(Effect::Create(
@@ -68,11 +64,7 @@ fn build_all_create_plan() -> Plan {
             .with_attribute("cidr_block", Value::String("10.0.1.0/24".to_string()))
             .with_attribute(
                 "vpc_id",
-                Value::ResourceRef {
-                    binding_name: "vpc".to_string(),
-                    attribute_name: "vpc_id".to_string(),
-                    field_path: vec![],
-                },
+                Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
             ),
     ));
     plan
@@ -110,11 +102,7 @@ fn build_mixed_operations_plan() -> Plan {
             )
             .with_attribute(
                 "vpc_id",
-                Value::ResourceRef {
-                    binding_name: "vpc".to_string(),
-                    attribute_name: "vpc_id".to_string(),
-                    field_path: vec![],
-                },
+                Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
             ),
     ));
     plan.add(Effect::Delete {

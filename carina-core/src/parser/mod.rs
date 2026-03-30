@@ -384,11 +384,11 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
                                     // `vpc.vpc_id` resolves as ResourceRef and `cidr_block`
                                     // resolves as a variable reference during parsing.
                                     // No `arguments.` prefix needed.
-                                    let placeholder_ref = Value::ResourceRef {
-                                        binding_name: arg.name.clone(),
-                                        attribute_name: String::new(),
-                                        field_path: vec![],
-                                    };
+                                    let placeholder_ref = Value::resource_ref(
+                                        arg.name.clone(),
+                                        String::new(),
+                                        vec![],
+                                    );
                                     ctx.set_variable(arg.name.clone(), placeholder_ref);
                                     let placeholder = Resource::new("_argument", &arg.name);
                                     ctx.set_resource_binding(arg.name.clone(), placeholder);
@@ -2450,11 +2450,11 @@ fn parse_primary_value(
                     })
                 } else if ctx.is_resource_binding(parts[0]) {
                     // Known resource binding: treat as resource reference
-                    Ok(Value::ResourceRef {
-                        binding_name: parts[0].to_string(),
-                        attribute_name: parts[1].to_string(),
-                        field_path: vec![],
-                    })
+                    Ok(Value::resource_ref(
+                        parts[0].to_string(),
+                        parts[1].to_string(),
+                        vec![],
+                    ))
                 } else {
                     // Unknown 2-part identifier: could be TypeName.value enum shorthand
                     // Will be resolved during schema validation
@@ -2463,11 +2463,11 @@ fn parse_primary_value(
             } else if ctx.is_resource_binding(parts[0]) {
                 // 3+ part identifier where first part is a resource binding:
                 // chained field access (e.g., web.network.vpc_id)
-                Ok(Value::ResourceRef {
-                    binding_name: parts[0].to_string(),
-                    attribute_name: parts[1].to_string(),
-                    field_path: parts[2..].iter().map(|s| s.to_string()).collect(),
-                })
+                Ok(Value::resource_ref(
+                    parts[0].to_string(),
+                    parts[1].to_string(),
+                    parts[2..].iter().map(|s| s.to_string()).collect(),
+                ))
             } else {
                 // 3+ part identifier is a namespaced type (aws.Region.ap_northeast_1)
                 Ok(Value::String(full_str.to_string()))
@@ -2595,20 +2595,16 @@ fn parse_primary_value(
                         None => {
                             // Return as ResourceRef with empty attribute_name
                             // (will be resolved later)
-                            Ok(Value::ResourceRef {
-                                binding_name,
-                                attribute_name: String::new(),
-                                field_path: vec![],
-                            })
+                            Ok(Value::resource_ref(binding_name, String::new(), vec![]))
                         }
                     }
                 } else {
                     let attribute_name = field_names.remove(0);
-                    Ok(Value::ResourceRef {
+                    Ok(Value::resource_ref(
                         binding_name,
                         attribute_name,
-                        field_path: field_names,
-                    })
+                        field_names,
+                    ))
                 }
             }
         }
@@ -2761,11 +2757,7 @@ fn resolve_forward_ref_in_value(
                     .get(2)
                     .map(|rest| rest.split('.').map(|s| s.to_string()).collect())
                     .unwrap_or_default();
-                return Value::ResourceRef {
-                    binding_name: parts[0].to_string(),
-                    attribute_name: parts[1].to_string(),
-                    field_path,
-                };
+                return Value::resource_ref(parts[0].to_string(), parts[1].to_string(), field_path);
             }
             value
         }
@@ -2872,12 +2864,8 @@ fn resolve_value_with_config(
     config: &ProviderContext,
 ) -> Result<Value, ParseError> {
     match value {
-        Value::ResourceRef {
-            binding_name,
-            attribute_name,
-            ..
-        } => match binding_map.get(binding_name) {
-            Some(attributes) => match attributes.get(attribute_name) {
+        Value::ResourceRef { path } => match binding_map.get(path.binding()) {
+            Some(attributes) => match attributes.get(path.attribute()) {
                 Some(attr_value) => {
                     // Recursively resolve in case the attribute itself is a reference
                     resolve_value_with_config(attr_value, binding_map, config)
@@ -2889,7 +2877,8 @@ fn resolve_value_with_config(
             },
             None => Err(ParseError::UndefinedVariable(format!(
                 "{}.{}",
-                binding_name, attribute_name
+                path.binding(),
+                path.attribute()
             ))),
         },
         Value::List(items) => {
@@ -3187,11 +3176,11 @@ mod tests {
         let policy = &result.resources[1];
         assert_eq!(
             policy.get_attr("bucket"),
-            Some(&Value::ResourceRef {
-                binding_name: "bucket".to_string(),
-                attribute_name: "name".to_string(),
-                field_path: vec![],
-            })
+            Some(&Value::resource_ref(
+                "bucket".to_string(),
+                "name".to_string(),
+                vec![]
+            ))
         );
     }
 
@@ -3444,11 +3433,11 @@ mod tests {
         let sg = &result.resources[0];
         assert_eq!(
             sg.get_attr("vpc_id"),
-            Some(&Value::ResourceRef {
-                binding_name: "vpc_id".to_string(),
-                attribute_name: String::new(),
-                field_path: vec![],
-            })
+            Some(&Value::resource_ref(
+                "vpc_id".to_string(),
+                String::new(),
+                vec![]
+            ))
         );
     }
 
@@ -4419,11 +4408,11 @@ aws.s3.bucket {
         // Forward reference vpc.vpc_id should be a ResourceRef, not a plain String
         assert_eq!(
             subnet.get_attr("vpc_id"),
-            Some(&Value::ResourceRef {
-                binding_name: "vpc".to_string(),
-                attribute_name: "vpc_id".to_string(),
-                field_path: vec![],
-            }),
+            Some(&Value::resource_ref(
+                "vpc".to_string(),
+                "vpc_id".to_string(),
+                vec![]
+            )),
             "Forward reference should be parsed as ResourceRef, got: {:?}",
             subnet.get_attr("vpc_id")
         );
@@ -4498,11 +4487,11 @@ aws.s3.bucket {
             if let Some(Value::Map(map)) = items.first() {
                 assert_eq!(
                     map.get("vpc_ref"),
-                    Some(&Value::ResourceRef {
-                        binding_name: "vpc".to_string(),
-                        attribute_name: "vpc_id".to_string(),
-                        field_path: vec![],
-                    }),
+                    Some(&Value::resource_ref(
+                        "vpc".to_string(),
+                        "vpc_id".to_string(),
+                        vec![]
+                    )),
                     "Nested forward reference should be resolved"
                 );
             } else {
@@ -4532,11 +4521,11 @@ aws.s3.bucket {
         let subnet = &result.resources[0];
         assert_eq!(
             subnet.get_attr("vpc_id"),
-            Some(&Value::ResourceRef {
-                binding_name: "vpc".to_string(),
-                attribute_name: "encryption_specification".to_string(),
-                field_path: vec!["status".to_string()],
-            }),
+            Some(&Value::resource_ref(
+                "vpc".to_string(),
+                "encryption_specification".to_string(),
+                vec!["status".to_string()]
+            )),
             "Chained forward reference should be parsed as ResourceRef with field_path"
         );
     }
@@ -4560,11 +4549,11 @@ aws.s3.bucket {
         let subnet = &result.resources[0];
         assert_eq!(
             subnet.get_attr("vpc_id"),
-            Some(&Value::ResourceRef {
-                binding_name: "vpc".to_string(),
-                attribute_name: "config".to_string(),
-                field_path: vec!["deep".to_string(), "nested".to_string()],
-            }),
+            Some(&Value::resource_ref(
+                "vpc".to_string(),
+                "config".to_string(),
+                vec!["deep".to_string(), "nested".to_string()]
+            )),
             "Deep chained forward reference should have multiple field_path entries"
         );
     }
@@ -4926,11 +4915,11 @@ aws.s3.bucket {
         let sg = &result.resources[0];
         assert_eq!(
             sg.get_attr("group_name"),
-            Some(&Value::ResourceRef {
-                binding_name: "web".to_string(),
-                attribute_name: "security_group".to_string(),
-                field_path: vec![],
-            })
+            Some(&Value::resource_ref(
+                "web".to_string(),
+                "security_group".to_string(),
+                vec![]
+            ))
         );
     }
 
@@ -4994,11 +4983,11 @@ aws.s3.bucket {
             subnet.get_attr("name"),
             Some(&Value::Interpolation(vec![
                 InterpolationPart::Literal("subnet-".to_string()),
-                InterpolationPart::Expr(Value::ResourceRef {
-                    binding_name: "vpc".to_string(),
-                    attribute_name: "vpc_id".to_string(),
-                    field_path: vec![],
-                }),
+                InterpolationPart::Expr(Value::resource_ref(
+                    "vpc".to_string(),
+                    "vpc_id".to_string(),
+                    vec![]
+                )),
             ]))
         );
     }
@@ -5485,14 +5474,13 @@ aws.s3.bucket {
         let subnet = &result.resources[1];
         let vpc_id = subnet.get_attr("vpc_id").expect("vpc_id attribute");
         match vpc_id {
-            Value::ResourceRef {
-                binding_name,
-                attribute_name,
-                field_path,
-            } => {
+            Value::ResourceRef { path } => {
+                let binding_name = path.binding();
+                let attribute_name = path.attribute();
+                let field_path = path.field_path();
                 assert_eq!(binding_name, "vpc");
                 assert_eq!(attribute_name, "network");
-                assert_eq!(field_path, &vec!["vpc_id".to_string()]);
+                assert_eq!(field_path, vec!["vpc_id"]);
             }
             other => panic!("Expected ResourceRef with field_path, got {:?}", other),
         }
@@ -5516,17 +5504,13 @@ aws.s3.bucket {
         let subnet = &result.resources[1];
         let vpc_id = subnet.get_attr("vpc_id").expect("vpc_id attribute");
         match vpc_id {
-            Value::ResourceRef {
-                binding_name,
-                attribute_name,
-                field_path,
-            } => {
+            Value::ResourceRef { path } => {
+                let binding_name = path.binding();
+                let attribute_name = path.attribute();
+                let field_path = path.field_path();
                 assert_eq!(binding_name, "web");
                 assert_eq!(attribute_name, "output");
-                assert_eq!(
-                    field_path,
-                    &vec!["network".to_string(), "vpc_id".to_string()]
-                );
+                assert_eq!(field_path, vec!["network", "vpc_id"]);
             }
             other => panic!("Expected ResourceRef with field_path, got {:?}", other),
         }
@@ -5552,11 +5536,10 @@ aws.s3.bucket {
         let rt = result.resources.last().expect("route_table resource");
         let subnet_id = rt.get_attr("subnet_id").expect("subnet_id attribute");
         match subnet_id {
-            Value::ResourceRef {
-                binding_name,
-                attribute_name,
-                field_path,
-            } => {
+            Value::ResourceRef { path } => {
+                let binding_name = path.binding();
+                let attribute_name = path.attribute();
+                let field_path = path.field_path();
                 assert_eq!(binding_name, "subnets[0]");
                 assert_eq!(attribute_name, "subnet_id");
                 assert!(field_path.is_empty());
@@ -5590,11 +5573,10 @@ aws.s3.bucket {
         let subnet = result.resources.last().expect("subnet resource");
         let vpc_id = subnet.get_attr("vpc_id").expect("vpc_id attribute");
         match vpc_id {
-            Value::ResourceRef {
-                binding_name,
-                attribute_name,
-                field_path,
-            } => {
+            Value::ResourceRef { path } => {
+                let binding_name = path.binding();
+                let attribute_name = path.attribute();
+                let field_path = path.field_path();
                 assert_eq!(binding_name, r#"networks["prod"]"#);
                 assert_eq!(attribute_name, "vpc_id");
                 assert!(field_path.is_empty());
@@ -5628,14 +5610,13 @@ aws.s3.bucket {
         let subnet = result.resources.last().expect("subnet resource");
         let sg_id = subnet.get_attr("sg_id").expect("sg_id attribute");
         match sg_id {
-            Value::ResourceRef {
-                binding_name,
-                attribute_name,
-                field_path,
-            } => {
+            Value::ResourceRef { path } => {
+                let binding_name = path.binding();
+                let attribute_name = path.attribute();
+                let field_path = path.field_path();
                 assert_eq!(binding_name, r#"webs["prod"]"#);
                 assert_eq!(attribute_name, "security_group");
-                assert_eq!(field_path, &vec!["id".to_string()]);
+                assert_eq!(field_path, vec!["id"]);
             }
             other => panic!("Expected ResourceRef with field_path, got {:?}", other),
         }

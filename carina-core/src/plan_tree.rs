@@ -289,21 +289,21 @@ pub fn extract_compact_hint(
     // Priority 2: First non-parent ResourceRef attribute (direct or inside a List)
     for key in &keys {
         match resource.get_attr(key) {
-            Some(Value::ResourceRef { binding_name, .. }) => {
-                if parent_binding == Some(binding_name.as_str()) {
+            Some(Value::ResourceRef { path }) => {
+                if parent_binding == Some(path.binding()) {
                     continue;
                 }
                 let short_key = shorten_attr_name(key);
-                return Some(format!("{}: {}", short_key, binding_name));
+                return Some(format!("{}: {}", short_key, path.binding()));
             }
             Some(Value::List(items)) => {
                 for item in items {
-                    if let Value::ResourceRef { binding_name, .. } = item {
-                        if parent_binding == Some(binding_name.as_str()) {
+                    if let Value::ResourceRef { path } = item {
+                        if parent_binding == Some(path.binding()) {
                             continue;
                         }
                         let short_key = shorten_attr_name(key);
-                        return Some(format!("{}: {}", short_key, binding_name));
+                        return Some(format!("{}: {}", short_key, path.binding()));
                     }
                 }
             }

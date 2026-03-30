@@ -424,12 +424,10 @@ impl<'cfg> ModuleResolver<'cfg> {
 /// We match when `binding_name` is one of the argument keys.
 fn substitute_arguments(value: &Value, arguments: &HashMap<String, Value>) -> Value {
     match value {
-        Value::ResourceRef { binding_name, .. } if arguments.contains_key(binding_name) => {
-            arguments
-                .get(binding_name)
-                .cloned()
-                .unwrap_or_else(|| value.clone())
-        }
+        Value::ResourceRef { path } if arguments.contains_key(path.binding()) => arguments
+            .get(path.binding())
+            .cloned()
+            .unwrap_or_else(|| value.clone()),
         Value::List(items) => Value::List(
             items
                 .iter()
@@ -475,15 +473,13 @@ fn rewrite_intra_module_refs(
     intra_module_bindings: &HashSet<String>,
 ) -> Value {
     match value {
-        Value::ResourceRef {
-            binding_name,
-            attribute_name,
-            field_path,
-        } if intra_module_bindings.contains(binding_name) => Value::ResourceRef {
-            binding_name: format!("{}.{}", instance_prefix, binding_name),
-            attribute_name: attribute_name.clone(),
-            field_path: field_path.clone(),
-        },
+        Value::ResourceRef { path } if intra_module_bindings.contains(path.binding()) => {
+            Value::resource_ref(
+                format!("{}.{}", instance_prefix, path.binding()),
+                path.attribute().to_string(),
+                path.field_path().iter().map(|s| s.to_string()).collect(),
+            )
+        }
         Value::List(items) => Value::List(
             items
                 .iter()
@@ -719,11 +715,7 @@ mod tests {
                     attrs.insert("name".to_string(), Value::String("sg".to_string()));
                     attrs.insert(
                         "vpc_id".to_string(),
-                        Value::ResourceRef {
-                            binding_name: "vpc_id".to_string(),
-                            attribute_name: String::new(),
-                            field_path: vec![],
-                        },
+                        Value::resource_ref("vpc_id".to_string(), String::new(), vec![]),
                     );
                     attrs.insert(
                         "_type".to_string(),
@@ -768,11 +760,7 @@ mod tests {
         inputs.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
 
         // Argument params are lexically scoped: binding_name is the param name itself
-        let value = Value::ResourceRef {
-            binding_name: "vpc_id".to_string(),
-            attribute_name: String::new(),
-            field_path: vec![],
-        };
+        let value = Value::resource_ref("vpc_id".to_string(), String::new(), vec![]);
         let result = substitute_arguments(&value, &inputs);
 
         assert_eq!(result, Value::String("vpc-123".to_string()));
@@ -784,11 +772,7 @@ mod tests {
         inputs.insert("port".to_string(), Value::Int(8080));
 
         let value = Value::List(vec![
-            Value::ResourceRef {
-                binding_name: "port".to_string(),
-                attribute_name: String::new(),
-                field_path: vec![],
-            },
+            Value::resource_ref("port".to_string(), String::new(), vec![]),
             Value::Int(443),
         ]);
         let result = substitute_arguments(&value, &inputs);
@@ -854,11 +838,7 @@ mod tests {
                         let mut attrs = HashMap::new();
                         attrs.insert(
                             "cidr_block".to_string(),
-                            Value::ResourceRef {
-                                binding_name: "cidr".to_string(),
-                                attribute_name: String::new(),
-                                field_path: vec![],
-                            },
+                            Value::resource_ref("cidr".to_string(), String::new(), vec![]),
                         );
                         Expr::wrap_map(attrs)
                     },
@@ -875,11 +855,7 @@ mod tests {
                         let mut attrs = HashMap::new();
                         attrs.insert(
                             "vpc_id".to_string(),
-                            Value::ResourceRef {
-                                binding_name: "vpc".to_string(),
-                                attribute_name: "id".to_string(),
-                                field_path: vec![],
-                            },
+                            Value::resource_ref("vpc".to_string(), "id".to_string(), vec![]),
                         );
                         Expr::wrap_map(attrs)
                     },
@@ -963,20 +939,20 @@ mod tests {
         // Intra-module ResourceRef must point to the dot-path binding
         assert_eq!(
             expanded_a[1].get_attr("vpc_id"),
-            Some(&Value::ResourceRef {
-                binding_name: "prod.vpc".to_string(),
-                attribute_name: "id".to_string(),
-                field_path: vec![],
-            }),
+            Some(&Value::resource_ref(
+                "prod.vpc".to_string(),
+                "id".to_string(),
+                vec![]
+            )),
             "Instance A subnet should reference prod.vpc, not bare vpc"
         );
         assert_eq!(
             expanded_b[1].get_attr("vpc_id"),
-            Some(&Value::ResourceRef {
-                binding_name: "staging.vpc".to_string(),
-                attribute_name: "id".to_string(),
-                field_path: vec![],
-            }),
+            Some(&Value::resource_ref(
+                "staging.vpc".to_string(),
+                "id".to_string(),
+                vec![]
+            )),
             "Instance B subnet should reference staging.vpc, not bare vpc"
         );
 
@@ -1016,11 +992,11 @@ mod tests {
             attribute_params: vec![AttributeParameter {
                 name: "security_group".to_string(),
                 type_expr: None,
-                value: Some(Value::ResourceRef {
-                    binding_name: "sg".to_string(),
-                    attribute_name: "id".to_string(),
-                    field_path: vec![],
-                }),
+                value: Some(Value::resource_ref(
+                    "sg".to_string(),
+                    "id".to_string(),
+                    vec![],
+                )),
             }],
             backend: None,
             state_blocks: vec![],
@@ -1068,11 +1044,11 @@ mod tests {
         // pointing to the dot-path binding (web.sg)
         assert_eq!(
             virtual_res.get_attr("security_group"),
-            Some(&Value::ResourceRef {
-                binding_name: "web.sg".to_string(),
-                attribute_name: "id".to_string(),
-                field_path: vec![],
-            })
+            Some(&Value::resource_ref(
+                "web.sg".to_string(),
+                "id".to_string(),
+                vec![]
+            ))
         );
     }
 
@@ -1176,11 +1152,11 @@ mod tests {
         // Intra-module ResourceRef should use dot notation
         assert_eq!(
             expanded[1].get_attr("vpc_id"),
-            Some(&Value::ResourceRef {
-                binding_name: "prod.vpc".to_string(),
-                attribute_name: "id".to_string(),
-                field_path: vec![],
-            }),
+            Some(&Value::resource_ref(
+                "prod.vpc".to_string(),
+                "id".to_string(),
+                vec![]
+            )),
         );
     }
 
@@ -1209,11 +1185,11 @@ mod tests {
         // The security_group attribute should reference dot-notation binding
         assert_eq!(
             virtual_res.get_attr("security_group"),
-            Some(&Value::ResourceRef {
-                binding_name: "web.sg".to_string(),
-                attribute_name: "id".to_string(),
-                field_path: vec![],
-            })
+            Some(&Value::resource_ref(
+                "web.sg".to_string(),
+                "id".to_string(),
+                vec![]
+            ))
         );
     }
 
@@ -1227,11 +1203,11 @@ mod tests {
         // Interpolation like "prefix-${env_name}-suffix" where env_name is a module argument
         let value = Value::Interpolation(vec![
             InterpolationPart::Literal("prefix-".to_string()),
-            InterpolationPart::Expr(Value::ResourceRef {
-                binding_name: "env_name".to_string(),
-                attribute_name: String::new(),
-                field_path: vec![],
-            }),
+            InterpolationPart::Expr(Value::resource_ref(
+                "env_name".to_string(),
+                String::new(),
+                vec![],
+            )),
             InterpolationPart::Literal("-suffix".to_string()),
         ]);
         let result = substitute_arguments(&value, &inputs);
@@ -1288,11 +1264,7 @@ mod tests {
         let value = Value::FunctionCall {
             name: "cidr_subnet".to_string(),
             args: vec![
-                Value::ResourceRef {
-                    binding_name: "cidr".to_string(),
-                    attribute_name: String::new(),
-                    field_path: vec![],
-                },
+                Value::resource_ref("cidr".to_string(), String::new(), vec![]),
                 Value::Int(8),
                 Value::Int(0),
             ],
@@ -1324,30 +1296,22 @@ mod tests {
                     let mut attrs = HashMap::new();
                     attrs.insert(
                         "cidr_block".to_string(),
-                        Value::ResourceRef {
-                            binding_name: "cidr_block".to_string(),
-                            attribute_name: String::new(),
-                            field_path: vec![],
-                        },
+                        Value::resource_ref("cidr_block".to_string(), String::new(), vec![]),
                     );
                     attrs.insert(
                         "name".to_string(),
                         Value::Interpolation(vec![
                             InterpolationPart::Literal("test-".to_string()),
-                            InterpolationPart::Expr(Value::ResourceRef {
-                                binding_name: "env_name".to_string(),
-                                attribute_name: String::new(),
-                                field_path: vec![],
-                            }),
+                            InterpolationPart::Expr(Value::resource_ref(
+                                "env_name".to_string(),
+                                String::new(),
+                                vec![],
+                            )),
                         ]),
                     );
                     attrs.insert(
                         "env".to_string(),
-                        Value::ResourceRef {
-                            binding_name: "env_name".to_string(),
-                            attribute_name: String::new(),
-                            field_path: vec![],
-                        },
+                        Value::resource_ref("env_name".to_string(), String::new(), vec![]),
                     );
                     Expr::wrap_map(attrs)
                 },

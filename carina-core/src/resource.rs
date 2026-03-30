@@ -71,6 +71,103 @@ impl std::fmt::Display for ResourceId {
 #[serde(transparent)]
 pub struct Expr(pub Value);
 
+/// A single segment in an access path.
+///
+/// For now, only `Field` is used. `Index` and `Key` will be added in the future
+/// for array indexing and map key access.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PathSegment {
+    /// Named field access (e.g., `vpc`, `id`, `vpc_id`)
+    Field(String),
+}
+
+impl PathSegment {
+    /// Returns the field name if this is a `Field` segment.
+    pub fn as_field(&self) -> Option<&str> {
+        match self {
+            PathSegment::Field(name) => Some(name),
+        }
+    }
+}
+
+impl std::fmt::Display for PathSegment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PathSegment::Field(name) => write!(f, "{}", name),
+        }
+    }
+}
+
+/// A unified access path representing a chain of field accesses.
+///
+/// For a `ResourceRef`, the path contains:
+/// - segment 0: binding name (e.g., "vpc")
+/// - segment 1: attribute name (e.g., "vpc_id")
+/// - segments 2+: nested field path (e.g., "network", "id")
+///
+/// This replaces the asymmetric `binding_name` / `attribute_name` / `field_path`
+/// representation where the 2nd segment was named differently but treated the same
+/// as subsequent segments.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AccessPath(pub Vec<PathSegment>);
+
+impl AccessPath {
+    /// Create an AccessPath from the legacy binding_name, attribute_name, field_path fields.
+    pub fn from_ref(
+        binding_name: impl Into<String>,
+        attribute_name: impl Into<String>,
+        field_path: Vec<String>,
+    ) -> Self {
+        let mut segments = Vec::with_capacity(2 + field_path.len());
+        segments.push(PathSegment::Field(binding_name.into()));
+        segments.push(PathSegment::Field(attribute_name.into()));
+        for field in field_path {
+            segments.push(PathSegment::Field(field));
+        }
+        AccessPath(segments)
+    }
+
+    /// Returns the binding name (first segment).
+    pub fn binding(&self) -> &str {
+        self.0.first().and_then(|s| s.as_field()).unwrap_or("")
+    }
+
+    /// Returns the attribute name (second segment).
+    pub fn attribute(&self) -> &str {
+        self.0.get(1).and_then(|s| s.as_field()).unwrap_or("")
+    }
+
+    /// Returns the remaining field path (segments after the first two) as strings.
+    pub fn field_path(&self) -> Vec<&str> {
+        self.0.iter().skip(2).filter_map(|s| s.as_field()).collect()
+    }
+
+    /// Returns all segments as a dot-separated string.
+    pub fn to_dot_string(&self) -> String {
+        self.0
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
+    /// Returns the number of segments.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns true if the path has no segments.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Display for AccessPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_dot_string())
+    }
+}
+
 /// Attribute value of a resource
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
@@ -80,15 +177,14 @@ pub enum Value {
     Bool(bool),
     List(Vec<Value>),
     Map(HashMap<String, Value>),
-    /// Reference to another resource's attribute
+    /// Reference to another resource's attribute via an access path.
+    ///
+    /// The access path segments represent:
+    /// - segment 0: binding name (e.g., "vpc")
+    /// - segment 1: attribute name (e.g., "vpc_id")
+    /// - segments 2+: nested field path
     ResourceRef {
-        /// Binding name of the referenced resource (e.g., "vpc", "web_sg")
-        binding_name: String,
-        /// Attribute name being referenced (e.g., "id", "name")
-        attribute_name: String,
-        /// Additional chained field path for nested access (e.g., ["vpc_id"] for a.b.vpc_id)
-        #[serde(default)]
-        field_path: Vec<String>,
+        path: AccessPath,
     },
     /// String interpolation: `"prefix-${expr}-suffix"`
     /// Parts are evaluated and concatenated into a final String.
@@ -117,6 +213,46 @@ pub enum InterpolationPart {
 
 /// Legacy alias for `InterpolationPart`.
 pub type ExprPart = InterpolationPart;
+
+impl Value {
+    /// Create a `ResourceRef` from binding name, attribute name, and optional field path.
+    ///
+    /// This is the primary constructor for `ResourceRef` values, replacing direct
+    /// struct literal construction.
+    pub fn resource_ref(
+        binding_name: impl Into<String>,
+        attribute_name: impl Into<String>,
+        field_path: Vec<String>,
+    ) -> Self {
+        Value::ResourceRef {
+            path: AccessPath::from_ref(binding_name, attribute_name, field_path),
+        }
+    }
+
+    /// If this is a `ResourceRef`, returns the binding name.
+    pub fn ref_binding(&self) -> Option<&str> {
+        match self {
+            Value::ResourceRef { path } => Some(path.binding()),
+            _ => None,
+        }
+    }
+
+    /// If this is a `ResourceRef`, returns the attribute name.
+    pub fn ref_attribute(&self) -> Option<&str> {
+        match self {
+            Value::ResourceRef { path } => Some(path.attribute()),
+            _ => None,
+        }
+    }
+
+    /// If this is a `ResourceRef`, returns the field path.
+    pub fn ref_field_path(&self) -> Option<Vec<&str>> {
+        match self {
+            Value::ResourceRef { path } => Some(path.field_path()),
+            _ => None,
+        }
+    }
+}
 
 impl Expr {
     /// Returns a reference to the inner `Value`.
@@ -250,14 +386,8 @@ impl Value {
                     map[key].hash_into(hasher);
                 }
             }
-            Value::ResourceRef {
-                binding_name,
-                attribute_name,
-                field_path,
-            } => {
-                binding_name.hash(hasher);
-                attribute_name.hash(hasher);
-                field_path.hash(hasher);
+            Value::ResourceRef { path } => {
+                path.hash(hasher);
             }
             Value::Interpolation(parts) => {
                 parts.len().hash(hasher);
@@ -773,20 +903,16 @@ mod tests {
                 ("key".to_string(), Value::String("val".to_string())),
                 ("num".to_string(), Value::Int(10)),
             ])),
-            Value::ResourceRef {
-                binding_name: "vpc".to_string(),
-                attribute_name: "id".to_string(),
-                field_path: vec![],
-            },
+            Value::resource_ref("vpc".to_string(), "id".to_string(), vec![]),
             Value::String("dedicated".to_string()),
             Value::String("InstanceTenancy.dedicated".to_string()),
             Value::Interpolation(vec![
                 InterpolationPart::Literal("prefix-".to_string()),
-                InterpolationPart::Expr(Value::ResourceRef {
-                    binding_name: "vpc".to_string(),
-                    attribute_name: "id".to_string(),
-                    field_path: vec![],
-                }),
+                InterpolationPart::Expr(Value::resource_ref(
+                    "vpc".to_string(),
+                    "id".to_string(),
+                    vec![],
+                )),
                 InterpolationPart::Literal("-suffix".to_string()),
             ]),
             Value::FunctionCall {
@@ -1276,11 +1402,11 @@ mod tests {
 
     #[test]
     fn expr_wraps_resource_ref() {
-        let expr = Expr(Value::ResourceRef {
-            binding_name: "vpc".to_string(),
-            attribute_name: "id".to_string(),
-            field_path: vec![],
-        });
+        let expr = Expr(Value::resource_ref(
+            "vpc".to_string(),
+            "id".to_string(),
+            vec![],
+        ));
         assert!(matches!(*expr, Value::ResourceRef { .. }));
         assert!(!expr.is_resolved());
     }
@@ -1289,11 +1415,11 @@ mod tests {
     fn expr_wraps_interpolation() {
         let expr = Expr(Value::Interpolation(vec![
             InterpolationPart::Literal("prefix-".to_string()),
-            InterpolationPart::Expr(Value::ResourceRef {
-                binding_name: "vpc".to_string(),
-                attribute_name: "id".to_string(),
-                field_path: vec![],
-            }),
+            InterpolationPart::Expr(Value::resource_ref(
+                "vpc".to_string(),
+                "id".to_string(),
+                vec![],
+            )),
         ]));
         assert!(matches!(*expr, Value::Interpolation(_)));
         assert!(!expr.is_resolved());
@@ -1320,11 +1446,11 @@ mod tests {
             .with_expr_attribute("name", Expr(Value::String("my-bucket".to_string())))
             .with_expr_attribute(
                 "vpc_id",
-                Expr(Value::ResourceRef {
-                    binding_name: "vpc".to_string(),
-                    attribute_name: "id".to_string(),
-                    field_path: vec![],
-                }),
+                Expr(Value::resource_ref(
+                    "vpc".to_string(),
+                    "id".to_string(),
+                    vec![],
+                )),
             );
         assert!(matches!(resource.get_attr("name"), Some(Value::String(_))));
         assert!(matches!(
@@ -1338,18 +1464,18 @@ mod tests {
         let exprs = vec![
             Expr(Value::String("hello".to_string())),
             Expr(Value::Int(42)),
-            Expr(Value::ResourceRef {
-                binding_name: "vpc".to_string(),
-                attribute_name: "id".to_string(),
-                field_path: vec![],
-            }),
+            Expr(Value::resource_ref(
+                "vpc".to_string(),
+                "id".to_string(),
+                vec![],
+            )),
             Expr(Value::Interpolation(vec![
                 InterpolationPart::Literal("prefix-".to_string()),
-                InterpolationPart::Expr(Value::ResourceRef {
-                    binding_name: "vpc".to_string(),
-                    attribute_name: "id".to_string(),
-                    field_path: vec![],
-                }),
+                InterpolationPart::Expr(Value::resource_ref(
+                    "vpc".to_string(),
+                    "id".to_string(),
+                    vec![],
+                )),
             ])),
             Expr(Value::FunctionCall {
                 name: "join".to_string(),
@@ -1380,11 +1506,11 @@ mod tests {
     #[test]
     fn expr_is_not_resolved_for_refs() {
         assert!(
-            !Expr(Value::ResourceRef {
-                binding_name: "vpc".to_string(),
-                attribute_name: "id".to_string(),
-                field_path: vec![],
-            })
+            !Expr(Value::resource_ref(
+                "vpc".to_string(),
+                "id".to_string(),
+                vec![]
+            ))
             .is_resolved()
         );
     }
@@ -1439,5 +1565,50 @@ mod tests {
         // Module source info should NOT be in attributes
         assert!(!resource.attributes.contains_key("_module"));
         assert!(!resource.attributes.contains_key("_module_instance"));
+    }
+
+    #[test]
+    fn access_path_from_ref() {
+        let path = AccessPath::from_ref("vpc", "id", vec![]);
+        assert_eq!(path.binding(), "vpc");
+        assert_eq!(path.attribute(), "id");
+        assert!(path.field_path().is_empty());
+        assert_eq!(path.to_dot_string(), "vpc.id");
+    }
+
+    #[test]
+    fn access_path_with_field_path() {
+        let path = AccessPath::from_ref("web", "network", vec!["vpc_id".to_string()]);
+        assert_eq!(path.binding(), "web");
+        assert_eq!(path.attribute(), "network");
+        assert_eq!(path.field_path(), vec!["vpc_id"]);
+        assert_eq!(path.to_dot_string(), "web.network.vpc_id");
+    }
+
+    #[test]
+    fn resource_ref_serde_roundtrip() {
+        let value = Value::resource_ref("vpc", "id", vec![]);
+        let json = serde_json::to_string(&value).unwrap();
+        let deserialized: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value, deserialized);
+    }
+
+    #[test]
+    fn resource_ref_serde_with_field_path() {
+        let value = Value::resource_ref("web", "network", vec!["vpc_id".to_string()]);
+        let json = serde_json::to_string(&value).unwrap();
+        let deserialized: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value, deserialized);
+    }
+
+    #[test]
+    fn value_ref_helpers() {
+        let value = Value::resource_ref("vpc", "vpc_id", vec!["nested".to_string()]);
+        assert_eq!(value.ref_binding(), Some("vpc"));
+        assert_eq!(value.ref_attribute(), Some("vpc_id"));
+        assert_eq!(value.ref_field_path(), Some(vec!["nested"]));
+
+        let non_ref = Value::String("hello".to_string());
+        assert_eq!(non_ref.ref_binding(), None);
     }
 }
