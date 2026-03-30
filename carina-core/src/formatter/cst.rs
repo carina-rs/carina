@@ -124,6 +124,8 @@ pub enum NodeKind {
     MovedToAttr,
     // Validate expression (opaque)
     ValidateExpr,
+    // Require statement
+    RequireStatement,
 }
 
 /// CST node - preserves all source information

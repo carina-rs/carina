@@ -11,7 +11,12 @@ ws = @{ (" " | "\t")+ }
 newline = @{ NEWLINE }
 comment = @{ "#" ~ (!NEWLINE ~ ANY)* }
 
-statement = { backend_block | provider_block | arguments_block | attributes_block | import_state_block | removed_block | moved_block | if_expr | for_expr | fn_def | let_binding | module_call | anonymous_resource }
+statement = { backend_block | provider_block | arguments_block | attributes_block | import_state_block | removed_block | moved_block | require_statement | if_expr | for_expr | fn_def | let_binding | module_call | anonymous_resource }
+
+// Require statement: require <validate_expr>, "error message"
+require_statement = {
+    kw_require ~ trivia+ ~ validate_expr ~ trivia* ~ comma ~ trivia* ~ string
+}
 
 // Backend block: backend s3 { ... }
 backend_block = {
@@ -83,6 +88,7 @@ op_or = { "||" }
 op_not = { "!" }
 validate_primary = {
     validate_function_call
+  | null_literal
   | boolean
   | float
   | number
@@ -90,6 +96,7 @@ validate_primary = {
   | variable_ref
   | open_paren ~ trivia* ~ validate_expr ~ trivia* ~ close_paren
 }
+null_literal = { "null" ~ !(ASCII_ALPHANUMERIC | "_") }
 validate_function_call = { identifier ~ open_paren ~ (trivia* ~ validate_expr ~ (trivia* ~ comma ~ trivia* ~ validate_expr)*)? ~ trivia* ~ close_paren }
 
 // Attributes block: attributes { name: type = value }
@@ -322,3 +329,4 @@ kw_moved = { "moved" }
 kw_to = { "to" }
 kw_from = { "from" }
 kw_id = { "id" }
+kw_require = { "require" }
