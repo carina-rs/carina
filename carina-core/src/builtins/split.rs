@@ -144,11 +144,10 @@ mod tests {
     }
 
     #[test]
-    fn split_wrong_arg_count() {
+    fn split_partial_application() {
         let args = vec![Value::String("-".to_string())];
-        let result = evaluate_builtin("split", &args);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("expects 2 arguments"));
+        let result = evaluate_builtin("split", &args).unwrap();
+        assert!(result.is_closure());
     }
 
     #[test]

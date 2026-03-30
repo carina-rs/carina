@@ -122,11 +122,10 @@ mod tests {
     }
 
     #[test]
-    fn join_wrong_arg_count() {
+    fn join_partial_application() {
         let args = vec![Value::String("-".to_string())];
-        let result = evaluate_builtin("join", &args);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("expects 2 arguments"));
+        let result = evaluate_builtin("join", &args).unwrap();
+        assert!(result.is_closure());
     }
 
     #[test]

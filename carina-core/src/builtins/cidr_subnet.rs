@@ -297,11 +297,21 @@ mod tests {
     }
 
     #[test]
-    fn error_wrong_arg_count() {
+    fn partial_application_with_two_args() {
         let args = vec![Value::String("10.0.0.0/16".to_string()), Value::Int(8)];
-        let result = evaluate_builtin("cidr_subnet", &args);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("expects 3 arguments"));
+        let result = evaluate_builtin("cidr_subnet", &args).unwrap();
+        match result {
+            Value::Closure {
+                name,
+                captured_args,
+                remaining_arity,
+            } => {
+                assert_eq!(name, "cidr_subnet");
+                assert_eq!(captured_args.len(), 2);
+                assert_eq!(remaining_arity, 1);
+            }
+            other => panic!("Expected Closure, got {:?}", other),
+        }
     }
 
     #[test]
