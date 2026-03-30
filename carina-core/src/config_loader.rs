@@ -63,6 +63,7 @@ pub fn load_configuration_with_config(
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
+            remote_states: vec![],
         };
         let mut merged = empty_parsed();
         let mut unresolved_merged = empty_parsed();
@@ -98,6 +99,9 @@ pub fn load_configuration_with_config(
                     unresolved_merged
                         .user_functions
                         .extend(unresolved.user_functions);
+                    unresolved_merged
+                        .remote_states
+                        .extend(unresolved.remote_states);
 
                     // Merge resolved
                     merged.providers.extend(parsed.providers);
@@ -109,6 +113,7 @@ pub fn load_configuration_with_config(
                     merged.attribute_params.extend(parsed.attribute_params);
                     merged.state_blocks.extend(parsed.state_blocks);
                     merged.user_functions.extend(parsed.user_functions);
+                    merged.remote_states.extend(parsed.remote_states);
                     // Merge backend (only one allowed)
                     if let Some(backend) = parsed.backend {
                         if merged.backend.is_some() {

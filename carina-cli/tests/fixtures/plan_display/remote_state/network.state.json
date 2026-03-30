@@ -1,0 +1,25 @@
+{
+  "version": 4,
+  "serial": 3,
+  "lineage": "remote-network-lineage",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "ec2.vpc",
+      "name": "main-vpc",
+      "provider": "awscc",
+      "identifier": "vpc-abc123",
+      "attributes": {
+        "vpc_id": "vpc-abc123",
+        "cidr_block": "10.0.0.0/16"
+      },
+      "protected": false,
+      "lifecycle": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "desired_keys": ["cidr_block"],
+      "binding": "vpc",
+      "dependency_bindings": []
+    }
+  ]
+}

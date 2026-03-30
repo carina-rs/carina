@@ -10,10 +10,10 @@ use std::path::PathBuf;
 use carina_core::config_loader::{get_base_dir, load_configuration};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
-use carina_core::resolver::resolve_refs_with_state;
-use carina_core::resource::{ResourceId, State};
+use carina_core::resolver::resolve_refs_with_state_and_remote;
+use carina_core::resource::{ResourceId, State, Value};
 use carina_core::schema::ResourceSchema;
-use carina_state::StateFile;
+use carina_state::{StateFile, check_and_migrate};
 
 use crate::DetailLevel;
 use crate::commands::validate_and_resolve;
@@ -104,9 +104,24 @@ fn build_plan_and_states_from_fixture(
         }
     }
 
-    // Resolve ResourceRef values using state
+    // Load remote state files if any
+    let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+    for rs in &parsed.remote_states {
+        let remote_path = if std::path::Path::new(&rs.path).is_absolute() {
+            std::path::PathBuf::from(&rs.path)
+        } else {
+            base_dir.join(&rs.path)
+        };
+        if let Ok(content) = std::fs::read_to_string(&remote_path)
+            && let Ok(sf) = check_and_migrate(&content)
+        {
+            remote_bindings.insert(rs.binding.clone(), sf.build_remote_bindings());
+        }
+    }
+
+    // Resolve ResourceRef values using state and remote bindings
     let mut resources = sorted_resources.clone();
-    resolve_refs_with_state(&mut resources, &current_states)
+    resolve_refs_with_state_and_remote(&mut resources, &current_states, &remote_bindings)
         .expect("Failed to resolve refs with state");
 
     // Normalize desired resources (resolve enum identifiers)
@@ -544,4 +559,17 @@ fn no_unused_let_bindings_in_fixtures() {
             msg.join("\n")
         );
     }
+}
+
+#[test]
+fn plan_snapshot_remote_state() {
+    let (plan, schemas, moved_origins) = build_plan_from_fixture("remote_state");
+    let output = format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &moved_origins,
+    );
+    insta::assert_snapshot!(strip_ansi(&output));
 }

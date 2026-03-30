@@ -70,8 +70,12 @@ pub fn validate_and_resolve_with_config(
 
     if !skip_resource_validation {
         validate_resources_with_ctx(&ctx, &parsed.resources)?;
-        let argument_names: HashSet<String> =
+        let mut argument_names: HashSet<String> =
             parsed.arguments.iter().map(|a| a.name.clone()).collect();
+        // Remote state bindings are resolved at plan time, skip type validation
+        for rs in &parsed.remote_states {
+            argument_names.insert(rs.binding.clone());
+        }
         validate_resource_ref_types_with_ctx(&ctx, &parsed.resources, &argument_names)?;
     }
 

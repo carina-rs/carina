@@ -16,9 +16,22 @@ use crate::resource::{Expr, InterpolationPart, Resource, ResourceId, State, Valu
 /// Before resolving, saves dependency binding names as `_dependency_bindings`
 /// metadata on each resource. This preserves dependency information that would
 /// otherwise be lost when ResourceRef values are replaced with plain strings.
+///
+/// `remote_bindings` provides external bindings from remote state data sources.
+/// Each entry maps a remote_state binding name to a map of resource binding names
+/// to their attributes. For example, `network -> { vpc -> { vpc_id -> "vpc-123" } }`.
 pub fn resolve_refs_with_state(
     resources: &mut [Resource],
     current_states: &HashMap<ResourceId, State>,
+) -> Result<(), String> {
+    resolve_refs_with_state_and_remote(resources, current_states, &HashMap::new())
+}
+
+/// Resolve all ResourceRef values in resources using current state and remote state bindings.
+pub fn resolve_refs_with_state_and_remote(
+    resources: &mut [Resource],
+    current_states: &HashMap<ResourceId, State>,
+    remote_bindings: &HashMap<String, HashMap<String, Value>>,
 ) -> Result<(), String> {
     // Save dependency bindings before resolution destroys ResourceRef values.
     // This metadata is used by plan tree building to recover parent-child
@@ -52,6 +65,13 @@ pub fn resolve_refs_with_state(
 
             binding_map.insert(binding_name.clone(), attrs);
         }
+    }
+
+    // Inject remote state bindings.
+    // Each remote_state binding (e.g., "network") maps to a Map value containing
+    // resource bindings as nested maps (e.g., { "vpc" -> Map { "vpc_id" -> "vpc-123" } }).
+    for (remote_binding, remote_attrs) in remote_bindings {
+        binding_map.insert(remote_binding.clone(), remote_attrs.clone());
     }
 
     // Resolve ResourceRef values in all resources
@@ -601,5 +621,76 @@ mod tests {
             "Error should mention the missing env var, got: {}",
             err_msg
         );
+    }
+
+    #[test]
+    fn test_resolve_remote_state_binding() {
+        // Simulate a resource that references a remote_state binding:
+        // network.vpc.vpc_id where network is a remote_state
+        let mut resources = vec![make_resource(
+            "web-sg",
+            None,
+            vec![(
+                "vpc_id",
+                // network.vpc.vpc_id -> ResourceRef { binding: "network", attribute: "vpc", field_path: ["vpc_id"] }
+                Value::resource_ref(
+                    "network".to_string(),
+                    "vpc".to_string(),
+                    vec!["vpc_id".to_string()],
+                ),
+            )],
+        )];
+
+        let current_states: HashMap<ResourceId, State> = HashMap::new();
+
+        // Build remote bindings: network -> { vpc -> Map { vpc_id -> "vpc-123" } }
+        let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let mut vpc_attrs = HashMap::new();
+        vpc_attrs.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
+        vpc_attrs.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        let mut network_map = HashMap::new();
+        network_map.insert("vpc".to_string(), Value::Map(vpc_attrs));
+        remote_bindings.insert("network".to_string(), network_map);
+
+        resolve_refs_with_state_and_remote(&mut resources, &current_states, &remote_bindings)
+            .unwrap();
+
+        assert_eq!(
+            resources[0].get_attr("vpc_id"),
+            Some(&Value::String("vpc-123".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_resolve_remote_state_unresolved_keeps_ref() {
+        // If the remote state doesn't have the referenced resource, the ref stays as-is
+        let mut resources = vec![make_resource(
+            "web-sg",
+            None,
+            vec![(
+                "vpc_id",
+                Value::resource_ref(
+                    "network".to_string(),
+                    "nonexistent".to_string(),
+                    vec!["vpc_id".to_string()],
+                ),
+            )],
+        )];
+
+        let current_states: HashMap<ResourceId, State> = HashMap::new();
+        let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        remote_bindings.insert("network".to_string(), HashMap::new());
+
+        resolve_refs_with_state_and_remote(&mut resources, &current_states, &remote_bindings)
+            .unwrap();
+
+        // Should remain as ResourceRef since "nonexistent" binding is not found
+        assert!(matches!(
+            resources[0].get_attr("vpc_id"),
+            Some(Value::ResourceRef { .. })
+        ));
     }
 }

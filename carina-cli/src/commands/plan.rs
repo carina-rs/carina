@@ -1,21 +1,21 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::effect::Effect;
-use carina_core::parser::{BackendConfig, ProviderConfig, ProviderContext};
+use carina_core::parser::{BackendConfig, ProviderConfig, ProviderContext, RemoteState};
 use carina_core::plan::Plan;
 use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::value::{
     redact_secrets_in_plan, redact_secrets_in_resource, redact_secrets_in_state,
 };
 use carina_state::{
-    BackendConfig as StateBackendConfig, StateBackend, StateFile, create_backend,
-    create_local_backend,
+    BackendConfig as StateBackendConfig, StateBackend, StateFile, check_and_migrate,
+    create_backend, create_local_backend,
 };
 
 use super::validate_and_resolve_with_config;
@@ -24,7 +24,7 @@ use crate::commands::apply::apply_name_overrides;
 use crate::display::print_plan;
 use crate::error::AppError;
 use crate::wiring::{
-    WiringContext, create_plan_from_parsed, reconcile_anonymous_identifiers_with_ctx,
+    WiringContext, create_plan_from_parsed_with_remote, reconcile_anonymous_identifiers_with_ctx,
     reconcile_prefixed_names,
 };
 
@@ -181,7 +181,11 @@ pub async fn run_plan(
         );
     }
 
-    let ctx = create_plan_from_parsed(&parsed, &state_file, refresh).await?;
+    // Load remote state data sources
+    let remote_bindings = load_remote_states(&parsed.remote_states, base_dir)?;
+
+    let ctx = create_plan_from_parsed_with_remote(&parsed, &state_file, refresh, &remote_bindings)
+        .await?;
     let has_changes = ctx.plan.mutation_count() > 0;
 
     // Build delete attributes map from current states for display
@@ -263,4 +267,48 @@ pub async fn run_plan(
     }
 
     Ok(has_changes)
+}
+
+/// Load remote state files and build binding maps for reference resolution.
+///
+/// For each `remote_state` block, reads the referenced state file and builds a
+/// map of resource bindings to their attributes. The result maps each remote_state
+/// binding name to a `HashMap<String, Value>` where keys are resource binding names
+/// and values are `Value::Map` of that resource's attributes.
+pub(crate) fn load_remote_states(
+    remote_states: &[RemoteState],
+    base_dir: &Path,
+) -> Result<HashMap<String, HashMap<String, Value>>, AppError> {
+    let mut result = HashMap::new();
+
+    for rs in remote_states {
+        let state_path = if Path::new(&rs.path).is_absolute() {
+            PathBuf::from(&rs.path)
+        } else {
+            base_dir.join(&rs.path)
+        };
+
+        let content = fs::read_to_string(&state_path).map_err(|e| {
+            AppError::Config(format!(
+                "Failed to read remote state file '{}' for remote_state '{}': {}",
+                state_path.display(),
+                rs.binding,
+                e
+            ))
+        })?;
+
+        let state_file = check_and_migrate(&content).map_err(|e| {
+            AppError::Config(format!(
+                "Failed to parse remote state file '{}' for remote_state '{}': {}",
+                state_path.display(),
+                rs.binding,
+                e
+            ))
+        })?;
+
+        let bindings = state_file.build_remote_bindings();
+        result.insert(rs.binding.clone(), bindings);
+    }
+
+    Ok(result)
 }

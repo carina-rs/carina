@@ -5,6 +5,10 @@ file = { SOI ~ statement* ~ EOI }
 
 statement = { backend_block | provider_block | arguments_block | attributes_block | import_state_block | removed_block | moved_block | if_expr | for_expr | fn_def | let_binding | module_call | anonymous_resource }
 
+// Remote state block: remote_state { path = "..." }
+// Only valid as a let binding RHS: let network = remote_state { path = "..." }
+remote_state_block = { "remote_state" ~ "{" ~ attribute* ~ "}" }
+
 // User-defined function: fn name(params) { body }
 fn_def = { "fn" ~ identifier ~ "(" ~ fn_params? ~ ")" ~ (":" ~ type_expr)? ~ "{" ~ fn_body ~ "}" }
 fn_params = { fn_param ~ ("," ~ fn_param)* }
@@ -139,6 +143,7 @@ function_call = { identifier ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
 primary = {
     read_resource_expr   // Must come before resource_expr for "read aws..." parsing
   | resource_expr
+  | remote_state_block   // Must come before module_call so "remote_state { ... }" is not parsed as module call
   | import_expr          // Must come before variable_ref since "import" is an identifier
   | for_expr             // Must come before module_call so "for" is not parsed as module name
   | if_expr              // Must come before module_call so "if" is not parsed as module name

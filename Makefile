@@ -121,9 +121,16 @@ plan-fixtures:
 	@echo ""
 	@echo "=== moved_prev_keys ==="
 	@$(MAKE) plan-moved-prev-keys
+	@echo ""
+	@echo "=== remote_state ==="
+	@$(MAKE) plan-remote-state
+
+plan-remote-state:
+	cd $(FIXTURES)/remote_state && $(CARINA) plan --refresh=false main.crn
 
 .PHONY: plan-all-create plan-no-changes plan-no-changes-enum plan-mixed plan-delete plan-compact \
         plan-map-diff plan-enum-display plan-destroy-full plan-destroy-orphans plan-read-only-attrs \
         plan-default-values plan-explicit plan-default-tags \
         plan-state-blocks plan-secret-values plan-moved-with-changes plan-moved-prev-keys \
+        plan-remote-state \
         plan-map-diff-tui plan-all-create-tui plan-mixed-tui plan-delete-tui plan-fixtures

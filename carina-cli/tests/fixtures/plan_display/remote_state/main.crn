@@ -1,0 +1,18 @@
+# Test remote_state: reference another project's state
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let network = remote_state {
+  path = "network.state.json"
+}
+
+awscc.ec2.security_group {
+  group_description = "Web security group"
+  vpc_id            = network.vpc.vpc_id
+
+  tags = {
+    Name = "web-sg"
+  }
+}

@@ -276,6 +276,11 @@ impl SemanticTokensProvider {
                     let if_start = let_start + 4 + if_pos + 2; // position of "if"
                     tokens.push((if_start as u32, 2, 0)); // KEYWORD: if
                 }
+                // Check for "remote_state" keyword after "let name = remote_state ..."
+                if let Some(rs_pos) = after_let.find("= remote_state ") {
+                    let rs_start = let_start + 4 + rs_pos + 2; // position of "remote_state"
+                    tokens.push((rs_start as u32, 12, 0)); // KEYWORD: remote_state
+                }
             }
         } else if trimmed.starts_with("attributes ") || trimmed == "attributes{" {
             tokens.push((indent, 10, 0)); // KEYWORD: attributes

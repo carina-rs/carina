@@ -237,6 +237,15 @@ pub struct BackendConfig {
     pub attributes: HashMap<String, Value>,
 }
 
+/// Remote state reference (data source for another project's state)
+#[derive(Debug, Clone)]
+pub struct RemoteState {
+    /// The binding name from the `let` binding (e.g., "network")
+    pub binding: String,
+    /// Path to the state file (local file path)
+    pub path: String,
+}
+
 /// Parse result
 #[derive(Debug, Clone)]
 pub struct ParsedFile {
@@ -257,6 +266,8 @@ pub struct ParsedFile {
     pub state_blocks: Vec<StateBlock>,
     /// User-defined pure functions
     pub user_functions: HashMap<String, UserFunction>,
+    /// Remote state references (data sources)
+    pub remote_states: Vec<RemoteState>,
 }
 
 impl ParsedFile {
@@ -361,6 +372,7 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
     let mut attribute_params = Vec::new();
     let mut backend = None;
     let mut state_blocks = Vec::new();
+    let mut remote_states = Vec::new();
     let mut anon_for_counter = 0usize;
     let mut anon_if_counter = 0usize;
 
@@ -419,8 +431,13 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
                             Rule::if_expr => {
                                 let binding_name = format!("_if{}", anon_if_counter);
                                 anon_if_counter += 1;
-                                let (_value, expanded_resources, expanded_module_calls, _import) =
-                                    parse_if_expr(stmt, &ctx, &binding_name)?;
+                                let (
+                                    _value,
+                                    expanded_resources,
+                                    expanded_module_calls,
+                                    _import,
+                                    _remote_state,
+                                ) = parse_if_expr(stmt, &ctx, &binding_name)?;
                                 resources.extend(expanded_resources);
                                 module_calls.extend(expanded_module_calls);
                             }
@@ -452,6 +469,7 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
                                     expanded_resources,
                                     expanded_module_calls,
                                     maybe_import,
+                                    maybe_remote_state,
                                 ) = parse_let_binding_extended(stmt, &ctx)?;
                                 let is_discard = name == "_";
                                 if !is_discard {
@@ -492,6 +510,15 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
                                         .insert(import.alias.clone(), import.path.clone());
                                     imports.push(import);
                                 }
+                                if let Some(rs) = maybe_remote_state {
+                                    if !is_discard {
+                                        // Register as a resource binding so that
+                                        // `name.resource_binding.attr` resolves as ResourceRef
+                                        let placeholder = Resource::new("_remote_state", &name);
+                                        ctx.set_resource_binding(name.clone(), placeholder);
+                                    }
+                                    remote_states.push(rs);
+                                }
                             }
                             Rule::module_call => {
                                 let call = parse_module_call(stmt, &ctx)?;
@@ -531,6 +558,7 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
         backend,
         state_blocks,
         user_functions: ctx.user_functions,
+        remote_states,
     })
 }
 
@@ -764,15 +792,17 @@ fn parse_module_call(
     })
 }
 
-/// Result of parsing the RHS of a let binding: (value, resources, module_calls, import)
+/// Result of parsing the RHS of a let binding: (value, resources, module_calls, import, remote_state)
 type LetBindingRhs = (
     Value,
     Vec<Resource>,
     Vec<ModuleCall>,
     Option<ImportStatement>,
+    Option<RemoteState>,
 );
 
-/// Extended parse_let_binding that also handles module calls, imports, and for expressions
+/// Extended parse_let_binding that also handles module calls, imports, for expressions,
+/// and remote_state blocks.
 #[allow(clippy::type_complexity)]
 fn parse_let_binding_extended(
     pair: pest::iterators::Pair<Rule>,
@@ -784,6 +814,7 @@ fn parse_let_binding_extended(
         Vec<Resource>,
         Vec<ModuleCall>,
         Option<ImportStatement>,
+        Option<RemoteState>,
     ),
     ParseError,
 > {
@@ -793,14 +824,21 @@ fn parse_let_binding_extended(
         .to_string();
     let expr_pair = next_pair(&mut inner, "expression", "let binding")?;
 
-    // Check if it's a module call, resource expression, import, or for expression
-    let (value, expanded_resources, module_calls, maybe_import) =
+    // Check if it's a module call, resource expression, import, for expression, or remote_state
+    let (value, expanded_resources, module_calls, maybe_import, maybe_remote_state) =
         parse_expression_with_resource_or_module(expr_pair, ctx, &name)?;
 
-    Ok((name, value, expanded_resources, module_calls, maybe_import))
+    Ok((
+        name,
+        value,
+        expanded_resources,
+        module_calls,
+        maybe_import,
+        maybe_remote_state,
+    ))
 }
 
-/// Parse expression with potential resource, module call, or import
+/// Parse expression with potential resource, module call, import, or remote_state
 fn parse_expression_with_resource_or_module(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
@@ -817,7 +855,7 @@ fn parse_pipe_expr_with_resource_or_module(
 ) -> Result<LetBindingRhs, ParseError> {
     let mut inner = pair.into_inner();
     let primary = next_pair(&mut inner, "primary expression", "pipe expression")?;
-    let (mut value, expanded_resources, module_calls, maybe_import) =
+    let (mut value, expanded_resources, module_calls, maybe_import, maybe_remote_state) =
         parse_primary_with_resource_or_module(primary, ctx, binding_name)?;
 
     // Desugar pipe: `x |> f(args)` becomes `f(x, args)`
@@ -839,7 +877,13 @@ fn parse_pipe_expr_with_resource_or_module(
         };
     }
 
-    Ok((value, expanded_resources, module_calls, maybe_import))
+    Ok((
+        value,
+        expanded_resources,
+        module_calls,
+        maybe_import,
+        maybe_remote_state,
+    ))
 }
 
 fn parse_primary_with_resource_or_module(
@@ -853,36 +897,45 @@ fn parse_primary_with_resource_or_module(
         Rule::read_resource_expr => {
             let resource = parse_read_resource_expr(inner, ctx, binding_name)?;
             let ref_value = Value::String(format!("${{{}}}", binding_name));
-            Ok((ref_value, vec![resource], vec![], None))
+            Ok((ref_value, vec![resource], vec![], None, None))
         }
         Rule::resource_expr => {
             let resource = parse_resource_expr(inner, ctx, binding_name)?;
             let ref_value = Value::String(format!("${{{}}}", binding_name));
-            Ok((ref_value, vec![resource], vec![], None))
+            Ok((ref_value, vec![resource], vec![], None, None))
+        }
+        Rule::remote_state_block => {
+            let remote_state = parse_remote_state_block(inner, binding_name)?;
+            let value = Value::String(format!("${{remote_state:{}}}", binding_name));
+            Ok((value, vec![], vec![], None, Some(remote_state)))
         }
         Rule::import_expr => {
             let import = parse_import_expr(inner, binding_name)?;
             let value = Value::String(format!("${{import:{}}}", import.path));
-            Ok((value, vec![], vec![], Some(import)))
+            Ok((value, vec![], vec![], Some(import), None))
         }
         Rule::for_expr => {
             let (resources, module_calls) = parse_for_expr(inner, ctx, binding_name)?;
             let ref_value = Value::String(format!("${{for:{}}}", binding_name));
-            Ok((ref_value, resources, module_calls, None))
+            Ok((ref_value, resources, module_calls, None, None))
         }
-        Rule::if_expr => parse_if_expr(inner, ctx, binding_name),
+        Rule::if_expr => {
+            let (value, resources, module_calls, import, remote_state) =
+                parse_if_expr(inner, ctx, binding_name)?;
+            Ok((value, resources, module_calls, import, remote_state))
+        }
         Rule::module_call => {
             let call = parse_module_call(inner, ctx)?;
             let value = Value::String(format!("${{module:{}}}", call.module_name));
-            Ok((value, vec![], vec![call], None))
+            Ok((value, vec![], vec![call], None, None))
         }
         Rule::function_call => {
             let value = parse_primary_value(inner, ctx)?;
-            Ok((value, vec![], vec![], None))
+            Ok((value, vec![], vec![], None, None))
         }
         _ => {
             let value = parse_primary_value(inner, ctx)?;
-            Ok((value, vec![], vec![], None))
+            Ok((value, vec![], vec![], None, None))
         }
     }
 }
@@ -1192,7 +1245,7 @@ fn parse_if_expr(
     } else {
         // No else clause and condition is false: produce nothing
         let ref_value = Value::String(format!("${{if:{}}}", binding_name));
-        Ok((ref_value, vec![], vec![], None))
+        Ok((ref_value, vec![], vec![], None, None))
     }
 }
 
@@ -1206,13 +1259,13 @@ fn parse_if_body_to_rhs(
     match result {
         IfBodyResult::Resource(r) => {
             let ref_value = Value::String(format!("${{{}}}", binding_name));
-            Ok((ref_value, vec![*r], vec![], None))
+            Ok((ref_value, vec![*r], vec![], None, None))
         }
         IfBodyResult::ModuleCall(c) => {
             let value = Value::String(format!("${{module:{}}}", c.module_name));
-            Ok((value, vec![], vec![c], None))
+            Ok((value, vec![], vec![c], None, None))
         }
-        IfBodyResult::Value(v) => Ok((v, vec![], vec![], None)),
+        IfBodyResult::Value(v) => Ok((v, vec![], vec![], None, None)),
     }
 }
 
@@ -2087,6 +2140,83 @@ fn parse_backend_block(
     })
 }
 
+/// Parse a remote_state block: remote_state { path = "..." }
+fn parse_remote_state_block(
+    pair: pest::iterators::Pair<Rule>,
+    binding_name: &str,
+) -> Result<RemoteState, ParseError> {
+    let mut path = None;
+
+    for attr_pair in pair.into_inner() {
+        if attr_pair.as_rule() == Rule::attribute {
+            let mut attr_inner = attr_pair.into_inner();
+            let key = next_pair(&mut attr_inner, "attribute name", "remote_state block")?
+                .as_str()
+                .to_string();
+            let value_pair = next_pair(&mut attr_inner, "attribute value", "remote_state block")?;
+            // Only parse string literals for now
+            let value_str = extract_string_from_pair(value_pair)?;
+            match key.as_str() {
+                "path" => path = Some(value_str),
+                other => {
+                    return Err(ParseError::InvalidExpression {
+                        line: 0,
+                        message: format!("unknown attribute '{}' in remote_state block", other),
+                    });
+                }
+            }
+        }
+    }
+
+    let path = path.ok_or_else(|| ParseError::InvalidExpression {
+        line: 0,
+        message: "remote_state block requires a 'path' attribute".to_string(),
+    })?;
+
+    Ok(RemoteState {
+        binding: binding_name.to_string(),
+        path,
+    })
+}
+
+/// Extract a string value from a pair (expression -> pipe_expr -> primary -> string)
+fn extract_string_from_pair(pair: pest::iterators::Pair<Rule>) -> Result<String, ParseError> {
+    // Walk through expression -> pipe_expr -> primary -> string -> string_part -> string_literal
+    fn find_string(pair: pest::iterators::Pair<Rule>) -> Option<String> {
+        if pair.as_rule() == Rule::string_literal {
+            return Some(pair.as_str().to_string());
+        }
+        if pair.as_rule() == Rule::string {
+            let mut result = String::new();
+            for inner in pair.into_inner() {
+                if let Some(s) = find_string(inner) {
+                    result.push_str(&s);
+                }
+            }
+            return Some(result);
+        }
+        if pair.as_rule() == Rule::string_part {
+            for inner in pair.into_inner() {
+                if let Some(s) = find_string(inner) {
+                    return Some(s);
+                }
+            }
+            return None;
+        }
+        for inner in pair.into_inner() {
+            if let Some(s) = find_string(inner) {
+                return Some(s);
+            }
+        }
+        None
+    }
+
+    find_string(pair).ok_or_else(|| ParseError::InvalidExpression {
+        line: 0,
+        message: "remote_state 'path' must be a string literal".to_string(),
+    })
+}
+
 fn parse_anonymous_resource(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
@@ -2841,6 +2971,12 @@ pub fn resolve_resource_refs_with_config(
         if let Some(ref name) = call.binding_name {
             binding_map.entry(name.clone()).or_default();
         }
+    }
+
+    // Register remote_state bindings so ResourceRefs to them are not rejected.
+    // The actual attribute values will be resolved at plan time when the state file is loaded.
+    for rs in &parsed.remote_states {
+        binding_map.entry(rs.binding.clone()).or_default();
     }
 
     // Resolve references in each resource
@@ -7511,6 +7647,86 @@ arguments {
         assert_eq!(
             result.resources[0].kind,
             crate::resource::ResourceKind::DataSource
+        );
+    }
+
+    #[test]
+    fn parse_remote_state_basic() {
+        let input = r#"
+            let network = remote_state {
+                path = "../network/carina.state.json"
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(result.remote_states.len(), 1);
+        assert_eq!(result.remote_states[0].binding, "network");
+        assert_eq!(result.remote_states[0].path, "../network/carina.state.json");
+    }
+
+    #[test]
+    fn parse_remote_state_registers_binding() {
+        // After parsing remote_state, the binding should be registered so that
+        // `network.vpc.vpc_id` is parsed as a ResourceRef
+        let input = r#"
+            let network = remote_state {
+                path = "../network/carina.state.json"
+            }
+
+            let web_sg = awscc.ec2.security_group {
+                name = "web-sg"
+                vpc_id = network.vpc.vpc_id
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(result.remote_states.len(), 1);
+        assert_eq!(result.resources.len(), 1);
+        // The vpc_id attribute should be a ResourceRef to network.vpc with field_path ["vpc_id"]
+        let vpc_id_attr = result.resources[0].get_attr("vpc_id").unwrap();
+        match vpc_id_attr {
+            Value::ResourceRef { path } => {
+                assert_eq!(path.binding(), "network");
+                assert_eq!(path.attribute(), "vpc");
+                assert_eq!(path.field_path(), vec!["vpc_id"]);
+            }
+            other => panic!("Expected ResourceRef, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_remote_state_missing_path() {
+        let input = r#"
+            let network = remote_state {
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("path"),
+            "Error should mention 'path', got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_remote_state_unknown_attribute() {
+        let input = r#"
+            let network = remote_state {
+                path = "../network/carina.state.json"
+                bucket = "my-bucket"
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown attribute"),
+            "Error should mention 'unknown attribute', got: {}",
+            err
         );
     }
 }
