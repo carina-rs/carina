@@ -1,15 +1,14 @@
 //! Application state for the TUI plan viewer
 
-use std::borrow::Cow;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
-use carina_core::deps::get_resource_dependencies;
 use carina_core::detail_rows::{DetailLevel, DetailRow, build_detail_rows};
 use carina_core::effect::Effect;
 use carina_core::plan::{Plan, PlanSummary};
-use carina_core::resource::Value;
+use carina_core::plan_tree::{
+    build_dependency_graph, build_single_parent_tree, extract_compact_hint,
+};
 use carina_core::schema::ResourceSchema;
-use carina_core::utils::{convert_enum_value, is_dsl_enum_format};
 use ratatui::widgets::ListState;
 
 /// A node in the tree view representing one effect
@@ -541,72 +540,9 @@ fn build_tree_structure(plan: &Plan, nodes: &mut [TreeNode]) {
         return;
     }
 
-    // Step 1: Build dependency maps from effects
-    let mut binding_to_effect: HashMap<String, usize> = HashMap::new();
-    let mut effect_deps: HashMap<usize, HashSet<String>> = HashMap::new();
-    let mut effect_bindings: HashMap<usize, String> = HashMap::new();
-    let mut effect_types: HashMap<usize, String> = HashMap::new();
-
-    for (idx, effect) in plan.effects().iter().enumerate() {
-        let (resource, deps) = match effect {
-            Effect::Create(r) => (Some(r), get_resource_dependencies(r)),
-            Effect::Update { to, .. } => (Some(to), get_resource_dependencies(to)),
-            Effect::Replace { to, .. } => (Some(to), get_resource_dependencies(to)),
-            Effect::Read { resource } => (Some(resource), get_resource_dependencies(resource)),
-            Effect::Delete {
-                id,
-                binding,
-                dependencies,
-                ..
-            } => {
-                let deps = dependencies.clone();
-                if let Some(b) = binding {
-                    binding_to_effect.insert(b.clone(), idx);
-                    effect_bindings.insert(idx, b.clone());
-                } else {
-                    let fallback = id.to_string();
-                    binding_to_effect.insert(fallback.clone(), idx);
-                    effect_bindings.insert(idx, fallback);
-                }
-                effect_types.insert(idx, id.resource_type.clone());
-                effect_deps.insert(idx, deps);
-                continue;
-            }
-            Effect::Import { id, .. } | Effect::Remove { id, .. } => {
-                let fallback = id.to_string();
-                binding_to_effect.insert(fallback.clone(), idx);
-                effect_bindings.insert(idx, fallback);
-                effect_types.insert(idx, id.resource_type.clone());
-                effect_deps.insert(idx, HashSet::new());
-                continue;
-            }
-            Effect::Move { to, .. } => {
-                let fallback = to.to_string();
-                binding_to_effect.insert(fallback.clone(), idx);
-                effect_bindings.insert(idx, fallback);
-                effect_types.insert(idx, to.resource_type.clone());
-                effect_deps.insert(idx, HashSet::new());
-                continue;
-            }
-        };
-
-        if let Some(r) = resource {
-            let binding = r.binding.clone().unwrap_or_else(|| r.id.to_string());
-            binding_to_effect.insert(binding.clone(), idx);
-            effect_bindings.insert(idx, binding);
-            effect_types.insert(idx, r.id.resource_type.clone());
-        }
-        effect_deps.insert(idx, deps);
-    }
-
-    // Step 2: Build the single-parent tree
-    let (roots, dependents) = build_single_parent_tree(
-        plan,
-        &binding_to_effect,
-        &effect_deps,
-        &effect_bindings,
-        &effect_types,
-    );
+    // Build dependency graph and single-parent tree using shared logic
+    let graph = build_dependency_graph(plan);
+    let (roots, dependents) = build_single_parent_tree(plan, &graph);
 
     // Step 3: Compute depth and parent/children relationships via DFS
     fn assign_tree(
@@ -631,145 +567,6 @@ fn build_tree_structure(plan: &Plan, nodes: &mut [TreeNode]) {
 
     // Nodes not reached by the tree (e.g., Delete effects with no deps) remain
     // roots with depth 0, parent None, and no children -- the defaults are correct.
-}
-
-/// Build a single-parent tree from the dependency graph.
-///
-/// Replicates the algorithm from `carina-cli/src/display.rs`.
-fn build_single_parent_tree(
-    plan: &Plan,
-    binding_to_effect: &HashMap<String, usize>,
-    effect_deps: &HashMap<usize, HashSet<String>>,
-    effect_bindings: &HashMap<usize, String>,
-    effect_types: &HashMap<usize, String>,
-) -> (Vec<usize>, HashMap<usize, Vec<usize>>) {
-    let effect_binding_set: HashSet<&str> = binding_to_effect.keys().map(|s| s.as_str()).collect();
-
-    let sort_key = |idx: &usize| -> (String, String) {
-        let rtype = effect_types.get(idx).cloned().unwrap_or_default();
-        let binding = effect_bindings.get(idx).cloned().unwrap_or_default();
-        (rtype, binding)
-    };
-
-    // Build the full reverse dependency map (all parents)
-    let mut all_dependents: HashMap<usize, Vec<usize>> = HashMap::new();
-    for idx in 0..plan.effects().len() {
-        all_dependents.insert(idx, Vec::new());
-    }
-    for (idx, deps) in effect_deps {
-        for dep in deps {
-            if let Some(&dep_idx) = binding_to_effect.get(dep) {
-                all_dependents.entry(dep_idx).or_default().push(*idx);
-            }
-        }
-    }
-
-    // Identify initial roots (no deps in plan)
-    let mut initial_roots: Vec<usize> = Vec::new();
-    for (idx, deps) in effect_deps {
-        let has_dep_in_plan = deps.iter().any(|d| binding_to_effect.contains_key(d));
-        if !has_dep_in_plan {
-            initial_roots.push(*idx);
-        }
-    }
-    initial_roots.sort();
-
-    // Nest no-dep resources under their first dependent (Issue #928)
-    let mut nested_under_dependent: HashSet<usize> = HashSet::new();
-    for &idx in &initial_roots {
-        let mut children = all_dependents.get(&idx).cloned().unwrap_or_default();
-        children.sort_by_key(|a| sort_key(a));
-        if !children.is_empty() {
-            let binding_of_idx = effect_bindings.get(&idx).map(|s| s.as_str());
-            let all_dependents_have_other_deps = children.iter().all(|&child_idx| {
-                effect_deps.get(&child_idx).is_some_and(|child_deps| {
-                    child_deps.iter().any(|d| {
-                        effect_binding_set.contains(d.as_str())
-                            && Some(d.as_str()) != binding_of_idx
-                    })
-                })
-            });
-            if all_dependents_have_other_deps {
-                nested_under_dependent.insert(idx);
-            }
-        }
-    }
-
-    // Compute final roots
-    let roots: Vec<usize> = initial_roots
-        .iter()
-        .filter(|idx| !nested_under_dependent.contains(idx))
-        .cloned()
-        .collect();
-
-    // Compute depth for each resource via BFS from roots
-    let mut depth: HashMap<usize, usize> = HashMap::new();
-    let mut queue: VecDeque<usize> = VecDeque::new();
-    for &root in &roots {
-        depth.insert(root, 0);
-        queue.push_back(root);
-    }
-    while let Some(node) = queue.pop_front() {
-        let d = depth[&node];
-        if let Some(children) = all_dependents.get(&node) {
-            for &child in children {
-                if let std::collections::hash_map::Entry::Vacant(e) = depth.entry(child) {
-                    e.insert(d + 1);
-                    queue.push_back(child);
-                }
-            }
-        }
-    }
-
-    // For each non-root resource, select a single parent
-    let mut dependents: HashMap<usize, Vec<usize>> = HashMap::new();
-    for idx in 0..plan.effects().len() {
-        dependents.insert(idx, Vec::new());
-    }
-
-    for (idx, deps) in effect_deps {
-        if roots.contains(idx) || nested_under_dependent.contains(idx) {
-            continue;
-        }
-        let mut parent_candidates: Vec<usize> = deps
-            .iter()
-            .filter_map(|d| binding_to_effect.get(d).cloned())
-            .collect();
-        if parent_candidates.is_empty() {
-            continue;
-        }
-        parent_candidates.sort_by(|a, b| {
-            let da = depth.get(a).copied().unwrap_or(usize::MAX);
-            let db = depth.get(b).copied().unwrap_or(usize::MAX);
-            da.cmp(&db).then_with(|| sort_key(a).cmp(&sort_key(b)))
-        });
-        let parent = parent_candidates[0];
-        dependents.entry(parent).or_default().push(*idx);
-    }
-
-    // Add nested-under-dependent resources as children of the shallowest referencing resource
-    for &idx in &nested_under_dependent {
-        let mut children = all_dependents.get(&idx).cloned().unwrap_or_default();
-        children.sort_by(|a, b| {
-            let da = depth.get(a).copied().unwrap_or(usize::MAX);
-            let db = depth.get(b).copied().unwrap_or(usize::MAX);
-            da.cmp(&db).then_with(|| sort_key(a).cmp(&sort_key(b)))
-        });
-        if let Some(&best_dependent) = children.first() {
-            dependents.entry(best_dependent).or_default().push(idx);
-        }
-    }
-
-    // Sort each parent's children
-    for children in dependents.values_mut() {
-        children.sort_by_key(|a| sort_key(a));
-    }
-
-    // Sort roots
-    let mut sorted_roots = roots;
-    sorted_roots.sort_by_key(|a| sort_key(a));
-
-    (sorted_roots, dependents)
 }
 
 /// Shorten effect labels: strip provider prefix and use binding name or compact hint.
@@ -829,85 +626,6 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
             nodes[idx].effect_label = format!("{} {}", display_type, id.name);
         }
     }
-}
-
-/// Extract a compact hint for anonymous resources (mirrors CLI logic).
-fn extract_compact_hint(
-    resource: &carina_core::resource::Resource,
-    parent_binding: Option<&str>,
-) -> Option<String> {
-    let mut keys: Vec<_> = resource
-        .attributes
-        .keys()
-        .filter(|k| !k.starts_with('_'))
-        .collect();
-    keys.sort();
-
-    // Priority 1: First distinguishing string attribute
-    for key in &keys {
-        if let Some(Value::String(s)) = resource.attributes.get(*key).map(|e| &e.0)
-            && !s.is_empty()
-        {
-            let short_key = shorten_attr_name(key);
-            // Resolve DSL enum identifiers (e.g., awscc.AvailabilityZone.ap_northeast_1a -> "ap-northeast-1a")
-            let resolved = if is_dsl_enum_format(s) {
-                Cow::Owned(convert_enum_value(s))
-            } else {
-                Cow::Borrowed(s.as_str())
-            };
-            let display_value = shorten_service_name(key, &resolved);
-            return Some(format!("{}: {}", short_key, display_value));
-        }
-    }
-
-    // Priority 2: First non-parent ResourceRef attribute
-    for key in &keys {
-        match resource.attributes.get(*key).map(|e| &e.0) {
-            Some(Value::ResourceRef { binding_name, .. }) => {
-                if parent_binding == Some(binding_name.as_str()) {
-                    continue;
-                }
-                let short_key = shorten_attr_name(key);
-                return Some(format!("{}: {}", short_key, binding_name));
-            }
-            Some(Value::List(items)) => {
-                for item in items {
-                    if let Value::ResourceRef { binding_name, .. } = item {
-                        if parent_binding == Some(binding_name.as_str()) {
-                            continue;
-                        }
-                        let short_key = shorten_attr_name(key);
-                        return Some(format!("{}: {}", short_key, binding_name));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    None
-}
-
-/// Shorten common attribute name suffixes for compact display.
-fn shorten_attr_name(attr: &str) -> &str {
-    attr.strip_suffix("_ids")
-        .or_else(|| attr.strip_suffix("_id"))
-        .or_else(|| attr.strip_suffix("_name"))
-        .unwrap_or(attr)
-}
-
-/// For `service_name` attributes, extract just the service suffix from AWS endpoint names.
-fn shorten_service_name<'a>(attr_name: &str, value: &'a str) -> Cow<'a, str> {
-    if attr_name == "service_name"
-        && let Some(rest) = value.strip_prefix("com.amazonaws.")
-        && let Some(dot_pos) = rest.find('.')
-    {
-        let after_region = &rest[dot_pos + 1..];
-        if !after_region.is_empty() {
-            return Cow::Borrowed(after_region);
-        }
-    }
-    Cow::Borrowed(value)
 }
 
 fn effect_to_node(effect: &Effect, schemas: Option<&HashMap<String, ResourceSchema>>) -> TreeNode {
@@ -1028,7 +746,7 @@ fn effect_to_node(effect: &Effect, schemas: Option<&HashMap<String, ResourceSche
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State};
+    use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
     use carina_core::value::format_value;
 
     #[test]
