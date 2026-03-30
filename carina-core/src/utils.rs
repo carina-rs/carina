@@ -387,13 +387,15 @@ pub fn normalize_state_enum_value(
 /// assert_eq!(convert_region_value("eu-west-1"), "eu-west-1");
 /// ```
 pub fn convert_region_value(value: &str) -> String {
-    if let Some(rest) = value.strip_prefix("aws.Region.") {
-        rest.replace('_', "-")
-    } else if let Some(rest) = value.strip_prefix("awscc.Region.") {
-        rest.replace('_', "-")
-    } else {
-        value.to_string()
+    // Match any `<provider>.Region.<region_name>` pattern (e.g., "aws.Region.ap_northeast_1")
+    if let Some(pos) = value.find(".Region.") {
+        let rest = &value[pos + ".Region.".len()..];
+        // Verify the prefix is a simple provider name (no dots except the one before Region)
+        if !value[..pos].contains('.') {
+            return rest.replace('_', "-");
+        }
     }
+    value.to_string()
 }
 
 #[cfg(test)]
