@@ -386,12 +386,7 @@ pub fn redact_secrets_in_resource(
         attributes: resource
             .attributes
             .iter()
-            .map(|(k, e)| {
-                (
-                    k.clone(),
-                    crate::resource::Expr(redact_secrets_in_value(&e.0)),
-                )
-            })
+            .map(|(k, e)| (k.clone(), crate::resource::Expr(redact_secrets_in_value(e))))
             .collect(),
         kind: resource.kind.clone(),
         lifecycle: resource.lifecycle.clone(),

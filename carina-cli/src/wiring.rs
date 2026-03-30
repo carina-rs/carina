@@ -260,10 +260,7 @@ pub fn resolve_enum_aliases_with_ctx(ctx: &WiringContext, resources: &mut [Resou
         };
         let mut value_attrs = resource.resolved_attributes();
         resolve_attrs_aliases(&mut value_attrs, &resource.id.resource_type, factory);
-        resource.attributes = value_attrs
-            .into_iter()
-            .map(|(k, v)| (k, carina_core::resource::Expr(v)))
-            .collect();
+        resource.attributes = carina_core::resource::Expr::wrap_map(value_attrs);
     }
 }
 

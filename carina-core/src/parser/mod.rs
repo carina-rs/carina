@@ -2120,7 +2120,7 @@ fn parse_anonymous_resource(
 
     Ok(Resource {
         id: ResourceId::with_provider(provider, resource_type, resource_name),
-        attributes: attributes.into_iter().map(|(k, v)| (k, Expr(v))).collect(),
+        attributes: Expr::wrap_map(attributes),
         kind: ResourceKind::Real,
         lifecycle,
         prefixes: HashMap::new(),
@@ -2266,7 +2266,7 @@ fn parse_resource_expr(
 
     Ok(Resource {
         id: ResourceId::with_provider(provider, resource_type, resource_name),
-        attributes: attributes.into_iter().map(|(k, v)| (k, Expr(v))).collect(),
+        attributes: Expr::wrap_map(attributes),
         kind: ResourceKind::Real,
         lifecycle,
         prefixes: HashMap::new(),
@@ -2312,7 +2312,7 @@ fn parse_read_resource_expr(
 
     Ok(Resource {
         id: ResourceId::with_provider(provider, resource_type, resource_name),
-        attributes: attributes.into_iter().map(|(k, v)| (k, Expr(v))).collect(),
+        attributes: Expr::wrap_map(attributes),
         kind: ResourceKind::DataSource,
         lifecycle,
         prefixes: HashMap::new(),
@@ -2719,7 +2719,7 @@ fn resolve_forward_references(
         let keys: Vec<String> = resource.attributes.keys().cloned().collect();
         for key in keys {
             if let Some(expr) = resource.attributes.remove(&key) {
-                let resolved = resolve_forward_ref_in_value(expr.0, resource_bindings);
+                let resolved = resolve_forward_ref_in_value(expr.into_value(), resource_bindings);
                 resource.attributes.insert(key, Expr(resolved));
             }
         }
@@ -2833,11 +2833,7 @@ pub fn resolve_resource_refs_with_config(
         if let Some(ref binding_name) = resource.binding {
             binding_map.insert(
                 binding_name.clone(),
-                resource
-                    .attributes
-                    .iter()
-                    .map(|(k, e)| (k.clone(), e.0.clone()))
-                    .collect(),
+                Expr::resolve_map(&resource.attributes),
             );
         }
     }
@@ -2860,7 +2856,7 @@ pub fn resolve_resource_refs_with_config(
         let mut resolved_attrs: HashMap<String, Expr> = HashMap::new();
 
         for (key, expr) in &resource.attributes {
-            let resolved = resolve_value_with_config(&expr.0, &binding_map, config)?;
+            let resolved = resolve_value_with_config(expr, &binding_map, config)?;
             resolved_attrs.insert(key.clone(), Expr(resolved));
         }
 

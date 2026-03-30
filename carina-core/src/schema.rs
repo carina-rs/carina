@@ -1061,7 +1061,7 @@ pub fn resolve_block_names(
             };
             match &attr_schema.attr_type {
                 AttributeType::Struct { fields, .. } => {
-                    if let Value::Map(inner_map) = &mut value.0 {
+                    if let Value::Map(inner_map) = &mut **value {
                         resolve_block_names_in_map(
                             inner_map,
                             fields,
@@ -1072,7 +1072,7 @@ pub fn resolve_block_names(
                 }
                 AttributeType::List { inner, .. } => {
                     if let AttributeType::Struct { fields, .. } = inner.as_ref()
-                        && let Value::List(items) = &mut value.0
+                        && let Value::List(items) = &mut **value
                     {
                         for item in items.iter_mut() {
                             if let Value::Map(item_map) = item {

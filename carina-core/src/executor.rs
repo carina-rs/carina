@@ -293,7 +293,7 @@ fn resolve_resource(
 ) -> Result<Resource, String> {
     let mut resolved = resource.clone();
     for (key, expr) in &resource.attributes {
-        let resolved_value = resolve_ref_value(&expr.0, binding_map)?;
+        let resolved_value = resolve_ref_value(expr, binding_map)?;
         resolved
             .attributes
             .insert(key.clone(), Expr(unwrap_secret(resolved_value)));
@@ -310,7 +310,7 @@ fn resolve_resource_with_source(
 ) -> Result<Resource, String> {
     let mut resolved = target.clone();
     for (key, expr) in &source.attributes {
-        let resolved_value = resolve_ref_value(&expr.0, binding_map)?;
+        let resolved_value = resolve_ref_value(expr, binding_map)?;
         resolved
             .attributes
             .insert(key.clone(), Expr(unwrap_secret(resolved_value)));

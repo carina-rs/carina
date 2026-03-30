@@ -886,10 +886,7 @@ fn build_orphan_resource(sf: &carina_state::StateFile, id: &ResourceId) -> Resou
         .collect();
     Resource {
         id: id.clone(),
-        attributes: attributes
-            .into_iter()
-            .map(|(k, v)| (k, carina_core::resource::Expr(v)))
-            .collect(),
+        attributes: carina_core::resource::Expr::wrap_map(attributes),
         kind: carina_core::resource::ResourceKind::Real,
         lifecycle: rs.lifecycle.clone(),
         prefixes: rs.prefixes.clone(),

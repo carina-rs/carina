@@ -33,10 +33,10 @@ pub fn resolve_enum_identifiers_impl(resources: &mut [Resource]) {
             if let Some(attr_schema) = config.schema.attributes.get(key.as_str())
                 && let Some(parts) = attr_schema.attr_type.namespaced_enum_parts()
             {
-                if let Some(resolved) = carina_core::utils::resolve_enum_value(&value.0, &parts) {
+                if let Some(resolved) = carina_core::utils::resolve_enum_value(value, &parts) {
                     resolved_attrs.insert(key.clone(), resolved);
                 } else {
-                    resolved_attrs.insert(key.clone(), value.0.clone());
+                    resolved_attrs.insert(key.clone(), value.as_value().clone());
                 }
                 continue;
             }
@@ -56,13 +56,13 @@ pub fn resolve_enum_identifiers_impl(resources: &mut [Resource]) {
                 };
 
                 if let Some(fields) = struct_fields {
-                    let resolved = resolve_struct_enum_values(&value.0, fields);
+                    let resolved = resolve_struct_enum_values(value, fields);
                     resolved_attrs.insert(key.clone(), resolved);
                     continue;
                 }
             }
 
-            resolved_attrs.insert(key.clone(), value.0.clone());
+            resolved_attrs.insert(key.clone(), value.as_value().clone());
         }
         for (key, value) in resolved_attrs {
             resource.set_attr(key, value);

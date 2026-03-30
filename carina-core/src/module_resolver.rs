@@ -371,7 +371,7 @@ impl<'cfg> ModuleResolver<'cfg> {
             let mut substituted_attrs = HashMap::new();
             for (key, expr) in &new_resource.attributes {
                 let rewritten =
-                    rewrite_intra_module_refs(&expr.0, instance_prefix, &intra_module_bindings);
+                    rewrite_intra_module_refs(expr, instance_prefix, &intra_module_bindings);
                 let substituted = substitute_arguments(&rewritten, &argument_values);
                 substituted_attrs.insert(key.clone(), Expr(substituted));
             }
@@ -729,7 +729,7 @@ mod tests {
                         "_type".to_string(),
                         Value::String("aws.security_group".to_string()),
                     );
-                    attrs.into_iter().map(|(k, v)| (k, Expr(v))).collect()
+                    Expr::wrap_map(attrs)
                 },
                 kind: ResourceKind::Real,
                 lifecycle: LifecycleConfig::default(),
@@ -860,7 +860,7 @@ mod tests {
                                 field_path: vec![],
                             },
                         );
-                        attrs.into_iter().map(|(k, v)| (k, Expr(v))).collect()
+                        Expr::wrap_map(attrs)
                     },
                     kind: ResourceKind::Real,
                     lifecycle: LifecycleConfig::default(),
@@ -881,7 +881,7 @@ mod tests {
                                 field_path: vec![],
                             },
                         );
-                        attrs.into_iter().map(|(k, v)| (k, Expr(v))).collect()
+                        Expr::wrap_map(attrs)
                     },
                     kind: ResourceKind::Real,
                     lifecycle: LifecycleConfig::default(),
@@ -1000,7 +1000,7 @@ mod tests {
                         "_type".to_string(),
                         Value::String("aws.security_group".to_string()),
                     );
-                    attrs.into_iter().map(|(k, v)| (k, Expr(v))).collect()
+                    Expr::wrap_map(attrs)
                 },
                 kind: ResourceKind::Real,
                 lifecycle: LifecycleConfig::default(),
@@ -1349,7 +1349,7 @@ mod tests {
                             field_path: vec![],
                         },
                     );
-                    attrs.into_iter().map(|(k, v)| (k, Expr(v))).collect()
+                    Expr::wrap_map(attrs)
                 },
                 kind: ResourceKind::Real,
                 lifecycle: LifecycleConfig::default(),

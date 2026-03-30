@@ -37,11 +37,7 @@ pub fn resolve_refs_with_state(
 
     for resource in resources.iter() {
         if let Some(ref binding_name) = resource.binding {
-            let mut attrs: HashMap<String, Value> = resource
-                .attributes
-                .iter()
-                .map(|(k, e)| (k.clone(), e.0.clone()))
-                .collect();
+            let mut attrs: HashMap<String, Value> = Expr::resolve_map(&resource.attributes);
 
             // Merge AWS state attributes (like `id`) if available
             if let Some(state) = current_states.get(&resource.id)
@@ -62,7 +58,7 @@ pub fn resolve_refs_with_state(
     for resource in resources.iter_mut() {
         let mut resolved_attrs = HashMap::new();
         for (key, expr) in &resource.attributes {
-            resolved_attrs.insert(key.clone(), Expr(resolve_ref_value(&expr.0, &binding_map)?));
+            resolved_attrs.insert(key.clone(), Expr(resolve_ref_value(expr, &binding_map)?));
         }
         resource.attributes = resolved_attrs;
     }
@@ -228,10 +224,7 @@ mod tests {
         let attributes: HashMap<String, Value> =
             attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
         let mut r = Resource::new("test.resource", name);
-        r.attributes = attributes
-            .into_iter()
-            .map(|(k, v)| (k, crate::resource::Expr(v)))
-            .collect();
+        r.attributes = Expr::wrap_map(attributes);
         r.binding = binding.map(|b| b.to_string());
         r
     }
