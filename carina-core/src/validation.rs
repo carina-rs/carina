@@ -89,11 +89,9 @@ pub fn validate_resource_ref_types(
             }
 
             let (ref_binding, ref_attr) = match attr_value.as_value() {
-                Value::ResourceRef {
-                    binding_name,
-                    attribute_name,
-                    ..
-                } => (binding_name, attribute_name),
+                Value::ResourceRef { path } => {
+                    (path.binding().to_string(), path.attribute().to_string())
+                }
                 _ => continue,
             };
 
@@ -123,7 +121,7 @@ pub fn validate_resource_ref_types(
             let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr.as_str()) else {
                 let known_attrs: Vec<&str> =
                     ref_schema.attributes.keys().map(|s| s.as_str()).collect();
-                let suggestion = suggest_similar_name(ref_attr, &known_attrs)
+                let suggestion = suggest_similar_name(&ref_attr, &known_attrs)
                     .map(|s| format!(" Did you mean '{}'?", s))
                     .unwrap_or_default();
                 all_errors.push(format!(
@@ -282,8 +280,8 @@ pub fn check_unused_bindings(parsed: &ParsedFile) -> Vec<String> {
 /// Recursively collect all `ResourceRef` binding names from a value tree.
 fn collect_resource_refs(value: &Value, refs: &mut HashSet<String>) {
     match value {
-        Value::ResourceRef { binding_name, .. } => {
-            refs.insert(binding_name.clone());
+        Value::ResourceRef { path } => {
+            refs.insert(path.binding().to_string());
         }
         Value::List(items) => {
             for item in items {
@@ -404,11 +402,7 @@ mod tests {
         // Resource that references the binding
         let subnet = Resource::with_provider("awscc", "ec2.subnet", "web-subnet").with_attribute(
             "vpc_id",
-            Value::ResourceRef {
-                binding_name: "vpc".to_string(),
-                attribute_name: "vpc_id".to_string(),
-                field_path: vec![],
-            },
+            Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         );
         parsed.resources.push(subnet);
 
@@ -451,11 +445,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(
             "vpc_id".to_string(),
-            Value::ResourceRef {
-                binding_name: "vpc".to_string(),
-                attribute_name: "vpc_id".to_string(),
-                field_path: vec![],
-            },
+            Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         );
         let sg = Resource::with_provider("awscc", "ec2.security_group", "web-sg")
             .with_attribute("tags", Value::List(vec![Value::Map(map)]));
@@ -474,11 +464,7 @@ mod tests {
         let mut args = HashMap::new();
         args.insert(
             "vpc_id".to_string(),
-            Value::ResourceRef {
-                binding_name: "vpc".to_string(),
-                attribute_name: "vpc_id".to_string(),
-                field_path: vec![],
-            },
+            Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         );
         parsed.module_calls.push(ModuleCall {
             module_name: "web_tier".to_string(),
@@ -503,11 +489,7 @@ mod tests {
         // Only vpc is referenced
         let subnet = Resource::with_provider("awscc", "ec2.subnet", "web-subnet").with_attribute(
             "vpc_id",
-            Value::ResourceRef {
-                binding_name: "vpc".to_string(),
-                attribute_name: "vpc_id".to_string(),
-                field_path: vec![],
-            },
+            Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         );
         parsed.resources.push(subnet);
 
@@ -527,11 +509,11 @@ mod tests {
             .push(crate::parser::AttributeParameter {
                 name: "vpc_id".to_string(),
                 type_expr: Some(TypeExpr::String),
-                value: Some(Value::ResourceRef {
-                    binding_name: "vpc".to_string(),
-                    attribute_name: "vpc_id".to_string(),
-                    field_path: vec![],
-                }),
+                value: Some(Value::resource_ref(
+                    "vpc".to_string(),
+                    "vpc_id".to_string(),
+                    vec![],
+                )),
             });
 
         assert!(check_unused_bindings(&parsed).is_empty());
@@ -576,13 +558,9 @@ let route = awscc.ec2.route {
             .unwrap();
         let gateway_id = route.get_attr("gateway_id").unwrap();
         match gateway_id {
-            Value::ResourceRef {
-                binding_name,
-                attribute_name,
-                ..
-            } => {
-                assert_eq!(binding_name, "igw_attachment");
-                assert_eq!(attribute_name, "internet_gateway_id");
+            Value::ResourceRef { path } => {
+                assert_eq!(path.binding(), "igw_attachment");
+                assert_eq!(path.attribute(), "internet_gateway_id");
             }
             other => panic!("Expected ResourceRef, got {:?}", other),
         }
@@ -645,11 +623,7 @@ let route = awscc.ec2.route {
         // Subnet references "vpc" binding which doesn't exist
         let subnet = Resource::with_provider("awscc", "ec2.subnet", "web-subnet").with_attribute(
             "vpc_id",
-            Value::ResourceRef {
-                binding_name: "vpc".to_string(),
-                attribute_name: "vpc_id".to_string(),
-                field_path: vec![],
-            },
+            Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         );
 
         let result =
@@ -680,11 +654,7 @@ let route = awscc.ec2.route {
         // Subnet references vpc.nonexistent_attr which doesn't exist on the VPC schema
         let subnet = Resource::with_provider("awscc", "ec2.subnet", "web-subnet").with_attribute(
             "vpc_id",
-            Value::ResourceRef {
-                binding_name: "vpc".to_string(),
-                attribute_name: "nonexistent_attr".to_string(),
-                field_path: vec![],
-            },
+            Value::resource_ref("vpc".to_string(), "nonexistent_attr".to_string(), vec![]),
         );
 
         let result = validate_resource_ref_types(
@@ -726,11 +696,11 @@ let route = awscc.ec2.route {
         // Typo: internet_gateway_idd instead of internet_gateway_id
         let route = Resource::with_provider("awscc", "ec2.route", "main-route").with_attribute(
             "gateway_id",
-            Value::ResourceRef {
-                binding_name: "igw".to_string(),
-                attribute_name: "internet_gateway_idd".to_string(),
-                field_path: vec![],
-            },
+            Value::resource_ref(
+                "igw".to_string(),
+                "internet_gateway_idd".to_string(),
+                vec![],
+            ),
         );
 
         let result = validate_resource_ref_types(
@@ -764,11 +734,11 @@ let route = awscc.ec2.route {
         // Completely unrelated attribute name - no suggestion expected
         let subnet = Resource::with_provider("awscc", "ec2.subnet", "web-subnet").with_attribute(
             "vpc_id",
-            Value::ResourceRef {
-                binding_name: "vpc".to_string(),
-                attribute_name: "completely_wrong_name".to_string(),
-                field_path: vec![],
-            },
+            Value::resource_ref(
+                "vpc".to_string(),
+                "completely_wrong_name".to_string(),
+                vec![],
+            ),
         );
 
         let result = validate_resource_ref_types(

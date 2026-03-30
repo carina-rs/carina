@@ -74,11 +74,10 @@ pub fn resolve_ref_value(
     binding_map: &HashMap<String, HashMap<String, Value>>,
 ) -> Result<Value, String> {
     match value {
-        Value::ResourceRef {
-            binding_name,
-            attribute_name,
-            field_path,
-        } => {
+        Value::ResourceRef { path } => {
+            let binding_name = path.binding();
+            let attribute_name = path.attribute();
+            let field_path = path.field_path();
             if let Some(attrs) = binding_map.get(binding_name)
                 && let Some(attr_value) = attrs.get(attribute_name)
             {
@@ -86,10 +85,10 @@ pub fn resolve_ref_value(
                 let mut resolved = resolve_ref_value(attr_value, binding_map)?;
 
                 // Traverse chained field path through nested maps
-                for field in field_path {
+                for field in &field_path {
                     match resolved {
                         Value::Map(ref map) => {
-                            if let Some(nested) = map.get(field) {
+                            if let Some(nested) = map.get(*field) {
                                 resolved = resolve_ref_value(nested, binding_map)?;
                             } else {
                                 // Field not found in nested map, keep original ref
@@ -236,11 +235,7 @@ mod tests {
         attrs.insert("id".to_string(), Value::String("vpc-123".to_string()));
         binding_map.insert("my_vpc".to_string(), attrs);
 
-        let ref_value = Value::ResourceRef {
-            binding_name: "my_vpc".to_string(),
-            attribute_name: "id".to_string(),
-            field_path: vec![],
-        };
+        let ref_value = Value::resource_ref("my_vpc".to_string(), "id".to_string(), vec![]);
 
         let resolved = resolve_ref_value(&ref_value, &binding_map).unwrap();
         assert_eq!(resolved, Value::String("vpc-123".to_string()));
@@ -255,11 +250,7 @@ mod tests {
 
         let list = Value::List(vec![
             Value::String("static".to_string()),
-            Value::ResourceRef {
-                binding_name: "my_sg".to_string(),
-                attribute_name: "id".to_string(),
-                field_path: vec![],
-            },
+            Value::resource_ref("my_sg".to_string(), "id".to_string(), vec![]),
         ]);
 
         let resolved = resolve_ref_value(&list, &binding_map).unwrap();
@@ -282,11 +273,7 @@ mod tests {
         let map = Value::Map(
             vec![(
                 "subnet_id".to_string(),
-                Value::ResourceRef {
-                    binding_name: "my_subnet".to_string(),
-                    attribute_name: "id".to_string(),
-                    field_path: vec![],
-                },
+                Value::resource_ref("my_subnet".to_string(), "id".to_string(), vec![]),
             )]
             .into_iter()
             .collect(),
@@ -307,11 +294,7 @@ mod tests {
     fn test_unresolved_ref_stays_as_is() {
         let binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
-        let ref_value = Value::ResourceRef {
-            binding_name: "nonexistent".to_string(),
-            attribute_name: "id".to_string(),
-            field_path: vec![],
-        };
+        let ref_value = Value::resource_ref("nonexistent".to_string(), "id".to_string(), vec![]);
 
         let resolved = resolve_ref_value(&ref_value, &binding_map).unwrap();
         assert_eq!(resolved, ref_value);
@@ -326,11 +309,11 @@ mod tests {
 
         let interp = Value::Interpolation(vec![
             InterpolationPart::Literal("subnet-".to_string()),
-            InterpolationPart::Expr(Value::ResourceRef {
-                binding_name: "my_vpc".to_string(),
-                attribute_name: "vpc_id".to_string(),
-                field_path: vec![],
-            }),
+            InterpolationPart::Expr(Value::resource_ref(
+                "my_vpc".to_string(),
+                "vpc_id".to_string(),
+                vec![],
+            )),
         ]);
 
         let resolved = resolve_ref_value(&interp, &binding_map).unwrap();
@@ -343,11 +326,11 @@ mod tests {
 
         let interp = Value::Interpolation(vec![
             InterpolationPart::Literal("subnet-".to_string()),
-            InterpolationPart::Expr(Value::ResourceRef {
-                binding_name: "my_vpc".to_string(),
-                attribute_name: "vpc_id".to_string(),
-                field_path: vec![],
-            }),
+            InterpolationPart::Expr(Value::resource_ref(
+                "my_vpc".to_string(),
+                "vpc_id".to_string(),
+                vec![],
+            )),
         ]);
 
         let resolved = resolve_ref_value(&interp, &binding_map).unwrap();
@@ -387,11 +370,7 @@ mod tests {
                 None,
                 vec![(
                     "vpc_id",
-                    Value::ResourceRef {
-                        binding_name: "my_vpc".to_string(),
-                        attribute_name: "vpc_id".to_string(),
-                        field_path: vec![],
-                    },
+                    Value::resource_ref("my_vpc".to_string(), "vpc_id".to_string(), vec![]),
                 )],
             ),
         ];
@@ -453,11 +432,7 @@ mod tests {
                 Value::String("-".to_string()),
                 Value::List(vec![
                     Value::String("prefix".to_string()),
-                    Value::ResourceRef {
-                        binding_name: "vpc".to_string(),
-                        attribute_name: "id".to_string(),
-                        field_path: vec![],
-                    },
+                    Value::resource_ref("vpc".to_string(), "id".to_string(), vec![]),
                 ]),
             ],
         };
@@ -475,11 +450,11 @@ mod tests {
             name: "join".to_string(),
             args: vec![
                 Value::String("-".to_string()),
-                Value::List(vec![Value::ResourceRef {
-                    binding_name: "unknown".to_string(),
-                    attribute_name: "id".to_string(),
-                    field_path: vec![],
-                }]),
+                Value::List(vec![Value::resource_ref(
+                    "unknown".to_string(),
+                    "id".to_string(),
+                    vec![],
+                )]),
             ],
         };
 
@@ -499,11 +474,11 @@ mod tests {
         binding_map.insert("web".to_string(), attrs);
 
         // web.network.vpc_id should resolve to "vpc-123"
-        let ref_value = Value::ResourceRef {
-            binding_name: "web".to_string(),
-            attribute_name: "network".to_string(),
-            field_path: vec!["vpc_id".to_string()],
-        };
+        let ref_value = Value::resource_ref(
+            "web".to_string(),
+            "network".to_string(),
+            vec!["vpc_id".to_string()],
+        );
 
         let resolved = resolve_ref_value(&ref_value, &binding_map).unwrap();
         assert_eq!(resolved, Value::String("vpc-123".to_string()));
@@ -522,11 +497,11 @@ mod tests {
         attrs.insert("output".to_string(), Value::Map(output_map));
         binding_map.insert("web".to_string(), attrs);
 
-        let ref_value = Value::ResourceRef {
-            binding_name: "web".to_string(),
-            attribute_name: "output".to_string(),
-            field_path: vec!["network".to_string(), "vpc_id".to_string()],
-        };
+        let ref_value = Value::resource_ref(
+            "web".to_string(),
+            "output".to_string(),
+            vec!["network".to_string(), "vpc_id".to_string()],
+        );
 
         let resolved = resolve_ref_value(&ref_value, &binding_map).unwrap();
         assert_eq!(resolved, Value::String("vpc-456".to_string()));
@@ -543,11 +518,11 @@ mod tests {
         binding_map.insert("web".to_string(), attrs);
 
         // web.network.nonexistent should keep original ref
-        let ref_value = Value::ResourceRef {
-            binding_name: "web".to_string(),
-            attribute_name: "network".to_string(),
-            field_path: vec!["nonexistent".to_string()],
-        };
+        let ref_value = Value::resource_ref(
+            "web".to_string(),
+            "network".to_string(),
+            vec!["nonexistent".to_string()],
+        );
 
         let resolved = resolve_ref_value(&ref_value, &binding_map).unwrap();
         assert_eq!(resolved, ref_value);
@@ -586,11 +561,7 @@ mod tests {
             name: "join".to_string(),
             args: vec![
                 Value::String("-".to_string()),
-                Value::ResourceRef {
-                    binding_name: "vpc".to_string(),
-                    attribute_name: "tags".to_string(),
-                    field_path: vec![],
-                },
+                Value::resource_ref("vpc".to_string(), "tags".to_string(), vec![]),
             ],
         };
 

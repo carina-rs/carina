@@ -174,21 +174,8 @@ fn deterministic_value_string(value: &Value) -> String {
                 .collect();
             format!("Map({{{}}})", parts.join(", "))
         }
-        Value::ResourceRef {
-            binding_name,
-            attribute_name,
-            field_path,
-        } => {
-            if field_path.is_empty() {
-                format!("ResourceRef({}.{})", binding_name, attribute_name)
-            } else {
-                format!(
-                    "ResourceRef({}.{}.{})",
-                    binding_name,
-                    attribute_name,
-                    field_path.join(".")
-                )
-            }
+        Value::ResourceRef { path } => {
+            format!("ResourceRef({})", path.to_dot_string())
         }
         Value::Interpolation(parts) => {
             use crate::resource::InterpolationPart;

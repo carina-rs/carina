@@ -286,16 +286,12 @@ impl DiagnosticEngine {
                                     carina_core::schema::AttributeType::Union(_)
                                     | carina_core::schema::AttributeType::StringEnum { .. }
                                     | carina_core::schema::AttributeType::Custom { .. },
-                                    Value::ResourceRef {
-                                        binding_name: ref_binding,
-                                        attribute_name: ref_attr,
-                                        ..
-                                    },
+                                    Value::ResourceRef { path },
                                 ) => check_resource_ref_type_mismatch(
                                     &binding_schema_map,
                                     &attr_schema.attr_type,
-                                    ref_binding,
-                                    ref_attr,
+                                    path.binding(),
+                                    path.attribute(),
                                 ),
                                 // Custom type validation (all Custom types use their validate fn)
                                 (carina_core::schema::AttributeType::StringEnum { .. }, value) => {

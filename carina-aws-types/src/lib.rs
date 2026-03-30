@@ -1248,11 +1248,11 @@ mod tests {
         );
         assert!(t.validate(&Value::Int(42)).is_err());
         assert!(
-            t.validate(&Value::ResourceRef {
-                binding_name: "role".to_string(),
-                attribute_name: "arn".to_string(),
-                field_path: vec![],
-            })
+            t.validate(&Value::resource_ref(
+                "role".to_string(),
+                "arn".to_string(),
+                vec![]
+            ))
             .is_ok()
         );
     }
@@ -1288,11 +1288,11 @@ mod tests {
         assert!(t.validate(&Value::String("vpc".to_string())).is_err());
         assert!(t.validate(&Value::Int(42)).is_err());
         assert!(
-            t.validate(&Value::ResourceRef {
-                binding_name: "my_vpc".to_string(),
-                attribute_name: "vpc_id".to_string(),
-                field_path: vec![],
-            })
+            t.validate(&Value::resource_ref(
+                "my_vpc".to_string(),
+                "vpc_id".to_string(),
+                vec![]
+            ))
             .is_ok()
         );
     }
@@ -1423,11 +1423,11 @@ mod tests {
         );
         assert!(t.validate(&Value::Int(42)).is_err());
         assert!(
-            t.validate(&Value::ResourceRef {
-                binding_name: "subnet".to_string(),
-                attribute_name: "availability_zone_id".to_string(),
-                field_path: vec![],
-            })
+            t.validate(&Value::resource_ref(
+                "subnet".to_string(),
+                "availability_zone_id".to_string(),
+                vec![]
+            ))
             .is_ok()
         );
     }

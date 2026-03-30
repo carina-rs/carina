@@ -152,15 +152,11 @@ fn format_value(value: &Value) -> String {
                 format!("{{...{} keys}}", map.len())
             }
         }
-        Value::ResourceRef {
-            binding_name,
-            attribute_name,
-            ..
-        } => {
-            if attribute_name.is_empty() {
-                binding_name.clone()
+        Value::ResourceRef { path } => {
+            if path.attribute().is_empty() {
+                path.binding().to_string()
             } else {
-                format!("{}.{}", binding_name, attribute_name)
+                format!("{}.{}", path.binding(), path.attribute())
             }
         }
         Value::Interpolation(parts) => {
@@ -441,18 +437,14 @@ impl RootConfigSignature {
         binding_types: &HashMap<String, ResourceTypePath>,
     ) {
         match value {
-            Value::ResourceRef {
-                binding_name,
-                attribute_name,
-                ..
-            } => {
-                let target_type = binding_types.get(binding_name).cloned();
+            Value::ResourceRef { path } => {
+                let target_type = binding_types.get(path.binding()).cloned();
                 graph.add_edge(
                     from.to_string(),
                     TypedDependency {
-                        target: binding_name.clone(),
+                        target: path.binding().to_string(),
                         target_type,
-                        attribute: attribute_name.clone(),
+                        attribute: path.attribute().to_string(),
                         used_in: attr_key.to_string(),
                     },
                 );
@@ -819,7 +811,7 @@ impl ModuleSignature {
             .iter()
             .map(|attr_param| {
                 let source_binding = attr_param.value.as_ref().and_then(|v| match v {
-                    Value::ResourceRef { binding_name, .. } => Some(binding_name.clone()),
+                    Value::ResourceRef { path } => Some(path.binding().to_string()),
                     _ => None,
                 });
 
@@ -849,15 +841,12 @@ impl ModuleSignature {
         argument_types: &HashMap<String, TypeExpr>,
     ) {
         match value {
-            Value::ResourceRef {
-                binding_name,
-                attribute_name,
-                ..
-            } => {
+            Value::ResourceRef { path } => {
+                let binding_name = path.binding();
                 let target_type = if let Some(arg_type) = argument_types.get(binding_name) {
                     // Argument parameter reference (lexically scoped)
-                    if let TypeExpr::Ref(path) = arg_type {
-                        Some(path.clone())
+                    if let TypeExpr::Ref(p) = arg_type {
+                        Some(p.clone())
                     } else {
                         None
                     }
@@ -868,9 +857,9 @@ impl ModuleSignature {
                 graph.add_edge(
                     from.to_string(),
                     TypedDependency {
-                        target: binding_name.clone(),
+                        target: binding_name.to_string(),
                         target_type,
-                        attribute: attribute_name.clone(),
+                        attribute: path.attribute().to_string(),
                         used_in: attr_key.to_string(),
                     },
                 );

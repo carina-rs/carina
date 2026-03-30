@@ -1498,7 +1498,7 @@ fn format_cascading_update_diff(
 #[cfg(test)]
 fn value_references_binding(value: &Value, binding: &str) -> bool {
     match value {
-        Value::ResourceRef { binding_name, .. } => binding_name == binding,
+        Value::ResourceRef { path } => path.binding() == binding,
         Value::List(items) => items.iter().any(|v| value_references_binding(v, binding)),
         Value::Map(map) => map.values().any(|v| value_references_binding(v, binding)),
         _ => false,
@@ -1519,11 +1519,7 @@ mod tests {
         for dep in deps {
             r.set_attr(
                 format!("ref_{}", dep),
-                Value::ResourceRef {
-                    binding_name: dep.to_string(),
-                    attribute_name: "id".to_string(),
-                    field_path: vec![],
-                },
+                Value::resource_ref(dep.to_string(), "id".to_string(), vec![]),
             );
         }
         r
@@ -1890,19 +1886,11 @@ mod tests {
         let mut r = Resource::new("ec2.subnet_route_table_association", "hash123");
         r.set_attr(
             "route_table_id".to_string(),
-            Value::ResourceRef {
-                binding_name: "public_rt".to_string(),
-                attribute_name: "id".to_string(),
-                field_path: vec![],
-            },
+            Value::resource_ref("public_rt".to_string(), "id".to_string(), vec![]),
         );
         r.set_attr(
             "subnet_id".to_string(),
-            Value::ResourceRef {
-                binding_name: "public_subnet_1a".to_string(),
-                attribute_name: "id".to_string(),
-                field_path: vec![],
-            },
+            Value::resource_ref("public_subnet_1a".to_string(), "id".to_string(), vec![]),
         );
 
         let hint = extract_compact_hint(&r, None);
@@ -1916,19 +1904,11 @@ mod tests {
         let mut r = Resource::new("ec2.subnet_route_table_association", "hash123");
         r.set_attr(
             "route_table_id".to_string(),
-            Value::ResourceRef {
-                binding_name: "database_rt".to_string(),
-                attribute_name: "id".to_string(),
-                field_path: vec![],
-            },
+            Value::resource_ref("database_rt".to_string(), "id".to_string(), vec![]),
         );
         r.set_attr(
             "subnet_id".to_string(),
-            Value::ResourceRef {
-                binding_name: "database_subnet_1a".to_string(),
-                attribute_name: "id".to_string(),
-                field_path: vec![],
-            },
+            Value::resource_ref("database_subnet_1a".to_string(), "id".to_string(), vec![]),
         );
 
         // When parent is database_rt, should skip route_table_id and show only subnet_id
@@ -1967,11 +1947,7 @@ mod tests {
         );
         r.set_attr(
             "gateway_id".to_string(),
-            Value::ResourceRef {
-                binding_name: "igw".to_string(),
-                attribute_name: "id".to_string(),
-                field_path: vec![],
-            },
+            Value::resource_ref("igw".to_string(), "id".to_string(), vec![]),
         );
 
         let hint = extract_compact_hint(&r, None);
@@ -2008,11 +1984,7 @@ mod tests {
         let mut r = Resource::new("ec2.security_group_ingress", "hash_sg");
         r.set_attr(
             "group_id".to_string(),
-            Value::ResourceRef {
-                binding_name: "endpoint_sg".to_string(),
-                attribute_name: "id".to_string(),
-                field_path: vec![],
-            },
+            Value::resource_ref("endpoint_sg".to_string(), "id".to_string(), vec![]),
         );
         r.set_attr(
             "description".to_string(),
@@ -2034,19 +2006,15 @@ mod tests {
         );
         r.set_attr(
             "security_group_ids".to_string(),
-            Value::List(vec![Value::ResourceRef {
-                binding_name: "endpoint_sg".to_string(),
-                attribute_name: "group_id".to_string(),
-                field_path: vec![],
-            }]),
+            Value::List(vec![Value::resource_ref(
+                "endpoint_sg".to_string(),
+                "group_id".to_string(),
+                vec![],
+            )]),
         );
         r.set_attr(
             "vpc_id".to_string(),
-            Value::ResourceRef {
-                binding_name: "vpc".to_string(),
-                attribute_name: "id".to_string(),
-                field_path: vec![],
-            },
+            Value::resource_ref("vpc".to_string(), "id".to_string(), vec![]),
         );
 
         // String attribute (service_name) takes priority over ResourceRef
@@ -2085,11 +2053,7 @@ mod tests {
         let mut r = Resource::new("ec2.subnet_route_table_association", "hash123");
         r.set_attr(
             "subnet_id".to_string(),
-            Value::ResourceRef {
-                binding_name: "database_subnet_1a".to_string(),
-                attribute_name: "id".to_string(),
-                field_path: vec![],
-            },
+            Value::resource_ref("database_subnet_1a".to_string(), "id".to_string(), vec![]),
         );
         let result = format_compact_name(&r, "hash123", None);
         assert!(
@@ -2135,11 +2099,7 @@ mod tests {
         );
         anon.set_attr(
             "route_table_id".to_string(),
-            Value::ResourceRef {
-                binding_name: "public_rt".to_string(),
-                attribute_name: "id".to_string(),
-                field_path: vec![],
-            },
+            Value::resource_ref("public_rt".to_string(), "id".to_string(), vec![]),
         );
 
         let mut plan = Plan::new();
@@ -2162,11 +2122,11 @@ mod tests {
         let mut r = Resource::new("ec2.vpc_endpoint", "hash_list_ref");
         r.set_attr(
             "security_group_ids".to_string(),
-            Value::List(vec![Value::ResourceRef {
-                binding_name: "endpoint_sg".to_string(),
-                attribute_name: "group_id".to_string(),
-                field_path: vec![],
-            }]),
+            Value::List(vec![Value::resource_ref(
+                "endpoint_sg".to_string(),
+                "group_id".to_string(),
+                vec![],
+            )]),
         );
 
         let hint = extract_compact_hint(&r, None);
@@ -2183,11 +2143,11 @@ mod tests {
         let mut r = Resource::new("ec2.vpc_endpoint", "hash_list_parent");
         r.set_attr(
             "security_group_ids".to_string(),
-            Value::List(vec![Value::ResourceRef {
-                binding_name: "endpoint_sg".to_string(),
-                attribute_name: "group_id".to_string(),
-                field_path: vec![],
-            }]),
+            Value::List(vec![Value::resource_ref(
+                "endpoint_sg".to_string(),
+                "group_id".to_string(),
+                vec![],
+            )]),
         );
 
         let hint = extract_compact_hint(&r, Some("endpoint_sg"));
@@ -2268,11 +2228,7 @@ mod tests {
         let subnet_to = Resource::new("ec2.subnet", "subnet")
             .with_attribute(
                 "vpc_id",
-                Value::ResourceRef {
-                    binding_name: "vpc".to_string(),
-                    attribute_name: "vpc_id".to_string(),
-                    field_path: vec![],
-                },
+                Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
             )
             .with_attribute("cidr_block", Value::String("10.0.1.0/24".to_string()));
 
@@ -2329,11 +2285,7 @@ mod tests {
             to: Resource::new("ec2.subnet", "subnet")
                 .with_attribute(
                     "vpc_id",
-                    Value::ResourceRef {
-                        binding_name: "vpc".to_string(),
-                        attribute_name: "vpc_id".to_string(),
-                        field_path: vec![],
-                    },
+                    Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
                 )
                 .with_attribute("cidr_block", Value::String("10.0.1.0/24".to_string())),
         };
@@ -2505,11 +2457,7 @@ mod tests {
             to: Resource::new("ec2.subnet", "subnet")
                 .with_attribute(
                     "vpc_id",
-                    Value::ResourceRef {
-                        binding_name: "vpc".to_string(),
-                        attribute_name: "vpc_id".to_string(),
-                        field_path: vec![],
-                    },
+                    Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
                 )
                 .with_attribute(
                     "availability_zone",
@@ -2559,11 +2507,11 @@ mod tests {
             )),
             to: Resource::new("ec2.instance", "instance").with_attribute(
                 "security_group_ids",
-                Value::List(vec![Value::ResourceRef {
-                    binding_name: "sg".to_string(),
-                    attribute_name: "group_id".to_string(),
-                    field_path: vec![],
-                }]),
+                Value::List(vec![Value::resource_ref(
+                    "sg".to_string(),
+                    "group_id".to_string(),
+                    vec![],
+                )]),
             ),
         };
 

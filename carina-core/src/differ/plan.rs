@@ -465,7 +465,7 @@ pub fn cascade_dependent_updates(
                 .attributes
                 .iter()
                 .filter(|(_, v)| {
-                    matches!(v.as_value(), Value::ResourceRef { binding_name, .. } if binding_name == dep)
+                    matches!(v.as_value(), Value::ResourceRef { path } if path.binding() == dep)
                 })
                 .map(|(k, _)| k.clone())
                 .collect();
@@ -474,13 +474,10 @@ pub fn cascade_dependent_updates(
                 .attributes
                 .iter()
                 .filter_map(|(k, v)| match v.as_value() {
-                    Value::ResourceRef {
-                        binding_name,
-                        attribute_name,
-                        ..
-                    } if binding_name == dep => {
-                        Some((k.clone(), format!("{}.{}", binding_name, attribute_name)))
-                    }
+                    Value::ResourceRef { path } if path.binding() == dep => Some((
+                        k.clone(),
+                        format!("{}.{}", path.binding(), path.attribute()),
+                    )),
                     _ => None,
                 })
                 .collect();
@@ -543,7 +540,7 @@ pub fn cascade_dependent_updates(
                     .attributes
                     .iter()
                     .filter(|(_, v)| {
-                        matches!(v.as_value(), Value::ResourceRef { binding_name, .. } if binding_name == replaced_binding)
+                        matches!(v.as_value(), Value::ResourceRef { path } if path.binding() == replaced_binding)
                     })
                     .map(|(k, _)| k.clone())
                     .collect();
@@ -572,14 +569,14 @@ pub fn cascade_dependent_updates(
                         .attributes
                         .iter()
                         .filter_map(|(k, v)| match v.as_value() {
-                            Value::ResourceRef {
-                                binding_name,
-                                attribute_name,
-                                ..
-                            } if binding_name == replaced_binding
-                                && create_only_refs.contains(k) =>
+                            Value::ResourceRef { path }
+                                if path.binding() == replaced_binding
+                                    && create_only_refs.contains(k) =>
                             {
-                                Some((k.clone(), format!("{}.{}", binding_name, attribute_name)))
+                                Some((
+                                    k.clone(),
+                                    format!("{}.{}", path.binding(), path.attribute()),
+                                ))
                             }
                             _ => None,
                         })

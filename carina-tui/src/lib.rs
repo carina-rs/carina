@@ -286,11 +286,11 @@ mod tests {
                 .with_binding("subnet")
                 .with_attribute(
                     "vpc_id",
-                    carina_core::resource::Value::ResourceRef {
-                        binding_name: "vpc".to_string(),
-                        attribute_name: "vpc_id".to_string(),
-                        field_path: vec![],
-                    },
+                    carina_core::resource::Value::resource_ref(
+                        "vpc".to_string(),
+                        "vpc_id".to_string(),
+                        vec![],
+                    ),
                 ),
         ));
         App::new(&plan, &HashMap::new())
