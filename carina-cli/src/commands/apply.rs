@@ -1082,7 +1082,7 @@ async fn run_apply_locked(
     }
 
     // Load remote state data sources
-    let remote_bindings = super::plan::load_remote_states(&parsed.remote_states, base_dir)?;
+    let remote_bindings = super::plan::load_remote_states(&parsed.remote_states, base_dir).await?;
 
     // Resolve references and enum identifiers, then create initial plan for display
     let mut resources_for_plan = sorted_resources.clone();

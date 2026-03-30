@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::effect::Effect;
-use carina_core::parser::{BackendConfig, ProviderConfig, ProviderContext, RemoteState};
+use carina_core::parser::{
+    BackendConfig, ProviderConfig, ProviderContext, RemoteState, RemoteStateBackend,
+};
 use carina_core::plan::Plan;
 use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::value::{
@@ -182,7 +184,7 @@ pub async fn run_plan(
     }
 
     // Load remote state data sources
-    let remote_bindings = load_remote_states(&parsed.remote_states, base_dir)?;
+    let remote_bindings = load_remote_states(&parsed.remote_states, base_dir).await?;
 
     let ctx = create_plan_from_parsed_with_remote(&parsed, &state_file, refresh, &remote_bindings)
         .await?;
@@ -275,40 +277,106 @@ pub async fn run_plan(
 /// map of resource bindings to their attributes. The result maps each remote_state
 /// binding name to a `HashMap<String, Value>` where keys are resource binding names
 /// and values are `Value::Map` of that resource's attributes.
-pub(crate) fn load_remote_states(
+pub(crate) async fn load_remote_states(
     remote_states: &[RemoteState],
     base_dir: &Path,
 ) -> Result<HashMap<String, HashMap<String, Value>>, AppError> {
     let mut result = HashMap::new();
 
     for rs in remote_states {
-        let state_path = if Path::new(&rs.path).is_absolute() {
-            PathBuf::from(&rs.path)
-        } else {
-            base_dir.join(&rs.path)
+        let state_file = match &rs.backend {
+            RemoteStateBackend::Local { path } => {
+                load_remote_state_local(path, &rs.binding, base_dir)?
+            }
+            RemoteStateBackend::S3 {
+                bucket,
+                key,
+                region,
+            } => load_remote_state_s3(bucket, key, region, &rs.binding).await?,
         };
-
-        let content = fs::read_to_string(&state_path).map_err(|e| {
-            AppError::Config(format!(
-                "Failed to read remote state file '{}' for remote_state '{}': {}",
-                state_path.display(),
-                rs.binding,
-                e
-            ))
-        })?;
-
-        let state_file = check_and_migrate(&content).map_err(|e| {
-            AppError::Config(format!(
-                "Failed to parse remote state file '{}' for remote_state '{}': {}",
-                state_path.display(),
-                rs.binding,
-                e
-            ))
-        })?;
 
         let bindings = state_file.build_remote_bindings();
         result.insert(rs.binding.clone(), bindings);
     }
 
     Ok(result)
+}
+
+/// Load a remote state file from a local path.
+fn load_remote_state_local(
+    path: &str,
+    binding: &str,
+    base_dir: &Path,
+) -> Result<StateFile, AppError> {
+    let state_path = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        base_dir.join(path)
+    };
+
+    let content = fs::read_to_string(&state_path).map_err(|e| {
+        AppError::Config(format!(
+            "Failed to read remote state file '{}' for remote_state '{}': {}",
+            state_path.display(),
+            binding,
+            e
+        ))
+    })?;
+
+    check_and_migrate(&content).map_err(|e| {
+        AppError::Config(format!(
+            "Failed to parse remote state file '{}' for remote_state '{}': {}",
+            state_path.display(),
+            binding,
+            e
+        ))
+    })
+}
+
+/// Load a remote state file from S3.
+async fn load_remote_state_s3(
+    bucket: &str,
+    key: &str,
+    region: &str,
+    binding: &str,
+) -> Result<StateFile, AppError> {
+    use carina_core::utils::convert_region_value;
+
+    let aws_region = convert_region_value(region);
+
+    let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_config::Region::new(aws_region))
+        .load()
+        .await;
+
+    let client = aws_sdk_s3::Client::new(&aws_config);
+
+    let output = client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .map_err(|e| {
+            AppError::Config(format!(
+                "Failed to read remote state from s3://{}/{} for remote_state '{}': {}",
+                bucket, key, binding, e
+            ))
+        })?;
+
+    let body = output.body.collect().await.map_err(|e| {
+        AppError::Config(format!(
+            "Failed to read response body from s3://{}/{} for remote_state '{}': {}",
+            bucket, key, binding, e
+        ))
+    })?;
+
+    let bytes = body.into_bytes();
+
+    carina_state::check_and_migrate_bytes(&bytes).map_err(|e| {
+        AppError::Config(format!(
+            "Failed to parse remote state from s3://{}/{} for remote_state '{}': {}",
+            bucket, key, binding, e
+        ))
+    })
 }

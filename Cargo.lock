@@ -774,6 +774,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-kms",
+ "aws-sdk-s3",
  "base64",
  "carina-core",
  "carina-provider-aws",

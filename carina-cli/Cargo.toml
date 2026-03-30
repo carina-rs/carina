@@ -17,6 +17,7 @@ carina-state = { path = "../carina-state" }
 carina-tui = { path = "../carina-tui" }
 aws-config = "1"
 aws-sdk-kms = "1"
+aws-sdk-s3 = "1"
 base64 = "0.22"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }

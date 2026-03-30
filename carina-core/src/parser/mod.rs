@@ -294,8 +294,21 @@ pub struct BackendConfig {
 pub struct RemoteState {
     /// The binding name from the `let` binding (e.g., "network")
     pub binding: String,
-    /// Path to the state file (local file path)
-    pub path: String,
+    /// Backend configuration
+    pub backend: RemoteStateBackend,
+}
+
+/// Backend type for remote state
+#[derive(Debug, Clone)]
+pub enum RemoteStateBackend {
+    /// Local file path
+    Local { path: String },
+    /// S3 bucket
+    S3 {
+        bucket: String,
+        key: String,
+        region: String,
+    },
 }
 
 /// Parse result
@@ -2367,43 +2380,124 @@ fn parse_backend_block(
     })
 }
 
-/// Parse a remote_state block: remote_state { path = "..." }
+/// Parse a remote_state block: remote_state { path = "..." } or remote_state "s3" { ... }
 fn parse_remote_state_block(
     pair: pest::iterators::Pair<Rule>,
     binding_name: &str,
 ) -> Result<RemoteState, ParseError> {
-    let mut path = None;
+    let mut backend_name: Option<String> = None;
+    let mut attrs: HashMap<String, String> = HashMap::new();
 
-    for attr_pair in pair.into_inner() {
-        if attr_pair.as_rule() == Rule::attribute {
-            let mut attr_inner = attr_pair.into_inner();
-            let key = next_pair(&mut attr_inner, "attribute name", "remote_state block")?
-                .as_str()
-                .to_string();
-            let value_pair = next_pair(&mut attr_inner, "attribute value", "remote_state block")?;
-            // Only parse string literals for now
-            let value_str = extract_string_from_pair(value_pair)?;
-            match key.as_str() {
-                "path" => path = Some(value_str),
-                other => {
+    for inner_pair in pair.into_inner() {
+        match inner_pair.as_rule() {
+            Rule::string => {
+                // Optional backend name string (e.g., "s3")
+                backend_name = Some(extract_string_from_string_pair(inner_pair)?);
+            }
+            Rule::attribute => {
+                let mut attr_inner = inner_pair.into_inner();
+                let key = next_pair(&mut attr_inner, "attribute name", "remote_state block")?
+                    .as_str()
+                    .to_string();
+                let value_pair =
+                    next_pair(&mut attr_inner, "attribute value", "remote_state block")?;
+                let value_str = extract_string_from_pair(value_pair)?;
+                attrs.insert(key, value_str);
+            }
+            _ => {}
+        }
+    }
+
+    let backend = match backend_name.as_deref() {
+        None | Some("local") => {
+            // Local backend: requires "path"
+            let valid_keys: &[&str] = &["path"];
+            for key in attrs.keys() {
+                if !valid_keys.contains(&key.as_str()) {
                     return Err(ParseError::InvalidExpression {
                         line: 0,
-                        message: format!("unknown attribute '{}' in remote_state block", other),
+                        message: format!("unknown attribute '{}' in remote_state block", key),
                     });
+                }
+            }
+            let path = attrs
+                .remove("path")
+                .ok_or_else(|| ParseError::InvalidExpression {
+                    line: 0,
+                    message: "remote_state block requires a 'path' attribute".to_string(),
+                })?;
+            RemoteStateBackend::Local { path }
+        }
+        Some("s3") => {
+            // S3 backend: requires "bucket", "key", "region"
+            let valid_keys: &[&str] = &["bucket", "key", "region"];
+            for key in attrs.keys() {
+                if !valid_keys.contains(&key.as_str()) {
+                    return Err(ParseError::InvalidExpression {
+                        line: 0,
+                        message: format!(
+                            "unknown attribute '{}' in remote_state \"s3\" block",
+                            key
+                        ),
+                    });
+                }
+            }
+            let bucket = attrs
+                .remove("bucket")
+                .ok_or_else(|| ParseError::InvalidExpression {
+                    line: 0,
+                    message: "remote_state \"s3\" block requires a 'bucket' attribute".to_string(),
+                })?;
+            let key = attrs
+                .remove("key")
+                .ok_or_else(|| ParseError::InvalidExpression {
+                    line: 0,
+                    message: "remote_state \"s3\" block requires a 'key' attribute".to_string(),
+                })?;
+            let region = attrs
+                .remove("region")
+                .ok_or_else(|| ParseError::InvalidExpression {
+                    line: 0,
+                    message: "remote_state \"s3\" block requires a 'region' attribute".to_string(),
+                })?;
+            RemoteStateBackend::S3 {
+                bucket,
+                key,
+                region,
+            }
+        }
+        Some(other) => {
+            return Err(ParseError::InvalidExpression {
+                line: 0,
+                message: format!(
+                    "unsupported remote_state backend '{}' (supported: local, s3)",
+                    other
+                ),
+            });
+        }
+    };
+
+    Ok(RemoteState {
+        binding: binding_name.to_string(),
+        backend,
+    })
+}
+
+/// Extract a string value directly from a Rule::string pair
+fn extract_string_from_string_pair(
+    pair: pest::iterators::Pair<Rule>,
+) -> Result<String, ParseError> {
+    let mut result = String::new();
+    for inner in pair.into_inner() {
+        if inner.as_rule() == Rule::string_part {
+            for part in inner.into_inner() {
+                if part.as_rule() == Rule::string_literal {
+                    result.push_str(part.as_str());
                 }
             }
         }
     }
-
-    let path = path.ok_or_else(|| ParseError::InvalidExpression {
-        line: 0,
-        message: "remote_state block requires a 'path' attribute".to_string(),
-    })?;
-
-    Ok(RemoteState {
-        binding: binding_name.to_string(),
-        path,
-    })
+    Ok(result)
 }
 
 /// Extract a string value from a pair (expression -> pipe_expr -> primary -> string)
@@ -8048,7 +8142,12 @@ arguments {
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.remote_states.len(), 1);
         assert_eq!(result.remote_states[0].binding, "network");
-        assert_eq!(result.remote_states[0].path, "../network/carina.state.json");
+        match &result.remote_states[0].backend {
+            RemoteStateBackend::Local { path } => {
+                assert_eq!(path, "../network/carina.state.json");
+            }
+            other => panic!("Expected Local backend, got: {:?}", other),
+        }
     }
 
     #[test]
@@ -8115,5 +8214,175 @@ arguments {
             "Error should mention 'unknown attribute', got: {}",
             err
         );
+    }
+
+    #[test]
+    fn parse_remote_state_s3_backend() {
+        let input = r#"
+            let network = remote_state "s3" {
+                bucket = "carina-state"
+                key    = "network/carina.state.json"
+                region = "ap-northeast-1"
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(result.remote_states.len(), 1);
+        assert_eq!(result.remote_states[0].binding, "network");
+        match &result.remote_states[0].backend {
+            RemoteStateBackend::S3 {
+                bucket,
+                key,
+                region,
+            } => {
+                assert_eq!(bucket, "carina-state");
+                assert_eq!(key, "network/carina.state.json");
+                assert_eq!(region, "ap-northeast-1");
+            }
+            other => panic!("Expected S3 backend, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_remote_state_s3_with_resource_ref() {
+        let input = r#"
+            let network = remote_state "s3" {
+                bucket = "carina-state"
+                key    = "network/carina.state.json"
+                region = "ap-northeast-1"
+            }
+
+            awscc.ec2.security_group {
+                name   = "web-sg"
+                vpc_id = network.vpc.vpc_id
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(result.remote_states.len(), 1);
+        assert_eq!(result.resources.len(), 1);
+        let vpc_id_attr = result.resources[0].get_attr("vpc_id").unwrap();
+        match vpc_id_attr {
+            Value::ResourceRef { path } => {
+                assert_eq!(path.binding(), "network");
+                assert_eq!(path.attribute(), "vpc");
+                assert_eq!(path.field_path(), vec!["vpc_id"]);
+            }
+            other => panic!("Expected ResourceRef, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_remote_state_s3_missing_bucket() {
+        let input = r#"
+            let network = remote_state "s3" {
+                key    = "network/carina.state.json"
+                region = "ap-northeast-1"
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("bucket"),
+            "Error should mention 'bucket', got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_remote_state_s3_missing_key() {
+        let input = r#"
+            let network = remote_state "s3" {
+                bucket = "carina-state"
+                region = "ap-northeast-1"
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("key"),
+            "Error should mention 'key', got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_remote_state_s3_missing_region() {
+        let input = r#"
+            let network = remote_state "s3" {
+                bucket = "carina-state"
+                key    = "network/carina.state.json"
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("region"),
+            "Error should mention 'region', got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_remote_state_s3_unknown_attribute() {
+        let input = r#"
+            let network = remote_state "s3" {
+                bucket  = "carina-state"
+                key     = "network/carina.state.json"
+                region  = "ap-northeast-1"
+                encrypt = "true"
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown attribute"),
+            "Error should mention 'unknown attribute', got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_remote_state_unsupported_backend() {
+        let input = r#"
+            let network = remote_state "gcs" {
+                bucket = "carina-state"
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unsupported remote_state backend"),
+            "Error should mention unsupported backend, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_remote_state_explicit_local_backend() {
+        let input = r#"
+            let network = remote_state "local" {
+                path = "../network/carina.state.json"
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(result.remote_states.len(), 1);
+        match &result.remote_states[0].backend {
+            RemoteStateBackend::Local { path } => {
+                assert_eq!(path, "../network/carina.state.json");
+            }
+            other => panic!("Expected Local backend, got: {:?}", other),
+        }
     }
 }
