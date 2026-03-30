@@ -21,6 +21,46 @@ Improve plan output so that when modules are used, the output clearly shows:
 
 ## Design
 
+### 0. Plan Summary Header
+
+When modules are used, display a structured summary at the top of plan output before the detailed execution plan. This provides a quick overview of what each module produces, enabling fast review of large plans.
+
+#### Display format
+
+```
+Plan Summary:
+  root.crn
+    ~ awscc.s3.bucket
+  modules/network (instance: net, source: modules/network/main.crn)
+    + awscc.ec2.vpc, + awscc.ec2.subnet ×3, + awscc.ec2.nat_gateway
+  modules/monitoring (instance: mon, source: modules/monitoring/main.crn)
+    + awscc.cloudwatch.metric_alarm ×2
+
+  7 to add, 1 to change, 0 to destroy.
+
+─────────────────────────────────────
+
+Execution Plan:
+  (detailed plan with module boundary grouping)
+```
+
+#### Rules
+
+- Group resources by module, with root-level resources listed under the source `.crn` file name
+- Each module shows instance name and source file path
+- Same resource types within a module are collapsed with `×N` suffix
+- Each resource is prefixed with its effect symbol (`+`, `~`, `-`, `-/+`, `<=`, `<-`, `x`, `->`)
+- The summary total line matches the existing `PlanSummary` format
+- When no modules are used (all resources are root-level), still show the summary but without module grouping — just the source file and resource list
+- A `--summary` CLI flag shows only the summary section without the detailed execution plan
+
+#### Implementation
+
+- Use `ModularPlan.group_by_module()` to partition effects by module source
+- Render the summary section before calling existing `format_plan()` logic
+- For `×N` collapsing: group consecutive effects of the same resource type and effect kind within a module
+- `--summary` flag short-circuits after rendering the summary, skipping the detailed plan
+
 ### 1. Module Boundary Display
 
 Group resources by module in plan output. Resources from a module are visually grouped with a header showing the module name and instance name.
@@ -197,10 +237,12 @@ pub struct ArgumentOriginKey {
 
 ### In scope
 
+- Plan summary header with module-grouped resource overview
+- `--summary` CLI flag for summary-only output
 - Module boundary grouping in plan output
 - Value traceability annotations for module arguments
 - Value traceability in `carina module info` output (see "module info vs plan" below)
-- Snapshot tests for module-aware plan display
+- Snapshot tests for module-aware plan display (including summary)
 - Fixture `.crn` files that use modules
 
 ### Out of scope
