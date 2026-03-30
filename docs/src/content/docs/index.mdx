@@ -15,7 +15,7 @@ hero:
       variant: minimal
 ---
 
-import { Card, CardGrid } from '@astrojs/starlight/components';
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
 <CardGrid>
   <Card title="Custom DSL" icon="pencil">
@@ -30,4 +30,11 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
   <Card title="Modules" icon="puzzle">
     Reusable infrastructure components with typed arguments and attributes.
   </Card>
+</CardGrid>
+
+## Providers
+
+<CardGrid>
+  <LinkCard title="AWSCC Provider" description="AWS Cloud Control API — EC2, S3, IAM, CloudWatch Logs" href="/reference/providers/awscc/" />
+  <LinkCard title="AWS Provider" description="AWS SDK — EC2, S3, STS" href="/reference/providers/aws/" />
 </CardGrid>
