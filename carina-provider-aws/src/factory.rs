@@ -32,10 +32,7 @@ impl ProviderFactory for AwsProviderFactory {
 
     fn extract_region(&self, attributes: &HashMap<String, Value>) -> String {
         if let Some(Value::String(region)) = attributes.get("region") {
-            if let Some(rest) = region.strip_prefix("aws.Region.") {
-                return rest.replace('_', "-");
-            }
-            return region.clone();
+            return carina_core::utils::convert_region_value(region);
         }
         "ap-northeast-1".to_string()
     }

@@ -19,6 +19,7 @@ use std::collections::HashMap;
 
 use carina_core::provider::{
     BoxFuture, Provider, ProviderFactory, ProviderNormalizer, ProviderResult, SavedAttrs,
+    merge_default_tags_for_provider,
 };
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use carina_core::schema::ResourceSchema;
@@ -52,57 +53,7 @@ impl ProviderNormalizer for AwsccNormalizer {
         default_tags: &HashMap<String, Value>,
         schemas: &HashMap<String, ResourceSchema>,
     ) {
-        if default_tags.is_empty() {
-            return;
-        }
-
-        for resource in resources.iter_mut() {
-            if resource.id.provider != "awscc" {
-                continue;
-            }
-
-            // Check if the resource schema has a `tags` attribute
-            let schema_key = format!("awscc.{}", resource.id.resource_type);
-            let has_tags = schemas
-                .get(&schema_key)
-                .is_some_and(|s| s.attributes.contains_key("tags"));
-
-            if !has_tags {
-                continue;
-            }
-
-            // Merge default_tags into the resource's tags
-            let mut default_tag_keys: Vec<String> = Vec::new();
-            match resource.get_attr_mut("tags") {
-                Some(Value::Map(existing_tags)) => {
-                    // Resource-level tags take precedence: only insert defaults for missing keys
-                    for (key, value) in default_tags {
-                        if !existing_tags.contains_key(key) {
-                            existing_tags.insert(key.clone(), value.clone());
-                            default_tag_keys.push(key.clone());
-                        }
-                    }
-                }
-                None => {
-                    // No tags on the resource: use default_tags as-is
-                    default_tag_keys = default_tags.keys().cloned().collect();
-                    resource.set_attr("tags".to_string(), Value::Map(default_tags.clone()));
-                }
-                _ => {
-                    // tags is some other value type (unexpected), skip
-                    continue;
-                }
-            }
-
-            // Store which tag keys came from default_tags as internal metadata
-            if !default_tag_keys.is_empty() {
-                default_tag_keys.sort();
-                resource.set_attr(
-                    "_default_tag_keys".to_string(),
-                    Value::List(default_tag_keys.into_iter().map(Value::String).collect()),
-                );
-            }
-        }
+        merge_default_tags_for_provider("awscc", resources, default_tags, schemas);
     }
 }
 
@@ -130,13 +81,7 @@ impl ProviderFactory for AwsccProviderFactory {
 
     fn extract_region(&self, attributes: &HashMap<String, Value>) -> String {
         if let Some(Value::String(region)) = attributes.get("region") {
-            if let Some(rest) = region.strip_prefix("awscc.Region.") {
-                return rest.replace('_', "-");
-            }
-            if let Some(rest) = region.strip_prefix("aws.Region.") {
-                return rest.replace('_', "-");
-            }
-            return region.clone();
+            return carina_core::utils::convert_region_value(region);
         }
         "ap-northeast-1".to_string()
     }

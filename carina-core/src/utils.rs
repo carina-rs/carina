@@ -310,6 +310,92 @@ pub fn validate_enum_namespace(s: &str, type_name: &str, namespace: &str) -> Res
     Ok(())
 }
 
+use crate::resource::Value;
+use crate::schema::NamespacedEnumParts;
+
+/// Resolve a single string value to its fully-qualified namespaced DSL format.
+///
+/// Given a value and the enum parts (type_name, namespace, optional to_dsl converter),
+/// resolves:
+/// - Bare identifiers: `"Enabled"` -> `"aws.s3.bucket.VersioningStatus.Enabled"`
+/// - TypeName.value shorthand: `"VersioningStatus.Enabled"` -> `"aws.s3.bucket.VersioningStatus.Enabled"`
+/// - Already-qualified values pass through unchanged (via the `_` arm)
+///
+/// Returns `None` if the value doesn't need resolution (non-String or already qualified).
+pub fn resolve_enum_value(value: &Value, parts: &NamespacedEnumParts<'_>) -> Option<Value> {
+    let (type_name, ns, to_dsl) = parts;
+    match value {
+        Value::String(s) if !s.contains('.') => {
+            // bare identifier: "Enabled" -> ns.TypeName.Enabled
+            let dsl_val = to_dsl.map_or_else(|| s.clone(), |f| f(s));
+            Some(Value::String(format!("{}.{}.{}", ns, type_name, dsl_val)))
+        }
+        Value::String(s)
+            if s.split_once('.')
+                .is_some_and(|(ident, member)| ident == *type_name && !member.contains('.')) =>
+        {
+            // TypeName.value: "VersioningStatus.Enabled" -> ns.TypeName.Enabled
+            let member = s.split_once('.').unwrap().1;
+            let dsl_val = to_dsl.map_or_else(|| member.to_string(), |f| f(member));
+            Some(Value::String(format!("{}.{}.{}", ns, type_name, dsl_val)))
+        }
+        _ => None,
+    }
+}
+
+/// Normalize a single state enum value to its fully-qualified namespaced DSL format.
+///
+/// Unlike `resolve_enum_value`, this also handles values that contain dots but are
+/// raw enum values (e.g., `"ipsec.1"`) rather than already-namespaced identifiers.
+/// Uses `string_enum_parts` from the attribute type to distinguish between the two cases.
+///
+/// Returns `None` if the value doesn't need normalization.
+pub fn normalize_state_enum_value(
+    value: &Value,
+    parts: &NamespacedEnumParts<'_>,
+    string_enum_check: Option<&dyn Fn(&str) -> bool>,
+) -> Option<Value> {
+    let (type_name, ns, to_dsl) = parts;
+    if let Value::String(s) = value {
+        // Skip values already in namespaced DSL format.
+        // A value that contains '.' but is not already namespaced is a raw enum value
+        // like "ipsec.1" -- check if it matches a known valid enum value.
+        let already_namespaced =
+            s.contains('.') && !string_enum_check.is_some_and(|check| check(s));
+        if !already_namespaced {
+            let dsl_val = to_dsl.map_or_else(|| s.clone(), |f| f(s));
+            return Some(Value::String(format!("{}.{}.{}", ns, type_name, dsl_val)));
+        }
+    }
+    None
+}
+
+/// Convert a region value from DSL format to AWS SDK format.
+///
+/// Handles the following patterns:
+/// - `aws.Region.ap_northeast_1` -> `ap-northeast-1`
+/// - `awscc.Region.ap_northeast_1` -> `ap-northeast-1`
+/// - `ap-northeast-1` -> `ap-northeast-1` (passthrough)
+///
+/// # Examples
+///
+/// ```
+/// use carina_core::utils::convert_region_value;
+///
+/// assert_eq!(convert_region_value("aws.Region.ap_northeast_1"), "ap-northeast-1");
+/// assert_eq!(convert_region_value("awscc.Region.us_west_2"), "us-west-2");
+/// assert_eq!(convert_region_value("eu-west-1"), "eu-west-1");
+/// ```
+pub fn convert_region_value(value: &str) -> String {
+    if let Some(rest) = value.strip_prefix("aws.Region.") {
+        rest.replace('_', "-")
+    } else if let Some(rest) = value.strip_prefix("awscc.Region.") {
+        rest.replace('_', "-")
+    } else {
+        value.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -659,5 +745,31 @@ mod tests {
             convert_enum_value("awscc.ec2.vpn_gateway.Type.ipsec.1"),
             "ipsec.1"
         );
+    }
+
+    // convert_region_value tests
+
+    #[test]
+    fn test_convert_region_value_aws_prefix() {
+        assert_eq!(
+            convert_region_value("aws.Region.ap_northeast_1"),
+            "ap-northeast-1"
+        );
+        assert_eq!(convert_region_value("aws.Region.us_west_2"), "us-west-2");
+    }
+
+    #[test]
+    fn test_convert_region_value_awscc_prefix() {
+        assert_eq!(
+            convert_region_value("awscc.Region.ap_northeast_1"),
+            "ap-northeast-1"
+        );
+        assert_eq!(convert_region_value("awscc.Region.us_west_2"), "us-west-2");
+    }
+
+    #[test]
+    fn test_convert_region_value_passthrough() {
+        assert_eq!(convert_region_value("us-east-1"), "us-east-1");
+        assert_eq!(convert_region_value("eu-west-1"), "eu-west-1");
     }
 }

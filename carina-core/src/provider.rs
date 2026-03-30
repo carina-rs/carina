@@ -181,6 +181,69 @@ pub trait ProviderNormalizer: Send + Sync {
     }
 }
 
+/// Shared implementation for merging default tags into resources.
+///
+/// For each resource matching `provider_name` whose schema includes a `tags` attribute:
+/// - If the resource has no `tags`, set it to `default_tags`
+/// - If the resource has `tags`, merge default_tags (resource-level tags win on conflict)
+///
+/// Records which tag keys came from defaults in the `_default_tag_keys` internal
+/// metadata attribute.
+pub fn merge_default_tags_for_provider(
+    provider_name: &str,
+    resources: &mut [Resource],
+    default_tags: &HashMap<String, Value>,
+    schemas: &HashMap<String, ResourceSchema>,
+) {
+    if default_tags.is_empty() {
+        return;
+    }
+
+    for resource in resources.iter_mut() {
+        if resource.id.provider != provider_name {
+            continue;
+        }
+
+        // Check if the resource schema has a `tags` attribute
+        let schema_key = format!("{}.{}", provider_name, resource.id.resource_type);
+        let has_tags = schemas
+            .get(&schema_key)
+            .is_some_and(|s| s.attributes.contains_key("tags"));
+
+        if !has_tags {
+            continue;
+        }
+
+        // Merge default_tags into the resource's tags
+        let mut default_tag_keys: Vec<String> = Vec::new();
+        match resource.get_attr_mut("tags") {
+            Some(Value::Map(existing_tags)) => {
+                for (key, value) in default_tags {
+                    if !existing_tags.contains_key(key) {
+                        existing_tags.insert(key.clone(), value.clone());
+                        default_tag_keys.push(key.clone());
+                    }
+                }
+            }
+            None => {
+                default_tag_keys = default_tags.keys().cloned().collect();
+                resource.set_attr("tags".to_string(), Value::Map(default_tags.clone()));
+            }
+            _ => {
+                continue;
+            }
+        }
+
+        if !default_tag_keys.is_empty() {
+            default_tag_keys.sort();
+            resource.set_attr(
+                "_default_tag_keys".to_string(),
+                Value::List(default_tag_keys.into_iter().map(Value::String).collect()),
+            );
+        }
+    }
+}
+
 /// A provider that routes operations to the correct sub-provider
 /// based on the resource's provider name (`ResourceId.provider`).
 pub struct ProviderRouter {

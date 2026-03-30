@@ -443,18 +443,8 @@ impl StateBackend for S3Backend {
     }
 }
 
-/// Convert region value from DSL format to AWS format
-/// e.g., "aws.Region.ap_northeast_1" -> "ap-northeast-1"
-///       "awscc.Region.ap_northeast_1" -> "ap-northeast-1"
-fn convert_region_value(value: &str) -> String {
-    if let Some(rest) = value.strip_prefix("aws.Region.") {
-        rest.replace('_', "-")
-    } else if let Some(rest) = value.strip_prefix("awscc.Region.") {
-        rest.replace('_', "-")
-    } else {
-        value.to_string()
-    }
-}
+/// Re-export from carina-core for region format conversion.
+use carina_core::utils::convert_region_value;
 
 /// Check if an S3 error is a "not found" error
 fn is_not_found_error<E: std::fmt::Debug>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
