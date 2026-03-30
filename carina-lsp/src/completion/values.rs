@@ -316,15 +316,20 @@ impl CompletionProvider {
             {
                 let name = rest[..eq_pos].trim();
                 let after_eq = rest[eq_pos + 1..].trim();
-                if after_eq.starts_with("remote_state") {
-                    let after_rs = after_eq.strip_prefix("remote_state").unwrap().trim();
-                    if after_rs.starts_with('{') {
+                if let Some(after_rs) = after_eq.strip_prefix("remote_state")
+                    && (after_rs.is_empty()
+                        || after_rs.starts_with(char::is_whitespace)
+                        || after_rs.starts_with('{'))
+                {
+                    let after_rs = after_rs.trim();
+                    if let Some(after_brace) = after_rs.strip_prefix('{') {
                         current_binding = Some(name.to_string());
                         in_remote_state_block = true;
                         brace_depth = 1;
 
                         // Check if path is on the same line
-                        if let Some(path) = Self::extract_path_from_line(after_rs) {
+                        let inside_block = after_brace.trim();
+                        if let Some(path) = Self::extract_path_from_line(inside_block) {
                             bindings.push((name.to_string(), path));
                             current_binding = None;
                             in_remote_state_block = false;

@@ -1016,3 +1016,34 @@ awscc.ec2.security_group {
         "Should return no completions when base_path is None for relative path"
     );
 }
+
+#[test]
+fn remote_state_single_line_syntax() {
+    // Single-line remote_state syntax should also work.
+    let provider = test_provider();
+    let tmp_dir = tempfile::tempdir().unwrap();
+    create_test_state_file(tmp_dir.path(), "network.state.json");
+
+    let doc = create_document(
+        r#"let network = remote_state { path = "network.state.json" }
+
+awscc.ec2.security_group {
+    vpc_id = network.
+}"#,
+    );
+
+    let position = Position {
+        line: 3,
+        character: 22,
+    };
+
+    let completions = provider.complete(&doc, position, Some(tmp_dir.path()));
+
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"network.vpc"),
+        "Should suggest 'network.vpc' from single-line remote_state. Got: {:?}",
+        labels
+    );
+}
