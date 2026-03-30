@@ -5,6 +5,7 @@ use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::utils::convert_enum_value;
 
 use crate::AwsProvider;
+use crate::helpers::require_string_attr;
 use aws_sdk_ec2::types::{AttributeBooleanValue, HostnameType};
 
 impl AwsProvider {
@@ -67,23 +68,8 @@ impl AwsProvider {
 
     /// Create an EC2 Subnet
     pub(crate) async fn create_ec2_subnet(&self, resource: Resource) -> ProviderResult<State> {
-        let cidr_block = match resource.get_attr("cidr_block") {
-            Some(Value::String(s)) => s.clone(),
-            _ => {
-                return Err(
-                    ProviderError::new("CIDR block is required").for_resource(resource.id.clone())
-                );
-            }
-        };
-
-        let vpc_id = match resource.get_attr("vpc_id") {
-            Some(Value::String(s)) => s.clone(),
-            _ => {
-                return Err(
-                    ProviderError::new("VPC ID is required").for_resource(resource.id.clone())
-                );
-            }
-        };
+        let cidr_block = require_string_attr(&resource, "cidr_block")?;
+        let vpc_id = require_string_attr(&resource, "vpc_id")?;
 
         let mut req = self
             .ec2_client

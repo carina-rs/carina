@@ -5,6 +5,7 @@
 mod ec2_security_group_rules;
 mod ec2_tags;
 mod factory;
+pub(crate) mod helpers;
 mod normalizer;
 mod provider;
 pub mod provider_generated;

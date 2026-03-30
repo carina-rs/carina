@@ -4,6 +4,7 @@ use carina_core::provider::{ProviderError, ProviderResult};
 use carina_core::resource::{Resource, ResourceId, State, Value};
 
 use crate::AwsProvider;
+use crate::helpers::require_string_attr;
 
 impl AwsProvider {
     /// Read an EC2 Subnet Route Table Association
@@ -77,22 +78,8 @@ impl AwsProvider {
         &self,
         resource: Resource,
     ) -> ProviderResult<State> {
-        let route_table_id = match resource.get_attr("route_table_id") {
-            Some(Value::String(s)) => s.clone(),
-            _ => {
-                return Err(ProviderError::new("route_table_id is required")
-                    .for_resource(resource.id.clone()));
-            }
-        };
-
-        let subnet_id = match resource.get_attr("subnet_id") {
-            Some(Value::String(s)) => s.clone(),
-            _ => {
-                return Err(
-                    ProviderError::new("subnet_id is required").for_resource(resource.id.clone())
-                );
-            }
-        };
+        let route_table_id = require_string_attr(&resource, "route_table_id")?;
+        let subnet_id = require_string_attr(&resource, "subnet_id")?;
 
         let result = self
             .ec2_client

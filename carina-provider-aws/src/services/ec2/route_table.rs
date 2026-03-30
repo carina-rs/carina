@@ -4,6 +4,7 @@ use carina_core::provider::{ProviderError, ProviderResult};
 use carina_core::resource::{Resource, ResourceId, State, Value};
 
 use crate::AwsProvider;
+use crate::helpers::require_string_attr;
 
 impl AwsProvider {
     /// Read an EC2 Route Table
@@ -77,14 +78,7 @@ impl AwsProvider {
 
     /// Create an EC2 Route Table
     pub(crate) async fn create_ec2_route_table(&self, resource: Resource) -> ProviderResult<State> {
-        let vpc_id = match resource.get_attr("vpc_id") {
-            Some(Value::String(s)) => s.clone(),
-            _ => {
-                return Err(
-                    ProviderError::new("VPC ID is required").for_resource(resource.id.clone())
-                );
-            }
-        };
+        let vpc_id = require_string_attr(&resource, "vpc_id")?;
 
         // Create Route Table
         let result = self

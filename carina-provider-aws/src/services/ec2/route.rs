@@ -4,6 +4,7 @@ use carina_core::provider::{ProviderError, ProviderResult};
 use carina_core::resource::{Resource, ResourceId, State, Value};
 
 use crate::AwsProvider;
+use crate::helpers::require_string_attr;
 
 impl AwsProvider {
     /// Read an EC2 Route (routes are identified by route_table_id + destination)
@@ -61,21 +62,8 @@ impl AwsProvider {
 
     /// Create an EC2 Route
     pub(crate) async fn create_ec2_route(&self, resource: Resource) -> ProviderResult<State> {
-        let route_table_id = match resource.get_attr("route_table_id") {
-            Some(Value::String(s)) => s.clone(),
-            _ => {
-                return Err(ProviderError::new("route_table_id is required")
-                    .for_resource(resource.id.clone()));
-            }
-        };
-
-        let destination_cidr = match resource.get_attr("destination_cidr_block") {
-            Some(Value::String(s)) => s.clone(),
-            _ => {
-                return Err(ProviderError::new("destination_cidr_block is required")
-                    .for_resource(resource.id.clone()));
-            }
-        };
+        let route_table_id = require_string_attr(&resource, "route_table_id")?;
+        let destination_cidr = require_string_attr(&resource, "destination_cidr_block")?;
 
         let mut req = self
             .ec2_client

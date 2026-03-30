@@ -4,6 +4,7 @@ use carina_core::provider::{ProviderError, ProviderResult};
 use carina_core::resource::{Resource, ResourceId, State, Value};
 
 use crate::AwsProvider;
+use crate::helpers::require_string_attr;
 
 impl AwsProvider {
     /// Read an EC2 VPC Gateway Attachment
@@ -135,14 +136,7 @@ impl AwsProvider {
         &self,
         resource: Resource,
     ) -> ProviderResult<State> {
-        let vpc_id = match resource.get_attr("vpc_id") {
-            Some(Value::String(s)) => s.clone(),
-            _ => {
-                return Err(
-                    ProviderError::new("vpc_id is required").for_resource(resource.id.clone())
-                );
-            }
-        };
+        let vpc_id = require_string_attr(&resource, "vpc_id")?;
 
         if let Some(Value::String(igw_id)) = resource.get_attr("internet_gateway_id") {
             // Attach Internet Gateway

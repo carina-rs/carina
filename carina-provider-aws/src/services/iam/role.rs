@@ -4,6 +4,7 @@ use carina_core::provider::{ProviderError, ProviderResult};
 use carina_core::resource::{Resource, ResourceId, State, Value};
 
 use crate::AwsProvider;
+use crate::helpers::require_string_attr;
 
 impl AwsProvider {
     /// Read an IAM Role
@@ -70,14 +71,7 @@ impl AwsProvider {
 
     /// Create an IAM Role
     pub(crate) async fn create_iam_role(&self, resource: Resource) -> ProviderResult<State> {
-        let role_name = match resource.get_attr("role_name") {
-            Some(Value::String(s)) => s.clone(),
-            _ => {
-                return Err(
-                    ProviderError::new("role_name is required").for_resource(resource.id.clone())
-                );
-            }
-        };
+        let role_name = require_string_attr(&resource, "role_name")?;
 
         let assume_role_policy_document = match resource.get_attr("assume_role_policy_document") {
             Some(Value::String(s)) => s.clone(),
