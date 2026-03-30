@@ -6,7 +6,28 @@ hero:
   title: Carina
   tagline: A strongly typed infrastructure management tool written in Rust.
   actions:
+    - text: Getting Started
+      link: /getting-started/installation/
+      icon: rocket
     - text: GitHub
       link: https://github.com/carina-rs/carina
       icon: github
+      variant: minimal
 ---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+<CardGrid>
+  <Card title="Custom DSL" icon="pencil">
+    Infrastructure definition with `.crn` files — strongly typed, validated at parse time.
+  </Card>
+  <Card title="Effects as Values" icon="list-format">
+    Side effects are represented as data, inspectable before execution.
+  </Card>
+  <Card title="Provider Architecture" icon="setting">
+    Pluggable providers — AWSCC (Cloud Control API) and AWS.
+  </Card>
+  <Card title="Modules" icon="puzzle">
+    Reusable infrastructure components with typed arguments and attributes.
+  </Card>
+</CardGrid>
