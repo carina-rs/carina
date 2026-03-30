@@ -3,8 +3,6 @@ title: "aws.ec2.security_group"
 description: "AWS EC2 security_group resource reference"
 ---
 
-# aws.ec2.security_group
-
 CloudFormation Type: `AWS::EC2::SecurityGroup`
 
 Describes a security group.

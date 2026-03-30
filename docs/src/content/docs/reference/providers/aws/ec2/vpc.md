@@ -3,8 +3,6 @@ title: "aws.ec2.vpc"
 description: "AWS EC2 vpc resource reference"
 ---
 
-# aws.ec2.vpc
-
 CloudFormation Type: `AWS::EC2::VPC`
 
 Describes a VPC.

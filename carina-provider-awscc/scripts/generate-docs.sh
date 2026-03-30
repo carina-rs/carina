@@ -118,7 +118,7 @@ for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
         continue
     fi
 
-    # Prepend Starlight frontmatter
+    # Prepend Starlight frontmatter and strip H1 (Starlight renders title as heading)
     DSL_NAME=$(head -1 "$OUTPUT_FILE" | sed 's/^# *//')
     FRONTMATTER_TMPFILE=$(mktemp)
     {
@@ -127,7 +127,7 @@ for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
         echo "description: \"AWSCC $SERVICE $RESOURCE resource reference\""
         echo "---"
         echo ""
-        cat "$OUTPUT_FILE"
+        sed '1{/^# /d;}' "$OUTPUT_FILE"
     } > "$FRONTMATTER_TMPFILE"
     mv "$FRONTMATTER_TMPFILE" "$OUTPUT_FILE"
 
@@ -167,8 +167,6 @@ cat > "$DOCS_DIR/index.md" << 'EOF'
 title: "AWSCC Provider"
 description: "AWSCC provider resource reference"
 ---
-
-# AWSCC Provider
 
 The `awscc` provider manages AWS resources through the [AWS Cloud Control API](https://docs.aws.amazon.com/cloudcontrolapi/latest/userguide/what-is-cloudcontrolapi.html).
 

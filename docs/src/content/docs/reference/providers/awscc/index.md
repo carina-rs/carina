@@ -2,8 +2,6 @@
 title: "AWSCC Provider"
 ---
 
-# AWSCC Provider
-
 The `awscc` provider manages AWS resources through the [AWS Cloud Control API](https://docs.aws.amazon.com/cloudcontrolapi/latest/userguide/what-is-cloudcontrolapi.html).
 
 ## Configuration

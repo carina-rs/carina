@@ -2,8 +2,6 @@
 title: "AWS Provider"
 ---
 
-# AWS Provider
-
 The `aws` provider manages AWS resources through native AWS SDK APIs (EC2, S3).
 
 ## Configuration

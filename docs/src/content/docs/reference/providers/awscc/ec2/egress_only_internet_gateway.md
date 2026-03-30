@@ -3,8 +3,6 @@ title: "awscc.ec2.egress_only_internet_gateway"
 description: "AWSCC EC2 egress_only_internet_gateway resource reference"
 ---
 
-# awscc.ec2.egress_only_internet_gateway
-
 CloudFormation Type: `AWS::EC2::EgressOnlyInternetGateway`
 
 Resource Type definition for AWS::EC2::EgressOnlyInternetGateway

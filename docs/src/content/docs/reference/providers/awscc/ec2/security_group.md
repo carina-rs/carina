@@ -3,8 +3,6 @@ title: "awscc.ec2.security_group"
 description: "AWSCC EC2 security_group resource reference"
 ---
 
-# awscc.ec2.security_group
-
 CloudFormation Type: `AWS::EC2::SecurityGroup`
 
 Resource Type definition for AWS::EC2::SecurityGroup

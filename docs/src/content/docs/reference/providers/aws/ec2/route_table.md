@@ -3,8 +3,6 @@ title: "aws.ec2.route_table"
 description: "AWS EC2 route_table resource reference"
 ---
 
-# aws.ec2.route_table
-
 CloudFormation Type: `AWS::EC2::RouteTable`
 
 Describes a route table.

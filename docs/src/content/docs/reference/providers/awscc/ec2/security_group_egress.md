@@ -3,8 +3,6 @@ title: "awscc.ec2.security_group_egress"
 description: "AWSCC EC2 security_group_egress resource reference"
 ---
 
-# awscc.ec2.security_group_egress
-
 CloudFormation Type: `AWS::EC2::SecurityGroupEgress`
 
 Adds the specified outbound (egress) rule to a security group.

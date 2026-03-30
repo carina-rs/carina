@@ -3,8 +3,6 @@ title: "awscc.ec2.vpc_peering_connection"
 description: "AWSCC EC2 vpc_peering_connection resource reference"
 ---
 
-# awscc.ec2.vpc_peering_connection
-
 CloudFormation Type: `AWS::EC2::VPCPeeringConnection`
 
 Resource Type definition for AWS::EC2::VPCPeeringConnection

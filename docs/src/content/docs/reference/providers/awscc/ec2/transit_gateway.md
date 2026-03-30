@@ -3,8 +3,6 @@ title: "awscc.ec2.transit_gateway"
 description: "AWSCC EC2 transit_gateway resource reference"
 ---
 
-# awscc.ec2.transit_gateway
-
 CloudFormation Type: `AWS::EC2::TransitGateway`
 
 Resource Type definition for AWS::EC2::TransitGateway

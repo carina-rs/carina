@@ -3,8 +3,6 @@ title: "awscc.ec2.vpc"
 description: "AWSCC EC2 vpc resource reference"
 ---
 
-# awscc.ec2.vpc
-
 CloudFormation Type: `AWS::EC2::VPC`
 
 Specifies a virtual private cloud (VPC).

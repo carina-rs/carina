@@ -3,8 +3,6 @@ title: "aws.ec2.route"
 description: "AWS EC2 route resource reference"
 ---
 
-# aws.ec2.route
-
 CloudFormation Type: `AWS::EC2::Route`
 
 Describes a route in a route table.

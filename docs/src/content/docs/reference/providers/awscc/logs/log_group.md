@@ -3,8 +3,6 @@ title: "awscc.logs.log_group"
 description: "AWSCC Logs log_group resource reference"
 ---
 
-# awscc.logs.log_group
-
 CloudFormation Type: `AWS::Logs::LogGroup`
 
 The ``AWS::Logs::LogGroup`` resource specifies a log group. A log group defines common properties for log streams, such as their retention and access control rules. Each log stream must belong to one log group.

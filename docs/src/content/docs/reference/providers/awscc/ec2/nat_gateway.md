@@ -3,8 +3,6 @@ title: "awscc.ec2.nat_gateway"
 description: "AWSCC EC2 nat_gateway resource reference"
 ---
 
-# awscc.ec2.nat_gateway
-
 CloudFormation Type: `AWS::EC2::NatGateway`
 
 Specifies a network address translation (NAT) gateway in the specified subnet. You can create either a public NAT gateway or a private NAT gateway. The default is a public NAT gateway. If you create a public NAT gateway, you must specify an elastic IP address.

@@ -3,8 +3,6 @@ title: "aws.ec2.subnet"
 description: "AWS EC2 subnet resource reference"
 ---
 
-# aws.ec2.subnet
-
 CloudFormation Type: `AWS::EC2::Subnet`
 
 Describes a subnet.
