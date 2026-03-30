@@ -59,9 +59,10 @@ impl std::fmt::Display for ResourceId {
 
 /// An unevaluated expression in the DSL.
 ///
-/// `Expr` represents values that may need resolution before becoming final `Value`s.
-/// The parser produces `Expr` values for resource attributes; the resolver converts
-/// them to `Expr::Literal(Value)` by resolving references, interpolations, and function calls.
+/// `Expr` is a newtype wrapper around `Value` that represents values which may need
+/// resolution before becoming final. The parser produces `Expr` values for resource
+/// attributes; the resolver resolves references within the inner `Value` (e.g.,
+/// replacing `ResourceRef` variants with concrete values).
 ///
 /// `Expr` wraps `Value` to enforce a type-level distinction between pre-resolution
 /// and post-resolution data. This prevents downstream code from accidentally receiving
@@ -114,7 +115,7 @@ pub enum InterpolationPart {
     Expr(Value),
 }
 
-/// Alias for ExprPart (legacy name)
+/// Legacy alias for `InterpolationPart`.
 pub type ExprPart = InterpolationPart;
 
 impl Expr {
@@ -128,8 +129,12 @@ impl Expr {
         self.0
     }
 
-    /// Returns true if the inner value is a resolved (non-expression) type.
-    /// A resolved value has no ResourceRef, Interpolation, or FunctionCall variants.
+    /// Returns true if the inner value contains no `ResourceRef` variants.
+    ///
+    /// This checks recursively: `ResourceRef`s nested inside `List`, `Map`,
+    /// `Interpolation`, `FunctionCall`, or `Secret` are detected.
+    /// Note that `Interpolation` and `FunctionCall` variants without nested
+    /// `ResourceRef`s are considered resolved by this method.
     pub fn is_resolved(&self) -> bool {
         !contains_resource_ref(&self.0)
     }
