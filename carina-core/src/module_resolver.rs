@@ -346,14 +346,14 @@ impl<'cfg> ModuleResolver<'cfg> {
             argument_values.insert(arg.name.clone(), value);
         }
 
-        // Validate argument values against validate expressions
+        // Validate argument values against validate blocks
         for arg in &module.arguments {
-            if let Some(ref validate_expr) = arg.validate {
-                let value = argument_values.get(&arg.name).unwrap();
-                match evaluate_validate_expr(validate_expr, &arg.name, value) {
+            let value = argument_values.get(&arg.name).unwrap();
+            for validation_block in &arg.validations {
+                match evaluate_validate_expr(&validation_block.condition, &arg.name, value) {
                     Ok(true) => {} // Validation passed
                     Ok(false) => {
-                        let message = arg.message.clone().unwrap_or_else(|| {
+                        let message = validation_block.error_message.clone().unwrap_or_else(|| {
                             format!("validation failed for argument '{}'", arg.name)
                         });
                         return Err(ModuleError::ArgumentValidationFailed {
@@ -1005,16 +1005,14 @@ mod tests {
                     type_expr: TypeExpr::String,
                     default: None,
                     description: None,
-                    validate: None,
-                    message: None,
+                    validations: Vec::new(),
                 },
                 ArgumentParameter {
                     name: "enable_flag".to_string(),
                     type_expr: TypeExpr::Bool,
                     default: Some(Value::Bool(true)),
                     description: None,
-                    validate: None,
-                    message: None,
+                    validations: Vec::new(),
                 },
             ],
             attribute_params: vec![],
@@ -1146,8 +1144,7 @@ mod tests {
                 type_expr: TypeExpr::String,
                 default: None,
                 description: None,
-                validate: None,
-                message: None,
+                validations: Vec::new(),
             }],
             attribute_params: vec![],
             backend: None,
@@ -1606,16 +1603,14 @@ mod tests {
                     type_expr: TypeExpr::String,
                     default: None,
                     description: None,
-                    validate: None,
-                    message: None,
+                    validations: Vec::new(),
                 },
                 ArgumentParameter {
                     name: "env_name".to_string(),
                     type_expr: TypeExpr::String,
                     default: None,
                     description: None,
-                    validate: None,
-                    message: None,
+                    validations: Vec::new(),
                 },
             ],
             attribute_params: vec![],
@@ -1872,7 +1867,7 @@ mod tests {
 
     /// Helper to create a module with a validated port argument
     fn create_module_with_port_validation() -> ParsedFile {
-        use crate::parser::{CompareOp, ValidateExpr};
+        use crate::parser::{CompareOp, ValidateExpr, ValidationBlock};
         ParsedFile {
             providers: vec![],
             resources: vec![],
@@ -1884,19 +1879,21 @@ mod tests {
                 type_expr: TypeExpr::Int,
                 default: Some(Value::Int(8080)),
                 description: Some("Web server port".to_string()),
-                validate: Some(ValidateExpr::And(
-                    Box::new(ValidateExpr::Compare {
-                        lhs: Box::new(ValidateExpr::Var("port".to_string())),
-                        op: CompareOp::Gte,
-                        rhs: Box::new(ValidateExpr::Int(1)),
-                    }),
-                    Box::new(ValidateExpr::Compare {
-                        lhs: Box::new(ValidateExpr::Var("port".to_string())),
-                        op: CompareOp::Lte,
-                        rhs: Box::new(ValidateExpr::Int(65535)),
-                    }),
-                )),
-                message: Some("Port must be between 1 and 65535".to_string()),
+                validations: vec![ValidationBlock {
+                    condition: ValidateExpr::And(
+                        Box::new(ValidateExpr::Compare {
+                            lhs: Box::new(ValidateExpr::Var("port".to_string())),
+                            op: CompareOp::Gte,
+                            rhs: Box::new(ValidateExpr::Int(1)),
+                        }),
+                        Box::new(ValidateExpr::Compare {
+                            lhs: Box::new(ValidateExpr::Var("port".to_string())),
+                            op: CompareOp::Lte,
+                            rhs: Box::new(ValidateExpr::Int(65535)),
+                        }),
+                    ),
+                    error_message: Some("Port must be between 1 and 65535".to_string()),
+                }],
             }],
             attribute_params: vec![],
             backend: None,
@@ -2044,7 +2041,7 @@ mod tests {
 
     #[test]
     fn test_argument_validation_no_message_uses_default() {
-        use crate::parser::{CompareOp, ValidateExpr};
+        use crate::parser::{CompareOp, ValidateExpr, ValidationBlock};
         let module = ParsedFile {
             providers: vec![],
             resources: vec![],
@@ -2056,12 +2053,14 @@ mod tests {
                 type_expr: TypeExpr::Int,
                 default: None,
                 description: None,
-                validate: Some(ValidateExpr::Compare {
-                    lhs: Box::new(ValidateExpr::Var("count".to_string())),
-                    op: CompareOp::Gt,
-                    rhs: Box::new(ValidateExpr::Int(0)),
-                }),
-                message: None, // No custom message
+                validations: vec![ValidationBlock {
+                    condition: ValidateExpr::Compare {
+                        lhs: Box::new(ValidateExpr::Var("count".to_string())),
+                        op: CompareOp::Gt,
+                        rhs: Box::new(ValidateExpr::Int(0)),
+                    },
+                    error_message: None,
+                }],
             }],
             attribute_params: vec![],
             backend: None,
@@ -2099,7 +2098,7 @@ mod tests {
 
     #[test]
     fn test_argument_validation_len_with_list() {
-        use crate::parser::{CompareOp, ValidateExpr};
+        use crate::parser::{CompareOp, ValidateExpr, ValidationBlock};
         let module = ParsedFile {
             providers: vec![],
             resources: vec![],
@@ -2111,15 +2110,17 @@ mod tests {
                 type_expr: TypeExpr::List(Box::new(TypeExpr::String)),
                 default: None,
                 description: None,
-                validate: Some(ValidateExpr::Compare {
-                    lhs: Box::new(ValidateExpr::FunctionCall {
-                        name: "len".to_string(),
-                        args: vec![ValidateExpr::Var("tags".to_string())],
-                    }),
-                    op: CompareOp::Gte,
-                    rhs: Box::new(ValidateExpr::Int(1)),
-                }),
-                message: Some("At least one tag is required".to_string()),
+                validations: vec![ValidationBlock {
+                    condition: ValidateExpr::Compare {
+                        lhs: Box::new(ValidateExpr::FunctionCall {
+                            name: "len".to_string(),
+                            args: vec![ValidateExpr::Var("tags".to_string())],
+                        }),
+                        op: CompareOp::Gte,
+                        rhs: Box::new(ValidateExpr::Int(1)),
+                    },
+                    error_message: Some("At least one tag is required".to_string()),
+                }],
             }],
             attribute_params: vec![],
             backend: None,

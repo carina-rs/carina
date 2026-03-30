@@ -34,14 +34,15 @@ arguments_param_block = {
 arguments_param_attr = {
     arg_description_attr
   | arg_default_attr
-  | arg_validate_attr
-  | arg_message_attr
+  | arg_validation_block
 }
 
 arg_description_attr = { "description" ~ "=" ~ string }
 arg_default_attr = { "default" ~ "=" ~ expression }
-arg_validate_attr = { "validate" ~ "=" ~ validate_expr }
-arg_message_attr = { "message" ~ "=" ~ string }
+arg_validation_block = { "validation" ~ "{" ~ validation_block_attr* ~ "}" }
+validation_block_attr = { validation_condition_attr | validation_error_message_attr }
+validation_condition_attr = { "condition" ~ "=" ~ validate_expr }
+validation_error_message_attr = { "error_message" ~ "=" ~ string }
 
 // Validate expression: boolean expression with comparison and logical operators
 // Used in arguments block to validate argument values at module call time

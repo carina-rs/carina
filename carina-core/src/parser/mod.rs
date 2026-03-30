@@ -142,10 +142,15 @@ pub struct ArgumentParameter {
     pub default: Option<Value>,
     /// Optional description (from block form)
     pub description: Option<String>,
-    /// Optional validation expression (from block form)
-    pub validate: Option<ValidateExpr>,
-    /// Optional validation error message (from block form)
-    pub message: Option<String>,
+    /// Optional validation blocks (from block form). Multiple blocks are allowed.
+    pub validations: Vec<ValidationBlock>,
+}
+
+/// A validate block: `validation { condition = <expr> error_message = "..." }`
+#[derive(Debug, Clone)]
+pub struct ValidationBlock {
+    pub condition: ValidateExpr,
+    pub error_message: Option<String>,
 }
 
 /// Comparison operator in a validate expression
@@ -632,11 +637,10 @@ fn parse_arguments_block(
             // Check if the next element is a block form or simple default
             if let Some(next) = param_inner.next() {
                 if next.as_rule() == Rule::arguments_param_block {
-                    // Block form: parse description, default, validate, message from attrs
+                    // Block form: parse description, default, validate blocks from attrs
                     let mut description = None;
                     let mut default = None;
-                    let mut validate = None;
-                    let mut message = None;
+                    let mut validations = Vec::new();
                     for attr in next.into_inner() {
                         if attr.as_rule() == Rule::arguments_param_attr {
                             let inner_attr =
@@ -655,20 +659,47 @@ fn parse_arguments_block(
                                         first_inner(inner_attr, "expression", "arg_default_attr")?;
                                     default = Some(parse_expression(expr_pair, &ctx)?);
                                 }
-                                Rule::arg_validate_attr => {
-                                    let validate_pair = first_inner(
-                                        inner_attr,
-                                        "validate_expr",
-                                        "arg_validate_attr",
-                                    )?;
-                                    validate = Some(parse_validate_expr(validate_pair)?);
-                                }
-                                Rule::arg_message_attr => {
-                                    let string_pair =
-                                        first_inner(inner_attr, "string", "arg_message_attr")?;
-                                    let value = parse_string_value(string_pair, &ctx)?;
-                                    if let Value::String(s) = value {
-                                        message = Some(s);
+                                Rule::arg_validation_block => {
+                                    let mut rule = None;
+                                    let mut error_msg = None;
+                                    for vattr in inner_attr.into_inner() {
+                                        if vattr.as_rule() == Rule::validation_block_attr {
+                                            let inner_vattr = first_inner(
+                                                vattr,
+                                                "validation_block_attr",
+                                                "validation_block_attr",
+                                            )?;
+                                            match inner_vattr.as_rule() {
+                                                Rule::validation_condition_attr => {
+                                                    let validate_pair = first_inner(
+                                                        inner_vattr,
+                                                        "validate_expr",
+                                                        "validation_condition_attr",
+                                                    )?;
+                                                    rule =
+                                                        Some(parse_validate_expr(validate_pair)?);
+                                                }
+                                                Rule::validation_error_message_attr => {
+                                                    let string_pair = first_inner(
+                                                        inner_vattr,
+                                                        "string",
+                                                        "validation_error_message_attr",
+                                                    )?;
+                                                    let value =
+                                                        parse_string_value(string_pair, &ctx)?;
+                                                    if let Value::String(s) = value {
+                                                        error_msg = Some(s);
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                    if let Some(condition) = rule {
+                                        validations.push(ValidationBlock {
+                                            condition,
+                                            error_message: error_msg,
+                                        });
                                     }
                                 }
                                 _ => {}
@@ -680,8 +711,7 @@ fn parse_arguments_block(
                         type_expr,
                         default,
                         description,
-                        validate,
-                        message,
+                        validations,
                     });
                 } else {
                     // Simple form: the next element is the default expression
@@ -691,8 +721,7 @@ fn parse_arguments_block(
                         type_expr,
                         default,
                         description: None,
-                        validate: None,
-                        message: None,
+                        validations: Vec::new(),
                     });
                 }
             } else {
@@ -702,8 +731,7 @@ fn parse_arguments_block(
                     type_expr,
                     default: None,
                     description: None,
-                    validate: None,
-                    message: None,
+                    validations: Vec::new(),
                 });
             }
         }
@@ -6698,14 +6726,16 @@ aws.s3.bucket {
     }
 
     #[test]
-    fn parse_arguments_block_form_validate_and_message() {
+    fn parse_arguments_block_form_validation_block() {
         let input = r#"
             arguments {
                 port: int {
                     description = "Web server port"
                     default     = 8080
-                    validate    = port >= 1 && port <= 65535
-                    message     = "Port must be between 1 and 65535"
+                    validation {
+                        condition   = port >= 1 && port <= 65535
+                        error_message = "Port must be between 1 and 65535"
+                    }
                 }
             }
         "#;
@@ -6717,16 +6747,15 @@ aws.s3.bucket {
         assert_eq!(arg.type_expr, TypeExpr::Int);
         assert_eq!(arg.default, Some(Value::Int(8080)));
         assert_eq!(arg.description.as_deref(), Some("Web server port"));
-        assert!(arg.validate.is_some());
+        assert_eq!(arg.validations.len(), 1);
         assert_eq!(
-            arg.message.as_deref(),
+            arg.validations[0].error_message.as_deref(),
             Some("Port must be between 1 and 65535")
         );
 
         // Verify the validate expression structure:
         // port >= 1 && port <= 65535
-        let validate = arg.validate.as_ref().unwrap();
-        match validate {
+        match &arg.validations[0].condition {
             ValidateExpr::And(left, right) => {
                 match left.as_ref() {
                     ValidateExpr::Compare { lhs, op, rhs } => {
@@ -6750,11 +6779,13 @@ aws.s3.bucket {
     }
 
     #[test]
-    fn parse_arguments_block_form_validate_only() {
+    fn parse_arguments_block_form_validate_no_description() {
         let input = r#"
             arguments {
                 count: int {
-                    validate = count > 0
+                    validation {
+                        condition = count > 0
+                    }
                 }
             }
         "#;
@@ -6762,8 +6793,8 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.arguments.len(), 1);
         let arg = &result.arguments[0];
-        assert!(arg.validate.is_some());
-        assert!(arg.message.is_none());
+        assert_eq!(arg.validations.len(), 1);
+        assert!(arg.validations[0].error_message.is_none());
         assert!(arg.description.is_none());
         assert!(arg.default.is_none());
     }
@@ -6773,13 +6804,15 @@ aws.s3.bucket {
         let input = r#"
             arguments {
                 enabled: bool {
-                    validate = !enabled == false
+                    validation {
+                        condition = !enabled == false
+                    }
                 }
             }
         "#;
 
         let result = parse(input, &ProviderContext::default()).unwrap();
-        assert!(result.arguments[0].validate.is_some());
+        assert_eq!(result.arguments[0].validations.len(), 1);
     }
 
     #[test]
@@ -6787,15 +6820,16 @@ aws.s3.bucket {
         let input = r#"
             arguments {
                 port: int {
-                    validate = port == 80 || port == 443
-                    message  = "Port must be 80 or 443"
+                    validation {
+                        condition   = port == 80 || port == 443
+                        error_message = "Port must be 80 or 443"
+                    }
                 }
             }
         "#;
 
         let result = parse(input, &ProviderContext::default()).unwrap();
-        let validate = result.arguments[0].validate.as_ref().unwrap();
-        match validate {
+        match &result.arguments[0].validations[0].condition {
             ValidateExpr::Or(_, _) => {}
             other => panic!("Expected Or, got {:?}", other),
         }
@@ -6806,17 +6840,48 @@ aws.s3.bucket {
         let input = r#"
             arguments {
                 name: string {
-                    validate = len(name) >= 1 && len(name) <= 64
-                    message  = "Name must be between 1 and 64 characters"
+                    validation {
+                        condition   = len(name) >= 1 && len(name) <= 64
+                        error_message = "Name must be between 1 and 64 characters"
+                    }
                 }
             }
         "#;
 
         let result = parse(input, &ProviderContext::default()).unwrap();
-        assert!(result.arguments[0].validate.is_some());
+        assert_eq!(result.arguments[0].validations.len(), 1);
         assert_eq!(
-            result.arguments[0].message.as_deref(),
+            result.arguments[0].validations[0].error_message.as_deref(),
             Some("Name must be between 1 and 64 characters")
+        );
+    }
+
+    #[test]
+    fn parse_arguments_block_form_multiple_validation_blocks() {
+        let input = r#"
+            arguments {
+                port: int {
+                    validation {
+                        condition   = port >= 1
+                        error_message = "Port must be positive"
+                    }
+                    validation {
+                        condition   = port <= 65535
+                        error_message = "Port must be at most 65535"
+                    }
+                }
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(result.arguments[0].validations.len(), 2);
+        assert_eq!(
+            result.arguments[0].validations[0].error_message.as_deref(),
+            Some("Port must be positive")
+        );
+        assert_eq!(
+            result.arguments[0].validations[1].error_message.as_deref(),
+            Some("Port must be at most 65535")
         );
     }
 

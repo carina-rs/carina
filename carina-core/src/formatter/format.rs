@@ -2261,7 +2261,7 @@ mod tests {
 "#;
         let config = FormatConfig::default();
         let block_names: std::collections::HashMap<String, String> =
-            [("rules".to_string(), "rule".to_string())]
+            [("rules".to_string(), "condition".to_string())]
                 .into_iter()
                 .collect();
         let result = format_with_block_names(input, &config, &block_names).unwrap();
@@ -2687,13 +2687,15 @@ mod tests {
     }
 
     #[test]
-    fn format_arguments_block_form_with_validate_and_message() {
+    fn format_arguments_block_form_with_validation_block() {
         let input = r#"arguments {
   port: int {
     description = "Web server port"
     default     = 8080
-    validate    = port >= 1 && port <= 65535
-    message     = "Port must be between 1 and 65535"
+    validation {
+      condition     = port >= 1 && port <= 65535
+      error_message = "Port must be between 1 and 65535"
+    }
   }
 }
 "#;

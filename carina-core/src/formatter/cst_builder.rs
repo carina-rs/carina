@@ -257,8 +257,14 @@ impl<'a> CstBuilder<'a> {
                 Some(CstChild::Token(Token::new("description".to_string(), span)))
             }
             Rule::kw_default => Some(CstChild::Token(Token::new("default".to_string(), span))),
-            Rule::kw_validate => Some(CstChild::Token(Token::new("validate".to_string(), span))),
-            Rule::kw_message => Some(CstChild::Token(Token::new("message".to_string(), span))),
+            Rule::kw_validation => {
+                Some(CstChild::Token(Token::new("validation".to_string(), span)))
+            }
+            Rule::kw_condition => Some(CstChild::Token(Token::new("condition".to_string(), span))),
+            Rule::kw_error_message => Some(CstChild::Token(Token::new(
+                "error_message".to_string(),
+                span,
+            ))),
 
             // Validate expression rules - treat as opaque node preserving source text
             Rule::validate_expr => Some(CstChild::Node(
@@ -281,6 +287,8 @@ impl<'a> CstBuilder<'a> {
             Rule::block_content => None,
             Rule::arguments_block_content => None,
             Rule::attributes_block_content => None,
+            Rule::validation_block_content => None,
+            Rule::validation_block_attr => None,
 
             Rule::file => None,
         }

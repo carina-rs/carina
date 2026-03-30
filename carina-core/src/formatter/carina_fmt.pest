@@ -55,14 +55,21 @@ arguments_param_block_content = _{ trivia | arguments_param_attr }
 arguments_param_attr = {
     kw_description ~ trivia* ~ equals ~ trivia* ~ string
   | kw_default ~ trivia* ~ equals ~ trivia* ~ expression
-  | kw_validate ~ trivia* ~ equals ~ trivia* ~ validate_expr
-  | kw_message ~ trivia* ~ equals ~ trivia* ~ string
+  | kw_validation ~ trivia* ~ open_brace ~ validation_block_content* ~ close_brace
+}
+
+validation_block_content = _{ trivia | validation_block_attr }
+
+validation_block_attr = {
+    kw_condition ~ trivia* ~ equals ~ trivia* ~ validate_expr
+  | kw_error_message ~ trivia* ~ equals ~ trivia* ~ string
 }
 
 kw_description = { "description" }
 kw_default = { "default" }
-kw_validate = { "validate" }
-kw_message = { "message" }
+kw_validation = { "validation" }
+kw_condition = { "condition" }
+kw_error_message = { "error_message" }
 
 // Validate expression for formatter (preserves tokens)
 validate_expr = { validate_or_expr }
