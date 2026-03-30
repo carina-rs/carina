@@ -17,18 +17,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install mdbook
-        uses: taiki-e/install-action@v2
+      - uses: actions/setup-node@v4
         with:
-          tool: mdbook
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: docs
 
       - name: Build docs
-        run: mdbook build docs
+        run: npm run build
+        working-directory: docs
 
       - name: Deploy to carina-rs.github.io
         uses: peaceiris/actions-gh-pages@v4
         with:
           external_repository: carina-rs/carina-rs.github.io
           publish_branch: main
-          publish_dir: ./docs/book
+          publish_dir: ./docs/dist
           personal_token: ${{ secrets.DOCS_DEPLOY_TOKEN }}

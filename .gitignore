@@ -26,12 +26,8 @@ Thumbs.db
 .env
 .env.local
 
-# mdbook build output
-docs/book/
-
-# Starlight build output
-docs/node_modules/
 docs/dist/
+docs/node_modules/
 docs/.astro/
 
 # CloudFormation schema cache
