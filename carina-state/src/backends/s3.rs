@@ -443,7 +443,6 @@ impl StateBackend for S3Backend {
     }
 }
 
-/// Re-export from carina-core for region format conversion.
 use carina_core::utils::convert_region_value;
 
 /// Check if an S3 error is a "not found" error

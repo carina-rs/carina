@@ -1,5 +1,8 @@
 //! Shared utility functions for value normalization and conversion
 
+use crate::resource::Value;
+use crate::schema::NamespacedEnumParts;
+
 /// Extract the last dot-separated part from a namespaced identifier.
 /// Returns the original string if no dots are present.
 ///
@@ -309,9 +312,6 @@ pub fn validate_enum_namespace(s: &str, type_name: &str, namespace: &str) -> Res
 
     Ok(())
 }
-
-use crate::resource::Value;
-use crate::schema::NamespacedEnumParts;
 
 /// Resolve a single string value to its fully-qualified namespaced DSL format.
 ///
