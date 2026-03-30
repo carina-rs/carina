@@ -1,0 +1,148 @@
+---
+title: "awscc.ec2.security_group"
+description: "AWSCC EC2 security_group resource reference"
+---
+
+# awscc.ec2.security_group
+
+CloudFormation Type: `AWS::EC2::SecurityGroup`
+
+Resource Type definition for AWS::EC2::SecurityGroup
+
+## Example
+
+```crn
+let vpc = awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+}
+
+awscc.ec2.security_group {
+  vpc_id            = vpc.vpc_id
+  group_description = "Example security group"
+
+  security_group_ingress {
+    ip_protocol = "tcp"
+    from_port   = 80
+    to_port     = 80
+    cidr_ip     = "0.0.0.0/0"
+  }
+
+  security_group_ingress {
+    ip_protocol = "tcp"
+    from_port   = 443
+    to_port     = 443
+    cidr_ip     = "0.0.0.0/0"
+  }
+
+  tags = {
+    Environment = "example"
+  }
+}
+```
+
+## Argument Reference
+
+### `group_description`
+
+- **Type:** String
+- **Required:** Yes
+- **Create-only:** Yes
+
+A description for the security group.
+
+### `group_name`
+
+- **Type:** String
+- **Required:** No
+- **Create-only:** Yes
+
+The name of the security group.
+
+### `security_group_egress`
+
+- **Type:** [List\<Egress\>](#egress)
+- **Required:** No
+
+[VPC only] The outbound rules associated with the security group. There is a short interruption during which you cannot connect to the security group.
+
+### `security_group_ingress`
+
+- **Type:** [List\<Ingress\>](#ingress)
+- **Required:** No
+
+The inbound rules associated with the security group. There is a short interruption during which you cannot connect to the security group.
+
+### `tags`
+
+- **Type:** Map(String)
+- **Required:** No
+
+Any tags assigned to the security group.
+
+### `vpc_id`
+
+- **Type:** VpcId
+- **Required:** No
+- **Create-only:** Yes
+
+The ID of the VPC for the security group.
+
+## Enum Values
+
+### ip_protocol (IpProtocol)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `tcp` | `awscc.ec2.security_group.IpProtocol.tcp` |
+| `udp` | `awscc.ec2.security_group.IpProtocol.udp` |
+| `icmp` | `awscc.ec2.security_group.IpProtocol.icmp` |
+| `icmpv6` | `awscc.ec2.security_group.IpProtocol.icmpv6` |
+| `-1` | `awscc.ec2.security_group.IpProtocol.all` |
+
+Shorthand formats: `tcp` or `IpProtocol.tcp`
+
+## Struct Definitions
+
+### Egress
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `cidr_ip` | Ipv4Cidr | No |  |
+| `cidr_ipv6` | Ipv6Cidr | No |  |
+| `description` | String | No |  |
+| `destination_prefix_list_id` | PrefixListId | No |  |
+| `destination_security_group_id` | SecurityGroupId | No |  |
+| `from_port` | Int(-1..=65535) | No |  |
+| `ip_protocol` | [Enum (IpProtocol)](#ip_protocol-ipprotocol) | Yes |  |
+| `to_port` | Int(-1..=65535) | No |  |
+
+### Ingress
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `cidr_ip` | Ipv4Cidr | No |  |
+| `cidr_ipv6` | Ipv6Cidr | No |  |
+| `description` | String | No |  |
+| `from_port` | Int(-1..=65535) | No |  |
+| `ip_protocol` | [Enum (IpProtocol)](#ip_protocol-ipprotocol) | Yes |  |
+| `source_prefix_list_id` | PrefixListId | No |  |
+| `source_security_group_id` | SecurityGroupId | No |  |
+| `source_security_group_name` | String | No |  |
+| `source_security_group_owner_id` | AwsAccountId | No |  |
+| `to_port` | Int(-1..=65535) | No |  |
+
+## Attribute Reference
+
+### `group_id`
+
+- **Type:** SecurityGroupId
+
+The group ID of the specified security group.
+
+### `id`
+
+- **Type:** SecurityGroupId
+
+The group name or group ID depending on whether the SG is created in default or specific VPC
+
+
