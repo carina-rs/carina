@@ -1,0 +1,189 @@
+---
+title: "awscc.ec2.flow_log"
+description: "AWSCC EC2 flow_log resource reference"
+---
+
+# awscc.ec2.flow_log
+
+CloudFormation Type: `AWS::EC2::FlowLog`
+
+Specifies a VPC flow log, which enables you to capture IP traffic for a specific network interface, subnet, or VPC.
+
+## Example
+
+```crn
+let vpc = awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+}
+
+awscc.ec2.flow_log {
+  resource_id          = vpc.vpc_id
+  resource_type        = VPC
+  traffic_type         = ALL
+  log_destination_type = s3
+  log_destination      = "arn:aws:s3:::example-flow-logs-bucket"
+
+  tags = {
+    Environment = "example"
+  }
+}
+```
+
+## Argument Reference
+
+### `deliver_cross_account_role`
+
+- **Type:** IamRoleArn
+- **Required:** No
+- **Create-only:** Yes
+
+The ARN of the IAM role that allows Amazon EC2 to publish flow logs across accounts.
+
+### `deliver_logs_permission_arn`
+
+- **Type:** IamRoleArn
+- **Required:** No
+- **Create-only:** Yes
+
+The ARN for the IAM role that permits Amazon EC2 to publish flow logs to a CloudWatch Logs log group in your account. If you specify LogDestinationType as s3 or kinesis-data-firehose, do not specify DeliverLogsPermissionArn or LogGroupName.
+
+### `destination_options`
+
+- **Type:** [Struct(DestinationOptions)](#destinationoptions)
+- **Required:** No
+- **Create-only:** Yes
+
+### `log_destination`
+
+- **Type:** Arn
+- **Required:** No
+- **Create-only:** Yes
+
+Specifies the destination to which the flow log data is to be published. Flow log data can be published to a CloudWatch Logs log group, an Amazon S3 bucket, or a Kinesis Firehose stream. The value specified for this parameter depends on the value specified for LogDestinationType.
+
+### `log_destination_type`
+
+- **Type:** [Enum (LogDestinationType)](#log_destination_type-logdestinationtype)
+- **Required:** No
+- **Create-only:** Yes
+
+Specifies the type of destination to which the flow log data is to be published. Flow log data can be published to CloudWatch Logs or Amazon S3.
+
+### `log_format`
+
+- **Type:** String
+- **Required:** No
+- **Create-only:** Yes
+
+The fields to include in the flow log record, in the order in which they should appear.
+
+### `log_group_name`
+
+- **Type:** String
+- **Required:** No
+- **Create-only:** Yes
+
+The name of a new or existing CloudWatch Logs log group where Amazon EC2 publishes your flow logs. If you specify LogDestinationType as s3 or kinesis-data-firehose, do not specify DeliverLogsPermissionArn or LogGroupName.
+
+### `max_aggregation_interval`
+
+- **Type:** IntEnum([60, 600])
+- **Required:** No
+- **Create-only:** Yes
+
+The maximum interval of time during which a flow of packets is captured and aggregated into a flow log record. You can specify 60 seconds (1 minute) or 600 seconds (10 minutes).
+
+### `resource_id`
+
+- **Type:** String
+- **Required:** Yes
+- **Create-only:** Yes
+
+The ID of the subnet, network interface, or VPC for which you want to create a flow log.
+
+### `resource_type`
+
+- **Type:** [Enum (ResourceType)](#resource_type-resourcetype)
+- **Required:** Yes
+- **Create-only:** Yes
+
+The type of resource for which to create the flow log. For example, if you specified a VPC ID for the ResourceId property, specify VPC for this property.
+
+### `tags`
+
+- **Type:** Map(String)
+- **Required:** No
+
+The tags to apply to the flow logs.
+
+### `traffic_type`
+
+- **Type:** [Enum (TrafficType)](#traffic_type-traffictype)
+- **Required:** No
+- **Create-only:** Yes
+
+The type of traffic to log. You can log traffic that the resource accepts or rejects, or all traffic.
+
+## Enum Values
+
+### file_format (FileFormat)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `plain-text` | `awscc.ec2.flow_log.FileFormat.plain_text` |
+| `parquet` | `awscc.ec2.flow_log.FileFormat.parquet` |
+
+Shorthand formats: `plain_text` or `FileFormat.plain_text`
+
+### log_destination_type (LogDestinationType)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `cloud-watch-logs` | `awscc.ec2.flow_log.LogDestinationType.cloud_watch_logs` |
+| `s3` | `awscc.ec2.flow_log.LogDestinationType.s3` |
+| `kinesis-data-firehose` | `awscc.ec2.flow_log.LogDestinationType.kinesis_data_firehose` |
+
+Shorthand formats: `cloud_watch_logs` or `LogDestinationType.cloud_watch_logs`
+
+### resource_type (ResourceType)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `NetworkInterface` | `awscc.ec2.flow_log.ResourceType.NetworkInterface` |
+| `Subnet` | `awscc.ec2.flow_log.ResourceType.Subnet` |
+| `VPC` | `awscc.ec2.flow_log.ResourceType.VPC` |
+| `TransitGateway` | `awscc.ec2.flow_log.ResourceType.TransitGateway` |
+| `TransitGatewayAttachment` | `awscc.ec2.flow_log.ResourceType.TransitGatewayAttachment` |
+| `RegionalNatGateway` | `awscc.ec2.flow_log.ResourceType.RegionalNatGateway` |
+
+Shorthand formats: `NetworkInterface` or `ResourceType.NetworkInterface`
+
+### traffic_type (TrafficType)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `ACCEPT` | `awscc.ec2.flow_log.TrafficType.ACCEPT` |
+| `ALL` | `awscc.ec2.flow_log.TrafficType.ALL` |
+| `REJECT` | `awscc.ec2.flow_log.TrafficType.REJECT` |
+
+Shorthand formats: `ACCEPT` or `TrafficType.ACCEPT`
+
+## Struct Definitions
+
+### DestinationOptions
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `file_format` | [Enum (FileFormat)](#file_format-fileformat) | Yes |  |
+| `hive_compatible_partitions` | Bool | Yes |  |
+| `per_hour_partition` | Bool | Yes |  |
+
+## Attribute Reference
+
+### `id`
+
+- **Type:** FlowLogId
+
+The Flow Log ID
+
+

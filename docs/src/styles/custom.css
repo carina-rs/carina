@@ -1,0 +1,18 @@
+/* Provider doc table styling */
+table {
+  width: 100%;
+  font-size: 0.9rem;
+}
+
+/* Enum value tables: Value and DSL Identifier columns */
+table th:first-child,
+table td:first-child {
+  min-width: 120px;
+}
+
+/* Struct field tables: narrower Required column */
+table th:nth-child(3),
+table td:nth-child(3) {
+  min-width: 80px;
+  white-space: nowrap;
+}

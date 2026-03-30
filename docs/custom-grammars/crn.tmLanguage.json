@@ -1,0 +1,111 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "crn",
+  "scopeName": "source.crn",
+  "displayName": "Carina",
+  "aliases": ["carina"],
+  "fileTypes": ["crn"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#keywords" },
+    { "include": "#constants" },
+    { "include": "#operators" },
+    { "include": "#identifiers" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.crn",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.line.hash.crn",
+          "match": "#.*$"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.crn",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.crn",
+              "match": "\\\\."
+            },
+            {
+              "name": "meta.embedded.expression.crn",
+              "begin": "\\$\\{",
+              "end": "\\}",
+              "patterns": [
+                { "include": "#identifiers" },
+                { "include": "#numbers" }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.crn",
+          "match": "\\b\\d+(\\.\\d+)?\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.crn",
+          "match": "\\b(if|else|for|in)\\b"
+        },
+        {
+          "name": "keyword.declaration.crn",
+          "match": "\\b(let|fn|import|module|provider|backend|arguments|attributes|removed|moved|lifecycle)\\b"
+        },
+        {
+          "name": "storage.type.crn",
+          "match": "\\b(string|int|float|bool|list|map)\\b"
+        }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language.crn",
+          "match": "\\b(true|false)\\b"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.pipe.crn",
+          "match": "\\|>"
+        },
+        {
+          "name": "keyword.operator.assignment.crn",
+          "match": "="
+        }
+      ]
+    },
+    "identifiers": {
+      "patterns": [
+        {
+          "name": "entity.name.type.resource.crn",
+          "match": "\\b(awscc|aws)\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*\\b"
+        },
+        {
+          "name": "variable.other.crn",
+          "match": "\\b[a-z_][a-z0-9_]*\\b"
+        }
+      ]
+    }
+  }
+}
