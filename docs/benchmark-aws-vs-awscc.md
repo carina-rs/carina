@@ -23,6 +23,18 @@ Comparison of operation speed between the `aws` (native SDK) and `awscc` (Cloud 
 | EC2 Security Group   | Read       |      434ms |      712ms |   1.6x |
 | EC2 Security Group   | Destroy    |       1.1s |      10.8s |   9.5x |
 
+## Multi-Resource Benchmark (VPC Full Stack)
+
+Real-world infrastructure involves multiple dependent resources. This test deploys a VPC with subnets, route tables, NAT Gateway, security group, and associations (16 resources total).
+
+| Operation          |  aws (SDK) | awscc (CC) | Ratio |
+|--------------------|------------|------------|-------|
+| Apply (16 resources)  |     130.2s |     152.5s |  1.2x |
+| Plan (read all)       |       0.7s |       1.4s |  2.0x |
+| Destroy (16 resources)|      57.9s |      69.3s |  1.2x |
+
+The gap shrinks from 8-14x (single resource) to **~1.2x** in multi-resource scenarios. This is because Carina executes independent resources in parallel, so the bottleneck becomes the slowest resource in the dependency chain (NAT Gateway creation ~90s) rather than individual API call overhead.
+
 ## Key Findings
 
 1. **Create operations**: AWS SDK is **8-14x faster** than Cloud Control. Cloud Control's abstraction layer adds significant overhead (10-25s vs 1-2s).
@@ -35,12 +47,17 @@ Comparison of operation speed between the `aws` (native SDK) and `awscc` (Cloud 
 
 ## Implications
 
-- For latency-sensitive workflows (development iteration, CI/CD), the `aws` provider provides significantly better UX
-- For resources where the native SDK implementation doesn't exist, `awscc` provides functional coverage at the cost of speed
-- Read operations (used during `plan`) have the smallest gap, so plan times are less affected than apply/destroy times
+- **Single-resource operations**: The `aws` provider is dramatically faster (8-14x for create). This matters most for quick iteration on individual resources
+- **Multi-resource deployments**: The gap narrows to ~1.2x because parallel execution masks individual API latency. Both providers are bottlenecked by slow resources (NAT Gateway, Transit Gateway)
+- **Plan operations**: The `aws` provider is 1.5-2x faster for reads, which directly affects `carina plan` responsiveness
+- **Overall**: The `aws` provider is consistently faster, but the practical difference in real-world multi-resource scenarios is modest (~20%)
 
 ## Reproducing
 
 ```bash
+# Single-resource benchmarks (3 iterations each)
 aws-vault exec <profile> -- ./scripts/benchmark-providers.sh [iterations]
+
+# Multi-resource VPC full stack benchmark
+aws-vault exec <profile> -- ./scripts/bench-vpc-full.sh
 ```
