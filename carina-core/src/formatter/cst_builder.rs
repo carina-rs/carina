@@ -257,6 +257,24 @@ impl<'a> CstBuilder<'a> {
                 Some(CstChild::Token(Token::new("description".to_string(), span)))
             }
             Rule::kw_default => Some(CstChild::Token(Token::new("default".to_string(), span))),
+            Rule::kw_validate => Some(CstChild::Token(Token::new("validate".to_string(), span))),
+            Rule::kw_message => Some(CstChild::Token(Token::new("message".to_string(), span))),
+
+            // Validate expression rules - treat as opaque node preserving source text
+            Rule::validate_expr => Some(CstChild::Node(
+                self.build_node(NodeKind::ValidateExpr, pair),
+            )),
+            Rule::validate_or_expr
+            | Rule::validate_and_expr
+            | Rule::validate_not_expr
+            | Rule::validate_comparison
+            | Rule::validate_primary
+            | Rule::validate_function_call => {
+                Some(CstChild::Token(Token::new(pair.as_str().to_string(), span)))
+            }
+            Rule::compare_op | Rule::op_and | Rule::op_or | Rule::op_not => {
+                Some(CstChild::Token(Token::new(pair.as_str().to_string(), span)))
+            }
 
             // Skip file_content (it's a silent rule wrapper)
             Rule::file_content => None,

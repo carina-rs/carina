@@ -2687,6 +2687,22 @@ mod tests {
     }
 
     #[test]
+    fn format_arguments_block_form_with_validate_and_message() {
+        let input = r#"arguments {
+  port: int {
+    description = "Web server port"
+    default     = 8080
+    validate    = port >= 1 && port <= 65535
+    message     = "Port must be between 1 and 65535"
+  }
+}
+"#;
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert_eq!(result, input);
+    }
+
+    #[test]
     fn format_fn_def_simple() {
         let config = FormatConfig::default();
         let input = "fn greet(name) {\n  join(\" \", [\"hello\",name])\n}\n";

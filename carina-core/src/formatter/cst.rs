@@ -122,6 +122,8 @@ pub enum NodeKind {
     RemovedFromAttr,
     MovedFromAttr,
     MovedToAttr,
+    // Validate expression (opaque)
+    ValidateExpr,
 }
 
 /// CST node - preserves all source information
