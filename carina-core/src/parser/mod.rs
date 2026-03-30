@@ -1375,6 +1375,7 @@ fn is_static_value(value: &Value) -> bool {
         Value::FunctionCall { args, .. } => args.iter().all(is_static_value),
         Value::ResourceRef { .. } | Value::Interpolation(_) => false,
         Value::Secret(inner) => is_static_value(inner),
+        Value::Closure { .. } => false,
     }
 }
 
@@ -2242,6 +2243,7 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::Interpolation(_) => "string",
         Value::FunctionCall { .. } => "function call",
         Value::Secret(_) => "secret",
+        Value::Closure { .. } => "closure",
     }
 }
 

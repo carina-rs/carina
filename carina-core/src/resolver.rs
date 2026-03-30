@@ -202,6 +202,21 @@ pub fn resolve_ref_value(
             let resolved_inner = resolve_ref_value(inner, binding_map)?;
             Ok(Value::Secret(Box::new(resolved_inner)))
         }
+        Value::Closure {
+            name,
+            captured_args,
+            remaining_arity,
+        } => {
+            let resolved_args: Result<Vec<Value>, String> = captured_args
+                .iter()
+                .map(|a| resolve_ref_value(a, binding_map))
+                .collect();
+            Ok(Value::Closure {
+                name: name.clone(),
+                captured_args: resolved_args?,
+                remaining_arity: *remaining_arity,
+            })
+        }
         _ => Ok(value.clone()),
     }
 }
@@ -218,6 +233,7 @@ fn contains_resource_ref(value: &Value) -> bool {
         }),
         Value::FunctionCall { args, .. } => args.iter().any(contains_resource_ref),
         Value::Secret(inner) => contains_resource_ref(inner),
+        Value::Closure { captured_args, .. } => captured_args.iter().any(contains_resource_ref),
         _ => false,
     }
 }
