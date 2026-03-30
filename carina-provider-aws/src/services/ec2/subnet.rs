@@ -93,16 +93,12 @@ impl AwsProvider {
         })?;
 
         // Apply tags
-        self.apply_ec2_tags(
-            &resource.id,
-            subnet_id,
-            &resource.resolved_attributes(),
-            None,
-        )
-        .await?;
+        let attrs = resource.resolved_attributes();
+        self.apply_ec2_tags(&resource.id, subnet_id, &attrs, None)
+            .await?;
 
         // Apply subnet attributes that require ModifySubnetAttribute
-        self.modify_subnet_attributes(&resource.id, subnet_id, &resource.resolved_attributes())
+        self.modify_subnet_attributes(&resource.id, subnet_id, &attrs)
             .await?;
 
         // Read back using subnet ID (reliable identifier)
@@ -118,17 +114,13 @@ impl AwsProvider {
         to: Resource,
     ) -> ProviderResult<State> {
         // Apply subnet attributes that require ModifySubnetAttribute
-        self.modify_subnet_attributes(&id, identifier, &to.resolved_attributes())
+        let attrs = to.resolved_attributes();
+        self.modify_subnet_attributes(&id, identifier, &attrs)
             .await?;
 
         // Update tags
-        self.apply_ec2_tags(
-            &id,
-            identifier,
-            &to.resolved_attributes(),
-            Some(&from.attributes),
-        )
-        .await?;
+        self.apply_ec2_tags(&id, identifier, &attrs, Some(&from.attributes))
+            .await?;
 
         self.read_ec2_subnet(&id, Some(identifier)).await
     }

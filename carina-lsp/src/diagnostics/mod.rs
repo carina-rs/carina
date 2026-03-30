@@ -440,7 +440,8 @@ impl DiagnosticEngine {
                     }
 
                     // Run resource-level validator (e.g., mutually exclusive required fields)
-                    if let Err(errors) = schema.validate(&resource.resolved_attributes()) {
+                    let resolved_attrs = resource.resolved_attributes();
+                    if let Err(errors) = schema.validate(&resolved_attrs) {
                         for error in errors {
                             // Skip errors that are already reported with precise positions
                             // by the attribute-level checks above.
@@ -478,7 +479,7 @@ impl DiagnosticEngine {
                     // Lint: prefer block syntax for List<Struct> attributes
                     diagnostics.extend(self.check_list_struct_syntax(
                         doc,
-                        &resource.resolved_attributes(),
+                        &resolved_attrs,
                         &schema,
                     ));
                 }
