@@ -44,10 +44,29 @@ Execution Plan:
   (detailed plan with module boundary grouping)
 ```
 
+#### Nested modules
+
+When a module calls another module (e.g., `web_infra` calls `network`), the summary shows the nested structure to preserve white-box visibility of which inner module generates which resources.
+
+```
+Plan Summary:
+  root.crn
+    ~ awscc.s3.bucket
+  modules/web_infra (instance: web, source: modules/web_infra/main.crn)
+    modules/network (instance: web.net, source: modules/network/main.crn)
+      + awscc.ec2.vpc, + awscc.ec2.subnet ×3
+    + awscc.ecs.service ×2
+
+  8 to add, 1 to change, 0 to destroy.
+```
+
+Each nesting level adds one level of indentation. Resources that belong directly to an outer module (not delegated to an inner module) appear at the outer module's indentation level.
+
 #### Rules
 
 - Group resources by module, with root-level resources listed under the source `.crn` file name
 - Each module shows instance name and source file path
+- Nested modules are displayed with hierarchical indentation, showing the full module call tree
 - Same resource types within a module are collapsed with `×N` suffix
 - Each resource is prefixed with its effect symbol (`+`, `~`, `-`, `-/+`, `<=`, `<-`, `x`, `->`)
 - The summary total line matches the existing `PlanSummary` format
@@ -85,7 +104,27 @@ Plan: 3 to add, 0 to change, 0 to destroy.
 
 **Implementation:** Use existing `ModularPlan.group_by_module()` in `format_plan()`. Root resources display without a module header (same as current behavior). Exact visual formatting (borders, indentation) will be refined during implementation.
 
-**Nested modules:** When a module calls another module (e.g., `web_infra` calls `network`), the plan shows the outermost module boundary. Inner module resources appear with their full dot-path prefix (e.g., `web.net.vpc`). Nested module headers are not displayed to avoid deep visual nesting — the dot-path prefix provides sufficient traceability.
+**Nested modules:** When a module calls another module (e.g., `web_infra` calls `network`), the plan shows nested module boundaries with hierarchical indentation. This preserves white-box visibility of which inner module generates which resources.
+
+```
+Execution Plan:
+
+  module: web_infra (instance: web)
+
+    module: network (instance: web.net)
+
+      + awscc.ec2.vpc web.net.vpc
+          cidr_block: "10.0.0.0/16"
+            │
+            └─ + awscc.ec2.subnet web.net.subnet
+                  vpc_id: web.net.vpc.vpc_id
+
+    + awscc.ecs.service web.app
+        cluster: "main"
+
+  + awscc.ec2.security_group sg
+      vpc_id: web.net.vpc.vpc_id
+```
 
 ### 2. Full Attribute Visibility
 
