@@ -37,7 +37,7 @@ pub struct BuiltinFunctionInfo {
 macro_rules! register_builtins {
     (
         $(
-            $name:ident ( $handler:expr ) {
+            $name:ident ( $handler:expr, arity: $arity:expr ) {
                 signature: $sig:expr,
                 description: $desc:expr,
             }
@@ -57,12 +57,36 @@ macro_rules! register_builtins {
             FUNCTIONS
         }
 
+        /// Return the expected arity (number of arguments) for a built-in function.
+        ///
+        /// Returns `None` if the function is unknown.
+        pub fn builtin_arity(name: &str) -> Option<usize> {
+            match name {
+                $( stringify!($name) => Some($arity), )*
+                _ => None,
+            }
+        }
+
         /// Evaluate a built-in function by name with the given arguments.
         ///
+        /// If fewer arguments than the arity are provided, returns a
+        /// `Value::Closure` capturing the partial arguments.
         /// Returns `Err` if the function is unknown or if the arguments are invalid.
         pub fn evaluate_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
             match name {
-                $( stringify!($name) => $handler(args), )*
+                $(
+                    stringify!($name) => {
+                        let arity: usize = $arity;
+                        if !args.is_empty() && args.len() < arity {
+                            return Ok(Value::Closure {
+                                name: name.to_string(),
+                                captured_args: args.to_vec(),
+                                remaining_arity: arity - args.len(),
+                            });
+                        }
+                        $handler(args)
+                    }
+                )*
                 _ => Err(format!("Unknown built-in function: {name}")),
             }
         }
@@ -70,82 +94,149 @@ macro_rules! register_builtins {
 }
 
 register_builtins! {
-    cidr_subnet(cidr_subnet::builtin_cidr_subnet) {
+    cidr_subnet(cidr_subnet::builtin_cidr_subnet, arity: 3) {
         signature: "cidr_subnet(prefix: string, newbits: int, netnum: int) -> string",
         description: "Calculates a subnet CIDR block within a given IP network address prefix.",
     },
-    concat(concat::builtin_concat) {
+    concat(concat::builtin_concat, arity: 2) {
         signature: "concat(items: list, base_list: list) -> list",
         description: "Appends items to a list. Data-last: base_list |> concat(items).",
     },
-    decrypt(decrypt::builtin_decrypt) {
+    decrypt(decrypt::builtin_decrypt, arity: 1) {
         signature: "decrypt(ciphertext: string, key?: string) -> string",
         description: "Decrypts ciphertext using the configured provider's encryption service (e.g., AWS KMS). Key is optional when embedded in ciphertext.",
     },
-    env(env::builtin_env) {
+    env(env::builtin_env, arity: 1) {
         signature: "env(name: string) -> string",
         description: "Reads an environment variable. Errors if the variable is not set.",
     },
-    flatten(flatten::builtin_flatten) {
+    flatten(flatten::builtin_flatten, arity: 1) {
         signature: "flatten(list: list) -> list",
         description: "Flattens nested lists by one level.",
     },
-    join(join::builtin_join) {
+    join(join::builtin_join, arity: 2) {
         signature: "join(separator: string, list: list) -> string",
         description: "Joins list elements into a string using the separator.",
     },
-    keys(keys_values::builtin_keys) {
+    keys(keys_values::builtin_keys, arity: 1) {
         signature: "keys(map: map) -> list",
         description: "Returns the keys of a map as a sorted list.",
     },
-    length(length::builtin_length) {
+    length(length::builtin_length, arity: 1) {
         signature: "length(value: list | map | string) -> int",
         description: "Returns the number of elements in a list or map, or characters in a string.",
     },
-    lookup(lookup::builtin_lookup) {
+    lookup(lookup::builtin_lookup, arity: 3) {
         signature: "lookup(map: map, key: string, default: any) -> any",
         description: "Looks up a key in a map, returning the default value if the key is not found.",
     },
-    lower(upper_lower::builtin_lower) {
+    lower(upper_lower::builtin_lower, arity: 1) {
         signature: "lower(string: string) -> string",
         description: "Converts a string to lowercase.",
     },
-    map(map::builtin_map) {
+    map(map::builtin_map, arity: 2) {
         signature: "map(accessor: string, collection: list | map) -> list | map",
         description: "Extracts a field from each element. Use a dot-prefixed accessor (e.g., \".field_name\"). Pipe form: collection |> map(\".field\").",
     },
-    max(min_max::builtin_max) {
+    max(min_max::builtin_max, arity: 2) {
         signature: "max(a: number, b: number) -> number",
         description: "Returns the maximum of two numbers.",
     },
-    min(min_max::builtin_min) {
+    min(min_max::builtin_min, arity: 2) {
         signature: "min(a: number, b: number) -> number",
         description: "Returns the minimum of two numbers.",
     },
-    replace(replace::builtin_replace) {
+    replace(replace::builtin_replace, arity: 3) {
         signature: "replace(search: string, replacement: string, string: string) -> string",
         description: "Replaces all occurrences of a search string. Data-last: string |> replace(search, replacement).",
     },
-    secret(secret::builtin_secret) {
+    secret(secret::builtin_secret, arity: 1) {
         signature: "secret(value: any) -> secret",
         description: "Marks a value as secret. The value is sent to the provider but stored only as a SHA256 hash in state.",
     },
-    split(split::builtin_split) {
+    split(split::builtin_split, arity: 2) {
         signature: "split(separator: string, string: string) -> list",
         description: "Splits a string into a list using the separator.",
     },
-    trim(trim::builtin_trim) {
+    trim(trim::builtin_trim, arity: 1) {
         signature: "trim(string: string) -> string",
         description: "Removes leading and trailing whitespace from a string.",
     },
-    upper(upper_lower::builtin_upper) {
+    upper(upper_lower::builtin_upper, arity: 1) {
         signature: "upper(string: string) -> string",
         description: "Converts a string to uppercase.",
     },
-    values(keys_values::builtin_values) {
+    values(keys_values::builtin_values, arity: 1) {
         signature: "values(map: map) -> list",
         description: "Returns the values of a map as a list, sorted by key.",
     },
+}
+
+/// Apply additional arguments to a Closure.
+///
+/// Merges `new_args` into the closure's captured args. If enough arguments are
+/// now present, evaluates the underlying built-in function. Otherwise returns
+/// a new Closure with updated captured args and remaining arity.
+pub fn apply_closure(
+    name: &str,
+    captured_args: &[Value],
+    remaining_arity: usize,
+    new_args: &[Value],
+) -> Result<Value, String> {
+    if new_args.len() > remaining_arity {
+        return Err(format!(
+            "{}() closure expects {} more argument{}, got {}",
+            name,
+            remaining_arity,
+            if remaining_arity == 1 { "" } else { "s" },
+            new_args.len(),
+        ));
+    }
+    let mut all_args = captured_args.to_vec();
+    all_args.extend_from_slice(new_args);
+    let new_remaining = remaining_arity - new_args.len();
+    if new_remaining == 0 {
+        evaluate_builtin(name, &all_args)
+    } else {
+        Ok(Value::Closure {
+            name: name.to_string(),
+            captured_args: all_args,
+            remaining_arity: new_remaining,
+        })
+    }
+}
+
+/// Apply additional arguments to a Closure using parser configuration.
+///
+/// Same as [`apply_closure`] but routes `decrypt` through the config-aware path.
+pub fn apply_closure_with_config(
+    name: &str,
+    captured_args: &[Value],
+    remaining_arity: usize,
+    new_args: &[Value],
+    config: &ProviderContext,
+) -> Result<Value, String> {
+    if new_args.len() > remaining_arity {
+        return Err(format!(
+            "{}() closure expects {} more argument{}, got {}",
+            name,
+            remaining_arity,
+            if remaining_arity == 1 { "" } else { "s" },
+            new_args.len(),
+        ));
+    }
+    let mut all_args = captured_args.to_vec();
+    all_args.extend_from_slice(new_args);
+    let new_remaining = remaining_arity - new_args.len();
+    if new_remaining == 0 {
+        evaluate_builtin_with_config(name, &all_args, config)
+    } else {
+        Ok(Value::Closure {
+            name: name.to_string(),
+            captured_args: all_args,
+            remaining_arity: new_remaining,
+        })
+    }
 }
 
 /// Evaluate a built-in function with parser configuration.
@@ -157,6 +248,17 @@ pub fn evaluate_builtin_with_config(
     args: &[Value],
     config: &ProviderContext,
 ) -> Result<Value, String> {
+    // Check for partial application before dispatching
+    if let Some(arity) = builtin_arity(name)
+        && !args.is_empty()
+        && args.len() < arity
+    {
+        return Ok(Value::Closure {
+            name: name.to_string(),
+            captured_args: args.to_vec(),
+            remaining_arity: arity - args.len(),
+        });
+    }
     match name {
         "decrypt" => decrypt::builtin_decrypt_with_config(args, config),
         _ => evaluate_builtin(name, args),

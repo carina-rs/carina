@@ -158,11 +158,10 @@ mod tests {
     }
 
     #[test]
-    fn map_error_wrong_arg_count_one() {
-        let args = vec![Value::List(vec![])];
-        let result = evaluate_builtin("map", &args);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("requires 2 arguments"));
+    fn map_partial_application_one_arg() {
+        let args = vec![Value::String(".field".to_string())];
+        let result = evaluate_builtin("map", &args).unwrap();
+        assert!(result.is_closure());
     }
 
     #[test]

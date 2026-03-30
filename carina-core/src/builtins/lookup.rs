@@ -113,11 +113,10 @@ mod tests {
     }
 
     #[test]
-    fn lookup_wrong_arg_count() {
+    fn lookup_partial_application() {
         let args = vec![Value::Map(HashMap::new()), Value::String("key".to_string())];
-        let result = evaluate_builtin("lookup", &args);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("expects 3 arguments"));
+        let result = evaluate_builtin("lookup", &args).unwrap();
+        assert!(result.is_closure());
     }
 
     #[test]

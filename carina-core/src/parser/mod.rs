@@ -1140,8 +1140,44 @@ fn parse_pipe_expr_with_resource_or_module(
             fc_inner.map(|arg| parse_expression(arg, ctx)).collect();
         let extra_args = extra_args?;
 
+        // Build args: pipe value goes as the last argument (data-last convention)
         let mut args = extra_args;
         args.push(value);
+
+        // Check if the pipe target is a Closure variable
+        if let Some(Value::Closure {
+            name: fn_name,
+            captured_args,
+            remaining_arity,
+        }) = ctx.get_variable(&func_name)
+            && args.iter().all(is_static_value)
+        {
+            value = crate::builtins::apply_closure_with_config(
+                fn_name,
+                captured_args,
+                *remaining_arity,
+                &args,
+                ctx.config,
+            )
+            .map_err(|e| ParseError::InvalidExpression {
+                line: 0,
+                message: e,
+            })?;
+            continue;
+        }
+
+        // Eagerly evaluate partial application for builtin pipe targets
+        if let Some(arity) = crate::builtins::builtin_arity(&func_name)
+            && args.len() < arity
+            && args.iter().all(is_static_value)
+        {
+            value = crate::builtins::evaluate_builtin_with_config(&func_name, &args, ctx.config)
+                .map_err(|e| ParseError::InvalidExpression {
+                    line: 0,
+                    message: format!("{}(): {}", func_name, e),
+                })?;
+            continue;
+        }
 
         value = Value::FunctionCall {
             name: func_name,
@@ -1375,7 +1411,7 @@ fn is_static_value(value: &Value) -> bool {
         Value::FunctionCall { args, .. } => args.iter().all(is_static_value),
         Value::ResourceRef { .. } | Value::Interpolation(_) => false,
         Value::Secret(inner) => is_static_value(inner),
-        Value::Closure { .. } => false,
+        Value::Closure { captured_args, .. } => captured_args.iter().all(is_static_value),
     }
 }
 
@@ -2330,6 +2366,26 @@ fn try_evaluate_fn_value(value: Value, ctx: &ParseContext) -> Result<Value, Pars
                 .collect();
             let evaluated_args = evaluated_args?;
 
+            // Check if the name refers to a Closure variable
+            if let Some(Value::Closure {
+                name: fn_name,
+                captured_args,
+                remaining_arity,
+            }) = ctx.get_variable(name)
+            {
+                return crate::builtins::apply_closure_with_config(
+                    fn_name,
+                    captured_args,
+                    *remaining_arity,
+                    &evaluated_args,
+                    ctx.config,
+                )
+                .map_err(|e| ParseError::InvalidExpression {
+                    line: 0,
+                    message: e,
+                });
+            }
+
             // Try built-in first (with config for decrypt support)
             match crate::builtins::evaluate_builtin_with_config(name, &evaluated_args, ctx.config) {
                 Ok(result) => Ok(result),
@@ -2833,15 +2889,51 @@ fn parse_pipe_expr(
             fc_inner.map(|arg| parse_expression(arg, ctx)).collect();
         let extra_args = extra_args?;
 
-        // Build args: pipe value is prepended as the last argument
-        // For join: `list |> join(sep)` => `join(sep, list)`
+        // Build args: pipe value goes as the last argument (data-last convention)
         let mut args = extra_args;
         args.push(value);
+
+        // Check if the pipe target is a Closure variable
+        if let Some(Value::Closure {
+            name: fn_name,
+            captured_args,
+            remaining_arity,
+        }) = ctx.get_variable(&func_name)
+            && args.iter().all(is_static_value)
+        {
+            value = crate::builtins::apply_closure_with_config(
+                fn_name,
+                captured_args,
+                *remaining_arity,
+                &args,
+                ctx.config,
+            )
+            .map_err(|e| ParseError::InvalidExpression {
+                line: 0,
+                message: e,
+            })?;
+            continue;
+        }
 
         // Try to eagerly evaluate user-defined function calls
         if ctx.user_functions.contains_key(&func_name) && args.iter().all(is_static_value) {
             let user_fn = ctx.user_functions.get(&func_name).unwrap().clone();
             value = evaluate_user_function(&user_fn, &args, ctx)?;
+        } else if let Some(arity) = crate::builtins::builtin_arity(&func_name) {
+            // Eagerly evaluate partial application for builtin pipe targets
+            if args.len() < arity && args.iter().all(is_static_value) {
+                value =
+                    crate::builtins::evaluate_builtin_with_config(&func_name, &args, ctx.config)
+                        .map_err(|e| ParseError::InvalidExpression {
+                            line: 0,
+                            message: format!("{}(): {}", func_name, e),
+                        })?;
+            } else {
+                value = Value::FunctionCall {
+                    name: func_name,
+                    args,
+                };
+            }
         } else {
             value = Value::FunctionCall {
                 name: func_name,
@@ -2992,10 +3084,45 @@ fn parse_primary_value(
                 fc_inner.map(|arg| parse_expression(arg, ctx)).collect();
             let args = args?;
 
+            // Check if the name refers to a Closure variable (direct call on closure)
+            if let Some(Value::Closure {
+                name: fn_name,
+                captured_args,
+                remaining_arity,
+            }) = ctx.get_variable(&func_name)
+                && args.iter().all(is_static_value)
+            {
+                return crate::builtins::apply_closure_with_config(
+                    fn_name,
+                    captured_args,
+                    *remaining_arity,
+                    &args,
+                    ctx.config,
+                )
+                .map_err(|e| ParseError::InvalidExpression {
+                    line: 0,
+                    message: e,
+                });
+            }
+
             // Try to eagerly evaluate user-defined function calls
             if ctx.user_functions.contains_key(&func_name) && args.iter().all(is_static_value) {
                 let user_fn = ctx.user_functions.get(&func_name).unwrap().clone();
                 return evaluate_user_function(&user_fn, &args, ctx);
+            }
+
+            // Eagerly evaluate partial application (fewer args than arity → Closure)
+            if let Some(arity) = crate::builtins::builtin_arity(&func_name)
+                && args.len() < arity
+                && args.iter().all(is_static_value)
+            {
+                return crate::builtins::evaluate_builtin_with_config(
+                    &func_name, &args, ctx.config,
+                )
+                .map_err(|e| ParseError::InvalidExpression {
+                    line: 0,
+                    message: format!("{}(): {}", func_name, e),
+                });
             }
 
             Ok(Value::FunctionCall {
@@ -4873,6 +5000,163 @@ aws.s3.bucket {
         resolve_resource_refs(&mut result).unwrap();
         assert_eq!(
             result.resources[0].get_attr("name"),
+            Some(&Value::String("my-bucket".to_string()))
+        );
+    }
+
+    #[test]
+    fn partial_application_produces_closure() {
+        // `let f = map(".subnet_id")` should produce a Closure
+        let input = r#"
+            let f = map(".subnet_id")
+        "#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        match result.variables.get("f") {
+            Some(Value::Closure {
+                name,
+                captured_args,
+                remaining_arity,
+            }) => {
+                assert_eq!(name, "map");
+                assert_eq!(captured_args, &[Value::String(".subnet_id".to_string())]);
+                assert_eq!(*remaining_arity, 1);
+            }
+            other => panic!("Expected Closure, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn partial_application_join_with_pipe() {
+        // `["a", "b"] |> join(",")` desugars to join(",", ["a","b"]) which is a full call.
+        // At parse time it stays as FunctionCall; resolution evaluates it.
+        let input = r#"
+            let bucket = aws.s3_bucket {
+                name = ["a", "b"] |> join(",")
+            }
+        "#;
+        let mut result = parse(input, &ProviderContext::default()).unwrap();
+        resolve_resource_refs(&mut result).unwrap();
+        assert_eq!(
+            result.resources[0].get_attr("name"),
+            Some(&Value::String("a,b".to_string()))
+        );
+    }
+
+    #[test]
+    fn partial_application_closure_direct_call() {
+        // `let f = join(","); let x = f(["a", "b"])` should work
+        let input = r#"
+            let f = join(",")
+            let x = f(["a", "b"])
+        "#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(
+            result.variables.get("x"),
+            Some(&Value::String("a,b".to_string()))
+        );
+    }
+
+    #[test]
+    fn partial_application_chained_pipes() {
+        // `["a", "b"] |> join(",") |> upper()` — resolved via resource refs
+        let input = r#"
+            let bucket = aws.s3_bucket {
+                name = ["a", "b"] |> join(",") |> upper()
+            }
+        "#;
+        let mut result = parse(input, &ProviderContext::default()).unwrap();
+        resolve_resource_refs(&mut result).unwrap();
+        assert_eq!(
+            result.resources[0].get_attr("name"),
+            Some(&Value::String("A,B".to_string()))
+        );
+    }
+
+    #[test]
+    fn partial_application_closure_pipe() {
+        // `let f = join(","); let x = ["a", "b"] |> f()` should work
+        let input = r#"
+            let f = join(",")
+            let x = ["a", "b"] |> f()
+        "#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(
+            result.variables.get("x"),
+            Some(&Value::String("a,b".to_string()))
+        );
+    }
+
+    #[test]
+    fn partial_application_too_many_args_errors() {
+        // Calling a closure with too many args should error
+        let input = r#"
+            let f = join(",")
+            let x = f(["a", "b"], "extra")
+        "#;
+        let result = parse(input, &ProviderContext::default());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn partial_application_replace() {
+        // `replace` has arity 3, partial application with 2 args
+        let input = r#"
+            let dash_to_underscore = replace("-", "_")
+            let x = "hello-world" |> dash_to_underscore()
+        "#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(
+            result.variables.get("x"),
+            Some(&Value::String("hello_world".to_string()))
+        );
+    }
+
+    #[test]
+    fn partial_application_in_resource_attribute() {
+        // Partial application in a resource attribute via pipe
+        let input = r#"
+            let bucket = aws.s3_bucket {
+                name = ["my", "bucket"] |> join("-")
+            }
+        "#;
+        let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+        resolve_resource_refs(&mut parsed).unwrap();
+        assert_eq!(
+            parsed.resources[0].get_attr("name"),
+            Some(&Value::String("my-bucket".to_string()))
+        );
+    }
+
+    #[test]
+    fn partial_application_closure_in_resource_attribute() {
+        // Closure variable used in resource attribute via pipe
+        let input = r#"
+            let dash_join = join("-")
+            let bucket = aws.s3_bucket {
+                name = ["my", "bucket"] |> dash_join()
+            }
+        "#;
+        let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+        resolve_resource_refs(&mut parsed).unwrap();
+        assert_eq!(
+            parsed.resources[0].get_attr("name"),
+            Some(&Value::String("my-bucket".to_string()))
+        );
+    }
+
+    #[test]
+    fn partial_application_closure_direct_call_in_resource_attribute() {
+        // Closure variable used in resource attribute via direct call
+        let input = r#"
+            let dash_join = join("-")
+            let bucket = aws.s3_bucket {
+                name = dash_join(["my", "bucket"])
+            }
+        "#;
+        let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+        resolve_resource_refs(&mut parsed).unwrap();
+        assert_eq!(
+            parsed.resources[0].get_attr("name"),
             Some(&Value::String("my-bucket".to_string()))
         );
     }

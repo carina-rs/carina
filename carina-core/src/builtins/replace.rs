@@ -145,14 +145,13 @@ mod tests {
     }
 
     #[test]
-    fn replace_wrong_arg_count() {
+    fn replace_partial_application() {
         let args = vec![
             Value::String("hello".to_string()),
             Value::String("-".to_string()),
         ];
-        let result = evaluate_builtin("replace", &args);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("expects 3 arguments"));
+        let result = evaluate_builtin("replace", &args).unwrap();
+        assert!(result.is_closure());
     }
 
     #[test]

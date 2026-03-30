@@ -148,10 +148,9 @@ mod tests {
     }
 
     #[test]
-    fn min_wrong_arg_count_one() {
-        let result = evaluate_builtin("min", &[Value::Int(1)]);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("expects 2 arguments"));
+    fn min_partial_application_one_arg() {
+        let result = evaluate_builtin("min", &[Value::Int(1)]).unwrap();
+        assert!(result.is_closure());
     }
 
     #[test]

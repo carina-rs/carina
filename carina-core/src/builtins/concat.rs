@@ -147,11 +147,10 @@ mod tests {
     }
 
     #[test]
-    fn concat_wrong_arg_count_one() {
+    fn concat_partial_application_one_arg() {
         let args = vec![Value::List(vec![Value::Int(1)])];
-        let result = evaluate_builtin("concat", &args);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("expects 2 arguments"));
+        let result = evaluate_builtin("concat", &args).unwrap();
+        assert!(result.is_closure());
     }
 
     #[test]
