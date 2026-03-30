@@ -38,7 +38,7 @@ pub fn build_tag_specification(
 }
 
 /// Build an EC2 `TagSpecification` from a `HashMap` of tags.
-pub fn build_tag_specification_from_map(
+fn build_tag_specification_from_map(
     tags: &HashMap<String, Value>,
     resource_type: ResourceType,
 ) -> TagSpecification {
