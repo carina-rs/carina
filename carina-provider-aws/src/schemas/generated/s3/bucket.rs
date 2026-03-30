@@ -61,27 +61,27 @@ pub fn s3_bucket_config() -> AwsSchemaConfig {
                 .with_provider_name("BucketNamespace"),
         )
         .attribute(
-            AttributeSchema::new("grant_full_control", AttributeType::String)
+            AttributeSchema::new("grant_full_control", super::s3_grantee())
                 .with_description("Allows grantee the read, write, read ACP, and write ACP permissions on the bucket. This functionality is not supported for directory buckets.")
                 .with_provider_name("GrantFullControl"),
         )
         .attribute(
-            AttributeSchema::new("grant_read", AttributeType::String)
+            AttributeSchema::new("grant_read", super::s3_grantee())
                 .with_description("Allows grantee to list the objects in the bucket. This functionality is not supported for directory buckets.")
                 .with_provider_name("GrantRead"),
         )
         .attribute(
-            AttributeSchema::new("grant_read_acp", AttributeType::String)
+            AttributeSchema::new("grant_read_acp", super::s3_grantee())
                 .with_description("Allows grantee to read the bucket ACL. This functionality is not supported for directory buckets.")
                 .with_provider_name("GrantReadACP"),
         )
         .attribute(
-            AttributeSchema::new("grant_write", AttributeType::String)
+            AttributeSchema::new("grant_write", super::s3_grantee())
                 .with_description("Allows grantee to create new objects in the bucket. For the bucket and object owners of existing objects, also allows deletions and overwrites of thos...")
                 .with_provider_name("GrantWrite"),
         )
         .attribute(
-            AttributeSchema::new("grant_write_acp", AttributeType::String)
+            AttributeSchema::new("grant_write_acp", super::s3_grantee())
                 .with_description("Allows grantee to write the ACL for the applicable bucket. This functionality is not supported for directory buckets.")
                 .with_provider_name("GrantWriteACP"),
         )
