@@ -39,12 +39,12 @@ export default defineConfig({
         {
           label: 'Guides',
           items: [
-            { label: 'Writing Resources', link: '/guides/writing-resources/', badge: 'Soon' },
-            { label: 'Using Modules', link: '/guides/using-modules/', badge: 'Soon' },
-            { label: 'State Management', link: '/guides/state-management/', badge: 'Soon' },
-            { label: 'For / If Expressions', link: '/guides/for-if-expressions/', badge: 'Soon' },
-            { label: 'Functions', link: '/guides/functions/', badge: 'Soon' },
-            { label: 'LSP Setup', link: '/guides/lsp-setup/', badge: 'Soon' },
+            { label: 'Writing Resources', link: '/guides/writing-resources/' },
+            { label: 'Using Modules', link: '/guides/using-modules/' },
+            { label: 'State Management', link: '/guides/state-management/' },
+            { label: 'For / If Expressions', link: '/guides/for-if-expressions/' },
+            { label: 'Functions', link: '/guides/functions/' },
+            { label: 'LSP Setup', link: '/guides/lsp-setup/' },
           ],
         },
         {
