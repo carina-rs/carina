@@ -6,7 +6,7 @@ provider aws {
   region = aws.Region.ap_northeast_1
 }
 
-let vgw = aws.ec2.vpn_gateway {
+aws.ec2.vpn_gateway {
   type = aws.ec2.vpn_gateway.Type.ipsec.1
 
   tags = {

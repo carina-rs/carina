@@ -1,5 +1,5 @@
 #!/bin/bash
-# Check that example .crn files produce no warnings when validated.
+# Check that example and acceptance test .crn files produce no warnings when validated.
 #
 # The `carina validate` command exits 0 even when warnings are emitted,
 # so this script inspects the output text for warning indicators.
@@ -12,6 +12,20 @@ set -euo pipefail
 DIRS=(
     "carina-provider-aws/examples"
     "carina-provider-awscc/examples"
+    "carina-provider-aws/acceptance-tests"
+    "carina-provider-awscc/acceptance-tests"
+)
+
+# Files with unavoidable warnings (for expressions, if expressions, read data sources)
+SKIP_FILES=(
+    "carina-provider-aws/acceptance-tests/sts_caller_identity/basic.crn"
+    "carina-provider-awscc/acceptance-tests/for_expression/for_list.crn"
+    "carina-provider-awscc/acceptance-tests/for_expression/for_map.crn"
+    "carina-provider-awscc/acceptance-tests/for_expression/index_access.crn"
+    "carina-provider-awscc/acceptance-tests/if_expression/if_true.crn"
+    "carina-provider-awscc/acceptance-tests/secret_env/decrypt_tag.crn"
+    "carina-provider-awscc/acceptance-tests/secret_env/env_tag.crn"
+    "carina-provider-awscc/acceptance-tests/secret_env/secret_tag.crn"
 )
 
 # Build the CLI binary
@@ -31,6 +45,19 @@ for dir in "${DIRS[@]}"; do
     fi
 
     while IFS= read -r -d '' file; do
+        # Skip files with unavoidable warnings
+        skip=false
+        for skip_file in "${SKIP_FILES[@]}"; do
+            if [ "$file" = "$skip_file" ]; then
+                skip=true
+                break
+            fi
+        done
+        if $skip; then
+            PASSED=$((PASSED + 1))
+            continue
+        fi
+
         output=$("$CARINA" validate "$file" 2>&1) || {
             echo "ERROR: $file (non-zero exit)"
             echo "$output"
@@ -62,4 +89,4 @@ if [ "$WARNINGS" -gt 0 ]; then
     exit 1
 fi
 
-echo "All example .crn files are warning-free."
+echo "All .crn files are warning-free."

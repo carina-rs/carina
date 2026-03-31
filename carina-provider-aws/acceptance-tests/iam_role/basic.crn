@@ -6,7 +6,7 @@ provider aws {
   region = aws.Region.ap_northeast_1
 }
 
-let role = aws.iam.role {
+aws.iam.role {
   role_name = "carina-acceptance-test-role"
   assume_role_policy_document = {
     version = "2012-10-17"

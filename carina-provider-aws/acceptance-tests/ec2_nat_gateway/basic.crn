@@ -14,7 +14,7 @@ let vpc = aws.ec2.vpc {
   }
 }
 
-let igw = aws.ec2.internet_gateway {
+aws.ec2.internet_gateway {
   vpc_id = vpc.vpc_id
 
   tags = {
@@ -40,7 +40,7 @@ let eip = aws.ec2.eip {
   }
 }
 
-let nat_gw = aws.ec2.nat_gateway {
+aws.ec2.nat_gateway {
   allocation_id     = eip.allocation_id
   subnet_id         = subnet.subnet_id
   connectivity_type = aws.ec2.nat_gateway.ConnectivityType.public

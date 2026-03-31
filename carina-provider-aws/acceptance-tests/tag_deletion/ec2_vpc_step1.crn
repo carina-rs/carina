@@ -7,7 +7,7 @@ provider aws {
   region = aws.Region.ap_northeast_1
 }
 
-let vpc = aws.ec2.vpc {
+aws.ec2.vpc {
   cidr_block           = "10.100.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true

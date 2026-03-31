@@ -24,7 +24,7 @@ let sg = aws.ec2.security_group {
   }
 }
 
-let ingress = aws.ec2.security_group_ingress {
+aws.ec2.security_group_ingress {
   group_id    = sg.group_id
   description = "Allow HTTPS from IPv6"
   ip_protocol = "tcp"
@@ -33,7 +33,7 @@ let ingress = aws.ec2.security_group_ingress {
   cidr_ipv6   = "::/0"
 }
 
-let egress = aws.ec2.security_group_egress {
+aws.ec2.security_group_egress {
   group_id    = sg.group_id
   description = "Allow all IPv6 outbound"
   ip_protocol = all

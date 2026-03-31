@@ -24,7 +24,7 @@ let sg = aws.ec2.security_group {
   }
 }
 
-let ingress = aws.ec2.security_group_ingress {
+aws.ec2.security_group_ingress {
   group_id    = sg.group_id
   description = "Allow HTTPS from VPC"
   ip_protocol = "tcp"

@@ -7,7 +7,7 @@ moved {
   to   = awscc.ec2.vpc "main_vpc"
 }
 
-let main_vpc = awscc.ec2.vpc {
+awscc.ec2.vpc {
   cidr_block = "10.0.0.0/16"
 
   tags = {

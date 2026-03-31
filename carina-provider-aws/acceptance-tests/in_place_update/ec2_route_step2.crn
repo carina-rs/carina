@@ -21,7 +21,7 @@ let vpc = aws.ec2.vpc {
   }
 }
 
-let igw = aws.ec2.internet_gateway {
+aws.ec2.internet_gateway {
   vpc_id = vpc.vpc_id
 
   tags = {
