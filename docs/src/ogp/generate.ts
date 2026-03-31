@@ -7,9 +7,9 @@ import { regularPageTemplate, topPageTemplate } from "./templates.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-const interBold = readFileSync(join(__dirname, "fonts", "inter-bold.woff2"));
+const interBold = readFileSync(join(__dirname, "fonts", "inter-bold.ttf"));
 const interRegular = readFileSync(
-  join(__dirname, "fonts", "inter-regular.woff2"),
+  join(__dirname, "fonts", "inter-regular.ttf"),
 );
 
 const faviconData = readFileSync(
