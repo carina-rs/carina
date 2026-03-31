@@ -1,6 +1,7 @@
 pub mod apply;
 pub mod destroy;
 pub mod fmt;
+pub mod init;
 pub mod lint;
 pub mod module;
 pub mod plan;
