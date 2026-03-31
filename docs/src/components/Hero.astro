@@ -23,7 +23,7 @@ const planHtml = `<span class="prompt">$</span> carina plan main.crn
   <span class="attr">enable_dns_support:</span> <span class="bool">true</span>
 
 <span class="add">+</span> <span class="id">awscc.ec2.subnet</span>
-  <span class="attr">vpc_id:</span> <span class="computed">(computed)</span>
+  <span class="attr">vpc_id:</span> <span class="id">vpc</span>.vpc_id
   <span class="attr">cidr_block:</span> <span class="str">"10.0.1.0/24"</span>
 
 <span class="plan-summary">Plan: 2 to create, 0 to update, 0 to delete.</span>`;
@@ -104,17 +104,17 @@ const planHtml = `<span class="prompt">$</span> carina plan main.crn
 
   .hero-panel {
     flex: 1;
-    background: #1e293b;
-    border: 1px solid #334155;
+    background: var(--hero-panel-bg, #1e293b);
+    border: 1px solid var(--hero-panel-border, #334155);
     border-radius: 0.5rem;
     overflow: hidden;
     text-align: left;
   }
 
   .panel-header {
-    background: #162032;
+    background: var(--hero-panel-header-bg, #162032);
     padding: 0.4rem 0.75rem;
-    border-bottom: 1px solid #334155;
+    border-bottom: 1px solid var(--hero-panel-border, #334155);
     display: flex;
     align-items: center;
     gap: 0.5rem;
@@ -160,7 +160,7 @@ const planHtml = `<span class="prompt">$</span> carina plan main.crn
     font-family: var(--__sl-font-mono);
     font-size: var(--sl-text-xs);
     line-height: 1.7;
-    color: #e2e8f0;
+    color: var(--hero-code-color, #e2e8f0);
   }
 
   :global(.kw) { color: #22d3ee; }
@@ -194,11 +194,11 @@ const planHtml = `<span class="prompt">$</span> carina plan main.crn
   }
 
   .hero-btn.primary {
-    background: #d97706;
+    background: #0891b2;
     color: #fff;
   }
   .hero-btn.primary:hover {
-    background: #f59e0b;
+    background: #06b6d4;
   }
 
   .hero-btn.secondary {
@@ -216,16 +216,11 @@ const planHtml = `<span class="prompt">$</span> carina plan main.crn
     }
   }
 
-  :global([data-theme='light']) .hero-panel {
-    background: #f1f5f9;
-    border-color: #e2e8f0;
-  }
-  :global([data-theme='light']) .panel-header {
-    background: #e2e8f0;
-    border-color: #cbd5e1;
-  }
-  :global([data-theme='light']) .panel-body code {
-    color: #0f172a;
+  :global([data-theme='light']) .hero-custom {
+    --hero-panel-bg: #f1f5f9;
+    --hero-panel-border: #e2e8f0;
+    --hero-panel-header-bg: #e2e8f0;
+    --hero-code-color: #0f172a;
   }
   :global([data-theme='light'] .kw) { color: #0891b2; }
   :global([data-theme='light'] .id) { color: #0f172a; }
@@ -239,7 +234,7 @@ const planHtml = `<span class="prompt">$</span> carina plan main.crn
   :global([data-theme='light'] .add) { color: #16a34a; }
   :global([data-theme='light'] .computed) { color: #0891b2; }
   :global([data-theme='light'] .plan-summary) { color: #0891b2; }
-  :global([data-theme='light']) h1 { color: #d97706; }
+  :global([data-theme='light']) h1 { color: #b45309; }
   :global([data-theme='light']) .hero-star {
     box-shadow: 0 0 16px #fbbf24, 0 0 40px rgba(251, 191, 36, 0.3);
   }
