@@ -10,9 +10,18 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 CARINA="cargo run --bin carina --"
-STEP1="$SCRIPT_DIR/step1.crn"
-STEP2="$SCRIPT_DIR/step2.crn"
+
+# Build provider binaries (not built by cargo run --bin carina since Phase 4)
+cargo build -p carina-provider-awscc --bin carina-provider-awscc --quiet 2>/dev/null || cargo build -p carina-provider-awscc --bin carina-provider-awscc
+cargo build -p carina-provider-aws --bin carina-provider-aws --quiet 2>/dev/null || cargo build -p carina-provider-aws --bin carina-provider-aws
+
+source "$SCRIPT_DIR/../shared/_helpers.sh"
+
+STEP1=$(inject_provider_source "$SCRIPT_DIR/step1.crn")
+STEP2=$(inject_provider_source "$SCRIPT_DIR/step2.crn")
+trap "rm -f $STEP1 $STEP2" EXIT
 
 PASS=0
 FAIL=0
