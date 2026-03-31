@@ -105,6 +105,10 @@ awscc.ec2.subnet {
 You can define local `let` bindings inside a `for` body:
 
 ```crn
+let vpc = awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+}
+
 let subnets = for (i, az) in ["ap-northeast-1a", "ap-northeast-1c"] {
   let cidr = cidr_subnet("10.0.0.0/16", 8, i)
 

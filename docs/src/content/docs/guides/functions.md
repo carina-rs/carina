@@ -173,16 +173,15 @@ let result = names |> join(", ")
 
 ## Compose operator
 
-The compose operator `>>` creates a new function by chaining two partially applied functions:
+The compose operator `>>` creates a new function by chaining two partially applied functions (closures). Both sides must be closures:
 
 ```crn
-# Create a composed function
-let transform = upper >> replace("_", "-")
-
-# Equivalent to: replace("_", "-", upper(input))
+# replace("_", "-") is a closure (2 of 3 args provided)
+# split("_") is a closure (1 of 2 args provided)
+let transform = split("_") >> join("-")
 ```
 
-This is useful when you want to pass a transformation chain to higher-order operations like `map`.
+The resulting function applies the left function first, then passes the result to the right function.
 
 ## Partial application
 

@@ -194,7 +194,7 @@ let vpc = awscc.ec2.vpc {
   }
 }
 
-let subnet = awscc.ec2.subnet {
+awscc.ec2.subnet {
   vpc_id                  = vpc.vpc_id
   cidr_block              = "10.0.1.0/24"
   availability_zone       = "ap-northeast-1a"
