@@ -1,3 +1,53 @@
+/* ============================================
+   Ocean/Teal Deep Navy Theme
+   ============================================ */
+
+/* Dark mode (default) */
+:root {
+  /* Gray scale: Slate palette (hue 215) */
+  --sl-color-white: hsl(0, 0%, 100%);
+  --sl-color-gray-1: hsl(214, 32%, 91%); /* #e2e8f0 Slate 200 */
+  --sl-color-gray-2: hsl(215, 16%, 62%); /* #94a3b8 Slate 400 */
+  --sl-color-gray-3: hsl(215, 14%, 46%); /* #64748b Slate 500 */
+  --sl-color-gray-4: hsl(217, 19%, 35%); /* #475569 Slate 600 */
+  --sl-color-gray-5: hsl(217, 33%, 17%); /* #1e293b Slate 800 */
+  --sl-color-gray-6: hsl(222, 47%, 11%); /* #0f172a Slate 900 */
+  --sl-color-black: hsl(229, 84%, 5%);   /* #020617 Slate 950 */
+
+  /* Accent: Cyan */
+  --sl-color-accent-low: hsl(192, 70%, 15%);  /* ~#164e63 Cyan 900 */
+  --sl-color-accent: hsl(192, 91%, 36%);       /* ~#0891b2 Cyan 600 */
+  --sl-color-accent-high: hsl(186, 78%, 58%);  /* ~#22d3ee Cyan 400 */
+}
+
+/* Light mode */
+:root[data-theme='light'] {
+  /* Gray scale: Slate palette (light) */
+  --sl-color-white: hsl(210, 40%, 8%);   /* #0f172a Slate 900 */
+  --sl-color-gray-1: hsl(215, 25%, 17%); /* #1e293b Slate 800 */
+  --sl-color-gray-2: hsl(215, 14%, 34%); /* #475569 Slate 600 */
+  --sl-color-gray-3: hsl(215, 14%, 46%); /* #64748b Slate 500 */
+  --sl-color-gray-4: hsl(215, 16%, 62%); /* #94a3b8 Slate 400 */
+  --sl-color-gray-5: hsl(214, 32%, 91%); /* #e2e8f0 Slate 200 */
+  --sl-color-gray-6: hsl(210, 40%, 96%); /* #f1f5f9 Slate 100 */
+  --sl-color-gray-7: hsl(210, 40%, 98%); /* #f8fafc Slate 50 */
+  --sl-color-black: hsl(0, 0%, 100%);    /* white */
+
+  /* Accent: Cyan (darker for contrast on light BG) */
+  --sl-color-accent-low: hsl(189, 94%, 93%);  /* ~#ecfeff Cyan 50 */
+  --sl-color-accent: hsl(192, 82%, 31%);       /* ~#0e7490 Cyan 700 */
+  --sl-color-accent-high: hsl(192, 91%, 36%);  /* ~#0891b2 Cyan 600 */
+}
+
+/* Code block theme */
+:root {
+  --astro-code-background: hsl(217, 33%, 17%); /* Slate 800 - matches sidebar */
+  --astro-code-token-keyword: var(--sl-color-accent-high); /* Cyan instead of purple */
+}
+:root[data-theme='light'] {
+  --astro-code-background: hsl(210, 40%, 96%); /* Slate 100 */
+}
+
 /* Provider doc table styling */
 table {
   width: 100%;
@@ -15,4 +65,48 @@ table th:nth-child(3),
 table td:nth-child(3) {
   min-width: 80px;
   white-space: nowrap;
+}
+
+/* Table header and stripe rows */
+table thead th {
+  background-color: var(--sl-color-accent-low);
+  color: var(--sl-color-white);
+}
+table tbody tr:nth-child(even) {
+  background-color: var(--sl-color-gray-6);
+}
+table td, table th {
+  border-color: var(--sl-color-hairline-light);
+}
+
+/* Feature cards: consistent cyan accent with left border */
+.card {
+  --sl-card-border: var(--sl-color-accent);
+  --sl-card-bg: var(--sl-color-accent-low);
+  border-color: var(--sl-color-gray-5);
+  border-left: 3px solid var(--sl-color-accent);
+  transition: border-color 0.2s ease;
+}
+.card:hover {
+  border-color: var(--sl-color-accent);
+}
+.card .icon {
+  color: var(--sl-color-accent);
+}
+/* Override per-card color rotation to use consistent cyan */
+.card:nth-child(4n + 1) {
+  --sl-card-border: var(--sl-color-accent);
+  --sl-card-bg: var(--sl-color-accent-low);
+}
+.card:nth-child(4n + 3) {
+  --sl-card-border: var(--sl-color-accent);
+  --sl-card-bg: var(--sl-color-accent-low);
+}
+.card:nth-child(4n + 4) {
+  --sl-card-border: var(--sl-color-accent);
+  --sl-card-bg: var(--sl-color-accent-low);
+}
+.card:nth-child(4n + 5) {
+  --sl-card-border: var(--sl-color-accent);
+  --sl-card-bg: var(--sl-color-accent-low);
 }
