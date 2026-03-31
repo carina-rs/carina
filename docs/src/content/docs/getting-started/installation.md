@@ -7,7 +7,7 @@ Carina is distributed as a Rust binary built from source.
 
 ## Prerequisites
 
-- **Rust toolchain** (1.75 or later) -- install via [rustup](https://rustup.rs/)
+- **Rust toolchain** (stable) -- install via [rustup](https://rustup.rs/)
 - **AWS credentials** -- required for `plan` and `apply` commands. Configure via environment variables, `~/.aws/credentials`, or IAM roles.
 
 ## Build from source
