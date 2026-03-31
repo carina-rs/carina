@@ -1,0 +1,161 @@
+---
+title: "State Management"
+description: "Learn how Carina tracks infrastructure state, configure an S3 backend, import existing resources, move and remove state entries, and reference remote state."
+---
+
+Carina uses a state file to track which resources it manages and their current attributes. This guide covers how to configure state storage, manipulate state entries, and share state between projects.
+
+## How state works
+
+When you run `carina apply`, Carina records each managed resource and its attributes in a state file. On subsequent runs, it compares the desired state (your `.crn` files) with the recorded state to determine what needs to change.
+
+By default, state is stored locally as `carina.state.json`. For team usage, configure a remote S3 backend.
+
+## Configuring the S3 backend
+
+Add a `backend` block to your `.crn` file:
+
+```crn
+backend s3 {
+  bucket = "my-carina-state"
+  key    = "production/carina.state.json"
+  region = "ap-northeast-1"
+}
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+
+  tags = {
+    Name = "my-vpc"
+  }
+}
+```
+
+The S3 backend stores state in the specified bucket and key. It also supports state locking to prevent concurrent modifications.
+
+## Importing existing resources
+
+To bring an existing cloud resource under Carina management, use the `import` block:
+
+```crn
+import {
+  to = awscc.ec2.vpc "my-vpc"
+  id = "vpc-0abc123def456"
+}
+
+awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+
+  tags = {
+    Name = "my-vpc"
+  }
+}
+```
+
+- `to` specifies the resource type and the name Carina will use in state
+- `id` is the cloud provider's identifier for the existing resource
+
+Run `carina plan` to verify the import matches the resource definition, then `carina apply` to record it in state.
+
+## Moving resources in state
+
+When you rename a resource or reorganize your code, use the `moved` block to update the state without destroying and recreating the resource:
+
+```crn
+moved {
+  from = awscc.ec2.vpc "vpc"
+  to   = awscc.ec2.vpc "main_vpc"
+}
+
+awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+
+  tags = {
+    Name = "my-vpc"
+  }
+}
+```
+
+After the move is applied, you can remove the `moved` block from your code.
+
+## Removing resources from state
+
+To stop managing a resource without destroying it in the cloud, use the `removed` block:
+
+```crn
+removed {
+  from = awscc.ec2.vpc "main_vpc"
+}
+```
+
+This removes the resource from Carina's state but leaves the actual cloud resource untouched. This is useful when transferring ownership of a resource to another tool or project.
+
+## Referencing remote state
+
+To read outputs from another Carina project's state, use `remote_state`:
+
+```crn
+let network = remote_state {
+  path = "network.state.json"
+}
+
+awscc.ec2.security_group {
+  group_description = "Web security group"
+  vpc_id            = network.vpc.vpc_id
+
+  tags = {
+    Name = "web-sg"
+  }
+}
+```
+
+The `remote_state` block loads another project's state file and makes its resource attributes available through the binding. In this example, `network.vpc.vpc_id` references the `vpc_id` attribute of the `vpc` resource from the network project's state.
+
+You can also specify the backend type explicitly:
+
+```crn
+let network = remote_state "s3" {
+  bucket = "carina-state"
+  key    = "network/carina.state.json"
+  region = "ap-northeast-1"
+}
+```
+
+## State CLI commands
+
+Carina provides several CLI commands for inspecting and managing state:
+
+```bash
+# List all managed resources
+carina state list
+
+# Show all resources with full attributes
+carina state show
+
+# Look up a specific resource or attribute
+carina state lookup vpc
+carina state lookup vpc.vpc_id
+
+# Refresh state from cloud providers
+carina state refresh
+
+# Force unlock a stuck state lock
+carina force-unlock <lock-id>
+
+# Delete a state bucket (destructive)
+carina state bucket-delete <bucket-name> --force
+```
+
+## State locking
+
+When using the S3 backend, Carina automatically locks state during `apply` and `destroy` operations to prevent concurrent modifications. If a lock gets stuck (for example, after a crash), use `carina force-unlock` to release it.
+
+You can disable locking with the `--lock=false` flag:
+
+```bash
+carina apply --lock=false
+```
