@@ -126,7 +126,7 @@ flatten([[1, [2, 3]]])  # => [1, [2, 3]]
 
 ### `length`
 
-Returns the number of elements in a list or map, or the number of bytes in a string.
+Returns the number of elements in a list or map, or the number of characters in a string.
 
 ```
 length(value: list | map | string) -> int

@@ -209,15 +209,30 @@ let result = ["prod", "web"]
 
 ## Compose Operator (`>>`)
 
-The compose operator (`>>`) combines two functions into a new function. The result of the first function is passed to the second. This is useful for creating reusable transformation pipelines.
+The compose operator (`>>`) combines two partially applied functions into a new function. The result of the first function is passed as input to the second. Both sides of `>>` must be closures (partially applied functions).
 
 ```crn
-# Create a composed function
-let transform = upper >> trim
+# Compose split and join into a single function
+let transform = split(",") >> join("-")
 
-# Use it with pipe
-let result = "  hello  " |> transform
-# => "HELLO"
+# Apply the composed function via pipe
+let result = "a,b,c" |> transform()
+# => "a-b-c"
+```
+
+Compose works with any partially applied built-in function:
+
+```crn
+# Extract IDs from a list of maps, then join them
+let pipeline = map(".id") >> join(", ")
+let result = [{ id = "1" }, { id = "2" }] |> pipeline()
+# => "1, 2"
+```
+
+Three or more functions can be composed:
+
+```crn
+let transform = split(",") >> join("-") >> split("-")
 ```
 
 The compose operator binds tighter than the pipe operator, so `f >> g |> h` means `(f >> g) |> h`.
