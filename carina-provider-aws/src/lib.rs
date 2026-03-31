@@ -15,6 +15,7 @@ mod services;
 mod tests;
 
 pub use factory::AwsProviderFactory;
+pub use normalizer::AwsNormalizer;
 
 use aws_config::Region;
 use aws_sdk_cloudwatchlogs::Client as CloudWatchLogsClient;

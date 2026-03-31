@@ -10,7 +10,14 @@ homepage.workspace = true
 [lib]
 doctest = false
 
+[[bin]]
+name = "carina-provider-aws"
+path = "src/main.rs"
+
 [dependencies]
+carina-plugin-host = { path = "../carina-plugin-host" }
+carina-plugin-sdk = { path = "../carina-plugin-sdk" }
+carina-provider-protocol = { path = "../carina-provider-protocol" }
 carina-core = { path = "../carina-core" }
 carina-aws-types = { path = "../carina-aws-types" }
 aws-config = "1"
