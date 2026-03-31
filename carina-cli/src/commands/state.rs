@@ -22,8 +22,8 @@ use super::validate_and_resolve_with_config;
 use crate::commands::apply::apply_name_overrides;
 use crate::error::AppError;
 use crate::wiring::{
-    WiringContext, get_provider_with_ctx, reconcile_anonymous_identifiers_with_ctx,
-    reconcile_prefixed_names,
+    WiringContext, build_factories_from_providers, get_provider_with_ctx,
+    reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
 };
 
 /// Convert a lock acquisition error into an `AppError`.
@@ -498,7 +498,9 @@ async fn run_state_bucket_delete(
     let backend_resource_type = backend
         .resource_type()
         .ok_or("Backend does not specify a resource type")?;
-    let ctx = WiringContext::new();
+    let base_dir = get_base_dir(path);
+    let factories = build_factories_from_providers(&parsed.providers, base_dir);
+    let ctx = WiringContext::new(factories);
     let factory = provider_mod::find_factory(ctx.factories(), backend_provider_name)
         .ok_or_else(|| format!("No provider factory found for '{}'", backend_provider_name))?;
 
@@ -597,7 +599,8 @@ pub(crate) async fn run_state_refresh_locked(
     lock: Option<&LockInfo>,
     base_dir: &std::path::Path,
 ) -> Result<(), AppError> {
-    let ctx = WiringContext::new();
+    let factories = build_factories_from_providers(&parsed.providers, base_dir);
+    let ctx = WiringContext::new(factories);
 
     // Read current state from backend
     let mut state_file = backend.read_state().await.map_err(AppError::Backend)?;

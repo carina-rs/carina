@@ -16,9 +16,9 @@ use carina_core::parser::{ParsedFile, ProviderContext};
 
 use crate::error::AppError;
 use crate::wiring::{
-    WiringContext, compute_anonymous_identifiers_with_ctx, resolve_names_with_ctx,
-    validate_module_calls, validate_provider_region_with_ctx, validate_resource_ref_types_with_ctx,
-    validate_resources_with_ctx,
+    WiringContext, build_factories_from_providers, compute_anonymous_identifiers_with_ctx,
+    resolve_names_with_ctx, validate_module_calls, validate_provider_region_with_ctx,
+    validate_resource_ref_types_with_ctx, validate_resources_with_ctx,
 };
 
 /// Run the common validation and module resolution pipeline.
@@ -54,7 +54,8 @@ pub fn validate_and_resolve_with_config(
     skip_resource_validation: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let ctx = WiringContext::new();
+    let factories = build_factories_from_providers(&parsed.providers, base_dir);
+    let ctx = WiringContext::new(factories);
 
     // Validate provider region
     validate_provider_region_with_ctx(&ctx, parsed)?;

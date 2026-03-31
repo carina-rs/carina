@@ -21,8 +21,6 @@ use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::schema::{ResourceSchema, resolve_block_names};
 use carina_core::utils;
 use carina_core::validation;
-use carina_provider_aws::AwsProviderFactory;
-use carina_provider_awscc::AwsccProviderFactory;
 use carina_provider_mock::MockProvider;
 use carina_state::StateFile;
 
@@ -50,9 +48,7 @@ pub struct WiringContext {
 }
 
 impl WiringContext {
-    pub fn new() -> Self {
-        let factories: Vec<Box<dyn ProviderFactory>> =
-            vec![Box::new(AwsProviderFactory), Box::new(AwsccProviderFactory)];
+    pub fn new(factories: Vec<Box<dyn ProviderFactory>>) -> Self {
         let schemas = provider_mod::collect_schemas(&factories);
         Self { factories, schemas }
     }
@@ -64,6 +60,68 @@ impl WiringContext {
     pub fn schemas(&self) -> &HashMap<String, ResourceSchema> {
         &self.schemas
     }
+}
+
+/// Build provider factories from provider configs that have a `source` attribute.
+///
+/// For each provider with a `source`, resolves the binary path and creates a
+/// `ProcessProviderFactory`. Providers without `source` are skipped (handled
+/// later in `get_provider_with_ctx`).
+pub fn build_factories_from_providers(
+    providers: &[ProviderConfig],
+    base_dir: &Path,
+) -> Vec<Box<dyn ProviderFactory>> {
+    let mut factories: Vec<Box<dyn ProviderFactory>> = Vec::new();
+
+    for config in providers {
+        let source = match &config.source {
+            Some(s) => s.clone(),
+            None => continue,
+        };
+
+        let binary_path = if let Some(path) = source.strip_prefix("file://") {
+            std::path::PathBuf::from(path)
+        } else if source.starts_with("github.com/") {
+            match crate::provider_resolver::resolve_single_config(base_dir, config) {
+                Ok(path) => path,
+                Err(e) => {
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "Failed to resolve provider '{}' from '{}': {}",
+                            config.name, source, e
+                        )
+                        .red()
+                    );
+                    continue;
+                }
+            }
+        } else {
+            eprintln!(
+                "{}",
+                format!(
+                    "Unsupported source format for provider '{}': {}. Use file:// or github.com/owner/repo.",
+                    config.name, source
+                )
+                .red()
+            );
+            continue;
+        };
+
+        match carina_plugin_host::ProcessProviderFactory::new(binary_path) {
+            Ok(factory) => {
+                factories.push(Box::new(factory));
+            }
+            Err(e) => {
+                eprintln!(
+                    "{}",
+                    format!("Failed to load provider '{}': {}", config.name, e).red()
+                );
+            }
+        }
+    }
+
+    factories
 }
 
 pub fn validate_resources_with_ctx(
@@ -368,7 +426,7 @@ pub async fn get_provider_with_ctx(
             continue;
         }
 
-        // Otherwise, use the hardcoded factory lookup (existing behavior)
+        // Otherwise, look up from the dynamic factories passed to WiringContext
         if let Some(factory) = provider_mod::find_factory(ctx.factories(), &provider_config.name) {
             let region = factory.extract_region(&provider_config.attributes);
             println!(
@@ -380,6 +438,15 @@ pub async fn get_provider_with_ctx(
             if let Some(ext) = factory.create_normalizer(&provider_config.attributes).await {
                 router.add_normalizer(ext);
             }
+        } else if !provider_config.name.is_empty() {
+            eprintln!(
+                "{}",
+                format!(
+                    "Provider '{}' requires 'source' and 'version' attributes.",
+                    provider_config.name
+                )
+                .red()
+            );
         }
     }
 
@@ -454,7 +521,8 @@ pub async fn create_providers_from_configs(
     configs: &[ProviderConfig],
     base_dir: &Path,
 ) -> ProviderRouter {
-    let ctx = WiringContext::new();
+    let factories = build_factories_from_providers(configs, base_dir);
+    let ctx = WiringContext::new(factories);
     let mut router = ProviderRouter::new();
 
     for config in configs {
@@ -508,7 +576,8 @@ pub async fn create_plan_from_parsed_with_remote(
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     base_dir: &Path,
 ) -> Result<PlanContext, AppError> {
-    let ctx = WiringContext::new();
+    let factories = build_factories_from_providers(&parsed.providers, base_dir);
+    let ctx = WiringContext::new(factories);
     let sorted_resources =
         sort_resources_by_dependencies(&parsed.resources).map_err(AppError::Validation)?;
 
@@ -883,19 +952,19 @@ pub async fn read_with_retry(
 /// which is acceptable in test code where the overhead is negligible.
 #[cfg(test)]
 pub fn validate_resources(resources: &[Resource]) -> Result<(), AppError> {
-    let ctx = WiringContext::new();
+    let ctx = WiringContext::new(vec![]);
     validate_resources_with_ctx(&ctx, resources)
 }
 
 #[cfg(test)]
 pub fn resolve_names(resources: &mut [Resource]) -> Result<(), AppError> {
-    let ctx = WiringContext::new();
+    let ctx = WiringContext::new(vec![]);
     resolve_names_with_ctx(&ctx, resources)
 }
 
 #[cfg(test)]
 pub fn resolve_attr_prefixes(resources: &mut [Resource]) -> Result<(), AppError> {
-    let ctx = WiringContext::new();
+    let ctx = WiringContext::new(vec![]);
     resolve_attr_prefixes_with_ctx(&ctx, resources)
 }
 
@@ -904,13 +973,13 @@ pub fn compute_anonymous_identifiers(
     resources: &mut [Resource],
     providers: &[ProviderConfig],
 ) -> Result<(), AppError> {
-    let ctx = WiringContext::new();
+    let ctx = WiringContext::new(vec![]);
     compute_anonymous_identifiers_with_ctx(&ctx, resources, providers)
 }
 
 #[cfg(test)]
 pub fn resolve_enum_aliases(resources: &mut [Resource]) {
-    let ctx = WiringContext::new();
+    let ctx = WiringContext::new(vec![]);
     resolve_enum_aliases_with_ctx(&ctx, resources)
 }
 
@@ -984,7 +1053,7 @@ mod tests {
     #[test]
     fn test_resolve_enum_aliases_in_states() {
         // Current states should also have aliases resolved
-        let ctx = WiringContext::new();
+        let ctx = WiringContext::new(vec![]);
         let id = ResourceId::with_provider("awscc", "ec2.security_group_egress", "test-rule");
         let mut attrs = HashMap::new();
         attrs.insert(
@@ -1060,7 +1129,7 @@ mod tests {
         use carina_core::resource::LifecycleConfig;
         use carina_core::schema::ResourceSchema;
 
-        let ctx = WiringContext::new();
+        let ctx = WiringContext::new(vec![]);
 
         // Desired resource with normalized DSL enum value (after normalize_desired)
         let mut resource = Resource::with_provider("awscc", "ec2.vpc", "test-vpc");
@@ -1196,7 +1265,7 @@ mod tests {
         );
 
         // After merge_default_tags, desired resource gains the default tags → no diff
-        let ctx = WiringContext::new();
+        let ctx = WiringContext::new(vec![]);
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("failed to build tokio runtime");

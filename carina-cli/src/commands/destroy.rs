@@ -33,7 +33,7 @@ use crate::commands::state::map_lock_error;
 use crate::display::{format_destroy_plan, format_effect};
 use crate::error::AppError;
 use crate::wiring::{
-    WiringContext, get_provider_with_ctx, read_with_retry,
+    WiringContext, build_factories_from_providers, get_provider_with_ctx, read_with_retry,
     reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
 };
 
@@ -127,7 +127,8 @@ async fn run_destroy_locked(
     refresh: bool,
     base_dir: &std::path::Path,
 ) -> Result<(), AppError> {
-    let ctx = WiringContext::new();
+    let factories = build_factories_from_providers(&parsed.providers, base_dir);
+    let ctx = WiringContext::new(factories);
 
     // Read current state from backend
     let state_file = backend.read_state().await.map_err(AppError::Backend)?;

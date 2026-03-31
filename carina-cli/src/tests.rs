@@ -2043,7 +2043,7 @@ async fn finalize_apply_without_lock_uses_write_state() {
 /// without repeated allocations.
 #[test]
 fn wiring_context_constructs_factories_and_schemas_once() {
-    let ctx = WiringContext::new();
+    let ctx = WiringContext::new(vec![]);
 
     // Factories should include at least aws and awscc
     assert!(

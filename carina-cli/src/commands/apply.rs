@@ -38,8 +38,9 @@ use crate::commands::state::map_lock_error;
 use crate::display::{format_effect, print_plan};
 use crate::error::AppError;
 use crate::wiring::{
-    WiringContext, create_providers_from_configs, get_provider_with_ctx, read_with_retry,
-    reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names, resolve_names_with_ctx,
+    WiringContext, build_factories_from_providers, create_providers_from_configs,
+    get_provider_with_ctx, read_with_retry, reconcile_anonymous_identifiers_with_ctx,
+    reconcile_prefixed_names, resolve_names_with_ctx,
 };
 
 /// Format a duration as a human-readable string like "3.2s" or "1m 5.3s".
@@ -752,12 +753,13 @@ pub async fn run_apply(
     lock: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let ctx = WiringContext::new();
     let loaded = load_configuration_with_config(path, provider_context)?;
     let mut parsed = loaded.parsed;
     let backend_file = loaded.backend_file;
 
     let base_dir = get_base_dir(path);
+    let factories = build_factories_from_providers(&parsed.providers, base_dir);
+    let ctx = WiringContext::new(factories);
     validate_and_resolve_with_config(&mut parsed, base_dir, false, provider_context)?;
 
     // Check for backend configuration - use local backend by default
@@ -1548,7 +1550,8 @@ async fn run_apply_from_plan_locked(
     execute_state_only_effects(plan, &mut result);
 
     // Build schemas for write-only attribute persistence
-    let ctx = WiringContext::new();
+    let factories = build_factories_from_providers(&plan_file.provider_configs, base_dir);
+    let ctx = WiringContext::new(factories);
 
     finalize_apply(FinalizeApplyInput {
         result: &result,

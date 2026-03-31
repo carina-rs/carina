@@ -75,7 +75,7 @@ fn build_plan_and_states_from_fixture(
     };
 
     // Reconcile identifiers with state (same as plan command)
-    let wiring = WiringContext::new();
+    let wiring = WiringContext::new(vec![]);
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
     if let Some(sf) = state_file.as_ref() {
         reconcile_anonymous_identifiers_with_ctx(&wiring, &mut parsed.resources, sf);
