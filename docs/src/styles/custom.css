@@ -15,6 +15,9 @@
   --sl-color-gray-6: hsl(222, 47%, 11%); /* #0f172a Slate 900 */
   --sl-color-black: hsl(229, 84%, 5%);   /* #020617 Slate 950 */
 
+  /* Nav bar: match page background */
+  --sl-color-bg-nav: var(--sl-color-black);
+
   /* Accent: Canopus Gold (Amber/Yellow) */
   --sl-color-accent-low: hsl(32, 60%, 15%);   /* dark amber */
   --sl-color-accent: hsl(43, 96%, 56%);        /* ~#fbbf24 Yellow 400 */
