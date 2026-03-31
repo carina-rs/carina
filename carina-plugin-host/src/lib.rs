@@ -1,1 +1,7 @@
-// Placeholder — will be implemented in Task 4
+pub mod convert;
+pub mod factory;
+pub mod process;
+pub mod provider;
+
+pub use factory::ProcessProviderFactory;
+pub use provider::ProcessProvider;
