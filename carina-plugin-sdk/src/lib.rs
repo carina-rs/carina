@@ -62,6 +62,25 @@ pub trait CarinaProvider {
     fn normalize_state(&self, states: HashMap<String, State>) -> HashMap<String, State> {
         states
     }
+
+    /// Hydrate read state with saved attributes that APIs don't return.
+    fn hydrate_read_state(
+        &self,
+        states: &mut HashMap<String, State>,
+        saved_attrs: &HashMap<String, HashMap<String, Value>>,
+    ) {
+        let _ = (states, saved_attrs);
+    }
+
+    /// Merge provider default_tags into resources.
+    fn merge_default_tags(
+        &self,
+        resources: &mut Vec<Resource>,
+        default_tags: &HashMap<String, Value>,
+        schemas: &Vec<ResourceSchema>,
+    ) {
+        let _ = (resources, default_tags, schemas);
+    }
 }
 
 /// Start the JSON-RPC server loop.
@@ -219,6 +238,26 @@ fn dispatch(provider: &mut impl CarinaProvider, request: &Request) -> Response {
             };
             let states = provider.normalize_state(params.states);
             Response::success(id, methods::NormalizeStateResult { states })
+        }
+
+        "hydrate_read_state" => {
+            let params: methods::HydrateReadStateParams = match parse_params(&request.params) {
+                Ok(p) => p,
+                Err(e) => return Response::error(id, -32602, e),
+            };
+            let mut states = params.states;
+            provider.hydrate_read_state(&mut states, &params.saved_attrs);
+            Response::success(id, methods::HydrateReadStateResult { states })
+        }
+
+        "merge_default_tags" => {
+            let params: methods::MergeDefaultTagsParams = match parse_params(&request.params) {
+                Ok(p) => p,
+                Err(e) => return Response::error(id, -32602, e),
+            };
+            let mut resources = params.resources;
+            provider.merge_default_tags(&mut resources, &params.default_tags, &params.schemas);
+            Response::success(id, methods::MergeDefaultTagsResult { resources })
         }
 
         "shutdown" => Response::success(id, serde_json::json!({"ok": true})),
