@@ -1,0 +1,13 @@
+[package]
+name = "carina-plugin-sdk"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[lib]
+doctest = false
+
+[dependencies]
+carina-provider-protocol = { path = "../carina-provider-protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
