@@ -63,11 +63,11 @@ export default defineConfig({
             {
               label: 'CLI Commands',
               items: [
-                { label: 'plan', link: '/reference/cli/plan/', badge: 'Soon' },
-                { label: 'apply', link: '/reference/cli/apply/', badge: 'Soon' },
-                { label: 'validate', link: '/reference/cli/validate/', badge: 'Soon' },
-                { label: 'state', link: '/reference/cli/state/', badge: 'Soon' },
-                { label: 'module info', link: '/reference/cli/module-info/', badge: 'Soon' },
+                { label: 'plan', link: '/reference/cli/plan/' },
+                { label: 'apply', link: '/reference/cli/apply/' },
+                { label: 'validate', link: '/reference/cli/validate/' },
+                { label: 'state', link: '/reference/cli/state/' },
+                { label: 'module info', link: '/reference/cli/module-info/' },
               ],
             },
             {
