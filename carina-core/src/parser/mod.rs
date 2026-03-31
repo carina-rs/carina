@@ -1126,9 +1126,65 @@ fn parse_pipe_expr_with_resource_or_module(
     binding_name: &str,
 ) -> Result<LetBindingRhs, ParseError> {
     let mut inner = pair.into_inner();
-    let primary = next_pair(&mut inner, "primary expression", "pipe expression")?;
+    let compose_pair = next_pair(&mut inner, "compose expression", "pipe expression")?;
+
+    // Unwrap compose_expr: get its inner pairs
+    let mut compose_inner = compose_pair.into_inner();
+    let primary = next_pair(
+        &mut compose_inner,
+        "primary expression",
+        "compose expression",
+    )?;
     let (mut value, expanded_resources, module_calls, maybe_import, maybe_remote_state) =
         parse_primary_with_resource_or_module(primary, ctx, binding_name)?;
+
+    // Handle >> composition within the compose_expr
+    let compose_rhs: Vec<_> = compose_inner.collect();
+    if !compose_rhs.is_empty() {
+        // Process the compose chain
+        for rhs_pair in compose_rhs {
+            let rhs = parse_primary_value(rhs_pair, ctx)?;
+
+            if !value.is_closure() {
+                return Err(ParseError::InvalidExpression {
+                    line: 0,
+                    message: format!(
+                        "left side of >> must be a Closure (partially applied function), got {}",
+                        value_type_name(&value)
+                    ),
+                });
+            }
+            if !rhs.is_closure() {
+                return Err(ParseError::InvalidExpression {
+                    line: 0,
+                    message: format!(
+                        "right side of >> must be a Closure (partially applied function), got {}",
+                        value_type_name(&rhs)
+                    ),
+                });
+            }
+
+            let functions = if let Value::Closure {
+                name,
+                captured_args,
+                ..
+            } = &value
+                && name == "__compose__"
+            {
+                let mut fns = captured_args.clone();
+                fns.push(rhs);
+                fns
+            } else {
+                vec![value, rhs]
+            };
+
+            value = Value::Closure {
+                name: "__compose__".to_string(),
+                captured_args: functions,
+                remaining_arity: 1,
+            };
+        }
+    }
 
     // Desugar pipe: `x |> f(args)` becomes `f(x, args)`
     for func_call_pair in inner {
@@ -2871,13 +2927,71 @@ fn parse_expression(
     parse_pipe_expr(inner, ctx)
 }
 
+fn parse_compose_expr(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+) -> Result<Value, ParseError> {
+    let mut inner = pair.into_inner();
+    let first = next_pair(&mut inner, "primary expression", "compose expression")?;
+    let mut value = parse_primary_value(first, ctx)?;
+
+    // Collect remaining primaries for >> composition
+    for rhs_pair in inner {
+        let rhs = parse_primary_value(rhs_pair, ctx)?;
+
+        // Both sides must be Closures
+        if !value.is_closure() {
+            return Err(ParseError::InvalidExpression {
+                line: 0,
+                message: format!(
+                    "left side of >> must be a Closure (partially applied function), got {}",
+                    value_type_name(&value)
+                ),
+            });
+        }
+        if !rhs.is_closure() {
+            return Err(ParseError::InvalidExpression {
+                line: 0,
+                message: format!(
+                    "right side of >> must be a Closure (partially applied function), got {}",
+                    value_type_name(&rhs)
+                ),
+            });
+        }
+
+        // Build a composed closure: __compose__ with the chain stored in captured_args
+        // If the left side is already a __compose__, extend the chain; otherwise start a new one
+        let functions = if let Value::Closure {
+            name,
+            captured_args,
+            ..
+        } = &value
+            && name == "__compose__"
+        {
+            let mut fns = captured_args.clone();
+            fns.push(rhs);
+            fns
+        } else {
+            vec![value, rhs]
+        };
+
+        value = Value::Closure {
+            name: "__compose__".to_string(),
+            captured_args: functions,
+            remaining_arity: 1,
+        };
+    }
+
+    Ok(value)
+}
+
 fn parse_pipe_expr(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
 ) -> Result<Value, ParseError> {
     let mut inner = pair.into_inner();
-    let primary = next_pair(&mut inner, "primary expression", "pipe expression")?;
-    let mut value = parse_primary_value(primary, ctx)?;
+    let compose = next_pair(&mut inner, "compose expression", "pipe expression")?;
+    let mut value = parse_compose_expr(compose, ctx)?;
 
     // Desugar pipe: `x |> f(args)` becomes `f(x, args)`
     for func_call_pair in inner {
@@ -8829,5 +8943,144 @@ arguments {
             }
             other => panic!("Expected Var('nullable'), got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_compose_operator_produces_closure() {
+        // map(".id") >> join(",") should produce a composed Closure
+        let input = r#"
+            let f = map(".id") >> join(",")
+            let result = [{ id = "a" }, { id = "b" }] |> f()
+        "#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+
+        // f should be a Closure with name "__compose__"
+        match result.variables.get("f").unwrap() {
+            Value::Closure { name, .. } => {
+                assert_eq!(name, "__compose__");
+            }
+            other => panic!("Expected Closure, got {:?}", other),
+        }
+
+        // result should be the string "a,b"
+        assert_eq!(
+            result.variables.get("result").unwrap(),
+            &Value::String("a,b".to_string())
+        );
+    }
+
+    #[test]
+    fn test_compose_operator_with_pipe() {
+        // Compose then use via pipe
+        let input = r#"
+            let transform = map(".name") >> join(", ")
+            let names = [{ name = "alice" }, { name = "bob" }] |> transform()
+        "#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(
+            result.variables.get("names").unwrap(),
+            &Value::String("alice, bob".to_string())
+        );
+    }
+
+    #[test]
+    fn test_compose_operator_two_step_chain() {
+        // split(",") >> join("-") composed and applied
+        let input = r#"
+            let transform = split(",") >> join("-")
+            let result = "a,b,c" |> transform()
+        "#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(
+            result.variables.get("result").unwrap(),
+            &Value::String("a-b-c".to_string())
+        );
+    }
+
+    #[test]
+    fn test_compose_operator_error_on_non_closure_lhs() {
+        // "hello" >> join(",") should fail
+        let input = r#"
+            let f = "hello" >> join(",")
+        "#;
+        let result = parse(input, &ProviderContext::default());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("left side of >> must be a Closure"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_compose_operator_error_on_non_closure_rhs() {
+        // join(",") >> "hello" should fail
+        let input = r#"
+            let f = join(",") >> "hello"
+        "#;
+        let result = parse(input, &ProviderContext::default());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("right side of >> must be a Closure"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_compose_operator_precedence_with_pipe() {
+        // Compose used with pipe via variable
+        let input = r#"
+            let pipeline = map(".x") >> join("-")
+            let data = [{ x = "1" }, { x = "2" }]
+            let result = data |> pipeline()
+        "#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(
+            result.variables.get("result").unwrap(),
+            &Value::String("1-2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_compose_three_functions() {
+        // Three-way composition structure check
+        let input = r#"
+            let transform = split(",") >> join("-") >> split("-")
+        "#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        match result.variables.get("transform").unwrap() {
+            Value::Closure {
+                name,
+                captured_args,
+                remaining_arity,
+            } => {
+                assert_eq!(name, "__compose__");
+                assert_eq!(captured_args.len(), 3);
+                assert_eq!(remaining_arity, &1);
+            }
+            other => panic!("Expected Closure, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_compose_three_functions_execution() {
+        // Three-way composition applied end-to-end:
+        // split(",") >> join("-") >> split("-") — split, rejoin, then split again
+        let input = r#"
+            let transform = split(",") >> join("-") >> split("-")
+            let result = "a,b,c" |> transform()
+        "#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(
+            result.variables.get("result").unwrap(),
+            &Value::List(vec![
+                Value::String("a".to_string()),
+                Value::String("b".to_string()),
+                Value::String("c".to_string()),
+            ])
+        );
     }
 }

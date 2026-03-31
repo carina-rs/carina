@@ -194,7 +194,10 @@ namespaced_id = @{ identifier ~ ("." ~ (identifier | ASCII_DIGIT+))+ }
 expression = { pipe_expr }
 
 // Pipe operator: value |> func |> func
-pipe_expr = { primary ~ (trivia* ~ pipe_op ~ trivia* ~ function_call)* }
+pipe_expr = { compose_expr ~ (trivia* ~ pipe_op ~ trivia* ~ function_call)* }
+
+// Compose operator: f >> g (function composition)
+compose_expr = { primary ~ (trivia* ~ compose_op ~ trivia* ~ primary)* }
 
 // Function call: func(args)
 function_call = {
@@ -308,6 +311,7 @@ equals = { "=" }
 colon = { ":" }
 comma = { "," }
 pipe_op = { "|>" }
+compose_op = { ">>" }
 
 // Keywords
 kw_provider = { "provider" }

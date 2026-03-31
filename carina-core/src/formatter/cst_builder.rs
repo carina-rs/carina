@@ -194,6 +194,9 @@ impl<'a> CstBuilder<'a> {
                 self.build_child(inner)
             }
             Rule::pipe_expr => Some(CstChild::Node(self.build_node(NodeKind::PipeExpr, pair))),
+            Rule::compose_expr => {
+                Some(CstChild::Node(self.build_node(NodeKind::ComposeExpr, pair)))
+            }
             Rule::function_call => Some(CstChild::Node(
                 self.build_node(NodeKind::FunctionCall, pair),
             )),
@@ -233,6 +236,7 @@ impl<'a> CstBuilder<'a> {
             Rule::colon => Some(CstChild::Token(Token::new(":".to_string(), span))),
             Rule::comma => Some(CstChild::Token(Token::new(",".to_string(), span))),
             Rule::pipe_op => Some(CstChild::Token(Token::new("|>".to_string(), span))),
+            Rule::compose_op => Some(CstChild::Token(Token::new(">>".to_string(), span))),
 
             // Keywords
             Rule::kw_import => Some(CstChild::Token(Token::new("import".to_string(), span))),

@@ -158,6 +158,7 @@ impl Formatter {
             NodeKind::ArgumentsParamAttr => self.format_arguments_param_attr(node, 0),
             NodeKind::AttributesParam => self.format_attributes_param(node, 0),
             NodeKind::PipeExpr => self.format_pipe_expr(node),
+            NodeKind::ComposeExpr => self.format_compose_expr(node),
             NodeKind::FunctionCall => self.format_function_call(node),
             NodeKind::VariableRef => self.format_variable_ref(node),
             NodeKind::List => self.format_list(node),
@@ -1274,26 +1275,30 @@ impl Formatter {
         None
     }
 
+    /// Unwrap transparent expression wrappers (PipeExpr, ComposeExpr) to find the inner node
+    fn unwrap_expr_wrappers<'a>(&self, node: &'a CstNode) -> &'a CstNode {
+        match node.kind {
+            NodeKind::PipeExpr | NodeKind::ComposeExpr => {
+                for child in &node.children {
+                    if let CstChild::Node(n) = child {
+                        return self.unwrap_expr_wrappers(n);
+                    }
+                }
+                node
+            }
+            _ => node,
+        }
+    }
+
     /// Check if an attribute has a non-empty map value (block form `{ ... }`)
     fn attribute_has_map_value(&self, node: &CstNode) -> bool {
         if node.kind != NodeKind::Attribute {
             return false;
         }
         if let Some(value_node) = self.get_value_after_equals(node) {
-            // The value may be directly a Map, or wrapped in a PipeExpr
-            let map_node = if value_node.kind == NodeKind::Map {
-                Some(value_node)
-            } else if value_node.kind == NodeKind::PipeExpr {
-                // Check if the first child node is a Map
-                value_node.children.iter().find_map(|child| {
-                    if let CstChild::Node(n) = child
-                        && n.kind == NodeKind::Map
-                    {
-                        Some(n)
-                    } else {
-                        None
-                    }
-                })
+            let unwrapped = self.unwrap_expr_wrappers(value_node);
+            let map_node = if unwrapped.kind == NodeKind::Map {
+                Some(unwrapped)
             } else {
                 None
             };
@@ -1368,26 +1373,9 @@ impl Formatter {
         !nodes.is_empty() && nodes.iter().all(|n| self.is_map_node(n))
     }
 
-    /// Check if a node is a Map, possibly wrapped in a PipeExpr
+    /// Check if a node is a Map, possibly wrapped in PipeExpr/ComposeExpr
     fn is_map_node(&self, node: &CstNode) -> bool {
-        if node.kind == NodeKind::Map {
-            return true;
-        }
-        // A PipeExpr with no pipe operators just wraps a single primary
-        if node.kind == NodeKind::PipeExpr {
-            return node
-                .children
-                .iter()
-                .filter_map(|child| {
-                    if let CstChild::Node(n) = child {
-                        Some(n)
-                    } else {
-                        None
-                    }
-                })
-                .any(|n| n.kind == NodeKind::Map);
-        }
-        false
+        self.unwrap_expr_wrappers(node).kind == NodeKind::Map
     }
 
     /// Extract Map nodes from a List node (unwrapping PipeExpr wrappers)
@@ -1405,38 +1393,24 @@ impl Formatter {
             .collect()
     }
 
-    /// Unwrap a node to get the inner Map, handling PipeExpr wrappers
+    /// Unwrap a node to get the inner Map, handling PipeExpr/ComposeExpr wrappers
     fn unwrap_to_map<'a>(&self, node: &'a CstNode) -> Option<&'a CstNode> {
-        if node.kind == NodeKind::Map {
-            return Some(node);
+        let unwrapped = self.unwrap_expr_wrappers(node);
+        if unwrapped.kind == NodeKind::Map {
+            Some(unwrapped)
+        } else {
+            None
         }
-        if node.kind == NodeKind::PipeExpr {
-            for child in &node.children {
-                if let CstChild::Node(n) = child
-                    && n.kind == NodeKind::Map
-                {
-                    return Some(n);
-                }
-            }
-        }
-        None
     }
 
-    /// Unwrap a node to get the inner List, handling PipeExpr wrappers
+    /// Unwrap a node to get the inner List, handling PipeExpr/ComposeExpr wrappers
     fn unwrap_to_list<'a>(&self, node: &'a CstNode) -> Option<&'a CstNode> {
-        if node.kind == NodeKind::List {
-            return Some(node);
+        let unwrapped = self.unwrap_expr_wrappers(node);
+        if unwrapped.kind == NodeKind::List {
+            Some(unwrapped)
+        } else {
+            None
         }
-        if node.kind == NodeKind::PipeExpr {
-            for child in &node.children {
-                if let CstChild::Node(n) = child
-                    && n.kind == NodeKind::List
-                {
-                    return Some(n);
-                }
-            }
-        }
-        None
     }
 
     /// Check if an attribute should be converted to block syntax
@@ -1610,6 +1584,24 @@ impl Formatter {
                         self.format_node(n);
                     }
                     first = false;
+                }
+                CstChild::Trivia(_) => {}
+            }
+        }
+    }
+
+    fn format_compose_expr(&mut self, node: &CstNode) {
+        for child in &node.children {
+            match child {
+                CstChild::Token(token) => {
+                    if token.text == ">>" {
+                        self.write(" >> ");
+                    } else {
+                        self.write(&token.text);
+                    }
+                }
+                CstChild::Node(n) => {
+                    self.format_node(n);
                 }
                 CstChild::Trivia(_) => {}
             }
