@@ -7,7 +7,7 @@ hero:
   tagline: ''
 ---
 
-import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+import { CardGrid, LinkCard } from '@astrojs/starlight/components';
 
 <div class="why-carina">
   <h2>Why Carina?</h2>
@@ -29,21 +29,6 @@ import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
     </div>
   </div>
 </div>
-
-<CardGrid>
-  <Card title="Custom DSL" icon="pencil">
-    Infrastructure definition with `.crn` files — strongly typed, validated at parse time.
-  </Card>
-  <Card title="Effects as Values" icon="list-format">
-    Side effects are represented as data, inspectable before execution.
-  </Card>
-  <Card title="Provider Architecture" icon="setting">
-    Pluggable providers — AWSCC (Cloud Control API) and AWS.
-  </Card>
-  <Card title="Modules" icon="puzzle">
-    Reusable infrastructure components with typed arguments and attributes.
-  </Card>
-</CardGrid>
 
 ## Providers
 
