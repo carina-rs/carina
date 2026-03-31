@@ -44,7 +44,7 @@
   --astro-code-background: #1e293b;
   --astro-code-token-keyword: var(--sl-color-accent-high);
 }
-/* Override Expressive Code frame backgrounds (loaded after custom.css, so need !important) */
+/* Override Expressive Code frame backgrounds and text color (loaded after custom.css, so need !important) */
 .expressive-code .frame pre {
   background: #1e293b !important;
 }
@@ -56,6 +56,13 @@
 }
 .expressive-code pre {
   border-color: #334155 !important;
+}
+/* Boost default code foreground for readability against #1e293b */
+.expressive-code .frame pre code {
+  color: #f1f5f9 !important; /* Slate 100 — high contrast on Slate 800 */
+}
+.expressive-code {
+  --ec-codeFg: #f1f5f9 !important;
 }
 
 /* "Soon" badge: improve contrast in sidebar */
