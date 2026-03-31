@@ -21,7 +21,7 @@ let vpc = aws.ec2.vpc {
   }
 }
 
-let igw = aws.ec2.internet_gateway {
+aws.ec2.internet_gateway {
   vpc_id = vpc.vpc_id
 
   tags = {
@@ -56,7 +56,7 @@ let rt = aws.ec2.route_table {
   }
 }
 
-let route = aws.ec2.route {
+aws.ec2.route {
   route_table_id         = rt.route_table_id
   destination_cidr_block = "0.0.0.0/0"
   nat_gateway_id         = nat_gw.nat_gateway_id

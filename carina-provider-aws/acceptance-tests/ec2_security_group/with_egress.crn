@@ -24,7 +24,7 @@ let sg = aws.ec2.security_group {
   }
 }
 
-let egress_https = aws.ec2.security_group_egress {
+aws.ec2.security_group_egress {
   group_id    = sg.group_id
   description = "Allow HTTPS outbound"
   ip_protocol = tcp
@@ -33,7 +33,7 @@ let egress_https = aws.ec2.security_group_egress {
   cidr_ip     = "0.0.0.0/0"
 }
 
-let egress_private = aws.ec2.security_group_egress {
+aws.ec2.security_group_egress {
   group_id    = sg.group_id
   description = "Allow all to private ranges"
   ip_protocol = all

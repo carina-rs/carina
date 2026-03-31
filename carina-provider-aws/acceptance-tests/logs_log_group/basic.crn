@@ -6,7 +6,7 @@ provider aws {
   region = aws.Region.ap_northeast_1
 }
 
-let log_group = aws.logs.log_group {
+aws.logs.log_group {
   log_group_name = "/carina/acceptance-test"
   retention_in_days = 7
 

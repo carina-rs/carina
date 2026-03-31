@@ -27,7 +27,7 @@ let igw = awscc.ec2.internet_gateway {
   }
 }
 
-let igw_attachment = awscc.ec2.vpc_gateway_attachment {
+awscc.ec2.vpc_gateway_attachment {
   vpc_id              = vpc.vpc_id
   internet_gateway_id = igw.internet_gateway_id
 }
@@ -40,7 +40,7 @@ let eip = awscc.ec2.eip {
   }
 }
 
-let nat = awscc.ec2.nat_gateway {
+awscc.ec2.nat_gateway {
   allocation_id            = eip.allocation_id
   subnet_id                = subnet.subnet_id
   max_drain_duration_seconds = 120

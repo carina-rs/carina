@@ -6,7 +6,7 @@ provider aws {
   region = aws.Region.ap_northeast_1
 }
 
-let eip = aws.ec2.eip {
+aws.ec2.eip {
   domain = aws.ec2.eip.Domain.vpc
 
   tags = {

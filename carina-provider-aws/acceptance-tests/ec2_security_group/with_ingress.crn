@@ -24,7 +24,7 @@ let sg = aws.ec2.security_group {
   }
 }
 
-let ingress_http = aws.ec2.security_group_ingress {
+aws.ec2.security_group_ingress {
   group_id    = sg.group_id
   description = "Allow HTTP"
   ip_protocol = "tcp"
@@ -33,7 +33,7 @@ let ingress_http = aws.ec2.security_group_ingress {
   cidr_ip     = "0.0.0.0/0"
 }
 
-let ingress_https = aws.ec2.security_group_ingress {
+aws.ec2.security_group_ingress {
   group_id    = sg.group_id
   description = "Allow HTTPS"
   ip_protocol = "tcp"

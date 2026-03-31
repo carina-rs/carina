@@ -29,7 +29,7 @@ let subnet = awscc.ec2.subnet {
   }
 }
 
-let tgw_a = awscc.ec2.transit_gateway {
+awscc.ec2.transit_gateway {
   description = "carina-acc-test-cbd-tgw-attach-a"
 
   tags = {

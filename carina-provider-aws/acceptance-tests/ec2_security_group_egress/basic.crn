@@ -27,7 +27,7 @@ let sg = aws.ec2.security_group {
   }
 }
 
-let egress = aws.ec2.security_group_egress {
+aws.ec2.security_group_egress {
   group_id    = sg.group_id
   description = "Allow HTTPS outbound"
   ip_protocol = tcp

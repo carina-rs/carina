@@ -6,7 +6,7 @@ provider aws {
   region = aws.Region.ap_northeast_1
 }
 
-let bucket = aws.s3.bucket {
+aws.s3.bucket {
   bucket = "carina-acc-test-aws-s3-versioning"
 
   versioning_status = aws.s3.bucket.VersioningStatus.Enabled

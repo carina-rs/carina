@@ -34,7 +34,7 @@ let dest_sg = aws.ec2.security_group {
   }
 }
 
-let ingress = aws.ec2.security_group_ingress {
+aws.ec2.security_group_ingress {
   group_id                 = dest_sg.group_id
   description              = "Allow HTTPS from source SG"
   ip_protocol              = "tcp"

@@ -14,7 +14,7 @@ let vpc = aws.ec2.vpc {
   }
 }
 
-let subnet = aws.ec2.subnet {
+aws.ec2.subnet {
   vpc_id            = vpc.vpc_id
   cidr_block        = "10.0.1.0/24"
   availability_zone = aws.AvailabilityZone.ap_northeast_1a

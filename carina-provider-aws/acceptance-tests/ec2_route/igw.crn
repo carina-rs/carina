@@ -30,7 +30,7 @@ let rt = aws.ec2.route_table {
   }
 }
 
-let route = aws.ec2.route {
+aws.ec2.route {
   route_table_id         = rt.route_table_id
   destination_cidr_block = "0.0.0.0/0"
   gateway_id             = igw.internet_gateway_id
