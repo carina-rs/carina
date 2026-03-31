@@ -1,6 +1,8 @@
 mod commands;
 mod display;
 mod error;
+#[allow(dead_code)]
+mod provider_resolver;
 mod wiring;
 
 use std::path::PathBuf;
