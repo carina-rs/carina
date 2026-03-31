@@ -1,8 +1,9 @@
 [package]
 name = "carina-provider-mock"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 license = "MIT"
+publish = false
 
 [lib]
 doctest = false

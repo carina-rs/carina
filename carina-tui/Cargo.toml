@@ -1,8 +1,11 @@
 [package]
 name = "carina-tui"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 license = "MIT"
+description = "TUI display for Carina infrastructure management tool"
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 carina-core = { path = "../carina-core" }

@@ -1,8 +1,11 @@
 [package]
 name = "carina-provider-awscc"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 license = "MIT"
+description = "AWS CloudControl provider for Carina infrastructure management tool"
+repository.workspace = true
+homepage.workspace = true
 
 [lib]
 doctest = false

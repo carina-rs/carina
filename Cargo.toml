@@ -13,3 +13,8 @@ members = [
     "carina-tui",
 ]
 resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+repository = "https://github.com/carina-rs/carina"
+homepage = "https://github.com/carina-rs/carina"
