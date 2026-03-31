@@ -1,5 +1,6 @@
 /* ============================================
-   Ocean/Teal Deep Navy Theme
+   Canopus Deep Navy Theme
+   Inspired by Canopus (α Carinae) — warm white-gold star
    ============================================ */
 
 /* Dark mode (default) */
@@ -14,10 +15,10 @@
   --sl-color-gray-6: hsl(222, 47%, 11%); /* #0f172a Slate 900 */
   --sl-color-black: hsl(229, 84%, 5%);   /* #020617 Slate 950 */
 
-  /* Accent: Cyan */
-  --sl-color-accent-low: hsl(192, 70%, 15%);  /* ~#164e63 Cyan 900 */
-  --sl-color-accent: hsl(192, 91%, 36%);       /* ~#0891b2 Cyan 600 */
-  --sl-color-accent-high: hsl(186, 78%, 58%);  /* ~#22d3ee Cyan 400 */
+  /* Accent: Canopus Gold (Amber/Yellow) */
+  --sl-color-accent-low: hsl(32, 60%, 15%);   /* dark amber */
+  --sl-color-accent: hsl(43, 96%, 56%);        /* ~#fbbf24 Yellow 400 */
+  --sl-color-accent-high: hsl(48, 96%, 89%);   /* ~#fef9c3 Yellow 100 */
 }
 
 /* Light mode */
@@ -33,10 +34,10 @@
   --sl-color-gray-7: hsl(210, 40%, 98%); /* #f8fafc Slate 50 */
   --sl-color-black: hsl(0, 0%, 100%);    /* white */
 
-  /* Accent: Cyan (darker for contrast on light BG) */
-  --sl-color-accent-low: hsl(189, 94%, 93%);  /* ~#ecfeff Cyan 50 */
-  --sl-color-accent: hsl(192, 82%, 31%);       /* ~#0e7490 Cyan 700 */
-  --sl-color-accent-high: hsl(192, 91%, 36%);  /* ~#0891b2 Cyan 600 */
+  /* Accent: Canopus Gold (darker for contrast on light BG) */
+  --sl-color-accent-low: hsl(48, 96%, 89%);   /* ~#fef9c3 Yellow 100 */
+  --sl-color-accent: hsl(32, 95%, 44%);        /* ~#d97706 Amber 600 */
+  --sl-color-accent-high: hsl(26, 90%, 37%);   /* ~#b45309 Amber 700 */
 }
 
 /* Code block theme */
