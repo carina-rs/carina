@@ -864,6 +864,8 @@ let vpc = awscc.ec2.vpc {
             name: "awscc".to_string(),
             attributes: HashMap::new(),
             default_tags: HashMap::new(),
+            source: None,
+            version: None,
         });
         parsed.arguments.push(crate::parser::ArgumentParameter {
             name: "vpc_cidr".to_string(),
@@ -888,6 +890,8 @@ let vpc = awscc.ec2.vpc {
             name: "awscc".to_string(),
             attributes: HashMap::new(),
             default_tags: HashMap::new(),
+            source: None,
+            version: None,
         });
         parsed
             .attribute_params
@@ -908,6 +912,8 @@ let vpc = awscc.ec2.vpc {
             name: "awscc".to_string(),
             attributes: HashMap::new(),
             default_tags: HashMap::new(),
+            source: None,
+            version: None,
         });
 
         let result = validate_no_provider_in_module(&parsed);
