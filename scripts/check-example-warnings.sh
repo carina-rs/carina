@@ -16,13 +16,8 @@ DIRS=(
     "carina-provider-awscc/acceptance-tests"
 )
 
-# Files with unavoidable warnings (for expressions, if expressions, read data sources)
+# Files that require runtime environment (env vars, KMS) and cannot be validated in CI
 SKIP_FILES=(
-    "carina-provider-aws/acceptance-tests/sts_caller_identity/basic.crn"
-    "carina-provider-awscc/acceptance-tests/for_expression/for_list.crn"
-    "carina-provider-awscc/acceptance-tests/for_expression/for_map.crn"
-    "carina-provider-awscc/acceptance-tests/for_expression/index_access.crn"
-    "carina-provider-awscc/acceptance-tests/if_expression/if_true.crn"
     "carina-provider-awscc/acceptance-tests/secret_env/decrypt_tag.crn"
     "carina-provider-awscc/acceptance-tests/secret_env/env_tag.crn"
     "carina-provider-awscc/acceptance-tests/secret_env/secret_tag.crn"

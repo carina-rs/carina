@@ -270,10 +270,15 @@ pub fn check_unused_bindings(parsed: &ParsedFile) -> Vec<String> {
         }
     }
 
-    // Return unused binding names
+    // Return unused binding names, skipping structurally-required bindings
+    // (if/for/read expressions) and for-generated indexed bindings (e.g., vpcs[0])
     defined_bindings
         .into_iter()
-        .filter(|binding| !referenced.contains(binding))
+        .filter(|binding| {
+            !referenced.contains(binding)
+                && !parsed.structural_bindings.contains(binding)
+                && !binding.contains('[')
+        })
         .collect()
 }
 
@@ -382,6 +387,7 @@ mod tests {
             user_functions: HashMap::new(),
             remote_states: Vec::new(),
             requires: Vec::new(),
+            structural_bindings: HashSet::new(),
         }
     }
 
@@ -575,6 +581,100 @@ let route = awscc.ec2.route {
             "igw_attachment should not be unused"
         );
         assert_eq!(unused, vec!["route"]);
+    }
+
+    #[test]
+    fn if_expression_binding_not_warned() {
+        let input = r#"
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let enabled = true
+
+let vpc = if enabled {
+  awscc.ec2.vpc {
+    cidr_block = "10.0.0.0/16"
+  }
+}
+"#;
+        let parsed = crate::parser::parse(input, &ProviderContext::default()).unwrap();
+        assert!(
+            parsed.structural_bindings.contains("vpc"),
+            "vpc should be in structural_bindings"
+        );
+        let unused = check_unused_bindings(&parsed);
+        assert!(
+            !unused.contains(&"vpc".to_string()),
+            "if-expression binding should not be warned as unused"
+        );
+    }
+
+    #[test]
+    fn for_expression_binding_not_warned() {
+        let input = r#"
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let vpcs = for (i, env) in ["dev", "stg"] {
+  awscc.ec2.vpc {
+    cidr_block = cidr_subnet("10.0.0.0/8", 8, i)
+  }
+}
+"#;
+        let parsed = crate::parser::parse(input, &ProviderContext::default()).unwrap();
+        assert!(
+            parsed.structural_bindings.contains("vpcs"),
+            "vpcs should be in structural_bindings"
+        );
+        let unused = check_unused_bindings(&parsed);
+        assert!(
+            unused.is_empty(),
+            "for-expression bindings should not be warned as unused, got: {:?}",
+            unused
+        );
+    }
+
+    #[test]
+    fn read_expression_binding_not_warned() {
+        let input = r#"
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+let caller = read aws.sts.caller_identity {}
+"#;
+        let parsed = crate::parser::parse(input, &ProviderContext::default()).unwrap();
+        assert!(
+            parsed.structural_bindings.contains("caller"),
+            "caller should be in structural_bindings"
+        );
+        let unused = check_unused_bindings(&parsed);
+        assert!(
+            !unused.contains(&"caller".to_string()),
+            "read-expression binding should not be warned as unused"
+        );
+    }
+
+    #[test]
+    fn genuinely_unused_binding_still_warns() {
+        let input = r#"
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+}
+"#;
+        let parsed = crate::parser::parse(input, &ProviderContext::default()).unwrap();
+        let unused = check_unused_bindings(&parsed);
+        assert_eq!(
+            unused,
+            vec!["vpc"],
+            "genuinely unused binding should still be warned"
+        );
     }
 
     /// Helper to create a simple ResourceSchema with given attributes.
