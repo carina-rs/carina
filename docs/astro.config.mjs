@@ -30,9 +30,9 @@ export default defineConfig({
         {
           label: 'Getting Started',
           items: [
-            { label: 'Installation', link: '/getting-started/installation/', badge: 'Soon' },
-            { label: 'Quick Start', link: '/getting-started/quick-start/', badge: 'Soon' },
-            { label: 'Core Concepts', link: '/getting-started/core-concepts/', badge: 'Soon' },
+            { label: 'Installation', link: '/getting-started/installation/' },
+            { label: 'Quick Start', link: '/getting-started/quick-start/' },
+            { label: 'Core Concepts', link: '/getting-started/core-concepts/' },
           ],
         },
         {
