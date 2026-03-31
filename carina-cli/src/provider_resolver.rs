@@ -249,6 +249,34 @@ pub fn resolve_provider(
     Ok(binary_path)
 }
 
+/// Resolve a single provider config with lock file management.
+///
+/// Handles version validation, lock file load/save, and delegation to `resolve_provider`.
+pub fn resolve_single_config(base_dir: &Path, config: &ProviderConfig) -> Result<PathBuf, String> {
+    let source = config
+        .source
+        .as_deref()
+        .ok_or_else(|| format!("Provider '{}' has no source", config.name))?;
+
+    let version = config.version.as_deref().ok_or_else(|| {
+        format!(
+            "Provider '{}' has source but no version. Add: version = \"x.y.z\"",
+            config.name
+        )
+    })?;
+
+    let lock_path = base_dir.join("carina.lock");
+    let mut lock_file = LockFile::load(&lock_path).unwrap_or_default();
+
+    let binary_path = resolve_provider(base_dir, source, version, &config.name, &mut lock_file)?;
+
+    lock_file
+        .save(&lock_path)
+        .map_err(|e| format!("Failed to save carina.lock: {e}"))?;
+
+    Ok(binary_path)
+}
+
 /// Resolve all providers that need GitHub source resolution.
 pub fn resolve_all(
     base_dir: &Path,

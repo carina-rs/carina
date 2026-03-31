@@ -432,30 +432,7 @@ async fn load_process_provider(
     let binary_path = if let Some(path) = source.strip_prefix("file://") {
         std::path::PathBuf::from(path)
     } else if source.starts_with("github.com/") {
-        let version = config.version.as_deref().ok_or_else(|| {
-            format!(
-                "Provider '{}' has source but no version. Add: version = \"x.y.z\"",
-                config.name
-            )
-        })?;
-
-        let lock_path = base_dir.join("carina.lock");
-        let mut lock_file =
-            crate::provider_resolver::LockFile::load(&lock_path).unwrap_or_default();
-
-        let path = crate::provider_resolver::resolve_provider(
-            base_dir,
-            source,
-            version,
-            &config.name,
-            &mut lock_file,
-        )?;
-
-        lock_file
-            .save(&lock_path)
-            .map_err(|e| format!("Failed to save carina.lock: {e}"))?;
-
-        path
+        crate::provider_resolver::resolve_single_config(base_dir, config)?
     } else {
         return Err(format!(
             "Unsupported source format: {source}. Use file:// for local binaries or github.com/owner/repo for remote."

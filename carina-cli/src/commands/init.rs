@@ -19,11 +19,7 @@ pub fn run_init(path: &Path) -> Result<(), String> {
         .parsed
         .providers
         .iter()
-        .filter(|p| {
-            p.source
-                .as_ref()
-                .is_some_and(|s: &String| !s.starts_with("file://"))
-        })
+        .filter(|p| p.source.as_ref().is_some_and(|s| !s.starts_with("file://")))
         .collect();
 
     if github_providers.is_empty() {
