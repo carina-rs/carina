@@ -1,5 +1,5 @@
 #!/bin/bash
-# Check that example .crn files produce no warnings when validated.
+# Check that example and acceptance test .crn files produce no warnings when validated.
 #
 # The `carina validate` command exits 0 even when warnings are emitted,
 # so this script inspects the output text for warning indicators.
@@ -89,4 +89,4 @@ if [ "$WARNINGS" -gt 0 ]; then
     exit 1
 fi
 
-echo "All example .crn files are warning-free."
+echo "All .crn files are warning-free."
