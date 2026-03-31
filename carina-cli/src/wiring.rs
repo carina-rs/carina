@@ -358,6 +358,13 @@ pub async fn get_provider_with_ctx(ctx: &WiringContext, parsed: &ParsedFile) -> 
     let mut router = ProviderRouter::new();
 
     for provider_config in &parsed.providers {
+        // If the provider has a source, load it as an external process
+        if let Some(ref source) = provider_config.source {
+            try_add_process_provider(&mut router, source, provider_config).await;
+            continue;
+        }
+
+        // Otherwise, use the hardcoded factory lookup (existing behavior)
         if let Some(factory) = provider_mod::find_factory(ctx.factories(), &provider_config.name) {
             let region = factory.extract_region(&provider_config.attributes);
             println!(
@@ -382,11 +389,72 @@ pub async fn get_provider_with_ctx(ctx: &WiringContext, parsed: &ParsedFile) -> 
     router
 }
 
+async fn try_add_process_provider(
+    router: &mut ProviderRouter,
+    source: &str,
+    config: &ProviderConfig,
+) {
+    match load_process_provider(source, config).await {
+        Ok((factory, provider, name)) => {
+            let region = factory.extract_region(&config.attributes);
+            println!(
+                "{}",
+                format!("Using {} (region: {}, source: {})", name, region, source).cyan()
+            );
+            router.add_provider(name, provider);
+        }
+        Err(e) => {
+            eprintln!(
+                "{}",
+                format!("Failed to load process provider '{}': {}", config.name, e).red()
+            );
+        }
+    }
+}
+
+async fn load_process_provider(
+    source: &str,
+    config: &ProviderConfig,
+) -> Result<
+    (
+        carina_plugin_host::ProcessProviderFactory,
+        Box<dyn Provider>,
+        String,
+    ),
+    String,
+> {
+    let binary_path = if let Some(path) = source.strip_prefix("file://") {
+        std::path::PathBuf::from(path)
+    } else {
+        // TODO: Phase 4 will implement download from GitHub Releases.
+        // For now, only file:// sources are supported.
+        return Err(format!(
+            "Remote sources not yet supported. Use file:// for local binaries. Got: {source}"
+        ));
+    };
+
+    let factory = carina_plugin_host::ProcessProviderFactory::new(binary_path)?;
+    let name = factory.name().to_string();
+
+    factory
+        .validate_config(&config.attributes)
+        .map_err(|e| format!("Config validation failed: {e}"))?;
+
+    let provider = factory.create_provider(&config.attributes).await;
+    Ok((factory, provider, name))
+}
+
 pub async fn create_providers_from_configs(configs: &[ProviderConfig]) -> ProviderRouter {
     let ctx = WiringContext::new();
     let mut router = ProviderRouter::new();
 
     for config in configs {
+        // If the provider has a source, load it as an external process
+        if let Some(ref source) = config.source {
+            try_add_process_provider(&mut router, source, config).await;
+            continue;
+        }
+
         if let Some(factory) = provider_mod::find_factory(ctx.factories(), &config.name) {
             let region = factory.extract_region(&config.attributes);
             println!(

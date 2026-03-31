@@ -288,6 +288,14 @@ pub struct ProviderConfig {
     /// Extracted from `default_tags = { ... }` in the provider block.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub default_tags: HashMap<String, Value>,
+    /// Provider source (e.g., "github.com/carina-rs/carina-provider-awscc" or "file:///path/to/binary").
+    /// Extracted from the provider block and not passed to the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Provider version constraint (e.g., "0.5.0").
+    /// Extracted from the provider block and not passed to the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 /// Backend configuration for state storage
@@ -1856,10 +1864,26 @@ fn parse_provider_block(
         HashMap::new()
     };
 
+    // Extract source from attributes if present
+    let source = if let Some(Value::String(s)) = attributes.remove("source") {
+        Some(s)
+    } else {
+        None
+    };
+
+    // Extract version from attributes if present
+    let version = if let Some(Value::String(v)) = attributes.remove("version") {
+        Some(v)
+    } else {
+        None
+    };
+
     Ok(ProviderConfig {
         name,
         attributes,
         default_tags,
+        source,
+        version,
     })
 }
 
@@ -5769,6 +5793,42 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.providers.len(), 1);
         assert!(result.providers[0].default_tags.is_empty());
+    }
+
+    #[test]
+    fn parse_provider_block_with_source_and_version() {
+        let input = r#"
+            provider mock {
+                source = "github.com/carina-rs/carina-provider-mock"
+                version = "0.1.0"
+            }
+        "#;
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(parsed.providers.len(), 1);
+
+        let provider = &parsed.providers[0];
+        assert_eq!(provider.name, "mock");
+        assert_eq!(
+            provider.source.as_deref(),
+            Some("github.com/carina-rs/carina-provider-mock")
+        );
+        assert_eq!(provider.version.as_deref(), Some("0.1.0"));
+        // source and version should NOT be in attributes
+        assert!(!provider.attributes.contains_key("source"));
+        assert!(!provider.attributes.contains_key("version"));
+    }
+
+    #[test]
+    fn parse_provider_block_without_source() {
+        let input = r#"
+            provider awscc {
+                region = awscc.Region.ap_northeast_1
+            }
+        "#;
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        let provider = &parsed.providers[0];
+        assert!(provider.source.is_none());
+        assert!(provider.version.is_none());
     }
 
     #[test]

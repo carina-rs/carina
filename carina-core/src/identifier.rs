@@ -777,6 +777,8 @@ mod tests {
             name: "awscc".to_string(),
             attributes: HashMap::new(),
             default_tags: HashMap::new(),
+            source: None,
+            version: None,
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -981,6 +983,8 @@ mod tests {
             .into_iter()
             .collect(),
             default_tags: HashMap::new(),
+            source: None,
+            version: None,
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
@@ -1019,6 +1023,8 @@ mod tests {
             .into_iter()
             .collect(),
             default_tags: HashMap::new(),
+            source: None,
+            version: None,
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
@@ -1062,6 +1068,8 @@ mod tests {
             name: "awscc".to_string(),
             attributes: HashMap::new(),
             default_tags: HashMap::new(),
+            source: None,
+            version: None,
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1164,6 +1172,8 @@ mod tests {
             .into_iter()
             .collect(),
             default_tags: HashMap::new(),
+            source: None,
+            version: None,
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
@@ -1269,6 +1279,8 @@ mod tests {
             name: "awscc".to_string(),
             attributes: HashMap::new(),
             default_tags: HashMap::new(),
+            source: None,
+            version: None,
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1458,6 +1470,8 @@ mod tests {
             name: "awscc".to_string(),
             attributes: HashMap::new(),
             default_tags: HashMap::new(),
+            source: None,
+            version: None,
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1561,6 +1575,8 @@ mod tests {
             name: "awscc".to_string(),
             attributes: HashMap::new(),
             default_tags: HashMap::new(),
+            source: None,
+            version: None,
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1632,6 +1648,8 @@ mod tests {
             name: "awscc".to_string(),
             attributes: HashMap::new(),
             default_tags: HashMap::new(),
+            source: None,
+            version: None,
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1688,6 +1706,8 @@ mod tests {
             name: "awscc".to_string(),
             attributes: HashMap::new(),
             default_tags: HashMap::new(),
+            source: None,
+            version: None,
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1783,6 +1803,8 @@ mod tests {
             name: "awscc".to_string(),
             attributes: HashMap::new(),
             default_tags: HashMap::new(),
+            source: None,
+            version: None,
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1825,6 +1847,8 @@ mod tests {
             name: "awscc".to_string(),
             attributes: HashMap::new(),
             default_tags: HashMap::new(),
+            source: None,
+            version: None,
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -2013,6 +2037,8 @@ mod tests {
             .into_iter()
             .collect(),
             default_tags: HashMap::new(),
+            source: None,
+            version: None,
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
