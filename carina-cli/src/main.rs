@@ -1,6 +1,7 @@
 mod commands;
 mod display;
 mod error;
+mod provider_resolver;
 mod wiring;
 
 use std::path::PathBuf;
@@ -153,6 +154,12 @@ enum Commands {
         #[command(subcommand)]
         command: StateCommands,
     },
+    /// Download and install provider binaries
+    Init {
+        /// Path to .crn file or directory
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Lint .crn files for style issues
     Lint {
         /// Path to .crn file or directory
@@ -288,6 +295,13 @@ async fn main() {
             run_force_unlock(&lock_id, &path, &provider_context).await
         }
         Commands::State { command } => run_state_command(command, &provider_context).await,
+        Commands::Init { path } => {
+            if let Err(e) = commands::init::run_init(&path) {
+                eprintln!("{}", format!("Error: {e}").red());
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         Commands::Lint { path } => run_lint(&path, &provider_context),
         Commands::Completions { shell } => {
             generate(shell, &mut Cli::command(), "carina", &mut std::io::stdout());

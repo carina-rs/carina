@@ -578,7 +578,7 @@ pub async fn run_state_refresh(
     };
 
     let op_result =
-        run_state_refresh_locked(&mut parsed, backend.as_ref(), lock_info.as_ref()).await;
+        run_state_refresh_locked(&mut parsed, backend.as_ref(), lock_info.as_ref(), base_dir).await;
 
     // Always release lock if it was acquired
     if let Some(ref li) = lock_info {
@@ -595,6 +595,7 @@ pub(crate) async fn run_state_refresh_locked(
     parsed: &mut carina_core::parser::ParsedFile,
     backend: &dyn StateBackend,
     lock: Option<&LockInfo>,
+    base_dir: &std::path::Path,
 ) -> Result<(), AppError> {
     let ctx = WiringContext::new();
 
@@ -620,7 +621,7 @@ pub(crate) async fn run_state_refresh_locked(
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
 
     // Select provider
-    let provider = get_provider_with_ctx(&ctx, parsed).await;
+    let provider = get_provider_with_ctx(&ctx, parsed, base_dir).await;
 
     println!();
     println!("{}", "Refreshing state...".cyan().bold());

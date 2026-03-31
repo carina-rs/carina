@@ -1946,7 +1946,13 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
 
     // MockProvider returns not_found for both resources (simulates external deletion)
     let lock = LockInfo::new("state-refresh");
-    let result = run_state_refresh_locked(&mut parsed, &backend, Some(&lock)).await;
+    let result = run_state_refresh_locked(
+        &mut parsed,
+        &backend,
+        Some(&lock),
+        std::path::Path::new("."),
+    )
+    .await;
     assert!(result.is_ok(), "refresh should succeed: {:?}", result);
 
     // Verify the written state

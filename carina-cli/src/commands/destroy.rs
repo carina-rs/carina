@@ -99,6 +99,7 @@ pub async fn run_destroy(
         protected_bucket,
         lock_info.as_ref(),
         refresh,
+        base_dir,
     )
     .await;
 
@@ -124,6 +125,7 @@ async fn run_destroy_locked(
     protected_bucket: Option<String>,
     lock: Option<&LockInfo>,
     refresh: bool,
+    base_dir: &std::path::Path,
 ) -> Result<(), AppError> {
     let ctx = WiringContext::new();
 
@@ -148,7 +150,7 @@ async fn run_destroy_locked(
     }
 
     // Select appropriate Provider based on configuration
-    let provider = get_provider_with_ctx(&ctx, parsed).await;
+    let provider = get_provider_with_ctx(&ctx, parsed, base_dir).await;
 
     // Build current states -- either from provider (refresh=true) or from state file
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
