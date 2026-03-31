@@ -1,5 +1,32 @@
 ---
-import { PAGE_TITLE_ID } from '@astrojs/starlight/constants';
+const PAGE_TITLE_ID = '_top';
+
+const codeHtml = `<span class="kw">provider</span> <span class="id">aws</span> {
+  <span class="attr">region:</span> <span class="enum">aws.Region.ap_northeast_1</span>
+}
+
+<span class="kw">let</span> <span class="id">vpc</span> = <span class="type">awscc.ec2.vpc</span> {
+  <span class="attr">cidr_block:</span> <span class="str">"10.0.0.0/16"</span>
+  <span class="attr">enable_dns_support:</span> <span class="bool">true</span>
+}
+
+<span class="type">awscc.ec2.subnet</span> {
+  <span class="attr">vpc_id:</span> <span class="id">vpc</span>.vpc_id
+  <span class="attr">cidr_block:</span> <span class="str">"10.0.1.0/24"</span>
+}`;
+
+const planHtml = `<span class="prompt">$</span> carina plan main.crn
+<span class="muted">Planning...</span>
+
+<span class="add">+</span> <span class="id">awscc.ec2.vpc</span>
+  <span class="attr">cidr_block:</span> <span class="str">"10.0.0.0/16"</span>
+  <span class="attr">enable_dns_support:</span> <span class="bool">true</span>
+
+<span class="add">+</span> <span class="id">awscc.ec2.subnet</span>
+  <span class="attr">vpc_id:</span> <span class="computed">(computed)</span>
+  <span class="attr">cidr_block:</span> <span class="str">"10.0.1.0/24"</span>
+
+<span class="plan-summary">Plan: 2 to create, 0 to update, 0 to delete.</span>`;
 ---
 
 <div class="hero-custom">
@@ -15,19 +42,19 @@ import { PAGE_TITLE_ID } from '@astrojs/starlight/constants';
         <span class="panel-tab">main.crn</span>
       </div>
       <div class="panel-body">
-        <pre><code><span class="kw">provider</span> <span class="id">aws</span> {'{'}{'\n'}  <span class="attr">region:</span> <span class="enum">aws.Region.ap_northeast_1</span>{'\n'}{'}'}{'\n'}{'\n'}<span class="kw">let</span> <span class="id">vpc</span> = <span class="type">awscc.ec2.vpc</span> {'{'}{'\n'}  <span class="attr">cidr_block:</span> <span class="str">"10.0.0.0/16"</span>{'\n'}  <span class="attr">enable_dns_support:</span> <span class="bool">true</span>{'\n'}{'}'}{'\n'}{'\n'}<span class="type">awscc.ec2.subnet</span> {'{'}{'\n'}  <span class="attr">vpc_id:</span> <span class="id">vpc</span>.vpc_id{'\n'}  <span class="attr">cidr_block:</span> <span class="str">"10.0.1.0/24"</span>{'\n'}{'}'}</code></pre>
+        <pre><code set:html={codeHtml} /></pre>
       </div>
     </div>
 
     <div class="hero-panel">
       <div class="panel-header terminal-header">
-        <span class="terminal-dot red"></span>
-        <span class="terminal-dot yellow"></span>
-        <span class="terminal-dot green"></span>
+        <span class="terminal-dot dot-red"></span>
+        <span class="terminal-dot dot-yellow"></span>
+        <span class="terminal-dot dot-green"></span>
         <span class="panel-tab-terminal">terminal</span>
       </div>
       <div class="panel-body">
-        <pre><code><span class="prompt">$</span> carina plan main.crn{'\n'}<span class="muted">Planning...</span>{'\n'}{'\n'}<span class="add">+</span> <span class="id">awscc.ec2.vpc</span>{'\n'}  <span class="attr">cidr_block:</span> <span class="str">"10.0.0.0/16"</span>{'\n'}  <span class="attr">enable_dns_support:</span> <span class="bool">true</span>{'\n'}{'\n'}<span class="add">+</span> <span class="id">awscc.ec2.subnet</span>{'\n'}  <span class="attr">vpc_id:</span> <span class="computed">(computed)</span>{'\n'}  <span class="attr">cidr_block:</span> <span class="str">"10.0.1.0/24"</span>{'\n'}{'\n'}<span class="plan-summary">Plan: 2 to create, 0 to update, 0 to delete.</span></code></pre>
+        <pre><code set:html={planHtml} /></pre>
       </div>
     </div>
   </div>
@@ -108,9 +135,9 @@ import { PAGE_TITLE_ID } from '@astrojs/starlight/constants';
     height: 0.5rem;
     border-radius: 50%;
   }
-  .terminal-dot.red { background: #f43f5e; }
-  .terminal-dot.yellow { background: #f59e0b; }
-  .terminal-dot.green { background: #10b981; }
+  .dot-red { background: #f43f5e; }
+  .dot-yellow { background: #f59e0b; }
+  .dot-green { background: #10b981; }
 
   .panel-tab-terminal {
     color: var(--sl-color-gray-3);
@@ -136,18 +163,18 @@ import { PAGE_TITLE_ID } from '@astrojs/starlight/constants';
     color: #e2e8f0;
   }
 
-  .kw { color: #22d3ee; }
-  .id { color: #e2e8f0; }
-  .attr { color: #94a3b8; }
-  .str { color: #86efac; }
-  .bool { color: #fbbf24; }
-  .enum { color: #a5f3fc; }
-  .type { color: #94a3b8; }
-  .prompt { color: #22d3ee; }
-  .muted { color: #64748b; }
-  .add { color: #10b981; font-weight: 700; }
-  .computed { color: #67e8f9; }
-  .plan-summary { color: #22d3ee; font-weight: 600; }
+  :global(.kw) { color: #22d3ee; }
+  :global(.id) { color: #e2e8f0; }
+  :global(.attr) { color: #94a3b8; }
+  :global(.str) { color: #86efac; }
+  :global(.bool) { color: #fbbf24; }
+  :global(.enum) { color: #a5f3fc; }
+  :global(.type) { color: #94a3b8; }
+  :global(.prompt) { color: #22d3ee; }
+  :global(.muted) { color: #64748b; }
+  :global(.add) { color: #10b981; font-weight: 700; }
+  :global(.computed) { color: #67e8f9; }
+  :global(.plan-summary) { color: #22d3ee; font-weight: 600; }
 
   .hero-actions {
     display: flex;
@@ -200,18 +227,18 @@ import { PAGE_TITLE_ID } from '@astrojs/starlight/constants';
   :global([data-theme='light']) .panel-body code {
     color: #0f172a;
   }
-  :global([data-theme='light']) .kw { color: #0891b2; }
-  :global([data-theme='light']) .id { color: #0f172a; }
-  :global([data-theme='light']) .attr { color: #475569; }
-  :global([data-theme='light']) .str { color: #16a34a; }
-  :global([data-theme='light']) .bool { color: #d97706; }
-  :global([data-theme='light']) .enum { color: #0e7490; }
-  :global([data-theme='light']) .type { color: #475569; }
-  :global([data-theme='light']) .prompt { color: #0891b2; }
-  :global([data-theme='light']) .muted { color: #94a3b8; }
-  :global([data-theme='light']) .add { color: #16a34a; }
-  :global([data-theme='light']) .computed { color: #0891b2; }
-  :global([data-theme='light']) .plan-summary { color: #0891b2; }
+  :global([data-theme='light'] .kw) { color: #0891b2; }
+  :global([data-theme='light'] .id) { color: #0f172a; }
+  :global([data-theme='light'] .attr) { color: #475569; }
+  :global([data-theme='light'] .str) { color: #16a34a; }
+  :global([data-theme='light'] .bool) { color: #d97706; }
+  :global([data-theme='light'] .enum) { color: #0e7490; }
+  :global([data-theme='light'] .type) { color: #475569; }
+  :global([data-theme='light'] .prompt) { color: #0891b2; }
+  :global([data-theme='light'] .muted) { color: #94a3b8; }
+  :global([data-theme='light'] .add) { color: #16a34a; }
+  :global([data-theme='light'] .computed) { color: #0891b2; }
+  :global([data-theme='light'] .plan-summary) { color: #0891b2; }
   :global([data-theme='light']) h1 { color: #d97706; }
   :global([data-theme='light']) .hero-star {
     box-shadow: 0 0 16px #fbbf24, 0 0 40px rgba(251, 191, 36, 0.3);
