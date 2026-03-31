@@ -1,6 +1,6 @@
 //! ProcessProvider wraps a ProviderProcess and implements the carina-core Provider trait.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use carina_core::provider::{BoxFuture, Provider, ProviderError, ProviderResult};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State};
@@ -10,15 +10,15 @@ use crate::convert;
 use crate::process::ProviderProcess;
 
 pub struct ProcessProvider {
-    process: Mutex<ProviderProcess>,
+    process: Arc<Mutex<ProviderProcess>>,
     name: &'static str,
 }
 
 impl ProcessProvider {
-    pub fn new(process: ProviderProcess, name: String) -> Self {
+    pub fn new(process: Arc<Mutex<ProviderProcess>>, name: String) -> Self {
         let name_static: &'static str = Box::leak(name.into_boxed_str());
         Self {
-            process: Mutex::new(process),
+            process,
             name: name_static,
         }
     }

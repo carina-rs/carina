@@ -10,7 +10,6 @@ members = [
     "carina-provider-aws",
     "carina-provider-awscc",
     "carina-provider-mock",
-    "carina-provider-mock-process",
     "carina-provider-protocol",
     "carina-smithy",
     "carina-state",

@@ -120,3 +120,30 @@ pub struct NormalizeStateParams {
 pub struct NormalizeStateResult {
     pub states: HashMap<String, State>,
 }
+
+// -- hydrate_read_state --
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HydrateReadStateParams {
+    pub states: HashMap<String, State>,
+    pub saved_attrs: HashMap<String, HashMap<String, Value>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HydrateReadStateResult {
+    pub states: HashMap<String, State>,
+}
+
+// -- merge_default_tags --
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MergeDefaultTagsParams {
+    pub resources: Vec<Resource>,
+    pub default_tags: HashMap<String, Value>,
+    pub schemas: Vec<ResourceSchema>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MergeDefaultTagsResult {
+    pub resources: Vec<Resource>,
+}
