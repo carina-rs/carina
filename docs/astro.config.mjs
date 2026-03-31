@@ -22,6 +22,7 @@ export default defineConfig({
       },
       customCss: ['./src/styles/custom.css'],
       expressiveCode: {
+        themes: ['github-dark-high-contrast'],
         shiki: {
           langs: [crnGrammar],
         },
