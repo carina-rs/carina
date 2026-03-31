@@ -126,25 +126,7 @@ let subnets = for (i, az) in ["ap-northeast-1a", "ap-northeast-1c"] {
 
 ### For with modules
 
-You can call modules inside `for` expressions:
-
-```crn
-let vpc_mod = import "./modules/vpc_only"
-
-let cidrs = {
-  dev = "10.0.0.0/16"
-  stg = "10.1.0.0/16"
-}
-
-let networks = for name, cidr in cidrs {
-  vpc_mod {
-    cidr_block = cidr
-    env_name   = name
-  }
-}
-```
-
-See the [Using Modules](/guides/using-modules/) guide for more on modules.
+You can call modules inside `for` expressions to create multiple instances of a module. See the [Using Modules](/guides/using-modules/#using-modules-with-for-expressions) guide for a full example.
 
 ## If expressions
 
