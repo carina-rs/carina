@@ -39,10 +39,30 @@
   color-scheme: dark;
 }
 
-/* Code block theme */
+/* Code block theme: match hero panels */
 :root {
-  --astro-code-background: hsl(217, 33%, 17%); /* Slate 800 - matches sidebar */
+  --astro-code-background: #1e293b;
   --astro-code-token-keyword: var(--sl-color-accent-high);
+}
+/* Override Expressive Code frame backgrounds (loaded after custom.css, so need !important) */
+.expressive-code .frame pre {
+  background: #1e293b !important;
+}
+.expressive-code .frame .header {
+  background: #162032 !important;
+}
+.expressive-code .frame.is-terminal .header {
+  background: #162032 !important;
+}
+.expressive-code pre {
+  border-color: #334155 !important;
+}
+
+/* "Soon" badge: improve contrast in sidebar */
+.sl-badge.default {
+  background-color: hsl(217, 19%, 35%); /* Slate 600 */
+  border-color: hsl(215, 14%, 46%);     /* Slate 500 */
+  color: hsl(214, 32%, 91%);            /* Slate 200 */
 }
 
 /* Hide theme toggle */
