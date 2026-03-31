@@ -360,31 +360,7 @@ pub async fn get_provider_with_ctx(ctx: &WiringContext, parsed: &ParsedFile) -> 
     for provider_config in &parsed.providers {
         // If the provider has a source, load it as an external process
         if let Some(ref source) = provider_config.source {
-            match load_process_provider(source, provider_config).await {
-                Ok((provider, name)) => {
-                    let region =
-                        if let Some(Value::String(r)) = provider_config.attributes.get("region") {
-                            utils::convert_region_value(r)
-                        } else {
-                            "ap-northeast-1".to_string()
-                        };
-                    println!(
-                        "{}",
-                        format!("Using {} (region: {}, source: {})", name, region, source).cyan()
-                    );
-                    router.add_provider(name, provider);
-                }
-                Err(e) => {
-                    eprintln!(
-                        "{}",
-                        format!(
-                            "Failed to load process provider '{}': {}",
-                            provider_config.name, e
-                        )
-                        .red()
-                    );
-                }
-            }
+            try_add_process_provider(&mut router, source, provider_config).await;
             continue;
         }
 
@@ -413,10 +389,40 @@ pub async fn get_provider_with_ctx(ctx: &WiringContext, parsed: &ParsedFile) -> 
     router
 }
 
+async fn try_add_process_provider(
+    router: &mut ProviderRouter,
+    source: &str,
+    config: &ProviderConfig,
+) {
+    match load_process_provider(source, config).await {
+        Ok((factory, provider, name)) => {
+            let region = factory.extract_region(&config.attributes);
+            println!(
+                "{}",
+                format!("Using {} (region: {}, source: {})", name, region, source).cyan()
+            );
+            router.add_provider(name, provider);
+        }
+        Err(e) => {
+            eprintln!(
+                "{}",
+                format!("Failed to load process provider '{}': {}", config.name, e).red()
+            );
+        }
+    }
+}
+
 async fn load_process_provider(
     source: &str,
     config: &ProviderConfig,
-) -> Result<(Box<dyn Provider>, String), String> {
+) -> Result<
+    (
+        carina_plugin_host::ProcessProviderFactory,
+        Box<dyn Provider>,
+        String,
+    ),
+    String,
+> {
     let binary_path = if let Some(path) = source.strip_prefix("file://") {
         std::path::PathBuf::from(path)
     } else {
@@ -427,13 +433,6 @@ async fn load_process_provider(
         ));
     };
 
-    if !binary_path.exists() {
-        return Err(format!(
-            "Provider binary not found: {}",
-            binary_path.display()
-        ));
-    }
-
     let factory = carina_plugin_host::ProcessProviderFactory::new(binary_path)?;
     let name = factory.name().to_string();
 
@@ -442,7 +441,7 @@ async fn load_process_provider(
         .map_err(|e| format!("Config validation failed: {e}"))?;
 
     let provider = factory.create_provider(&config.attributes).await;
-    Ok((provider, name))
+    Ok((factory, provider, name))
 }
 
 pub async fn create_providers_from_configs(configs: &[ProviderConfig]) -> ProviderRouter {
@@ -452,17 +451,7 @@ pub async fn create_providers_from_configs(configs: &[ProviderConfig]) -> Provid
     for config in configs {
         // If the provider has a source, load it as an external process
         if let Some(ref source) = config.source {
-            match load_process_provider(source, config).await {
-                Ok((provider, name)) => {
-                    router.add_provider(name, provider);
-                }
-                Err(e) => {
-                    eprintln!(
-                        "{}",
-                        format!("Failed to load process provider '{}': {}", config.name, e).red()
-                    );
-                }
-            }
+            try_add_process_provider(&mut router, source, config).await;
             continue;
         }
 

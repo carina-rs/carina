@@ -24,6 +24,14 @@ impl ProcessProvider {
     }
 }
 
+impl ProcessProvider {
+    fn lock_process(&self) -> ProviderResult<std::sync::MutexGuard<'_, ProviderProcess>> {
+        self.process
+            .lock()
+            .map_err(|e| ProviderError::new(format!("Process lock poisoned: {e}")))
+    }
+}
+
 impl Provider for ProcessProvider {
     fn name(&self) -> &'static str {
         self.name
@@ -39,10 +47,7 @@ impl Provider for ProcessProvider {
             identifier: identifier.map(String::from),
         };
         Box::pin(async move {
-            let mut process = self
-                .process
-                .lock()
-                .map_err(|e| ProviderError::new(format!("Process lock poisoned: {e}")))?;
+            let mut process = self.lock_process()?;
             let result: methods::ReadResult =
                 process.call("read", &params).map_err(ProviderError::new)?;
             Ok(convert::proto_to_core_state(&result.state))
@@ -54,10 +59,7 @@ impl Provider for ProcessProvider {
             resource: convert::core_to_proto_resource(resource),
         };
         Box::pin(async move {
-            let mut process = self
-                .process
-                .lock()
-                .map_err(|e| ProviderError::new(format!("Process lock poisoned: {e}")))?;
+            let mut process = self.lock_process()?;
             let result: methods::CreateResult = process
                 .call("create", &params)
                 .map_err(ProviderError::new)?;
@@ -79,10 +81,7 @@ impl Provider for ProcessProvider {
             to: convert::core_to_proto_resource(to),
         };
         Box::pin(async move {
-            let mut process = self
-                .process
-                .lock()
-                .map_err(|e| ProviderError::new(format!("Process lock poisoned: {e}")))?;
+            let mut process = self.lock_process()?;
             let result: methods::UpdateResult = process
                 .call("update", &params)
                 .map_err(ProviderError::new)?;
@@ -102,10 +101,7 @@ impl Provider for ProcessProvider {
             lifecycle: convert::core_to_proto_lifecycle(lifecycle),
         };
         Box::pin(async move {
-            let mut process = self
-                .process
-                .lock()
-                .map_err(|e| ProviderError::new(format!("Process lock poisoned: {e}")))?;
+            let mut process = self.lock_process()?;
             let _result: methods::DeleteResult = process
                 .call("delete", &params)
                 .map_err(ProviderError::new)?;
