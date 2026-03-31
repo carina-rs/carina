@@ -16,30 +16,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 FILTER="${1:-}"
 
-CARINA_BIN="$PROJECT_ROOT/target/debug/carina"
-if [ ! -f "$CARINA_BIN" ]; then
-    echo "Building carina..."
-    cargo build --quiet 2>/dev/null || cargo build
-fi
-
-# ── Provider source injection ────────────────────────────────────────
-AWSCC_PROVIDER_BIN="$PROJECT_ROOT/target/debug/carina-provider-awscc"
-AWS_PROVIDER_BIN="$PROJECT_ROOT/target/debug/carina-provider-aws"
-
-inject_provider_source() {
-    local original="$1"
-    local tmp_file
-    tmp_file=$(mktemp "${TMPDIR:-/tmp}/carina-test-XXXXXX.crn")
-    sed \
-        -e '/^provider awscc {/a\
-  source = "file://'"$AWSCC_PROVIDER_BIN"'"\
-  version = "0.1.0"' \
-        -e '/^provider aws {/a\
-  source = "file://'"$AWS_PROVIDER_BIN"'"\
-  version = "0.1.0"' \
-        "$original" > "$tmp_file"
-    echo "$tmp_file"
-}
+source "$SCRIPT_DIR/../shared/_helpers.sh"
 
 TOTAL_PASSED=0
 TOTAL_FAILED=0
