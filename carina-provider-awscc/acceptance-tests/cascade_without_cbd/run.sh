@@ -13,6 +13,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 CARINA="cargo run --bin carina --"
 
+# Build provider binaries (not built by cargo run --bin carina since Phase 4)
+cargo build -p carina-provider-awscc --bin carina-provider-awscc --quiet 2>/dev/null || cargo build -p carina-provider-awscc --bin carina-provider-awscc
+cargo build -p carina-provider-aws --bin carina-provider-aws --quiet 2>/dev/null || cargo build -p carina-provider-aws --bin carina-provider-aws
+
 # ── Provider source injection ────────────────────────────────────────
 AWSCC_PROVIDER_BIN="$PROJECT_ROOT/target/debug/carina-provider-awscc"
 AWS_PROVIDER_BIN="$PROJECT_ROOT/target/debug/carina-provider-aws"

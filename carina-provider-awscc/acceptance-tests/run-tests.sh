@@ -236,16 +236,6 @@ inject_provider_source() {
     echo "$tmp_file"
 }
 
-# Track temp files for cleanup
-INJECTED_TEMP_FILES=()
-
-cleanup_injected_files() {
-    for f in ${INJECTED_TEMP_FILES[@]+"${INJECTED_TEMP_FILES[@]}"}; do
-        rm -f "$f"
-    done
-    INJECTED_TEMP_FILES=()
-}
-
 # Find test files
 # matches_any_filter: returns 0 if rel_path matches any filter, or if no filters given
 matches_any_filter() {
@@ -651,7 +641,6 @@ for TEST_FILE in "${TESTS[@]}"; do
     printf "  %-55s " "$REL_PATH"
 
     INJECTED_FILE=$(inject_provider_source "$TEST_FILE")
-    INJECTED_TEMP_FILES+=("$INJECTED_FILE")
 
     AUTO_APPROVE=""
     if [ "$COMMAND" = "apply" ] || [ "$COMMAND" = "destroy" ]; then

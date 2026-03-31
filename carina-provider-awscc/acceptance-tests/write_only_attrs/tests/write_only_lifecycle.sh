@@ -35,6 +35,7 @@ fi
 
 # Step 2: Change write-only value (120 → 240)
 cp "$SCRIPT_DIR/step2_change.crn" "$WORK_DIR/main.crn"
+prepare_work_dir "$WORK_DIR"
 
 # Plan should detect the change
 printf "  %-50s" "step2: plan detects value change"
@@ -57,6 +58,7 @@ assert_state_value "assert: max_drain_duration_seconds = 240 in state" \
 
 # Step 3: Remove write-only attribute
 cp "$SCRIPT_DIR/step3_remove.crn" "$WORK_DIR/main.crn"
+prepare_work_dir "$WORK_DIR"
 
 # Plan should detect the removal
 printf "  %-50s" "step3: plan detects attribute removal"
