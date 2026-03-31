@@ -15,8 +15,6 @@
   --sl-color-gray-6: hsl(222, 47%, 11%); /* #0f172a Slate 900 */
   --sl-color-black: hsl(229, 84%, 5%);   /* #020617 Slate 950 */
 
-  /* Nav bar: match page background */
-  --sl-color-bg-nav: var(--sl-color-black);
 
   /* Accent: Canopus Gold (Amber/Yellow) */
   --sl-color-accent-low: hsl(32, 60%, 15%);   /* dark amber */
@@ -50,6 +48,11 @@
 /* Hide theme toggle */
 starlight-theme-select {
   display: none;
+}
+
+/* Nav bar: match page background */
+.header {
+  background-color: var(--sl-color-black) !important;
 }
 
 /* Provider doc table styling */
