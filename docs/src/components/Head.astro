@@ -1,0 +1,12 @@
+---
+// Override Starlight's Head to inject per-page og:image meta tag.
+import Default from '@astrojs/starlight/components/Head.astro';
+
+const pathname = Astro.url.pathname; // e.g., "/" or "/reference/providers/awscc/"
+const isIndex = pathname === '/' || pathname === '/index';
+
+const ogImagePath = isIndex ? '/og/index.png' : `/og${pathname}index.png`;
+---
+
+<Default {...Astro.props}><slot /></Default>
+<meta property="og:image" content={ogImagePath} />
