@@ -239,7 +239,7 @@ attributes {
 
 ## Null
 
-The `null` literal represents the absence of a value. It is primarily used in validation expressions:
+The `null` literal represents the absence of a value. It can only appear in [validate expressions](/reference/dsl/expressions/#validate-expressions) such as `require` statements and argument validation:
 
 ```crn
 require value != null, "Value must not be null"

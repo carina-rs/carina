@@ -55,6 +55,8 @@ The following statements are valid at the top level of a `.crn` file:
 | `if` | Conditionally create resources |
 | `fn` | Define a reusable function |
 | `require` | Assert a condition with an error message |
+| `arguments` | Declare module input parameters |
+| `attributes` | Declare module output values |
 
 ## Provider Block
 

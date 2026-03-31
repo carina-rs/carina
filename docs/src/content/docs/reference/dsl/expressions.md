@@ -81,24 +81,7 @@ let networks = for name, cidr in cidrs {
 
 ### For with Module Calls
 
-`for` works with module calls to create multiple instances of a module:
-
-```crn
-let network = import "./modules/network"
-
-let cidrs = {
-  dev = "10.0.0.0/16"
-  stg = "10.1.0.0/16"
-}
-
-let networks = for name, cidr in cidrs {
-  network {
-    cidr_block  = cidr
-    subnet_cidr = cidr_subnet(cidr, 8, 1)
-    az          = "ap-northeast-1a"
-  }
-}
-```
+`for` works with module calls to create multiple instances of a module. See [Modules: Modules with For Expressions](/reference/dsl/modules/#modules-with-for-expressions) for a full example.
 
 ## If Expression
 
@@ -167,6 +150,8 @@ let shared = remote_state {
   path = "shared.state.json"
 }
 ```
+
+Use `let _ =` (the discard pattern) when you need to evaluate an expression but do not need to reference the result. See [Syntax: Discard Pattern](/reference/dsl/syntax/#discard-pattern) for details.
 
 ## Pipe Operator (`|>`)
 
