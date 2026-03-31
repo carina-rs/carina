@@ -10,6 +10,9 @@ export default defineConfig({
   integrations: [
     starlight({
       title: 'Carina',
+      components: {
+        Hero: './src/components/Hero.astro',
+      },
       favicon: '/favicon.png',
       head: [
         { tag: 'meta', attrs: { property: 'og:image', content: '/og.png' } },
