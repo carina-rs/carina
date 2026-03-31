@@ -211,7 +211,7 @@ AWSCC_PROVIDER_BIN="$PROJECT_ROOT/target/debug/carina-provider-awscc"
 inject_provider_source() {
     local original="$1"
     local tmp_file
-    tmp_file=$(mktemp "${TMPDIR:-/tmp}/carina-test-XXXXXX.crn")
+    tmp_file=$(mktemp).crn
 
     sed \
         -e '/^provider aws {/a\
