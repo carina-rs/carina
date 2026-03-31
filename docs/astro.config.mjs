@@ -1,6 +1,7 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import { readFileSync } from 'node:fs';
+import { ogpIntegration } from './src/ogp/integration.ts';
 
 const crnGrammar = JSON.parse(
   readFileSync(new URL('./custom-grammars/crn.tmLanguage.json', import.meta.url), 'utf-8')
@@ -14,9 +15,7 @@ export default defineConfig({
         Hero: './src/components/Hero.astro',
       },
       favicon: '/favicon.png',
-      head: [
-        { tag: 'meta', attrs: { property: 'og:image', content: '/og.png' } },
-      ],
+      head: [],
       social: {
         github: 'https://github.com/carina-rs/carina',
       },
@@ -78,5 +77,6 @@ export default defineConfig({
         },
       ],
     }),
+    ogpIntegration(),
   ],
 });
