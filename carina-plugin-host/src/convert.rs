@@ -6,9 +6,15 @@ use carina_core::resource::{
     LifecycleConfig as CoreLifecycle, Resource as CoreResource, ResourceId as CoreResourceId,
     State as CoreState, Value as CoreValue,
 };
+use carina_core::schema::{
+    AttributeSchema as CoreAttributeSchema, AttributeType as CoreAttributeType,
+    ResourceSchema as CoreResourceSchema, StructField as CoreStructField,
+};
 use carina_provider_protocol::types::{
+    AttributeSchema as ProtoAttributeSchema, AttributeType as ProtoAttributeType,
     LifecycleConfig as ProtoLifecycle, Resource as ProtoResource, ResourceId as ProtoResourceId,
-    State as ProtoState, Value as ProtoValue,
+    ResourceSchema as ProtoResourceSchema, State as ProtoState, StructField as ProtoStructField,
+    Value as ProtoValue,
 };
 
 // -- ResourceId --
@@ -112,5 +118,228 @@ pub fn core_to_proto_lifecycle(l: &CoreLifecycle) -> ProtoLifecycle {
     ProtoLifecycle {
         force_delete: l.force_delete,
         create_before_destroy: l.create_before_destroy,
+    }
+}
+
+// -- proto_to_core_resource (reverse of core_to_proto_resource) --
+
+pub fn proto_to_core_resource(r: &ProtoResource) -> CoreResource {
+    use carina_core::resource::Expr;
+    let mut resource = CoreResource::with_provider(&r.id.provider, &r.id.resource_type, &r.id.name);
+    resource.attributes = r
+        .attributes
+        .iter()
+        .map(|(k, v)| (k.clone(), Expr(proto_to_core_value(v))))
+        .collect();
+    resource.lifecycle = CoreLifecycle {
+        force_delete: r.lifecycle.force_delete,
+        create_before_destroy: r.lifecycle.create_before_destroy,
+    };
+    resource
+}
+
+// -- AttributeType --
+
+fn proto_to_core_attribute_type(t: &ProtoAttributeType) -> CoreAttributeType {
+    match t {
+        ProtoAttributeType::String => CoreAttributeType::String,
+        ProtoAttributeType::Int => CoreAttributeType::Int,
+        ProtoAttributeType::Float => CoreAttributeType::Float,
+        ProtoAttributeType::Bool => CoreAttributeType::Bool,
+        ProtoAttributeType::StringEnum { values } => CoreAttributeType::StringEnum {
+            name: String::new(),
+            values: values.clone(),
+            namespace: None,
+            to_dsl: None,
+        },
+        ProtoAttributeType::List { inner } => CoreAttributeType::List {
+            inner: Box::new(proto_to_core_attribute_type(inner)),
+            ordered: true,
+        },
+        ProtoAttributeType::Map { inner } => {
+            CoreAttributeType::Map(Box::new(proto_to_core_attribute_type(inner)))
+        }
+        ProtoAttributeType::Struct { name, fields } => CoreAttributeType::Struct {
+            name: name.clone(),
+            fields: fields.iter().map(proto_to_core_struct_field).collect(),
+        },
+    }
+}
+
+fn proto_to_core_struct_field(f: &ProtoStructField) -> CoreStructField {
+    CoreStructField {
+        name: f.name.clone(),
+        field_type: proto_to_core_attribute_type(&f.field_type),
+        required: f.required,
+        description: f.description.clone(),
+        provider_name: None,
+        block_name: None,
+    }
+}
+
+fn proto_to_core_attribute_schema(a: &ProtoAttributeSchema) -> CoreAttributeSchema {
+    CoreAttributeSchema {
+        name: a.name.clone(),
+        attr_type: proto_to_core_attribute_type(&a.attr_type),
+        required: a.required,
+        default: a.default.as_ref().map(proto_to_core_value),
+        description: a.description.clone(),
+        completions: None,
+        provider_name: None,
+        create_only: a.create_only,
+        read_only: a.read_only,
+        removable: None,
+        block_name: None,
+        write_only: a.write_only,
+    }
+}
+
+pub fn proto_to_core_schema(s: &ProtoResourceSchema) -> CoreResourceSchema {
+    CoreResourceSchema {
+        resource_type: s.resource_type.clone(),
+        attributes: s
+            .attributes
+            .iter()
+            .map(|(k, v)| (k.clone(), proto_to_core_attribute_schema(v)))
+            .collect(),
+        description: s.description.clone(),
+        validator: None,
+        data_source: s.data_source,
+        name_attribute: s.name_attribute.clone(),
+        force_replace: s.force_replace,
+    }
+}
+
+fn core_to_proto_attribute_type(t: &CoreAttributeType) -> ProtoAttributeType {
+    match t {
+        CoreAttributeType::String => ProtoAttributeType::String,
+        CoreAttributeType::Int => ProtoAttributeType::Int,
+        CoreAttributeType::Float => ProtoAttributeType::Float,
+        CoreAttributeType::Bool => ProtoAttributeType::Bool,
+        CoreAttributeType::StringEnum { values, .. } => ProtoAttributeType::StringEnum {
+            values: values.clone(),
+        },
+        CoreAttributeType::List { inner, .. } => ProtoAttributeType::List {
+            inner: Box::new(core_to_proto_attribute_type(inner)),
+        },
+        CoreAttributeType::Map(inner) => ProtoAttributeType::Map {
+            inner: Box::new(core_to_proto_attribute_type(inner)),
+        },
+        CoreAttributeType::Struct { name, fields } => ProtoAttributeType::Struct {
+            name: name.clone(),
+            fields: fields.iter().map(core_to_proto_struct_field).collect(),
+        },
+        // Custom → base type: function pointers can't cross process boundary
+        CoreAttributeType::Custom { base, .. } => core_to_proto_attribute_type(base),
+        // Union has no proto equivalent → best-effort String
+        CoreAttributeType::Union(_) => ProtoAttributeType::String,
+    }
+}
+
+fn core_to_proto_struct_field(f: &CoreStructField) -> ProtoStructField {
+    ProtoStructField {
+        name: f.name.clone(),
+        field_type: core_to_proto_attribute_type(&f.field_type),
+        required: f.required,
+        description: f.description.clone(),
+    }
+}
+
+fn core_to_proto_attribute_schema(a: &CoreAttributeSchema) -> ProtoAttributeSchema {
+    ProtoAttributeSchema {
+        name: a.name.clone(),
+        attr_type: core_to_proto_attribute_type(&a.attr_type),
+        required: a.required,
+        default: a.default.as_ref().map(core_to_proto_value),
+        description: a.description.clone(),
+        create_only: a.create_only,
+        read_only: a.read_only,
+        write_only: a.write_only,
+    }
+}
+
+pub fn core_to_proto_schema(s: &CoreResourceSchema) -> ProtoResourceSchema {
+    ProtoResourceSchema {
+        resource_type: s.resource_type.clone(),
+        attributes: s
+            .attributes
+            .iter()
+            .map(|(k, v)| (k.clone(), core_to_proto_attribute_schema(v)))
+            .collect(),
+        description: s.description.clone(),
+        data_source: s.data_source,
+        name_attribute: s.name_attribute.clone(),
+        force_replace: s.force_replace,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_schema_roundtrip() {
+        let core_schema = CoreResourceSchema {
+            resource_type: "ec2.vpc".into(),
+            attributes: HashMap::from([(
+                "cidr_block".into(),
+                CoreAttributeSchema {
+                    name: "cidr_block".into(),
+                    attr_type: CoreAttributeType::String,
+                    required: true,
+                    default: None,
+                    description: Some("CIDR block".into()),
+                    completions: None,
+                    provider_name: None,
+                    create_only: true,
+                    read_only: false,
+                    removable: None,
+                    block_name: None,
+                    write_only: false,
+                },
+            )]),
+            description: Some("VPC".into()),
+            validator: None,
+            data_source: false,
+            name_attribute: None,
+            force_replace: false,
+        };
+
+        let proto = core_to_proto_schema(&core_schema);
+        let back = proto_to_core_schema(&proto);
+
+        assert_eq!(back.resource_type, "ec2.vpc");
+        assert_eq!(back.attributes.len(), 1);
+        let attr = &back.attributes["cidr_block"];
+        assert_eq!(attr.name, "cidr_block");
+        assert!(attr.required);
+        assert!(attr.create_only);
+        assert_eq!(attr.description, Some("CIDR block".into()));
+    }
+
+    #[test]
+    fn test_struct_type_roundtrip() {
+        let core_type = CoreAttributeType::Struct {
+            name: "Tag".into(),
+            fields: vec![CoreStructField {
+                name: "key".into(),
+                field_type: CoreAttributeType::String,
+                required: true,
+                description: None,
+                provider_name: None,
+                block_name: None,
+            }],
+        };
+
+        let proto = core_to_proto_attribute_type(&core_type);
+        let back = proto_to_core_attribute_type(&proto);
+
+        if let CoreAttributeType::Struct { name, fields } = back {
+            assert_eq!(name, "Tag");
+            assert_eq!(fields.len(), 1);
+            assert_eq!(fields[0].name, "key");
+        } else {
+            panic!("Expected Struct type");
+        }
     }
 }
