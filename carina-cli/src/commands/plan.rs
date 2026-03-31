@@ -186,8 +186,14 @@ pub async fn run_plan(
     // Load remote state data sources
     let remote_bindings = load_remote_states(&parsed.remote_states, base_dir).await?;
 
-    let ctx = create_plan_from_parsed_with_remote(&parsed, &state_file, refresh, &remote_bindings)
-        .await?;
+    let ctx = create_plan_from_parsed_with_remote(
+        &parsed,
+        &state_file,
+        refresh,
+        &remote_bindings,
+        base_dir,
+    )
+    .await?;
     let has_changes = ctx.plan.mutation_count() > 0;
 
     // Build delete attributes map from current states for display

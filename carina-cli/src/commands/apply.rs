@@ -1006,7 +1006,7 @@ async fn run_apply_locked(
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
 
     // Select appropriate Provider based on configuration
-    let provider = get_provider_with_ctx(ctx, parsed).await;
+    let provider = get_provider_with_ctx(ctx, parsed, base_dir).await;
 
     // Read states for all resources using identifier from state
     // In identifier-based approach, if there's no identifier in state, the resource doesn't exist
@@ -1344,11 +1344,14 @@ pub async fn run_apply_from_plan(
         None
     };
 
+    let source_path = std::path::PathBuf::from(&plan_file.source_path);
+    let base_dir = get_base_dir(&source_path);
     let op_result = run_apply_from_plan_locked(
         plan_file,
         auto_approve,
         backend.as_ref(),
         lock_info.as_ref(),
+        base_dir,
     )
     .await;
 
@@ -1372,6 +1375,7 @@ async fn run_apply_from_plan_locked(
     auto_approve: bool,
     backend: &dyn StateBackend,
     lock: Option<&LockInfo>,
+    base_dir: &std::path::Path,
 ) -> Result<(), AppError> {
     // Read current state and validate lineage
     let state_file = backend.read_state().await.map_err(AppError::Backend)?;
@@ -1414,7 +1418,7 @@ async fn run_apply_from_plan_locked(
         .collect();
 
     // Create provider early for drift detection
-    let provider = create_providers_from_configs(&plan_file.provider_configs).await;
+    let provider = create_providers_from_configs(&plan_file.provider_configs, base_dir).await;
 
     // Drift detection: re-read actual infrastructure state and compare against planned states
     println!("{}", "Checking for infrastructure drift...".cyan());

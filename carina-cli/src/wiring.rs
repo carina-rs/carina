@@ -354,13 +354,17 @@ pub fn validate_module_calls(parsed: &ParsedFile, base_dir: &Path) -> Result<(),
         .map_err(AppError::Validation)
 }
 
-pub async fn get_provider_with_ctx(ctx: &WiringContext, parsed: &ParsedFile) -> ProviderRouter {
+pub async fn get_provider_with_ctx(
+    ctx: &WiringContext,
+    parsed: &ParsedFile,
+    base_dir: &Path,
+) -> ProviderRouter {
     let mut router = ProviderRouter::new();
 
     for provider_config in &parsed.providers {
         // If the provider has a source, load it as an external process
         if let Some(ref source) = provider_config.source {
-            try_add_process_provider(&mut router, source, provider_config).await;
+            try_add_process_provider(&mut router, source, provider_config, base_dir).await;
             continue;
         }
 
@@ -393,8 +397,9 @@ async fn try_add_process_provider(
     router: &mut ProviderRouter,
     source: &str,
     config: &ProviderConfig,
+    base_dir: &Path,
 ) {
-    match load_process_provider(source, config).await {
+    match load_process_provider(source, config, base_dir).await {
         Ok((factory, provider, name)) => {
             let region = factory.extract_region(&config.attributes);
             println!(
@@ -415,6 +420,7 @@ async fn try_add_process_provider(
 async fn load_process_provider(
     source: &str,
     config: &ProviderConfig,
+    base_dir: &Path,
 ) -> Result<
     (
         carina_plugin_host::ProcessProviderFactory,
@@ -425,11 +431,34 @@ async fn load_process_provider(
 > {
     let binary_path = if let Some(path) = source.strip_prefix("file://") {
         std::path::PathBuf::from(path)
+    } else if source.starts_with("github.com/") {
+        let version = config.version.as_deref().ok_or_else(|| {
+            format!(
+                "Provider '{}' has source but no version. Add: version = \"x.y.z\"",
+                config.name
+            )
+        })?;
+
+        let lock_path = base_dir.join("carina.lock");
+        let mut lock_file =
+            crate::provider_resolver::LockFile::load(&lock_path).unwrap_or_default();
+
+        let path = crate::provider_resolver::resolve_provider(
+            base_dir,
+            source,
+            version,
+            &config.name,
+            &mut lock_file,
+        )?;
+
+        lock_file
+            .save(&lock_path)
+            .map_err(|e| format!("Failed to save carina.lock: {e}"))?;
+
+        path
     } else {
-        // TODO: Phase 4 will implement download from GitHub Releases.
-        // For now, only file:// sources are supported.
         return Err(format!(
-            "Remote sources not yet supported. Use file:// for local binaries. Got: {source}"
+            "Unsupported source format: {source}. Use file:// for local binaries or github.com/owner/repo for remote."
         ));
     };
 
@@ -444,14 +473,17 @@ async fn load_process_provider(
     Ok((factory, provider, name))
 }
 
-pub async fn create_providers_from_configs(configs: &[ProviderConfig]) -> ProviderRouter {
+pub async fn create_providers_from_configs(
+    configs: &[ProviderConfig],
+    base_dir: &Path,
+) -> ProviderRouter {
     let ctx = WiringContext::new();
     let mut router = ProviderRouter::new();
 
     for config in configs {
         // If the provider has a source, load it as an external process
         if let Some(ref source) = config.source {
-            try_add_process_provider(&mut router, source, config).await;
+            try_add_process_provider(&mut router, source, config, base_dir).await;
             continue;
         }
 
@@ -486,8 +518,10 @@ pub async fn create_plan_from_parsed(
     parsed: &ParsedFile,
     state_file: &Option<StateFile>,
     refresh: bool,
+    base_dir: &Path,
 ) -> Result<PlanContext, AppError> {
-    create_plan_from_parsed_with_remote(parsed, state_file, refresh, &HashMap::new()).await
+    create_plan_from_parsed_with_remote(parsed, state_file, refresh, &HashMap::new(), base_dir)
+        .await
 }
 
 pub async fn create_plan_from_parsed_with_remote(
@@ -495,13 +529,14 @@ pub async fn create_plan_from_parsed_with_remote(
     state_file: &Option<StateFile>,
     refresh: bool,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    base_dir: &Path,
 ) -> Result<PlanContext, AppError> {
     let ctx = WiringContext::new();
     let sorted_resources =
         sort_resources_by_dependencies(&parsed.resources).map_err(AppError::Validation)?;
 
     // Select appropriate Provider based on configuration
-    let provider = get_provider_with_ctx(&ctx, parsed).await;
+    let provider = get_provider_with_ctx(&ctx, parsed, base_dir).await;
 
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
 
