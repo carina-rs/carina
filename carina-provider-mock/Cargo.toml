@@ -8,6 +8,12 @@ publish = false
 [lib]
 doctest = false
 
+[[bin]]
+name = "carina-provider-mock"
+path = "src/main.rs"
+
 [dependencies]
 carina-core = { path = "../carina-core" }
+carina-plugin-sdk = { path = "../carina-plugin-sdk" }
+carina-provider-protocol = { path = "../carina-provider-protocol" }
 serde_json = "1"

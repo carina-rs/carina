@@ -13,14 +13,20 @@ static BUILD_ONCE: Once = Once::new();
 fn build_mock_process() -> PathBuf {
     BUILD_ONCE.call_once(|| {
         let status = Command::new("cargo")
-            .args(["build", "-p", "carina-provider-mock-process"])
+            .args([
+                "build",
+                "-p",
+                "carina-provider-mock",
+                "--bin",
+                "carina-provider-mock",
+            ])
             .status()
             .expect("Failed to run cargo build");
         assert!(status.success(), "Failed to build mock-process provider");
     });
 
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-    let binary = workspace_root.join("target/debug/carina-provider-mock-process");
+    let binary = workspace_root.join("target/debug/carina-provider-mock");
     assert!(binary.exists(), "Binary not found: {}", binary.display());
     binary
 }
