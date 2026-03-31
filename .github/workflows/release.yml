@@ -64,7 +64,11 @@ jobs:
           cp target/${{ matrix.target }}/release/carina "${ARCHIVE_NAME}/"
           cp target/${{ matrix.target }}/release/carina-lsp "${ARCHIVE_NAME}/"
           tar czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
-          shasum -a 256 "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
+          else
+            sha256sum "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
