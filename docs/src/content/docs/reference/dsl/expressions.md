@@ -256,8 +256,8 @@ When a built-in function is called with fewer arguments than it expects, it retu
 # Providing only 1 creates a closure
 let split_by_comma = split(",")
 
-# The closure can be used with pipe
-let parts = "a,b,c" |> split_by_comma
+# The closure can be used with pipe (parentheses are required)
+let parts = "a,b,c" |> split_by_comma()
 ```
 
 This is particularly useful with the pipe operator:
