@@ -988,6 +988,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires provider binary for enum alias resolution"]
     fn test_resolve_enum_aliases_ip_protocol_all() {
         // After normalize_desired, ip_protocol "all" becomes a namespaced DSL value.
         // resolve_enum_aliases should resolve the alias "all" -> "-1".
@@ -1032,6 +1033,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires provider binary for enum alias resolution"]
     fn test_resolve_enum_aliases_aws_provider() {
         // Same alias resolution should work for the aws provider
         let mut resource =
@@ -1051,6 +1053,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires provider binary for enum alias resolution"]
     fn test_resolve_enum_aliases_in_states() {
         // Current states should also have aliases resolved
         let ctx = WiringContext::new(vec![]);
@@ -1073,6 +1076,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires provider binary for enum alias resolution"]
     fn test_resolve_enum_aliases_in_struct_field() {
         // Aliases within struct fields (maps inside lists) should also be resolved
         let mut resource = Resource::with_provider("awscc", "ec2.security_group", "test-sg");
@@ -1124,6 +1128,7 @@ mod tests {
     /// normalize_state to maintain parity. This test ensures the normalization
     /// produces matching values so no false diff occurs.
     #[test]
+    #[ignore = "requires provider binary for state normalization"]
     fn test_normalize_state_prevents_false_enum_diff() {
         use carina_core::differ::create_plan;
         use carina_core::resource::LifecycleConfig;
@@ -1199,6 +1204,7 @@ mod tests {
     /// Both the plan path (wiring.rs) and the apply path (apply.rs) must call
     /// merge_default_tags to maintain parity.
     #[test]
+    #[ignore = "requires provider binary for default tags merging"]
     fn test_merge_default_tags_prevents_false_diff() {
         use carina_core::differ::create_plan;
         use carina_core::resource::LifecycleConfig;

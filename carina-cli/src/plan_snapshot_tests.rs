@@ -64,7 +64,7 @@ fn build_plan_and_states_from_fixture(
     // Parse configuration
     let mut parsed = load_configuration(&crn_path).unwrap().parsed;
     let base_dir = get_base_dir(&crn_path);
-    validate_and_resolve(&mut parsed, base_dir, false).unwrap();
+    validate_and_resolve(&mut parsed, base_dir, true).unwrap();
 
     // Load state file if present
     let state_file: Option<StateFile> = if state_path.exists() {

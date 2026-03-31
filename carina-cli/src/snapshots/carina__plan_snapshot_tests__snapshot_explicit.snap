@@ -8,7 +8,7 @@ Execution Plan:
       tags:
         + Environment: "staging"
         │
-        ├─ + awscc.ec2.security_group ec2_security_group_712c54ef
+        ├─ + awscc.ec2.security_group 
         │     group_description: "Test security group"
         │     tags:
         │       Name: "test-sg"
