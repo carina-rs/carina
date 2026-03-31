@@ -41,10 +41,11 @@
 
 /* Code block theme */
 :root {
-  --astro-code-color-background: hsl(217, 33%, 17%); /* Slate 800 - matches sidebar */
+  --astro-code-background: hsl(217, 33%, 17%); /* Slate 800 - matches sidebar */
+  --astro-code-token-keyword: var(--sl-color-accent-high); /* Cyan instead of purple */
 }
 :root[data-theme='light'] {
-  --astro-code-color-background: hsl(210, 40%, 96%); /* Slate 100 */
+  --astro-code-background: hsl(210, 40%, 96%); /* Slate 100 */
 }
 
 /* Provider doc table styling */
@@ -78,15 +79,19 @@ table td, table th {
   border-color: var(--sl-color-hairline-light);
 }
 
-/* Feature cards: consistent cyan accent */
+/* Feature cards: consistent cyan accent with left border */
 .card {
   --sl-card-border: var(--sl-color-accent);
   --sl-card-bg: var(--sl-color-accent-low);
   border-color: var(--sl-color-gray-5);
+  border-left: 3px solid var(--sl-color-accent);
   transition: border-color 0.2s ease;
 }
 .card:hover {
   border-color: var(--sl-color-accent);
+}
+.card .icon {
+  color: var(--sl-color-accent);
 }
 /* Override per-card color rotation to use consistent cyan */
 .card:nth-child(4n + 1) {
