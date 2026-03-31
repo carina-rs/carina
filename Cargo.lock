@@ -839,8 +839,6 @@ name = "carina-lsp"
 version = "0.1.0"
 dependencies = [
  "carina-core",
- "carina-provider-aws",
- "carina-provider-awscc",
  "carina-state",
  "dashmap 6.1.0",
  "env_logger",

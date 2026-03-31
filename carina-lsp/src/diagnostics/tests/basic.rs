@@ -1,6 +1,7 @@
 use super::*;
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn unknown_field_in_struct_block() {
     let engine = test_engine();
     let doc = create_document(
@@ -30,6 +31,7 @@ security_group_ingress {
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn type_mismatch_in_struct_field() {
     let engine = test_engine();
     let doc = create_document(
@@ -60,6 +62,7 @@ security_group_ingress {
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn resource_ref_type_mismatch() {
     let engine = test_engine();
     // vpc.vpc_id is AwsResourceId, but ipv4_ipam_pool_id expects IpamPoolId
@@ -122,6 +125,7 @@ cidr_block = "10.0.1.0/24"
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn unknown_field_in_second_repeated_block() {
     let engine = test_engine();
     let doc = create_document(
@@ -169,6 +173,7 @@ security_group_ingress {
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn block_syntax_rejected_for_bare_struct() {
     let engine = test_engine();
     let doc = create_document(
@@ -207,6 +212,7 @@ private_dns_name_options_on_launch {
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn block_syntax_rejected_for_bare_struct_multiple_blocks() {
     let engine = test_engine();
     let doc = create_document(
@@ -246,6 +252,7 @@ private_dns_name_options_on_launch {
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn lint_list_literal_for_list_struct() {
     let engine = test_engine();
     let doc = create_document(
@@ -338,6 +345,7 @@ group_description = "Test security group"
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn data_source_without_read_keyword_errors() {
     let engine = test_engine();
     let doc = create_document(

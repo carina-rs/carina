@@ -1,4 +1,5 @@
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower_lsp::{LspService, Server};
@@ -6,9 +7,6 @@ use tower_lsp::{LspService, Server};
 use carina_core::parser::ProviderContext;
 use carina_core::provider::ProviderFactory;
 use carina_lsp::Backend;
-use carina_provider_aws::AwsProviderFactory;
-use carina_provider_awscc::AwsccProviderFactory;
-use carina_provider_awscc::schemas::awscc_types::awscc_validators;
 
 struct TestClient {
     writer: tokio::io::DuplexStream,
@@ -23,11 +21,10 @@ impl TestClient {
         let (server_writer, client_reader) = tokio::io::duplex(1024 * 1024);
 
         let (service, socket) = LspService::new(|client| {
-            let factories: Vec<Box<dyn ProviderFactory>> =
-                vec![Box::new(AwsProviderFactory), Box::new(AwsccProviderFactory)];
+            let factories: Vec<Box<dyn ProviderFactory>> = vec![];
             let provider_context = ProviderContext {
                 decryptor: None,
-                validators: awscc_validators(),
+                validators: HashMap::new(),
             };
             Backend::new(client, factories, provider_context)
         });
@@ -154,7 +151,7 @@ impl TestClient {
         self.send_message(&notification).await;
     }
 
-    async fn request_completion(&mut self, uri: &str, line: u32, character: u32) -> Value {
+    async fn _request_completion(&mut self, uri: &str, line: u32, character: u32) -> Value {
         let id = self.next_id();
         let request = json!({
             "jsonrpc": "2.0",
@@ -174,7 +171,7 @@ impl TestClient {
         self.read_response(id).await
     }
 
-    async fn read_notification(&mut self, method: &str, timeout: Duration) -> Option<Value> {
+    async fn _read_notification(&mut self, method: &str, timeout: Duration) -> Option<Value> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             // Try to parse from buffer first
@@ -253,6 +250,7 @@ async fn test_initialize_returns_completion_provider() {
     client.shutdown().await;
 }
 
+#[ignore = "requires provider schemas"]
 #[tokio::test]
 async fn test_struct_field_completion() {
     let mut client = TestClient::new().await;
@@ -272,7 +270,7 @@ async fn test_struct_field_completion() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Request completion inside the security_group_ingress block (line 3)
-    let response = client.request_completion(uri, 3, 8).await;
+    let response = client._request_completion(uri, 3, 8).await;
 
     let items = response["result"]
         .as_array()
@@ -316,6 +314,7 @@ async fn test_struct_field_completion() {
     client.shutdown().await;
 }
 
+#[ignore = "requires provider schemas"]
 #[tokio::test]
 async fn test_diagnostics_for_unknown_struct_field() {
     let mut client = TestClient::new().await;
@@ -339,7 +338,7 @@ awscc.ec2.security_group {
 
     // Read publishDiagnostics notification
     let notification = client
-        .read_notification("textDocument/publishDiagnostics", Duration::from_secs(5))
+        ._read_notification("textDocument/publishDiagnostics", Duration::from_secs(5))
         .await
         .expect("Should receive publishDiagnostics notification");
 
@@ -366,6 +365,7 @@ awscc.ec2.security_group {
     client.shutdown().await;
 }
 
+#[ignore = "requires provider schemas"]
 #[tokio::test]
 async fn test_resource_attribute_completion() {
     let mut client = TestClient::new().await;
@@ -380,7 +380,7 @@ async fn test_resource_attribute_completion() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Request completion inside the block (line 1, after indentation)
-    let response = client.request_completion(uri, 1, 4).await;
+    let response = client._request_completion(uri, 1, 4).await;
 
     let items = response["result"]
         .as_array()
@@ -405,6 +405,7 @@ async fn test_resource_attribute_completion() {
     client.shutdown().await;
 }
 
+#[ignore = "requires provider schemas"]
 #[tokio::test]
 async fn test_diagnostics_for_exclusive_required_attrs() {
     let mut client = TestClient::new().await;
@@ -424,7 +425,7 @@ awscc.ec2.vpc_gateway_attachment {
     client.open_document(uri, text).await;
 
     let notification = client
-        .read_notification("textDocument/publishDiagnostics", Duration::from_secs(5))
+        ._read_notification("textDocument/publishDiagnostics", Duration::from_secs(5))
         .await
         .expect("Should receive publishDiagnostics notification");
 

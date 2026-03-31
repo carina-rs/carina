@@ -3,9 +3,8 @@ use std::sync::Arc;
 use super::*;
 use crate::document::Document;
 use carina_core::parser::ProviderContext;
-use carina_core::provider::{self as provider_mod, ProviderFactory};
+use carina_core::provider::ProviderFactory;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
-use carina_provider_awscc::schemas::awscc_types::awscc_validators;
 
 mod basic;
 mod extended;
@@ -15,18 +14,14 @@ pub(super) fn create_document(content: &str) -> Document {
 }
 
 pub(super) fn test_provider() -> CompletionProvider {
-    let factories: Vec<Box<dyn ProviderFactory>> = vec![
-        Box::new(carina_provider_aws::AwsProviderFactory),
-        Box::new(carina_provider_awscc::AwsccProviderFactory),
-    ];
-    let schemas = Arc::new(provider_mod::collect_schemas(&factories));
+    let factories: Vec<Box<dyn ProviderFactory>> = vec![];
+    let schemas = Arc::new(carina_core::provider::collect_schemas(&factories));
     let provider_names: Vec<String> = factories.iter().map(|f| f.name().to_string()).collect();
     let region_completions: Vec<CompletionValue> = factories
         .iter()
         .flat_map(|f| f.region_completions())
         .collect();
-    // Collect custom type names from provider validators
-    let custom_type_names: Vec<String> = awscc_validators().keys().cloned().collect();
+    let custom_type_names: Vec<String> = vec![];
     CompletionProvider::new(
         schemas,
         provider_names,

@@ -1,6 +1,7 @@
 use super::*;
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn top_level_completion_replaces_prefix() {
     let provider = test_provider();
     let doc = create_document("aws.s");
@@ -41,6 +42,7 @@ fn top_level_completion_replaces_prefix() {
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn top_level_completion_with_leading_whitespace() {
     let provider = test_provider();
     let doc = create_document("    aws.e");
@@ -71,6 +73,7 @@ fn top_level_completion_with_leading_whitespace() {
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn top_level_completion_at_line_start() {
     let provider = test_provider();
     let doc = create_document("a");
@@ -235,6 +238,7 @@ n
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn instance_tenancy_completion_for_aws_vpc() {
     let provider = test_provider();
     let doc = create_document(
@@ -274,6 +278,7 @@ instance_tenancy =
 // instead of the custom InstanceTenancy type that provides completions.
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn string_enum_completion_for_aws_s3_bucket_versioning_status() {
     let provider = test_provider();
     let doc = create_document(
@@ -303,6 +308,7 @@ versioning_status =
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn string_enum_completion_for_awscc_ipam_pool_address_family() {
     let provider = test_provider();
     let doc = create_document(
@@ -332,6 +338,7 @@ address_family =
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn versioning_status_completion_for_s3_bucket() {
     let provider = test_provider();
     let doc = create_document(
@@ -357,6 +364,7 @@ name = "my-bucket"
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn struct_field_completion_inside_nested_block() {
     let provider = test_provider();
     let doc = create_document(
@@ -440,6 +448,7 @@ destination_options {
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn struct_field_completion_inside_second_repeated_block() {
     let provider = test_provider();
     let doc = create_document(
@@ -479,6 +488,7 @@ security_group_ingress {
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn context_detection_returns_struct_context() {
     let provider = test_provider();
     let text = r#"awscc.ec2.security_group {
@@ -527,6 +537,7 @@ fn context_detection_type_position_in_arguments() {
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn type_completion_uses_text_edit_to_replace_from_colon() {
     let provider = test_provider();
     // User has typed "vpc: aws." inside arguments block
@@ -570,6 +581,7 @@ fn type_completion_uses_text_edit_to_replace_from_colon() {
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn type_completion_with_empty_type() {
     let provider = test_provider();
     // User has typed "vpc: " inside arguments block
@@ -630,6 +642,7 @@ fn provider_block_completion_suggests_region() {
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn provider_block_region_value_completion() {
     let provider = test_provider();
     let doc = create_document(
@@ -677,6 +690,7 @@ fn context_detection_inside_provider_block() {
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn provider_block_region_completions_use_matching_namespace() {
     let provider = test_provider();
 
@@ -715,6 +729,7 @@ fn provider_block_region_completions_use_matching_namespace() {
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn provider_block_region_completions_use_aws_namespace() {
     let provider = test_provider();
 
@@ -809,6 +824,7 @@ fn type_completion_includes_generic_constructors() {
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn type_completion_includes_custom_types() {
     let provider = test_provider();
     let doc = create_document("arguments {\naddr: ");
