@@ -77,6 +77,7 @@ fn out_of_range_integer() {
 }
 
 #[test]
+#[ignore = "requires provider binary for resource type validation"]
 fn unknown_resource_type() {
     assert_validate_fails("unknown_resource_type.crn", "Unknown resource type");
 }

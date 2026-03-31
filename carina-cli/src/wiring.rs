@@ -128,9 +128,17 @@ pub fn validate_resources_with_ctx(
     ctx: &WiringContext,
     resources: &[Resource],
 ) -> Result<(), AppError> {
-    validation::validate_resources(resources, ctx.schemas(), &|r| {
-        provider_mod::schema_key_for_resource(ctx.factories(), r)
-    })
+    let known_providers: HashSet<String> = ctx
+        .factories()
+        .iter()
+        .map(|f| f.name().to_string())
+        .collect();
+    validation::validate_resources(
+        resources,
+        ctx.schemas(),
+        &|r| provider_mod::schema_key_for_resource(ctx.factories(), r),
+        &known_providers,
+    )
     .map_err(AppError::Validation)
 }
 
