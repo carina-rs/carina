@@ -10,11 +10,6 @@ export default defineConfig({
   integrations: [
     starlight({
       title: 'Carina',
-      logo: {
-        dark: './src/assets/logo.png',
-        light: './src/assets/logo-dark.png',
-        replacesTitle: false,
-      },
       favicon: '/favicon.png',
       head: [
         { tag: 'meta', attrs: { property: 'og:image', content: '/og.png' } },
