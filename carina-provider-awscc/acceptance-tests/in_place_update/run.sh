@@ -40,6 +40,25 @@ if [ ! -f "$CARINA_BIN" ]; then
     cargo build --quiet 2>/dev/null || cargo build
 fi
 
+# ── Provider source injection ────────────────────────────────────────
+AWSCC_PROVIDER_BIN="$PROJECT_ROOT/target/debug/carina-provider-awscc"
+AWS_PROVIDER_BIN="$PROJECT_ROOT/target/debug/carina-provider-aws"
+
+inject_provider_source() {
+    local original="$1"
+    local tmp_file
+    tmp_file=$(mktemp "${TMPDIR:-/tmp}/carina-test-XXXXXX.crn")
+    sed \
+        -e '/^provider awscc {/a\
+  source = "file://'"$AWSCC_PROVIDER_BIN"'"\
+  version = "0.1.0"' \
+        -e '/^provider aws {/a\
+  source = "file://'"$AWS_PROVIDER_BIN"'"\
+  version = "0.1.0"' \
+        "$original" > "$tmp_file"
+    echo "$tmp_file"
+}
+
 TOTAL_PASSED=0
 TOTAL_FAILED=0
 
@@ -217,6 +236,10 @@ run_test() {
     local work_dir
     work_dir=$(mktemp -d)
 
+    # Inject provider source into .crn files
+    step1=$(inject_provider_source "$step1")
+    step2=$(inject_provider_source "$step2")
+
     # Register for signal cleanup
     ACTIVE_WORK_DIR="$work_dir"
     ACTIVE_STEP1="$step1"
@@ -229,6 +252,7 @@ run_test() {
     if ! run_step "$work_dir" "step1: apply initial" "apply" "$step1" "--auto-approve"; then
         cleanup "$work_dir" "$step2" "$step1"
         rm -rf "$work_dir"
+        rm -f "$step1" "$step2"
         ACTIVE_WORK_DIR=""
         return 1
     fi
@@ -237,6 +261,7 @@ run_test() {
     if ! run_plan_verify "$work_dir" "step1: plan-verify initial" "$step1"; then
         cleanup "$work_dir" "$step2" "$step1"
         rm -rf "$work_dir"
+        rm -f "$step1" "$step2"
         ACTIVE_WORK_DIR=""
         return 1
     fi
@@ -249,6 +274,7 @@ run_test() {
     if ! run_step "$work_dir" "step2: apply in-place update" "apply" "$step2" "--auto-approve"; then
         cleanup "$work_dir" "$step2" "$step1"
         rm -rf "$work_dir"
+        rm -f "$step1" "$step2"
         ACTIVE_WORK_DIR=""
         return 1
     fi
@@ -261,6 +287,7 @@ run_test() {
     if ! assert_identifiers "assert: identifiers preserved after update" "$ids_after_step1" "$ids_after_step2" "equal"; then
         cleanup "$work_dir" "$step2" "$step1"
         rm -rf "$work_dir"
+        rm -f "$step1" "$step2"
         ACTIVE_WORK_DIR=""
         return 1
     fi
@@ -269,6 +296,7 @@ run_test() {
     if ! run_plan_verify "$work_dir" "step3: plan-verify after update" "$step2"; then
         cleanup "$work_dir" "$step2" "$step1"
         rm -rf "$work_dir"
+        rm -f "$step1" "$step2"
         ACTIVE_WORK_DIR=""
         return 1
     fi
@@ -278,12 +306,14 @@ run_test() {
         echo "  WARNING: All destroy attempts failed. Preserving work dir for debugging:"
         echo "    $work_dir"
         TOTAL_FAILED=$((TOTAL_FAILED + 1))
+        rm -f "$step1" "$step2"
         ACTIVE_WORK_DIR=""
         echo ""
         return 1
     fi
 
     rm -rf "$work_dir"
+    rm -f "$step1" "$step2"
     ACTIVE_WORK_DIR=""
     echo ""
 }

@@ -10,9 +10,31 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 CARINA="cargo run --bin carina --"
-STEP1="$SCRIPT_DIR/step1.crn"
-STEP2="$SCRIPT_DIR/step2.crn"
+
+# ── Provider source injection ────────────────────────────────────────
+AWSCC_PROVIDER_BIN="$PROJECT_ROOT/target/debug/carina-provider-awscc"
+AWS_PROVIDER_BIN="$PROJECT_ROOT/target/debug/carina-provider-aws"
+
+inject_provider_source() {
+    local original="$1"
+    local tmp_file
+    tmp_file=$(mktemp "${TMPDIR:-/tmp}/carina-test-XXXXXX.crn")
+    sed \
+        -e '/^provider awscc {/a\
+  source = "file://'"$AWSCC_PROVIDER_BIN"'"\
+  version = "0.1.0"' \
+        -e '/^provider aws {/a\
+  source = "file://'"$AWS_PROVIDER_BIN"'"\
+  version = "0.1.0"' \
+        "$original" > "$tmp_file"
+    echo "$tmp_file"
+}
+
+STEP1=$(inject_provider_source "$SCRIPT_DIR/step1.crn")
+STEP2=$(inject_provider_source "$SCRIPT_DIR/step2.crn")
+trap "rm -f $STEP1 $STEP2" EXIT
 
 PASS=0
 FAIL=0
