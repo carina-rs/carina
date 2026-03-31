@@ -326,3 +326,5 @@ Assert conditions that must be true, with a custom error message if they fail:
 require length(subnets) > 0, "At least one subnet must be specified"
 require cidr_block != "", "CIDR block cannot be empty"
 ```
+
+The condition is a [validate expression](/reference/dsl/expressions/#validate-expressions) that supports comparison operators (`==`, `!=`, `>`, `<`, `>=`, `<=`) and logical operators (`&&`, `||`, `!`).
