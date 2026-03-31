@@ -53,11 +53,11 @@ export default defineConfig({
             {
               label: 'DSL Language',
               items: [
-                { label: 'Syntax', link: '/reference/dsl/syntax/', badge: 'Soon' },
-                { label: 'Types & Values', link: '/reference/dsl/types-and-values/', badge: 'Soon' },
-                { label: 'Expressions', link: '/reference/dsl/expressions/', badge: 'Soon' },
-                { label: 'Built-in Functions', link: '/reference/dsl/built-in-functions/', badge: 'Soon' },
-                { label: 'Modules', link: '/reference/dsl/modules/', badge: 'Soon' },
+                { label: 'Syntax', link: '/reference/dsl/syntax/' },
+                { label: 'Types & Values', link: '/reference/dsl/types-and-values/' },
+                { label: 'Expressions', link: '/reference/dsl/expressions/' },
+                { label: 'Built-in Functions', link: '/reference/dsl/built-in-functions/' },
+                { label: 'Modules', link: '/reference/dsl/modules/' },
               ],
             },
             {
