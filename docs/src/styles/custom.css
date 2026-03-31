@@ -21,32 +21,32 @@
   --sl-color-accent-high: hsl(48, 96%, 89%);   /* ~#fef9c3 Yellow 100 */
 }
 
-/* Light mode */
+/* Force dark mode only */
 :root[data-theme='light'] {
-  /* Gray scale: Slate palette (light) */
-  --sl-color-white: hsl(210, 40%, 8%);   /* #0f172a Slate 900 */
-  --sl-color-gray-1: hsl(215, 25%, 17%); /* #1e293b Slate 800 */
-  --sl-color-gray-2: hsl(215, 14%, 34%); /* #475569 Slate 600 */
-  --sl-color-gray-3: hsl(215, 14%, 46%); /* #64748b Slate 500 */
-  --sl-color-gray-4: hsl(215, 16%, 62%); /* #94a3b8 Slate 400 */
-  --sl-color-gray-5: hsl(214, 32%, 91%); /* #e2e8f0 Slate 200 */
-  --sl-color-gray-6: hsl(210, 40%, 96%); /* #f1f5f9 Slate 100 */
-  --sl-color-gray-7: hsl(210, 40%, 98%); /* #f8fafc Slate 50 */
-  --sl-color-black: hsl(0, 0%, 100%);    /* white */
-
-  /* Accent: Canopus Gold (darker for contrast on light BG) */
-  --sl-color-accent-low: hsl(48, 96%, 89%);   /* ~#fef9c3 Yellow 100 */
-  --sl-color-accent: hsl(32, 95%, 44%);        /* ~#d97706 Amber 600 */
-  --sl-color-accent-high: hsl(26, 90%, 37%);   /* ~#b45309 Amber 700 */
+  /* Override light mode to use dark mode values */
+  --sl-color-white: hsl(0, 0%, 100%);
+  --sl-color-gray-1: hsl(214, 32%, 91%);
+  --sl-color-gray-2: hsl(215, 16%, 62%);
+  --sl-color-gray-3: hsl(215, 14%, 46%);
+  --sl-color-gray-4: hsl(217, 19%, 35%);
+  --sl-color-gray-5: hsl(217, 33%, 17%);
+  --sl-color-gray-6: hsl(222, 47%, 11%);
+  --sl-color-black: hsl(229, 84%, 5%);
+  --sl-color-accent-low: hsl(32, 60%, 15%);
+  --sl-color-accent: hsl(43, 96%, 56%);
+  --sl-color-accent-high: hsl(48, 96%, 89%);
+  color-scheme: dark;
 }
 
 /* Code block theme */
 :root {
   --astro-code-background: hsl(217, 33%, 17%); /* Slate 800 - matches sidebar */
-  --astro-code-token-keyword: var(--sl-color-accent-high); /* Cyan instead of purple */
+  --astro-code-token-keyword: var(--sl-color-accent-high);
 }
-:root[data-theme='light'] {
-  --astro-code-background: hsl(210, 40%, 96%); /* Slate 100 */
+
+/* Hide theme toggle */
+starlight-theme-select {
+  display: none;
 }
 
 /* Provider doc table styling */
