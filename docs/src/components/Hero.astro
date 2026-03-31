@@ -36,6 +36,11 @@ const planHtml = `<span class="prompt">$</span> carina plan main.crn
     <p class="hero-tagline">A strongly typed infrastructure management tool written in Rust.</p>
   </div>
 
+  <div class="hero-banner">
+    <span class="banner-label">Experimental</span>
+    <span class="banner-text">Carina is under active development. APIs and DSL syntax may change without notice. Not recommended for production use yet.</span>
+  </div>
+
   <div class="hero-panels">
     <div class="hero-panel">
       <div class="panel-header">
@@ -92,6 +97,37 @@ const planHtml = `<span class="prompt">$</span> carina plan main.crn
     font-size: clamp(var(--sl-text-base), calc(0.0625rem + 2vw), var(--sl-text-xl));
     color: var(--sl-color-gray-2);
     margin: 0.5rem 0 0;
+  }
+
+  .hero-banner {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    max-width: 52rem;
+    margin: 1.5rem auto 0;
+    padding: 0.625rem 1rem;
+    border: 1px solid hsl(0, 60%, 25%);
+    border-radius: 0.5rem;
+    background: hsl(0, 50%, 10%);
+    font-size: var(--sl-text-sm);
+    text-align: left;
+  }
+
+  .banner-label {
+    flex-shrink: 0;
+    padding: 0.125rem 0.5rem;
+    border-radius: 0.25rem;
+    background: hsl(0, 72%, 50%);
+    color: var(--sl-color-white);
+    font-size: var(--sl-text-xs);
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .banner-text {
+    color: hsl(0, 86%, 90%);
+    line-height: 1.5;
   }
 
   .hero-panels {
