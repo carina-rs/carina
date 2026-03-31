@@ -358,6 +358,37 @@ pub async fn get_provider_with_ctx(ctx: &WiringContext, parsed: &ParsedFile) -> 
     let mut router = ProviderRouter::new();
 
     for provider_config in &parsed.providers {
+        // If the provider has a source, load it as an external process
+        if let Some(ref source) = provider_config.source {
+            match load_process_provider(source, provider_config).await {
+                Ok((provider, name)) => {
+                    let region =
+                        if let Some(Value::String(r)) = provider_config.attributes.get("region") {
+                            utils::convert_region_value(r)
+                        } else {
+                            "ap-northeast-1".to_string()
+                        };
+                    println!(
+                        "{}",
+                        format!("Using {} (region: {}, source: {})", name, region, source).cyan()
+                    );
+                    router.add_provider(name, provider);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "Failed to load process provider '{}': {}",
+                            provider_config.name, e
+                        )
+                        .red()
+                    );
+                }
+            }
+            continue;
+        }
+
+        // Otherwise, use the hardcoded factory lookup (existing behavior)
         if let Some(factory) = provider_mod::find_factory(ctx.factories(), &provider_config.name) {
             let region = factory.extract_region(&provider_config.attributes);
             println!(
@@ -380,6 +411,38 @@ pub async fn get_provider_with_ctx(ctx: &WiringContext, parsed: &ParsedFile) -> 
     }
 
     router
+}
+
+async fn load_process_provider(
+    source: &str,
+    config: &ProviderConfig,
+) -> Result<(Box<dyn Provider>, String), String> {
+    let binary_path = if let Some(path) = source.strip_prefix("file://") {
+        std::path::PathBuf::from(path)
+    } else {
+        // TODO: Phase 4 will implement download from GitHub Releases.
+        // For now, only file:// sources are supported.
+        return Err(format!(
+            "Remote sources not yet supported. Use file:// for local binaries. Got: {source}"
+        ));
+    };
+
+    if !binary_path.exists() {
+        return Err(format!(
+            "Provider binary not found: {}",
+            binary_path.display()
+        ));
+    }
+
+    let factory = carina_plugin_host::ProcessProviderFactory::new(binary_path)?;
+    let name = factory.name().to_string();
+
+    factory
+        .validate_config(&config.attributes)
+        .map_err(|e| format!("Config validation failed: {e}"))?;
+
+    let provider = factory.create_provider(&config.attributes).await;
+    Ok((provider, name))
 }
 
 pub async fn create_providers_from_configs(configs: &[ProviderConfig]) -> ProviderRouter {
