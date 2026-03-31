@@ -13,6 +13,7 @@ export default defineConfig({
       title: 'Carina',
       components: {
         Hero: './src/components/Hero.astro',
+        Head: './src/components/Head.astro',
       },
       favicon: '/favicon.png',
       head: [],
