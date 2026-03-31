@@ -39,12 +39,12 @@ export default defineConfig({
         {
           label: 'Guides',
           items: [
-            { label: 'Writing Resources', link: '/guides/writing-resources/', badge: 'Soon' },
-            { label: 'Using Modules', link: '/guides/using-modules/', badge: 'Soon' },
-            { label: 'State Management', link: '/guides/state-management/', badge: 'Soon' },
-            { label: 'For / If Expressions', link: '/guides/for-if-expressions/', badge: 'Soon' },
-            { label: 'Functions', link: '/guides/functions/', badge: 'Soon' },
-            { label: 'LSP Setup', link: '/guides/lsp-setup/', badge: 'Soon' },
+            { label: 'Writing Resources', link: '/guides/writing-resources/' },
+            { label: 'Using Modules', link: '/guides/using-modules/' },
+            { label: 'State Management', link: '/guides/state-management/' },
+            { label: 'For / If Expressions', link: '/guides/for-if-expressions/' },
+            { label: 'Functions', link: '/guides/functions/' },
+            { label: 'LSP Setup', link: '/guides/lsp-setup/' },
           ],
         },
         {
@@ -53,21 +53,21 @@ export default defineConfig({
             {
               label: 'DSL Language',
               items: [
-                { label: 'Syntax', link: '/reference/dsl/syntax/', badge: 'Soon' },
-                { label: 'Types & Values', link: '/reference/dsl/types-and-values/', badge: 'Soon' },
-                { label: 'Expressions', link: '/reference/dsl/expressions/', badge: 'Soon' },
-                { label: 'Built-in Functions', link: '/reference/dsl/built-in-functions/', badge: 'Soon' },
-                { label: 'Modules', link: '/reference/dsl/modules/', badge: 'Soon' },
+                { label: 'Syntax', link: '/reference/dsl/syntax/' },
+                { label: 'Types & Values', link: '/reference/dsl/types-and-values/' },
+                { label: 'Expressions', link: '/reference/dsl/expressions/' },
+                { label: 'Built-in Functions', link: '/reference/dsl/built-in-functions/' },
+                { label: 'Modules', link: '/reference/dsl/modules/' },
               ],
             },
             {
               label: 'CLI Commands',
               items: [
-                { label: 'plan', link: '/reference/cli/plan/', badge: 'Soon' },
-                { label: 'apply', link: '/reference/cli/apply/', badge: 'Soon' },
-                { label: 'validate', link: '/reference/cli/validate/', badge: 'Soon' },
-                { label: 'state', link: '/reference/cli/state/', badge: 'Soon' },
-                { label: 'module info', link: '/reference/cli/module-info/', badge: 'Soon' },
+                { label: 'plan', link: '/reference/cli/plan/' },
+                { label: 'apply', link: '/reference/cli/apply/' },
+                { label: 'validate', link: '/reference/cli/validate/' },
+                { label: 'state', link: '/reference/cli/state/' },
+                { label: 'module info', link: '/reference/cli/module-info/' },
               ],
             },
             {
