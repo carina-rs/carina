@@ -159,7 +159,7 @@ let result = join("-", split("_", upper("hello_world")))
 
 # With pipe -- reads left to right
 let result = "hello_world" |> upper() |> split("_") |> join("-")
-# "HELLO" - "WORLD" -> "HELLO-WORLD"
+# Result: "HELLO-WORLD"
 ```
 
 The pipe operator is especially useful with collection functions:
@@ -176,8 +176,8 @@ let result = names |> join(", ")
 The compose operator `>>` creates a new function by chaining two partially applied functions (closures). Both sides must be closures:
 
 ```crn
-# replace("_", "-") is a closure (2 of 3 args provided)
 # split("_") is a closure (1 of 2 args provided)
+# join("-") is a closure (1 of 2 args provided)
 let transform = split("_") >> join("-")
 ```
 
