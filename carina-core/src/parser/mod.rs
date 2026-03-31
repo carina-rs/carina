@@ -12,7 +12,7 @@ use crate::schema::{
 };
 use pest::Parser;
 use pest_derive::Parser;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Parser)]
 #[grammar = "parser/carina.pest"]
@@ -345,6 +345,9 @@ pub struct ParsedFile {
     pub remote_states: Vec<RemoteState>,
     /// Require blocks (cross-argument constraints)
     pub requires: Vec<RequireBlock>,
+    /// Binding names that are structurally required (if/for/read expressions)
+    /// and should not trigger unused-binding warnings.
+    pub structural_bindings: HashSet<String>,
 }
 
 impl ParsedFile {
@@ -376,6 +379,8 @@ struct ParseContext<'cfg> {
     evaluating_functions: Vec<String>,
     /// Parser configuration (decryptor, custom validators)
     config: &'cfg ProviderContext,
+    /// Binding names from structurally-required expressions (if/for/read)
+    structural_bindings: HashSet<String>,
 }
 
 impl<'cfg> ParseContext<'cfg> {
@@ -387,6 +392,7 @@ impl<'cfg> ParseContext<'cfg> {
             user_functions: HashMap::new(),
             evaluating_functions: Vec::new(),
             config,
+            structural_bindings: HashSet::new(),
         }
     }
 
@@ -551,7 +557,11 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
                                     expanded_module_calls,
                                     maybe_import,
                                     maybe_remote_state,
+                                    is_structural,
                                 ) = parse_let_binding_extended(stmt, &ctx)?;
+                                if is_structural {
+                                    ctx.structural_bindings.insert(name.clone());
+                                }
                                 let is_discard = name == "_";
                                 if !is_discard {
                                     if ctx.variables.contains_key(&name)
@@ -641,6 +651,7 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
         user_functions: ctx.user_functions,
         remote_states,
         requires,
+        structural_bindings: ctx.structural_bindings,
     })
 }
 
@@ -1075,6 +1086,10 @@ type LetBindingRhs = (
 
 /// Extended parse_let_binding that also handles module calls, imports, for expressions,
 /// and remote_state blocks.
+///
+/// Returns `(name, value, resources, module_calls, import, remote_state, is_structural)`.
+/// `is_structural` is true when the RHS is an if/for/read expression, meaning the
+/// `let` binding is structurally required and should not trigger unused-binding warnings.
 #[allow(clippy::type_complexity)]
 fn parse_let_binding_extended(
     pair: pest::iterators::Pair<Rule>,
@@ -1087,6 +1102,7 @@ fn parse_let_binding_extended(
         Vec<ModuleCall>,
         Option<ImportStatement>,
         Option<RemoteState>,
+        bool,
     ),
     ParseError,
 > {
@@ -1095,6 +1111,9 @@ fn parse_let_binding_extended(
         .as_str()
         .to_string();
     let expr_pair = next_pair(&mut inner, "expression", "let binding")?;
+
+    // Detect if the RHS is a structurally-required expression (if/for/read)
+    let is_structural = detect_structural_rhs(&expr_pair);
 
     // Check if it's a module call, resource expression, import, for expression, or remote_state
     let (value, expanded_resources, module_calls, maybe_import, maybe_remote_state) =
@@ -1107,7 +1126,31 @@ fn parse_let_binding_extended(
         module_calls,
         maybe_import,
         maybe_remote_state,
+        is_structural,
     ))
+}
+
+/// Detect if an expression pair's innermost primary is an if/for/read expression.
+fn detect_structural_rhs(pair: &pest::iterators::Pair<Rule>) -> bool {
+    // Walk into expression -> pipe_expr -> compose_expr -> primary -> inner
+    fn find_inner_rule(pair: &pest::iterators::Pair<Rule>) -> Option<Rule> {
+        let inner = pair.clone().into_inner().next()?;
+        match inner.as_rule() {
+            Rule::if_expr | Rule::for_expr | Rule::read_resource_expr => Some(inner.as_rule()),
+            Rule::pipe_expr | Rule::compose_expr | Rule::expression => find_inner_rule(&inner),
+            Rule::primary => {
+                let primary_inner = inner.into_inner().next()?;
+                match primary_inner.as_rule() {
+                    Rule::if_expr | Rule::for_expr | Rule::read_resource_expr => {
+                        Some(primary_inner.as_rule())
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+    find_inner_rule(pair).is_some()
 }
 
 /// Parse expression with potential resource, module call, import, or remote_state

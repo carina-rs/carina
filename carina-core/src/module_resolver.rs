@@ -191,6 +191,7 @@ impl<'cfg> ModuleResolver<'cfg> {
             user_functions: HashMap::new(),
             remote_states: vec![],
             requires: vec![],
+            structural_bindings: HashSet::new(),
         };
 
         // Read all .crn files in the directory
@@ -218,6 +219,9 @@ impl<'cfg> ModuleResolver<'cfg> {
             merged.user_functions.extend(parsed.user_functions);
             merged.remote_states.extend(parsed.remote_states);
             merged.requires.extend(parsed.requires);
+            merged
+                .structural_bindings
+                .extend(parsed.structural_bindings);
         }
 
         Ok(merged)
@@ -1100,6 +1104,7 @@ pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
         user_functions: HashMap::new(),
         remote_states: vec![],
         requires: vec![],
+        structural_bindings: HashSet::new(),
     };
 
     for entry in entries.flatten() {
@@ -1118,6 +1123,9 @@ pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
             merged.user_functions.extend(parsed.user_functions);
             merged.remote_states.extend(parsed.remote_states);
             merged.requires.extend(parsed.requires);
+            merged
+                .structural_bindings
+                .extend(parsed.structural_bindings);
         }
     }
 
@@ -1182,6 +1190,7 @@ pub fn load_module_from_directory(dir: &Path) -> Result<ParsedFile, String> {
         user_functions: HashMap::new(),
         remote_states: vec![],
         requires: vec![],
+        structural_bindings: HashSet::new(),
     };
 
     for entry in entries {
@@ -1205,6 +1214,9 @@ pub fn load_module_from_directory(dir: &Path) -> Result<ParsedFile, String> {
             merged.user_functions.extend(parsed.user_functions);
             merged.remote_states.extend(parsed.remote_states);
             merged.requires.extend(parsed.requires);
+            merged
+                .structural_bindings
+                .extend(parsed.structural_bindings);
         }
     }
 
@@ -1267,6 +1279,7 @@ mod tests {
             user_functions: HashMap::new(),
             remote_states: vec![],
             requires: vec![],
+            structural_bindings: HashSet::new(),
         }
     }
 
@@ -1399,6 +1412,7 @@ mod tests {
             user_functions: HashMap::new(),
             remote_states: vec![],
             requires: vec![],
+            structural_bindings: HashSet::new(),
         }
     }
 
@@ -1522,6 +1536,7 @@ mod tests {
             user_functions: HashMap::new(),
             remote_states: vec![],
             requires: vec![],
+            structural_bindings: HashSet::new(),
         }
     }
 
@@ -1868,6 +1883,7 @@ mod tests {
             user_functions: HashMap::new(),
             remote_states: vec![],
             requires: vec![],
+            structural_bindings: HashSet::new(),
         }
     }
 
@@ -2151,6 +2167,7 @@ mod tests {
             user_functions: HashMap::new(),
             remote_states: vec![],
             requires: vec![],
+            structural_bindings: HashSet::new(),
         }
     }
 
@@ -2319,6 +2336,7 @@ mod tests {
             user_functions: HashMap::new(),
             remote_states: vec![],
             requires: vec![],
+            structural_bindings: HashSet::new(),
         };
 
         let resolver = {
@@ -2380,6 +2398,7 @@ mod tests {
             user_functions: HashMap::new(),
             remote_states: vec![],
             requires: vec![],
+            structural_bindings: HashSet::new(),
         };
 
         let resolver = {
@@ -2469,6 +2488,7 @@ mod tests {
                 ),
                 error_message: "cert_arn is required when HTTPS is enabled".to_string(),
             }],
+            structural_bindings: HashSet::new(),
         };
 
         let resolver = {
@@ -2534,6 +2554,7 @@ mod tests {
                 ),
                 error_message: "cert is required when HTTPS is enabled".to_string(),
             }],
+            structural_bindings: HashSet::new(),
         };
 
         let resolver = {
@@ -2596,6 +2617,7 @@ mod tests {
                 },
                 error_message: "ALB requires at least two subnets".to_string(),
             }],
+            structural_bindings: HashSet::new(),
         };
 
         let resolver = {
@@ -2684,6 +2706,7 @@ mod tests {
                 },
                 error_message: "min_size must be <= max_size".to_string(),
             }],
+            structural_bindings: HashSet::new(),
         };
 
         let resolver = {

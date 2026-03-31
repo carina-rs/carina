@@ -1,6 +1,6 @@
 //! Configuration loading and .crn file discovery utilities
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -65,6 +65,7 @@ pub fn load_configuration_with_config(
             user_functions: HashMap::new(),
             remote_states: vec![],
             requires: vec![],
+            structural_bindings: HashSet::new(),
         };
         let mut merged = empty_parsed();
         let mut unresolved_merged = empty_parsed();
@@ -103,6 +104,9 @@ pub fn load_configuration_with_config(
                     unresolved_merged
                         .remote_states
                         .extend(unresolved.remote_states);
+                    unresolved_merged
+                        .structural_bindings
+                        .extend(unresolved.structural_bindings);
 
                     // Merge resolved
                     merged.providers.extend(parsed.providers);
@@ -116,6 +120,9 @@ pub fn load_configuration_with_config(
                     merged.user_functions.extend(parsed.user_functions);
                     merged.remote_states.extend(parsed.remote_states);
                     merged.requires.extend(parsed.requires);
+                    merged
+                        .structural_bindings
+                        .extend(parsed.structural_bindings);
                     // Merge backend (only one allowed)
                     if let Some(backend) = parsed.backend {
                         if merged.backend.is_some() {
