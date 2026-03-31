@@ -1,7 +1,7 @@
 //! ProcessProviderNormalizer forwards normalizer calls to the provider process via JSON-RPC.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use carina_core::provider::{ProviderNormalizer, SavedAttrs};
 use carina_core::resource::{Expr, Resource, ResourceId, State, Value};
@@ -19,6 +19,12 @@ impl ProcessProviderNormalizer {
     pub fn new(process: Arc<Mutex<ProviderProcess>>) -> Self {
         Self { process }
     }
+
+    fn lock_process(&self) -> Result<MutexGuard<'_, ProviderProcess>, ()> {
+        self.process.lock().map_err(|e| {
+            log::error!("Process lock poisoned: {e}");
+        })
+    }
 }
 
 impl ProviderNormalizer for ProcessProviderNormalizer {
@@ -31,12 +37,8 @@ impl ProviderNormalizer for ProcessProviderNormalizer {
             resources: proto_resources,
         };
 
-        let mut process = match self.process.lock() {
-            Ok(p) => p,
-            Err(e) => {
-                log::error!("Process lock poisoned in normalize_desired: {e}");
-                return;
-            }
+        let Ok(mut process) = self.lock_process() else {
+            return;
         };
 
         match process.call::<_, methods::NormalizeDesiredResult>("normalize_desired", &params) {
@@ -55,31 +57,21 @@ impl ProviderNormalizer for ProcessProviderNormalizer {
     fn normalize_state(&self, current_states: &mut HashMap<ResourceId, State>) {
         let proto_states: HashMap<String, _> = current_states
             .iter()
-            .map(|(id, state)| {
-                let key = format!("{}.{}.{}", id.provider, id.resource_type, id.name);
-                (key, convert::core_to_proto_state(state))
-            })
+            .map(|(id, state)| (id.to_string(), convert::core_to_proto_state(state)))
             .collect();
 
         let params = methods::NormalizeStateParams {
             states: proto_states,
         };
 
-        let mut process = match self.process.lock() {
-            Ok(p) => p,
-            Err(e) => {
-                log::error!("Process lock poisoned in normalize_state: {e}");
-                return;
-            }
+        let Ok(mut process) = self.lock_process() else {
+            return;
         };
 
         match process.call::<_, methods::NormalizeStateResult>("normalize_state", &params) {
             Ok(result) => {
                 for state in current_states.values_mut() {
-                    let key = format!(
-                        "{}.{}.{}",
-                        state.id.provider, state.id.resource_type, state.id.name
-                    );
+                    let key = state.id.to_string();
                     if let Some(proto_state) = result.states.get(&key) {
                         state.attributes =
                             convert::proto_to_core_value_map(&proto_state.attributes);
@@ -97,18 +89,12 @@ impl ProviderNormalizer for ProcessProviderNormalizer {
     ) {
         let proto_states: HashMap<String, _> = current_states
             .iter()
-            .map(|(id, state)| {
-                let key = format!("{}.{}.{}", id.provider, id.resource_type, id.name);
-                (key, convert::core_to_proto_state(state))
-            })
+            .map(|(id, state)| (id.to_string(), convert::core_to_proto_state(state)))
             .collect();
 
         let proto_saved: HashMap<String, HashMap<String, _>> = saved_attrs
             .iter()
-            .map(|(id, attrs)| {
-                let key = format!("{}.{}.{}", id.provider, id.resource_type, id.name);
-                (key, convert::core_to_proto_value_map(attrs))
-            })
+            .map(|(id, attrs)| (id.to_string(), convert::core_to_proto_value_map(attrs)))
             .collect();
 
         let params = methods::HydrateReadStateParams {
@@ -116,21 +102,14 @@ impl ProviderNormalizer for ProcessProviderNormalizer {
             saved_attrs: proto_saved,
         };
 
-        let mut process = match self.process.lock() {
-            Ok(p) => p,
-            Err(e) => {
-                log::error!("Process lock poisoned in hydrate_read_state: {e}");
-                return;
-            }
+        let Ok(mut process) = self.lock_process() else {
+            return;
         };
 
         match process.call::<_, methods::HydrateReadStateResult>("hydrate_read_state", &params) {
             Ok(result) => {
                 for state in current_states.values_mut() {
-                    let key = format!(
-                        "{}.{}.{}",
-                        state.id.provider, state.id.resource_type, state.id.name
-                    );
+                    let key = state.id.to_string();
                     if let Some(proto_state) = result.states.get(&key) {
                         state.attributes =
                             convert::proto_to_core_value_map(&proto_state.attributes);
@@ -163,12 +142,8 @@ impl ProviderNormalizer for ProcessProviderNormalizer {
             schemas: proto_schemas,
         };
 
-        let mut process = match self.process.lock() {
-            Ok(p) => p,
-            Err(e) => {
-                log::error!("Process lock poisoned in merge_default_tags: {e}");
-                return;
-            }
+        let Ok(mut process) = self.lock_process() else {
+            return;
         };
 
         match process.call::<_, methods::MergeDefaultTagsResult>("merge_default_tags", &params) {
