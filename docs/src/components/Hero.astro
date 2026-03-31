@@ -1,0 +1,219 @@
+---
+const PAGE_TITLE_ID = '_top';
+
+const codeHtml = `<span class="kw">provider</span> <span class="id">aws</span> {
+  <span class="attr">region:</span> <span class="enum">aws.Region.ap_northeast_1</span>
+}
+
+<span class="kw">let</span> <span class="id">vpc</span> = <span class="type">awscc.ec2.vpc</span> {
+  <span class="attr">cidr_block:</span> <span class="str">"10.0.0.0/16"</span>
+  <span class="attr">enable_dns_support:</span> <span class="bool">true</span>
+}
+
+<span class="type">awscc.ec2.subnet</span> {
+  <span class="attr">vpc_id:</span> <span class="id">vpc</span>.vpc_id
+  <span class="attr">cidr_block:</span> <span class="str">"10.0.1.0/24"</span>
+}`;
+
+const planHtml = `<span class="prompt">$</span> carina plan main.crn
+<span class="muted">Planning...</span>
+
+<span class="add">+</span> <span class="id">awscc.ec2.vpc</span>
+  <span class="attr">cidr_block:</span> <span class="str">"10.0.0.0/16"</span>
+  <span class="attr">enable_dns_support:</span> <span class="bool">true</span>
+
+<span class="add">+</span> <span class="id">awscc.ec2.subnet</span>
+  <span class="attr">vpc_id:</span> <span class="id">vpc</span>.vpc_id
+  <span class="attr">cidr_block:</span> <span class="str">"10.0.1.0/24"</span>
+
+<span class="plan-summary">Plan: 2 to create, 0 to update, 0 to delete.</span>`;
+---
+
+<div class="hero-custom">
+  <div class="hero-header">
+    <div class="hero-star"></div>
+    <h1 id={PAGE_TITLE_ID} data-page-title>Carina</h1>
+    <p class="hero-tagline">A strongly typed infrastructure management tool written in Rust.</p>
+  </div>
+
+  <div class="hero-panels">
+    <div class="hero-panel">
+      <div class="panel-header">
+        <span class="panel-tab">main.crn</span>
+      </div>
+      <div class="panel-body">
+        <pre><code set:html={codeHtml} /></pre>
+      </div>
+    </div>
+
+    <div class="hero-panel">
+      <div class="panel-header terminal-header">
+        <span class="terminal-dot dot-red"></span>
+        <span class="terminal-dot dot-yellow"></span>
+        <span class="terminal-dot dot-green"></span>
+        <span class="panel-tab-terminal">terminal</span>
+      </div>
+      <div class="panel-body">
+        <pre><code set:html={planHtml} /></pre>
+      </div>
+    </div>
+  </div>
+
+  <div class="hero-actions">
+    <a href="/getting-started/installation/" class="hero-btn primary">Get Started</a>
+    <a href="https://github.com/carina-rs/carina" class="hero-btn secondary">GitHub</a>
+  </div>
+</div>
+
+<style>
+  .hero-custom {
+    padding: clamp(2rem, 6vw, 4rem) 0 2rem;
+    text-align: center;
+  }
+
+  .hero-star {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #fef3c7;
+    box-shadow: 0 0 16px #fde68a, 0 0 40px rgba(253, 230, 138, 0.3);
+    margin: 0 auto 1rem;
+  }
+
+  h1 {
+    font-size: clamp(var(--sl-text-4xl), calc(0.25rem + 5vw), var(--sl-text-6xl));
+    font-weight: 700;
+    line-height: var(--sl-line-height-headings);
+    color: #fbbf24;
+    margin: 0;
+  }
+
+  .hero-tagline {
+    font-size: clamp(var(--sl-text-base), calc(0.0625rem + 2vw), var(--sl-text-xl));
+    color: var(--sl-color-gray-2);
+    margin: 0.5rem 0 0;
+  }
+
+  .hero-panels {
+    display: flex;
+    gap: 0.75rem;
+    margin: 2rem auto 0;
+    max-width: 52rem;
+    padding: 0 1rem;
+  }
+
+  .hero-panel {
+    flex: 1;
+    background: var(--hero-panel-bg, #1e293b);
+    border: 1px solid var(--hero-panel-border, #334155);
+    border-radius: 0.5rem;
+    overflow: hidden;
+    text-align: left;
+  }
+
+  .panel-header {
+    background: var(--hero-panel-header-bg, #162032);
+    padding: 0.4rem 0.75rem;
+    border-bottom: 1px solid var(--hero-panel-border, #334155);
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .panel-tab {
+    color: #fbbf24;
+    font-size: var(--sl-text-xs);
+    font-weight: 600;
+  }
+
+  .terminal-header {
+    gap: 0.25rem;
+  }
+
+  .terminal-dot {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+  }
+  .dot-red { background: #f43f5e; }
+  .dot-yellow { background: #f59e0b; }
+  .dot-green { background: #10b981; }
+
+  .panel-tab-terminal {
+    color: var(--sl-color-gray-3);
+    font-size: var(--sl-text-xs);
+    margin-left: 0.25rem;
+  }
+
+  .panel-body {
+    padding: 0.75rem;
+  }
+
+  .panel-body pre {
+    margin: 0;
+    background: transparent !important;
+    border: none !important;
+    padding: 0 !important;
+  }
+
+  .panel-body code {
+    font-family: var(--__sl-font-mono);
+    font-size: var(--sl-text-xs);
+    line-height: 1.7;
+    color: var(--hero-code-color, #e2e8f0);
+  }
+
+  :global(.kw) { color: #fbbf24; }
+  :global(.id) { color: #e2e8f0; }
+  :global(.attr) { color: #94a3b8; }
+  :global(.str) { color: #86efac; }
+  :global(.bool) { color: #fde68a; }
+  :global(.enum) { color: #fef3c7; }
+  :global(.type) { color: #94a3b8; }
+  :global(.prompt) { color: #fbbf24; }
+  :global(.muted) { color: #64748b; }
+  :global(.add) { color: #10b981; font-weight: 700; }
+  :global(.computed) { color: #fde68a; }
+  :global(.plan-summary) { color: #fbbf24; font-weight: 600; }
+
+  .hero-actions {
+    display: flex;
+    gap: 0.75rem;
+    justify-content: center;
+    margin-top: 1.5rem;
+    flex-wrap: wrap;
+  }
+
+  .hero-btn {
+    padding: 0.5rem 1.25rem;
+    border-radius: 0.375rem;
+    font-size: var(--sl-text-sm);
+    font-weight: 600;
+    text-decoration: none;
+    transition: background-color 0.2s ease;
+  }
+
+  .hero-btn.primary {
+    background: #d97706;
+    color: #fff;
+  }
+  .hero-btn.primary:hover {
+    background: #f59e0b;
+  }
+
+  .hero-btn.secondary {
+    border: 1px solid #475569;
+    color: #94a3b8;
+  }
+  .hero-btn.secondary:hover {
+    border-color: #64748b;
+    color: #e2e8f0;
+  }
+
+  @media (max-width: 50rem) {
+    .hero-panels {
+      flex-direction: column;
+    }
+  }
+
+</style>

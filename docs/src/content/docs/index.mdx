@@ -4,33 +4,31 @@ description: A strongly typed infrastructure management tool written in Rust.
 template: splash
 hero:
   title: Carina
-  tagline: A strongly typed infrastructure management tool written in Rust.
-  actions:
-    - text: Getting Started
-      link: /getting-started/installation/
-      icon: rocket
-    - text: GitHub
-      link: https://github.com/carina-rs/carina
-      icon: github
-      variant: minimal
+  tagline: ''
 ---
 
-import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+import { CardGrid, LinkCard } from '@astrojs/starlight/components';
 
-<CardGrid>
-  <Card title="Custom DSL" icon="pencil">
-    Infrastructure definition with `.crn` files — strongly typed, validated at parse time.
-  </Card>
-  <Card title="Effects as Values" icon="list-format">
-    Side effects are represented as data, inspectable before execution.
-  </Card>
-  <Card title="Provider Architecture" icon="setting">
-    Pluggable providers — AWSCC (Cloud Control API) and AWS.
-  </Card>
-  <Card title="Modules" icon="puzzle">
-    Reusable infrastructure components with typed arguments and attributes.
-  </Card>
-</CardGrid>
+<div class="why-carina">
+  <h2>Why Carina?</h2>
+  <div class="why-grid">
+    <div class="why-item">
+      <div class="why-icon">🔒</div>
+      <h3>Type Safe</h3>
+      <p>DSL validates at parse time. Catch errors before any infrastructure is touched.</p>
+    </div>
+    <div class="why-item">
+      <div class="why-icon">📋</div>
+      <h3>Effects as Values</h3>
+      <p>Side effects are data. Inspect your Plan before execution, not after.</p>
+    </div>
+    <div class="why-item">
+      <div class="why-icon">🔌</div>
+      <h3>Pluggable Providers</h3>
+      <p>AWS Cloud Control API, native AWS SDK, and more. One DSL, multiple backends.</p>
+    </div>
+  </div>
+</div>
 
 ## Providers
 
