@@ -3,7 +3,9 @@ name = "carina-state"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "State management for Carina infrastructure tool"
+description = "State management for Carina infrastructure management tool"
+repository = "https://github.com/carina-rs/carina"
+homepage = "https://github.com/carina-rs/carina"
 
 [lib]
 doctest = false

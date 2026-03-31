@@ -1,0 +1,39 @@
+# Homebrew formula template for Carina
+# This template is used by the release workflow to generate the actual formula.
+# Placeholders: {{VERSION}}, {{MACOS_ARM_SHA256}}, {{MACOS_X86_SHA256}}, {{LINUX_ARM_SHA256}}, {{LINUX_X86_SHA256}}
+
+class Carina < Formula
+  desc "A functional infrastructure management tool"
+  homepage "https://github.com/carina-rs/carina"
+  version "{{VERSION}}"
+  license "MIT"
+
+  on_macos do
+    if Hardware::CPU.arm?
+      url "https://github.com/carina-rs/carina/releases/download/v{{VERSION}}/carina-{{VERSION}}-macos-aarch64.tar.gz"
+      sha256 "{{MACOS_ARM_SHA256}}"
+    else
+      url "https://github.com/carina-rs/carina/releases/download/v{{VERSION}}/carina-{{VERSION}}-macos-x86_64.tar.gz"
+      sha256 "{{MACOS_X86_SHA256}}"
+    end
+  end
+
+  on_linux do
+    if Hardware::CPU.arm?
+      url "https://github.com/carina-rs/carina/releases/download/v{{VERSION}}/carina-{{VERSION}}-linux-aarch64.tar.gz"
+      sha256 "{{LINUX_ARM_SHA256}}"
+    else
+      url "https://github.com/carina-rs/carina/releases/download/v{{VERSION}}/carina-{{VERSION}}-linux-x86_64.tar.gz"
+      sha256 "{{LINUX_X86_SHA256}}"
+    end
+  end
+
+  def install
+    bin.install "carina"
+    bin.install "carina-lsp"
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/carina --version")
+  end
+end

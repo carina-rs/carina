@@ -3,6 +3,9 @@ name = "carina-lsp"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "Language Server Protocol implementation for Carina DSL"
+repository = "https://github.com/carina-rs/carina"
+homepage = "https://github.com/carina-rs/carina"
 
 [lib]
 name = "carina_lsp"

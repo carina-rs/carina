@@ -43,6 +43,7 @@ impl DetailLevel {
 
 #[derive(Parser)]
 #[command(name = "carina")]
+#[command(version)]
 #[command(about = "A functional infrastructure management tool", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -300,6 +301,8 @@ async fn main() {
     }
 }
 
+#[cfg(test)]
+mod cli_version_tests;
 #[cfg(test)]
 mod module_info_snapshot_tests;
 #[cfg(test)]

@@ -3,6 +3,9 @@ name = "carina-core"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "Core library for Carina, a functional infrastructure management tool"
+repository = "https://github.com/carina-rs/carina"
+homepage = "https://github.com/carina-rs/carina"
 
 [dependencies]
 futures = "0.3"
