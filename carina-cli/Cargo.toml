@@ -1,11 +1,11 @@
 [package]
 name = "carina-cli"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 license = "MIT"
 description = "CLI for Carina, a functional infrastructure management tool"
-repository = "https://github.com/carina-rs/carina"
-homepage = "https://github.com/carina-rs/carina"
+repository.workspace = true
+homepage.workspace = true
 
 [[bin]]
 name = "carina"

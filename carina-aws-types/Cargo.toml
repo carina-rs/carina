@@ -1,11 +1,11 @@
 [package]
 name = "carina-aws-types"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 license = "MIT"
 description = "AWS type definitions for Carina infrastructure management tool"
-repository = "https://github.com/carina-rs/carina"
-homepage = "https://github.com/carina-rs/carina"
+repository.workspace = true
+homepage.workspace = true
 
 [lib]
 doctest = false

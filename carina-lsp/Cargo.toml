@@ -1,11 +1,11 @@
 [package]
 name = "carina-lsp"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 license = "MIT"
 description = "Language Server Protocol implementation for Carina DSL"
-repository = "https://github.com/carina-rs/carina"
-homepage = "https://github.com/carina-rs/carina"
+repository.workspace = true
+homepage.workspace = true
 
 [lib]
 name = "carina_lsp"

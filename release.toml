@@ -1,0 +1,24 @@
+# cargo-release configuration
+# Usage: cargo release <version> --execute
+#   e.g., cargo release 0.2.0 --execute
+#   e.g., cargo release minor --execute
+
+# Use workspace version (all crates share the same version)
+shared-version = true
+
+# Tag format: v0.1.0
+tag-name = "v{{version}}"
+tag-message = "release: v{{version}}"
+
+# Commit message for version bump
+pre-release-commit-message = "release: v{{version}}"
+
+# Don't publish to crates.io from cargo-release (CI handles it)
+publish = false
+
+# Push tag and commit to trigger CI release workflow
+push = true
+
+# Sign tags (disable if no GPG key configured)
+sign-tag = false
+sign-commit = false
