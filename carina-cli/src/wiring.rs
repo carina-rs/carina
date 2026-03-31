@@ -450,6 +450,22 @@ pub async fn create_providers_from_configs(configs: &[ProviderConfig]) -> Provid
     let mut router = ProviderRouter::new();
 
     for config in configs {
+        // If the provider has a source, load it as an external process
+        if let Some(ref source) = config.source {
+            match load_process_provider(source, config).await {
+                Ok((provider, name)) => {
+                    router.add_provider(name, provider);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "{}",
+                        format!("Failed to load process provider '{}': {}", config.name, e).red()
+                    );
+                }
+            }
+            continue;
+        }
+
         if let Some(factory) = provider_mod::find_factory(ctx.factories(), &config.name) {
             let region = factory.extract_region(&config.attributes);
             println!(
