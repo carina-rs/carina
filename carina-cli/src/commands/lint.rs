@@ -17,7 +17,7 @@ use carina_core::parser::ProviderContext;
 use carina_core::provider::{self as provider_mod};
 
 use crate::error::AppError;
-use crate::wiring::WiringContext;
+use crate::wiring::{WiringContext, build_factories_from_providers};
 
 /// A lint warning with file, line, and message info.
 struct LintWarning {
@@ -35,7 +35,8 @@ pub fn run_lint(path: &PathBuf, provider_context: &ProviderContext) -> Result<()
     module_resolver::resolve_modules_with_config(&mut parsed, base_dir, provider_context)
         .map_err(|e| format!("Module resolution error: {}", e))?;
 
-    let ctx = WiringContext::new();
+    let provider_factories = build_factories_from_providers(&parsed.providers, base_dir);
+    let ctx = WiringContext::new(provider_factories);
     let factories = ctx.factories();
     let schemas = ctx.schemas();
 

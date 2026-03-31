@@ -35,51 +35,61 @@ fn assert_validate_fails(fixture: &str, expected_substring: &str) {
 }
 
 #[test]
+#[ignore = "requires provider binary for schema-based validation"]
 fn invalid_enum_value() {
     assert_validate_fails("invalid_enum_value.crn", "Invalid enum variant");
 }
 
 #[test]
+#[ignore = "requires provider binary for schema-based validation"]
 fn invalid_cidr_format() {
     assert_validate_fails("invalid_cidr.crn", "Invalid CIDR format");
 }
 
 #[test]
+#[ignore = "requires provider binary for schema-based validation"]
 fn invalid_cidr_prefix_out_of_range() {
     assert_validate_fails("invalid_cidr_prefix.crn", "Invalid prefix length");
 }
 
 #[test]
+#[ignore = "requires provider binary for schema-based validation"]
 fn invalid_cidr_octet_out_of_range() {
     assert_validate_fails("invalid_cidr_octet.crn", "Invalid octet");
 }
 
 #[test]
+#[ignore = "requires provider binary for schema-based validation"]
 fn type_mismatch_bool_gets_string() {
     assert_validate_fails("type_mismatch_bool.crn", "expected Bool, got String");
 }
 
 #[test]
+#[ignore = "requires provider binary for schema-based validation"]
 fn type_mismatch_int_gets_string() {
     assert_validate_fails("type_mismatch_int.crn", "Expected integer");
 }
 
 #[test]
+#[ignore = "requires provider binary for schema-based validation"]
 fn out_of_range_integer() {
     assert_validate_fails("out_of_range_int.crn", "out of range");
 }
 
 #[test]
+#[ignore = "requires provider binary for resource type validation"]
 fn unknown_resource_type() {
     assert_validate_fails("unknown_resource_type.crn", "Unknown resource type");
 }
 
 #[test]
+#[ignore = "requires provider binary for schema-based validation"]
 fn missing_required_attribute() {
     assert_validate_fails("missing_required_attr.crn", "group_description");
 }
 
 #[test]
+#[ignore = "requires provider binary for schema-based validation"]
 fn invalid_region() {
     assert_validate_fails("invalid_region.crn", "region");
 }

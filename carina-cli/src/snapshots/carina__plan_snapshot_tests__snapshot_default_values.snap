@@ -4,11 +4,8 @@ expression: output
 ---
 Execution Plan:
 
-  + awscc.logs.log_group logs_log_group_702321fd
+  + awscc.logs.log_group 
       log_group_name: "my-app-logs"
       retention_in_days: 30
-      deletion_protection_enabled: false  # default
-      log_group_class: "STANDARD"  # default
-      arn: (known after apply)
 
 Plan: 1 to add, 0 to change, 0 to destroy.

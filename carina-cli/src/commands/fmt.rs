@@ -20,7 +20,7 @@ pub fn run_fmt(
     let config = FormatConfig::default();
 
     // Load schemas to get block_name mappings for list-to-block conversion
-    let ctx = WiringContext::new();
+    let ctx = WiringContext::new(vec![]);
     let block_names = collect_all_block_names(ctx.schemas());
 
     let files = if path.is_file() {

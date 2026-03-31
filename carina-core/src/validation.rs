@@ -18,6 +18,7 @@ pub fn validate_resources(
     resources: &[Resource],
     schemas: &HashMap<String, ResourceSchema>,
     schema_key_fn: &dyn Fn(&Resource) -> String,
+    known_providers: &HashSet<String>,
 ) -> Result<(), String> {
     let mut all_errors = Vec::new();
 
@@ -44,6 +45,13 @@ pub fn validate_resources(
                 }
             }
             None => {
+                // If no factory is registered for this provider, skip validation
+                // (schemas are simply not available)
+                if !resource.id.provider.is_empty()
+                    && !known_providers.contains(&resource.id.provider)
+                {
+                    continue;
+                }
                 all_errors.push(format!("Unknown resource type: {}", schema_key));
             }
         }

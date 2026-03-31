@@ -64,7 +64,7 @@ fn build_plan_and_states_from_fixture(
     // Parse configuration
     let mut parsed = load_configuration(&crn_path).unwrap().parsed;
     let base_dir = get_base_dir(&crn_path);
-    validate_and_resolve(&mut parsed, base_dir, false).unwrap();
+    validate_and_resolve(&mut parsed, base_dir, true).unwrap();
 
     // Load state file if present
     let state_file: Option<StateFile> = if state_path.exists() {
@@ -75,7 +75,7 @@ fn build_plan_and_states_from_fixture(
     };
 
     // Reconcile identifiers with state (same as plan command)
-    let wiring = WiringContext::new();
+    let wiring = WiringContext::new(vec![]);
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
     if let Some(sf) = state_file.as_ref() {
         reconcile_anonymous_identifiers_with_ctx(&wiring, &mut parsed.resources, sf);

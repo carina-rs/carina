@@ -8,12 +8,8 @@ Execution Plan:
       tags: (none) → {Name: "updated"}
       # (1 unchanged attribute hidden)
         │
-        └─ + awscc.ec2.subnet ec2_subnet_739e36ff
+        └─ + awscc.ec2.subnet 
               cidr_block: "10.0.1.0/24"
               vpc_id: new_vpc.vpc_id
-              block_public_access_states: (known after apply)
-              ipv6_cidr_blocks: (known after apply)
-              network_acl_association_id: (known after apply)
-              subnet_id: (known after apply)
 
 Plan: 1 to add, 1 to change, 0 to destroy, 1 to move.

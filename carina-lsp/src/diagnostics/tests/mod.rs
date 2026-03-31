@@ -13,10 +13,7 @@ pub(super) fn create_document(content: &str) -> Document {
 }
 
 pub(super) fn test_engine() -> DiagnosticEngine {
-    let factories: Vec<Box<dyn ProviderFactory>> = vec![
-        Box::new(carina_provider_aws::AwsProviderFactory),
-        Box::new(carina_provider_awscc::AwsccProviderFactory),
-    ];
+    let factories: Vec<Box<dyn ProviderFactory>> = vec![];
     let schemas = Arc::new(provider_mod::collect_schemas(&factories));
     let provider_names: Vec<String> = factories.iter().map(|f| f.name().to_string()).collect();
     let factories = Arc::new(factories);
@@ -24,10 +21,7 @@ pub(super) fn test_engine() -> DiagnosticEngine {
 }
 
 pub(super) fn test_engine_reversed() -> DiagnosticEngine {
-    let factories: Vec<Box<dyn ProviderFactory>> = vec![
-        Box::new(carina_provider_awscc::AwsccProviderFactory),
-        Box::new(carina_provider_aws::AwsProviderFactory),
-    ];
+    let factories: Vec<Box<dyn ProviderFactory>> = vec![];
     let schemas = Arc::new(provider_mod::collect_schemas(&factories));
     let provider_names: Vec<String> = factories.iter().map(|f| f.name().to_string()).collect();
     let factories = Arc::new(factories);

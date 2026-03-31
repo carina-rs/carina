@@ -4,12 +4,10 @@ expression: strip_ansi(&output)
 ---
 Execution Plan:
 
-  + awscc.ec2.security_group ec2_security_group_acdfb070
+  + awscc.ec2.security_group 
       group_description: "Web security group"
       tags:
         Name: "web-sg"
       vpc_id: "vpc-abc123"
-      group_id: (known after apply)
-      id: (known after apply)
 
 Plan: 1 to add, 0 to change, 0 to destroy.

@@ -110,6 +110,7 @@ outer {
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn string_enum_invalid_value_top_level() {
     let engine = test_engine();
     let doc = create_document(
@@ -162,6 +163,7 @@ instance_tenancy = awscc.ec2.vpc.InstanceTenancy.default
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn string_enum_invalid_value_in_struct_field() {
     let engine = test_engine();
     let doc = create_document(
@@ -224,6 +226,7 @@ security_group_ingress {
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn custom_type_validation_in_struct_field() {
     let engine = test_engine();
     let doc = create_document(
@@ -297,6 +300,7 @@ protocols = ["tcp", "invalid_protocol"]
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn block_name_mixed_syntax_error() {
     let engine = test_engine();
     // Use both operating_region and operating_regions - should error
@@ -832,6 +836,7 @@ awscc.ec2.vpc {
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn resource_ref_typo_suggests_similar_attribute() {
     let engine = test_engine();
     let doc = create_document(

@@ -26,8 +26,8 @@ use crate::commands::apply::apply_name_overrides;
 use crate::display::print_plan;
 use crate::error::AppError;
 use crate::wiring::{
-    WiringContext, create_plan_from_parsed_with_remote, reconcile_anonymous_identifiers_with_ctx,
-    reconcile_prefixed_names,
+    WiringContext, build_factories_from_providers, create_plan_from_parsed_with_remote,
+    reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
 };
 
 /// Saved plan file for `plan --out` / `apply plan.json`
@@ -169,7 +169,8 @@ pub async fn run_plan(
         println!();
     }
 
-    let wiring = WiringContext::new();
+    let factories = build_factories_from_providers(&parsed.providers, base_dir);
+    let wiring = WiringContext::new(factories);
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
     if let Some(sf) = state_file.as_ref() {
         reconcile_anonymous_identifiers_with_ctx(&wiring, &mut parsed.resources, sf);
