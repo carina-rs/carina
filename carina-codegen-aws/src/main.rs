@@ -2398,7 +2398,10 @@ fn known_string_type_overrides() -> &'static HashMap<&'static str, &'static str>
 fn known_enum_overrides() -> &'static HashMap<&'static str, Vec<&'static str>> {
     static OVERRIDES: LazyLock<HashMap<&'static str, Vec<&'static str>>> = LazyLock::new(|| {
         let mut m = HashMap::new();
-        m.insert("IpProtocol", vec!["tcp", "udp", "icmp", "icmpv6", "-1"]);
+        m.insert(
+            "IpProtocol",
+            vec!["tcp", "udp", "icmp", "icmpv6", "-1", "all"],
+        );
         m.insert("HostnameType", vec!["ip-name", "resource-name"]);
         m
     });
