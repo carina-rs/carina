@@ -188,6 +188,10 @@ pub enum AttributeType {
         name: String,
         fields: Vec<StructField>,
     },
+    #[serde(rename = "union")]
+    Union {
+        members: Vec<AttributeType>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,6 +255,28 @@ mod tests {
                 required: true,
                 description: None,
             }],
+        };
+
+        let json = serde_json::to_string(&attr).unwrap();
+        let back: AttributeType = serde_json::from_str(&json).unwrap();
+        assert_eq!(json, serde_json::to_string(&back).unwrap());
+    }
+
+    #[test]
+    fn test_union_type_roundtrip() {
+        let attr = AttributeType::Union {
+            members: vec![
+                AttributeType::Struct {
+                    name: "IamPolicyPrincipal".into(),
+                    fields: vec![StructField {
+                        name: "service".into(),
+                        field_type: AttributeType::String,
+                        required: false,
+                        description: None,
+                    }],
+                },
+                AttributeType::String,
+            ],
         };
 
         let json = serde_json::to_string(&attr).unwrap();
