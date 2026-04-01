@@ -7,7 +7,7 @@ use carina_core::utils::extract_enum_value;
 use aws_sdk_ec2::types::NatGatewayState;
 
 use crate::AwsProvider;
-use crate::helpers::{PollState, require_string_attr, wait_for_ec2_state};
+use crate::helpers::{PollState, require_string_attr, retry_aws_operation, wait_for_ec2_state};
 
 impl AwsProvider {
     /// Read an EC2 NAT Gateway
@@ -82,11 +82,19 @@ impl AwsProvider {
             req = req.connectivity_type(ct);
         }
 
-        let result = req.send().await.map_err(|e| {
-            ProviderError::new("Failed to create NAT gateway")
-                .with_cause(e)
-                .for_resource(resource.id.clone())
-        })?;
+        let rid = resource.id.clone();
+        let result = retry_aws_operation("create NAT gateway", 5, 5, || {
+            let req = req.clone();
+            let rid = rid.clone();
+            async move {
+                req.send().await.map_err(|e| {
+                    ProviderError::new("Failed to create NAT gateway")
+                        .with_cause(e)
+                        .for_resource(rid)
+                })
+            }
+        })
+        .await?;
 
         let ngw_id = result
             .nat_gateway()
@@ -186,6 +194,7 @@ impl AwsProvider {
                     },
                 )
             },
+            60,
             "Timeout waiting for NAT gateway to become available",
             "NAT gateway creation failed",
         )
@@ -200,6 +209,7 @@ impl AwsProvider {
     ) -> ProviderResult<()> {
         let ec2 = &self.ec2_client;
         let rid = id.clone();
+        // NAT Gateways can take 5+ minutes to delete; use 90 iterations (7.5 min).
         wait_for_ec2_state(
             id,
             || async {
@@ -223,6 +233,7 @@ impl AwsProvider {
                     PollState::Gone
                 })
             },
+            90,
             "Timeout waiting for NAT gateway to be deleted",
             "NAT gateway deletion failed",
         )

@@ -63,16 +63,71 @@ pub enum PollState {
     Pending,
 }
 
+/// Retry an AWS SDK operation with exponential backoff on transient errors.
+///
+/// Only retries on known transient error patterns (throttling, service errors).
+/// Does NOT retry on validation, permission, or resource-not-found errors.
+///
+/// - `operation_name`: Human-readable name for log messages.
+/// - `max_attempts`: Maximum number of attempts (including the first).
+/// - `initial_delay_secs`: Delay before the first retry (doubles each attempt, capped at 120s).
+/// - `f`: A closure that returns a `Future` producing the SDK result.
+pub async fn retry_aws_operation<F, Fut, T, E>(
+    operation_name: &str,
+    max_attempts: u32,
+    initial_delay_secs: u64,
+    f: F,
+) -> Result<T, E>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match f().await {
+            Ok(result) => return Ok(result),
+            Err(e) if attempt < max_attempts && is_retryable_error(&e.to_string()) => {
+                let delay = std::cmp::min(initial_delay_secs * 2u64.pow(attempt - 1), 120);
+                eprintln!(
+                    "  Retrying {} (attempt {}/{}): {}",
+                    operation_name, attempt, max_attempts, e
+                );
+                sleep(Duration::from_secs(delay)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Check whether an error message indicates a transient AWS error worth retrying.
+fn is_retryable_error(error_msg: &str) -> bool {
+    const PATTERNS: &[&str] = &[
+        "ThrottlingException",
+        "Throttling",
+        "Rate exceeded",
+        "RequestLimitExceeded",
+        "ServiceUnavailable",
+        "InternalError",
+        "InternalServerError",
+        "ServiceException",
+    ];
+    PATTERNS.iter().any(|p| error_msg.contains(p))
+}
+
 /// Generic wait/poll loop for EC2 resources.
 ///
-/// Polls at 5-second intervals for up to 60 iterations (5 minutes).
+/// Polls at 5-second intervals for up to `max_iterations` iterations.
 ///
 /// - `poll_fn`: An async function that describes the resource and returns its `PollState`.
+/// - `max_iterations`: Maximum number of poll iterations (each 5 seconds apart).
 /// - `timeout_msg`: Error message if the loop times out.
 /// - `failure_msg`: Error message if the resource reaches a failed state.
 pub async fn wait_for_ec2_state<F, Fut>(
     id: &ResourceId,
     poll_fn: F,
+    max_iterations: u32,
     timeout_msg: &str,
     failure_msg: &str,
 ) -> ProviderResult<()>
@@ -80,7 +135,7 @@ where
     F: Fn() -> Fut,
     Fut: Future<Output = ProviderResult<PollState>>,
 {
-    for _ in 0..60 {
+    for _ in 0..max_iterations {
         match poll_fn().await? {
             PollState::Ready => return Ok(()),
             PollState::Gone => return Ok(()),
@@ -93,4 +148,60 @@ where
     }
 
     Err(ProviderError::new(timeout_msg).for_resource(id.clone()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_retryable_error_throttling() {
+        assert!(is_retryable_error("ThrottlingException: Rate exceeded"));
+        assert!(is_retryable_error("Throttling: request limit"));
+        assert!(is_retryable_error("Rate exceeded for API call"));
+        assert!(is_retryable_error("RequestLimitExceeded"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_service_errors() {
+        assert!(is_retryable_error("ServiceUnavailable: try again"));
+        assert!(is_retryable_error("InternalError occurred"));
+        assert!(is_retryable_error("InternalServerError"));
+        assert!(is_retryable_error("ServiceException: transient"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_non_retryable() {
+        assert!(!is_retryable_error("ValidationError: invalid parameter"));
+        assert!(!is_retryable_error("AccessDeniedException: not authorized"));
+        assert!(!is_retryable_error("ResourceNotFoundException: not found"));
+        assert!(!is_retryable_error("InvalidParameterValue"));
+    }
+
+    #[tokio::test]
+    async fn test_retry_aws_operation_succeeds_first_try() {
+        let result: Result<&str, String> =
+            retry_aws_operation("test op", 3, 1, || async { Ok("success") }).await;
+        assert_eq!(result.unwrap(), "success");
+    }
+
+    #[tokio::test]
+    async fn test_retry_aws_operation_non_retryable_fails_immediately() {
+        let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter = attempt_count.clone();
+        let result: Result<&str, String> = retry_aws_operation("test op", 3, 1, || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err("ValidationError: bad input".to_string())
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "should not retry non-retryable errors"
+        );
+    }
 }
