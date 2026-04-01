@@ -152,9 +152,9 @@ fn proto_to_core_attribute_type(t: &ProtoAttributeType) -> CoreAttributeType {
             namespace: None,
             to_dsl: None,
         },
-        ProtoAttributeType::List { inner } => CoreAttributeType::List {
+        ProtoAttributeType::List { inner, ordered } => CoreAttributeType::List {
             inner: Box::new(proto_to_core_attribute_type(inner)),
-            ordered: true,
+            ordered: *ordered,
         },
         ProtoAttributeType::Map { inner } => {
             CoreAttributeType::Map(Box::new(proto_to_core_attribute_type(inner)))
@@ -175,7 +175,7 @@ fn proto_to_core_struct_field(f: &ProtoStructField) -> CoreStructField {
         field_type: proto_to_core_attribute_type(&f.field_type),
         required: f.required,
         description: f.description.clone(),
-        provider_name: None,
+        provider_name: f.provider_name.clone(),
         block_name: f.block_name.clone(),
     }
 }
@@ -188,10 +188,10 @@ fn proto_to_core_attribute_schema(a: &ProtoAttributeSchema) -> CoreAttributeSche
         default: a.default.as_ref().map(proto_to_core_value),
         description: a.description.clone(),
         completions: None,
-        provider_name: None,
+        provider_name: a.provider_name.clone(),
         create_only: a.create_only,
         read_only: a.read_only,
-        removable: None,
+        removable: a.removable,
         block_name: a.block_name.clone(),
         write_only: a.write_only,
     }
@@ -222,8 +222,9 @@ fn core_to_proto_attribute_type(t: &CoreAttributeType) -> ProtoAttributeType {
         CoreAttributeType::StringEnum { values, .. } => ProtoAttributeType::StringEnum {
             values: values.clone(),
         },
-        CoreAttributeType::List { inner, .. } => ProtoAttributeType::List {
+        CoreAttributeType::List { inner, ordered } => ProtoAttributeType::List {
             inner: Box::new(core_to_proto_attribute_type(inner)),
+            ordered: *ordered,
         },
         CoreAttributeType::Map(inner) => ProtoAttributeType::Map {
             inner: Box::new(core_to_proto_attribute_type(inner)),
@@ -247,6 +248,7 @@ fn core_to_proto_struct_field(f: &CoreStructField) -> ProtoStructField {
         required: f.required,
         description: f.description.clone(),
         block_name: f.block_name.clone(),
+        provider_name: f.provider_name.clone(),
     }
 }
 
@@ -261,6 +263,8 @@ fn core_to_proto_attribute_schema(a: &CoreAttributeSchema) -> ProtoAttributeSche
         read_only: a.read_only,
         write_only: a.write_only,
         block_name: a.block_name.clone(),
+        provider_name: a.provider_name.clone(),
+        removable: a.removable,
     }
 }
 
@@ -461,6 +465,114 @@ mod tests {
             );
         } else {
             panic!("Expected Struct type");
+        }
+    }
+
+    #[test]
+    fn test_list_ordered_roundtrip() {
+        // ordered flag on List types must survive core->proto->core roundtrip.
+        // Without this, unordered lists (ordered=false) become ordered lists
+        // (ordered=true), causing the differ to compare items positionally
+        // instead of as multisets. This was the root cause of issue #1439.
+        let ordered_list = CoreAttributeType::List {
+            inner: Box::new(CoreAttributeType::String),
+            ordered: true,
+        };
+        let unordered_list = CoreAttributeType::List {
+            inner: Box::new(CoreAttributeType::Struct {
+                name: "Egress".into(),
+                fields: vec![],
+            }),
+            ordered: false,
+        };
+
+        let proto_ordered = core_to_proto_attribute_type(&ordered_list);
+        let back_ordered = proto_to_core_attribute_type(&proto_ordered);
+        if let CoreAttributeType::List { ordered, .. } = back_ordered {
+            assert!(ordered, "ordered=true must survive roundtrip");
+        } else {
+            panic!("Expected List type");
+        }
+
+        let proto_unordered = core_to_proto_attribute_type(&unordered_list);
+        let back_unordered = proto_to_core_attribute_type(&proto_unordered);
+        if let CoreAttributeType::List { ordered, .. } = back_unordered {
+            assert!(!ordered, "ordered=false must survive roundtrip");
+        } else {
+            panic!("Expected List type");
+        }
+    }
+
+    #[test]
+    fn test_provider_name_roundtrip() {
+        // provider_name on attribute schemas and struct fields must survive roundtrip.
+        let core_schema = CoreResourceSchema {
+            resource_type: "ec2.security_group".into(),
+            attributes: HashMap::from([(
+                "security_group_egress".into(),
+                CoreAttributeSchema {
+                    name: "security_group_egress".into(),
+                    attr_type: CoreAttributeType::unordered_list(CoreAttributeType::Struct {
+                        name: "Egress".into(),
+                        fields: vec![CoreStructField {
+                            name: "ip_protocol".into(),
+                            field_type: CoreAttributeType::String,
+                            required: true,
+                            description: None,
+                            provider_name: Some("IpProtocol".into()),
+                            block_name: None,
+                        }],
+                    }),
+                    required: false,
+                    default: None,
+                    description: None,
+                    completions: None,
+                    provider_name: Some("SecurityGroupEgress".into()),
+                    create_only: false,
+                    read_only: false,
+                    removable: Some(false),
+                    block_name: None,
+                    write_only: false,
+                },
+            )]),
+            description: None,
+            validator: None,
+            data_source: false,
+            name_attribute: None,
+            force_replace: false,
+        };
+
+        let proto = core_to_proto_schema(&core_schema);
+        let back = proto_to_core_schema(&proto);
+
+        let attr = &back.attributes["security_group_egress"];
+        assert_eq!(
+            attr.provider_name,
+            Some("SecurityGroupEgress".into()),
+            "attribute provider_name must survive roundtrip"
+        );
+        assert_eq!(
+            attr.removable,
+            Some(false),
+            "attribute removable must survive roundtrip"
+        );
+
+        if let CoreAttributeType::List { inner, ordered, .. } = &attr.attr_type {
+            assert!(
+                !ordered,
+                "unordered_list must survive roundtrip as ordered=false"
+            );
+            if let CoreAttributeType::Struct { fields, .. } = inner.as_ref() {
+                assert_eq!(
+                    fields[0].provider_name,
+                    Some("IpProtocol".into()),
+                    "struct field provider_name must survive roundtrip"
+                );
+            } else {
+                panic!("Expected Struct type inside List");
+            }
+        } else {
+            panic!("Expected List type");
         }
     }
 }
