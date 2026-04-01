@@ -256,8 +256,8 @@ impl AwsccProvider {
 
     /// Returns the max polling attempts for a given resource type and operation.
     ///
-    /// Some resource types (e.g., IPAM Pool, VPCGatewayAttachment) take significantly
-    /// longer to delete via the CloudControl API than the default timeout allows.
+    /// Some resource types (e.g., IPAM Pool, VPCGatewayAttachment, NatGateway) take
+    /// significantly longer to delete via the CloudControl API than the default timeout allows.
     pub(crate) fn max_polling_attempts(type_name: &str, operation: &str) -> u32 {
         if operation == "delete" {
             // IPAM Pool deletions can take 15-30 minutes via CloudControl API
@@ -269,6 +269,11 @@ impl AwsccProvider {
             // The default 10-minute timeout is often insufficient. (issue #1066)
             if type_name.contains("VPCGatewayAttachment") {
                 return 360; // 30 minutes (360 * 5s)
+            }
+            // NatGateway deletion via CloudControl API can take 10-15 minutes.
+            // The default 10-minute timeout is insufficient. (issue #1443)
+            if type_name == "AWS::EC2::NatGateway" {
+                return 240; // 20 minutes (240 * 5s)
             }
         }
         120 // Default: 10 minutes (120 * 5s)
@@ -806,6 +811,25 @@ mod tests {
         // Create operations use the default timeout
         assert_eq!(
             AwsccProvider::max_polling_attempts("AWS::EC2::VPCGatewayAttachment", "create"),
+            120
+        );
+    }
+
+    #[test]
+    fn test_max_polling_attempts_nat_gateway_delete() {
+        // NatGateway deletion via CloudControl API can take 10-15 minutes.
+        // Extended timeout prevents premature timeout failures. (issue #1443)
+        assert_eq!(
+            AwsccProvider::max_polling_attempts("AWS::EC2::NatGateway", "delete"),
+            240
+        );
+    }
+
+    #[test]
+    fn test_max_polling_attempts_nat_gateway_create() {
+        // Create operations use the default timeout
+        assert_eq!(
+            AwsccProvider::max_polling_attempts("AWS::EC2::NatGateway", "create"),
             120
         );
     }
