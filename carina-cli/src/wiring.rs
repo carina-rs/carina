@@ -482,6 +482,9 @@ async fn try_add_process_provider(
                 format!("Using {} (region: {}, source: {})", name, region, source).cyan()
             );
             router.add_provider(name, provider);
+            if let Some(normalizer) = factory.create_normalizer(&config.attributes).await {
+                router.add_normalizer(normalizer);
+            }
         }
         Err(e) => {
             eprintln!(
@@ -1307,6 +1310,114 @@ mod tests {
             plan_with.is_empty(),
             "After merge_default_tags, no false diff should occur"
         );
+    }
+
+    /// Verify that process providers loaded via `source` attribute have normalizers
+    /// registered so that normalize_desired and normalize_state work correctly.
+    ///
+    /// Before the fix for issue #1429, `try_add_process_provider` only added a
+    /// Provider but NOT a ProviderNormalizer. This caused normalize_desired to be
+    /// a no-op for source-based providers, leading to false diffs between raw
+    /// desired values (e.g., "ap-northeast-1a") and normalized state values
+    /// (e.g., "awscc.AvailabilityZone.ap_northeast_1a").
+    #[test]
+    #[ignore = "requires provider binary for normalizer registration"]
+    fn test_process_provider_normalizer_registered_via_source() {
+        use carina_core::differ::create_plan;
+        use carina_core::resource::LifecycleConfig;
+        use carina_core::schema::ResourceSchema;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build tokio runtime");
+
+        rt.block_on(async {
+            let config = carina_core::parser::ProviderConfig {
+                name: "awscc".to_string(),
+                attributes: HashMap::from([(
+                    "region".to_string(),
+                    Value::String("awscc.Region.ap_northeast_1".to_string()),
+                )]),
+                source: Some(format!(
+                    "file://{}",
+                    std::env::current_dir()
+                        .unwrap()
+                        .join("../target/debug/carina-provider-awscc")
+                        .display()
+                )),
+                version: Some("0.1.0".to_string()),
+                default_tags: HashMap::new(),
+            };
+
+            let mut router = ProviderRouter::new();
+            let base_dir = std::env::current_dir().unwrap();
+            try_add_process_provider(
+                &mut router,
+                config.source.as_ref().unwrap(),
+                &config,
+                &base_dir,
+            )
+            .await;
+
+            // Desired resource with raw availability_zone (not yet normalized)
+            let mut resource = Resource::with_provider("awscc", "ec2.subnet", "test-subnet");
+            resource.set_attr(
+                "availability_zone".to_string(),
+                Value::String("ap-northeast-1a".to_string()),
+            );
+            resource.set_attr(
+                "cidr_block".to_string(),
+                Value::String("10.0.1.0/24".to_string()),
+            );
+            resource.set_attr("vpc_id".to_string(), Value::String("vpc-12345".to_string()));
+            let mut resources = vec![resource];
+
+            // State with normalized availability_zone (as stored after apply)
+            let id = resources[0].id.clone();
+            let mut state_attrs = HashMap::new();
+            state_attrs.insert(
+                "availability_zone".to_string(),
+                Value::String("awscc.AvailabilityZone.ap_northeast_1a".to_string()),
+            );
+            state_attrs.insert(
+                "cidr_block".to_string(),
+                Value::String("10.0.1.0/24".to_string()),
+            );
+            state_attrs.insert("vpc_id".to_string(), Value::String("vpc-12345".to_string()));
+            let state = State::existing(id.clone(), state_attrs);
+            let mut current_states = HashMap::new();
+            current_states.insert(id.clone(), state);
+
+            // Normalize both desired and state via the router (which should have
+            // a normalizer registered by try_add_process_provider)
+            router.normalize_desired(&mut resources);
+            router.normalize_state(&mut current_states);
+
+            // After normalization, both sides should use the same format → no diff
+            let lifecycles: HashMap<ResourceId, LifecycleConfig> = HashMap::new();
+            let schemas: HashMap<String, ResourceSchema> = HashMap::new();
+            let saved_attrs = HashMap::new();
+            let prev_desired_keys = HashMap::new();
+            let orphan_deps = HashMap::new();
+            let plan = create_plan(
+                &resources,
+                &current_states,
+                &lifecycles,
+                &schemas,
+                &saved_attrs,
+                &prev_desired_keys,
+                &orphan_deps,
+            );
+            assert!(
+                plan.is_empty(),
+                "After normalize_desired + normalize_state via process provider, \
+                 no false diff should occur for availability_zone. \
+                 desired={:?}, current={:?}",
+                resources[0].get_attr("availability_zone"),
+                current_states[&id].attributes.get("availability_zone"),
+            );
+        });
     }
 
     #[test]

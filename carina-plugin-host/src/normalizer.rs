@@ -46,6 +46,21 @@ impl ProviderNormalizer for ProcessProviderNormalizer {
                 for (core_res, proto_res) in resources.iter_mut().zip(result.resources.iter()) {
                     let resolved = convert::proto_to_core_value_map(&proto_res.attributes);
                     for (key, value) in resolved {
+                        // Only update attributes that were literal values.
+                        // Non-literal expressions (ResourceRef, Interpolation, etc.)
+                        // get corrupted during proto conversion and must be preserved.
+                        if let Some(Expr(v)) = core_res.attributes.get(&key)
+                            && matches!(
+                                v,
+                                Value::ResourceRef { .. }
+                                    | Value::Interpolation(_)
+                                    | Value::FunctionCall { .. }
+                                    | Value::Closure { .. }
+                                    | Value::Secret(_)
+                            )
+                        {
+                            continue;
+                        }
                         core_res.attributes.insert(key, Expr(value));
                     }
                 }
@@ -151,6 +166,19 @@ impl ProviderNormalizer for ProcessProviderNormalizer {
                 for (core_res, proto_res) in resources.iter_mut().zip(result.resources.iter()) {
                     let resolved = convert::proto_to_core_value_map(&proto_res.attributes);
                     for (key, value) in resolved {
+                        // Preserve non-literal expressions (same as normalize_desired)
+                        if let Some(Expr(v)) = core_res.attributes.get(&key)
+                            && matches!(
+                                v,
+                                Value::ResourceRef { .. }
+                                    | Value::Interpolation(_)
+                                    | Value::FunctionCall { .. }
+                                    | Value::Closure { .. }
+                                    | Value::Secret(_)
+                            )
+                        {
+                            continue;
+                        }
                         core_res.attributes.insert(key, Expr(value));
                     }
                 }
