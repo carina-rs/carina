@@ -892,3 +892,266 @@ fn orphan_delete_preserves_binding_and_dependencies() {
         _ => unreachable!(),
     }
 }
+
+/// Regression test for issue #1439: security_group_egress struct list should
+/// be idempotent after apply -> plan-verify when saved state contains
+/// namespaced enum values that differ from alias-resolved values.
+///
+/// Scenario: After apply, the state file stores ip_protocol values in
+/// namespaced format (e.g., "awscc.ec2.security_group.IpProtocol.tcp"),
+/// while plan-time alias resolution converts "all" to "-1".
+/// The differ should see no changes when comparing merged-desired vs current.
+#[test]
+fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
+    use crate::schema::{ResourceSchema, StructField};
+
+    // Build a schema that matches ec2.security_group's security_group_egress attribute
+    let egress_struct = AttributeType::Struct {
+        name: "Egress".to_string(),
+        fields: vec![
+            StructField::new("cidr_ip", AttributeType::String),
+            StructField::new("description", AttributeType::String),
+            StructField::new("from_port", AttributeType::Int),
+            StructField::new(
+                "ip_protocol",
+                AttributeType::StringEnum {
+                    name: "IpProtocol".to_string(),
+                    values: vec![
+                        "tcp".to_string(),
+                        "udp".to_string(),
+                        "icmp".to_string(),
+                        "-1".to_string(),
+                        "all".to_string(),
+                    ],
+                    namespace: Some("awscc.ec2.security_group".to_string()),
+                    to_dsl: Some(|s: &str| match s {
+                        "-1" => "all".to_string(),
+                        _ => s.to_string(),
+                    }),
+                },
+            ),
+            StructField::new("to_port", AttributeType::Int),
+        ],
+    };
+    let schema = ResourceSchema::new("awscc.ec2.security_group").attribute(
+        crate::schema::AttributeSchema::new(
+            "security_group_egress",
+            AttributeType::unordered_list(egress_struct),
+        ),
+    );
+
+    // Desired state (post-normalization, post-alias-resolution)
+    // "all" -> "-1" (alias resolved), "tcp" stays as namespaced identifier
+    let desired = Resource::with_provider("awscc", "ec2.security_group", "test-sg").with_attribute(
+        "security_group_egress",
+        Value::List(vec![
+            Value::Map(HashMap::from([
+                (
+                    "ip_protocol".to_string(),
+                    Value::String("awscc.ec2.security_group.IpProtocol.tcp".to_string()),
+                ),
+                ("from_port".to_string(), Value::Int(443)),
+                ("to_port".to_string(), Value::Int(443)),
+                (
+                    "cidr_ip".to_string(),
+                    Value::String("0.0.0.0/0".to_string()),
+                ),
+                (
+                    "description".to_string(),
+                    Value::String("Allow HTTPS outbound".to_string()),
+                ),
+            ])),
+            Value::Map(HashMap::from([
+                ("ip_protocol".to_string(), Value::String("-1".to_string())),
+                (
+                    "cidr_ip".to_string(),
+                    Value::String("10.0.0.0/8".to_string()),
+                ),
+                (
+                    "description".to_string(),
+                    Value::String("Allow all to private ranges".to_string()),
+                ),
+            ])),
+        ]),
+    );
+
+    // Current state (from AWS read, post-normalization, post-alias-resolution)
+    // Same as desired, but the "all" rule also has from_port: -1, to_port: -1 from AWS
+    let current_attrs = HashMap::from([(
+        "security_group_egress".to_string(),
+        Value::List(vec![
+            Value::Map(HashMap::from([
+                (
+                    "ip_protocol".to_string(),
+                    Value::String("awscc.ec2.security_group.IpProtocol.tcp".to_string()),
+                ),
+                ("from_port".to_string(), Value::Int(443)),
+                ("to_port".to_string(), Value::Int(443)),
+                (
+                    "cidr_ip".to_string(),
+                    Value::String("0.0.0.0/0".to_string()),
+                ),
+                (
+                    "description".to_string(),
+                    Value::String("Allow HTTPS outbound".to_string()),
+                ),
+            ])),
+            Value::Map(HashMap::from([
+                ("ip_protocol".to_string(), Value::String("-1".to_string())),
+                ("from_port".to_string(), Value::Int(-1)),
+                ("to_port".to_string(), Value::Int(-1)),
+                (
+                    "cidr_ip".to_string(),
+                    Value::String("10.0.0.0/8".to_string()),
+                ),
+                (
+                    "description".to_string(),
+                    Value::String("Allow all to private ranges".to_string()),
+                ),
+            ])),
+        ]),
+    )]);
+    let current = State::existing(
+        ResourceId::with_provider("awscc", "ec2.security_group", "test-sg"),
+        current_attrs,
+    );
+
+    // Saved state (from state file, NOT alias-resolved)
+    // This is the state as written after apply: namespaced enum values, AWS-returned fields
+    let saved = HashMap::from([(
+        "security_group_egress".to_string(),
+        Value::List(vec![
+            Value::Map(HashMap::from([
+                (
+                    "ip_protocol".to_string(),
+                    Value::String("awscc.ec2.security_group.IpProtocol.tcp".to_string()),
+                ),
+                ("from_port".to_string(), Value::Int(443)),
+                ("to_port".to_string(), Value::Int(443)),
+                (
+                    "cidr_ip".to_string(),
+                    Value::String("0.0.0.0/0".to_string()),
+                ),
+                (
+                    "description".to_string(),
+                    Value::String("Allow HTTPS outbound".to_string()),
+                ),
+            ])),
+            Value::Map(HashMap::from([
+                (
+                    "ip_protocol".to_string(),
+                    Value::String("awscc.ec2.security_group.IpProtocol.all".to_string()),
+                ),
+                ("from_port".to_string(), Value::Int(-1)),
+                ("to_port".to_string(), Value::Int(-1)),
+                (
+                    "cidr_ip".to_string(),
+                    Value::String("10.0.0.0/8".to_string()),
+                ),
+                (
+                    "description".to_string(),
+                    Value::String("Allow all to private ranges".to_string()),
+                ),
+            ])),
+        ]),
+    )]);
+
+    let result = diff(&desired, &current, Some(&saved), None, Some(&schema));
+    assert!(
+        matches!(result, Diff::NoChange(_)),
+        "Expected NoChange for idempotent egress rules, got: {:?}",
+        result
+    );
+}
+
+/// Regression test for the root cause of issue #1439: when the schema
+/// has `ordered: true` (as it would be after losing `ordered` info in the
+/// protocol roundtrip), struct lists are compared positionally instead of
+/// as multisets. If AWS returns items in a different order, positional
+/// comparison fails and falsely detects changes.
+#[test]
+fn diff_false_positive_when_ordered_true_for_struct_list() {
+    use crate::schema::{ResourceSchema, StructField};
+
+    let egress_struct = AttributeType::Struct {
+        name: "Egress".to_string(),
+        fields: vec![
+            StructField::new("cidr_ip", AttributeType::String),
+            StructField::new("description", AttributeType::String),
+            StructField::new("from_port", AttributeType::Int),
+            StructField::new("ip_protocol", AttributeType::String),
+            StructField::new("to_port", AttributeType::Int),
+        ],
+    };
+
+    // Bug: ordered: true causes positional comparison of struct list items
+    let schema_ordered = ResourceSchema::new("awscc.ec2.security_group").attribute(
+        crate::schema::AttributeSchema::new(
+            "security_group_egress",
+            AttributeType::List {
+                inner: Box::new(egress_struct.clone()),
+                ordered: true,
+            },
+        ),
+    );
+
+    // Same items in different order
+    let item_a = Value::Map(HashMap::from([
+        ("ip_protocol".to_string(), Value::String("tcp".to_string())),
+        ("from_port".to_string(), Value::Int(443)),
+        ("to_port".to_string(), Value::Int(443)),
+        (
+            "cidr_ip".to_string(),
+            Value::String("0.0.0.0/0".to_string()),
+        ),
+        (
+            "description".to_string(),
+            Value::String("HTTPS".to_string()),
+        ),
+    ]));
+    let item_b = Value::Map(HashMap::from([
+        ("ip_protocol".to_string(), Value::String("-1".to_string())),
+        (
+            "cidr_ip".to_string(),
+            Value::String("10.0.0.0/8".to_string()),
+        ),
+        ("description".to_string(), Value::String("All".to_string())),
+        ("from_port".to_string(), Value::Int(-1)),
+        ("to_port".to_string(), Value::Int(-1)),
+    ]));
+
+    let desired = Resource::with_provider("awscc", "ec2.security_group", "test-sg").with_attribute(
+        "security_group_egress",
+        Value::List(vec![item_a.clone(), item_b.clone()]),
+    );
+    let current = State::existing(
+        ResourceId::with_provider("awscc", "ec2.security_group", "test-sg"),
+        HashMap::from([(
+            "security_group_egress".to_string(),
+            // AWS returns items in reversed order
+            Value::List(vec![item_b.clone(), item_a.clone()]),
+        )]),
+    );
+
+    // With ordered: true, differ falsely detects changes (reordered items)
+    let result = diff(&desired, &current, None, None, Some(&schema_ordered));
+    assert!(
+        matches!(result, Diff::Update { .. }),
+        "Expected false positive Update with ordered:true, got: {:?}",
+        result
+    );
+
+    // With ordered: false (unordered_list), differ correctly sees no change
+    let schema_unordered = ResourceSchema::new("awscc.ec2.security_group").attribute(
+        crate::schema::AttributeSchema::new(
+            "security_group_egress",
+            AttributeType::unordered_list(egress_struct),
+        ),
+    );
+    let result = diff(&desired, &current, None, None, Some(&schema_unordered));
+    assert!(
+        matches!(result, Diff::NoChange(_)),
+        "Expected NoChange with ordered:false, got: {:?}",
+        result
+    );
+}

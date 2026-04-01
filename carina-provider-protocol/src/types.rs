@@ -5,6 +5,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+fn default_true() -> bool {
+    true
+}
+
 /// Mirrors `carina_core::resource::ResourceId`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ResourceId {
@@ -164,6 +168,13 @@ pub struct AttributeSchema {
     pub write_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_name: Option<String>,
+    /// Provider-side property name (e.g., "VpcId" for AWS Cloud Control)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_name: Option<String>,
+    /// Override for removability detection.
+    /// `None` = auto-detect, `Some(false)` = explicitly non-removable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removable: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +191,10 @@ pub enum AttributeType {
     #[serde(rename = "list")]
     List {
         inner: Box<AttributeType>,
+        /// Whether list elements are ordered (positional comparison).
+        /// When false, elements are compared as multisets (order-insensitive).
+        #[serde(default = "default_true")]
+        ordered: bool,
     },
     #[serde(rename = "map")]
     Map {
@@ -205,6 +220,9 @@ pub struct StructField {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_name: Option<String>,
+    /// Provider-side property name (e.g., "IpProtocol" for AWS Cloud Control)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_name: Option<String>,
 }
 
 #[cfg(test)]
@@ -259,6 +277,7 @@ mod tests {
                 required: true,
                 description: None,
                 block_name: None,
+                provider_name: None,
             }],
         };
 
@@ -279,6 +298,7 @@ mod tests {
                         required: false,
                         description: None,
                         block_name: None,
+                        provider_name: None,
                     }],
                 },
                 AttributeType::String,
