@@ -149,3 +149,59 @@ where
 
     Err(ProviderError::new(timeout_msg).for_resource(id.clone()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_retryable_error_throttling() {
+        assert!(is_retryable_error("ThrottlingException: Rate exceeded"));
+        assert!(is_retryable_error("Throttling: request limit"));
+        assert!(is_retryable_error("Rate exceeded for API call"));
+        assert!(is_retryable_error("RequestLimitExceeded"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_service_errors() {
+        assert!(is_retryable_error("ServiceUnavailable: try again"));
+        assert!(is_retryable_error("InternalError occurred"));
+        assert!(is_retryable_error("InternalServerError"));
+        assert!(is_retryable_error("ServiceException: transient"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_non_retryable() {
+        assert!(!is_retryable_error("ValidationError: invalid parameter"));
+        assert!(!is_retryable_error("AccessDeniedException: not authorized"));
+        assert!(!is_retryable_error("ResourceNotFoundException: not found"));
+        assert!(!is_retryable_error("InvalidParameterValue"));
+    }
+
+    #[tokio::test]
+    async fn test_retry_aws_operation_succeeds_first_try() {
+        let result: Result<&str, String> =
+            retry_aws_operation("test op", 3, 1, || async { Ok("success") }).await;
+        assert_eq!(result.unwrap(), "success");
+    }
+
+    #[tokio::test]
+    async fn test_retry_aws_operation_non_retryable_fails_immediately() {
+        let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter = attempt_count.clone();
+        let result: Result<&str, String> = retry_aws_operation("test op", 3, 1, || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err("ValidationError: bad input".to_string())
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "should not retry non-retryable errors"
+        );
+    }
+}
