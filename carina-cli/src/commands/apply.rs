@@ -106,11 +106,12 @@ impl RefreshProgress {
 
 /// Create a `MultiProgress` for concurrent refresh spinners.
 ///
-/// Hides the draw target when stdout is not a terminal (e.g., in CI).
+/// Redirects the draw target to stderr when stdout is not a terminal (e.g., in CI),
+/// so that spinner animations are suppressed but `println` messages still appear.
 pub(crate) fn refresh_multi_progress() -> MultiProgress {
     let multi = MultiProgress::new();
     if !std::io::stdout().is_terminal() {
-        multi.set_draw_target(indicatif::ProgressDrawTarget::hidden());
+        multi.set_draw_target(indicatif::ProgressDrawTarget::stderr());
     }
     multi
 }
@@ -132,7 +133,7 @@ impl CliObserver {
     fn new(_plan: &Plan) -> Self {
         let multi = MultiProgress::new();
         if !std::io::stdout().is_terminal() {
-            multi.set_draw_target(indicatif::ProgressDrawTarget::hidden());
+            multi.set_draw_target(indicatif::ProgressDrawTarget::stderr());
         }
 
         Self {

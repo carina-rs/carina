@@ -379,7 +379,7 @@ async fn run_destroy_locked(
     // Set up multi-progress for concurrent spinners
     let multi = MultiProgress::new();
     if !std::io::stdout().is_terminal() {
-        multi.set_draw_target(indicatif::ProgressDrawTarget::hidden());
+        multi.set_draw_target(indicatif::ProgressDrawTarget::stderr());
     }
 
     // Map from resource index to its spinner (populated lazily on dispatch)
