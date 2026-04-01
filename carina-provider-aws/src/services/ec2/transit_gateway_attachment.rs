@@ -204,6 +204,7 @@ impl AwsProvider {
                     },
                 )
             },
+            60,
             "Timeout waiting for transit gateway attachment to become available",
             "Transit gateway attachment creation failed",
         )
@@ -243,6 +244,7 @@ impl AwsProvider {
                     },
                 )
             },
+            60,
             "Timeout waiting for transit gateway attachment to be deleted",
             "Transit gateway attachment deletion failed",
         )

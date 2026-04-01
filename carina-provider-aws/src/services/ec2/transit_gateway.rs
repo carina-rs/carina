@@ -224,6 +224,7 @@ impl AwsProvider {
                     },
                 )
             },
+            60,
             "Timeout waiting for transit gateway to become available",
             "Transit gateway creation failed",
         )
@@ -261,6 +262,7 @@ impl AwsProvider {
                     PollState::Gone
                 })
             },
+            60,
             "Timeout waiting for transit gateway to be deleted",
             "Transit gateway deletion failed",
         )

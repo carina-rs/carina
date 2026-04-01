@@ -4,7 +4,7 @@ use carina_core::provider::{ProviderError, ProviderResult};
 use carina_core::resource::{Resource, ResourceId, State, Value};
 
 use crate::AwsProvider;
-use crate::helpers::require_string_attr;
+use crate::helpers::{require_string_attr, retry_aws_operation};
 
 impl AwsProvider {
     /// Read an EC2 Security Group
@@ -77,19 +77,28 @@ impl AwsProvider {
         };
 
         // Create Security Group
-        let result = self
-            .ec2_client
-            .create_security_group()
-            .group_name(&group_name)
-            .description(&description)
-            .vpc_id(&vpc_id)
-            .send()
-            .await
-            .map_err(|e| {
-                ProviderError::new("Failed to create security group")
-                    .with_cause(e)
-                    .for_resource(resource.id.clone())
-            })?;
+        let ec2 = &self.ec2_client;
+        let rid = resource.id.clone();
+        let result = retry_aws_operation("create security group", 5, 5, || {
+            let rid = rid.clone();
+            let group_name = group_name.clone();
+            let description = description.clone();
+            let vpc_id = vpc_id.clone();
+            async move {
+                ec2.create_security_group()
+                    .group_name(&group_name)
+                    .description(&description)
+                    .vpc_id(&vpc_id)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        ProviderError::new("Failed to create security group")
+                            .with_cause(e)
+                            .for_resource(rid)
+                    })
+            }
+        })
+        .await?;
 
         let sg_id = result.group_id().ok_or_else(|| {
             ProviderError::new("Security Group created but no ID returned")

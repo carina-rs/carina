@@ -5,7 +5,7 @@ use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::utils::extract_enum_value;
 
 use crate::AwsProvider;
-use crate::helpers::require_string_attr;
+use crate::helpers::{require_string_attr, retry_aws_operation};
 
 impl AwsProvider {
     /// Read an EC2 VPC Endpoint
@@ -118,11 +118,19 @@ impl AwsProvider {
             req = req.policy_document(&json_str);
         }
 
-        let result = req.send().await.map_err(|e| {
-            ProviderError::new("Failed to create VPC endpoint")
-                .with_cause(e)
-                .for_resource(resource.id.clone())
-        })?;
+        let rid = resource.id.clone();
+        let result = retry_aws_operation("create VPC endpoint", 5, 5, || {
+            let req = req.clone();
+            let rid = rid.clone();
+            async move {
+                req.send().await.map_err(|e| {
+                    ProviderError::new("Failed to create VPC endpoint")
+                        .with_cause(e)
+                        .for_resource(rid)
+                })
+            }
+        })
+        .await?;
 
         let endpoint_id = result
             .vpc_endpoint()
