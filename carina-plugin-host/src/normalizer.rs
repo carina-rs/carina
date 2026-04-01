@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use carina_core::provider::{ProviderNormalizer, SavedAttrs};
-use carina_core::resource::{Expr, Resource, ResourceId, State, Value};
+use carina_core::resource::{Expr, Resource, ResourceId, State, Value, contains_resource_ref};
 use carina_core::schema::ResourceSchema;
 use carina_provider_protocol::methods;
 
@@ -46,18 +46,10 @@ impl ProviderNormalizer for ProcessProviderNormalizer {
                 for (core_res, proto_res) in resources.iter_mut().zip(result.resources.iter()) {
                     let resolved = convert::proto_to_core_value_map(&proto_res.attributes);
                     for (key, value) in resolved {
-                        // Only update attributes that were literal values.
-                        // Non-literal expressions (ResourceRef, Interpolation, etc.)
-                        // get corrupted during proto conversion and must be preserved.
+                        // Skip attributes containing unresolved references.
+                        // These get corrupted during proto conversion and must be preserved.
                         if let Some(Expr(v)) = core_res.attributes.get(&key)
-                            && matches!(
-                                v,
-                                Value::ResourceRef { .. }
-                                    | Value::Interpolation(_)
-                                    | Value::FunctionCall { .. }
-                                    | Value::Closure { .. }
-                                    | Value::Secret(_)
-                            )
+                            && contains_resource_ref(v)
                         {
                             continue;
                         }
