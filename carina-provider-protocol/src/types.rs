@@ -188,6 +188,10 @@ pub enum AttributeType {
         name: String,
         fields: Vec<StructField>,
     },
+    #[serde(rename = "union")]
+    Union {
+        members: Vec<AttributeType>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

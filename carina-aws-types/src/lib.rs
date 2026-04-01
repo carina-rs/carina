@@ -1662,6 +1662,88 @@ mod tests {
     }
 
     #[test]
+    fn iam_policy_document_principal_map_validates() {
+        let t = iam_policy_document();
+        // principal as a map: { service = "ec2.amazonaws.com" }
+        let doc_with_principal_map = Value::Map(
+            vec![
+                (
+                    "version".to_string(),
+                    Value::String("2012-10-17".to_string()),
+                ),
+                (
+                    "statement".to_string(),
+                    Value::List(vec![Value::Map(
+                        vec![
+                            ("effect".to_string(), Value::String("Allow".to_string())),
+                            (
+                                "principal".to_string(),
+                                Value::Map(
+                                    vec![(
+                                        "service".to_string(),
+                                        Value::String("ec2.amazonaws.com".to_string()),
+                                    )]
+                                    .into_iter()
+                                    .collect(),
+                                ),
+                            ),
+                            (
+                                "action".to_string(),
+                                Value::String("sts:AssumeRole".to_string()),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    )]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert!(
+            t.validate(&doc_with_principal_map).is_ok(),
+            "principal as map (struct) should be valid: {:?}",
+            t.validate(&doc_with_principal_map)
+        );
+    }
+
+    #[test]
+    fn iam_policy_document_principal_string_validates() {
+        let t = iam_policy_document();
+        // principal as a string: "*"
+        let doc_with_principal_string = Value::Map(
+            vec![
+                (
+                    "version".to_string(),
+                    Value::String("2012-10-17".to_string()),
+                ),
+                (
+                    "statement".to_string(),
+                    Value::List(vec![Value::Map(
+                        vec![
+                            ("effect".to_string(), Value::String("Allow".to_string())),
+                            ("principal".to_string(), Value::String("*".to_string())),
+                            (
+                                "action".to_string(),
+                                Value::String("sts:AssumeRole".to_string()),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    )]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert!(
+            t.validate(&doc_with_principal_string).is_ok(),
+            "principal as string should be valid: {:?}",
+            t.validate(&doc_with_principal_string)
+        );
+    }
+
+    #[test]
     fn transit_gateway_attachment_id_valid() {
         assert!(
             validate_prefixed_resource_id("tgw-attach-0123456789abcdef0", "tgw-attach").is_ok()

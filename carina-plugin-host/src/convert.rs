@@ -163,6 +163,9 @@ fn proto_to_core_attribute_type(t: &ProtoAttributeType) -> CoreAttributeType {
             name: name.clone(),
             fields: fields.iter().map(proto_to_core_struct_field).collect(),
         },
+        ProtoAttributeType::Union { members } => {
+            CoreAttributeType::Union(members.iter().map(proto_to_core_attribute_type).collect())
+        }
     }
 }
 
@@ -231,8 +234,9 @@ fn core_to_proto_attribute_type(t: &CoreAttributeType) -> ProtoAttributeType {
         },
         // Custom → base type: function pointers can't cross process boundary
         CoreAttributeType::Custom { base, .. } => core_to_proto_attribute_type(base),
-        // Union has no proto equivalent → best-effort String
-        CoreAttributeType::Union(_) => ProtoAttributeType::String,
+        CoreAttributeType::Union(members) => ProtoAttributeType::Union {
+            members: members.iter().map(core_to_proto_attribute_type).collect(),
+        },
     }
 }
 
@@ -315,6 +319,53 @@ mod tests {
         assert!(attr.required);
         assert!(attr.create_only);
         assert_eq!(attr.description, Some("CIDR block".into()));
+    }
+
+    #[test]
+    fn test_union_type_roundtrip() {
+        // Union types (e.g., IAM principal: Struct | String) must survive
+        // the core→proto→core roundtrip. Previously, Union was downgraded
+        // to String, causing "Type mismatch: expected String, got Map" errors
+        // when validating principal = { service = "ec2.amazonaws.com" }.
+        let core_type = CoreAttributeType::Union(vec![
+            CoreAttributeType::Struct {
+                name: "IamPolicyPrincipal".into(),
+                fields: vec![CoreStructField {
+                    name: "service".into(),
+                    field_type: CoreAttributeType::String,
+                    required: false,
+                    description: None,
+                    provider_name: None,
+                    block_name: None,
+                }],
+            },
+            CoreAttributeType::String,
+        ]);
+
+        let proto = core_to_proto_attribute_type(&core_type);
+        let back = proto_to_core_attribute_type(&proto);
+
+        // The roundtripped type must accept both String and Map values
+        let string_val = CoreValue::String("*".to_string());
+        let map_val = CoreValue::Map(
+            vec![(
+                "service".to_string(),
+                CoreValue::String("ec2.amazonaws.com".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        assert!(
+            back.validate(&string_val).is_ok(),
+            "Union roundtrip should accept String value, got: {:?}",
+            back.validate(&string_val)
+        );
+        assert!(
+            back.validate(&map_val).is_ok(),
+            "Union roundtrip should accept Map value (struct), got: {:?}",
+            back.validate(&map_val)
+        );
     }
 
     #[test]
