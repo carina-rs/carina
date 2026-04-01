@@ -500,7 +500,7 @@ async fn run_destroy_locked(
                     pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
                     pb.finish_with_message(msg);
                 } else {
-                    multi.println(format!("  {}", msg)).ok();
+                    eprintln!("  {}", msg);
                 }
                 skip_count += 1;
                 failed_bindings.insert(binding.clone());
@@ -599,7 +599,7 @@ async fn run_destroy_locked(
                     pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
                     pb.finish_with_message(msg);
                 } else {
-                    multi.println(format!("  {}", msg)).ok();
+                    eprintln!("  {}", msg);
                 }
                 skip_count += 1;
                 failed_bindings.insert(binding.clone());
@@ -666,7 +666,7 @@ async fn run_destroy_locked(
                         pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
                         pb.finish_with_message(msg);
                     } else {
-                        multi.println(format!("  {}", msg)).ok();
+                        eprintln!("  {}", msg);
                     }
                     let binding = &resource_info[idx].0;
                     failed_bindings.insert(binding.clone());
@@ -705,7 +705,7 @@ async fn run_destroy_locked(
                     pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
                     pb.finish_with_message(msg);
                 } else {
-                    multi.println(format!("  {}", msg)).ok();
+                    eprintln!("  {}", msg);
                 }
             };
 

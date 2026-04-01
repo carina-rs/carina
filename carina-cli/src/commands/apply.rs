@@ -223,14 +223,13 @@ impl ExecutionObserver for CliObserver {
                     reason,
                     counter
                 );
-                // Skipped effects may not have a spinner (they were never started),
-                // so print directly via multi.println().
+                // Skipped effects may not have a spinner (they were never started).
                 let mut bars = self.bars.lock().unwrap();
                 if let Some(pb) = bars.remove(&key) {
                     pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
                     pb.finish_with_message(msg);
                 } else {
-                    self.multi.println(format!("  {}", msg)).ok();
+                    eprintln!("  {}", msg);
                 }
             }
             ExecutionEvent::CascadeUpdateSucceeded { id } => {
