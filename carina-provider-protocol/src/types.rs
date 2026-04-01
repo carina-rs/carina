@@ -162,6 +162,8 @@ pub struct AttributeSchema {
     pub read_only: bool,
     #[serde(default)]
     pub write_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,6 +203,8 @@ pub struct StructField {
     pub required: bool,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_name: Option<String>,
 }
 
 #[cfg(test)]
@@ -254,6 +258,7 @@ mod tests {
                 field_type: AttributeType::Bool,
                 required: true,
                 description: None,
+                block_name: None,
             }],
         };
 
@@ -273,6 +278,7 @@ mod tests {
                         field_type: AttributeType::String,
                         required: false,
                         description: None,
+                        block_name: None,
                     }],
                 },
                 AttributeType::String,

@@ -176,7 +176,7 @@ fn proto_to_core_struct_field(f: &ProtoStructField) -> CoreStructField {
         required: f.required,
         description: f.description.clone(),
         provider_name: None,
-        block_name: None,
+        block_name: f.block_name.clone(),
     }
 }
 
@@ -192,7 +192,7 @@ fn proto_to_core_attribute_schema(a: &ProtoAttributeSchema) -> CoreAttributeSche
         create_only: a.create_only,
         read_only: a.read_only,
         removable: None,
-        block_name: None,
+        block_name: a.block_name.clone(),
         write_only: a.write_only,
     }
 }
@@ -246,6 +246,7 @@ fn core_to_proto_struct_field(f: &CoreStructField) -> ProtoStructField {
         field_type: core_to_proto_attribute_type(&f.field_type),
         required: f.required,
         description: f.description.clone(),
+        block_name: f.block_name.clone(),
     }
 }
 
@@ -259,6 +260,7 @@ fn core_to_proto_attribute_schema(a: &CoreAttributeSchema) -> ProtoAttributeSche
         create_only: a.create_only,
         read_only: a.read_only,
         write_only: a.write_only,
+        block_name: a.block_name.clone(),
     }
 }
 
@@ -389,6 +391,74 @@ mod tests {
             assert_eq!(name, "Tag");
             assert_eq!(fields.len(), 1);
             assert_eq!(fields[0].name, "key");
+        } else {
+            panic!("Expected Struct type");
+        }
+    }
+
+    #[test]
+    fn test_block_name_roundtrip_struct_field() {
+        // block_name on struct fields must survive core->proto->core roundtrip.
+        // Without this, block syntax (e.g., `rule { ... }` for `rules` field)
+        // fails with "Required attribute 'rules' is missing" because the CLI
+        // cannot resolve block names.
+        let core_schema = CoreResourceSchema {
+            resource_type: "s3.bucket".into(),
+            attributes: HashMap::from([(
+                "lifecycle_configuration".into(),
+                CoreAttributeSchema {
+                    name: "lifecycle_configuration".into(),
+                    attr_type: CoreAttributeType::Struct {
+                        name: "LifecycleConfiguration".into(),
+                        fields: vec![CoreStructField {
+                            name: "rules".into(),
+                            field_type: CoreAttributeType::list(CoreAttributeType::Struct {
+                                name: "Rule".into(),
+                                fields: vec![],
+                            }),
+                            required: true,
+                            description: None,
+                            provider_name: None,
+                            block_name: Some("rule".into()),
+                        }],
+                    },
+                    required: false,
+                    default: None,
+                    description: None,
+                    completions: None,
+                    provider_name: None,
+                    create_only: false,
+                    read_only: false,
+                    removable: None,
+                    block_name: Some("lifecycle_configuration".into()),
+                    write_only: false,
+                },
+            )]),
+            description: None,
+            validator: None,
+            data_source: false,
+            name_attribute: None,
+            force_replace: false,
+        };
+
+        let proto = core_to_proto_schema(&core_schema);
+        let back = proto_to_core_schema(&proto);
+
+        // Attribute-level block_name
+        let attr = &back.attributes["lifecycle_configuration"];
+        assert_eq!(
+            attr.block_name,
+            Some("lifecycle_configuration".into()),
+            "attribute-level block_name must survive roundtrip"
+        );
+
+        // Struct field-level block_name
+        if let CoreAttributeType::Struct { fields, .. } = &attr.attr_type {
+            assert_eq!(
+                fields[0].block_name,
+                Some("rule".into()),
+                "struct field block_name must survive roundtrip"
+            );
         } else {
             panic!("Expected Struct type");
         }
