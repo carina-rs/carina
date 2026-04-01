@@ -99,6 +99,7 @@ pub fn ec2_security_group_egress_config() -> AwsSchemaConfig {
                             "icmp".to_string(),
                             "icmpv6".to_string(),
                             "-1".to_string(),
+                            "all".to_string(),
                         ],
                         namespace: Some("aws.ec2.security_group_egress".to_string()),
                         to_dsl: Some(|s: &str| match s {

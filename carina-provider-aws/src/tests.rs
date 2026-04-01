@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use carina_core::resource::Value;
+use carina_core::schema::AttributeType;
 
 use crate::AwsProvider;
 
@@ -1187,4 +1188,48 @@ fn test_extract_ec2_egress_only_internet_gateway_attributes_minimal() {
     let identifier =
         AwsProvider::extract_ec2_egress_only_internet_gateway_attributes(&eigw, &mut attributes);
     assert_eq!(identifier, None);
+}
+
+// --- ip_protocol enum "all" variant tests (issue #1428) ---
+
+#[test]
+fn test_security_group_egress_schema_includes_all_variant() {
+    // The "all" value (alias for "-1") must be included in the StringEnum values
+    // so it is accepted even when to_dsl is lost during protocol serialization.
+    let config =
+        crate::schemas::generated::ec2::security_group_egress::ec2_security_group_egress_config();
+    let ip_protocol = config
+        .schema
+        .attributes
+        .get("ip_protocol")
+        .expect("ip_protocol attribute not found");
+    if let AttributeType::StringEnum { values, .. } = &ip_protocol.attr_type {
+        assert!(
+            values.contains(&"all".to_string()),
+            "StringEnum values must include 'all': {:?}",
+            values
+        );
+    } else {
+        panic!("ip_protocol should be StringEnum");
+    }
+}
+
+#[test]
+fn test_security_group_ingress_schema_includes_all_variant() {
+    let config =
+        crate::schemas::generated::ec2::security_group_ingress::ec2_security_group_ingress_config();
+    let ip_protocol = config
+        .schema
+        .attributes
+        .get("ip_protocol")
+        .expect("ip_protocol attribute not found");
+    if let AttributeType::StringEnum { values, .. } = &ip_protocol.attr_type {
+        assert!(
+            values.contains(&"all".to_string()),
+            "StringEnum values must include 'all': {:?}",
+            values
+        );
+    } else {
+        panic!("ip_protocol should be StringEnum");
+    }
 }

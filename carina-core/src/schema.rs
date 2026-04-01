@@ -1481,6 +1481,47 @@ mod tests {
     }
 
     #[test]
+    fn validate_string_enum_all_without_to_dsl_requires_explicit_variant() {
+        // When StringEnum goes through the protocol layer (external process
+        // providers), to_dsl and namespace are lost. Without "all" as a direct
+        // variant, it cannot be accepted (issue #1428).
+        let without_all = AttributeType::StringEnum {
+            name: String::new(),
+            values: vec![
+                "tcp".to_string(),
+                "udp".to_string(),
+                "icmp".to_string(),
+                "icmpv6".to_string(),
+                "-1".to_string(),
+            ],
+            namespace: None,
+            to_dsl: None,
+        };
+        // Without "all" in values and no to_dsl alias, "all" is rejected
+        assert!(
+            without_all
+                .validate(&Value::String("all".to_string()))
+                .is_err()
+        );
+
+        // With "all" added to values, it is accepted even without to_dsl
+        let with_all = AttributeType::StringEnum {
+            name: String::new(),
+            values: vec![
+                "tcp".to_string(),
+                "udp".to_string(),
+                "icmp".to_string(),
+                "icmpv6".to_string(),
+                "-1".to_string(),
+                "all".to_string(),
+            ],
+            namespace: None,
+            to_dsl: None,
+        };
+        assert!(with_all.validate(&Value::String("all".to_string())).is_ok());
+    }
+
+    #[test]
     fn validate_string_enum_accepts_values_with_dots() {
         // Values like "ipsec.1" contain dots that should not be treated as
         // namespace separators (issue #611)

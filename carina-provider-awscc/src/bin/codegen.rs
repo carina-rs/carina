@@ -2532,7 +2532,10 @@ fn generate_struct_type(
 fn known_enum_overrides() -> &'static HashMap<&'static str, Vec<&'static str>> {
     static OVERRIDES: LazyLock<HashMap<&'static str, Vec<&'static str>>> = LazyLock::new(|| {
         let mut m = HashMap::new();
-        m.insert("IpProtocol", vec!["tcp", "udp", "icmp", "icmpv6", "-1"]);
+        m.insert(
+            "IpProtocol",
+            vec!["tcp", "udp", "icmp", "icmpv6", "-1", "all"],
+        );
         m.insert("ConnectivityType", vec!["public", "private"]);
         m.insert("AvailabilityMode", vec!["zonal", "regional"]);
         m.insert("AddressFamily", vec!["IPv4", "IPv6"]);
@@ -4089,7 +4092,7 @@ mod tests {
         assert!(ip_protocol.is_some(), "IpProtocol should be in overrides");
         assert_eq!(
             ip_protocol.unwrap(),
-            &vec!["tcp", "udp", "icmp", "icmpv6", "-1"]
+            &vec!["tcp", "udp", "icmp", "icmpv6", "-1", "all"]
         );
 
         // ConnectivityType should be overridden
@@ -4150,7 +4153,10 @@ mod tests {
         );
         let info = enum_info.unwrap();
         assert_eq!(info.type_name, "IpProtocol");
-        assert_eq!(info.values, vec!["tcp", "udp", "icmp", "icmpv6", "-1"]);
+        assert_eq!(
+            info.values,
+            vec!["tcp", "udp", "icmp", "icmpv6", "-1", "all"]
+        );
     }
 
     #[test]

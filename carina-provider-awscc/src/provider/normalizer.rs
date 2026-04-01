@@ -584,4 +584,117 @@ mod tests {
             panic!("Expected List for security_group_egress");
         }
     }
+
+    // --- ip_protocol enum "all" variant tests (issue #1428) ---
+
+    #[test]
+    fn test_security_group_egress_schema_includes_all_variant() {
+        let config =
+            crate::schemas::generated::ec2::security_group_egress::ec2_security_group_egress_config(
+            );
+        let ip_protocol = config
+            .schema
+            .attributes
+            .get("ip_protocol")
+            .expect("ip_protocol attribute not found");
+        if let carina_core::schema::AttributeType::StringEnum { values, .. } =
+            &ip_protocol.attr_type
+        {
+            assert!(
+                values.contains(&"all".to_string()),
+                "StringEnum values must include 'all': {:?}",
+                values
+            );
+        } else {
+            panic!("ip_protocol should be StringEnum");
+        }
+    }
+
+    #[test]
+    fn test_security_group_ingress_schema_includes_all_variant() {
+        let config = crate::schemas::generated::ec2::security_group_ingress::ec2_security_group_ingress_config();
+        let ip_protocol = config
+            .schema
+            .attributes
+            .get("ip_protocol")
+            .expect("ip_protocol attribute not found");
+        if let carina_core::schema::AttributeType::StringEnum { values, .. } =
+            &ip_protocol.attr_type
+        {
+            assert!(
+                values.contains(&"all".to_string()),
+                "StringEnum values must include 'all': {:?}",
+                values
+            );
+        } else {
+            panic!("ip_protocol should be StringEnum");
+        }
+    }
+
+    #[test]
+    fn test_security_group_egress_struct_schema_includes_all_variant() {
+        let config = crate::schemas::generated::ec2::security_group::ec2_security_group_config();
+        let egress = config
+            .schema
+            .attributes
+            .get("security_group_egress")
+            .expect("security_group_egress attribute not found");
+        // Drill into List -> Struct -> ip_protocol field
+        if let carina_core::schema::AttributeType::List { inner, .. } = &egress.attr_type {
+            if let carina_core::schema::AttributeType::Struct { fields, .. } = inner.as_ref() {
+                let ip_field = fields
+                    .iter()
+                    .find(|f| f.name == "ip_protocol")
+                    .expect("ip_protocol field not found in egress struct");
+                if let carina_core::schema::AttributeType::StringEnum { values, .. } =
+                    &ip_field.field_type
+                {
+                    assert!(
+                        values.contains(&"all".to_string()),
+                        "StringEnum values must include 'all': {:?}",
+                        values
+                    );
+                } else {
+                    panic!("ip_protocol should be StringEnum");
+                }
+            } else {
+                panic!("Expected Struct inside List");
+            }
+        } else {
+            panic!("Expected List for security_group_egress");
+        }
+    }
+
+    #[test]
+    fn test_security_group_ingress_struct_schema_includes_all_variant() {
+        let config = crate::schemas::generated::ec2::security_group::ec2_security_group_config();
+        let ingress = config
+            .schema
+            .attributes
+            .get("security_group_ingress")
+            .expect("security_group_ingress attribute not found");
+        if let carina_core::schema::AttributeType::List { inner, .. } = &ingress.attr_type {
+            if let carina_core::schema::AttributeType::Struct { fields, .. } = inner.as_ref() {
+                let ip_field = fields
+                    .iter()
+                    .find(|f| f.name == "ip_protocol")
+                    .expect("ip_protocol field not found in ingress struct");
+                if let carina_core::schema::AttributeType::StringEnum { values, .. } =
+                    &ip_field.field_type
+                {
+                    assert!(
+                        values.contains(&"all".to_string()),
+                        "StringEnum values must include 'all': {:?}",
+                        values
+                    );
+                } else {
+                    panic!("ip_protocol should be StringEnum");
+                }
+            } else {
+                panic!("Expected Struct inside List");
+            }
+        } else {
+            panic!("Expected List for security_group_ingress");
+        }
+    }
 }
