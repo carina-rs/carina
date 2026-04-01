@@ -698,12 +698,18 @@ async fn run_destroy_locked(
         let counter = format!("{}/{}", c, destroy_total).dimmed();
         let effect = &resource_info[finished_idx].2;
 
-        // Helper to finish the spinner for the completed effect
+        // Helper to finish the spinner for the completed effect.
+        // Always prints via eprintln when stdout is not a terminal,
+        // because indicatif suppresses spinner output in non-terminal contexts.
+        let is_terminal = std::io::stdout().is_terminal();
         let finish_spinner =
             |spinners: &mut HashMap<usize, ProgressBar>, idx: usize, msg: String| {
                 if let Some(pb) = spinners.remove(&idx) {
                     pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
-                    pb.finish_with_message(msg);
+                    pb.finish_with_message(msg.clone());
+                    if !is_terminal {
+                        eprintln!("  {}", msg);
+                    }
                 } else {
                     eprintln!("  {}", msg);
                 }
@@ -777,13 +783,11 @@ async fn run_destroy_locked(
 
     // Handle any remaining timed-out resources that no parent waited on
     for (dep_binding, (dep_id, dep_identifier)) in &timed_out_resources {
-        multi
-            .println(format!(
-                "  {} Waiting for {} to be deleted...",
-                "⏳".yellow(),
-                dep_id
-            ))
-            .ok();
+        eprintln!(
+            "  {} Waiting for {} to be deleted...",
+            "⏳".yellow(),
+            dep_id
+        );
 
         match wait_for_deletion(
             &provider,
@@ -795,41 +799,31 @@ async fn run_destroy_locked(
         .await
         {
             WaitResult::Deleted => {
-                multi
-                    .println(format!(
-                        "  {} Delete {} (completed after extended wait)",
-                        "✓".green(),
-                        dep_id
-                    ))
-                    .ok();
+                eprintln!(
+                    "  {} Delete {} (completed after extended wait)",
+                    "✓".green(),
+                    dep_id
+                );
                 destroyed_ids.push(dep_id.clone());
                 success_count += 1;
             }
             WaitResult::ReadError(msg) => {
-                multi
-                    .println(format!("  {} Delete {}", "✗".red(), dep_id))
-                    .ok();
-                multi
-                    .println(format!(
-                        "      {} {}",
-                        "→".red(),
-                        format!("read error during wait: {}", msg).red()
-                    ))
-                    .ok();
+                eprintln!("  {} Delete {}", "✗".red(), dep_id);
+                eprintln!(
+                    "      {} {}",
+                    "→".red(),
+                    format!("read error during wait: {}", msg).red()
+                );
                 failed_bindings.insert(dep_binding.clone());
                 failure_count += 1;
             }
             WaitResult::TimedOut => {
-                multi
-                    .println(format!("  {} Delete {}", "✗".red(), dep_id))
-                    .ok();
-                multi
-                    .println(format!(
-                        "      {} {}",
-                        "→".red(),
-                        "still exists after extended wait".red()
-                    ))
-                    .ok();
+                eprintln!("  {} Delete {}", "✗".red(), dep_id);
+                eprintln!(
+                    "      {} {}",
+                    "→".red(),
+                    "still exists after extended wait".red()
+                );
                 failed_bindings.insert(dep_binding.clone());
                 failure_count += 1;
             }
