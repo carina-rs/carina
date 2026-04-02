@@ -41,11 +41,7 @@ pub fn run_lint(path: &PathBuf, provider_context: &ProviderContext) -> Result<()
     let schemas = ctx.schemas();
 
     // Collect source texts for each .crn file
-    let source_texts: Vec<(PathBuf, String)> = if path.is_file() {
-        let content = fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-        vec![(path.clone(), content)]
-    } else if path.is_dir() {
+    let source_texts: Vec<(PathBuf, String)> = {
         let files = find_crn_files_in_dir(path)?;
         let mut texts = Vec::new();
         for file in files {
@@ -54,11 +50,6 @@ pub fn run_lint(path: &PathBuf, provider_context: &ProviderContext) -> Result<()
             texts.push((file, content));
         }
         texts
-    } else {
-        return Err(AppError::Config(format!(
-            "Path not found: {}",
-            path.display()
-        )));
     };
 
     // Collect all List<Struct> attribute names from schemas of parsed resources

@@ -23,9 +23,14 @@ pub fn run_fmt(
     let ctx = WiringContext::new(vec![]);
     let block_names = collect_all_block_names(ctx.schemas());
 
-    let files = if path.is_file() {
-        vec![path.clone()]
-    } else if recursive {
+    if path.is_file() {
+        return Err(AppError::Config(format!(
+            "expected directory, got file: {}",
+            path.display()
+        )));
+    }
+
+    let files = if recursive {
         find_crn_files_recursive(path)?
     } else {
         find_crn_files_in_dir(path)?

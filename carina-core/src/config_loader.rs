@@ -16,35 +16,20 @@ pub struct LoadedConfig {
     pub backend_file: Option<PathBuf>,
 }
 
-/// Load configuration from a file or directory
+/// Load configuration from a directory containing .crn files
 pub fn load_configuration(path: &PathBuf) -> Result<LoadedConfig, String> {
     load_configuration_with_config(path, &ProviderContext::default())
 }
 
-/// Load configuration from a file or directory with the given parser configuration.
+/// Load configuration from a directory containing .crn files.
+///
+/// File paths are rejected — pass a directory instead.
 pub fn load_configuration_with_config(
     path: &PathBuf,
     config: &ProviderContext,
 ) -> Result<LoadedConfig, String> {
     if path.is_file() {
-        // Single file mode (existing behavior)
-        let content = fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-        let mut parsed =
-            parser::parse(&content, config).map_err(|e| format!("Parse error: {}", e))?;
-        let unresolved_parsed = parsed.clone();
-        parser::resolve_resource_refs_with_config(&mut parsed, config)
-            .map_err(|e| format!("Parse error: {}", e))?;
-        let backend_file = if parsed.backend.is_some() {
-            Some(path.clone())
-        } else {
-            None
-        };
-        Ok(LoadedConfig {
-            parsed,
-            unresolved_parsed,
-            backend_file,
-        })
+        Err(format!("expected directory, got file: {}", path.display()))
     } else if path.is_dir() {
         // Directory mode
         let files = find_crn_files_in_dir(path)?;
@@ -155,13 +140,12 @@ pub fn load_configuration_with_config(
     }
 }
 
-/// Get base directory for module resolution
+/// Get base directory for module resolution.
+///
+/// Since paths are now always directories, this returns the path as-is.
+/// Kept for backward compatibility with callers.
 pub fn get_base_dir(path: &Path) -> &Path {
-    if path.is_file() {
-        path.parent().unwrap_or(Path::new("."))
-    } else {
-        path
-    }
+    path
 }
 
 /// Find all .crn files recursively in a directory, skipping hidden dirs, target, and node_modules
@@ -380,12 +364,10 @@ mod tests {
     // ========== get_base_dir tests ==========
 
     #[test]
-    fn get_base_dir_for_file() {
-        let dir = create_temp_dir("base_dir_file");
-        let file = dir.join("test.crn");
-        fs::write(&file, "").unwrap();
+    fn get_base_dir_returns_path_as_is() {
+        let dir = create_temp_dir("base_dir_as_is");
 
-        let base = get_base_dir(&file);
+        let base = get_base_dir(&dir);
         assert_eq!(base, dir.as_path());
         cleanup(&dir);
     }
@@ -410,11 +392,10 @@ mod tests {
     // ========== load_configuration tests ==========
 
     #[test]
-    fn load_configuration_single_file() {
-        let dir = create_temp_dir("load_single_file");
-        let file = dir.join("test.crn");
+    fn load_configuration_directory_with_provider() {
+        let dir = create_temp_dir("load_dir_provider");
         fs::write(
-            &file,
+            dir.join("test.crn"),
             r#"provider aws {
     region = aws.Region.ap_northeast_1
 }
@@ -422,18 +403,17 @@ mod tests {
         )
         .unwrap();
 
-        let config = load_configuration(&file).unwrap();
+        let config = load_configuration(&dir).unwrap();
         assert_eq!(config.parsed.providers.len(), 1);
         assert!(config.backend_file.is_none());
         cleanup(&dir);
     }
 
     #[test]
-    fn load_configuration_single_file_with_backend() {
-        let dir = create_temp_dir("load_single_backend");
-        let file = dir.join("test.crn");
+    fn load_configuration_directory_with_backend() {
+        let dir = create_temp_dir("load_dir_backend");
         fs::write(
-            &file,
+            dir.join("test.crn"),
             r#"backend s3 {
     bucket = "my-bucket"
     key    = "state.json"
@@ -443,9 +423,9 @@ mod tests {
         )
         .unwrap();
 
-        let config = load_configuration(&file).unwrap();
+        let config = load_configuration(&dir).unwrap();
         assert!(config.parsed.backend.is_some());
-        assert_eq!(config.backend_file.unwrap(), file);
+        assert!(config.backend_file.is_some());
         cleanup(&dir);
     }
 
@@ -546,22 +526,8 @@ mod tests {
     }
 
     #[test]
-    fn load_configuration_single_file_with_parse_error() {
-        let dir = create_temp_dir("load_file_parse_error");
-        let file = dir.join("bad.crn");
-        fs::write(&file, "this is not valid crn syntax {{{").unwrap();
-
-        let result = load_configuration(&file);
-        match result {
-            Err(e) => assert!(e.contains("Parse error"), "unexpected error: {}", e),
-            Ok(_) => panic!("expected parse error"),
-        }
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn load_configuration_preserves_unresolved_parsed() {
-        let dir = create_temp_dir("load_unresolved");
+    fn load_configuration_rejects_file_path() {
+        let dir = create_temp_dir("load_rejects_file");
         let file = dir.join("test.crn");
         fs::write(
             &file,
@@ -572,7 +538,49 @@ mod tests {
         )
         .unwrap();
 
-        let config = load_configuration(&file).unwrap();
+        let result = load_configuration(&file);
+        match result {
+            Err(e) => assert!(
+                e.contains("expected directory, got file"),
+                "unexpected error: {}",
+                e
+            ),
+            Ok(_) => panic!("expected error for file path"),
+        }
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn load_configuration_file_path_rejected_even_with_bad_content() {
+        let dir = create_temp_dir("load_file_parse_error");
+        let file = dir.join("bad.crn");
+        fs::write(&file, "this is not valid crn syntax {{{").unwrap();
+
+        let result = load_configuration(&file);
+        match result {
+            Err(e) => assert!(
+                e.contains("expected directory, got file"),
+                "unexpected error: {}",
+                e
+            ),
+            Ok(_) => panic!("expected error for file path"),
+        }
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn load_configuration_preserves_unresolved_parsed() {
+        let dir = create_temp_dir("load_unresolved");
+        fs::write(
+            dir.join("test.crn"),
+            r#"provider aws {
+    region = aws.Region.ap_northeast_1
+}
+"#,
+        )
+        .unwrap();
+
+        let config = load_configuration(&dir).unwrap();
         // unresolved_parsed should also have the provider
         assert_eq!(config.unresolved_parsed.providers.len(), 1);
         cleanup(&dir);

@@ -52,8 +52,8 @@ fn build_plan_and_states_from_fixture(
     HashMap<ResourceId, ResourceId>,
 ) {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let crn_path = PathBuf::from(format!(
-        "{}/tests/fixtures/plan_display/{}/main.crn",
+    let fixture_path = PathBuf::from(format!(
+        "{}/tests/fixtures/plan_display/{}",
         manifest_dir, fixture_dir
     ));
     let state_path = PathBuf::from(format!(
@@ -62,8 +62,8 @@ fn build_plan_and_states_from_fixture(
     ));
 
     // Parse configuration
-    let mut parsed = load_configuration(&crn_path).unwrap().parsed;
-    let base_dir = get_base_dir(&crn_path);
+    let mut parsed = load_configuration(&fixture_path).unwrap().parsed;
+    let base_dir = get_base_dir(&fixture_path);
     validate_and_resolve(&mut parsed, base_dir, true).unwrap();
 
     // Load state file if present
@@ -537,12 +537,13 @@ fn no_unused_let_bindings_in_fixtures() {
             continue;
         }
         let fixture_name = entry.file_name().to_string_lossy().to_string();
-        let crn_path = PathBuf::from(format!("{}/{}/main.crn", fixtures_dir, fixture_name));
+        let fixture_dir = PathBuf::from(format!("{}/{}", fixtures_dir, fixture_name));
+        let crn_path = fixture_dir.join("main.crn");
         if !crn_path.exists() {
             continue;
         }
 
-        let loaded = load_configuration(&crn_path).unwrap();
+        let loaded = load_configuration(&fixture_dir).unwrap();
         let unused = crate::wiring::check_unused_bindings(&loaded.unresolved_parsed);
         if !unused.is_empty() {
             failures.push((fixture_name, unused));

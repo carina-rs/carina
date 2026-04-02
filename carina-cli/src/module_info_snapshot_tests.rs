@@ -29,16 +29,17 @@ fn module_info_output(fixture_name: &str) -> String {
     strip_ansi(&signature.display())
 }
 
-/// Helper: load a single .crn file fixture and return the stripped display output.
-fn module_info_file_output(fixture_name: &str) -> String {
+/// Helper: load a fixture directory for root config and return the stripped display output.
+fn module_info_dir_output(fixture_name: &str) -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let file_path = PathBuf::from(format!(
-        "{}/tests/fixtures/module_info/{}/main.crn",
+    let dir_path = PathBuf::from(format!(
+        "{}/tests/fixtures/module_info/{}",
         manifest_dir, fixture_name
     ));
 
-    let parsed = module_resolver::get_parsed_file(&file_path).expect("failed to load fixture file");
-    let module_name = module_resolver::derive_module_name(&file_path);
+    let parsed =
+        module_resolver::load_module_from_directory(&dir_path).expect("failed to load fixture dir");
+    let module_name = module_resolver::derive_module_name(&dir_path);
     let signature = FileSignature::from_parsed_file_with_name(&parsed, &module_name);
     strip_ansi(&signature.display())
 }
@@ -78,6 +79,6 @@ fn snapshot_module_info_empty_module() {
 /// Verifies the RootConfig display format (File: header, IMPORTS section, dependency tree).
 #[test]
 fn snapshot_module_info_root_config() {
-    let display = module_info_file_output("root_config");
+    let display = module_info_dir_output("root_config");
     insta::assert_snapshot!(display);
 }

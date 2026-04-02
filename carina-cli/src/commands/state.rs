@@ -114,13 +114,13 @@ pub enum StateCommands {
         #[arg(long)]
         force: bool,
 
-        /// Path to .crn file or directory containing backend configuration
+        /// Path to directory containing backend configuration
         #[arg(default_value = ".")]
         path: PathBuf,
     },
     /// Refresh state from cloud providers without planning or applying
     Refresh {
-        /// Path to .crn file or directory
+        /// Path to directory containing .crn files
         #[arg(default_value = ".")]
         path: PathBuf,
 
@@ -130,7 +130,7 @@ pub enum StateCommands {
     },
     /// List all managed resources from the state file
     List {
-        /// Path to .crn file or directory
+        /// Path to directory containing .crn files
         #[arg(default_value = ".")]
         path: PathBuf,
     },
@@ -140,7 +140,7 @@ pub enum StateCommands {
         #[arg(add = ArgValueCompleter::new(complete_state_lookup))]
         query: String,
 
-        /// Path to .crn file or directory
+        /// Path to directory containing .crn files
         #[arg(default_value = ".")]
         path: PathBuf,
 
@@ -150,7 +150,7 @@ pub enum StateCommands {
     },
     /// Show all managed resources with full attributes
     Show {
-        /// Path to .crn file or directory
+        /// Path to directory containing .crn files
         #[arg(default_value = ".")]
         path: PathBuf,
 
