@@ -3,24 +3,10 @@ title: "aws.ec2.vpc"
 description: "AWS EC2 vpc resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::VPC`
 
 Describes a VPC.
-
-## Example
-
-```crn
-let vpc = aws.ec2.vpc {
-  cidr_block           = "10.0.0.0/16"
-  enable_dns_support   = true
-  enable_dns_hostnames = true
-  instance_tenancy     = aws.ec2.vpc.InstanceTenancy.default
-
-  tags = {
-    Environment = "example"
-  }
-}
-```
 
 ## Argument Reference
 

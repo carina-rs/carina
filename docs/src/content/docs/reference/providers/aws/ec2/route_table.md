@@ -3,29 +3,10 @@ title: "aws.ec2.route_table"
 description: "AWS EC2 route_table resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::RouteTable`
 
 Describes a route table.
-
-## Example
-
-```crn
-let vpc = aws.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
-
-  tags = {
-    Environment = "example"
-  }
-}
-
-let rt = aws.ec2.route_table {
-  vpc_id = vpc.vpc_id
-
-  tags = {
-    Environment = "example"
-  }
-}
-```
 
 ## Argument Reference
 

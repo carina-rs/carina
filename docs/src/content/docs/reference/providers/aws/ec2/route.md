@@ -3,43 +3,10 @@ title: "aws.ec2.route"
 description: "AWS EC2 route resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::Route`
 
 Describes a route in a route table.
-
-## Example
-
-```crn
-let vpc = aws.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
-
-  tags = {
-    Environment = "example"
-  }
-}
-
-let igw = aws.ec2.internet_gateway {
-  vpc_id = vpc.vpc_id
-
-  tags = {
-    Environment = "example"
-  }
-}
-
-let rt = aws.ec2.route_table {
-  vpc_id = vpc.vpc_id
-
-  tags = {
-    Environment = "example"
-  }
-}
-
-let route = aws.ec2.route {
-  route_table_id         = rt.route_table_id
-  destination_cidr_block = "0.0.0.0/0"
-  gateway_id             = igw.internet_gateway_id
-}
-```
 
 ## Argument Reference
 

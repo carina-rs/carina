@@ -3,40 +3,10 @@ title: "aws.ec2.security_group_egress"
 description: "AWS EC2 security_group_egress resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::SecurityGroupEgress`
 
 Describes a security group rule.
-
-## Example
-
-```crn
-let vpc = aws.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
-
-  tags = {
-    Environment = "example"
-  }
-}
-
-let sg = aws.ec2.security_group {
-  group_name  = "carina-example-sg-egress"
-  description = "SG for egress rule example"
-  vpc_id      = vpc.vpc_id
-
-  tags = {
-    Environment = "example"
-  }
-}
-
-let egress = aws.ec2.security_group_egress {
-  group_id    = sg.group_id
-  description = "Allow HTTPS outbound"
-  ip_protocol = tcp
-  from_port   = 443
-  to_port     = 443
-  cidr_ip     = "0.0.0.0/0"
-}
-```
 
 ## Argument Reference
 
@@ -128,6 +98,7 @@ The ID of the destination security group.
 | `icmp` | `aws.ec2.security_group_egress.IpProtocol.icmp` |
 | `icmpv6` | `aws.ec2.security_group_egress.IpProtocol.icmpv6` |
 | `-1` | `aws.ec2.security_group_egress.IpProtocol.all` |
+| `all` | `aws.ec2.security_group_egress.IpProtocol.all` |
 
 Shorthand formats: `tcp` or `IpProtocol.tcp`
 
