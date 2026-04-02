@@ -13,11 +13,15 @@ use crate::process::ProviderProcess;
 
 pub struct ProcessProviderNormalizer {
     process: Arc<Mutex<ProviderProcess>>,
+    capabilities: Vec<String>,
 }
 
 impl ProcessProviderNormalizer {
-    pub fn new(process: Arc<Mutex<ProviderProcess>>) -> Self {
-        Self { process }
+    pub fn new(process: Arc<Mutex<ProviderProcess>>, capabilities: Vec<String>) -> Self {
+        Self {
+            process,
+            capabilities,
+        }
     }
 
     fn lock_process(&self) -> Result<MutexGuard<'_, ProviderProcess>, ()> {
@@ -25,10 +29,17 @@ impl ProcessProviderNormalizer {
             log::error!("Process lock poisoned: {e}");
         })
     }
+
+    fn has_capability(&self, cap: &str) -> bool {
+        self.capabilities.iter().any(|c| c == cap)
+    }
 }
 
 impl ProviderNormalizer for ProcessProviderNormalizer {
     fn normalize_desired(&self, resources: &mut [Resource]) {
+        if !self.has_capability("normalize_desired") {
+            return;
+        }
         let proto_resources: Vec<_> = resources
             .iter()
             .map(convert::core_to_proto_resource)
@@ -62,6 +73,9 @@ impl ProviderNormalizer for ProcessProviderNormalizer {
     }
 
     fn normalize_state(&self, current_states: &mut HashMap<ResourceId, State>) {
+        if !self.has_capability("normalize_state") {
+            return;
+        }
         let proto_states: HashMap<String, _> = current_states
             .iter()
             .map(|(id, state)| (id.to_string(), convert::core_to_proto_state(state)))
@@ -94,6 +108,9 @@ impl ProviderNormalizer for ProcessProviderNormalizer {
         current_states: &mut HashMap<ResourceId, State>,
         saved_attrs: &SavedAttrs,
     ) {
+        if !self.has_capability("hydrate_read_state") {
+            return;
+        }
         let proto_states: HashMap<String, _> = current_states
             .iter()
             .map(|(id, state)| (id.to_string(), convert::core_to_proto_state(state)))
@@ -133,6 +150,9 @@ impl ProviderNormalizer for ProcessProviderNormalizer {
         default_tags: &HashMap<String, Value>,
         schemas: &HashMap<String, ResourceSchema>,
     ) {
+        if !self.has_capability("merge_default_tags") {
+            return;
+        }
         let proto_resources: Vec<_> = resources
             .iter()
             .map(convert::core_to_proto_resource)

@@ -21,6 +21,7 @@ pub struct ProcessProviderFactory {
     schemas: Vec<ResourceSchema>,
     name_static: &'static str,
     display_name_static: &'static str,
+    capabilities: Vec<String>,
 }
 
 impl ProcessProviderFactory {
@@ -44,6 +45,7 @@ impl ProcessProviderFactory {
         let name_static: &'static str = Box::leak(info_result.info.name.clone().into_boxed_str());
         let display_name_static: &'static str =
             Box::leak(info_result.info.display_name.clone().into_boxed_str());
+        let capabilities = info_result.info.capabilities.clone();
 
         process.shutdown();
 
@@ -53,6 +55,7 @@ impl ProcessProviderFactory {
             schemas,
             name_static,
             display_name_static,
+            capabilities,
         })
     }
 
@@ -119,10 +122,13 @@ impl ProviderFactory for ProcessProviderFactory {
         attributes: &HashMap<String, Value>,
     ) -> BoxFuture<'_, Option<Box<dyn ProviderNormalizer>>> {
         let attrs = attributes.clone();
+        let capabilities = self.capabilities.clone();
         Box::pin(async move {
             match self.spawn_and_initialize(&attrs) {
-                Ok(process) => Some(Box::new(ProcessProviderNormalizer::new(process))
-                    as Box<dyn ProviderNormalizer>),
+                Ok(process) => Some(
+                    Box::new(ProcessProviderNormalizer::new(process, capabilities))
+                        as Box<dyn ProviderNormalizer>,
+                ),
                 Err(e) => {
                     log::error!("Failed to spawn normalizer process: {e}");
                     None
