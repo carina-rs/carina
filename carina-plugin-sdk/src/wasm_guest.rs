@@ -128,16 +128,27 @@ pub fn proto_attr_type_to_json(t: &proto::AttributeType) -> AttrTypeJson {
 ///
 /// Usage:
 /// ```ignore
+/// // Non-HTTP provider (e.g., MockProvider)
 /// #[cfg(target_arch = "wasm32")]
 /// carina_plugin_sdk::export_provider!(MyProvider);
+///
+/// // HTTP-capable provider (e.g., AWS provider)
+/// #[cfg(target_arch = "wasm32")]
+/// carina_plugin_sdk::export_provider!(MyProvider, http);
 /// ```
 #[macro_export]
 macro_rules! export_provider {
     ($provider_type:ty) => {
+        $crate::export_provider!(@internal $provider_type, "carina-provider");
+    };
+    ($provider_type:ty, http) => {
+        $crate::export_provider!(@internal $provider_type, "carina-provider-with-http");
+    };
+    (@internal $provider_type:ty, $world:literal) => {
         mod __carina_wasm_guest {
             wit_bindgen::generate!({
                 path: "../carina-plugin-wit/wit",
-                world: "carina-provider",
+                world: $world,
             });
 
             use super::*;
