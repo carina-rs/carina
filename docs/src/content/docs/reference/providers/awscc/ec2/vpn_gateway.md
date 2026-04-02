@@ -3,6 +3,7 @@ title: "awscc.ec2.vpn_gateway"
 description: "AWSCC EC2 vpn_gateway resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::VPNGateway`
 
 Specifies a virtual private gateway. A virtual private gateway is the endpoint on the VPC side of your VPN connection. You can create a virtual private gateway before creating the VPC itself.
@@ -50,7 +51,6 @@ The type of VPN connection the virtual private gateway supports.
 ### `vpn_gateway_id`
 
 - **Type:** VpnGatewayId
-
 
 
 

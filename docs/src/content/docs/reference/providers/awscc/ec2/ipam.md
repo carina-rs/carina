@@ -3,6 +3,7 @@ title: "awscc.ec2.ipam"
 description: "AWSCC EC2 ipam resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::IPAM`
 
 Resource Schema of AWS::EC2::IPAM Type
@@ -156,5 +157,4 @@ The count of resource discoveries associated with this IPAM.
 - **Type:** Int
 
 The number of scopes that currently exist in this IPAM.
-
 

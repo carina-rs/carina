@@ -3,6 +3,7 @@ title: "awscc.ec2.vpc_endpoint"
 description: "AWSCC EC2 vpc_endpoint resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::VPCEndpoint`
 
 Specifies a VPC endpoint. A VPC endpoint provides a private connection between your VPC and an endpoint service. You can use an endpoint service provided by AWS, an MKT Partner, or another AWS accounts in your organization. For more information, see the [User Guide](https://docs.aws.amazon.com/vpc/latest/privatelink/).
@@ -247,7 +248,6 @@ Shorthand formats: `Interface` or `VpcEndpointType.Interface`
 ### `network_interface_ids`
 
 - **Type:** `List<NetworkInterfaceId>`
-
 
 
 

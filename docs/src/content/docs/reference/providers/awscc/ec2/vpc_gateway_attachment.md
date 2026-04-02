@@ -3,6 +3,7 @@ title: "awscc.ec2.vpc_gateway_attachment"
 description: "AWSCC EC2 vpc_gateway_attachment resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::VPCGatewayAttachment`
 
 Resource Type definition for AWS::EC2::VPCGatewayAttachment
@@ -55,5 +56,4 @@ The ID of the virtual private gateway. You must specify either InternetGatewayId
 - **Type:** String
 
 Used to identify if this resource is an Internet Gateway or Vpn Gateway Attachment 
-
 

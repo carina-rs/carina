@@ -3,6 +3,7 @@ title: "awscc.ec2.eip"
 description: "AWSCC EC2 eip resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::EIP`
 
 Specifies an Elastic IP (EIP) address and can, optionally, associate it with an Amazon EC2 instance.
@@ -108,7 +109,6 @@ Shorthand formats: `vpc` or `Domain.vpc`
 ### `public_ip`
 
 - **Type:** Ipv4Address
-
 
 
 

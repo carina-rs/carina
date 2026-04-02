@@ -3,6 +3,7 @@ title: "awscc.ec2.route"
 description: "AWSCC EC2 route resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::Route`
 
 Specifies a route in a route table. For more information, see [Routes](https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Route_Tables.html#route-table-routes) in the *Amazon VPC User Guide*.
@@ -152,7 +153,6 @@ The ID of a VPC peering connection.
 ### `cidr_block`
 
 - **Type:** Ipv4Cidr
-
 
 
 

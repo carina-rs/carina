@@ -3,6 +3,7 @@ title: "awscc.ec2.route_table"
 description: "AWSCC EC2 route_table resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::RouteTable`
 
 Specifies a route table for the specified VPC. After you create a route table, you can add routes and associate the table with a subnet.
@@ -48,7 +49,6 @@ The ID of the VPC.
 ### `route_table_id`
 
 - **Type:** RouteTableId
-
 
 
 

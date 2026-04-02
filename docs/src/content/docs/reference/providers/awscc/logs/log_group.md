@@ -1,7 +1,8 @@
 ---
 title: "awscc.logs.log_group"
-description: "AWSCC Logs log_group resource reference"
+description: "AWSCC LOGS log_group resource reference"
 ---
+
 
 CloudFormation Type: `AWS::Logs::LogGroup`
 
@@ -109,7 +110,6 @@ Shorthand formats: `STANDARD` or `LogGroupClass.STANDARD`
 ### `arn`
 
 - **Type:** Arn
-
 
 
 

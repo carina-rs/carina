@@ -3,6 +3,7 @@ title: "awscc.ec2.security_group_ingress"
 description: "AWSCC EC2 security_group_ingress resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::SecurityGroupIngress`
 
 Resource Type definition for AWS::EC2::SecurityGroupIngress
@@ -137,6 +138,7 @@ The end of port range for the TCP and UDP protocols, or an ICMP/ICMPv6 code. A v
 | `icmp` | `awscc.ec2.security_group_ingress.IpProtocol.icmp` |
 | `icmpv6` | `awscc.ec2.security_group_ingress.IpProtocol.icmpv6` |
 | `-1` | `awscc.ec2.security_group_ingress.IpProtocol.all` |
+| `all` | `awscc.ec2.security_group_ingress.IpProtocol.all` |
 
 Shorthand formats: `tcp` or `IpProtocol.tcp`
 
@@ -147,5 +149,4 @@ Shorthand formats: `tcp` or `IpProtocol.tcp`
 - **Type:** String
 
 The Security Group Rule Id
-
 
