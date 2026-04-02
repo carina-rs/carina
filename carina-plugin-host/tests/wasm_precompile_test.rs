@@ -33,8 +33,8 @@ macro_rules! skip_if_no_wasm {
     };
 }
 
-#[test]
-fn test_precompile_cache_creation() {
+#[tokio::test]
+async fn test_precompile_cache_creation() {
     let wasm = skip_if_no_wasm!();
     let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let cwasm_path = cache_dir.path().join("carina_provider_mock.cwasm");
@@ -47,18 +47,20 @@ fn test_precompile_cache_creation() {
 
     // Load from precompiled and verify the factory works
     let factory = WasmProviderFactory::from_precompiled(&cwasm_path)
+        .await
         .expect("from_precompiled should succeed");
 
     assert_eq!(factory.name(), "mock");
 }
 
-#[test]
-fn test_from_file_cached_creates_cache() {
+#[tokio::test]
+async fn test_from_file_cached_creates_cache() {
     let wasm = skip_if_no_wasm!();
     let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
 
     // First call: no cache exists, should compile and cache
     let factory = WasmProviderFactory::from_file_cached(&wasm, cache_dir.path())
+        .await
         .expect("from_file_cached should succeed");
 
     assert_eq!(factory.name(), "mock");
@@ -72,18 +74,20 @@ fn test_from_file_cached_creates_cache() {
     assert!(cwasm_path.exists(), ".cwasm cache file should be created");
 }
 
-#[test]
-fn test_from_file_cached_uses_cache() {
+#[tokio::test]
+async fn test_from_file_cached_uses_cache() {
     let wasm = skip_if_no_wasm!();
     let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
 
     // First call: compiles and caches
     let factory1 = WasmProviderFactory::from_file_cached(&wasm, cache_dir.path())
+        .await
         .expect("first from_file_cached should succeed");
     assert_eq!(factory1.name(), "mock");
 
     // Second call: uses cache
     let factory2 = WasmProviderFactory::from_file_cached(&wasm, cache_dir.path())
+        .await
         .expect("second from_file_cached (cache hit) should succeed");
     assert_eq!(factory2.name(), "mock");
 
@@ -92,8 +96,8 @@ fn test_from_file_cached_uses_cache() {
     assert!(factory2.schemas().is_empty());
 }
 
-#[test]
-fn test_from_file_cached_recovers_from_stale_cache() {
+#[tokio::test]
+async fn test_from_file_cached_recovers_from_stale_cache() {
     let wasm = skip_if_no_wasm!();
     let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let cwasm_path = cache_dir.path().join("carina_provider_mock.cwasm");
@@ -104,6 +108,7 @@ fn test_from_file_cached_recovers_from_stale_cache() {
 
     // from_file_cached should detect invalid cache, recompile, and succeed
     let factory = WasmProviderFactory::from_file_cached(&wasm, cache_dir.path())
+        .await
         .expect("from_file_cached should recover from stale cache");
 
     assert_eq!(factory.name(), "mock");
@@ -118,6 +123,7 @@ async fn test_precompiled_factory_creates_provider() {
     WasmProviderFactory::precompile(&wasm, &cwasm_path).expect("precompile should succeed");
 
     let factory = WasmProviderFactory::from_precompiled(&cwasm_path)
+        .await
         .expect("from_precompiled should succeed");
 
     // Verify the factory can actually create a working provider
