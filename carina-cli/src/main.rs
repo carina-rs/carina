@@ -145,7 +145,7 @@ enum Commands {
         /// The lock ID to force unlock
         lock_id: String,
 
-        /// Path to directory containing .crn files containing backend configuration
+        /// Path to directory containing backend configuration
         #[arg(default_value = ".")]
         path: PathBuf,
     },
