@@ -277,6 +277,11 @@ pub fn resolve_single_config(base_dir: &Path, config: &ProviderConfig) -> Result
     Ok(binary_path)
 }
 
+/// Returns true if the given path points to a WASM provider binary.
+pub fn is_wasm_provider(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "wasm")
+}
+
 /// Resolve all providers that need GitHub source resolution.
 pub fn resolve_all(
     base_dir: &Path,
