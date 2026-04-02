@@ -2889,4 +2889,32 @@ require   port >= 1 && port <= 65535  , "port must be valid"
             result
         );
     }
+
+    #[test]
+    fn format_heredoc_preserved() {
+        let input = "aws.iam.role {\n  name   = \"my-role\"\n  policy = <<EOT\n{\n  \"Version\": \"2012-10-17\"\n}\nEOT\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        // Heredoc should be preserved in output
+        assert!(
+            result.contains("<<EOT"),
+            "Heredoc marker should be preserved. Got:\n{}",
+            result
+        );
+        assert!(
+            result.contains("EOT\n"),
+            "Closing marker should be preserved. Got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn format_heredoc_idempotent() {
+        // Formatting a file with heredoc should be idempotent (formatting twice gives same result)
+        let input = "aws.iam.role {\n  name   = \"my-role\"\n  policy = <<EOT\n{\n  \"Version\": \"2012-10-17\"\n}\nEOT\n}\n";
+        let config = FormatConfig::default();
+        let first = format(input, &config).unwrap();
+        let second = format(&first, &config).unwrap();
+        assert_eq!(first, second, "Formatting should be idempotent");
+    }
 }
