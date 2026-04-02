@@ -245,7 +245,8 @@ index_access = { "[" ~ expression ~ "]" }
 boolean = { "true" | "false" }
 float = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
 number = @{ "-"? ~ ASCII_DIGIT+ }
-string = ${ "\"" ~ string_part* ~ "\"" }
+string = ${ single_quoted_string | double_quoted_string }
+double_quoted_string = ${ "\"" ~ string_part* ~ "\"" }
 string_part = ${ interpolation | string_literal }
 interpolation = ${ "${" ~ expression ~ "}" }
 string_literal = @{ string_char+ }
@@ -253,6 +254,14 @@ string_char = {
     !("\"" | "\\" | "${") ~ ANY
   | "\\" ~ ("\"" | "\\" | "n" | "r" | "t" | "$")
   | "$" ~ !("{")
+}
+
+// Single-quoted strings: literal only, no interpolation
+single_quoted_string = ${ "'" ~ single_quoted_content ~ "'" }
+single_quoted_content = @{ single_quoted_char* }
+single_quoted_char = {
+    !("'" | "\\") ~ ANY
+  | "\\" ~ ("'" | "\\")
 }
 
 // Whitespace (auto-skip)
