@@ -911,6 +911,9 @@ fn is_retryable_delete_error(e: &carina_core::provider::ProviderError) -> bool {
         "resource has dependencies",
         "mapped public address",
         "Failed to detach",
+        // CloudControl operation timeout — often caused by dependent resources
+        // still being deleted (e.g., NAT Gateway blocking VPCGatewayAttachment)
+        "Exceeded attempts to wait",
     ];
     retryable_patterns.iter().any(|p| msg.contains(p))
 }
