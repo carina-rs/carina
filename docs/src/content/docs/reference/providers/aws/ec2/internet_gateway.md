@@ -3,6 +3,7 @@ title: "aws.ec2.internet_gateway"
 description: "AWS EC2 internet_gateway resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::InternetGateway`
 
 Describes an internet gateway.
@@ -18,7 +19,7 @@ let vpc = aws.ec2.vpc {
   }
 }
 
-let igw = aws.ec2.internet_gateway {
+aws.ec2.internet_gateway {
   vpc_id = vpc.vpc_id
 
   tags = {

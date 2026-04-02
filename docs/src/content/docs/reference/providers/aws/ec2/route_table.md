@@ -3,6 +3,7 @@ title: "aws.ec2.route_table"
 description: "AWS EC2 route_table resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::RouteTable`
 
 Describes a route table.
@@ -18,7 +19,7 @@ let vpc = aws.ec2.vpc {
   }
 }
 
-let rt = aws.ec2.route_table {
+aws.ec2.route_table {
   vpc_id = vpc.vpc_id
 
   tags = {
