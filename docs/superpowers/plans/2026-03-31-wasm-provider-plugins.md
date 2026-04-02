@@ -10,6 +10,14 @@
 
 **Spec:** `docs/superpowers/specs/2026-03-31-wasm-provider-plugins-design.md`
 
+**Repository Structure (updated 2026-04-02):**
+- `carina-rs/carina` (this repo): carina-core, carina-cli, carina-plugin-host, carina-plugin-sdk, carina-provider-mock, carina-provider-protocol, carina-lsp, etc.
+- `carina-rs/carina-provider-aws` (separate repo): AWS provider binary
+- `carina-rs/carina-provider-awscc` (separate repo): AWSCC provider binary
+
+Phase 0-1 work is entirely within the `carina` monorepo (host-side + MockProvider).
+Phase 2-3 work happens in the provider repos. `carina-plugin-sdk` and `carina-plugin-wit` are published from `carina` and consumed as dependencies by provider repos.
+
 ---
 
 ## Phase 0: PoC — AWS SDK wasm32-wasip2 Compilation
@@ -1368,6 +1376,8 @@ git commit -m "feat: add WasmProviderFactory with Provider and Normalizer implem
 - Create: `carina-plugin-sdk/src/wasm_guest.rs`
 - Modify: `carina-plugin-sdk/src/lib.rs`
 
+**Note:** Since provider repos (`carina-provider-aws`, `carina-provider-awscc`) are now separate repositories, `carina-plugin-sdk` and `carina-plugin-wit` must be publishable/consumable as external dependencies (via crates.io or git dependency). The WIT files should be bundled into `carina-plugin-sdk` (e.g., included via `include_str!` or shipped as part of the crate) so that external provider repos don't need a relative path to `carina-plugin-wit/wit/`.
+
 - [ ] **Step 1: Add wit-bindgen dependency**
 
 Add to `carina-plugin-sdk/Cargo.toml`:
@@ -1388,6 +1398,9 @@ Create `carina-plugin-sdk/src/wasm_guest.rs`:
 //! their `CarinaProvider` implementation to the WIT export interface.
 
 // Generate guest bindings from WIT
+// WIT files are bundled in the carina-plugin-wit crate.
+// For in-monorepo builds, use relative path.
+// For external provider repos, this path must resolve via the crate's published content.
 wit_bindgen::generate!({
     path: "../carina-plugin-wit/wit",
     world: "carina-provider",
@@ -1910,33 +1923,59 @@ git commit -m "feat: add precompile (AOT) cache for WASM providers"
 
 Phase 2-5 depend on the outcome of Phase 0 (PoC) and the specific bindgen API surface discovered in Phase 1. Each phase should get its own detailed plan when the time comes.
 
+**Important: Provider repos are now separate repositories.** Phase 2-3 work happens in `carina-rs/carina-provider-aws` and `carina-rs/carina-provider-awscc` respectively, not in this monorepo.
+
 ### Phase 2: AWS Provider WASM Compilation
 
-- Swap AWS SDK HTTP connector to `WasiHttpClient` (uses `wasi:http/outgoing-handler`)
-- Implement `WasiHttpClient` in `carina-plugin-sdk` (implements `aws_smithy_runtime_api::client::http::HttpClient`)
-- Add `#[cfg(target_arch = "wasm32")]` gates for HTTP adapter selection
-- Add `export_provider!(AwsProcessProvider)` to `carina-provider-aws/src/main.rs`
+**Repo:** `carina-rs/carina-provider-aws`
+
+Prerequisites from Phase 1 (monorepo side):
+- `carina-plugin-sdk` with WASM guest support must be published/available as a git dependency
+- `carina-plugin-wit` WIT files must be bundled or accessible from the SDK
+
+Work in the provider repo:
+- Add `carina-plugin-sdk` dependency (git or crates.io)
+- Implement `WasiHttpClient` in `carina-plugin-sdk` (implements `aws_smithy_runtime_api::client::http::HttpClient`) — or in a shared crate if both providers need it
+- Swap AWS SDK HTTP connector to `WasiHttpClient` via `#[cfg(target_arch = "wasm32")]`
+- Add `export_provider!(AwsProcessProvider)` with cfg-gate in `src/main.rs`
 - Compile to `wasm32-wasip2` and fix any remaining dependency issues
 - Run existing provider tests against WASM build
 - E2E test: `plan` and `apply` with WASM provider
+- Update CI to build `.wasm` artifacts alongside native binaries
 
 ### Phase 3: AWSCC Provider WASM Compilation
 
-- Same approach as Phase 2 for `carina-provider-awscc`
+**Repo:** `carina-rs/carina-provider-awscc`
+
+- Same approach as Phase 2
 - AWSCC uses CloudControl API (single SDK) — may be simpler than AWS provider
+- Shares `WasiHttpClient` from `carina-plugin-sdk`
 
 ### Phase 4: Distribution
 
-- Update GitHub Actions CI to build `.wasm` artifacts
+**Repos:** All three (`carina`, `carina-provider-aws`, `carina-provider-awscc`)
+
+Monorepo (`carina`) side:
 - Update `provider_resolver.rs` to download `.wasm` from releases
-- Remove OS/arch detection for WASM providers
+- Remove OS/arch detection for WASM providers (single file download)
 - Add precompile cache to the download/resolve flow
 - Update SHA256 verification for `.wasm` files
 
+Provider repos side:
+- Update GitHub Actions CI to build and release `.wasm` artifacts
+- Update release workflows to publish single `.wasm` + SHA256 instead of OS/arch binaries
+
 ### Phase 5: Cleanup
 
-- Remove `ProcessProviderFactory`, `ProcessProvider`, `ProcessProviderNormalizer`
-- Remove `carina-provider-protocol` crate
+**Repos:** All three
+
+Monorepo (`carina`) side:
+- Remove `ProcessProviderFactory`, `ProcessProvider`, `ProcessProviderNormalizer` from `carina-plugin-host`
+- Remove `carina-provider-protocol` crate from workspace
 - Remove `ProviderProcess` (stdin/stdout JSON-RPC)
 - Remove `jsonrpc.rs` and `methods.rs`
-- Update all documentation
+
+Provider repos side:
+- Remove JSON-RPC `run()` entry point from `main.rs`
+- Remove `carina-provider-protocol` dependency
+- Keep only WASM `export_provider!()` entry point
