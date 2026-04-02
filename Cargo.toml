@@ -2,14 +2,12 @@
 members = [
     "carina-aws-types",
     "carina-cli",
-    "carina-codegen-aws",
     "carina-core",
     "carina-lsp",
     "carina-plugin-host",
     "carina-plugin-sdk",
     "carina-provider-mock",
     "carina-provider-protocol",
-    "carina-smithy",
     "carina-state",
     "carina-tui",
 ]
