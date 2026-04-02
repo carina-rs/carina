@@ -891,6 +891,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "tokio",
  "wasmtime",
  "wasmtime-wasi",
 ]

@@ -16,3 +16,6 @@ log = "0.4"
 futures = "0.3"
 wasmtime = { version = "29", features = ["component-model"] }
 wasmtime-wasi = "29"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
