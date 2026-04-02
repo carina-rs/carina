@@ -28,10 +28,12 @@ macro_rules! skip_if_no_wasm {
     };
 }
 
-#[test]
-fn test_wasm_mock_provider_factory() {
+#[tokio::test]
+async fn test_wasm_mock_provider_factory() {
     let path = skip_if_no_wasm!();
-    let factory = WasmProviderFactory::new(path).expect("Failed to load WASM provider");
+    let factory = WasmProviderFactory::new(path)
+        .await
+        .expect("Failed to load WASM provider");
 
     assert_eq!(factory.name(), "mock");
     assert_eq!(factory.display_name(), "Mock Provider (Process)");
@@ -44,7 +46,9 @@ fn test_wasm_mock_provider_factory() {
 #[tokio::test]
 async fn test_wasm_mock_provider_create_and_read() {
     let path = skip_if_no_wasm!();
-    let factory = WasmProviderFactory::new(path).expect("Failed to load WASM provider");
+    let factory = WasmProviderFactory::new(path)
+        .await
+        .expect("Failed to load WASM provider");
     let provider = factory.create_provider(&HashMap::new()).await;
 
     assert_eq!(provider.name(), "mock");
@@ -101,7 +105,9 @@ async fn test_wasm_mock_provider_create_and_read() {
 #[tokio::test]
 async fn test_wasm_mock_provider_update_and_delete() {
     let path = skip_if_no_wasm!();
-    let factory = WasmProviderFactory::new(path).expect("Failed to load WASM provider");
+    let factory = WasmProviderFactory::new(path)
+        .await
+        .expect("Failed to load WASM provider");
     let provider = factory.create_provider(&HashMap::new()).await;
 
     let id = ResourceId::with_provider("mock", "test.resource", "updatable");
@@ -168,7 +174,9 @@ async fn test_wasm_mock_provider_update_and_delete() {
 #[tokio::test]
 async fn test_wasm_mock_provider_normalizer() {
     let path = skip_if_no_wasm!();
-    let factory = WasmProviderFactory::new(path).expect("Failed to load WASM provider");
+    let factory = WasmProviderFactory::new(path)
+        .await
+        .expect("Failed to load WASM provider");
     let normalizer = factory
         .create_normalizer(&HashMap::new())
         .await

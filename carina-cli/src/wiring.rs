@@ -110,9 +110,12 @@ pub fn build_factories_from_providers(
 
         let factory_result: Result<Box<dyn ProviderFactory>, String> =
             if crate::provider_resolver::is_wasm_provider(&binary_path) {
-                carina_plugin_host::WasmProviderFactory::new(binary_path)
-                    .map(|f| Box::new(f) as Box<dyn ProviderFactory>)
-                    .map_err(|e| format!("Failed to load WASM provider: {e}"))
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(carina_plugin_host::WasmProviderFactory::new(binary_path))
+                })
+                .map(|f| Box::new(f) as Box<dyn ProviderFactory>)
+                .map_err(|e| format!("Failed to load WASM provider: {e}"))
             } else {
                 carina_plugin_host::ProcessProviderFactory::new(binary_path)
                     .map(|f| Box::new(f) as Box<dyn ProviderFactory>)
@@ -509,14 +512,7 @@ async fn load_process_provider(
     source: &str,
     config: &ProviderConfig,
     base_dir: &Path,
-) -> Result<
-    (
-        carina_plugin_host::ProcessProviderFactory,
-        Box<dyn Provider>,
-        String,
-    ),
-    String,
-> {
+) -> Result<(Box<dyn ProviderFactory>, Box<dyn Provider>, String), String> {
     let binary_path = if let Some(path) = source.strip_prefix("file://") {
         std::path::PathBuf::from(path)
     } else if source.starts_with("github.com/") {
@@ -527,7 +523,18 @@ async fn load_process_provider(
         ));
     };
 
-    let factory = carina_plugin_host::ProcessProviderFactory::new(binary_path)?;
+    let factory: Box<dyn ProviderFactory> =
+        if crate::provider_resolver::is_wasm_provider(&binary_path) {
+            Box::new(
+                carina_plugin_host::WasmProviderFactory::new(binary_path.clone())
+                    .await
+                    .map_err(|e| format!("Failed to load WASM provider: {e}"))?,
+            )
+        } else {
+            Box::new(carina_plugin_host::ProcessProviderFactory::new(
+                binary_path,
+            )?)
+        };
     let name = factory.name().to_string();
 
     factory
