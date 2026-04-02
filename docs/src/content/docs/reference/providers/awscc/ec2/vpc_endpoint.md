@@ -3,51 +3,13 @@ title: "awscc.ec2.vpc_endpoint"
 description: "AWSCC EC2 vpc_endpoint resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::VPCEndpoint`
 
 Specifies a VPC endpoint. A VPC endpoint provides a private connection between your VPC and an endpoint service. You can use an endpoint service provided by AWS, an MKT Partner, or another AWS accounts in your organization. For more information, see the [User Guide](https://docs.aws.amazon.com/vpc/latest/privatelink/).
  An endpoint of type ``Interface`` establishes connections between the subnets in your VPC and an AWS-service, your own service, or a service hosted by another AWS-account. With an interface VPC endpoint, you specify the subnets in which to create the endpoint and the security groups to associate with the endpoint network interfaces.
  An endpoint of type ``gateway`` serves as a target for a route in your route table for traffic destined for S3 or DDB. You can specify an endpoint policy for the endpoint, which controls access to the service from your VPC. You can also specify the VPC route tables that use the endpoint. For more information about connectivity to S3, see [Why can't I connect to an S3 bucket using a gateway VPC endpoint?](https://docs.aws.amazon.com/premiumsupport/knowledge-center/connect-s3-vpc-endpoint)
  An endpoint of type ``GatewayLoadBalancer`` provides private connectivity between your VPC and virtual appliances from a service provider.
-
-## Example
-
-```crn
-let vpc = awscc.ec2.vpc {
-  cidr_block           = "10.0.0.0/16"
-  enable_dns_support   = true
-  enable_dns_hostnames = true
-}
-
-let subnet = awscc.ec2.subnet {
-  vpc_id            = vpc.vpc_id
-  cidr_block        = "10.0.100.0/24"
-  availability_zone = "ap-northeast-1a"
-}
-
-let sg = awscc.ec2.security_group {
-  vpc_id            = vpc.vpc_id
-  group_description = "SG for VPC Endpoint"
-}
-
-awscc.ec2.security_group_ingress {
-  group_id    = sg.group_id
-  description = "Allow HTTPS from VPC"
-  ip_protocol = "tcp"
-  from_port   = 443
-  to_port     = 443
-  cidr_ip     = "10.0.0.0/16"
-}
-
-awscc.ec2.vpc_endpoint {
-  vpc_id              = vpc.vpc_id
-  service_name        = "com.amazonaws.ap-northeast-1.ecr.dkr"
-  vpc_endpoint_type   = "Interface"
-  subnet_ids          = [subnet.subnet_id]
-  security_group_ids  = [sg.group_id]
-  private_dns_enabled = true
-}
-```
 
 ## Argument Reference
 
@@ -247,7 +209,6 @@ Shorthand formats: `Interface` or `VpcEndpointType.Interface`
 ### `network_interface_ids`
 
 - **Type:** `List<NetworkInterfaceId>`
-
 
 
 

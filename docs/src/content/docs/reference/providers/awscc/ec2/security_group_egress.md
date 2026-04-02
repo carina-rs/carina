@@ -3,6 +3,7 @@ title: "awscc.ec2.security_group_egress"
 description: "AWSCC EC2 security_group_egress resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::SecurityGroupEgress`
 
 Adds the specified outbound (egress) rule to a security group.
@@ -10,26 +11,6 @@ Adds the specified outbound (egress) rule to a security group.
  You must specify exactly one of the following destinations: an IPv4 address range, an IPv6 address range, a prefix list, or a security group.
  You must specify a protocol for each rule (for example, TCP). If the protocol is TCP or UDP, you must also specify a port or port range. If the protocol is ICMP or ICMPv6, you must also specify the ICMP/ICMPv6 type and code. To specify all types or all codes, use -1.
  Rule changes are propagated to instances associated with the security group as quickly as possible. However, a small delay might occur.
-
-## Example
-
-```crn
-let vpc = awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
-}
-
-let sg = awscc.ec2.security_group {
-  vpc_id            = vpc.vpc_id
-  group_description = "Example security group"
-}
-
-awscc.ec2.security_group_egress {
-  group_id    = sg.group_id
-  description = "Allow all outbound traffic"
-  ip_protocol = all
-  cidr_ip     = "0.0.0.0/0"
-}
-```
 
 ## Argument Reference
 
@@ -115,6 +96,7 @@ If the protocol is TCP or UDP, this is the end of the port range. If the protoco
 | `icmp` | `awscc.ec2.security_group_egress.IpProtocol.icmp` |
 | `icmpv6` | `awscc.ec2.security_group_egress.IpProtocol.icmpv6` |
 | `-1` | `awscc.ec2.security_group_egress.IpProtocol.all` |
+| `all` | `awscc.ec2.security_group_egress.IpProtocol.all` |
 
 Shorthand formats: `tcp` or `IpProtocol.tcp`
 
@@ -123,7 +105,6 @@ Shorthand formats: `tcp` or `IpProtocol.tcp`
 ### `id`
 
 - **Type:** String
-
 
 
 

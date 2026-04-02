@@ -3,29 +3,10 @@ title: "awscc.ec2.flow_log"
 description: "AWSCC EC2 flow_log resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::FlowLog`
 
 Specifies a VPC flow log, which enables you to capture IP traffic for a specific network interface, subnet, or VPC.
-
-## Example
-
-```crn
-let vpc = awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
-}
-
-awscc.ec2.flow_log {
-  resource_id          = vpc.vpc_id
-  resource_type        = VPC
-  traffic_type         = ALL
-  log_destination_type = s3
-  log_destination      = "arn:aws:s3:::example-flow-logs-bucket"
-
-  tags = {
-    Environment = "example"
-  }
-}
-```
 
 ## Argument Reference
 
@@ -183,5 +164,4 @@ Shorthand formats: `ACCEPT` or `TrafficType.ACCEPT`
 - **Type:** FlowLogId
 
 The Flow Log ID
-
 

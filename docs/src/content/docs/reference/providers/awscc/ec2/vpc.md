@@ -3,26 +3,12 @@ title: "awscc.ec2.vpc"
 description: "AWSCC EC2 vpc resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::VPC`
 
 Specifies a virtual private cloud (VPC).
  To add an IPv6 CIDR block to the VPC, see [AWS::EC2::VPCCidrBlock](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-vpccidrblock.html).
  For more information, see [Virtual private clouds (VPC)](https://docs.aws.amazon.com/vpc/latest/userguide/configure-your-vpc.html) in the *Amazon VPC User Guide*.
-
-## Example
-
-```crn
-awscc.ec2.vpc {
-  cidr_block           = "10.0.0.0/16"
-  enable_dns_support   = true
-  enable_dns_hostnames = true
-  instance_tenancy     = default
-
-  tags = {
-    Environment = "example"
-  }
-}
-```
 
 ## Argument Reference
 
@@ -121,7 +107,6 @@ Shorthand formats: `default` or `InstanceTenancy.default`
 ### `vpc_id`
 
 - **Type:** VpcId
-
 
 
 

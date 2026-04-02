@@ -3,31 +3,10 @@ title: "awscc.ec2.security_group_ingress"
 description: "AWSCC EC2 security_group_ingress resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::SecurityGroupIngress`
 
 Resource Type definition for AWS::EC2::SecurityGroupIngress
-
-## Example
-
-```crn
-let vpc = awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
-}
-
-let sg = awscc.ec2.security_group {
-  vpc_id            = vpc.vpc_id
-  group_description = "Example security group"
-}
-
-awscc.ec2.security_group_ingress {
-  group_id    = sg.group_id
-  description = "Allow HTTPS from VPC"
-  ip_protocol = "tcp"
-  from_port   = 443
-  to_port     = 443
-  cidr_ip     = "10.0.0.0/16"
-}
-```
 
 ## Argument Reference
 
@@ -137,6 +116,7 @@ The end of port range for the TCP and UDP protocols, or an ICMP/ICMPv6 code. A v
 | `icmp` | `awscc.ec2.security_group_ingress.IpProtocol.icmp` |
 | `icmpv6` | `awscc.ec2.security_group_ingress.IpProtocol.icmpv6` |
 | `-1` | `awscc.ec2.security_group_ingress.IpProtocol.all` |
+| `all` | `awscc.ec2.security_group_ingress.IpProtocol.all` |
 
 Shorthand formats: `tcp` or `IpProtocol.tcp`
 
@@ -147,5 +127,4 @@ Shorthand formats: `tcp` or `IpProtocol.tcp`
 - **Type:** String
 
 The Security Group Rule Id
-
 

@@ -3,37 +3,10 @@ title: "awscc.ec2.ipam_pool"
 description: "AWSCC EC2 ipam_pool resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::IPAMPool`
 
 Resource Schema of AWS::EC2::IPAMPool Type
-
-## Example
-
-```crn
-let ipam = awscc.ec2.ipam {
-  description = "Example IPAM"
-  tier        = free
-
-  operating_region {
-    region_name = "ap-northeast-1"
-  }
-}
-
-awscc.ec2.ipam_pool {
-  ipam_scope_id  = ipam.private_default_scope_id
-  address_family = "IPv4"
-  locale         = "ap-northeast-1"
-  description    = "Example IPv4 IPAM Pool"
-
-  provisioned_cidr {
-    cidr = "10.0.0.0/8"
-  }
-
-  tags = {
-    Environment = "example"
-  }
-}
-```
 
 ## Argument Reference
 
@@ -270,5 +243,4 @@ The state of this pool. This can be one of the following values: "create-in-prog
 - **Type:** String
 
 An explanation of how the pool arrived at it current state.
-
 

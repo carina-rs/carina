@@ -3,37 +3,10 @@ title: "awscc.ec2.transit_gateway_attachment"
 description: "AWSCC EC2 transit_gateway_attachment resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::TransitGatewayAttachment`
 
 Resource Type definition for AWS::EC2::TransitGatewayAttachment
-
-## Example
-
-```crn
-let vpc = awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
-}
-
-let subnet = awscc.ec2.subnet {
-  vpc_id            = vpc.vpc_id
-  cidr_block        = "10.0.1.0/24"
-  availability_zone = "ap-northeast-1a"
-}
-
-let tgw = awscc.ec2.transit_gateway {
-  description = "Example Transit Gateway"
-}
-
-awscc.ec2.transit_gateway_attachment {
-  transit_gateway_id = tgw.id
-  vpc_id             = vpc.vpc_id
-  subnet_ids         = [subnet.subnet_id]
-
-  tags = {
-    Environment = "example"
-  }
-}
-```
 
 ## Argument Reference
 
@@ -120,5 +93,4 @@ Shorthand formats: `enable` or `SecurityGroupReferencingSupport.enable`
 ### `id`
 
 - **Type:** TransitGatewayAttachmentId
-
 

@@ -1,7 +1,8 @@
 ---
 title: "awscc.logs.log_group"
-description: "AWSCC Logs log_group resource reference"
+description: "AWSCC LOGS log_group resource reference"
 ---
+
 
 CloudFormation Type: `AWS::Logs::LogGroup`
 
@@ -10,19 +11,6 @@ The ``AWS::Logs::LogGroup`` resource specifies a log group. A log group defines 
   +  Log group names must be unique within a Region for an AWS account.
   +  Log group names can be between 1 and 512 characters long.
   +  Log group names consist of the following characters: a-z, A-Z, 0-9, '_' (underscore), '-' (hyphen), '/' (forward slash), and '.' (period).
-
-## Example
-
-```crn
-awscc.logs.log_group {
-  log_group_name    = "/example/my-app"
-  retention_in_days = 30
-
-  tags = {
-    Environment = "example"
-  }
-}
-```
 
 ## Argument Reference
 
@@ -109,7 +97,6 @@ Shorthand formats: `STANDARD` or `LogGroupClass.STANDARD`
 ### `arn`
 
 - **Type:** Arn
-
 
 
 

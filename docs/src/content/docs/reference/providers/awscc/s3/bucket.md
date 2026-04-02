@@ -3,27 +3,12 @@ title: "awscc.s3.bucket"
 description: "AWSCC S3 bucket resource reference"
 ---
 
+
 CloudFormation Type: `AWS::S3::Bucket`
 
 The ``AWS::S3::Bucket`` resource creates an Amazon S3 bucket in the same AWS Region where you create the AWS CloudFormation stack.
  To control how AWS CloudFormation handles the bucket when the stack is deleted, you can set a deletion policy for your bucket. You can choose to *retain* the bucket or to *delete* the bucket. For more information, see [DeletionPolicy Attribute](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-attribute-deletionpolicy.html).
   You can only delete empty buckets. Deletion fails for buckets that have contents.
-
-## Example
-
-```crn
-awscc.s3.bucket {
-  bucket_name = "my-example-bucket"
-
-  versioning_configuration = {
-    status = Enabled
-  }
-
-  tags = {
-    Environment = "example"
-  }
-}
-```
 
 ## Argument Reference
 
@@ -1085,7 +1070,6 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 ### `website_url`
 
 - **Type:** String(uri)
-
 
 
 

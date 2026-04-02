@@ -3,40 +3,10 @@ title: "awscc.ec2.security_group"
 description: "AWSCC EC2 security_group resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::SecurityGroup`
 
 Resource Type definition for AWS::EC2::SecurityGroup
-
-## Example
-
-```crn
-let vpc = awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
-}
-
-awscc.ec2.security_group {
-  vpc_id            = vpc.vpc_id
-  group_description = "Example security group"
-
-  security_group_ingress {
-    ip_protocol = "tcp"
-    from_port   = 80
-    to_port     = 80
-    cidr_ip     = "0.0.0.0/0"
-  }
-
-  security_group_ingress {
-    ip_protocol = "tcp"
-    from_port   = 443
-    to_port     = 443
-    cidr_ip     = "0.0.0.0/0"
-  }
-
-  tags = {
-    Environment = "example"
-  }
-}
-```
 
 ## Argument Reference
 
@@ -96,6 +66,7 @@ The ID of the VPC for the security group.
 | `icmp` | `awscc.ec2.security_group.IpProtocol.icmp` |
 | `icmpv6` | `awscc.ec2.security_group.IpProtocol.icmpv6` |
 | `-1` | `awscc.ec2.security_group.IpProtocol.all` |
+| `all` | `awscc.ec2.security_group.IpProtocol.all` |
 
 Shorthand formats: `tcp` or `IpProtocol.tcp`
 
@@ -142,5 +113,4 @@ The group ID of the specified security group.
 - **Type:** SecurityGroupId
 
 The group name or group ID depending on whether the SG is created in default or specific VPC
-
 

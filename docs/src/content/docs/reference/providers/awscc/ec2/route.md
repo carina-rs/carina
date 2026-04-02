@@ -3,38 +3,12 @@ title: "awscc.ec2.route"
 description: "AWSCC EC2 route resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::Route`
 
 Specifies a route in a route table. For more information, see [Routes](https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Route_Tables.html#route-table-routes) in the *Amazon VPC User Guide*.
  You must specify either a destination CIDR block or prefix list ID. You must also specify exactly one of the resources as the target.
  If you create a route that references a transit gateway in the same template where you create the transit gateway, you must declare a dependency on the transit gateway attachment. The route table cannot use the transit gateway until it has successfully attached to the VPC. Add a [DependsOn Attribute](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-attribute-dependson.html) in the ``AWS::EC2::Route`` resource to explicitly declare a dependency on the ``AWS::EC2::TransitGatewayAttachment`` resource.
-
-## Example
-
-```crn
-let vpc = awscc.ec2.vpc {
-  cidr_block           = "10.0.0.0/16"
-  enable_dns_support   = true
-  enable_dns_hostnames = true
-}
-
-let igw = awscc.ec2.internet_gateway {}
-
-let igw_attachment = awscc.ec2.vpc_gateway_attachment {
-  vpc_id              = vpc.vpc_id
-  internet_gateway_id = igw.internet_gateway_id
-}
-
-let rt = awscc.ec2.route_table {
-  vpc_id = vpc.vpc_id
-}
-
-awscc.ec2.route {
-  route_table_id         = rt.route_table_id
-  destination_cidr_block = "0.0.0.0/0"
-  gateway_id             = igw_attachment.internet_gateway_id
-}
-```
 
 ## Argument Reference
 
@@ -152,7 +126,6 @@ The ID of a VPC peering connection.
 ### `cidr_block`
 
 - **Type:** Ipv4Cidr
-
 
 
 
