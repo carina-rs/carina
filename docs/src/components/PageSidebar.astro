@@ -29,6 +29,15 @@ import TableOfContents from 'virtual:starlight/components/TableOfContents';
 	)
 }
 
+<script is:inline>
+	// Restore collapsed state immediately to prevent FOUC
+	(function() {
+		if (localStorage.getItem('carina-toc-collapsed') === 'true') {
+			document.documentElement.setAttribute('data-toc-collapsed', '');
+		}
+	})();
+</script>
+
 <script>
 	const STORAGE_KEY = 'carina-toc-collapsed';
 
@@ -36,7 +45,7 @@ import TableOfContents from 'virtual:starlight/components/TableOfContents';
 		const button = document.querySelector('.toc-toggle');
 		if (!button) return;
 
-		// Restore state from localStorage
+		// Restore state (for view transitions where inline script doesn't re-run)
 		const collapsed = localStorage.getItem(STORAGE_KEY) === 'true';
 		if (collapsed) {
 			document.documentElement.setAttribute('data-toc-collapsed', '');
