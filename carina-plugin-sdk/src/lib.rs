@@ -17,6 +17,13 @@ pub trait CarinaProvider {
     /// Return provider name and display name.
     fn info(&self) -> ProviderInfo;
 
+    /// Return the list of optional capabilities this provider supports.
+    /// Possible values: "normalize_desired", "normalize_state",
+    /// "hydrate_read_state", "merge_default_tags".
+    fn capabilities(&self) -> Vec<String> {
+        vec![]
+    }
+
     /// Return all resource schemas this provider supports.
     fn schemas(&self) -> Vec<ResourceSchema>;
 
@@ -149,7 +156,8 @@ fn dispatch(provider: &mut impl CarinaProvider, request: &Request) -> Response {
 
     match request.method.as_str() {
         "provider_info" => {
-            let info = provider.info();
+            let mut info = provider.info();
+            info.capabilities = provider.capabilities();
             Response::success(id, methods::ProviderInfoResult { info })
         }
 

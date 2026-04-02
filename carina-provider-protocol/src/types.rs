@@ -124,6 +124,8 @@ pub struct Resource {
 pub struct ProviderInfo {
     pub name: String,
     pub display_name: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 /// Provider error returned from operations.
@@ -284,6 +286,29 @@ mod tests {
         let json = serde_json::to_string(&attr).unwrap();
         let back: AttributeType = serde_json::from_str(&json).unwrap();
         assert_eq!(json, serde_json::to_string(&back).unwrap());
+    }
+
+    #[test]
+    fn test_provider_info_with_capabilities() {
+        let info = ProviderInfo {
+            name: "test".into(),
+            display_name: "Test Provider".into(),
+            capabilities: vec!["normalize_desired".into(), "normalize_state".into()],
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let back: ProviderInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.capabilities,
+            vec!["normalize_desired", "normalize_state"]
+        );
+    }
+
+    #[test]
+    fn test_provider_info_without_capabilities_defaults_to_empty() {
+        // Simulates deserializing a response from an older plugin that doesn't send capabilities
+        let json = r#"{"name":"old","display_name":"Old Provider"}"#;
+        let info: ProviderInfo = serde_json::from_str(json).unwrap();
+        assert!(info.capabilities.is_empty());
     }
 
     #[test]
