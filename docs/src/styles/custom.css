@@ -193,3 +193,23 @@ table td, table th {
     grid-template-columns: 1fr;
   }
 }
+
+/* Collapsible right sidebar (ToC) */
+@media (min-width: 72rem) {
+  [data-toc-collapsed] .right-sidebar {
+    border-inline-start: none;
+  }
+
+  /* When collapsed, shrink the sidebar container to zero width */
+  [data-toc-collapsed] .right-sidebar-container {
+    width: 0 !important;
+    min-width: 0;
+    overflow: hidden;
+    padding: 0;
+  }
+
+  /* Allow the main content pane to expand to fill the freed space */
+  [data-toc-collapsed] .main-pane {
+    width: 100% !important;
+  }
+}
