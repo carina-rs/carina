@@ -1,7 +1,0 @@
-provider awscc {
-  region = awscc.Region.ap_northeast_1
-}
-
-removed {
-  from = awscc.ec2.vpc "main_vpc"
-}

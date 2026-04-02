@@ -8,7 +8,6 @@ members = [
     "carina-plugin-host",
     "carina-plugin-sdk",
     "carina-provider-aws",
-    "carina-provider-awscc",
     "carina-provider-mock",
     "carina-provider-protocol",
     "carina-smithy",
