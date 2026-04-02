@@ -3,6 +3,7 @@ title: "aws.ec2.subnet"
 description: "AWS EC2 subnet resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::Subnet`
 
 Describes a subnet.
@@ -18,7 +19,7 @@ let vpc = aws.ec2.vpc {
   }
 }
 
-let subnet = aws.ec2.subnet {
+aws.ec2.subnet {
   vpc_id            = vpc.vpc_id
   cidr_block        = "10.0.1.0/24"
   availability_zone = aws.AvailabilityZone.ap_northeast_1a

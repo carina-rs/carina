@@ -3,12 +3,13 @@ title: "aws.s3.bucket"
 description: "AWS S3 bucket resource reference"
 ---
 
+
 CloudFormation Type: `AWS::S3::Bucket`
 
 ## Example
 
 ```crn
-let bucket = aws.s3.bucket {
+aws.s3.bucket {
   bucket = "carina-example-s3-bucket"
 
   versioning_status = aws.s3.bucket.VersioningStatus.Enabled
@@ -44,35 +45,35 @@ Specifies the namespace where you want to create your general purpose bucket. Wh
 
 ### `grant_full_control`
 
-- **Type:** S3Grantee
+- **Type:** s3_grantee
 - **Required:** No
 
 Allows grantee the read, write, read ACP, and write ACP permissions on the bucket. This functionality is not supported for directory buckets.
 
 ### `grant_read`
 
-- **Type:** S3Grantee
+- **Type:** s3_grantee
 - **Required:** No
 
 Allows grantee to list the objects in the bucket. This functionality is not supported for directory buckets.
 
 ### `grant_read_acp`
 
-- **Type:** S3Grantee
+- **Type:** s3_grantee
 - **Required:** No
 
 Allows grantee to read the bucket ACL. This functionality is not supported for directory buckets.
 
 ### `grant_write`
 
-- **Type:** S3Grantee
+- **Type:** s3_grantee
 - **Required:** No
 
 Allows grantee to create new objects in the bucket. For the bucket and object owners of existing objects, also allows deletions and overwrites of those objects. This functionality is not supported for directory buckets.
 
 ### `grant_write_acp`
 
-- **Type:** S3Grantee
+- **Type:** s3_grantee
 - **Required:** No
 
 Allows grantee to write the ACL for the applicable bucket. This functionality is not supported for directory buckets.

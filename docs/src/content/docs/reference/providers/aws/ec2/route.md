@@ -3,6 +3,7 @@ title: "aws.ec2.route"
 description: "AWS EC2 route resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::Route`
 
 Describes a route in a route table.
@@ -34,7 +35,7 @@ let rt = aws.ec2.route_table {
   }
 }
 
-let route = aws.ec2.route {
+aws.ec2.route {
   route_table_id         = rt.route_table_id
   destination_cidr_block = "0.0.0.0/0"
   gateway_id             = igw.internet_gateway_id

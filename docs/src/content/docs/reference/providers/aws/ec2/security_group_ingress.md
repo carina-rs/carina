@@ -3,6 +3,7 @@ title: "aws.ec2.security_group_ingress"
 description: "AWS EC2 security_group_ingress resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::SecurityGroupIngress`
 
 Describes a security group rule.
@@ -28,7 +29,7 @@ let sg = aws.ec2.security_group {
   }
 }
 
-let ingress = aws.ec2.security_group_ingress {
+aws.ec2.security_group_ingress {
   group_id    = sg.group_id
   description = "Allow HTTPS from VPC"
   ip_protocol = tcp
@@ -135,6 +136,7 @@ The ID of the source security group.
 | `icmp` | `aws.ec2.security_group_ingress.IpProtocol.icmp` |
 | `icmpv6` | `aws.ec2.security_group_ingress.IpProtocol.icmpv6` |
 | `-1` | `aws.ec2.security_group_ingress.IpProtocol.all` |
+| `all` | `aws.ec2.security_group_ingress.IpProtocol.all` |
 
 Shorthand formats: `tcp` or `IpProtocol.tcp`
 

@@ -3,6 +3,7 @@ title: "aws.ec2.security_group_egress"
 description: "AWS EC2 security_group_egress resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::SecurityGroupEgress`
 
 Describes a security group rule.
@@ -28,7 +29,7 @@ let sg = aws.ec2.security_group {
   }
 }
 
-let egress = aws.ec2.security_group_egress {
+aws.ec2.security_group_egress {
   group_id    = sg.group_id
   description = "Allow HTTPS outbound"
   ip_protocol = tcp
@@ -128,6 +129,7 @@ The ID of the destination security group.
 | `icmp` | `aws.ec2.security_group_egress.IpProtocol.icmp` |
 | `icmpv6` | `aws.ec2.security_group_egress.IpProtocol.icmpv6` |
 | `-1` | `aws.ec2.security_group_egress.IpProtocol.all` |
+| `all` | `aws.ec2.security_group_egress.IpProtocol.all` |
 
 Shorthand formats: `tcp` or `IpProtocol.tcp`
 

@@ -3,6 +3,7 @@ title: "aws.ec2.security_group"
 description: "AWS EC2 security_group resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::SecurityGroup`
 
 Describes a security group.
@@ -18,7 +19,7 @@ let vpc = aws.ec2.vpc {
   }
 }
 
-let sg = aws.ec2.security_group {
+aws.ec2.security_group {
   group_name  = "carina-example-sg"
   description = "Example security group"
   vpc_id      = vpc.vpc_id
