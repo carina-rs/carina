@@ -7,10 +7,20 @@ use super::parser::{self, FormatParseError};
 
 /// Format a .crn file
 pub fn format(source: &str, config: &FormatConfig) -> Result<String, FormatParseError> {
-    let pairs = parser::parse(source)?;
-    let cst = build_cst(source, pairs);
+    let preprocess_result =
+        crate::heredoc::preprocess_heredocs(source).map_err(|e| FormatParseError {
+            message: e.to_string(),
+            line: 0,
+            column: 0,
+        })?;
+    let pairs = parser::parse(&preprocess_result.source)?;
+    let cst = build_cst(&preprocess_result.source, pairs);
     let formatter = Formatter::new(config.clone());
-    Ok(formatter.format(&cst))
+    let formatted = formatter.format(&cst);
+    Ok(crate::heredoc::restore_heredocs(
+        &formatted,
+        &preprocess_result.heredocs,
+    ))
 }
 
 /// Format a .crn file, converting `= [{...}]` to block syntax for attributes
@@ -21,10 +31,20 @@ pub fn format_with_block_names(
     config: &FormatConfig,
     block_names: &std::collections::HashMap<String, String>,
 ) -> Result<String, FormatParseError> {
-    let pairs = parser::parse(source)?;
-    let cst = build_cst(source, pairs);
+    let preprocess_result =
+        crate::heredoc::preprocess_heredocs(source).map_err(|e| FormatParseError {
+            message: e.to_string(),
+            line: 0,
+            column: 0,
+        })?;
+    let pairs = parser::parse(&preprocess_result.source)?;
+    let cst = build_cst(&preprocess_result.source, pairs);
     let formatter = Formatter::with_block_names(config.clone(), block_names.clone());
-    Ok(formatter.format(&cst))
+    let formatted = formatter.format(&cst);
+    Ok(crate::heredoc::restore_heredocs(
+        &formatted,
+        &preprocess_result.heredocs,
+    ))
 }
 
 /// Check if a file needs formatting

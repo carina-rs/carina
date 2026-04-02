@@ -40,8 +40,65 @@ impl SemanticTokensProvider {
         let mut prev_line = 0u32;
         let mut prev_start = 0u32;
         let mut block_comment_depth: usize = 0;
+        let mut heredoc_marker: Option<String> = None;
 
         for (line_idx, line) in text.lines().enumerate() {
+            // Handle heredoc state: if we're inside a heredoc, highlight the whole line as string
+            if let Some(ref marker) = heredoc_marker {
+                let trimmed = line.trim();
+                let line_len = position::char_len(line);
+                if line_len > 0 {
+                    let delta_line = line_idx as u32 - prev_line;
+                    let delta_start = if delta_line == 0 { 0 - prev_start } else { 0 };
+                    tokens.push(SemanticToken {
+                        delta_line,
+                        delta_start,
+                        length: line_len,
+                        token_type: 4, // STRING
+                        token_modifiers_bitset: 0,
+                    });
+                    prev_line = line_idx as u32;
+                    prev_start = 0;
+                }
+                if trimmed == marker {
+                    heredoc_marker = None;
+                }
+                continue;
+            }
+
+            // Check if this line starts a heredoc
+            if let Some(marker) = find_heredoc_marker(line) {
+                // Tokenize the part before the heredoc normally
+                let line_tokens = self.tokenize_line_with_block_comments(
+                    line,
+                    line_idx as u32,
+                    &mut block_comment_depth,
+                );
+
+                for (start, length, token_type) in line_tokens {
+                    let delta_line = line_idx as u32 - prev_line;
+                    let delta_start = if delta_line == 0 {
+                        start - prev_start
+                    } else {
+                        start
+                    };
+
+                    tokens.push(SemanticToken {
+                        delta_line,
+                        delta_start,
+                        length,
+                        token_type,
+                        token_modifiers_bitset: 0,
+                    });
+
+                    prev_line = line_idx as u32;
+                    prev_start = start;
+                }
+
+                heredoc_marker = Some(marker);
+                continue;
+            }
+
             let line_tokens = self.tokenize_line_with_block_comments(
                 line,
                 line_idx as u32,
@@ -570,6 +627,66 @@ impl SemanticTokensProvider {
             search_start = absolute_byte_pos + pattern.len();
         }
     }
+}
+
+/// Find a heredoc marker in a line (e.g., `<<EOT` or `<<-EOT`).
+/// Returns the marker string if found, skipping occurrences inside string literals.
+fn find_heredoc_marker(line: &str) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut in_double_quote = false;
+    let mut in_single_quote = false;
+    let mut escaped = false;
+
+    while i < bytes.len() {
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'\\' && (in_double_quote || in_single_quote) {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+            i += 1;
+            continue;
+        }
+
+        if !in_double_quote
+            && !in_single_quote
+            && bytes[i] == b'<'
+            && i + 1 < bytes.len()
+            && bytes[i + 1] == b'<'
+        {
+            let mut j = i + 2;
+            if j < bytes.len() && bytes[j] == b'-' {
+                j += 1;
+            }
+            let marker_start = j;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            let marker = &line[marker_start..j];
+            if !marker.is_empty() {
+                let rest = line[j..].trim();
+                if rest.is_empty() {
+                    return Some(marker.to_string());
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -1244,5 +1361,31 @@ mod tests {
             "Expected KEYWORD token for 'in'. Got: {:?}",
             tokens
         );
+    }
+
+    #[test]
+    fn test_heredoc_highlighted_as_string() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let input = "policy = <<EOT\n{\"Version\": \"2012-10-17\"}\nEOT";
+        let tokens = provider.tokenize(input);
+
+        // Lines 2 and 3 (body + closing marker) should have STRING tokens
+        let string_tokens: Vec<_> = tokens.iter().filter(|t| t.token_type == 4).collect();
+        assert!(
+            string_tokens.len() >= 2,
+            "Heredoc body and closing marker should be highlighted as STRING. Got: {:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn test_find_heredoc_marker() {
+        assert_eq!(
+            find_heredoc_marker("policy = <<EOT"),
+            Some("EOT".to_string())
+        );
+        assert_eq!(find_heredoc_marker("x = <<-EOF"), Some("EOF".to_string()));
+        assert_eq!(find_heredoc_marker("x = \"<<EOT\""), None);
+        assert_eq!(find_heredoc_marker("x = 123"), None);
     }
 }

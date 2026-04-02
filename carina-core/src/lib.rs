@@ -11,6 +11,7 @@ pub mod differ;
 pub mod effect;
 pub mod executor;
 pub mod formatter;
+pub mod heredoc;
 pub mod identifier;
 pub mod lint;
 pub mod module;

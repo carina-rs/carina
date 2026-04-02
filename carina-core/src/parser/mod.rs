@@ -452,7 +452,12 @@ fn first_inner<'a>(
 /// The config allows injecting a decryptor function for `decrypt()` calls
 /// and custom type validators from provider crates.
 pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseError> {
-    let pairs = CarinaParser::parse(Rule::file, input)?;
+    let preprocess_result =
+        crate::heredoc::preprocess_heredocs(input).map_err(|e| ParseError::InvalidExpression {
+            line: 0,
+            message: e.to_string(),
+        })?;
+    let pairs = CarinaParser::parse(Rule::file, &preprocess_result.source)?;
 
     let mut ctx = ParseContext::new(config);
     let mut providers = Vec::new();
@@ -9317,6 +9322,65 @@ arguments {
                 Value::String("b".to_string()),
                 Value::String("c".to_string()),
             ])
+        );
+    }
+
+    #[test]
+    fn parse_heredoc_basic() {
+        let input = r#"
+            aws.iam.role {
+                name = "my-role"
+                policy = <<EOT
+{
+  "Version": "2012-10-17"
+}
+EOT
+            }
+        "#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        let resource = &result.resources[0];
+        assert_eq!(
+            resource.get_attr("policy"),
+            Some(&Value::String(
+                "{\n  \"Version\": \"2012-10-17\"\n}".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_heredoc_indented() {
+        // <<- strips common leading whitespace
+        let input = "aws.iam.role {\n    name = \"my-role\"\n    policy = <<-EOT\n        line1\n        line2\n        line3\n    EOT\n}\n";
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        let resource = &result.resources[0];
+        assert_eq!(
+            resource.get_attr("policy"),
+            Some(&Value::String("line1\nline2\nline3".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_heredoc_empty() {
+        let input = "aws.iam.role {\n    name = \"my-role\"\n    policy = <<EOT\nEOT\n}\n";
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        let resource = &result.resources[0];
+        assert_eq!(
+            resource.get_attr("policy"),
+            Some(&Value::String("".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_heredoc_in_let_binding() {
+        let input = r#"
+            let doc = <<EOF
+hello world
+EOF
+        "#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(
+            result.variables.get("doc"),
+            Some(&Value::String("hello world".to_string()))
         );
     }
 }
