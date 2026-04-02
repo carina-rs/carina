@@ -1,6 +1,0 @@
-provider aws {
-    source = "file:///Users/mizzy/src/github.com/carina-rs/carina-provider-aws/target/wasm32-wasip2/release/carina-provider-aws.wasm"
-    region = "ap-northeast-1"
-}
-
-let identity = read aws.sts.caller_identity {}
