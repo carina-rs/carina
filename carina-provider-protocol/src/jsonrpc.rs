@@ -83,7 +83,9 @@ impl Notification {
         Self {
             jsonrpc: "2.0".into(),
             method: "ready".into(),
-            params: None,
+            params: Some(serde_json::json!({
+                "protocol_version": crate::PROTOCOL_VERSION,
+            })),
         }
     }
 }
@@ -123,5 +125,16 @@ mod tests {
         let json = serde_json::to_string(&notif).unwrap();
         assert!(json.contains("\"method\":\"ready\""));
         assert!(!json.contains("\"id\""));
+    }
+
+    #[test]
+    fn test_notification_ready_includes_protocol_version() {
+        let notif = Notification::ready();
+        let json: serde_json::Value = serde_json::to_value(&notif).unwrap();
+        let params = json.get("params").expect("ready should have params");
+        let version = params
+            .get("protocol_version")
+            .expect("params should have protocol_version");
+        assert_eq!(version, &serde_json::Value::Number(1.into()));
     }
 }
