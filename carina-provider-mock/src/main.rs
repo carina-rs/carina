@@ -26,6 +26,7 @@ impl CarinaProvider for MockProcessProvider {
         ProviderInfo {
             name: "mock".into(),
             display_name: "Mock Provider (Process)".into(),
+            capabilities: vec![],
         }
     }
 
