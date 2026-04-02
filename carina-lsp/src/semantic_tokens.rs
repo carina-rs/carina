@@ -391,18 +391,27 @@ impl SemanticTokensProvider {
             )); // OPERATOR
         }
 
-        // String literals
-        let mut in_string = false;
-        let mut string_start_char = 0u32;
-        for (char_idx, (_byte_idx, c)) in line.char_indices().enumerate() {
-            let char_idx = char_idx as u32;
-            if c == '"' {
+        // String literals (double-quoted and single-quoted)
+        {
+            let mut in_string = false;
+            let mut string_start_char = 0u32;
+            let mut string_quote_char = '"';
+            let mut escaped = false;
+            for (char_idx, (_byte_idx, c)) in line.char_indices().enumerate() {
+                let char_idx = char_idx as u32;
                 if in_string {
-                    tokens.push((string_start_char, char_idx - string_start_char + 1, 4));
-                    // STRING
-                    in_string = false;
-                } else {
+                    if escaped {
+                        escaped = false;
+                    } else if c == '\\' {
+                        escaped = true;
+                    } else if c == string_quote_char {
+                        tokens.push((string_start_char, char_idx - string_start_char + 1, 4));
+                        // STRING
+                        in_string = false;
+                    }
+                } else if c == '"' || c == '\'' {
                     string_start_char = char_idx;
+                    string_quote_char = c;
                     in_string = true;
                 }
             }

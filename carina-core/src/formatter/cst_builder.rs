@@ -223,7 +223,12 @@ impl<'a> CstBuilder<'a> {
             Rule::float => Some(CstChild::Token(Token::new(pair.as_str().to_string(), span))),
             Rule::number => Some(CstChild::Token(Token::new(pair.as_str().to_string(), span))),
             Rule::boolean => Some(CstChild::Token(Token::new(pair.as_str().to_string(), span))),
-            Rule::inner_string | Rule::char => None,
+            Rule::inner_string
+            | Rule::char
+            | Rule::double_quoted_string
+            | Rule::single_quoted_string
+            | Rule::single_quoted_inner
+            | Rule::single_quoted_char => None,
 
             // Delimiters and operators
             Rule::open_brace => Some(CstChild::Token(Token::new("{".to_string(), span))),

@@ -1916,8 +1916,20 @@ fn parse_resource_address(pair: pest::iterators::Pair<Rule>) -> Result<ResourceI
 /// Parse a string token into its literal value (without quotes).
 /// Only handles plain strings (no interpolation).
 fn parse_string_literal(pair: pest::iterators::Pair<Rule>) -> Result<String, ParseError> {
+    // string = single_quoted_string | double_quoted_string
+    let inner_pair = pair.into_inner().next().unwrap();
+
+    if inner_pair.as_rule() == Rule::single_quoted_string {
+        return Ok(inner_pair
+            .into_inner()
+            .next()
+            .map(|p| unescape_single_quoted(p.as_str()))
+            .unwrap_or_default());
+    }
+
+    // Double-quoted string
     let mut result = String::new();
-    for part in pair.into_inner() {
+    for part in inner_pair.into_inner() {
         if part.as_rule() == Rule::string_part {
             for inner in part.into_inner() {
                 if inner.as_rule() == Rule::string_literal {
@@ -2700,8 +2712,20 @@ fn parse_remote_state_block(
 fn extract_string_from_string_pair(
     pair: pest::iterators::Pair<Rule>,
 ) -> Result<String, ParseError> {
+    // string = single_quoted_string | double_quoted_string
+    let inner_pair = pair.into_inner().next().unwrap();
+
+    if inner_pair.as_rule() == Rule::single_quoted_string {
+        return Ok(inner_pair
+            .into_inner()
+            .next()
+            .map(|p| unescape_single_quoted(p.as_str()))
+            .unwrap_or_default());
+    }
+
+    // Double-quoted string
     let mut result = String::new();
-    for inner in pair.into_inner() {
+    for inner in inner_pair.into_inner() {
         if inner.as_rule() == Rule::string_part {
             for part in inner.into_inner() {
                 if part.as_rule() == Rule::string_literal {
@@ -2719,6 +2743,15 @@ fn extract_string_from_pair(pair: pest::iterators::Pair<Rule>) -> Result<String,
     fn find_string(pair: pest::iterators::Pair<Rule>) -> Option<String> {
         if pair.as_rule() == Rule::string_literal {
             return Some(pair.as_str().to_string());
+        }
+        if pair.as_rule() == Rule::single_quoted_content {
+            return Some(unescape_single_quoted(pair.as_str()));
+        }
+        if pair.as_rule() == Rule::single_quoted_string {
+            return pair
+                .into_inner()
+                .next()
+                .map(|p| unescape_single_quoted(p.as_str()));
         }
         if pair.as_rule() == Rule::string {
             let mut result = String::new();
@@ -3413,10 +3446,24 @@ fn parse_string_value(
 ) -> Result<Value, ParseError> {
     use crate::resource::InterpolationPart;
 
+    // string = single_quoted_string | double_quoted_string
+    let inner_pair = first_inner(pair, "string content", "string")?;
+
+    if inner_pair.as_rule() == Rule::single_quoted_string {
+        // Single-quoted: literal only, no interpolation
+        let content = inner_pair
+            .into_inner()
+            .next()
+            .map(|p| unescape_single_quoted(p.as_str()))
+            .unwrap_or_default();
+        return Ok(Value::String(content));
+    }
+
+    // Double-quoted string (original behavior)
     let mut parts: Vec<InterpolationPart> = Vec::new();
     let mut has_interpolation = false;
 
-    for part in pair.into_inner() {
+    for part in inner_pair.into_inner() {
         if part.as_rule() == Rule::string_part {
             let inner = first_inner(part, "string content", "string_part")?;
             match inner.as_rule() {
@@ -3454,8 +3501,20 @@ fn parse_string_value(
 /// Parse a string rule for use in non-expression contexts (e.g., import paths).
 /// This only handles plain strings without interpolation.
 fn parse_string(pair: pest::iterators::Pair<Rule>) -> String {
+    // string = single_quoted_string | double_quoted_string
+    let inner_pair = pair.into_inner().next().unwrap();
+
+    if inner_pair.as_rule() == Rule::single_quoted_string {
+        return inner_pair
+            .into_inner()
+            .next()
+            .map(|p| unescape_single_quoted(p.as_str()))
+            .unwrap_or_default();
+    }
+
+    // Double-quoted string
     let mut result = String::new();
-    for part in pair.into_inner() {
+    for part in inner_pair.into_inner() {
         if part.as_rule() == Rule::string_part
             && let Some(inner) = part.into_inner().next()
             && inner.as_rule() == Rule::string_literal
@@ -3479,6 +3538,29 @@ fn unescape_string(s: &str) -> String {
                 Some('"') => result.push('"'),
                 Some('\\') => result.push('\\'),
                 Some('$') => result.push('$'),
+                Some(other) => {
+                    result.push('\\');
+                    result.push(other);
+                }
+                None => result.push('\\'),
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Handle escape sequences in single-quoted string literals.
+/// Only `\'` and `\\` are recognized as escape sequences.
+fn unescape_single_quoted(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('\'') => result.push('\''),
+                Some('\\') => result.push('\\'),
                 Some(other) => {
                     result.push('\\');
                     result.push(other);
@@ -9166,6 +9248,57 @@ arguments {
             }
             other => panic!("Expected Closure, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn parse_single_quoted_string_literal() {
+        let input = r#"
+            let vpc = aws.ec2.vpc {
+                name = 'my-vpc'
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        let vpc = &result.resources[0];
+        assert_eq!(
+            vpc.get_attr("name"),
+            Some(&Value::String("my-vpc".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_single_quoted_string_no_interpolation() {
+        // Single-quoted strings should NOT support interpolation — ${...} is literal
+        let input = r#"
+            let env = "prod"
+            let vpc = aws.ec2.vpc {
+                name = 'vpc-${env}'
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        let vpc = &result.resources[0];
+        // Should be a plain string, not interpolated
+        assert_eq!(
+            vpc.get_attr("name"),
+            Some(&Value::String("vpc-${env}".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_single_quoted_string_escape_sequences() {
+        let input = r#"
+            let vpc = aws.ec2.vpc {
+                name = 'it\'s a test'
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        let vpc = &result.resources[0];
+        assert_eq!(
+            vpc.get_attr("name"),
+            Some(&Value::String("it's a test".to_string()))
+        );
     }
 
     #[test]
