@@ -30,8 +30,5 @@ docs/dist/
 docs/node_modules/
 docs/.astro/
 
-# CloudFormation schema cache
-carina-provider-awscc/cfn-schema-cache/
-
 # Superpowers brainstorm sessions
 .superpowers/
