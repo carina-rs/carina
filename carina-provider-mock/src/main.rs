@@ -104,6 +104,15 @@ impl CarinaProvider for MockProcessProvider {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() {
     carina_plugin_sdk::run(MockProcessProvider::default());
 }
+
+// For WASM: export_provider! macro bridges CarinaProvider to the WIT interface.
+// An empty main() is still required for the binary target.
+#[cfg(target_arch = "wasm32")]
+carina_plugin_sdk::export_provider!(MockProcessProvider);
+
+#[cfg(target_arch = "wasm32")]
+fn main() {}
