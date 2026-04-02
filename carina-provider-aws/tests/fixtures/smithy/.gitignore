@@ -1,3 +1,0 @@
-# Downloaded AWS Smithy models (large files, not checked in)
-# Run scripts/download-smithy-models.sh to fetch them
-*.json
