@@ -85,6 +85,22 @@ pub fn download_url(source: &str, version: &str, target: &str) -> Result<String,
     ))
 }
 
+/// Construct the download URL for a WASM provider binary.
+pub fn download_url_wasm(source: &str, version: &str) -> Result<String, String> {
+    let parts: Vec<&str> = source.split('/').collect();
+    if parts.len() != 3 || parts[0] != "github.com" {
+        return Err(format!(
+            "Invalid source format: {source}. Expected: github.com/{{owner}}/{{repo}}"
+        ));
+    }
+    let owner = parts[1];
+    let repo = parts[2];
+
+    Ok(format!(
+        "https://github.com/{owner}/{repo}/releases/download/v{version}/{repo}-v{version}.wasm"
+    ))
+}
+
 /// Resolve the cache path for a provider binary.
 pub fn cache_path(base_dir: &Path, source: &str, version: &str) -> PathBuf {
     let repo = source.split('/').next_back().unwrap_or("provider");
@@ -94,6 +110,17 @@ pub fn cache_path(base_dir: &Path, source: &str, version: &str) -> PathBuf {
         .join(source)
         .join(version)
         .join(repo)
+}
+
+/// Resolve the cache path for a WASM provider binary.
+pub fn cache_path_wasm(base_dir: &Path, source: &str, version: &str) -> PathBuf {
+    let repo = source.split('/').next_back().unwrap_or("provider");
+    base_dir
+        .join(".carina")
+        .join("providers")
+        .join(source)
+        .join(version)
+        .join(format!("{repo}.wasm"))
 }
 
 /// Compute SHA256 hex digest of a file.
@@ -185,6 +212,12 @@ fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> Result<PathBuf, Strin
 }
 
 /// Resolve a single provider: download if missing, verify if cached.
+///
+/// Resolution order:
+/// 1. Check WASM cache — use it if it exists (after SHA256 verification).
+/// 2. Check native binary cache — use it if it exists (after SHA256 verification).
+/// 3. Try downloading WASM first (platform-independent).
+/// 4. Fall back to downloading the native binary as a tar.gz.
 pub fn resolve_provider(
     base_dir: &Path,
     source: &str,
@@ -192,8 +225,24 @@ pub fn resolve_provider(
     name: &str,
     lock_file: &mut LockFile,
 ) -> Result<PathBuf, String> {
-    let binary_path = cache_path(base_dir, source, version);
+    // 1. Check WASM cache first.
+    let wasm_path = cache_path_wasm(base_dir, source, version);
+    if wasm_path.exists() {
+        if let Some(lock_entry) = lock_file.find(source, version) {
+            let actual_hash =
+                sha256_file(&wasm_path).map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
+            if actual_hash != lock_entry.sha256 {
+                return Err(format!(
+                    "SHA256 mismatch for provider '{}' ({}@{}). Expected: {}, got: {}. Re-run `carina init` to re-download.",
+                    name, source, version, lock_entry.sha256, actual_hash
+                ));
+            }
+        }
+        return Ok(wasm_path);
+    }
 
+    // 2. Check native binary cache.
+    let binary_path = cache_path(base_dir, source, version);
     if binary_path.exists() {
         if let Some(lock_entry) = lock_file.find(source, version) {
             let actual_hash =
@@ -208,6 +257,36 @@ pub fn resolve_provider(
         return Ok(binary_path);
     }
 
+    // 3. Try downloading WASM first (platform-independent).
+    let wasm_url = download_url_wasm(source, version)?;
+    println!("Downloading WASM provider '{}' from {}", name, wasm_url);
+    match download_to_file(&wasm_url, &wasm_path) {
+        Ok(()) => {
+            let hash =
+                sha256_file(&wasm_path).map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
+            lock_file.upsert(LockEntry {
+                name: name.to_string(),
+                source: source.to_string(),
+                version: version.to_string(),
+                sha256: hash,
+            });
+            println!(
+                "Installed WASM provider '{}' ({}@{})",
+                name, source, version
+            );
+            return Ok(wasm_path);
+        }
+        Err(e) => {
+            eprintln!(
+                "WASM provider not available ({}), falling back to native binary: {}",
+                wasm_url, e
+            );
+            // Clean up any partial download.
+            let _ = fs::remove_file(&wasm_path);
+        }
+    }
+
+    // 4. Fall back to downloading the native binary.
     let target = detect_target()?;
     let url = download_url(source, version, &target)?;
 
@@ -347,6 +426,21 @@ mod tests {
     }
 
     #[test]
+    fn test_download_url_wasm() {
+        let url = download_url_wasm("github.com/carina-rs/carina-provider-awscc", "0.1.0").unwrap();
+        assert_eq!(
+            url,
+            "https://github.com/carina-rs/carina-provider-awscc/releases/download/v0.1.0/carina-provider-awscc-v0.1.0.wasm"
+        );
+    }
+
+    #[test]
+    fn test_download_url_wasm_invalid_source() {
+        let result = download_url_wasm("invalid-source", "0.1.0");
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_download_url_invalid_source() {
         let result = download_url("invalid-source", "0.1.0", "x86_64-unknown-linux-gnu");
         assert!(result.is_err());
@@ -361,6 +455,47 @@ mod tests {
             PathBuf::from(
                 "/tmp/project/.carina/providers/github.com/carina-rs/carina-provider-awscc/0.1.0/carina-provider-awscc"
             )
+        );
+    }
+
+    #[test]
+    fn test_cache_path_wasm() {
+        let base = Path::new("/tmp/project");
+        let path = cache_path_wasm(base, "github.com/carina-rs/carina-provider-awscc", "0.1.0");
+        assert_eq!(
+            path,
+            PathBuf::from(
+                "/tmp/project/.carina/providers/github.com/carina-rs/carina-provider-awscc/0.1.0/carina-provider-awscc.wasm"
+            )
+        );
+    }
+
+    #[test]
+    fn test_resolve_prefers_wasm_cache() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let source = "github.com/carina-rs/carina-provider-awscc";
+        let version = "0.1.0";
+
+        // Create a fake WASM file in the cache.
+        let wasm_path = cache_path_wasm(base, source, version);
+        fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
+        let mut f = fs::File::create(&wasm_path).unwrap();
+        f.write_all(b"fake wasm content").unwrap();
+
+        // Also create a fake native binary (should NOT be preferred).
+        let native_path = cache_path(base, source, version);
+        let mut f2 = fs::File::create(&native_path).unwrap();
+        f2.write_all(b"fake native binary").unwrap();
+
+        let mut lock_file = LockFile::default();
+        let result = resolve_provider(base, source, version, "awscc", &mut lock_file).unwrap();
+
+        assert_eq!(
+            result, wasm_path,
+            "WASM cache should be preferred over native binary"
         );
     }
 
