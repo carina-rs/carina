@@ -1,0 +1,10 @@
+package carina:provider@0.1.0;
+
+world carina-provider {
+    export provider;
+}
+
+world carina-provider-with-http {
+    import wasi:http/outgoing-handler@0.2.0;
+    export provider;
+}

@@ -1,0 +1,37 @@
+interface provider {
+    use types.{
+        resource-id, state, resource-def, lifecycle-config,
+        provider-error, resource-schema, value, provider-info,
+    };
+
+    info: func() -> provider-info;
+
+    schemas: func() -> list<resource-schema>;
+
+    validate-config: func(attrs: list<tuple<string, value>>) -> result<_, string>;
+
+    initialize: func(attrs: list<tuple<string, value>>) -> result<_, string>;
+
+    read: func(id: resource-id, identifier: option<string>) -> result<state, provider-error>;
+
+    create: func(res: resource-def) -> result<state, provider-error>;
+
+    update: func(
+        id: resource-id,
+        identifier: string,
+        current: state,
+        to: resource-def,
+    ) -> result<state, provider-error>;
+
+    delete: func(
+        id: resource-id,
+        identifier: string,
+        lifecycle: lifecycle-config,
+    ) -> result<_, provider-error>;
+
+    normalize-desired: func(resources: list<resource-def>) -> list<resource-def>;
+
+    normalize-state: func(
+        states: list<tuple<string, state>>,
+    ) -> list<tuple<string, state>>;
+}
