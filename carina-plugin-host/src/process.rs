@@ -15,6 +15,38 @@ pub struct ProviderProcess {
     next_id: AtomicU64,
 }
 
+fn validate_protocol_version(params: Option<&serde_json::Value>) -> Result<(), String> {
+    let expected = carina_provider_protocol::PROTOCOL_VERSION;
+
+    let params = params.ok_or_else(|| {
+        format!(
+            "Plugin did not report a protocol version. Carina requires protocol version {expected}."
+        )
+    })?;
+
+    let version = params.get("protocol_version").and_then(|v| v.as_u64());
+
+    match version {
+        Some(v) if v as u32 == expected => Ok(()),
+        Some(v) => {
+            if (v as u32) < expected {
+                Err(format!(
+                    "Plugin uses protocol version {v}, but Carina requires version {expected}. \
+                     Please update the plugin."
+                ))
+            } else {
+                Err(format!(
+                    "Plugin uses protocol version {v}, but this version of Carina only supports \
+                     version {expected}. Please update Carina."
+                ))
+            }
+        }
+        None => Err(format!(
+            "Plugin did not report a protocol version. Carina requires protocol version {expected}."
+        )),
+    }
+}
+
 impl ProviderProcess {
     /// Spawn a provider binary and wait for the "ready" notification.
     pub fn spawn(binary_path: &Path) -> Result<Self, String> {
@@ -47,6 +79,12 @@ impl ProviderProcess {
         if !trimmed.contains("\"ready\"") {
             return Err(format!("Expected ready notification, got: {trimmed}"));
         }
+
+        // Validate protocol version from ready notification params
+        let notification: carina_provider_protocol::jsonrpc::Notification =
+            serde_json::from_str(trimmed)
+                .map_err(|e| format!("Failed to parse ready notification: {e}"))?;
+        validate_protocol_version(notification.params.as_ref())?;
 
         Ok(Self {
             child,
@@ -103,5 +141,46 @@ impl ProviderProcess {
 impl Drop for ProviderProcess {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_protocol_version_matching() {
+        let params =
+            serde_json::json!({ "protocol_version": carina_provider_protocol::PROTOCOL_VERSION });
+        let result = validate_protocol_version(Some(&params));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_protocol_version_mismatch() {
+        let params = serde_json::json!({ "protocol_version": 999 });
+        let result = validate_protocol_version(Some(&params));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("protocol version 999"));
+        assert!(err.contains(&format!(
+            "version {}",
+            carina_provider_protocol::PROTOCOL_VERSION
+        )));
+    }
+
+    #[test]
+    fn test_validate_protocol_version_missing_params() {
+        let result = validate_protocol_version(None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("did not report a protocol version"));
+    }
+
+    #[test]
+    fn test_validate_protocol_version_missing_field() {
+        let params = serde_json::json!({});
+        let result = validate_protocol_version(Some(&params));
+        assert!(result.is_err());
     }
 }
