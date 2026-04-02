@@ -171,8 +171,6 @@ jobs:
           sleep 30
           cargo publish -p carina-provider-aws --no-verify || true
           sleep 30
-          cargo publish -p carina-provider-awscc --no-verify || true
-          sleep 30
           cargo publish -p carina-tui --no-verify || true
           sleep 30
           cargo publish -p carina-lsp --no-verify || true

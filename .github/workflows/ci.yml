@@ -62,7 +62,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: bash carina-provider-aws/scripts/check-examples.sh
-      - run: bash carina-provider-awscc/scripts/check-examples.sh
 
   validate-crn:
     name: Validate .crn Files
