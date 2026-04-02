@@ -14,7 +14,6 @@ export default defineConfig({
       components: {
         Hero: './src/components/Hero.astro',
         Head: './src/components/Head.astro',
-        PageSidebar: './src/components/PageSidebar.astro',
       },
       favicon: '/favicon.png',
       head: [],
