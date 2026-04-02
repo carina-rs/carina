@@ -24,12 +24,15 @@ fn validate_protocol_version(params: Option<&serde_json::Value>) -> Result<(), S
         )
     })?;
 
-    let version = params.get("protocol_version").and_then(|v| v.as_u64());
+    let version = params
+        .get("protocol_version")
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u32::try_from(v).ok());
 
     match version {
-        Some(v) if v as u32 == expected => Ok(()),
+        Some(v) if v == expected => Ok(()),
         Some(v) => {
-            if (v as u32) < expected {
+            if v < expected {
                 Err(format!(
                     "Plugin uses protocol version {v}, but Carina requires version {expected}. \
                      Please update the plugin."
