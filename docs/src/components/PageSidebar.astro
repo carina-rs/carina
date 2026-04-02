@@ -13,6 +13,7 @@ import TableOfContents from 'virtual:starlight/components/TableOfContents';
 				<div class="toc-header">
 					<button
 						class="toc-toggle"
+						aria-expanded="true"
 						aria-label="Toggle table of contents"
 						title="Toggle table of contents"
 					>
@@ -53,6 +54,9 @@ import TableOfContents from 'virtual:starlight/components/TableOfContents';
 			document.documentElement.removeAttribute('data-toc-collapsed');
 		}
 
+		// Update aria-expanded to match current state
+		button.setAttribute('aria-expanded', String(!collapsed));
+
 		// Clone and replace to remove old event listeners (for view transitions)
 		const newButton = button.cloneNode(true);
 		button.replaceWith(newButton);
@@ -62,9 +66,11 @@ import TableOfContents from 'virtual:starlight/components/TableOfContents';
 			if (isCollapsed) {
 				document.documentElement.removeAttribute('data-toc-collapsed');
 				localStorage.setItem(STORAGE_KEY, 'false');
+				newButton.setAttribute('aria-expanded', 'true');
 			} else {
 				document.documentElement.setAttribute('data-toc-collapsed', '');
 				localStorage.setItem(STORAGE_KEY, 'true');
+				newButton.setAttribute('aria-expanded', 'false');
 			}
 		});
 	}
