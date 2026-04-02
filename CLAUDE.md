@@ -74,7 +74,7 @@ cargo test
 
 Key rules:
 - After modifying a single crate, build/test only that crate with `-p <crate-name>`
-- After modifying codegen, build only the affected provider crate (e.g., `cargo build -p carina-provider-awscc`)
+- After modifying codegen, build only the affected provider crate
 - Use full workspace `cargo build` / `cargo test` only when changes affect multiple crates or before creating a PR
 - For `cargo check`, prefer `cargo check -p <crate-name>` as well
 
@@ -97,8 +97,11 @@ DSL (.crn) → Parser → Resources → Differ → Plan (Effects) → Provider �
 ### Crate Structure
 
 - **carina-core**: Core library with parser, types, and traits. No AWS dependencies.
-- **carina-provider-aws**: AWS implementation of Provider trait using `aws-sdk-s3`.
 - **carina-cli**: Binary that wires everything together.
+- **carina-plugin-host**: WASM plugin host for loading provider plugins.
+- **carina-plugin-sdk**: SDK for building WASM provider plugins.
+- **carina-provider-mock**: Mock provider for testing.
+- **carina-provider-protocol**: Protocol definitions for provider communication.
 
 ### DSL Parser
 
@@ -106,12 +109,6 @@ The parser uses [pest](https://pest.rs/) grammar defined in `carina-core/src/par
 - `provider <name> { ... }` - Provider configuration
 - `<provider>.<service>.<resource_type> { ... }` - Anonymous resource (ID from `name` attribute)
 - `let <binding> = <resource>` - Named resource binding
-
-### Region Format Conversion
-
-The DSL uses `aws.Region.ap_northeast_1` format, but AWS SDK uses `ap-northeast-1`. Conversion happens in:
-- `carina-provider-aws/src/lib.rs`: `convert_region_value()` for DSL→SDK
-- Provider read operations return DSL format for consistent state comparison
 
 ### LSP Integration
 
@@ -134,10 +131,6 @@ When modifying the DSL or resource schemas, also update the LSP:
 
 **Testing**: When bugs are found or issues are pointed out, write test code to capture the fix. This ensures regressions are caught and documents expected behavior.
 
-### Provider-Specific Types
-
-AWS-specific type definitions (e.g., region validation, versioning status) belong in `carina-provider-aws/src/schemas/types.rs` and `carina-provider-awscc/src/schemas/generated/mod.rs`, NOT in `carina-core`. Keep `carina-core` provider-agnostic.
-
 ### Resource Type Mapping
 
 Resource types in DSL use dot notation (`s3.bucket`, `ec2.vpc`). When mapping between DSL resource types and schema lookups:
@@ -151,7 +144,7 @@ Resource types in DSL use dot notation (`s3.bucket`, `ec2.vpc`). When mapping be
 
 ### Namespaced Enum Identifiers
 
-Enum values use namespaced identifiers like `aws.s3.VersioningStatus.Enabled` or `awscc.ec2.vpc.InstanceTenancy.default`.
+Enum values use namespaced identifiers like `aws.s3.VersioningStatus.Enabled`.
 
 **When adding new namespaced patterns:**
 
@@ -179,8 +172,6 @@ Enum values use namespaced identifiers like `aws.s3.VersioningStatus.Enabled` or
 **Key points:**
 - Defined in `carina-core/src/schema.rs` as `Struct { name, fields: Vec<StructField> }`
 - Each `StructField` has: `name`, `field_type` (recursive AttributeType), `required`, `description`
-- AWSCC provider converts between DSL snake_case and CloudFormation PascalCase (see `carina-provider-awscc/src/provider.rs`)
-- Codegen resolves CloudFormation `$ref` and inline object definitions into Struct types
 
 **LSP integration:**
 - When adding Struct validation, update `carina-lsp/src/diagnostics/validation.rs` to validate nested fields
@@ -208,19 +199,6 @@ git wt
 # Delete worktree after PR is merged (from main worktree, not feature worktree)
 git wt -d <branch-name>
 ```
-
-### cfn-schema-cache Copy for Worktrees
-
-`carina-provider-awscc/cfn-schema-cache/` is in `.gitignore` and NOT copied to worktrees. You MUST copy it manually using **absolute paths** after creating a worktree. Relative paths cause "are identical (not copied)" errors.
-
-```bash
-MAIN_REPO=/Users/mizzy/src/github.com/carina-rs/carina
-WORKTREE=$MAIN_REPO/.worktrees/<branch>
-mkdir -p $WORKTREE/carina-provider-awscc/cfn-schema-cache
-cp -r $MAIN_REPO/carina-provider-awscc/cfn-schema-cache/* $WORKTREE/carina-provider-awscc/cfn-schema-cache/
-```
-
-**Source MUST be the main repo absolute path. NEVER use relative paths.**
 
 ### Branch Cleanup
 

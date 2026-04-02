@@ -334,12 +334,10 @@ carina/
 │   │   ├── module_resolver.rs # Module import and expansion
 │   │   └── formatter/       # Code formatter
 │   └── ...
-├── carina-provider-aws/     # AWS provider implementation
-│   └── src/schemas/         # AWS-specific type definitions
-├── carina-provider-awscc/   # AWS Cloud Control provider implementation
-│   └── src/
-│       ├── bin/codegen.rs   # Schema code generator from CloudFormation
-│       └── schemas/generated/ # Auto-generated schemas from CloudFormation
+├── carina-plugin-host/      # WASM plugin host for provider plugins
+├── carina-plugin-sdk/       # SDK for building WASM provider plugins
+├── carina-provider-mock/    # Mock provider for testing
+├── carina-provider-protocol/ # Protocol definitions for provider communication
 ├── carina-state/            # State management
 │   └── src/backends/        # State backends (S3, etc.)
 └── carina-lsp/              # Language Server Protocol implementation
