@@ -3,6 +3,7 @@ pub mod factory;
 pub mod normalizer;
 pub mod process;
 pub mod provider;
+pub mod wasm_convert;
 
 pub mod wasm_bindings {
     wasmtime::component::bindgen!({
