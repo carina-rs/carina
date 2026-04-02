@@ -193,3 +193,10 @@ table td, table th {
     grid-template-columns: 1fr;
   }
 }
+
+/* Collapsible right sidebar (ToC) */
+@media (min-width: 72rem) {
+  [data-toc-collapsed] .right-sidebar {
+    border-inline-start: none;
+  }
+}
