@@ -61,7 +61,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: bash carina-provider-aws/scripts/check-examples.sh
+      - run: echo "Provider examples moved to standalone repos"
 
   validate-crn:
     name: Validate .crn Files
