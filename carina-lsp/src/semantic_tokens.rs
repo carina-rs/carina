@@ -49,7 +49,8 @@ impl SemanticTokensProvider {
                 let line_len = position::char_len(line);
                 if line_len > 0 {
                     let delta_line = line_idx as u32 - prev_line;
-                    let delta_start = if delta_line == 0 { 0 - prev_start } else { 0 };
+                    // Heredoc body is always on a new line, so delta_start is 0
+                    let delta_start = 0;
                     tokens.push(SemanticToken {
                         delta_line,
                         delta_start,
@@ -67,7 +68,7 @@ impl SemanticTokensProvider {
             }
 
             // Check if this line starts a heredoc
-            if let Some(marker) = find_heredoc_marker(line) {
+            if let Some(marker) = carina_core::heredoc::find_heredoc_marker(line) {
                 // Tokenize the part before the heredoc normally
                 let line_tokens = self.tokenize_line_with_block_comments(
                     line,
@@ -627,66 +628,6 @@ impl SemanticTokensProvider {
             search_start = absolute_byte_pos + pattern.len();
         }
     }
-}
-
-/// Find a heredoc marker in a line (e.g., `<<EOT` or `<<-EOT`).
-/// Returns the marker string if found, skipping occurrences inside string literals.
-fn find_heredoc_marker(line: &str) -> Option<String> {
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    let mut in_double_quote = false;
-    let mut in_single_quote = false;
-    let mut escaped = false;
-
-    while i < bytes.len() {
-        if escaped {
-            escaped = false;
-            i += 1;
-            continue;
-        }
-        if bytes[i] == b'\\' && (in_double_quote || in_single_quote) {
-            escaped = true;
-            i += 1;
-            continue;
-        }
-        if bytes[i] == b'"' && !in_single_quote {
-            in_double_quote = !in_double_quote;
-            i += 1;
-            continue;
-        }
-        if bytes[i] == b'\'' && !in_double_quote {
-            in_single_quote = !in_single_quote;
-            i += 1;
-            continue;
-        }
-
-        if !in_double_quote
-            && !in_single_quote
-            && bytes[i] == b'<'
-            && i + 1 < bytes.len()
-            && bytes[i + 1] == b'<'
-        {
-            let mut j = i + 2;
-            if j < bytes.len() && bytes[j] == b'-' {
-                j += 1;
-            }
-            let marker_start = j;
-            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
-                j += 1;
-            }
-            let marker = &line[marker_start..j];
-            if !marker.is_empty() {
-                let rest = line[j..].trim();
-                if rest.is_empty() {
-                    return Some(marker.to_string());
-                }
-            }
-        }
-
-        i += 1;
-    }
-
-    None
 }
 
 #[cfg(test)]
@@ -1380,6 +1321,7 @@ mod tests {
 
     #[test]
     fn test_find_heredoc_marker() {
+        use carina_core::heredoc::find_heredoc_marker;
         assert_eq!(
             find_heredoc_marker("policy = <<EOT"),
             Some("EOT".to_string())

@@ -220,6 +220,13 @@ fn escape_for_double_quote(s: &str) -> String {
         .replace("${", "\\${")
 }
 
+/// Check if a line contains a heredoc start (`<<MARKER` or `<<-MARKER`).
+/// Returns the marker string if found, skipping occurrences inside string literals.
+/// Used by the LSP for semantic token highlighting.
+pub fn find_heredoc_marker(line: &str) -> Option<String> {
+    find_heredoc_start(line).map(|h| h.marker.to_string())
+}
+
 /// Error during heredoc preprocessing.
 #[derive(Debug, thiserror::Error)]
 pub enum HeredocError {
