@@ -274,6 +274,16 @@ fn find_heredoc_start(line: &str) -> Option<HeredocStart<'_>> {
             continue;
         }
 
+        // Skip line comments: # or //
+        if !in_double_quote && !in_single_quote {
+            if bytes[i] == b'#' {
+                return None;
+            }
+            if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                return None;
+            }
+        }
+
         if !in_double_quote
             && !in_single_quote
             && bytes[i] == b'<'
@@ -370,5 +380,36 @@ mod tests {
         let result = preprocess_heredocs(input).unwrap();
         let restored = restore_heredocs(&result.source, &result.heredocs);
         assert_eq!(restored, input);
+    }
+
+    #[test]
+    fn test_heredoc_in_comment_ignored() {
+        let input = "# x = <<EOT\ny = \"hello\"\n";
+        let result = preprocess_heredocs(input).unwrap();
+        assert_eq!(result.source, input);
+        assert_eq!(result.heredocs.len(), 0);
+    }
+
+    #[test]
+    fn test_heredoc_in_line_comment_ignored() {
+        let input = "// x = <<EOT\ny = \"hello\"\n";
+        let result = preprocess_heredocs(input).unwrap();
+        assert_eq!(result.source, input);
+        assert_eq!(result.heredocs.len(), 0);
+    }
+
+    #[test]
+    fn test_multiple_heredocs() {
+        let input = "a = <<EOF\nhello\nEOF\nb = <<END\nworld\nEND\n";
+        let result = preprocess_heredocs(input).unwrap();
+        assert_eq!(result.source, "a = \"hello\"\nb = \"world\"\n");
+        assert_eq!(result.heredocs.len(), 2);
+    }
+
+    #[test]
+    fn test_heredoc_with_backslash() {
+        let input = "x = <<EOT\npath\\to\\file\nEOT\n";
+        let result = preprocess_heredocs(input).unwrap();
+        assert_eq!(result.source, "x = \"path\\\\to\\\\file\"\n");
     }
 }
