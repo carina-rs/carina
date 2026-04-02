@@ -41,13 +41,24 @@ carina-cli
 | Process model | Child process | In-process (Wasmtime) |
 | Type conversion | Core ↔ Protocol (JSON) | Core ↔ WIT types |
 
+### Repository Structure (updated 2026-04-02)
+
+Provider repos have been separated from the monorepo:
+- `carina-rs/carina`: Core, CLI, plugin-host, plugin-sdk, mock provider, protocol, LSP
+- `carina-rs/carina-provider-aws`: AWS provider (separate repo)
+- `carina-rs/carina-provider-awscc`: AWSCC provider (separate repo)
+
 ### Affected Crates
 
+Monorepo (`carina-rs/carina`):
 - **carina-plugin-host**: Add `WasmProviderFactory` alongside `ProcessProviderFactory`
-- **carina-plugin-sdk**: Add WASM guest-side library (WIT bindings generation)
+- **carina-plugin-sdk**: Add WASM guest-side library (WIT bindings generation). Must be publishable for external provider repos to consume.
 - **carina-provider-protocol**: Gradually replaced by WIT definitions (eventually removed)
-- **carina-provider-aws / awscc**: Compile target change + HTTP adapter swap
 - **carina-cli**: provider_resolver updated for `.wasm` download/cache
+
+External repos:
+- **carina-provider-aws** (`carina-rs/carina-provider-aws`): Compile target change + HTTP adapter swap
+- **carina-provider-awscc** (`carina-rs/carina-provider-awscc`): Compile target change + HTTP adapter swap
 
 ### Coexistence Strategy
 
@@ -244,10 +255,13 @@ wasmtime-wasi-http = "..."
 
 ## Provider-Side Implementation
 
+**Note:** Provider repos (`carina-provider-aws`, `carina-provider-awscc`) are now separate repositories. They consume `carina-plugin-sdk` (and bundled WIT definitions) as a git or crates.io dependency.
+
 ### Compile Target
 
 ```bash
-cargo build --target wasm32-wasip2 -p carina-provider-aws --release
+# In the carina-provider-aws repo:
+cargo build --target wasm32-wasip2 --release
 # Output: target/wasm32-wasip2/release/carina_provider_aws.wasm
 ```
 
@@ -362,12 +376,12 @@ fn create_factory(resolved_path: &Path, ...) -> Box<dyn ProviderFactory> {
 
 | Phase | Description | Done When |
 |---|---|---|
-| **Phase 0: PoC** | Verify AWS SDK compiles to wasm32-wasip2 | S3 read works from WASM |
-| **Phase 1: Foundation** | WIT definition, WasmProviderFactory, SDK WASM support | MockProvider works as WASM |
-| **Phase 2: AWS Provider** | Compile carina-provider-aws to WASM | All tests pass, plan/apply works |
-| **Phase 3: AWSCC Provider** | Compile carina-provider-awscc to WASM | All tests pass |
-| **Phase 4: Distribution** | Switch GitHub Releases to .wasm, precompile cache | Users can use .wasm providers |
-| **Phase 5: Cleanup** | Remove ProcessProviderFactory, carina-provider-protocol | Code reduction |
+| **Phase 0: PoC** | Verify AWS SDK compiles to wasm32-wasip2 | S3 read works from WASM | standalone PoC |
+| **Phase 1: Foundation** | WIT definition, WasmProviderFactory, SDK WASM support | MockProvider works as WASM | `carina` monorepo |
+| **Phase 2: AWS Provider** | Compile carina-provider-aws to WASM | All tests pass, plan/apply works | `carina-provider-aws` repo |
+| **Phase 3: AWSCC Provider** | Compile carina-provider-awscc to WASM | All tests pass | `carina-provider-awscc` repo |
+| **Phase 4: Distribution** | Switch GitHub Releases to .wasm, precompile cache | Users can use .wasm providers | All repos |
+| **Phase 5: Cleanup** | Remove ProcessProviderFactory, carina-provider-protocol | Code reduction | All repos |
 
 ### Phase 0 (PoC) Details
 
@@ -433,10 +447,17 @@ async fn test_wasm_mock_provider_crud() {
 
 ### CI Pipeline Addition
 
+Monorepo (`carina`):
+```yaml
+wasm-integration:
+  - cargo build -p carina-provider-mock --target wasm32-wasip2
+  - cargo test -p carina-plugin-host --features wasm-tests
+```
+
+Provider repos (`carina-provider-aws`, `carina-provider-awscc`):
 ```yaml
 wasm-build:
-  - cargo build --target wasm32-wasip2 -p carina-provider-aws --release
-  - cargo build --target wasm32-wasip2 -p carina-provider-awscc --release
+  - cargo build --target wasm32-wasip2 --release
 
 wasm-integration:
   - cargo test -p carina-plugin-host --features wasm-tests
