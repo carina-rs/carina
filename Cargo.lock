@@ -83,12 +83,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anyhow"
-version = "1.0.100"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
-
-[[package]]
 name = "argon2"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -715,16 +709,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "carina-codegen-aws"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "carina-smithy",
- "clap",
- "heck",
-]
-
-[[package]]
 name = "carina-core"
 version = "0.1.0"
 dependencies = [
@@ -789,14 +773,6 @@ dependencies = [
 
 [[package]]
 name = "carina-provider-protocol"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "carina-smithy"
 version = "0.1.0"
 dependencies = [
  "serde",
