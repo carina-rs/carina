@@ -55,13 +55,13 @@ struct Cli {
 enum Commands {
     /// Validate the configuration file
     Validate {
-        /// Path to .crn file or directory
+        /// Path to directory containing .crn files
         #[arg(default_value = ".")]
         path: PathBuf,
     },
     /// Show execution plan without applying changes
     Plan {
-        /// Path to .crn file or directory
+        /// Path to directory containing .crn files
         #[arg(default_value = ".")]
         path: PathBuf,
 
@@ -87,7 +87,7 @@ enum Commands {
     },
     /// Apply changes to reach the desired state
     Apply {
-        /// Path to .crn file or directory
+        /// Path to directory containing .crn files
         #[arg(default_value = ".")]
         path: PathBuf,
 
@@ -101,7 +101,7 @@ enum Commands {
     },
     /// Destroy all resources defined in the configuration file
     Destroy {
-        /// Path to .crn file or directory
+        /// Path to directory containing .crn files
         #[arg(default_value = ".")]
         path: PathBuf,
 
@@ -119,7 +119,7 @@ enum Commands {
     },
     /// Format .crn files
     Fmt {
-        /// Path to .crn file or directory
+        /// Path to directory containing .crn files
         #[arg(default_value = ".")]
         path: PathBuf,
 
@@ -145,7 +145,7 @@ enum Commands {
         /// The lock ID to force unlock
         lock_id: String,
 
-        /// Path to .crn file or directory containing backend configuration
+        /// Path to directory containing .crn files containing backend configuration
         #[arg(default_value = ".")]
         path: PathBuf,
     },
@@ -156,13 +156,13 @@ enum Commands {
     },
     /// Download and install provider binaries
     Init {
-        /// Path to .crn file or directory
+        /// Path to directory containing .crn files
         #[arg(default_value = ".")]
         path: PathBuf,
     },
     /// Lint .crn files for style issues
     Lint {
-        /// Path to .crn file or directory
+        /// Path to directory containing .crn files
         #[arg(default_value = ".")]
         path: PathBuf,
     },

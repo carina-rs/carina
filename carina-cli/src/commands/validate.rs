@@ -30,11 +30,7 @@ pub fn run_validate(path: &PathBuf, provider_context: &ProviderContext) -> Resul
     let unused_warnings = check_unused_bindings(&loaded.unresolved_parsed);
 
     // Check for duplicate attribute keys
-    let source_files: Vec<(PathBuf, String)> = if path.is_file() {
-        let content = fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-        vec![(path.clone(), content)]
-    } else if path.is_dir() {
+    let source_files: Vec<(PathBuf, String)> = {
         let files = find_crn_files_in_dir(path)?;
         let mut texts = Vec::new();
         for file in files {
@@ -43,8 +39,6 @@ pub fn run_validate(path: &PathBuf, provider_context: &ProviderContext) -> Resul
             texts.push((file, content));
         }
         texts
-    } else {
-        vec![]
     };
 
     let mut duplicate_warnings: Vec<(PathBuf, String)> = Vec::new();

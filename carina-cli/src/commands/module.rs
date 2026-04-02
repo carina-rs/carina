@@ -10,8 +10,8 @@ use crate::error::AppError;
 pub enum ModuleCommands {
     /// Show module structure and dependencies
     Info {
-        /// Path to module .crn file
-        file: std::path::PathBuf,
+        /// Path to module directory
+        path: std::path::PathBuf,
 
         /// Display module info in interactive TUI mode
         #[arg(long)]
@@ -19,7 +19,7 @@ pub enum ModuleCommands {
     },
     /// List imported modules
     List {
-        /// Path to .crn file or directory
+        /// Path to directory containing .crn files
         #[arg(default_value = ".")]
         path: std::path::PathBuf,
     },
@@ -30,7 +30,7 @@ pub fn run_module_command(
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
     match command {
-        ModuleCommands::Info { file, tui } => run_module_info(&file, tui),
+        ModuleCommands::Info { path, tui } => run_module_info(&path, tui),
         ModuleCommands::List { path } => run_module_list(&path, provider_context),
     }
 }
@@ -57,16 +57,15 @@ pub fn format_module_list(imports: &[carina_core::parser::ImportStatement]) -> S
 }
 
 fn run_module_info(path: &Path, tui: bool) -> Result<(), AppError> {
-    let parsed = if path.is_dir() {
-        // Read all .crn files in the directory and merge them
-        module_resolver::load_module_from_directory(path)?
-    } else {
-        module_resolver::get_parsed_file(path).map_err(|e| format!("Failed to load file: {}", e))?
-    };
+    if path.is_file() {
+        return Err(AppError::Config(format!(
+            "expected directory, got file: {}",
+            path.display()
+        )));
+    }
 
-    // Derive module name from directory structure
-    // For directory-based modules like modules/web_tier/, use the directory name
-    // For file-based modules like modules/web_tier.crn, use the file stem
+    let parsed = module_resolver::load_module_from_directory(path)?;
+
     let module_name = module_resolver::derive_module_name(path);
 
     // Build and display the file signature (module or root config)
