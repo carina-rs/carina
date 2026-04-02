@@ -18,13 +18,13 @@ cargo test -p carina-provider-aws
 # Run a single test
 cargo test -p carina-core test_name
 
-# Run CLI commands
-cargo run -- validate example.crn
-cargo run -- plan example.crn
-cargo run -- apply example.crn
+# Run CLI commands (path must be a directory, not a file)
+cargo run -- validate .
+cargo run -- plan .
+cargo run -- apply .
 
 # With AWS credentials (using aws-vault)
-aws-vault exec <profile> -- cargo run -- plan example.crn
+aws-vault exec <profile> -- cargo run -- plan .
 ```
 
 ### Plan Display Testing
