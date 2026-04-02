@@ -39,6 +39,8 @@ collect_changed_crates() {
     changed_crates=()
     for crate_dir in carina-*/; do
         crate_name="${crate_dir%/}"
+        # Skip directories that are not Cargo crates (e.g., WIT-only packages)
+        [ -f "${crate_dir}Cargo.toml" ] || continue
         if echo "$staged_files" | grep -q "^${crate_name}/"; then
             changed_crates+=("-p" "$crate_name")
         fi

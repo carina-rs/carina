@@ -108,9 +108,19 @@ pub fn build_factories_from_providers(
             continue;
         };
 
-        match carina_plugin_host::ProcessProviderFactory::new(binary_path) {
+        let factory_result: Result<Box<dyn ProviderFactory>, String> =
+            if crate::provider_resolver::is_wasm_provider(&binary_path) {
+                carina_plugin_host::WasmProviderFactory::new(binary_path)
+                    .map(|f| Box::new(f) as Box<dyn ProviderFactory>)
+                    .map_err(|e| format!("Failed to load WASM provider: {e}"))
+            } else {
+                carina_plugin_host::ProcessProviderFactory::new(binary_path)
+                    .map(|f| Box::new(f) as Box<dyn ProviderFactory>)
+            };
+
+        match factory_result {
             Ok(factory) => {
-                factories.push(Box::new(factory));
+                factories.push(factory);
             }
             Err(e) => {
                 eprintln!(

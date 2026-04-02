@@ -17,3 +17,6 @@ carina-core = { path = "../carina-core" }
 carina-plugin-sdk = { path = "../carina-plugin-sdk" }
 carina-provider-protocol = { path = "../carina-provider-protocol" }
 serde_json = "1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wit-bindgen = { version = "0.51", default-features = false, features = ["macros"] }

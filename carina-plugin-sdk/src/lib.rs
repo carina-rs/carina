@@ -6,6 +6,10 @@
 pub use carina_provider_protocol as protocol;
 pub use carina_provider_protocol::types;
 
+#[cfg(target_arch = "wasm32")]
+#[doc(hidden)]
+pub mod wasm_guest;
+
 use carina_provider_protocol::jsonrpc::{Notification, Request, Response};
 use carina_provider_protocol::methods;
 use carina_provider_protocol::types::*;
