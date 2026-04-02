@@ -1,7 +1,7 @@
 //! WasmProviderFactory loads a WASM component and implements ProviderFactory.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use wasmtime::component::{Component, Linker};
@@ -114,6 +114,99 @@ impl WasmProviderFactory {
             display_name_static,
             schemas,
         })
+    }
+
+    /// Precompile a .wasm file and save the result to a .cwasm file.
+    pub fn precompile(wasm_path: &Path, cwasm_path: &Path) -> Result<(), String> {
+        let mut config = wasmtime::Config::new();
+        config.wasm_component_model(true);
+        let engine = Engine::new(&config).map_err(|e| format!("Engine error: {e}"))?;
+        let wasm_bytes = std::fs::read(wasm_path).map_err(|e| format!("Read error: {e}"))?;
+        let serialized = engine
+            .precompile_component(&wasm_bytes)
+            .map_err(|e| format!("Precompile error: {e}"))?;
+        if let Some(parent) = cwasm_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("Mkdir error: {e}"))?;
+        }
+        std::fs::write(cwasm_path, &serialized).map_err(|e| format!("Write error: {e}"))?;
+        Ok(())
+    }
+
+    /// Load from a precompiled .cwasm file.
+    ///
+    /// # Safety
+    /// The .cwasm file must have been produced by `precompile()` using the same
+    /// Wasmtime version. Deserializing an untrusted or corrupted file is unsafe.
+    pub fn from_precompiled(cwasm_path: &Path) -> Result<Self, String> {
+        let mut config = wasmtime::Config::new();
+        config.wasm_component_model(true);
+        let engine =
+            Engine::new(&config).map_err(|e| format!("Failed to create WASM engine: {e}"))?;
+
+        // SAFETY: The caller is responsible for ensuring the .cwasm file was
+        // produced by a trusted `precompile()` call with the same Wasmtime version.
+        let component =
+            unsafe { Component::deserialize_file(&engine, cwasm_path) }.map_err(|e| {
+                format!(
+                    "Failed to deserialize WASM component from {}: {e}",
+                    cwasm_path.display()
+                )
+            })?;
+
+        let (mut store, bindings) = create_instance(&engine, &component)?;
+        let guest = bindings.carina_provider_provider();
+
+        let info = guest
+            .call_info(&mut store)
+            .map_err(|e| format!("Failed to call info(): {e}"))?;
+
+        let wit_schemas = guest
+            .call_schemas(&mut store)
+            .map_err(|e| format!("Failed to call schemas(): {e}"))?;
+
+        let schemas: Vec<ResourceSchema> = wit_schemas
+            .iter()
+            .map(wasm_convert::wit_to_core_schema)
+            .collect();
+
+        let name_static: &'static str = Box::leak(info.name.into_boxed_str());
+        let display_name_static: &'static str = Box::leak(info.display_name.into_boxed_str());
+
+        drop(store);
+
+        Ok(Self {
+            engine,
+            component,
+            wasm_path: cwasm_path.to_path_buf(),
+            name_static,
+            display_name_static,
+            schemas,
+        })
+    }
+
+    /// Load from .wasm with automatic precompile caching.
+    ///
+    /// Checks for an existing `.cwasm` in `cache_dir`. If present, attempts to
+    /// load it; if the cache is stale or invalid, recompiles and caches anew.
+    pub fn from_file_cached(wasm_path: &Path, cache_dir: &Path) -> Result<Self, String> {
+        let stem = wasm_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("provider");
+        let cwasm_path = cache_dir.join(format!("{stem}.cwasm"));
+
+        if cwasm_path.exists() {
+            match Self::from_precompiled(&cwasm_path) {
+                Ok(factory) => return Ok(factory),
+                Err(e) => {
+                    eprintln!("Precompile cache invalid, recompiling: {e}");
+                    let _ = std::fs::remove_file(&cwasm_path);
+                }
+            }
+        }
+
+        Self::precompile(wasm_path, &cwasm_path)?;
+        Self::from_precompiled(&cwasm_path)
     }
 
     fn create_initialized_instance(
