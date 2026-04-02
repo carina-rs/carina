@@ -3,6 +3,7 @@ title: "awscc.ec2.transit_gateway"
 description: "AWSCC EC2 transit_gateway resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::TransitGateway`
 
 Resource Type definition for AWS::EC2::TransitGateway
@@ -190,5 +191,4 @@ Shorthand formats: `enable` or `VpnEcmpSupport.enable`
 ### `transit_gateway_arn`
 
 - **Type:** Arn
-
 

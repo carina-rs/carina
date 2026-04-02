@@ -3,6 +3,7 @@ title: "awscc.ec2.subnet"
 description: "AWSCC EC2 subnet resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::Subnet`
 
 Specifies a subnet for the specified VPC.
@@ -226,7 +227,6 @@ Shorthand formats: `ip_name` or `HostnameType.ip_name`
 ### `subnet_id`
 
 - **Type:** SubnetId
-
 
 
 

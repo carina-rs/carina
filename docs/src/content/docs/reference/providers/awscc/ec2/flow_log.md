@@ -3,6 +3,7 @@ title: "awscc.ec2.flow_log"
 description: "AWSCC EC2 flow_log resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::FlowLog`
 
 Specifies a VPC flow log, which enables you to capture IP traffic for a specific network interface, subnet, or VPC.
@@ -183,5 +184,4 @@ Shorthand formats: `ACCEPT` or `TrafficType.ACCEPT`
 - **Type:** FlowLogId
 
 The Flow Log ID
-
 

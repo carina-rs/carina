@@ -3,6 +3,7 @@ title: "awscc.ec2.transit_gateway_attachment"
 description: "AWSCC EC2 transit_gateway_attachment resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::TransitGatewayAttachment`
 
 Resource Type definition for AWS::EC2::TransitGatewayAttachment
@@ -120,5 +121,4 @@ Shorthand formats: `enable` or `SecurityGroupReferencingSupport.enable`
 ### `id`
 
 - **Type:** TransitGatewayAttachmentId
-
 

@@ -3,6 +3,7 @@ title: "awscc.ec2.security_group_egress"
 description: "AWSCC EC2 security_group_egress resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::SecurityGroupEgress`
 
 Adds the specified outbound (egress) rule to a security group.
@@ -115,6 +116,7 @@ If the protocol is TCP or UDP, this is the end of the port range. If the protoco
 | `icmp` | `awscc.ec2.security_group_egress.IpProtocol.icmp` |
 | `icmpv6` | `awscc.ec2.security_group_egress.IpProtocol.icmpv6` |
 | `-1` | `awscc.ec2.security_group_egress.IpProtocol.all` |
+| `all` | `awscc.ec2.security_group_egress.IpProtocol.all` |
 
 Shorthand formats: `tcp` or `IpProtocol.tcp`
 
@@ -123,7 +125,6 @@ Shorthand formats: `tcp` or `IpProtocol.tcp`
 ### `id`
 
 - **Type:** String
-
 
 
 

@@ -3,6 +3,7 @@ title: "awscc.ec2.ipam_pool"
 description: "AWSCC EC2 ipam_pool resource reference"
 ---
 
+
 CloudFormation Type: `AWS::EC2::IPAMPool`
 
 Resource Schema of AWS::EC2::IPAMPool Type
@@ -270,5 +271,4 @@ The state of this pool. This can be one of the following values: "create-in-prog
 - **Type:** String
 
 An explanation of how the pool arrived at it current state.
-
 
