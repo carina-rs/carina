@@ -293,11 +293,18 @@ index_access = { open_bracket ~ trivia* ~ expression ~ trivia* ~ close_bracket }
 boolean = { "true" | "false" }
 float = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
 number = @{ "-"? ~ ASCII_DIGIT+ }
-string = ${ "\"" ~ inner_string ~ "\"" }
+string = ${ single_quoted_string | double_quoted_string }
+double_quoted_string = ${ "\"" ~ inner_string ~ "\"" }
 inner_string = @{ char* }
 char = {
     !("\"" | "\\") ~ ANY
   | "\\" ~ ("\"" | "\\" | "n" | "r" | "t")
+}
+single_quoted_string = ${ "'" ~ single_quoted_inner ~ "'" }
+single_quoted_inner = @{ single_quoted_char* }
+single_quoted_char = {
+    !("'" | "\\") ~ ANY
+  | "\\" ~ ("'" | "\\")
 }
 
 // Tokens (for easier identification in CST)
