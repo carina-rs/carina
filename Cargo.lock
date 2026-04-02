@@ -886,8 +886,6 @@ name = "carina-plugin-host"
 version = "0.1.0"
 dependencies = [
  "carina-core",
- "carina-provider-protocol",
- "futures",
  "log",
  "serde",
  "serde_json",
