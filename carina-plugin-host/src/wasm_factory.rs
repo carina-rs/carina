@@ -315,16 +315,16 @@ impl WasmProviderFactory {
     /// Compute a cache-safe filename for the given wasm path.
     ///
     /// The filename includes a SHA-256 hash of the canonical wasm path and the
-    /// wasmtime version so that different files or engine versions never collide.
+    /// crate version so that different files or crate upgrades never collide.
     fn cache_key(wasm_path: &Path) -> String {
         let canonical = wasm_path
             .canonicalize()
             .unwrap_or_else(|_| wasm_path.to_path_buf());
         let mut hasher = Sha256::new();
         hasher.update(canonical.to_string_lossy().as_bytes());
-        // Include the wasmtime crate version so cache is invalidated on upgrades.
-        // The deserialization also checks compatibility, but this avoids unnecessary
-        // recompile-on-error cycles.
+        // Include the crate version so cache is invalidated on upgrades.
+        // Component::deserialize also checks wasmtime compatibility, but this
+        // avoids unnecessary recompile-on-error cycles.
         hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
         let hash = format!("{:x}", hasher.finalize());
         let stem = wasm_path

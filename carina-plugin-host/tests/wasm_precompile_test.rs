@@ -100,9 +100,20 @@ async fn test_from_file_cached_uses_cache() {
 async fn test_from_file_cached_recovers_from_stale_cache() {
     let wasm = skip_if_no_wasm!();
     let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
-    let cwasm_path = cache_dir.path().join("carina_provider_mock.cwasm");
 
-    // Write garbage as a "stale" cache file
+    // First, create a valid cache so we know the filename
+    let factory = WasmProviderFactory::from_file_cached(&wasm, cache_dir.path())
+        .await
+        .expect("initial from_file_cached should succeed");
+    assert_eq!(factory.name(), "mock");
+
+    // Find the .cwasm file and corrupt it
+    let cwasm_path = std::fs::read_dir(cache_dir.path())
+        .expect("read_dir")
+        .filter_map(|e| e.ok())
+        .find(|e| e.path().extension().is_some_and(|ext| ext == "cwasm"))
+        .expect("should find .cwasm file")
+        .path();
     std::fs::write(&cwasm_path, b"not a valid cwasm file")
         .expect("Failed to write stale cache file");
 
