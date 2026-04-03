@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 use tokio::sync::Mutex;
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Engine, Store};
@@ -304,7 +306,79 @@ pub struct WasmProviderFactory {
 }
 
 impl WasmProviderFactory {
+    /// Compute the default cache directory (`~/.carina/cache/`).
+    /// Returns `None` if the home directory cannot be determined.
+    fn default_cache_dir() -> Option<PathBuf> {
+        dirs::home_dir().map(|h| h.join(".carina").join("cache"))
+    }
+
+    /// Compute a cache-safe filename for the given wasm path.
+    ///
+    /// The filename includes a SHA-256 hash of the canonical wasm path and the
+    /// wasmtime version so that different files or engine versions never collide.
+    fn cache_key(wasm_path: &Path) -> String {
+        let canonical = wasm_path
+            .canonicalize()
+            .unwrap_or_else(|_| wasm_path.to_path_buf());
+        let mut hasher = Sha256::new();
+        hasher.update(canonical.to_string_lossy().as_bytes());
+        // Include the wasmtime crate version so cache is invalidated on upgrades.
+        // The deserialization also checks compatibility, but this avoids unnecessary
+        // recompile-on-error cycles.
+        hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+        let hash = format!("{:x}", hasher.finalize());
+        let stem = wasm_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("provider");
+        format!("{stem}-{}.cwasm", &hash[..16])
+    }
+
+    /// Load a WASM provider, using the default precompile cache at `~/.carina/cache/`.
+    ///
+    /// If the cache directory cannot be created, falls back to compiling without caching.
     pub async fn new(wasm_path: PathBuf) -> Result<Self, String> {
+        match Self::default_cache_dir() {
+            Some(cache_dir) => Self::new_with_cache_dir(wasm_path, &cache_dir).await,
+            None => Self::new_uncached(wasm_path).await,
+        }
+    }
+
+    /// Load a WASM provider with an explicit cache directory.
+    pub async fn new_with_cache_dir(wasm_path: PathBuf, cache_dir: &Path) -> Result<Self, String> {
+        let cwasm_name = Self::cache_key(&wasm_path);
+        let cwasm_path = cache_dir.join(&cwasm_name);
+
+        // Try loading from existing cache
+        if cwasm_path.exists() {
+            match Self::from_precompiled(&cwasm_path).await {
+                Ok(mut factory) => {
+                    factory.wasm_path = wasm_path;
+                    return Ok(factory);
+                }
+                Err(e) => {
+                    eprintln!("Precompile cache invalid, recompiling: {e}");
+                    let _ = std::fs::remove_file(&cwasm_path);
+                }
+            }
+        }
+
+        // Try to precompile and cache
+        match Self::precompile(&wasm_path, &cwasm_path) {
+            Ok(()) => {
+                let mut factory = Self::from_precompiled(&cwasm_path).await?;
+                factory.wasm_path = wasm_path;
+                Ok(factory)
+            }
+            Err(e) => {
+                eprintln!("Failed to write precompile cache, loading directly: {e}");
+                Self::new_uncached(wasm_path).await
+            }
+        }
+    }
+
+    /// Load a WASM provider without any precompile caching.
+    async fn new_uncached(wasm_path: PathBuf) -> Result<Self, String> {
         let mut config = wasmtime::Config::new();
         config.wasm_component_model(true);
         config.async_support(true);
@@ -442,25 +516,11 @@ impl WasmProviderFactory {
     ///
     /// Checks for an existing `.cwasm` in `cache_dir`. If present, attempts to
     /// load it; if the cache is stale or invalid, recompiles and caches anew.
+    ///
+    /// **Deprecated**: Use `new()` or `new_with_cache_dir()` instead, which
+    /// handle caching automatically.
     pub async fn from_file_cached(wasm_path: &Path, cache_dir: &Path) -> Result<Self, String> {
-        let stem = wasm_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("provider");
-        let cwasm_path = cache_dir.join(format!("{stem}.cwasm"));
-
-        if cwasm_path.exists() {
-            match Self::from_precompiled(&cwasm_path).await {
-                Ok(factory) => return Ok(factory),
-                Err(e) => {
-                    eprintln!("Precompile cache invalid, recompiling: {e}");
-                    let _ = std::fs::remove_file(&cwasm_path);
-                }
-            }
-        }
-
-        Self::precompile(wasm_path, &cwasm_path)?;
-        Self::from_precompiled(&cwasm_path).await
+        Self::new_with_cache_dir(wasm_path.to_path_buf(), cache_dir).await
     }
 
     async fn create_initialized_instance(

@@ -16,6 +16,8 @@ wasmtime = { version = "29", features = ["component-model"] }
 wasmtime-wasi = "29"
 wasmtime-wasi-http = "29"
 tokio = { version = "1", features = ["rt"] }
+dirs = "6"
+sha2 = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

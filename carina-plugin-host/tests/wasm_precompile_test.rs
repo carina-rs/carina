@@ -130,3 +130,53 @@ async fn test_precompiled_factory_creates_provider() {
     let provider = factory.create_provider(&HashMap::new()).await;
     assert_eq!(provider.name(), "mock");
 }
+
+#[tokio::test]
+async fn test_new_uses_default_cache() {
+    let wasm = skip_if_no_wasm!();
+
+    // Use a temporary directory as the cache location to avoid polluting the real cache
+    let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
+
+    let factory = WasmProviderFactory::new_with_cache_dir(wasm.clone(), cache_dir.path())
+        .await
+        .expect("new_with_cache_dir should succeed");
+
+    assert_eq!(factory.name(), "mock");
+
+    // A .cwasm file should have been created in the cache dir
+    let entries: Vec<_> = std::fs::read_dir(cache_dir.path())
+        .expect("read_dir should succeed")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "cwasm"))
+        .collect();
+
+    assert_eq!(
+        entries.len(),
+        1,
+        "Exactly one .cwasm file should be created"
+    );
+
+    // Second call should reuse the cache (file should not change)
+    let cwasm_path = entries[0].path();
+    let mtime1 = std::fs::metadata(&cwasm_path)
+        .expect("metadata")
+        .modified()
+        .expect("modified");
+
+    let factory2 = WasmProviderFactory::new_with_cache_dir(wasm, cache_dir.path())
+        .await
+        .expect("second new_with_cache_dir should succeed");
+
+    assert_eq!(factory2.name(), "mock");
+
+    let mtime2 = std::fs::metadata(&cwasm_path)
+        .expect("metadata")
+        .modified()
+        .expect("modified");
+
+    assert_eq!(
+        mtime1, mtime2,
+        "Cache file should not be rewritten on second call"
+    );
+}

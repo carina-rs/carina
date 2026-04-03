@@ -121,16 +121,9 @@ pub fn build_factories_from_providers(
         }
 
         let factory_result: Result<Box<dyn ProviderFactory>, String> = {
-            let cache_dir = base_dir
-                .join(".carina")
-                .join("providers")
-                .join("precompile");
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(
-                    carina_plugin_host::WasmProviderFactory::from_file_cached(
-                        &binary_path,
-                        &cache_dir,
-                    ),
+                    carina_plugin_host::WasmProviderFactory::new(binary_path.clone()),
                 )
             })
             .map(|f| Box::new(f) as Box<dyn ProviderFactory>)
