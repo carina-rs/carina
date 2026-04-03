@@ -13,7 +13,7 @@ cargo test
 
 # Run tests for a specific crate
 cargo test -p carina-core
-cargo test -p carina-provider-aws
+cargo test -p carina-cli
 
 # Run a single test
 cargo test -p carina-core test_name
@@ -74,9 +74,9 @@ cargo test
 
 Key rules:
 - After modifying a single crate, build/test only that crate with `-p <crate-name>`
-- After modifying codegen, build only the affected provider crate
 - Use full workspace `cargo build` / `cargo test` only when changes affect multiple crates or before creating a PR
 - For `cargo check`, prefer `cargo check -p <crate-name>` as well
+- Provider crates (aws, awscc) are in separate repositories — changes here may require updating those repos
 
 ## Architecture
 
@@ -94,14 +94,30 @@ DSL (.crn) → Parser → Resources → Differ → Plan (Effects) → Provider �
 - **Plan** (`carina-core/src/plan.rs`): Collection of Effects. Immutable, can be inspected before execution.
 - **Provider** trait (`carina-core/src/provider.rs`): Async trait for infrastructure operations. Returns `BoxFuture` for async methods.
 
-### Crate Structure
+### Repository Structure (Polyrepo)
+
+Carina is split across multiple repositories under [carina-rs](https://github.com/carina-rs):
+
+| Repository | Description |
+|------------|-------------|
+| **carina** (this repo) | Core, CLI, LSP, plugin SDK/host, state, TUI |
+| [carina-provider-aws](https://github.com/carina-rs/carina-provider-aws) | AWS provider (Smithy-based codegen) |
+| [carina-provider-awscc](https://github.com/carina-rs/carina-provider-awscc) | AWS Cloud Control provider |
+
+Provider repositories depend on this repo's crates via `git` dependencies.
+
+### Crate Structure (this repo)
 
 - **carina-core**: Core library with parser, types, and traits. No AWS dependencies.
 - **carina-cli**: Binary that wires everything together.
+- **carina-aws-types**: AWS-specific type definitions shared by providers.
 - **carina-plugin-host**: WASM plugin host for loading provider plugins.
 - **carina-plugin-sdk**: SDK for building WASM provider plugins.
 - **carina-provider-mock**: Mock provider for testing.
 - **carina-provider-protocol**: Protocol definitions for provider communication.
+- **carina-state**: State management.
+- **carina-lsp**: Language Server Protocol implementation.
+- **carina-tui**: Terminal UI for plan display.
 
 ### DSL Parser
 
