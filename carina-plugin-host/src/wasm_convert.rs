@@ -919,4 +919,39 @@ mod tests {
             panic!("Expected Map type");
         }
     }
+
+    #[test]
+    fn test_struct_field_block_name_roundtrip() {
+        let core_type = CoreAttributeType::Struct {
+            name: "Transition".into(),
+            fields: vec![CoreStructField {
+                name: "transitions".into(),
+                field_type: CoreAttributeType::list(CoreAttributeType::Struct {
+                    name: "TransitionItem".into(),
+                    fields: vec![CoreStructField {
+                        name: "days".into(),
+                        field_type: CoreAttributeType::Int,
+                        required: true,
+                        description: None,
+                        provider_name: Some("Days".into()),
+                        block_name: None,
+                    }],
+                }),
+                required: false,
+                description: Some("Lifecycle transitions".into()),
+                provider_name: Some("Transitions".into()),
+                block_name: Some("transition".into()),
+            }],
+        };
+
+        let wit = core_to_wit_attribute_type(&core_type);
+        let back = wit_to_core_attribute_type(&wit);
+
+        if let CoreAttributeType::Struct { fields, .. } = &back {
+            assert_eq!(fields[0].block_name, Some("transition".into()));
+            assert_eq!(fields[0].provider_name, Some("Transitions".into()));
+        } else {
+            panic!("Expected Struct type");
+        }
+    }
 }

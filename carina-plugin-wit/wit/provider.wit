@@ -34,4 +34,9 @@ interface provider {
     normalize-state: func(
         states: list<tuple<string, state>>,
     ) -> list<tuple<string, state>>;
+
+    hydrate-read-state: func(
+        states: list<tuple<string, state>>,
+        saved-attrs: list<tuple<string, list<tuple<string, value>>>>,
+    ) -> list<tuple<string, state>>;
 }
