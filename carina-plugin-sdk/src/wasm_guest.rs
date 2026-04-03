@@ -256,7 +256,7 @@ macro_rules! export_provider {
                     id: id.clone(),
                     identifier: state.identifier.clone(),
                     attributes: wit_to_proto_value_map(&state.attributes),
-                    exists: true,
+                    exists: state.exists,
                 }
             }
 
@@ -264,6 +264,7 @@ macro_rules! export_provider {
                 wit_types::State {
                     identifier: state.identifier.clone(),
                     attributes: proto_to_wit_value_map(&state.attributes),
+                    exists: state.exists,
                 }
             }
 
@@ -630,7 +631,7 @@ macro_rules! export_provider {
                     id: id.clone(),
                     identifier: state.identifier.clone(),
                     attributes: wit_to_proto_value_map(&state.attributes),
-                    exists: true,
+                    exists: state.exists,
                 }
             }
 
@@ -638,6 +639,7 @@ macro_rules! export_provider {
                 wit_types::State {
                     identifier: state.identifier.clone(),
                     attributes: proto_to_wit_value_map(&state.attributes),
+                    exists: state.exists,
                 }
             }
 

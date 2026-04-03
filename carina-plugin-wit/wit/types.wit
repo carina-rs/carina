@@ -21,6 +21,7 @@ interface types {
     record state {
         identifier: option<string>,
         attributes: list<tuple<string, value>>,
+        exists: bool,
     }
 
     record resource-def {

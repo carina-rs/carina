@@ -149,10 +149,14 @@ pub fn core_to_wit_state(state: &CoreState) -> wit::State {
     wit::State {
         identifier: state.identifier.clone(),
         attributes: core_to_wit_value_map(&state.attributes),
+        exists: state.exists,
     }
 }
 
 pub fn wit_to_core_state(state: &wit::State, id: &CoreResourceId) -> CoreState {
+    if !state.exists {
+        return CoreState::not_found(id.clone());
+    }
     let attributes = wit_to_core_value_map(&state.attributes);
     let mut core_state = CoreState::existing(id.clone(), attributes);
     if let Some(ref ident) = state.identifier {
