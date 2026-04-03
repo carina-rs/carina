@@ -234,6 +234,8 @@ enum AttrTypeJson {
         name: String,
         fields: Vec<StructFieldJson>,
     },
+    #[serde(rename = "union")]
+    Union { members: Vec<AttrTypeJson> },
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -270,7 +272,9 @@ fn core_attr_type_to_json(t: &CoreAttributeType) -> AttrTypeJson {
             fields: fields.iter().map(core_struct_field_to_json).collect(),
         },
         CoreAttributeType::Custom { base, .. } => core_attr_type_to_json(base),
-        CoreAttributeType::Union(_) => AttrTypeJson::String, // degrade to String
+        CoreAttributeType::Union(members) => AttrTypeJson::Union {
+            members: members.iter().map(core_attr_type_to_json).collect(),
+        },
     }
 }
 
@@ -297,6 +301,9 @@ fn json_to_core_attr_type(t: &AttrTypeJson) -> CoreAttributeType {
             name: name.clone(),
             fields: fields.iter().map(json_to_core_struct_field).collect(),
         },
+        AttrTypeJson::Union { members } => {
+            CoreAttributeType::Union(members.iter().map(json_to_core_attr_type).collect())
+        }
     }
 }
 
@@ -353,7 +360,12 @@ pub fn core_to_wit_attribute_type(t: &CoreAttributeType) -> wit::AttributeType {
             })
         }
         CoreAttributeType::Custom { base, .. } => core_to_wit_attribute_type(base),
-        CoreAttributeType::Union(_) => wit::AttributeType::StringType,
+        CoreAttributeType::Union(members) => {
+            let json_members: Vec<AttrTypeJson> =
+                members.iter().map(core_attr_type_to_json).collect();
+            let json = serde_json::to_string(&json_members).unwrap();
+            wit::AttributeType::UnionType(json)
+        }
     }
 }
 
@@ -390,6 +402,14 @@ pub fn wit_to_core_attribute_type(t: &wit::AttributeType) -> CoreAttributeType {
             CoreAttributeType::Struct {
                 name: struct_def.name.clone(),
                 fields: fields.iter().map(json_to_core_struct_field).collect(),
+            }
+        }
+        wit::AttributeType::UnionType(json) => {
+            if let Ok(members) = serde_json::from_str::<Vec<AttrTypeJson>>(json) {
+                CoreAttributeType::Union(members.iter().map(json_to_core_attr_type).collect())
+            } else {
+                // Fallback: single-member union of String
+                CoreAttributeType::Union(vec![CoreAttributeType::String])
             }
         }
     }
@@ -834,15 +854,53 @@ mod tests {
         assert!(matches!(wit, wit::AttributeType::StringType));
     }
 
-    // -- Union degrades to String --
+    // -- Union type roundtrip --
 
     #[test]
-    fn test_union_degrades_to_string() {
+    fn test_union_type_roundtrip() {
         let core_type =
             CoreAttributeType::Union(vec![CoreAttributeType::String, CoreAttributeType::Int]);
 
         let wit = core_to_wit_attribute_type(&core_type);
-        assert!(matches!(wit, wit::AttributeType::StringType));
+        assert!(matches!(wit, wit::AttributeType::UnionType(_)));
+
+        let back = wit_to_core_attribute_type(&wit);
+        if let CoreAttributeType::Union(members) = &back {
+            assert_eq!(members.len(), 2);
+            assert!(matches!(members[0], CoreAttributeType::String));
+            assert!(matches!(members[1], CoreAttributeType::Int));
+        } else {
+            panic!("Expected Union type, got {:?}", back);
+        }
+    }
+
+    #[test]
+    fn test_union_with_struct_roundtrip() {
+        // Simulates IAM principal: Union(Struct, String)
+        let struct_type = CoreAttributeType::Struct {
+            name: "Principal".into(),
+            fields: vec![CoreStructField {
+                name: "service".into(),
+                field_type: CoreAttributeType::String,
+                required: false,
+                description: None,
+                provider_name: None,
+                block_name: None,
+            }],
+        };
+        let core_type = CoreAttributeType::Union(vec![struct_type, CoreAttributeType::String]);
+
+        let wit = core_to_wit_attribute_type(&core_type);
+        assert!(matches!(wit, wit::AttributeType::UnionType(_)));
+
+        let back = wit_to_core_attribute_type(&wit);
+        if let CoreAttributeType::Union(members) = &back {
+            assert_eq!(members.len(), 2);
+            assert!(matches!(members[0], CoreAttributeType::Struct { .. }));
+            assert!(matches!(members[1], CoreAttributeType::String));
+        } else {
+            panic!("Expected Union type, got {:?}", back);
+        }
     }
 
     // -- Map type roundtrip --

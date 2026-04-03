@@ -78,6 +78,8 @@ pub enum AttrTypeJson {
         name: std::string::String,
         fields: Vec<StructFieldJson>,
     },
+    #[serde(rename = "union")]
+    Union { members: Vec<AttrTypeJson> },
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -117,7 +119,9 @@ pub fn proto_attr_type_to_json(t: &proto::AttributeType) -> AttrTypeJson {
                 })
                 .collect(),
         },
-        proto::AttributeType::Union { .. } => AttrTypeJson::String,
+        proto::AttributeType::Union { members } => AttrTypeJson::Union {
+            members: members.iter().map(proto_attr_type_to_json).collect(),
+        },
     }
 }
 
@@ -373,8 +377,11 @@ macro_rules! export_provider {
                             fields: serde_json::to_string(&fields_json).unwrap(),
                         })
                     }
-                    proto::AttributeType::Union { .. } => {
-                        wit_types::AttributeType::StringType
+                    proto::AttributeType::Union { members } => {
+                        let json_members: Vec<helpers::AttrTypeJson> =
+                            members.iter().map(helpers::proto_attr_type_to_json).collect();
+                        let json = serde_json::to_string(&json_members).unwrap();
+                        wit_types::AttributeType::UnionType(json)
                     }
                 }
             }
@@ -748,8 +755,11 @@ macro_rules! export_provider {
                             fields: serde_json::to_string(&fields_json).unwrap(),
                         })
                     }
-                    proto::AttributeType::Union { .. } => {
-                        wit_types::AttributeType::StringType
+                    proto::AttributeType::Union { members } => {
+                        let json_members: Vec<helpers::AttrTypeJson> =
+                            members.iter().map(helpers::proto_attr_type_to_json).collect();
+                        let json = serde_json::to_string(&json_members).unwrap();
+                        wit_types::AttributeType::UnionType(json)
                     }
                 }
             }

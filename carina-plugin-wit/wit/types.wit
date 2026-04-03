@@ -71,6 +71,8 @@ interface types {
         /// JSON-encoded attribute-type for the value type
         map-type(string),
         struct-type(struct-def),
+        /// JSON-encoded list of member attribute-types
+        union-type(string),
     }
 
     record struct-def {
