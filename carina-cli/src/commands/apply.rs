@@ -183,6 +183,8 @@ impl ExecutionObserver for CliObserver {
                 if let Some(pb) = bars.remove(&key) {
                     pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
                     pb.finish_with_message(msg);
+                } else {
+                    eprintln!("  {msg}");
                 }
             }
             ExecutionEvent::EffectFailed {
@@ -206,8 +208,11 @@ impl ExecutionObserver for CliObserver {
                 let mut bars = self.bars.lock().unwrap();
                 if let Some(pb) = bars.remove(&key) {
                     pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
-                    pb.finish_with_message(msg);
+                    pb.finish_with_message(msg.clone());
                 }
+                // Always print errors to stderr so they're visible even when
+                // indicatif's MultiProgress swallows progress bar output.
+                eprintln!("  {msg}");
             }
             ExecutionEvent::EffectSkipped {
                 effect,
