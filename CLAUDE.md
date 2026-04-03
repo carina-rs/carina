@@ -78,6 +78,29 @@ Key rules:
 - For `cargo check`, prefer `cargo check -p <crate-name>` as well
 - Provider crates (aws, awscc) are in separate repositories — changes here may require updating those repos
 
+### Build Cache Setup (sccache + shared target)
+
+To speed up builds across git worktrees, set up sccache and a shared target directory. Without this, each worktree recompiles all dependencies from scratch.
+
+```bash
+# Install sccache
+brew install sccache
+
+# Create .cargo/config.toml (gitignored, local only)
+mkdir -p .cargo
+cat > .cargo/config.toml << 'EOF'
+[build]
+rustc-wrapper = "sccache"
+target-dir = "/Users/mizzy/.cargo-target/carina"
+EOF
+```
+
+This configuration:
+- **sccache**: Caches compiled artifacts globally. New worktrees hit the cache instead of recompiling.
+- **shared target-dir**: All worktrees share one target directory. Cargo uses file locks to handle concurrent access (builds are serialized, not parallel).
+
+Note: `.cargo/config.toml` is gitignored because it contains machine-specific paths. Each new worktree needs this file copied or recreated.
+
 ## Architecture
 
 Carina is a functional infrastructure management tool that treats side effects as values (Effects) rather than immediately executing them.

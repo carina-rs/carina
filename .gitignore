@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target/
 
+# Local cargo config (contains machine-specific paths)
+/.cargo/config.toml
+
 # Carina state files
 .carina/
 carina.state.json
