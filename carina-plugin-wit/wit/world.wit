@@ -5,6 +5,6 @@ world carina-provider {
 }
 
 world carina-provider-with-http {
-    import wasi:http/outgoing-handler@0.2.0;
+    import wasi:http/outgoing-handler@0.2.6;
     export provider;
 }
