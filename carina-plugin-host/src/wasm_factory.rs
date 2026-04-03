@@ -349,16 +349,30 @@ impl WasmProviderFactory {
         let cwasm_name = Self::cache_key(&wasm_path);
         let cwasm_path = cache_dir.join(&cwasm_name);
 
-        // Try loading from existing cache
+        // Try loading from existing cache.
+        // On failure, retry once after a short delay — another process may be
+        // writing the cache file atomically (write to .tmp then rename).
         if cwasm_path.exists() {
             match Self::from_precompiled(&cwasm_path).await {
                 Ok(mut factory) => {
                     factory.wasm_path = wasm_path;
                     return Ok(factory);
                 }
-                Err(e) => {
-                    eprintln!("Precompile cache invalid, recompiling: {e}");
-                    let _ = std::fs::remove_file(&cwasm_path);
+                Err(_) => {
+                    // Another process may be writing; wait briefly and retry
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    if cwasm_path.exists() {
+                        match Self::from_precompiled(&cwasm_path).await {
+                            Ok(mut factory) => {
+                                factory.wasm_path = wasm_path;
+                                return Ok(factory);
+                            }
+                            Err(e) => {
+                                eprintln!("Precompile cache invalid, recompiling: {e}");
+                                let _ = std::fs::remove_file(&cwasm_path);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -446,8 +460,21 @@ impl WasmProviderFactory {
             .map_err(|e| format!("Precompile error: {e}"))?;
         if let Some(parent) = cwasm_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("Mkdir error: {e}"))?;
+            // Write to a temp file and atomically rename to avoid race conditions
+            // when multiple processes precompile the same component concurrently.
+            let tmp_path = parent.join(format!(
+                ".{}.tmp.{}",
+                cwasm_path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or("cwasm"),
+                std::process::id()
+            ));
+            std::fs::write(&tmp_path, &serialized).map_err(|e| format!("Write error: {e}"))?;
+            std::fs::rename(&tmp_path, cwasm_path).map_err(|e| format!("Rename error: {e}"))?;
+        } else {
+            std::fs::write(cwasm_path, &serialized).map_err(|e| format!("Write error: {e}"))?;
         }
-        std::fs::write(cwasm_path, &serialized).map_err(|e| format!("Write error: {e}"))?;
         Ok(())
     }
 
