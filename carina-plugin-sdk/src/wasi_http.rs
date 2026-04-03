@@ -218,7 +218,7 @@ fn read_body(body: &IncomingBody) -> Result<Vec<u8>, ConnectorError> {
         .map_err(|()| ConnectorError::other("Failed to get input stream".into(), None))?;
     let mut buf = Vec::new();
     loop {
-        match stream.read(64 * 1024) {
+        match stream.blocking_read(64 * 1024) {
             Ok(chunk) => buf.extend_from_slice(&chunk),
             Err(StreamError::Closed) => break,
             Err(e) => {
