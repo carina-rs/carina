@@ -151,12 +151,12 @@ macro_rules! export_provider {
                 path: "../carina-plugin-wit/wit",
                 world: "carina-provider-with-http",
                 with: {
-                    "wasi:io/poll@0.2.0": ::wasi::io::poll,
-                    "wasi:io/error@0.2.0": ::wasi::io::error,
-                    "wasi:io/streams@0.2.0": ::wasi::io::streams,
-                    "wasi:clocks/monotonic-clock@0.2.0": ::wasi::clocks::monotonic_clock,
-                    "wasi:http/types@0.2.0": ::wasi::http::types,
-                    "wasi:http/outgoing-handler@0.2.0": ::wasi::http::outgoing_handler,
+                    "wasi:io/poll@0.2.6": ::wasi::io::poll,
+                    "wasi:io/error@0.2.6": ::wasi::io::error,
+                    "wasi:io/streams@0.2.6": ::wasi::io::streams,
+                    "wasi:clocks/monotonic-clock@0.2.6": ::wasi::clocks::monotonic_clock,
+                    "wasi:http/types@0.2.6": ::wasi::http::types,
+                    "wasi:http/outgoing-handler@0.2.6": ::wasi::http::outgoing_handler,
                 },
             });
 
