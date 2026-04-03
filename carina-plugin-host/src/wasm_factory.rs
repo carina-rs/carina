@@ -15,6 +15,7 @@ use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use carina_core::provider::{
     BoxFuture, Provider, ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult,
+    SavedAttrs,
 };
 use carina_core::resource::{
     Expr, LifecycleConfig, Resource, ResourceId, State, Value, contains_resource_ref,
@@ -240,6 +241,26 @@ impl WasmBindings {
             WasmBindings::Http(b) => {
                 b.carina_provider_provider()
                     .call_normalize_state(store, states)
+                    .await
+            }
+        }
+    }
+
+    async fn call_hydrate_read_state(
+        &self,
+        store: &mut Store<HostState>,
+        states: &[(String, wit_types::State)],
+        saved_attrs: &[(String, Vec<(String, wit_types::Value)>)],
+    ) -> wasmtime::Result<Vec<(String, wit_types::State)>> {
+        match self {
+            WasmBindings::Basic(b) => {
+                b.carina_provider_provider()
+                    .call_hydrate_read_state(store, states, saved_attrs)
+                    .await
+            }
+            WasmBindings::Http(b) => {
+                b.carina_provider_provider()
+                    .call_hydrate_read_state(store, states, saved_attrs)
                     .await
             }
         }
@@ -835,6 +856,44 @@ impl ProviderNormalizer for WasmProviderNormalizer {
                 }
             }
             Err(e) => log::error!("WASM trap in normalize_state: {e}"),
+        }
+    }
+
+    fn hydrate_read_state(
+        &self,
+        current_states: &mut HashMap<ResourceId, State>,
+        saved_attrs: &SavedAttrs,
+    ) {
+        let wit_states: Vec<(String, _)> = current_states
+            .iter()
+            .map(|(id, state)| (id.to_string(), wasm_convert::core_to_wit_state(state)))
+            .collect();
+
+        let wit_saved: Vec<(String, Vec<(String, _)>)> = saved_attrs
+            .iter()
+            .map(|(id, attrs)| (id.to_string(), wasm_convert::core_to_wit_value_map(attrs)))
+            .collect();
+
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let mut store = self.store.lock().await;
+                self.bindings
+                    .call_hydrate_read_state(&mut store, &wit_states, &wit_saved)
+                    .await
+            })
+        });
+
+        match result {
+            Ok(result) => {
+                for state in current_states.values_mut() {
+                    let key = state.id.to_string();
+                    if let Some((_, wit_state)) = result.iter().find(|(k, _)| k == &key) {
+                        state.attributes =
+                            wasm_convert::wit_to_core_value_map(&wit_state.attributes);
+                    }
+                }
+            }
+            Err(e) => log::error!("WASM trap in hydrate_read_state: {e}"),
         }
     }
 }

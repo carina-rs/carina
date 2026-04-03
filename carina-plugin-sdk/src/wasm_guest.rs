@@ -89,6 +89,10 @@ pub struct StructFieldJson {
     pub required: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_name: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_name: Option<std::string::String>,
 }
 
 pub fn proto_attr_type_to_json(t: &proto::AttributeType) -> AttrTypeJson {
@@ -116,6 +120,8 @@ pub fn proto_attr_type_to_json(t: &proto::AttributeType) -> AttrTypeJson {
                     field_type: proto_attr_type_to_json(&f.field_type),
                     required: f.required,
                     description: f.description.clone(),
+                    provider_name: f.provider_name.clone(),
+                    block_name: f.block_name.clone(),
                 })
                 .collect(),
         },
@@ -370,6 +376,8 @@ macro_rules! export_provider {
                                 field_type: helpers::proto_attr_type_to_json(&f.field_type),
                                 required: f.required,
                                 description: f.description.clone(),
+                                provider_name: f.provider_name.clone(),
+                                block_name: f.block_name.clone(),
                             })
                             .collect();
                         wit_types::AttributeType::StructType(wit_types::StructDef {
@@ -517,6 +525,37 @@ macro_rules! export_provider {
                     let result =
                         $crate::CarinaProvider::normalize_state(&*provider, proto_states);
                     result
+                        .into_iter()
+                        .map(|(k, s)| (k, proto_to_wit_state(&s)))
+                        .collect()
+                }
+
+                fn hydrate_read_state(
+                    states: Vec<(String, wit_types::State)>,
+                    saved_attrs: Vec<(String, Vec<(String, wit_types::Value)>)>,
+                ) -> Vec<(String, wit_types::State)> {
+                    let provider = get_provider().lock().unwrap();
+                    let mut proto_states: HashMap<String, proto::State> = states
+                        .iter()
+                        .map(|(k, s)| {
+                            let dummy_id = proto::ResourceId {
+                                provider: String::new(),
+                                resource_type: String::new(),
+                                name: k.clone(),
+                            };
+                            (k.clone(), wit_to_proto_state(&dummy_id, s))
+                        })
+                        .collect();
+                    let proto_saved: HashMap<String, HashMap<String, proto::Value>> = saved_attrs
+                        .iter()
+                        .map(|(k, attrs)| (k.clone(), wit_to_proto_value_map(attrs)))
+                        .collect();
+                    $crate::CarinaProvider::hydrate_read_state(
+                        &*provider,
+                        &mut proto_states,
+                        &proto_saved,
+                    );
+                    proto_states
                         .into_iter()
                         .map(|(k, s)| (k, proto_to_wit_state(&s)))
                         .collect()
@@ -748,6 +787,8 @@ macro_rules! export_provider {
                                 field_type: helpers::proto_attr_type_to_json(&f.field_type),
                                 required: f.required,
                                 description: f.description.clone(),
+                                provider_name: f.provider_name.clone(),
+                                block_name: f.block_name.clone(),
                             })
                             .collect();
                         wit_types::AttributeType::StructType(wit_types::StructDef {
@@ -897,6 +938,37 @@ macro_rules! export_provider {
                     let result =
                         $crate::CarinaProvider::normalize_state(&*provider, proto_states);
                     result
+                        .into_iter()
+                        .map(|(k, s)| (k, proto_to_wit_state(&s)))
+                        .collect()
+                }
+
+                fn hydrate_read_state(
+                    states: Vec<(String, wit_types::State)>,
+                    saved_attrs: Vec<(String, Vec<(String, wit_types::Value)>)>,
+                ) -> Vec<(String, wit_types::State)> {
+                    let provider = get_provider().lock().unwrap();
+                    let mut proto_states: HashMap<String, proto::State> = states
+                        .iter()
+                        .map(|(k, s)| {
+                            let dummy_id = proto::ResourceId {
+                                provider: String::new(),
+                                resource_type: String::new(),
+                                name: k.clone(),
+                            };
+                            (k.clone(), wit_to_proto_state(&dummy_id, s))
+                        })
+                        .collect();
+                    let proto_saved: HashMap<String, HashMap<String, proto::Value>> = saved_attrs
+                        .iter()
+                        .map(|(k, attrs)| (k.clone(), wit_to_proto_value_map(attrs)))
+                        .collect();
+                    $crate::CarinaProvider::hydrate_read_state(
+                        &*provider,
+                        &mut proto_states,
+                        &proto_saved,
+                    );
+                    proto_states
                         .into_iter()
                         .map(|(k, s)| (k, proto_to_wit_state(&s)))
                         .collect()
