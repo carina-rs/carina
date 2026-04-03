@@ -3569,4 +3569,172 @@ mod tests {
             deps
         );
     }
+
+    /// Test that ResourceRef values in dependent resources are resolved using
+    /// state attributes from predecessor resources (binding_map propagation).
+    #[tokio::test]
+    async fn test_resource_ref_resolved_from_predecessor_state() {
+        let provider = RecordingMockProvider::new();
+
+        // VPC resource with binding "vpc"
+        let mut vpc = Resource::new("test", "my-vpc");
+        vpc.binding = Some("vpc".to_string());
+        vpc.set_attr("cidr_block", Value::String("10.0.0.0/16".to_string()));
+        let vpc_id = vpc.id.clone();
+
+        // Subnet resource that references vpc.vpc_id
+        let mut subnet = Resource::new("test", "my-subnet");
+        subnet.set_attr(
+            "vpc_id",
+            Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
+        );
+        subnet.set_attr("cidr_block", Value::String("10.0.1.0/24".to_string()));
+        subnet.dependency_bindings = vec!["vpc".to_string()];
+        let subnet_id = subnet.id.clone();
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(vpc));
+        plan.add(Effect::Create(subnet));
+
+        // VPC create returns state with vpc_id
+        let vpc_state = State::existing(
+            vpc_id.clone(),
+            vec![("vpc_id".to_string(), Value::String("vpc-12345".to_string()))]
+                .into_iter()
+                .collect(),
+        )
+        .with_identifier("vpc-12345");
+        provider.push_create(Ok(vpc_state));
+
+        // Subnet create returns state
+        let subnet_state = State::existing(
+            subnet_id.clone(),
+            vec![(
+                "subnet_id".to_string(),
+                Value::String("subnet-67890".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .with_identifier("subnet-67890");
+        provider.push_create(Ok(subnet_state));
+
+        let input = ExecutionInput {
+            plan: &plan,
+            unresolved_resources: &HashMap::new(),
+            binding_map: HashMap::new(),
+            current_states: HashMap::new(),
+        };
+
+        let observer = MockObserver::new();
+        let result = execute_plan(&provider, input, &observer).await;
+
+        assert_eq!(result.success_count, 2, "Both resources should succeed");
+        assert_eq!(result.failure_count, 0, "No failures expected");
+
+        // Check that the subnet received vpc_id = "vpc-12345" (resolved from state)
+        let create_calls = provider.create_calls();
+        assert_eq!(create_calls.len(), 2, "Should have 2 create calls");
+
+        // First call should be VPC
+        assert_eq!(create_calls[0].0, vpc_id.to_string());
+
+        // Second call should be subnet with resolved vpc_id
+        assert_eq!(create_calls[1].0, subnet_id.to_string());
+        let subnet_attrs = &create_calls[1].1;
+        assert_eq!(
+            subnet_attrs.get("vpc_id"),
+            Some(&Value::String("vpc-12345".to_string())),
+            "Subnet's vpc_id should be resolved from VPC state, got: {:?}",
+            subnet_attrs.get("vpc_id")
+        );
+    }
+
+    /// A mock provider that records the resource attributes passed to create().
+    type CreateLog = Vec<(String, HashMap<String, Value>)>;
+
+    struct RecordingMockProvider {
+        create_results: Mutex<Vec<ProviderResult<State>>>,
+        /// Records: (resource_id_string, resolved_attributes)
+        create_log: Arc<Mutex<CreateLog>>,
+    }
+
+    impl RecordingMockProvider {
+        fn new() -> Self {
+            Self {
+                create_results: Mutex::new(Vec::new()),
+                create_log: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn push_create(&self, result: ProviderResult<State>) {
+            self.create_results.lock().unwrap().push(result);
+        }
+
+        fn create_calls(&self) -> Vec<(String, HashMap<String, Value>)> {
+            self.create_log.lock().unwrap().clone()
+        }
+    }
+
+    impl Provider for RecordingMockProvider {
+        fn name(&self) -> &'static str {
+            "recording_mock"
+        }
+
+        fn read(
+            &self,
+            _id: &ResourceId,
+            _identifier: Option<&str>,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            Box::pin(async {
+                Err(ProviderError {
+                    message: "not implemented".to_string(),
+                    resource_id: None,
+                    cause: None,
+                    is_timeout: false,
+                })
+            })
+        }
+
+        fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+            let id_str = resource.id.to_string();
+            let attrs = resource.resolved_attributes();
+            self.create_log.lock().unwrap().push((id_str, attrs));
+            let result = self.create_results.lock().unwrap().remove(0);
+            Box::pin(async move { result })
+        }
+
+        fn update(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _from: &State,
+            _to: &Resource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            Box::pin(async {
+                Err(ProviderError {
+                    message: "not implemented".to_string(),
+                    resource_id: None,
+                    cause: None,
+                    is_timeout: false,
+                })
+            })
+        }
+
+        fn delete(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _lifecycle: &LifecycleConfig,
+        ) -> BoxFuture<'_, ProviderResult<()>> {
+            Box::pin(async {
+                Err(ProviderError {
+                    message: "not implemented".to_string(),
+                    resource_id: None,
+                    cause: None,
+                    is_timeout: false,
+                })
+            })
+        }
+    }
 }

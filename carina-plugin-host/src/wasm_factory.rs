@@ -12,7 +12,9 @@ use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 use carina_core::provider::{
     BoxFuture, Provider, ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult,
 };
-use carina_core::resource::{Expr, LifecycleConfig, Resource, ResourceId, State, Value};
+use carina_core::resource::{
+    Expr, LifecycleConfig, Resource, ResourceId, State, Value, contains_resource_ref,
+};
 use carina_core::schema::ResourceSchema;
 
 use crate::wasm_bindings::CarinaProvider;
@@ -700,6 +702,16 @@ impl ProviderNormalizer for WasmProviderNormalizer {
                 for (core_res, wit_res) in resources.iter_mut().zip(result.iter()) {
                     let resolved = wasm_convert::wit_to_core_value_map(&wit_res.attributes);
                     for (key, value) in resolved {
+                        // Skip attributes whose original value contains a ResourceRef.
+                        // The WIT roundtrip converts ResourceRef to a debug string
+                        // (e.g., "ResourceRef { path: ... }") because the WIT Value type
+                        // has no ResourceRef variant. Overwriting would destroy the ref
+                        // and prevent resolution at apply time.
+                        if let Some(original) = core_res.attributes.get(&key)
+                            && contains_resource_ref(original)
+                        {
+                            continue;
+                        }
                         core_res.attributes.insert(key, Expr(value));
                     }
                 }
