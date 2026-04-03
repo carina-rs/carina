@@ -5,7 +5,7 @@ pub mod wasm_bindings {
     wasmtime::component::bindgen!({
         path: "../carina-plugin-wit/wit",
         world: "carina-provider",
-        async: true,
+        require_store_data_send: true,
     });
 }
 
@@ -13,7 +13,7 @@ pub mod wasm_bindings_http {
     wasmtime::component::bindgen!({
         path: "../carina-plugin-wit/wit",
         world: "carina-provider-with-http",
-        async: true,
+        require_store_data_send: true,
         with: {
             "carina:provider/types": super::wasm_bindings::carina::provider::types,
             "carina:provider/provider": super::wasm_bindings::exports::carina::provider::provider,

@@ -12,9 +12,9 @@ carina-core = { path = "../carina-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"
-wasmtime = { version = "29", features = ["component-model"] }
-wasmtime-wasi = "29"
-wasmtime-wasi-http = "29"
+wasmtime = { version = "43", features = ["component-model"] }
+wasmtime-wasi = "43"
+wasmtime-wasi-http = "43"
 tokio = { version = "1", features = ["rt"] }
 dirs = "6"
 sha2 = "0.10"
