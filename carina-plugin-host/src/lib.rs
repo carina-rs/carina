@@ -19,6 +19,8 @@ pub mod wasm_bindings_http {
         with: {
             "carina:provider/types": super::wasm_bindings::carina::provider::types,
             "carina:provider/provider": super::wasm_bindings::exports::carina::provider::provider,
+            "wasi:http": wasmtime_wasi_http::p2::bindings::http,
+            "wasi:io": wasmtime_wasi::p2::bindings::io,
         },
     });
 }
