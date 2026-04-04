@@ -889,8 +889,8 @@ mod tests {
             from: from.clone(),
             to: Resource::new("ec2.vpc", "my-vpc"),
             lifecycle: LifecycleConfig {
-                force_delete: false,
                 create_before_destroy: true,
+                ..Default::default()
             },
             changed_create_only: vec!["cidr".to_string()],
             cascading_updates: vec![],

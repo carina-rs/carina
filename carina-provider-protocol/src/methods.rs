@@ -89,6 +89,7 @@ pub struct UpdateResult {
 pub struct DeleteParams {
     pub id: ResourceId,
     pub identifier: String,
+    #[serde(default)]
     pub lifecycle: LifecycleConfig,
 }
 

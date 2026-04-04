@@ -704,12 +704,15 @@ fn similarity_score(a: &Value, b: &Value) -> usize {
 /// Lifecycle configuration for a resource
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct LifecycleConfig {
-    /// If true, force-delete the resource (e.g., empty S3 bucket before deletion)
+    /// If true, force-delete the resource (e.g., non-empty S3 buckets)
     #[serde(default)]
     pub force_delete: bool,
     /// If true, create the new resource before destroying the old one during replacement
     #[serde(default)]
     pub create_before_destroy: bool,
+    /// If true, prevent the resource from being destroyed
+    #[serde(default)]
+    pub prevent_destroy: bool,
 }
 
 /// Source of a resource (root or from a module)
@@ -1007,8 +1010,8 @@ mod tests {
     #[test]
     fn lifecycle_config_serde_with_create_before_destroy() {
         let config = LifecycleConfig {
-            force_delete: false,
             create_before_destroy: true,
+            ..Default::default()
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: LifecycleConfig = serde_json::from_str(&json).unwrap();
@@ -1018,11 +1021,25 @@ mod tests {
 
     #[test]
     fn lifecycle_config_backward_compatible_deserialize() {
-        // Old JSON without create_before_destroy field should deserialize with default (false)
-        let json = r#"{"force_delete":true}"#;
+        // Old JSON without all fields should deserialize with defaults
+        let json = r#"{"create_before_destroy":true}"#;
         let config: LifecycleConfig = serde_json::from_str(json).unwrap();
-        assert!(config.force_delete);
-        assert!(!config.create_before_destroy);
+        assert!(config.create_before_destroy);
+        assert!(!config.force_delete);
+        assert!(!config.prevent_destroy);
+    }
+
+    #[test]
+    fn lifecycle_config_with_force_delete() {
+        let config = LifecycleConfig {
+            force_delete: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: LifecycleConfig = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.force_delete);
+        assert!(!deserialized.create_before_destroy);
+        assert!(!deserialized.prevent_destroy);
     }
 
     #[test]

@@ -1,40 +1,26 @@
 interface provider {
-    use types.{
-        resource-id, state, resource-def, lifecycle-config,
-        provider-error, resource-schema, value, provider-info,
-    };
+    use types.{ resource-id, state, resource-def, value };
 
-    info: func() -> provider-info;
+    /// Returns JSON-serialized ProviderInfo
+    info: func() -> string;
 
-    schemas: func() -> list<resource-schema>;
+    /// Returns JSON-serialized Vec<ResourceSchema>
+    schemas: func() -> string;
 
     validate-config: func(attrs: list<tuple<string, value>>) -> result<_, string>;
-
     initialize: func(attrs: list<tuple<string, value>>) -> result<_, string>;
 
-    read: func(id: resource-id, identifier: option<string>) -> result<state, provider-error>;
+    read: func(id: resource-id, identifier: option<string>) -> result<state, string>;
+    create: func(res: resource-def) -> result<state, string>;
+    update: func(id: resource-id, identifier: string, current: state, to: resource-def) -> result<state, string>;
 
-    create: func(res: resource-def) -> result<state, provider-error>;
-
-    update: func(
-        id: resource-id,
-        identifier: string,
-        current: state,
-        to: resource-def,
-    ) -> result<state, provider-error>;
-
-    delete: func(
-        id: resource-id,
-        identifier: string,
-        lifecycle: lifecycle-config,
-    ) -> result<_, provider-error>;
+    /// options is JSON-serialized provider options map
+    delete: func(id: resource-id, identifier: string, options: string) -> result<_, string>;
 
     normalize-desired: func(resources: list<resource-def>) -> list<resource-def>;
-
     normalize-state: func(
         states: list<tuple<string, state>>,
     ) -> list<tuple<string, state>>;
-
     hydrate-read-state: func(
         states: list<tuple<string, state>>,
         saved-attrs: list<tuple<string, list<tuple<string, value>>>>,

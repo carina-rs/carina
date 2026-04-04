@@ -2926,9 +2926,11 @@ fn extract_lifecycle_config(attributes: &mut HashMap<String, Value>) -> Lifecycl
             let force_delete = matches!(map.get("force_delete"), Some(Value::Bool(true)));
             let create_before_destroy =
                 matches!(map.get("create_before_destroy"), Some(Value::Bool(true)));
+            let prevent_destroy = matches!(map.get("prevent_destroy"), Some(Value::Bool(true)));
             return LifecycleConfig {
                 force_delete,
                 create_before_destroy,
+                prevent_destroy,
             };
         }
     }
@@ -4760,6 +4762,7 @@ mod tests {
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert!(!result.resources[0].lifecycle.force_delete);
+        assert!(!result.resources[0].lifecycle.prevent_destroy);
     }
 
     #[test]

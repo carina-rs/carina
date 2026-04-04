@@ -1664,8 +1664,8 @@ async fn rename_failure_in_create_before_destroy_counts_as_failure() {
         from: Box::new(old_state.clone()),
         to: new_resource.clone(),
         lifecycle: LifecycleConfig {
-            force_delete: false,
             create_before_destroy: true,
+            ..Default::default()
         },
         changed_create_only: vec!["bucket_name".to_string()],
         cascading_updates: vec![],
@@ -1772,8 +1772,8 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: vpc_unresolved.clone().with_binding("vpc"),
         lifecycle: LifecycleConfig {
-            force_delete: false,
             create_before_destroy: true,
+            ..Default::default()
         },
         changed_create_only: vec!["cidr_block".to_string()],
         cascading_updates: vec![],

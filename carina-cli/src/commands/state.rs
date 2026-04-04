@@ -11,7 +11,7 @@ use carina_core::effect::Effect;
 use carina_core::parser::ProviderContext;
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
-use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
+use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::value::{format_value, json_to_dsl_value};
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, LockInfo, ResourceState, StateBackend,
@@ -521,7 +521,11 @@ async fn run_state_bucket_delete(
     let bucket_id =
         ResourceId::with_provider(backend_provider_name, backend_resource_type, bucket_name);
     match bucket_provider
-        .delete(&bucket_id, bucket_name, &LifecycleConfig::default())
+        .delete(
+            &bucket_id,
+            bucket_name,
+            &carina_core::resource::LifecycleConfig::default(),
+        )
         .await
     {
         Ok(()) => {

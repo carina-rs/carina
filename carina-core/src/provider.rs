@@ -688,7 +688,7 @@ mod tests {
         router.add_provider("mock".to_string(), Box::new(MockProvider));
 
         let id = ResourceId::with_provider("mock", "test", "example");
-        let lifecycle = LifecycleConfig::default();
+        let lifecycle = crate::resource::LifecycleConfig::default();
         let result = router.delete(&id, "mock-id-123", &lifecycle).await;
         assert!(result.is_ok());
     }

@@ -3,13 +3,15 @@
 use std::collections::HashMap;
 
 use carina_core::resource::{
-    Expr, LifecycleConfig as CoreLifecycle, Resource as CoreResource, ResourceId as CoreResourceId,
+    Expr, LifecycleConfig, Resource as CoreResource, ResourceId as CoreResourceId,
     State as CoreState, Value as CoreValue,
 };
 use carina_core::schema::{
     AttributeSchema as CoreAttributeSchema, AttributeType as CoreAttributeType,
     ResourceSchema as CoreResourceSchema, StructField as CoreStructField,
 };
+
+use carina_provider_protocol::types as proto;
 
 use crate::wasm_bindings::carina::provider::types as wit;
 
@@ -185,295 +187,121 @@ pub fn wit_to_core_resource(resource: &wit::ResourceDef) -> CoreResource {
     core_resource
 }
 
-// -- LifecycleConfig --
+// -- JSON passthrough functions for provider-specific types --
 
-pub fn core_to_wit_lifecycle(lifecycle: &CoreLifecycle) -> wit::LifecycleConfig {
-    wit::LifecycleConfig {
-        prevent_destroy: false,
-        force_delete: lifecycle.force_delete,
-        create_before_destroy: lifecycle.create_before_destroy,
-    }
+/// Serialize LifecycleConfig to JSON string for the WIT boundary.
+pub fn lifecycle_to_json(lifecycle: &LifecycleConfig) -> String {
+    serde_json::to_string(lifecycle).unwrap_or_else(|_| "{}".to_string())
 }
 
-// -- ProviderError --
-
-pub fn wit_to_core_provider_error(e: &wit::ProviderError) -> carina_core::provider::ProviderError {
-    carina_core::provider::ProviderError {
-        message: e.message.clone(),
-        resource_id: e.resource_id.as_ref().map(wit_to_core_resource_id),
-        cause: None,
-        is_timeout: e.is_timeout,
-    }
-}
-
-// -- AttributeType --
-
-/// JSON-serializable representation of an attribute type for WIT encoding.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type")]
-enum AttrTypeJson {
-    #[serde(rename = "string")]
-    String,
-    #[serde(rename = "int")]
-    Int,
-    #[serde(rename = "float")]
-    Float,
-    #[serde(rename = "bool")]
-    Bool,
-    #[serde(rename = "string-enum")]
-    StringEnum { values: Vec<String> },
-    #[serde(rename = "list")]
-    List {
-        inner: Box<AttrTypeJson>,
-        ordered: bool,
-    },
-    #[serde(rename = "map")]
-    Map { inner: Box<AttrTypeJson> },
-    #[serde(rename = "struct")]
-    Struct {
-        name: String,
-        fields: Vec<StructFieldJson>,
-    },
-    #[serde(rename = "union")]
-    Union { members: Vec<AttrTypeJson> },
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct StructFieldJson {
-    name: String,
-    field_type: AttrTypeJson,
-    required: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    provider_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    block_name: Option<String>,
-}
-
-fn core_attr_type_to_json(t: &CoreAttributeType) -> AttrTypeJson {
-    match t {
-        CoreAttributeType::String => AttrTypeJson::String,
-        CoreAttributeType::Int => AttrTypeJson::Int,
-        CoreAttributeType::Float => AttrTypeJson::Float,
-        CoreAttributeType::Bool => AttrTypeJson::Bool,
-        CoreAttributeType::StringEnum { values, .. } => AttrTypeJson::StringEnum {
-            values: values.clone(),
-        },
-        CoreAttributeType::List { inner, ordered } => AttrTypeJson::List {
-            inner: Box::new(core_attr_type_to_json(inner)),
-            ordered: *ordered,
-        },
-        CoreAttributeType::Map(inner) => AttrTypeJson::Map {
-            inner: Box::new(core_attr_type_to_json(inner)),
-        },
-        CoreAttributeType::Struct { name, fields } => AttrTypeJson::Struct {
-            name: name.clone(),
-            fields: fields.iter().map(core_struct_field_to_json).collect(),
-        },
-        CoreAttributeType::Custom { base, .. } => core_attr_type_to_json(base),
-        CoreAttributeType::Union(members) => AttrTypeJson::Union {
-            members: members.iter().map(core_attr_type_to_json).collect(),
-        },
-    }
-}
-
-fn json_to_core_attr_type(t: &AttrTypeJson) -> CoreAttributeType {
-    match t {
-        AttrTypeJson::String => CoreAttributeType::String,
-        AttrTypeJson::Int => CoreAttributeType::Int,
-        AttrTypeJson::Float => CoreAttributeType::Float,
-        AttrTypeJson::Bool => CoreAttributeType::Bool,
-        AttrTypeJson::StringEnum { values } => CoreAttributeType::StringEnum {
-            name: String::new(),
-            values: values.clone(),
-            namespace: None,
-            to_dsl: None,
-        },
-        AttrTypeJson::List { inner, ordered } => CoreAttributeType::List {
-            inner: Box::new(json_to_core_attr_type(inner)),
-            ordered: *ordered,
-        },
-        AttrTypeJson::Map { inner } => {
-            CoreAttributeType::Map(Box::new(json_to_core_attr_type(inner)))
+/// Deserialize a JSON error string to a core ProviderError.
+pub fn json_to_provider_error(json: &str) -> carina_core::provider::ProviderError {
+    if let Ok(proto_err) = serde_json::from_str::<proto::ProviderError>(json) {
+        carina_core::provider::ProviderError {
+            message: proto_err.message,
+            resource_id: proto_err.resource_id.map(|pid| {
+                CoreResourceId::with_provider(&pid.provider, &pid.resource_type, &pid.name)
+            }),
+            cause: None,
+            is_timeout: proto_err.is_timeout,
         }
-        AttrTypeJson::Struct { name, fields } => CoreAttributeType::Struct {
-            name: name.clone(),
-            fields: fields.iter().map(json_to_core_struct_field).collect(),
-        },
-        AttrTypeJson::Union { members } => {
-            CoreAttributeType::Union(members.iter().map(json_to_core_attr_type).collect())
+    } else {
+        carina_core::provider::ProviderError {
+            message: json.to_string(),
+            resource_id: None,
+            cause: None,
+            is_timeout: false,
         }
     }
 }
 
-fn core_struct_field_to_json(f: &CoreStructField) -> StructFieldJson {
-    StructFieldJson {
-        name: f.name.clone(),
-        field_type: core_attr_type_to_json(&f.field_type),
-        required: f.required,
-        description: f.description.clone(),
-        provider_name: f.provider_name.clone(),
-        block_name: f.block_name.clone(),
+/// Deserialize JSON to (name, display_name) tuple from ProviderInfo.
+pub fn json_to_provider_info(json: &str) -> (String, String) {
+    if let Ok(info) = serde_json::from_str::<proto::ProviderInfo>(json) {
+        (info.name, info.display_name)
+    } else {
+        ("unknown".to_string(), "Unknown Provider".to_string())
     }
 }
 
-fn json_to_core_struct_field(f: &StructFieldJson) -> CoreStructField {
-    CoreStructField {
-        name: f.name.clone(),
-        field_type: json_to_core_attr_type(&f.field_type),
-        required: f.required,
-        description: f.description.clone(),
-        provider_name: f.provider_name.clone(),
-        block_name: f.block_name.clone(),
-    }
+/// Deserialize JSON to a Vec of core ResourceSchemas.
+pub fn json_to_schemas(json: &str) -> Vec<CoreResourceSchema> {
+    let proto_schemas: Vec<proto::ResourceSchema> = serde_json::from_str(json).unwrap_or_default();
+    proto_schemas.iter().map(proto_schema_to_core).collect()
 }
 
-pub fn core_to_wit_attribute_type(t: &CoreAttributeType) -> wit::AttributeType {
-    match t {
-        CoreAttributeType::String => wit::AttributeType::StringType,
-        CoreAttributeType::Int => wit::AttributeType::IntType,
-        CoreAttributeType::Float => wit::AttributeType::FloatType,
-        CoreAttributeType::Bool => wit::AttributeType::BoolType,
-        CoreAttributeType::StringEnum { values, .. } => {
-            wit::AttributeType::StringEnum(values.clone())
-        }
-        CoreAttributeType::List { inner, ordered } => {
-            let json = AttrTypeJson::List {
-                inner: Box::new(core_attr_type_to_json(inner)),
-                ordered: *ordered,
-            };
-            wit::AttributeType::ListType(serde_json::to_string(&json).unwrap())
-        }
-        CoreAttributeType::Map(inner) => {
-            let json = AttrTypeJson::Map {
-                inner: Box::new(core_attr_type_to_json(inner)),
-            };
-            wit::AttributeType::MapType(serde_json::to_string(&json).unwrap())
-        }
-        CoreAttributeType::Struct { name, fields } => {
-            let fields_json: Vec<StructFieldJson> =
-                fields.iter().map(core_struct_field_to_json).collect();
-            wit::AttributeType::StructType(wit::StructDef {
-                name: name.clone(),
-                fields: serde_json::to_string(&fields_json).unwrap(),
-            })
-        }
-        CoreAttributeType::Custom { base, .. } => core_to_wit_attribute_type(base),
-        CoreAttributeType::Union(members) => {
-            let json_members: Vec<AttrTypeJson> =
-                members.iter().map(core_attr_type_to_json).collect();
-            let json = serde_json::to_string(&json_members).unwrap();
-            wit::AttributeType::UnionType(json)
-        }
-    }
-}
+// -- Protocol schema to core schema conversion --
 
-pub fn wit_to_core_attribute_type(t: &wit::AttributeType) -> CoreAttributeType {
-    match t {
-        wit::AttributeType::StringType => CoreAttributeType::String,
-        wit::AttributeType::IntType => CoreAttributeType::Int,
-        wit::AttributeType::FloatType => CoreAttributeType::Float,
-        wit::AttributeType::BoolType => CoreAttributeType::Bool,
-        wit::AttributeType::StringEnum(values) => CoreAttributeType::StringEnum {
-            name: String::new(),
-            values: values.clone(),
-            namespace: None,
-            to_dsl: None,
-        },
-        wit::AttributeType::ListType(json) => {
-            if let Ok(attr_json) = serde_json::from_str::<AttrTypeJson>(json) {
-                json_to_core_attr_type(&attr_json)
-            } else {
-                // Fallback: treat the JSON string as the inner type descriptor
-                CoreAttributeType::list(CoreAttributeType::String)
-            }
-        }
-        wit::AttributeType::MapType(json) => {
-            if let Ok(attr_json) = serde_json::from_str::<AttrTypeJson>(json) {
-                json_to_core_attr_type(&attr_json)
-            } else {
-                CoreAttributeType::Map(Box::new(CoreAttributeType::String))
-            }
-        }
-        wit::AttributeType::StructType(struct_def) => {
-            let fields: Vec<StructFieldJson> =
-                serde_json::from_str(&struct_def.fields).unwrap_or_default();
-            CoreAttributeType::Struct {
-                name: struct_def.name.clone(),
-                fields: fields.iter().map(json_to_core_struct_field).collect(),
-            }
-        }
-        wit::AttributeType::UnionType(json) => {
-            if let Ok(members) = serde_json::from_str::<Vec<AttrTypeJson>>(json) {
-                CoreAttributeType::Union(members.iter().map(json_to_core_attr_type).collect())
-            } else {
-                // Fallback: single-member union of String
-                CoreAttributeType::Union(vec![CoreAttributeType::String])
-            }
-        }
-    }
-}
-
-// -- Schema --
-
-fn core_to_wit_attribute_schema(a: &CoreAttributeSchema) -> wit::AttributeSchema {
-    wit::AttributeSchema {
-        name: a.name.clone(),
-        attr_type: core_to_wit_attribute_type(&a.attr_type),
-        required: a.required,
-        description: a.description.clone(),
-        create_only: a.create_only,
-        read_only: a.read_only,
-        write_only: a.write_only,
-    }
-}
-
-fn wit_to_core_attribute_schema(a: &wit::AttributeSchema) -> CoreAttributeSchema {
-    CoreAttributeSchema {
-        name: a.name.clone(),
-        attr_type: wit_to_core_attribute_type(&a.attr_type),
-        required: a.required,
-        default: None,
-        description: a.description.clone(),
-        completions: None,
-        provider_name: None,
-        create_only: a.create_only,
-        read_only: a.read_only,
-        removable: None,
-        block_name: None,
-        write_only: a.write_only,
-    }
-}
-
-pub fn core_to_wit_schema(s: &CoreResourceSchema) -> wit::ResourceSchema {
-    wit::ResourceSchema {
-        resource_type: s.resource_type.clone(),
-        attributes: s
-            .attributes
-            .values()
-            .map(core_to_wit_attribute_schema)
-            .collect(),
-        description: s.description.clone(),
-        data_source: s.data_source,
-        name_attribute: s.name_attribute.clone(),
-        force_replace: s.force_replace,
-    }
-}
-
-pub fn wit_to_core_schema(s: &wit::ResourceSchema) -> CoreResourceSchema {
+fn proto_schema_to_core(s: &proto::ResourceSchema) -> CoreResourceSchema {
     CoreResourceSchema {
         resource_type: s.resource_type.clone(),
         attributes: s
             .attributes
             .iter()
-            .map(|a| (a.name.clone(), wit_to_core_attribute_schema(a)))
+            .map(|(name, a)| (name.clone(), proto_attr_schema_to_core(a)))
             .collect(),
         description: s.description.clone(),
         validator: None,
         data_source: s.data_source,
         name_attribute: s.name_attribute.clone(),
         force_replace: s.force_replace,
+    }
+}
+
+fn proto_attr_schema_to_core(a: &proto::AttributeSchema) -> CoreAttributeSchema {
+    CoreAttributeSchema {
+        name: a.name.clone(),
+        attr_type: proto_attr_type_to_core(&a.attr_type),
+        required: a.required,
+        default: None,
+        description: a.description.clone(),
+        completions: None,
+        provider_name: a.provider_name.clone(),
+        create_only: a.create_only,
+        read_only: a.read_only,
+        removable: a.removable,
+        block_name: a.block_name.clone(),
+        write_only: a.write_only,
+    }
+}
+
+fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
+    match t {
+        proto::AttributeType::String => CoreAttributeType::String,
+        proto::AttributeType::Int => CoreAttributeType::Int,
+        proto::AttributeType::Float => CoreAttributeType::Float,
+        proto::AttributeType::Bool => CoreAttributeType::Bool,
+        proto::AttributeType::StringEnum { values } => CoreAttributeType::StringEnum {
+            name: String::new(),
+            values: values.clone(),
+            namespace: None,
+            to_dsl: None,
+        },
+        proto::AttributeType::List { inner, ordered } => CoreAttributeType::List {
+            inner: Box::new(proto_attr_type_to_core(inner)),
+            ordered: *ordered,
+        },
+        proto::AttributeType::Map { inner } => {
+            CoreAttributeType::Map(Box::new(proto_attr_type_to_core(inner)))
+        }
+        proto::AttributeType::Struct { name, fields } => CoreAttributeType::Struct {
+            name: name.clone(),
+            fields: fields.iter().map(proto_struct_field_to_core).collect(),
+        },
+        proto::AttributeType::Union { members } => {
+            CoreAttributeType::Union(members.iter().map(proto_attr_type_to_core).collect())
+        }
+    }
+}
+
+fn proto_struct_field_to_core(f: &proto::StructField) -> CoreStructField {
+    CoreStructField {
+        name: f.name.clone(),
+        field_type: proto_attr_type_to_core(&f.field_type),
+        required: f.required,
+        description: f.description.clone(),
+        provider_name: f.provider_name.clone(),
+        block_name: f.block_name.clone(),
     }
 }
 
@@ -664,265 +492,222 @@ mod tests {
         assert_eq!(back.resolved_attributes(), resource.resolved_attributes());
     }
 
-    // -- Schema with basic string attribute --
+    // -- JSON passthrough tests --
 
     #[test]
-    fn test_schema_basic_string_roundtrip() {
-        let core_schema = CoreResourceSchema {
-            resource_type: "ec2.vpc".into(),
-            attributes: HashMap::from([(
-                "cidr_block".into(),
-                CoreAttributeSchema {
-                    name: "cidr_block".into(),
-                    attr_type: CoreAttributeType::String,
-                    required: true,
-                    default: None,
-                    description: Some("CIDR block".into()),
-                    completions: None,
-                    provider_name: None,
-                    create_only: true,
-                    read_only: false,
-                    removable: None,
-                    block_name: None,
-                    write_only: false,
+    fn test_lifecycle_to_json() {
+        let lifecycle = LifecycleConfig {
+            force_delete: true,
+            create_before_destroy: false,
+            prevent_destroy: false,
+        };
+        let json = lifecycle_to_json(&lifecycle);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["force_delete"], true);
+        assert_eq!(parsed["create_before_destroy"], false);
+        assert_eq!(parsed["prevent_destroy"], false);
+    }
+
+    #[test]
+    fn test_json_to_provider_error_valid() {
+        let json = r#"{"message":"something failed","resource_id":{"provider":"aws","resource_type":"s3.bucket","name":"test"},"is_timeout":true}"#;
+        let err = json_to_provider_error(json);
+        assert_eq!(err.message, "something failed");
+        assert!(err.is_timeout);
+        assert_eq!(err.resource_id.as_ref().unwrap().provider, "aws");
+    }
+
+    #[test]
+    fn test_json_to_provider_error_plain_string() {
+        let err = json_to_provider_error("some error message");
+        assert_eq!(err.message, "some error message");
+        assert!(!err.is_timeout);
+        assert!(err.resource_id.is_none());
+    }
+
+    #[test]
+    fn test_json_to_provider_info_valid() {
+        let json = r#"{"name":"aws","display_name":"AWS Provider"}"#;
+        let (name, display) = json_to_provider_info(json);
+        assert_eq!(name, "aws");
+        assert_eq!(display, "AWS Provider");
+    }
+
+    #[test]
+    fn test_json_to_schemas_empty() {
+        let schemas = json_to_schemas("[]");
+        assert!(schemas.is_empty());
+    }
+
+    #[test]
+    fn test_json_to_schemas_with_complex_attributes() {
+        let json = r#"[
+          {
+            "resource_type": "ec2.security_group",
+            "description": "EC2 Security Group",
+            "data_source": false,
+            "name_attribute": "group_name",
+            "force_replace": true,
+            "attributes": {
+              "ingress": {
+                "name": "ingress",
+                "attr_type": {
+                  "type": "list",
+                  "inner": {
+                    "type": "union",
+                    "members": [
+                      {
+                        "type": "struct",
+                        "name": "IngressRule",
+                        "fields": [
+                          {
+                            "name": "from_port",
+                            "field_type": { "type": "Int" },
+                            "required": true,
+                            "description": "Start of port range",
+                            "block_name": "from_port_block",
+                            "provider_name": "FromPort"
+                          },
+                          {
+                            "name": "protocol",
+                            "field_type": { "type": "String" },
+                            "required": true,
+                            "description": null,
+                            "block_name": null,
+                            "provider_name": null
+                          }
+                        ]
+                      },
+                      { "type": "String" }
+                    ]
+                  },
+                  "ordered": false
                 },
-            )]),
-            description: Some("VPC".into()),
-            validator: None,
-            data_source: false,
-            name_attribute: None,
-            force_replace: false,
-        };
+                "required": false,
+                "description": "Ingress rules",
+                "create_only": false,
+                "read_only": false,
+                "write_only": false,
+                "block_name": "ingress_block",
+                "provider_name": "IpPermissions",
+                "removable": false
+              },
+              "description": {
+                "name": "description",
+                "attr_type": { "type": "String" },
+                "required": true,
+                "description": "Group description",
+                "create_only": false,
+                "read_only": false,
+                "write_only": false
+              },
+              "enabled": {
+                "name": "enabled",
+                "attr_type": { "type": "Bool" },
+                "required": false,
+                "description": null,
+                "create_only": false,
+                "read_only": false,
+                "write_only": false
+              },
+              "priority": {
+                "name": "priority",
+                "attr_type": { "type": "Int" },
+                "required": false,
+                "description": null,
+                "create_only": false,
+                "read_only": false,
+                "write_only": false
+              }
+            }
+          }
+        ]"#;
 
-        let wit = core_to_wit_schema(&core_schema);
-        assert_eq!(wit.resource_type, "ec2.vpc");
-        assert_eq!(wit.attributes.len(), 1);
+        let schemas = json_to_schemas(json);
+        assert_eq!(schemas.len(), 1);
 
-        let back = wit_to_core_schema(&wit);
-        assert_eq!(back.resource_type, "ec2.vpc");
-        let attr = &back.attributes["cidr_block"];
-        assert_eq!(attr.name, "cidr_block");
-        assert!(attr.required);
-        assert!(attr.create_only);
-        assert_eq!(attr.description, Some("CIDR block".into()));
-    }
+        let schema = &schemas[0];
+        assert_eq!(schema.resource_type, "ec2.security_group");
+        assert_eq!(schema.description.as_deref(), Some("EC2 Security Group"));
+        assert!(!schema.data_source);
+        assert_eq!(schema.name_attribute.as_deref(), Some("group_name"));
+        assert!(schema.force_replace);
 
-    // -- Schema with enum attribute --
+        // Basic attribute types
+        let desc_attr = schema
+            .attributes
+            .get("description")
+            .expect("description attribute");
+        assert_eq!(desc_attr.name, "description");
+        assert!(matches!(desc_attr.attr_type, CoreAttributeType::String));
+        assert!(desc_attr.required);
 
-    #[test]
-    fn test_schema_enum_roundtrip() {
-        let core_type = CoreAttributeType::StringEnum {
-            name: "VersioningStatus".into(),
-            values: vec!["Enabled".into(), "Suspended".into()],
-            namespace: Some("aws.s3".into()),
-            to_dsl: None,
-        };
+        let enabled_attr = schema.attributes.get("enabled").expect("enabled attribute");
+        assert!(matches!(enabled_attr.attr_type, CoreAttributeType::Bool));
 
-        let wit = core_to_wit_attribute_type(&core_type);
-        if let wit::AttributeType::StringEnum(values) = &wit {
-            assert_eq!(values, &["Enabled", "Suspended"]);
-        } else {
-            panic!("Expected StringEnum");
-        }
+        let priority_attr = schema
+            .attributes
+            .get("priority")
+            .expect("priority attribute");
+        assert!(matches!(priority_attr.attr_type, CoreAttributeType::Int));
 
-        let back = wit_to_core_attribute_type(&wit);
-        if let CoreAttributeType::StringEnum { values, .. } = &back {
-            assert_eq!(values, &["Enabled", "Suspended"]);
-        } else {
-            panic!("Expected StringEnum");
-        }
-    }
+        // Ingress attribute: list with ordered=false, provider_name, block_name, removable
+        let ingress_attr = schema.attributes.get("ingress").expect("ingress attribute");
+        assert_eq!(ingress_attr.provider_name.as_deref(), Some("IpPermissions"));
+        assert_eq!(ingress_attr.block_name.as_deref(), Some("ingress_block"));
+        assert_eq!(ingress_attr.removable, Some(false));
 
-    // -- Schema with list attribute type --
+        // List with ordered: false
+        match &ingress_attr.attr_type {
+            CoreAttributeType::List { inner, ordered } => {
+                assert!(!ordered, "list should be unordered");
 
-    #[test]
-    fn test_schema_list_type_roundtrip() {
-        let core_type = CoreAttributeType::List {
-            inner: Box::new(CoreAttributeType::String),
-            ordered: true,
-        };
+                // Union inside list
+                match inner.as_ref() {
+                    CoreAttributeType::Union(members) => {
+                        assert_eq!(members.len(), 2);
 
-        let wit = core_to_wit_attribute_type(&core_type);
-        assert!(matches!(wit, wit::AttributeType::ListType(_)));
+                        // First member: struct with block_name and provider_name on fields
+                        match &members[0] {
+                            CoreAttributeType::Struct { name, fields } => {
+                                assert_eq!(name, "IngressRule");
+                                assert_eq!(fields.len(), 2);
 
-        let back = wit_to_core_attribute_type(&wit);
-        if let CoreAttributeType::List { inner, ordered } = &back {
-            assert!(matches!(inner.as_ref(), CoreAttributeType::String));
-            assert!(*ordered);
-        } else {
-            panic!("Expected List type");
-        }
-    }
+                                let from_port = &fields[0];
+                                assert_eq!(from_port.name, "from_port");
+                                assert!(matches!(from_port.field_type, CoreAttributeType::Int));
+                                assert!(from_port.required);
+                                assert_eq!(
+                                    from_port.description.as_deref(),
+                                    Some("Start of port range")
+                                );
+                                assert_eq!(
+                                    from_port.block_name.as_deref(),
+                                    Some("from_port_block")
+                                );
+                                assert_eq!(from_port.provider_name.as_deref(), Some("FromPort"));
 
-    #[test]
-    fn test_schema_unordered_list_roundtrip() {
-        let core_type = CoreAttributeType::List {
-            inner: Box::new(CoreAttributeType::Int),
-            ordered: false,
-        };
+                                let protocol = &fields[1];
+                                assert_eq!(protocol.name, "protocol");
+                                assert!(matches!(protocol.field_type, CoreAttributeType::String));
+                                assert!(protocol.block_name.is_none());
+                                assert!(protocol.provider_name.is_none());
+                            }
+                            other => panic!("expected Struct, got {:?}", other),
+                        }
 
-        let wit = core_to_wit_attribute_type(&core_type);
-        let back = wit_to_core_attribute_type(&wit);
-        if let CoreAttributeType::List { ordered, .. } = &back {
-            assert!(!ordered, "ordered=false must survive roundtrip");
-        } else {
-            panic!("Expected List type");
-        }
-    }
-
-    // -- Schema with struct attribute type --
-
-    #[test]
-    fn test_schema_struct_type_roundtrip() {
-        let core_type = CoreAttributeType::Struct {
-            name: "Tag".into(),
-            fields: vec![
-                CoreStructField {
-                    name: "key".into(),
-                    field_type: CoreAttributeType::String,
-                    required: true,
-                    description: Some("Tag key".into()),
-                    provider_name: Some("Key".into()),
-                    block_name: None,
-                },
-                CoreStructField {
-                    name: "value".into(),
-                    field_type: CoreAttributeType::String,
-                    required: false,
-                    description: None,
-                    provider_name: Some("Value".into()),
-                    block_name: None,
-                },
-            ],
-        };
-
-        let wit = core_to_wit_attribute_type(&core_type);
-        if let wit::AttributeType::StructType(struct_def) = &wit {
-            assert_eq!(struct_def.name, "Tag");
-        } else {
-            panic!("Expected StructType");
-        }
-
-        let back = wit_to_core_attribute_type(&wit);
-        if let CoreAttributeType::Struct { name, fields } = &back {
-            assert_eq!(name, "Tag");
-            assert_eq!(fields.len(), 2);
-            assert_eq!(fields[0].name, "key");
-            assert!(fields[0].required);
-            assert_eq!(fields[0].description, Some("Tag key".into()));
-            assert_eq!(fields[0].provider_name, Some("Key".into()));
-            assert_eq!(fields[1].name, "value");
-            assert!(!fields[1].required);
-        } else {
-            panic!("Expected Struct type");
-        }
-    }
-
-    // -- ProviderError conversion --
-
-    #[test]
-    fn test_provider_error_conversion() {
-        let wit_err = wit::ProviderError {
-            message: "something failed".into(),
-            resource_id: Some(wit::ResourceId {
-                provider: "aws".into(),
-                resource_type: "s3.bucket".into(),
-                name: "test".into(),
-            }),
-            is_timeout: true,
-        };
-
-        let core_err = wit_to_core_provider_error(&wit_err);
-        assert_eq!(core_err.message, "something failed");
-        assert!(core_err.is_timeout);
-        assert_eq!(core_err.resource_id.as_ref().unwrap().provider, "aws");
-    }
-
-    // -- Custom type degrades to base --
-
-    #[test]
-    fn test_custom_type_degrades_to_base() {
-        let core_type = CoreAttributeType::Custom {
-            name: "Region".into(),
-            base: Box::new(CoreAttributeType::String),
-            validate: |_| Ok(()),
-            namespace: None,
-            to_dsl: None,
-        };
-
-        let wit = core_to_wit_attribute_type(&core_type);
-        assert!(matches!(wit, wit::AttributeType::StringType));
-    }
-
-    // -- Union type roundtrip --
-
-    #[test]
-    fn test_union_type_roundtrip() {
-        let core_type =
-            CoreAttributeType::Union(vec![CoreAttributeType::String, CoreAttributeType::Int]);
-
-        let wit = core_to_wit_attribute_type(&core_type);
-        assert!(matches!(wit, wit::AttributeType::UnionType(_)));
-
-        let back = wit_to_core_attribute_type(&wit);
-        if let CoreAttributeType::Union(members) = &back {
-            assert_eq!(members.len(), 2);
-            assert!(matches!(members[0], CoreAttributeType::String));
-            assert!(matches!(members[1], CoreAttributeType::Int));
-        } else {
-            panic!("Expected Union type, got {:?}", back);
-        }
-    }
-
-    #[test]
-    fn test_union_with_struct_roundtrip() {
-        // Simulates IAM principal: Union(Struct, String)
-        let struct_type = CoreAttributeType::Struct {
-            name: "Principal".into(),
-            fields: vec![CoreStructField {
-                name: "service".into(),
-                field_type: CoreAttributeType::String,
-                required: false,
-                description: None,
-                provider_name: None,
-                block_name: None,
-            }],
-        };
-        let core_type = CoreAttributeType::Union(vec![struct_type, CoreAttributeType::String]);
-
-        let wit = core_to_wit_attribute_type(&core_type);
-        assert!(matches!(wit, wit::AttributeType::UnionType(_)));
-
-        let back = wit_to_core_attribute_type(&wit);
-        if let CoreAttributeType::Union(members) = &back {
-            assert_eq!(members.len(), 2);
-            assert!(matches!(members[0], CoreAttributeType::Struct { .. }));
-            assert!(matches!(members[1], CoreAttributeType::String));
-        } else {
-            panic!("Expected Union type, got {:?}", back);
-        }
-    }
-
-    // -- Map type roundtrip --
-
-    #[test]
-    fn test_schema_map_type_roundtrip() {
-        let core_type = CoreAttributeType::Map(Box::new(CoreAttributeType::String));
-
-        let wit = core_to_wit_attribute_type(&core_type);
-        assert!(matches!(wit, wit::AttributeType::MapType(_)));
-
-        let back = wit_to_core_attribute_type(&wit);
-        if let CoreAttributeType::Map(inner) = &back {
-            assert!(matches!(inner.as_ref(), CoreAttributeType::String));
-        } else {
-            panic!("Expected Map type");
+                        // Second member: String
+                        assert!(matches!(members[1], CoreAttributeType::String));
+                    }
+                    other => panic!("expected Union inside list, got {:?}", other),
+                }
+            }
+            other => panic!("expected List, got {:?}", other),
         }
     }
 
     #[test]
     fn test_deeply_nested_list_map_roundtrip() {
-        // Simulates IAM role policies: List<Map<String, Map<String, List<Map>>>>
         let policy_document = CoreValue::Map(
             vec![
                 (
@@ -963,73 +748,5 @@ mod tests {
         let wit = core_to_wit_value(&policies);
         let back = wit_to_core_value(&wit);
         assert_eq!(policies, back);
-    }
-
-    #[test]
-    fn test_struct_field_block_name_roundtrip() {
-        let core_type = CoreAttributeType::Struct {
-            name: "Transition".into(),
-            fields: vec![CoreStructField {
-                name: "transitions".into(),
-                field_type: CoreAttributeType::list(CoreAttributeType::Struct {
-                    name: "TransitionItem".into(),
-                    fields: vec![CoreStructField {
-                        name: "days".into(),
-                        field_type: CoreAttributeType::Int,
-                        required: true,
-                        description: None,
-                        provider_name: Some("Days".into()),
-                        block_name: None,
-                    }],
-                }),
-                required: false,
-                description: Some("Lifecycle transitions".into()),
-                provider_name: Some("Transitions".into()),
-                block_name: Some("transition".into()),
-            }],
-        };
-
-        let wit = core_to_wit_attribute_type(&core_type);
-        let back = wit_to_core_attribute_type(&wit);
-
-        if let CoreAttributeType::Struct { fields, .. } = &back {
-            assert_eq!(fields[0].block_name, Some("transition".into()));
-            assert_eq!(fields[0].provider_name, Some("Transitions".into()));
-        } else {
-            panic!("Expected Struct type");
-        }
-    }
-
-    // -- LifecycleConfig --
-
-    #[test]
-    fn test_lifecycle_force_delete_preserved() {
-        let core = CoreLifecycle {
-            force_delete: true,
-            create_before_destroy: false,
-        };
-        let wit = core_to_wit_lifecycle(&core);
-        assert!(wit.force_delete);
-        assert!(!wit.create_before_destroy);
-    }
-
-    #[test]
-    fn test_lifecycle_create_before_destroy_preserved() {
-        let core = CoreLifecycle {
-            force_delete: false,
-            create_before_destroy: true,
-        };
-        let wit = core_to_wit_lifecycle(&core);
-        assert!(!wit.force_delete);
-        assert!(wit.create_before_destroy);
-    }
-
-    #[test]
-    fn test_lifecycle_default_all_false() {
-        let core = CoreLifecycle::default();
-        let wit = core_to_wit_lifecycle(&core);
-        assert!(!wit.force_delete);
-        assert!(!wit.create_before_destroy);
-        assert!(!wit.prevent_destroy);
     }
 }

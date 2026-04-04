@@ -55,8 +55,8 @@ fn cascade_dependent_updates_adds_update_for_dependent() {
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: vpc.clone().with_binding("vpc"),
         lifecycle: LifecycleConfig {
-            force_delete: false,
             create_before_destroy: true,
+            ..Default::default()
         },
         changed_create_only: vec!["cidr_block".to_string()],
         cascading_updates: vec![],
@@ -142,8 +142,8 @@ fn cascade_skips_resources_already_in_plan() {
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: vpc.clone(),
         lifecycle: LifecycleConfig {
-            force_delete: false,
             create_before_destroy: true,
+            ..Default::default()
         },
         changed_create_only: vec!["cidr_block".to_string()],
         cascading_updates: vec![],
@@ -293,8 +293,8 @@ fn cascade_transitive_dependencies() {
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: vpc.clone(),
         lifecycle: LifecycleConfig {
-            force_delete: false,
             create_before_destroy: true,
+            ..Default::default()
         },
         changed_create_only: vec!["cidr_block".to_string()],
         cascading_updates: vec![],
@@ -363,8 +363,8 @@ fn cascade_anonymous_resource_dependent() {
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: vpc.clone(),
         lifecycle: LifecycleConfig {
-            force_delete: false,
             create_before_destroy: true,
+            ..Default::default()
         },
         changed_create_only: vec!["cidr_block".to_string()],
         cascading_updates: vec![],
@@ -461,8 +461,8 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: vpc.clone().with_binding("vpc"),
         lifecycle: LifecycleConfig {
-            force_delete: false,
             create_before_destroy: true,
+            ..Default::default()
         },
         changed_create_only: vec!["cidr_block".to_string()],
         cascading_updates: vec![],
@@ -617,8 +617,8 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: vpc.clone().with_binding("vpc"),
         lifecycle: LifecycleConfig {
-            force_delete: false,
             create_before_destroy: true,
+            ..Default::default()
         },
         changed_create_only: vec!["cidr_block".to_string()],
         cascading_updates: vec![],
@@ -857,8 +857,8 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: vpc.clone().with_binding("vpc"),
         lifecycle: LifecycleConfig {
-            force_delete: false,
             create_before_destroy: true,
+            ..Default::default()
         },
         changed_create_only: vec!["cidr_block".to_string()],
         cascading_updates: vec![],

@@ -52,85 +52,6 @@ pub fn proto_value_to_json(v: &proto::Value) -> serde_json::Value {
     }
 }
 
-/// JSON-serializable representation for encoding recursive attribute types.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type")]
-pub enum AttrTypeJson {
-    #[serde(rename = "string")]
-    String,
-    #[serde(rename = "int")]
-    Int,
-    #[serde(rename = "float")]
-    Float,
-    #[serde(rename = "bool")]
-    Bool,
-    #[serde(rename = "string-enum")]
-    StringEnum { values: Vec<std::string::String> },
-    #[serde(rename = "list")]
-    List {
-        inner: Box<AttrTypeJson>,
-        ordered: bool,
-    },
-    #[serde(rename = "map")]
-    Map { inner: Box<AttrTypeJson> },
-    #[serde(rename = "struct")]
-    Struct {
-        name: std::string::String,
-        fields: Vec<StructFieldJson>,
-    },
-    #[serde(rename = "union")]
-    Union { members: Vec<AttrTypeJson> },
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct StructFieldJson {
-    pub name: std::string::String,
-    pub field_type: AttrTypeJson,
-    pub required: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider_name: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub block_name: Option<std::string::String>,
-}
-
-pub fn proto_attr_type_to_json(t: &proto::AttributeType) -> AttrTypeJson {
-    match t {
-        proto::AttributeType::String => AttrTypeJson::String,
-        proto::AttributeType::Int => AttrTypeJson::Int,
-        proto::AttributeType::Float => AttrTypeJson::Float,
-        proto::AttributeType::Bool => AttrTypeJson::Bool,
-        proto::AttributeType::StringEnum { values } => AttrTypeJson::StringEnum {
-            values: values.clone(),
-        },
-        proto::AttributeType::List { inner, ordered } => AttrTypeJson::List {
-            inner: Box::new(proto_attr_type_to_json(inner)),
-            ordered: *ordered,
-        },
-        proto::AttributeType::Map { inner } => AttrTypeJson::Map {
-            inner: Box::new(proto_attr_type_to_json(inner)),
-        },
-        proto::AttributeType::Struct { name, fields } => AttrTypeJson::Struct {
-            name: name.clone(),
-            fields: fields
-                .iter()
-                .map(|f| StructFieldJson {
-                    name: f.name.clone(),
-                    field_type: proto_attr_type_to_json(&f.field_type),
-                    required: f.required,
-                    description: f.description.clone(),
-                    provider_name: f.provider_name.clone(),
-                    block_name: f.block_name.clone(),
-                })
-                .collect(),
-        },
-        proto::AttributeType::Union { members } => AttrTypeJson::Union {
-            members: members.iter().map(proto_attr_type_to_json).collect(),
-        },
-    }
-}
-
 /// Parse a ResourceId string (provider.resource_type.name) into a proto::ResourceId.
 ///
 /// Format: "provider.service.type.name" where provider is the first segment,
@@ -324,126 +245,19 @@ macro_rules! export_provider {
                 }
             }
 
-            fn wit_to_proto_lifecycle(
-                lc: &wit_types::LifecycleConfig,
-            ) -> proto::LifecycleConfig {
-                proto::LifecycleConfig {
-                    force_delete: lc.force_delete,
-                    create_before_destroy: lc.create_before_destroy,
-                }
-            }
-
-            fn proto_to_wit_provider_error(
-                e: &proto::ProviderError,
-            ) -> wit_types::ProviderError {
-                wit_types::ProviderError {
-                    message: e.message.clone(),
-                    resource_id: e.resource_id.as_ref().map(proto_to_wit_resource_id),
-                    is_timeout: e.is_timeout,
-                }
-            }
-
-            fn proto_to_wit_resource_schema(
-                s: &proto::ResourceSchema,
-            ) -> wit_types::ResourceSchema {
-                wit_types::ResourceSchema {
-                    resource_type: s.resource_type.clone(),
-                    attributes: s
-                        .attributes
-                        .values()
-                        .map(proto_to_wit_attribute_schema)
-                        .collect(),
-                    description: s.description.clone(),
-                    data_source: s.data_source,
-                    name_attribute: s.name_attribute.clone(),
-                    force_replace: s.force_replace,
-                }
-            }
-
-            fn proto_to_wit_attribute_schema(
-                a: &proto::AttributeSchema,
-            ) -> wit_types::AttributeSchema {
-                wit_types::AttributeSchema {
-                    name: a.name.clone(),
-                    attr_type: proto_to_wit_attribute_type(&a.attr_type),
-                    required: a.required,
-                    description: a.description.clone(),
-                    create_only: a.create_only,
-                    read_only: a.read_only,
-                    write_only: a.write_only,
-                }
-            }
-
-            fn proto_to_wit_attribute_type(
-                t: &proto::AttributeType,
-            ) -> wit_types::AttributeType {
-                match t {
-                    proto::AttributeType::String => wit_types::AttributeType::StringType,
-                    proto::AttributeType::Int => wit_types::AttributeType::IntType,
-                    proto::AttributeType::Float => wit_types::AttributeType::FloatType,
-                    proto::AttributeType::Bool => wit_types::AttributeType::BoolType,
-                    proto::AttributeType::StringEnum { values } => {
-                        wit_types::AttributeType::StringEnum(values.clone())
-                    }
-                    proto::AttributeType::List { inner, ordered } => {
-                        let json = helpers::AttrTypeJson::List {
-                            inner: Box::new(helpers::proto_attr_type_to_json(inner)),
-                            ordered: *ordered,
-                        };
-                        wit_types::AttributeType::ListType(
-                            serde_json::to_string(&json).unwrap(),
-                        )
-                    }
-                    proto::AttributeType::Map { inner } => {
-                        let json = helpers::AttrTypeJson::Map {
-                            inner: Box::new(helpers::proto_attr_type_to_json(inner)),
-                        };
-                        wit_types::AttributeType::MapType(
-                            serde_json::to_string(&json).unwrap(),
-                        )
-                    }
-                    proto::AttributeType::Struct { name, fields } => {
-                        let fields_json: Vec<helpers::StructFieldJson> = fields
-                            .iter()
-                            .map(|f| helpers::StructFieldJson {
-                                name: f.name.clone(),
-                                field_type: helpers::proto_attr_type_to_json(&f.field_type),
-                                required: f.required,
-                                description: f.description.clone(),
-                                provider_name: f.provider_name.clone(),
-                                block_name: f.block_name.clone(),
-                            })
-                            .collect();
-                        wit_types::AttributeType::StructType(wit_types::StructDef {
-                            name: name.clone(),
-                            fields: serde_json::to_string(&fields_json).unwrap(),
-                        })
-                    }
-                    proto::AttributeType::Union { members } => {
-                        let json_members: Vec<helpers::AttrTypeJson> =
-                            members.iter().map(helpers::proto_attr_type_to_json).collect();
-                        let json = serde_json::to_string(&json_members).unwrap();
-                        wit_types::AttributeType::UnionType(json)
-                    }
-                }
-            }
-
             struct WasmGuest;
 
             impl exports::carina::provider::provider::Guest for WasmGuest {
-                fn info() -> wit_types::ProviderInfo {
+                fn info() -> String {
                     let provider = get_provider().lock().unwrap();
                     let info = $crate::CarinaProvider::info(&*provider);
-                    wit_types::ProviderInfo {
-                        name: info.name,
-                        display_name: info.display_name,
-                    }
+                    serde_json::to_string(&info).unwrap_or_else(|_| "{}".to_string())
                 }
 
-                fn schemas() -> Vec<wit_types::ResourceSchema> {
+                fn schemas() -> String {
                     let provider = get_provider().lock().unwrap();
                     let schemas = $crate::CarinaProvider::schemas(&*provider);
-                    schemas.iter().map(proto_to_wit_resource_schema).collect()
+                    serde_json::to_string(&schemas).unwrap_or_else(|_| "[]".to_string())
                 }
 
                 fn validate_config(
@@ -465,7 +279,7 @@ macro_rules! export_provider {
                 fn read(
                     id: wit_types::ResourceId,
                     identifier: Option<String>,
-                ) -> Result<wit_types::State, wit_types::ProviderError> {
+                ) -> Result<wit_types::State, String> {
                     let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
                     match $crate::CarinaProvider::read(
@@ -474,18 +288,18 @@ macro_rules! export_provider {
                         identifier.as_deref(),
                     ) {
                         Ok(state) => Ok(proto_to_wit_state(&state)),
-                        Err(e) => Err(proto_to_wit_provider_error(&e)),
+                        Err(e) => Err(serde_json::to_string(&e).unwrap_or_else(|_| e.message.clone())),
                     }
                 }
 
                 fn create(
                     res: wit_types::ResourceDef,
-                ) -> Result<wit_types::State, wit_types::ProviderError> {
+                ) -> Result<wit_types::State, String> {
                     let provider = get_provider().lock().unwrap();
                     let proto_res = wit_to_proto_resource(&res);
                     match $crate::CarinaProvider::create(&*provider, &proto_res) {
                         Ok(state) => Ok(proto_to_wit_state(&state)),
-                        Err(e) => Err(proto_to_wit_provider_error(&e)),
+                        Err(e) => Err(serde_json::to_string(&e).unwrap_or_else(|_| e.message.clone())),
                     }
                 }
 
@@ -494,7 +308,7 @@ macro_rules! export_provider {
                     identifier: String,
                     current: wit_types::State,
                     to: wit_types::ResourceDef,
-                ) -> Result<wit_types::State, wit_types::ProviderError> {
+                ) -> Result<wit_types::State, String> {
                     let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
                     let proto_from = wit_to_proto_state(&proto_id, &current);
@@ -507,26 +321,27 @@ macro_rules! export_provider {
                         &proto_to,
                     ) {
                         Ok(state) => Ok(proto_to_wit_state(&state)),
-                        Err(e) => Err(proto_to_wit_provider_error(&e)),
+                        Err(e) => Err(serde_json::to_string(&e).unwrap_or_else(|_| e.message.clone())),
                     }
                 }
 
                 fn delete(
                     id: wit_types::ResourceId,
                     identifier: String,
-                    lifecycle: wit_types::LifecycleConfig,
-                ) -> Result<(), wit_types::ProviderError> {
+                    options: String,
+                ) -> Result<(), String> {
                     let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
-                    let proto_lc = wit_to_proto_lifecycle(&lifecycle);
+                    let lifecycle: proto::LifecycleConfig =
+                        serde_json::from_str(&options).unwrap_or_default();
                     match $crate::CarinaProvider::delete(
                         &*provider,
                         &proto_id,
                         &identifier,
-                        &proto_lc,
+                        &lifecycle,
                     ) {
                         Ok(()) => Ok(()),
-                        Err(e) => Err(proto_to_wit_provider_error(&e)),
+                        Err(e) => Err(serde_json::to_string(&e).unwrap_or_else(|_| e.message.clone())),
                     }
                 }
 
@@ -730,128 +545,21 @@ macro_rules! export_provider {
                 }
             }
 
-            fn wit_to_proto_lifecycle(
-                lc: &wit_types::LifecycleConfig,
-            ) -> proto::LifecycleConfig {
-                proto::LifecycleConfig {
-                    force_delete: lc.force_delete,
-                    create_before_destroy: lc.create_before_destroy,
-                }
-            }
-
-            fn proto_to_wit_provider_error(
-                e: &proto::ProviderError,
-            ) -> wit_types::ProviderError {
-                wit_types::ProviderError {
-                    message: e.message.clone(),
-                    resource_id: e.resource_id.as_ref().map(proto_to_wit_resource_id),
-                    is_timeout: e.is_timeout,
-                }
-            }
-
-            fn proto_to_wit_resource_schema(
-                s: &proto::ResourceSchema,
-            ) -> wit_types::ResourceSchema {
-                wit_types::ResourceSchema {
-                    resource_type: s.resource_type.clone(),
-                    attributes: s
-                        .attributes
-                        .values()
-                        .map(proto_to_wit_attribute_schema)
-                        .collect(),
-                    description: s.description.clone(),
-                    data_source: s.data_source,
-                    name_attribute: s.name_attribute.clone(),
-                    force_replace: s.force_replace,
-                }
-            }
-
-            fn proto_to_wit_attribute_schema(
-                a: &proto::AttributeSchema,
-            ) -> wit_types::AttributeSchema {
-                wit_types::AttributeSchema {
-                    name: a.name.clone(),
-                    attr_type: proto_to_wit_attribute_type(&a.attr_type),
-                    required: a.required,
-                    description: a.description.clone(),
-                    create_only: a.create_only,
-                    read_only: a.read_only,
-                    write_only: a.write_only,
-                }
-            }
-
-            fn proto_to_wit_attribute_type(
-                t: &proto::AttributeType,
-            ) -> wit_types::AttributeType {
-                match t {
-                    proto::AttributeType::String => wit_types::AttributeType::StringType,
-                    proto::AttributeType::Int => wit_types::AttributeType::IntType,
-                    proto::AttributeType::Float => wit_types::AttributeType::FloatType,
-                    proto::AttributeType::Bool => wit_types::AttributeType::BoolType,
-                    proto::AttributeType::StringEnum { values } => {
-                        wit_types::AttributeType::StringEnum(values.clone())
-                    }
-                    proto::AttributeType::List { inner, ordered } => {
-                        let json = helpers::AttrTypeJson::List {
-                            inner: Box::new(helpers::proto_attr_type_to_json(inner)),
-                            ordered: *ordered,
-                        };
-                        wit_types::AttributeType::ListType(
-                            serde_json::to_string(&json).unwrap(),
-                        )
-                    }
-                    proto::AttributeType::Map { inner } => {
-                        let json = helpers::AttrTypeJson::Map {
-                            inner: Box::new(helpers::proto_attr_type_to_json(inner)),
-                        };
-                        wit_types::AttributeType::MapType(
-                            serde_json::to_string(&json).unwrap(),
-                        )
-                    }
-                    proto::AttributeType::Struct { name, fields } => {
-                        let fields_json: Vec<helpers::StructFieldJson> = fields
-                            .iter()
-                            .map(|f| helpers::StructFieldJson {
-                                name: f.name.clone(),
-                                field_type: helpers::proto_attr_type_to_json(&f.field_type),
-                                required: f.required,
-                                description: f.description.clone(),
-                                provider_name: f.provider_name.clone(),
-                                block_name: f.block_name.clone(),
-                            })
-                            .collect();
-                        wit_types::AttributeType::StructType(wit_types::StructDef {
-                            name: name.clone(),
-                            fields: serde_json::to_string(&fields_json).unwrap(),
-                        })
-                    }
-                    proto::AttributeType::Union { members } => {
-                        let json_members: Vec<helpers::AttrTypeJson> =
-                            members.iter().map(helpers::proto_attr_type_to_json).collect();
-                        let json = serde_json::to_string(&json_members).unwrap();
-                        wit_types::AttributeType::UnionType(json)
-                    }
-                }
-            }
-
             // -- Guest trait implementation --
 
             struct WasmGuest;
 
             impl exports::carina::provider::provider::Guest for WasmGuest {
-                fn info() -> wit_types::ProviderInfo {
+                fn info() -> String {
                     let provider = get_provider().lock().unwrap();
                     let info = $crate::CarinaProvider::info(&*provider);
-                    wit_types::ProviderInfo {
-                        name: info.name,
-                        display_name: info.display_name,
-                    }
+                    serde_json::to_string(&info).unwrap_or_else(|_| "{}".to_string())
                 }
 
-                fn schemas() -> Vec<wit_types::ResourceSchema> {
+                fn schemas() -> String {
                     let provider = get_provider().lock().unwrap();
                     let schemas = $crate::CarinaProvider::schemas(&*provider);
-                    schemas.iter().map(proto_to_wit_resource_schema).collect()
+                    serde_json::to_string(&schemas).unwrap_or_else(|_| "[]".to_string())
                 }
 
                 fn validate_config(
@@ -873,7 +581,7 @@ macro_rules! export_provider {
                 fn read(
                     id: wit_types::ResourceId,
                     identifier: Option<String>,
-                ) -> Result<wit_types::State, wit_types::ProviderError> {
+                ) -> Result<wit_types::State, String> {
                     let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
                     match $crate::CarinaProvider::read(
@@ -882,18 +590,18 @@ macro_rules! export_provider {
                         identifier.as_deref(),
                     ) {
                         Ok(state) => Ok(proto_to_wit_state(&state)),
-                        Err(e) => Err(proto_to_wit_provider_error(&e)),
+                        Err(e) => Err(serde_json::to_string(&e).unwrap_or_else(|_| e.message.clone())),
                     }
                 }
 
                 fn create(
                     res: wit_types::ResourceDef,
-                ) -> Result<wit_types::State, wit_types::ProviderError> {
+                ) -> Result<wit_types::State, String> {
                     let provider = get_provider().lock().unwrap();
                     let proto_res = wit_to_proto_resource(&res);
                     match $crate::CarinaProvider::create(&*provider, &proto_res) {
                         Ok(state) => Ok(proto_to_wit_state(&state)),
-                        Err(e) => Err(proto_to_wit_provider_error(&e)),
+                        Err(e) => Err(serde_json::to_string(&e).unwrap_or_else(|_| e.message.clone())),
                     }
                 }
 
@@ -902,7 +610,7 @@ macro_rules! export_provider {
                     identifier: String,
                     current: wit_types::State,
                     to: wit_types::ResourceDef,
-                ) -> Result<wit_types::State, wit_types::ProviderError> {
+                ) -> Result<wit_types::State, String> {
                     let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
                     let proto_from = wit_to_proto_state(&proto_id, &current);
@@ -915,26 +623,27 @@ macro_rules! export_provider {
                         &proto_to,
                     ) {
                         Ok(state) => Ok(proto_to_wit_state(&state)),
-                        Err(e) => Err(proto_to_wit_provider_error(&e)),
+                        Err(e) => Err(serde_json::to_string(&e).unwrap_or_else(|_| e.message.clone())),
                     }
                 }
 
                 fn delete(
                     id: wit_types::ResourceId,
                     identifier: String,
-                    lifecycle: wit_types::LifecycleConfig,
-                ) -> Result<(), wit_types::ProviderError> {
+                    options: String,
+                ) -> Result<(), String> {
                     let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
-                    let proto_lc = wit_to_proto_lifecycle(&lifecycle);
+                    let lifecycle: proto::LifecycleConfig =
+                        serde_json::from_str(&options).unwrap_or_default();
                     match $crate::CarinaProvider::delete(
                         &*provider,
                         &proto_id,
                         &identifier,
-                        &proto_lc,
+                        &lifecycle,
                     ) {
                         Ok(()) => Ok(()),
-                        Err(e) => Err(proto_to_wit_provider_error(&e)),
+                        Err(e) => Err(serde_json::to_string(&e).unwrap_or_else(|_| e.message.clone())),
                     }
                 }
 
