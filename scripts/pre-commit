@@ -112,8 +112,18 @@ main() {
         exit 0
     fi
 
-    # Ensure incremental compilation for faster checks.
-    export CARGO_INCREMENTAL=1
+    # sccache (configured via .cargo/config.toml) is incompatible with cargo's
+    # incremental compilation: cargo sets CARGO_INCREMENTAL=1 internally for dev
+    # profile, and sccache refuses to run when it's set. Disable sccache for
+    # pre-commit checks by overriding RUSTC_WRAPPER, and enable incremental
+    # compilation directly for faster checks.
+    clippy_env=()
+    if [[ "$RUSTC_WRAPPER" == *sccache* ]] || { [ -f .cargo/config.toml ] && grep -q 'sccache' .cargo/config.toml 2>/dev/null; }; then
+        clippy_env=(env RUSTC_WRAPPER="")
+        export CARGO_INCREMENTAL=1
+    else
+        export CARGO_INCREMENTAL=1
+    fi
 
     fmt_log=$(mktemp)
     clippy_log=$(mktemp)
@@ -128,7 +138,7 @@ main() {
         clippy_pid=""
     else
         clippy_start=$(date +%s)
-        cargo clippy "${clippy_scope[@]}" --no-deps -- -D warnings >"$clippy_log" 2>&1 &
+        "${clippy_env[@]}" cargo clippy "${clippy_scope[@]}" --no-deps -- -D warnings >"$clippy_log" 2>&1 &
         clippy_pid=$!
     fi
 
