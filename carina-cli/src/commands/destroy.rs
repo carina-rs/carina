@@ -42,6 +42,7 @@ pub async fn run_destroy(
     auto_approve: bool,
     lock: bool,
     refresh: bool,
+    force: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
     let mut parsed = load_configuration_with_config(path, provider_context)?.parsed;
@@ -99,6 +100,7 @@ pub async fn run_destroy(
         protected_bucket,
         lock_info.as_ref(),
         refresh,
+        force,
         base_dir,
     )
     .await;
@@ -118,6 +120,7 @@ pub async fn run_destroy(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_destroy_locked(
     parsed: &mut carina_core::parser::ParsedFile,
     auto_approve: bool,
@@ -125,6 +128,7 @@ async fn run_destroy_locked(
     protected_bucket: Option<String>,
     lock: Option<&LockInfo>,
     refresh: bool,
+    force: bool,
     base_dir: &std::path::Path,
 ) -> Result<(), AppError> {
     let factories = build_factories_from_providers(&parsed.providers, base_dir);
@@ -249,6 +253,7 @@ async fn run_destroy_locked(
     // Collect resources that exist and will be destroyed
     // Skip the state bucket if it matches the backend bucket
     let mut protected_resources: Vec<&Resource> = Vec::new();
+    let mut prevent_destroy_resources: Vec<&Resource> = Vec::new();
     let resources_to_destroy: Vec<&Resource> = destroy_order
         .iter()
         .filter(|r| {
@@ -258,6 +263,12 @@ async fn run_destroy_locked(
             }
 
             if !current_states.get(&r.id).map(|s| s.exists).unwrap_or(false) {
+                return false;
+            }
+
+            // Check prevent_destroy lifecycle (unless --force)
+            if !force && r.lifecycle.prevent_destroy {
+                prevent_destroy_resources.push(r);
                 return false;
             }
 
@@ -276,7 +287,10 @@ async fn run_destroy_locked(
         })
         .collect();
 
-    if resources_to_destroy.is_empty() && protected_resources.is_empty() {
+    if resources_to_destroy.is_empty()
+        && protected_resources.is_empty()
+        && prevent_destroy_resources.is_empty()
+    {
         println!("{}", "No resources to destroy.".green());
         return Ok(());
     }
@@ -324,18 +338,47 @@ async fn run_destroy_locked(
         );
     }
 
+    // Show prevent_destroy resources
+    if !prevent_destroy_resources.is_empty() {
+        println!();
+        println!(
+            "{}",
+            "Error: the following resources have prevent_destroy set and cannot be destroyed:"
+                .red()
+                .bold()
+        );
+        for resource in &prevent_destroy_resources {
+            println!("  {} {}", "✗".red().bold(), resource.id);
+        }
+        println!();
+        println!(
+            "{}",
+            "Use --force to override prevent_destroy and destroy these resources.".yellow()
+        );
+    }
+
     println!();
-    let total_count = resources_to_destroy.len() + protected_resources.len();
-    if !protected_resources.is_empty() {
+    let total_count =
+        resources_to_destroy.len() + protected_resources.len() + prevent_destroy_resources.len();
+    if !protected_resources.is_empty() || !prevent_destroy_resources.is_empty() {
+        let guarded_count = protected_resources.len() + prevent_destroy_resources.len();
         println!(
             "Plan: {} to destroy, {} protected.",
             resources_to_destroy.len().to_string().red(),
-            protected_resources.len().to_string().yellow()
+            guarded_count.to_string().yellow()
         );
     } else {
         println!("Plan: {} to destroy.", total_count.to_string().red());
     }
     println!();
+
+    // If there are prevent_destroy resources, refuse to proceed
+    if !prevent_destroy_resources.is_empty() {
+        return Err(AppError::Validation(format!(
+            "{} resource(s) have prevent_destroy set. Use --force to override.",
+            prevent_destroy_resources.len()
+        )));
+    }
 
     if resources_to_destroy.is_empty() {
         println!(

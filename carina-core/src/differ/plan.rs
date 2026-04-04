@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use crate::deps::get_resource_dependencies;
 use crate::effect::{CascadingUpdate, Effect, TemporaryName};
 use crate::identifier::generate_random_suffix;
-use crate::plan::Plan;
+use crate::plan::{Plan, PlanError};
 use crate::resource::{Expr, LifecycleConfig, Resource, ResourceId, ResourceKind, State, Value};
 use crate::schema::ResourceSchema;
 
@@ -238,6 +238,16 @@ pub fn create_plan(
                         changed_attributes,
                     });
                 } else {
+                    // Replace involves destroying the old resource
+                    if resource.lifecycle.prevent_destroy {
+                        plan.add_error(PlanError {
+                            resource_id: id.clone(),
+                            message:
+                                "resource has prevent_destroy set, but the plan would replace it (which requires destroying the old resource)"
+                                    .to_string(),
+                        });
+                        continue;
+                    }
                     let lifecycle = resource.lifecycle.clone();
                     let temporary_name = if lifecycle.create_before_destroy {
                         find_schema(&resource.id.provider, &resource.id.resource_type, schemas)
@@ -272,6 +282,14 @@ pub fn create_plan(
             }
             Diff::NoChange(_) => {}
             Diff::Delete(id) => {
+                if resource.lifecycle.prevent_destroy {
+                    plan.add_error(PlanError {
+                        resource_id: id.clone(),
+                        message: "resource has prevent_destroy set, but the plan would delete it"
+                            .to_string(),
+                    });
+                    continue;
+                }
                 let identifier = current_states
                     .get(&id)
                     .and_then(|s| s.identifier.clone())
@@ -293,8 +311,17 @@ pub fn create_plan(
     // Detect orphaned resources: exist in current_states but not in desired
     for (id, state) in current_states {
         if state.exists && !desired_ids.contains(id) {
-            let identifier = state.identifier.clone().unwrap_or_default();
             let lifecycle = lifecycles.get(id).cloned().unwrap_or_default();
+            if lifecycle.prevent_destroy {
+                plan.add_error(PlanError {
+                    resource_id: id.clone(),
+                    message:
+                        "resource has prevent_destroy set, but the plan would delete it (resource removed from configuration)"
+                            .to_string(),
+                });
+                continue;
+            }
+            let identifier = state.identifier.clone().unwrap_or_default();
             let binding = state.attributes.get("_binding").and_then(|v| match v {
                 Value::String(s) => Some(s.clone()),
                 _ => None,

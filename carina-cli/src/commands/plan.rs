@@ -197,6 +197,17 @@ pub async fn run_plan(
     .await?;
     let has_changes = ctx.plan.mutation_count() > 0;
 
+    // Check for prevent_destroy violations
+    if ctx.plan.has_errors() {
+        for err in ctx.plan.errors() {
+            eprintln!("{} {}", "Error:".red().bold(), err);
+        }
+        return Err(AppError::Validation(format!(
+            "{} resource(s) have prevent_destroy set and cannot be deleted or replaced",
+            ctx.plan.errors().len()
+        )));
+    }
+
     // Build delete attributes map from current states for display
     let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = ctx
         .plan

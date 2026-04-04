@@ -116,6 +116,10 @@ enum Commands {
         /// Refresh state from provider before destroying (default: true)
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         refresh: bool,
+
+        /// Force destroy even if resources have prevent_destroy set
+        #[arg(long)]
+        force: bool,
     },
     /// Format .crn files
     Fmt {
@@ -283,7 +287,8 @@ async fn main() {
             auto_approve,
             lock,
             refresh,
-        } => run_destroy(&path, auto_approve, lock, refresh, &provider_context).await,
+            force,
+        } => run_destroy(&path, auto_approve, lock, refresh, force, &provider_context).await,
         Commands::Fmt {
             path,
             check,
