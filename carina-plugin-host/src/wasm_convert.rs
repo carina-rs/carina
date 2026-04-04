@@ -187,58 +187,49 @@ pub fn wit_to_core_resource(resource: &wit::ResourceDef) -> CoreResource {
     core_resource
 }
 
-// -- JSON passthrough functions for provider-specific types --
+// -- WIT type conversions for provider-specific types --
 
-/// Serialize LifecycleConfig to JSON string for the WIT boundary.
-pub fn lifecycle_to_json(lifecycle: &LifecycleConfig) -> String {
-    serde_json::to_string(lifecycle).unwrap_or_else(|_| "{}".to_string())
-}
-
-/// Deserialize a JSON error string to a core ProviderError.
-pub fn json_to_provider_error(json: &str) -> carina_core::provider::ProviderError {
-    if let Ok(proto_err) = serde_json::from_str::<proto::ProviderError>(json) {
-        carina_core::provider::ProviderError {
-            message: proto_err.message,
-            resource_id: proto_err.resource_id.map(|pid| {
-                CoreResourceId::with_provider(&pid.provider, &pid.resource_type, &pid.name)
-            }),
-            cause: None,
-            is_timeout: proto_err.is_timeout,
-        }
-    } else {
-        carina_core::provider::ProviderError {
-            message: json.to_string(),
-            resource_id: None,
-            cause: None,
-            is_timeout: false,
-        }
+/// Convert a core LifecycleConfig to a WIT LifecycleConfig.
+pub fn core_to_wit_lifecycle(lifecycle: &LifecycleConfig) -> wit::LifecycleConfig {
+    wit::LifecycleConfig {
+        prevent_destroy: lifecycle.prevent_destroy,
     }
 }
 
-/// Deserialize JSON to (name, display_name) tuple from ProviderInfo.
-pub fn json_to_provider_info(json: &str) -> (String, String) {
-    if let Ok(info) = serde_json::from_str::<proto::ProviderInfo>(json) {
-        (info.name, info.display_name)
-    } else {
-        ("unknown".to_string(), "Unknown Provider".to_string())
+/// Convert a WIT ProviderError to a core ProviderError.
+pub fn wit_to_core_provider_error(
+    err: &wit::ProviderError,
+) -> carina_core::provider::ProviderError {
+    carina_core::provider::ProviderError {
+        message: err.message.clone(),
+        resource_id: err
+            .resource_id
+            .as_ref()
+            .map(|pid| CoreResourceId::with_provider(&pid.provider, &pid.resource_type, &pid.name)),
+        cause: None,
+        is_timeout: err.is_timeout,
     }
 }
 
-/// Deserialize JSON to a Vec of core ResourceSchemas.
-pub fn json_to_schemas(json: &str) -> Vec<CoreResourceSchema> {
-    let proto_schemas: Vec<proto::ResourceSchema> = serde_json::from_str(json).unwrap_or_default();
-    proto_schemas.iter().map(proto_schema_to_core).collect()
+/// Convert a WIT ProviderInfo to a (name, display_name) tuple.
+pub fn wit_to_provider_info(info: &wit::ProviderInfo) -> (String, String) {
+    (info.name.clone(), info.display_name.clone())
 }
 
-// -- Protocol schema to core schema conversion --
+/// Convert a Vec of WIT ResourceSchemas to a Vec of core ResourceSchemas.
+pub fn wit_to_core_schemas(schemas: &[wit::ResourceSchema]) -> Vec<CoreResourceSchema> {
+    schemas.iter().map(wit_schema_to_core).collect()
+}
 
-fn proto_schema_to_core(s: &proto::ResourceSchema) -> CoreResourceSchema {
+// -- WIT schema to core schema conversion --
+
+fn wit_schema_to_core(s: &wit::ResourceSchema) -> CoreResourceSchema {
     CoreResourceSchema {
         resource_type: s.resource_type.clone(),
         attributes: s
             .attributes
             .iter()
-            .map(|(name, a)| (name.clone(), proto_attr_schema_to_core(a)))
+            .map(|a| (a.name.clone(), wit_attr_schema_to_core(a)))
             .collect(),
         description: s.description.clone(),
         validator: None,
@@ -248,20 +239,71 @@ fn proto_schema_to_core(s: &proto::ResourceSchema) -> CoreResourceSchema {
     }
 }
 
-fn proto_attr_schema_to_core(a: &proto::AttributeSchema) -> CoreAttributeSchema {
+fn wit_attr_schema_to_core(a: &wit::AttributeSchema) -> CoreAttributeSchema {
     CoreAttributeSchema {
         name: a.name.clone(),
-        attr_type: proto_attr_type_to_core(&a.attr_type),
+        attr_type: wit_attr_type_to_core(&a.attr_type),
         required: a.required,
         default: None,
         description: a.description.clone(),
         completions: None,
-        provider_name: a.provider_name.clone(),
+        provider_name: None,
         create_only: a.create_only,
         read_only: a.read_only,
-        removable: a.removable,
-        block_name: a.block_name.clone(),
+        removable: None,
+        block_name: None,
         write_only: a.write_only,
+    }
+}
+
+fn wit_attr_type_to_core(t: &wit::AttributeType) -> CoreAttributeType {
+    match t {
+        wit::AttributeType::StringType => CoreAttributeType::String,
+        wit::AttributeType::IntType => CoreAttributeType::Int,
+        wit::AttributeType::FloatType => CoreAttributeType::Float,
+        wit::AttributeType::BoolType => CoreAttributeType::Bool,
+        wit::AttributeType::StringEnum(values) => CoreAttributeType::StringEnum {
+            name: String::new(),
+            values: values.clone(),
+            namespace: None,
+            to_dsl: None,
+        },
+        wit::AttributeType::ListType(json) => {
+            // inner type is JSON-encoded as a proto::AttributeType
+            if let Ok(inner) = serde_json::from_str::<proto::AttributeType>(json) {
+                CoreAttributeType::List {
+                    inner: Box::new(proto_attr_type_to_core(&inner)),
+                    ordered: true, // default
+                }
+            } else {
+                CoreAttributeType::List {
+                    inner: Box::new(CoreAttributeType::String),
+                    ordered: true,
+                }
+            }
+        }
+        wit::AttributeType::MapType(json) => {
+            if let Ok(inner) = serde_json::from_str::<proto::AttributeType>(json) {
+                CoreAttributeType::Map(Box::new(proto_attr_type_to_core(&inner)))
+            } else {
+                CoreAttributeType::Map(Box::new(CoreAttributeType::String))
+            }
+        }
+        wit::AttributeType::StructType(def) => {
+            let fields: Vec<proto::StructField> =
+                serde_json::from_str(&def.fields).unwrap_or_default();
+            CoreAttributeType::Struct {
+                name: def.name.clone(),
+                fields: fields.iter().map(proto_struct_field_to_core).collect(),
+            }
+        }
+        wit::AttributeType::UnionType(json) => {
+            if let Ok(members) = serde_json::from_str::<Vec<proto::AttributeType>>(json) {
+                CoreAttributeType::Union(members.iter().map(proto_attr_type_to_core).collect())
+            } else {
+                CoreAttributeType::Union(vec![])
+            }
+        }
     }
 }
 
@@ -492,218 +534,83 @@ mod tests {
         assert_eq!(back.resolved_attributes(), resource.resolved_attributes());
     }
 
-    // -- JSON passthrough tests --
+    // -- WIT type conversion tests --
 
     #[test]
-    fn test_lifecycle_to_json() {
+    fn test_lifecycle_to_wit() {
         let lifecycle = LifecycleConfig {
             force_delete: true,
             create_before_destroy: false,
-            prevent_destroy: false,
+            prevent_destroy: true,
         };
-        let json = lifecycle_to_json(&lifecycle);
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["force_delete"], true);
-        assert_eq!(parsed["create_before_destroy"], false);
-        assert_eq!(parsed["prevent_destroy"], false);
+        let wit_lc = core_to_wit_lifecycle(&lifecycle);
+        assert!(wit_lc.prevent_destroy);
     }
 
     #[test]
-    fn test_json_to_provider_error_valid() {
-        let json = r#"{"message":"something failed","resource_id":{"provider":"aws","resource_type":"s3.bucket","name":"test"},"is_timeout":true}"#;
-        let err = json_to_provider_error(json);
+    fn test_wit_provider_error_to_core() {
+        let wit_err = wit::ProviderError {
+            message: "something failed".to_string(),
+            resource_id: Some(wit::ResourceId {
+                provider: "aws".to_string(),
+                resource_type: "s3.bucket".to_string(),
+                name: "test".to_string(),
+            }),
+            is_timeout: true,
+        };
+        let err = wit_to_core_provider_error(&wit_err);
         assert_eq!(err.message, "something failed");
         assert!(err.is_timeout);
         assert_eq!(err.resource_id.as_ref().unwrap().provider, "aws");
     }
 
     #[test]
-    fn test_json_to_provider_error_plain_string() {
-        let err = json_to_provider_error("some error message");
-        assert_eq!(err.message, "some error message");
-        assert!(!err.is_timeout);
-        assert!(err.resource_id.is_none());
-    }
-
-    #[test]
-    fn test_json_to_provider_info_valid() {
-        let json = r#"{"name":"aws","display_name":"AWS Provider"}"#;
-        let (name, display) = json_to_provider_info(json);
+    fn test_wit_provider_info_to_tuple() {
+        let info = wit::ProviderInfo {
+            name: "aws".to_string(),
+            display_name: "AWS Provider".to_string(),
+        };
+        let (name, display) = wit_to_provider_info(&info);
         assert_eq!(name, "aws");
         assert_eq!(display, "AWS Provider");
     }
 
     #[test]
-    fn test_json_to_schemas_empty() {
-        let schemas = json_to_schemas("[]");
-        assert!(schemas.is_empty());
-    }
-
-    #[test]
-    fn test_json_to_schemas_with_complex_attributes() {
-        let json = r#"[
-          {
-            "resource_type": "ec2.security_group",
-            "description": "EC2 Security Group",
-            "data_source": false,
-            "name_attribute": "group_name",
-            "force_replace": true,
-            "attributes": {
-              "ingress": {
-                "name": "ingress",
-                "attr_type": {
-                  "type": "list",
-                  "inner": {
-                    "type": "union",
-                    "members": [
-                      {
-                        "type": "struct",
-                        "name": "IngressRule",
-                        "fields": [
-                          {
-                            "name": "from_port",
-                            "field_type": { "type": "Int" },
-                            "required": true,
-                            "description": "Start of port range",
-                            "block_name": "from_port_block",
-                            "provider_name": "FromPort"
-                          },
-                          {
-                            "name": "protocol",
-                            "field_type": { "type": "String" },
-                            "required": true,
-                            "description": null,
-                            "block_name": null,
-                            "provider_name": null
-                          }
-                        ]
-                      },
-                      { "type": "String" }
-                    ]
-                  },
-                  "ordered": false
+    fn test_wit_schemas_to_core() {
+        let schemas = vec![wit::ResourceSchema {
+            resource_type: "s3.bucket".to_string(),
+            attributes: vec![
+                wit::AttributeSchema {
+                    name: "name".to_string(),
+                    attr_type: wit::AttributeType::StringType,
+                    required: true,
+                    description: Some("Bucket name".to_string()),
+                    create_only: false,
+                    read_only: false,
+                    write_only: false,
                 },
-                "required": false,
-                "description": "Ingress rules",
-                "create_only": false,
-                "read_only": false,
-                "write_only": false,
-                "block_name": "ingress_block",
-                "provider_name": "IpPermissions",
-                "removable": false
-              },
-              "description": {
-                "name": "description",
-                "attr_type": { "type": "String" },
-                "required": true,
-                "description": "Group description",
-                "create_only": false,
-                "read_only": false,
-                "write_only": false
-              },
-              "enabled": {
-                "name": "enabled",
-                "attr_type": { "type": "Bool" },
-                "required": false,
-                "description": null,
-                "create_only": false,
-                "read_only": false,
-                "write_only": false
-              },
-              "priority": {
-                "name": "priority",
-                "attr_type": { "type": "Int" },
-                "required": false,
-                "description": null,
-                "create_only": false,
-                "read_only": false,
-                "write_only": false
-              }
-            }
-          }
-        ]"#;
-
-        let schemas = json_to_schemas(json);
-        assert_eq!(schemas.len(), 1);
-
-        let schema = &schemas[0];
-        assert_eq!(schema.resource_type, "ec2.security_group");
-        assert_eq!(schema.description.as_deref(), Some("EC2 Security Group"));
-        assert!(!schema.data_source);
-        assert_eq!(schema.name_attribute.as_deref(), Some("group_name"));
-        assert!(schema.force_replace);
-
-        // Basic attribute types
-        let desc_attr = schema
-            .attributes
-            .get("description")
-            .expect("description attribute");
-        assert_eq!(desc_attr.name, "description");
-        assert!(matches!(desc_attr.attr_type, CoreAttributeType::String));
-        assert!(desc_attr.required);
-
-        let enabled_attr = schema.attributes.get("enabled").expect("enabled attribute");
-        assert!(matches!(enabled_attr.attr_type, CoreAttributeType::Bool));
-
-        let priority_attr = schema
-            .attributes
-            .get("priority")
-            .expect("priority attribute");
-        assert!(matches!(priority_attr.attr_type, CoreAttributeType::Int));
-
-        // Ingress attribute: list with ordered=false, provider_name, block_name, removable
-        let ingress_attr = schema.attributes.get("ingress").expect("ingress attribute");
-        assert_eq!(ingress_attr.provider_name.as_deref(), Some("IpPermissions"));
-        assert_eq!(ingress_attr.block_name.as_deref(), Some("ingress_block"));
-        assert_eq!(ingress_attr.removable, Some(false));
-
-        // List with ordered: false
-        match &ingress_attr.attr_type {
-            CoreAttributeType::List { inner, ordered } => {
-                assert!(!ordered, "list should be unordered");
-
-                // Union inside list
-                match inner.as_ref() {
-                    CoreAttributeType::Union(members) => {
-                        assert_eq!(members.len(), 2);
-
-                        // First member: struct with block_name and provider_name on fields
-                        match &members[0] {
-                            CoreAttributeType::Struct { name, fields } => {
-                                assert_eq!(name, "IngressRule");
-                                assert_eq!(fields.len(), 2);
-
-                                let from_port = &fields[0];
-                                assert_eq!(from_port.name, "from_port");
-                                assert!(matches!(from_port.field_type, CoreAttributeType::Int));
-                                assert!(from_port.required);
-                                assert_eq!(
-                                    from_port.description.as_deref(),
-                                    Some("Start of port range")
-                                );
-                                assert_eq!(
-                                    from_port.block_name.as_deref(),
-                                    Some("from_port_block")
-                                );
-                                assert_eq!(from_port.provider_name.as_deref(), Some("FromPort"));
-
-                                let protocol = &fields[1];
-                                assert_eq!(protocol.name, "protocol");
-                                assert!(matches!(protocol.field_type, CoreAttributeType::String));
-                                assert!(protocol.block_name.is_none());
-                                assert!(protocol.provider_name.is_none());
-                            }
-                            other => panic!("expected Struct, got {:?}", other),
-                        }
-
-                        // Second member: String
-                        assert!(matches!(members[1], CoreAttributeType::String));
-                    }
-                    other => panic!("expected Union inside list, got {:?}", other),
-                }
-            }
-            other => panic!("expected List, got {:?}", other),
-        }
+                wit::AttributeSchema {
+                    name: "versioning".to_string(),
+                    attr_type: wit::AttributeType::BoolType,
+                    required: false,
+                    description: None,
+                    create_only: false,
+                    read_only: false,
+                    write_only: false,
+                },
+            ],
+            description: Some("S3 Bucket".to_string()),
+            data_source: false,
+            name_attribute: Some("name".to_string()),
+            force_replace: false,
+        }];
+        let core = wit_to_core_schemas(&schemas);
+        assert_eq!(core.len(), 1);
+        assert_eq!(core[0].resource_type, "s3.bucket");
+        assert_eq!(core[0].attributes.len(), 2);
+        let name_attr = core[0].attributes.get("name").expect("name attr");
+        assert!(matches!(name_attr.attr_type, CoreAttributeType::String));
+        assert!(name_attr.required);
     }
 
     #[test]

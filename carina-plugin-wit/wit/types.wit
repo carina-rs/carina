@@ -27,4 +27,55 @@ interface types {
         id: resource-id,
         attributes: list<tuple<string, value>>,
     }
+
+    record lifecycle-config {
+        prevent-destroy: bool,
+    }
+
+    record provider-error {
+        message: string,
+        resource-id: option<resource-id>,
+        is-timeout: bool,
+    }
+
+    record struct-def {
+        name: string,
+        fields: string,
+    }
+
+    variant attribute-type {
+        string-type,
+        int-type,
+        float-type,
+        bool-type,
+        string-enum(list<string>),
+        list-type(string),
+        map-type(string),
+        struct-type(struct-def),
+        union-type(string),
+    }
+
+    record attribute-schema {
+        name: string,
+        attr-type: attribute-type,
+        required: bool,
+        description: option<string>,
+        create-only: bool,
+        read-only: bool,
+        write-only: bool,
+    }
+
+    record resource-schema {
+        resource-type: string,
+        attributes: list<attribute-schema>,
+        description: option<string>,
+        data-source: bool,
+        name-attribute: option<string>,
+        force-replace: bool,
+    }
+
+    record provider-info {
+        name: string,
+        display-name: string,
+    }
 }
