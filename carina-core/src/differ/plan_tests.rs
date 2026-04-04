@@ -674,6 +674,304 @@ fn diff_skips_internal_attributes_in_removal_detection() {
 }
 
 #[test]
+fn prevent_destroy_blocks_delete_for_desired_resource() {
+    // A resource in desired with prevent_destroy that would generate a Delete
+    // (e.g., Diff::Delete when the resource is "not found" but still in desired?
+    // Actually Diff::Delete only occurs when the diff says "delete". Let's simulate
+    // an orphaned resource scenario instead.)
+    //
+    // For a desired resource, Diff::Delete occurs when the resource's diff
+    // evaluates to Delete. But in practice, Delete from diff means the resource
+    // is marked for deletion. Let's use the orphan path instead for realism.
+
+    // Orphaned resource: exists in current_states but NOT in desired
+    let mut current_states = HashMap::new();
+    let mut attrs = HashMap::new();
+    attrs.insert(
+        "cidr_block".to_string(),
+        Value::String("10.0.0.0/16".to_string()),
+    );
+    current_states.insert(
+        ResourceId::new("ec2.vpc", "my-vpc"),
+        State::existing(ResourceId::new("ec2.vpc", "my-vpc"), attrs),
+    );
+
+    // Lifecycle from state says prevent_destroy
+    let mut lifecycles = HashMap::new();
+    lifecycles.insert(
+        ResourceId::new("ec2.vpc", "my-vpc"),
+        LifecycleConfig {
+            prevent_destroy: true,
+            ..Default::default()
+        },
+    );
+
+    let plan = create_plan(
+        &[], // no desired resources
+        &current_states,
+        &lifecycles,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+
+    // Should have NO delete effects
+    assert!(
+        plan.effects().is_empty(),
+        "Should not generate Delete effect for prevent_destroy resource, got {:?}",
+        plan.effects()
+    );
+
+    // Should have an error
+    assert!(plan.has_errors(), "Should have prevent_destroy error");
+    assert_eq!(plan.errors().len(), 1);
+    assert!(
+        plan.errors()[0].message.contains("prevent_destroy"),
+        "Error message should mention prevent_destroy: {}",
+        plan.errors()[0].message
+    );
+    assert_eq!(
+        plan.errors()[0].resource_id,
+        ResourceId::new("ec2.vpc", "my-vpc")
+    );
+}
+
+#[test]
+fn prevent_destroy_blocks_replace() {
+    use crate::schema::{AttributeSchema, AttributeType};
+
+    // Resource with prevent_destroy that has a create-only attribute change
+    // (which would normally trigger a Replace)
+    let mut resource = Resource::new("ec2.vpc", "my-vpc")
+        .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
+    resource.lifecycle.prevent_destroy = true;
+
+    let resources = vec![resource];
+
+    let mut current_states = HashMap::new();
+    let mut attrs = HashMap::new();
+    attrs.insert(
+        "cidr_block".to_string(),
+        Value::String("10.0.0.0/16".to_string()),
+    );
+    current_states.insert(
+        ResourceId::new("ec2.vpc", "my-vpc"),
+        State::existing(ResourceId::new("ec2.vpc", "my-vpc"), attrs),
+    );
+
+    let mut schemas = HashMap::new();
+    schemas.insert(
+        "ec2.vpc".to_string(),
+        ResourceSchema::new("ec2.vpc")
+            .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
+    );
+
+    let plan = create_plan(
+        &resources,
+        &current_states,
+        &HashMap::new(),
+        &schemas,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+
+    // Should have NO replace effects
+    assert!(
+        plan.effects().is_empty(),
+        "Should not generate Replace effect for prevent_destroy resource, got {:?}",
+        plan.effects()
+    );
+
+    // Should have an error
+    assert!(
+        plan.has_errors(),
+        "Should have prevent_destroy error for replace"
+    );
+    assert_eq!(plan.errors().len(), 1);
+    assert!(
+        plan.errors()[0].message.contains("prevent_destroy"),
+        "Error message should mention prevent_destroy: {}",
+        plan.errors()[0].message
+    );
+}
+
+#[test]
+fn prevent_destroy_does_not_block_update() {
+    // Resource with prevent_destroy that has a normal (non-create-only) attribute change
+    // Updates don't destroy the resource, so they should be allowed
+    let mut resource = Resource::new("s3.bucket", "my-bucket")
+        .with_attribute("versioning", Value::String("Enabled".to_string()));
+    resource.lifecycle.prevent_destroy = true;
+
+    let resources = vec![resource];
+
+    let mut current_states = HashMap::new();
+    let mut attrs = HashMap::new();
+    attrs.insert(
+        "versioning".to_string(),
+        Value::String("Disabled".to_string()),
+    );
+    current_states.insert(
+        ResourceId::new("s3.bucket", "my-bucket"),
+        State::existing(ResourceId::new("s3.bucket", "my-bucket"), attrs),
+    );
+
+    let plan = create_plan(
+        &resources,
+        &current_states,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+
+    // Should generate an Update effect (not blocked)
+    assert_eq!(plan.effects().len(), 1);
+    assert!(
+        matches!(&plan.effects()[0], Effect::Update { .. }),
+        "Expected Update effect, got {:?}",
+        plan.effects()[0]
+    );
+
+    // Should have NO errors
+    assert!(
+        !plan.has_errors(),
+        "Should not have errors for Update with prevent_destroy"
+    );
+}
+
+#[test]
+fn prevent_destroy_does_not_block_create() {
+    // Resource with prevent_destroy that doesn't exist yet
+    // Creates don't destroy anything, so they should be allowed
+    let mut resource = Resource::new("s3.bucket", "my-bucket")
+        .with_attribute("bucket", Value::String("my-bucket".to_string()));
+    resource.lifecycle.prevent_destroy = true;
+
+    let resources = vec![resource];
+
+    let plan = create_plan(
+        &resources,
+        &HashMap::new(), // no current states (resource doesn't exist)
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+
+    // Should generate a Create effect (not blocked)
+    assert_eq!(plan.effects().len(), 1);
+    assert!(
+        matches!(&plan.effects()[0], Effect::Create(_)),
+        "Expected Create effect, got {:?}",
+        plan.effects()[0]
+    );
+
+    // Should have NO errors
+    assert!(
+        !plan.has_errors(),
+        "Should not have errors for Create with prevent_destroy"
+    );
+}
+
+#[test]
+fn without_prevent_destroy_delete_works_normally() {
+    // Orphaned resource without prevent_destroy should still be deleted normally
+    let mut current_states = HashMap::new();
+    let mut attrs = HashMap::new();
+    attrs.insert(
+        "cidr_block".to_string(),
+        Value::String("10.0.0.0/16".to_string()),
+    );
+    current_states.insert(
+        ResourceId::new("ec2.vpc", "my-vpc"),
+        State::existing(ResourceId::new("ec2.vpc", "my-vpc"), attrs),
+    );
+
+    let plan = create_plan(
+        &[], // no desired resources
+        &current_states,
+        &HashMap::new(), // no lifecycles (default = prevent_destroy: false)
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+
+    // Should generate a Delete effect
+    assert_eq!(plan.effects().len(), 1);
+    assert!(
+        matches!(&plan.effects()[0], Effect::Delete { .. }),
+        "Expected Delete effect, got {:?}",
+        plan.effects()[0]
+    );
+
+    // Should have NO errors
+    assert!(!plan.has_errors());
+}
+
+#[test]
+fn prevent_destroy_collects_multiple_errors() {
+    // Two orphaned resources with prevent_destroy - both should generate errors
+    let mut current_states = HashMap::new();
+    let mut attrs1 = HashMap::new();
+    attrs1.insert(
+        "cidr_block".to_string(),
+        Value::String("10.0.0.0/16".to_string()),
+    );
+    current_states.insert(
+        ResourceId::new("ec2.vpc", "vpc-1"),
+        State::existing(ResourceId::new("ec2.vpc", "vpc-1"), attrs1),
+    );
+    let mut attrs2 = HashMap::new();
+    attrs2.insert(
+        "cidr_block".to_string(),
+        Value::String("10.1.0.0/16".to_string()),
+    );
+    current_states.insert(
+        ResourceId::new("ec2.vpc", "vpc-2"),
+        State::existing(ResourceId::new("ec2.vpc", "vpc-2"), attrs2),
+    );
+
+    let mut lifecycles = HashMap::new();
+    lifecycles.insert(
+        ResourceId::new("ec2.vpc", "vpc-1"),
+        LifecycleConfig {
+            prevent_destroy: true,
+            ..Default::default()
+        },
+    );
+    lifecycles.insert(
+        ResourceId::new("ec2.vpc", "vpc-2"),
+        LifecycleConfig {
+            prevent_destroy: true,
+            ..Default::default()
+        },
+    );
+
+    let plan = create_plan(
+        &[],
+        &current_states,
+        &lifecycles,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+
+    assert!(plan.effects().is_empty());
+    assert_eq!(
+        plan.errors().len(),
+        2,
+        "Should collect errors for both resources"
+    );
+}
+
+#[test]
 fn virtual_resources_are_skipped_in_plan() {
     // Virtual resources (module attribute containers) should not generate any effects
     let mut virtual_resource = Resource::new("_virtual", "web").with_kind(ResourceKind::Virtual {

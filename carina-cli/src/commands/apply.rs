@@ -1163,6 +1163,17 @@ async fn run_apply_locked(
         &moved_pairs,
     );
 
+    // Check for prevent_destroy violations
+    if plan.has_errors() {
+        for err in plan.errors() {
+            eprintln!("{} {}", "Error:".red().bold(), err);
+        }
+        return Err(AppError::Validation(format!(
+            "{} resource(s) have prevent_destroy set and cannot be deleted or replaced",
+            plan.errors().len()
+        )));
+    }
+
     if plan.is_empty() {
         println!("{}", "No changes needed.".green());
         return Ok(());
@@ -1457,6 +1468,17 @@ async fn run_apply_from_plan_locked(
 
     // Use the actual states (freshly read) as current_states for apply
     let mut current_states = planned_states;
+
+    // Check for prevent_destroy violations
+    if plan.has_errors() {
+        for err in plan.errors() {
+            eprintln!("{} {}", "Error:".red().bold(), err);
+        }
+        return Err(AppError::Validation(format!(
+            "{} resource(s) have prevent_destroy set and cannot be deleted or replaced",
+            plan.errors().len()
+        )));
+    }
 
     if plan.is_empty() {
         println!("{}", "No changes needed.".green());

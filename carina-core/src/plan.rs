@@ -10,11 +10,30 @@ use serde::{Deserialize, Serialize};
 use crate::effect::Effect;
 use crate::module::DependencyGraph;
 pub use crate::resource::ModuleSource;
+use crate::resource::ResourceId;
+
+/// Error when a plan would violate a lifecycle constraint
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanError {
+    /// The resource that triggered the error
+    pub resource_id: ResourceId,
+    /// Human-readable description of the violation
+    pub message: String,
+}
+
+impl std::fmt::Display for PlanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.resource_id, self.message)
+    }
+}
 
 /// Plan containing Effects to be executed
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Plan {
     effects: Vec<Effect>,
+    /// Lifecycle constraint violations detected during plan generation
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    errors: Vec<PlanError>,
 }
 
 impl Plan {
@@ -32,6 +51,21 @@ impl Plan {
 
     pub fn is_empty(&self) -> bool {
         self.effects.is_empty()
+    }
+
+    /// Add a lifecycle constraint violation error
+    pub fn add_error(&mut self, error: PlanError) {
+        self.errors.push(error);
+    }
+
+    /// Returns lifecycle constraint violation errors
+    pub fn errors(&self) -> &[PlanError] {
+        &self.errors
+    }
+
+    /// Returns true if there are lifecycle constraint violations
+    pub fn has_errors(&self) -> bool {
+        !self.errors.is_empty()
     }
 
     /// Remove effects that don't satisfy the predicate
