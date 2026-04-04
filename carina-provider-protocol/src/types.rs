@@ -103,11 +103,15 @@ pub struct State {
     pub exists: bool,
 }
 
-/// Mirrors `carina_core::resource::LifecycleConfig`.
+/// Lifecycle configuration for a resource.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LifecycleConfig {
+    #[serde(default)]
     pub force_delete: bool,
+    #[serde(default)]
     pub create_before_destroy: bool,
+    #[serde(default)]
+    pub prevent_destroy: bool,
 }
 
 /// Simplified resource for the process boundary.
@@ -116,6 +120,7 @@ pub struct LifecycleConfig {
 pub struct Resource {
     pub id: ResourceId,
     pub attributes: HashMap<String, Value>,
+    #[serde(default)]
     pub lifecycle: LifecycleConfig,
 }
 

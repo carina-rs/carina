@@ -862,8 +862,7 @@ mod tests {
         let mut state = StateFile::new();
         let mut aws_rs = ResourceState::new("s3.bucket", "main", "aws");
         aws_rs.lifecycle.force_delete = true;
-        let mut awscc_rs = ResourceState::new("s3.bucket", "main", "awscc");
-        awscc_rs.lifecycle.force_delete = false;
+        let awscc_rs = ResourceState::new("s3.bucket", "main", "awscc");
 
         state.upsert_resource(aws_rs);
         state.upsert_resource(awscc_rs);
