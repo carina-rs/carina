@@ -13,6 +13,38 @@ pub mod wasm_guest;
 #[cfg(target_arch = "wasm32")]
 pub mod wasi_http;
 
+/// Parse a ResourceId string (provider.resource_type.name) into a ResourceId.
+///
+/// Format: "provider.service.type.name" where provider is the first segment,
+/// name is the last segment, and resource_type is everything in between.
+///
+/// This is also used by the WASM guest SDK via `wasm_guest::parse_resource_id_string`.
+pub fn parse_resource_id_string(key: &str) -> carina_provider_protocol::types::ResourceId {
+    let parts: Vec<&str> = key.splitn(2, '.').collect();
+    if parts.len() < 2 {
+        return carina_provider_protocol::types::ResourceId {
+            provider: String::new(),
+            resource_type: String::new(),
+            name: key.to_string(),
+        };
+    }
+    let provider = parts[0].to_string();
+    let rest = parts[1];
+    if let Some(dot_pos) = rest.rfind('.') {
+        carina_provider_protocol::types::ResourceId {
+            provider,
+            resource_type: rest[..dot_pos].to_string(),
+            name: rest[dot_pos + 1..].to_string(),
+        }
+    } else {
+        carina_provider_protocol::types::ResourceId {
+            provider,
+            resource_type: String::new(),
+            name: rest.to_string(),
+        }
+    }
+}
+
 use carina_provider_protocol::jsonrpc::{Notification, Request, Response};
 use carina_provider_protocol::methods;
 use carina_provider_protocol::types::*;
@@ -288,5 +320,58 @@ fn parse_params<T: serde::de::DeserializeOwned>(
         Some(v) => serde_json::from_value(v.clone()).map_err(|e| format!("Invalid params: {e}")),
         None => serde_json::from_value(serde_json::json!({}))
             .map_err(|e| format!("Missing params: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_resource_id_standard() {
+        let id = parse_resource_id_string("awscc.iam.role.my-role");
+        assert_eq!(id.provider, "awscc");
+        assert_eq!(id.resource_type, "iam.role");
+        assert_eq!(id.name, "my-role");
+    }
+
+    #[test]
+    fn parse_resource_id_three_part_type() {
+        let id = parse_resource_id_string("awscc.ec2.ipam.test-ipam");
+        assert_eq!(id.provider, "awscc");
+        assert_eq!(id.resource_type, "ec2.ipam");
+        assert_eq!(id.name, "test-ipam");
+    }
+
+    #[test]
+    fn parse_resource_id_with_prefix_name() {
+        let id = parse_resource_id_string("awscc.s3.bucket.carina-acc-test-abc123");
+        assert_eq!(id.provider, "awscc");
+        assert_eq!(id.resource_type, "s3.bucket");
+        assert_eq!(id.name, "carina-acc-test-abc123");
+    }
+
+    #[test]
+    fn parse_resource_id_aws_provider() {
+        let id = parse_resource_id_string("aws.s3.bucket.my-bucket");
+        assert_eq!(id.provider, "aws");
+        assert_eq!(id.resource_type, "s3.bucket");
+        assert_eq!(id.name, "my-bucket");
+    }
+
+    #[test]
+    fn parse_resource_id_no_dots() {
+        let id = parse_resource_id_string("simple");
+        assert_eq!(id.provider, "");
+        assert_eq!(id.resource_type, "");
+        assert_eq!(id.name, "simple");
+    }
+
+    #[test]
+    fn parse_resource_id_two_parts() {
+        let id = parse_resource_id_string("provider.name");
+        assert_eq!(id.provider, "provider");
+        assert_eq!(id.resource_type, "");
+        assert_eq!(id.name, "name");
     }
 }
