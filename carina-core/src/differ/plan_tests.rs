@@ -674,15 +674,9 @@ fn diff_skips_internal_attributes_in_removal_detection() {
 }
 
 #[test]
-fn prevent_destroy_blocks_delete_for_desired_resource() {
-    // A resource in desired with prevent_destroy that would generate a Delete
-    // (e.g., Diff::Delete when the resource is "not found" but still in desired?
-    // Actually Diff::Delete only occurs when the diff says "delete". Let's simulate
-    // an orphaned resource scenario instead.)
-    //
-    // For a desired resource, Diff::Delete occurs when the resource's diff
-    // evaluates to Delete. But in practice, Delete from diff means the resource
-    // is marked for deletion. Let's use the orphan path instead for realism.
+fn prevent_destroy_blocks_delete_for_orphaned_resource() {
+    // Orphaned resource (in state but removed from .crn) with prevent_destroy
+    // should produce a PlanError instead of a Delete effect.
 
     // Orphaned resource: exists in current_states but NOT in desired
     let mut current_states = HashMap::new();
