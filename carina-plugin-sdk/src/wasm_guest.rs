@@ -131,6 +131,37 @@ pub fn proto_attr_type_to_json(t: &proto::AttributeType) -> AttrTypeJson {
     }
 }
 
+/// Parse a ResourceId string (provider.resource_type.name) into a proto::ResourceId.
+///
+/// Format: "provider.service.type.name" where provider is the first segment,
+/// name is the last segment, and resource_type is everything in between.
+pub fn parse_resource_id_string(key: &str) -> crate::types::ResourceId {
+    let parts: Vec<&str> = key.splitn(2, '.').collect();
+    if parts.len() < 2 {
+        return crate::types::ResourceId {
+            provider: String::new(),
+            resource_type: String::new(),
+            name: key.to_string(),
+        };
+    }
+    let provider = parts[0].to_string();
+    let rest = parts[1];
+    // rest = "service.type.name" — split from the end to get name
+    if let Some(dot_pos) = rest.rfind('.') {
+        crate::types::ResourceId {
+            provider,
+            resource_type: rest[..dot_pos].to_string(),
+            name: rest[dot_pos + 1..].to_string(),
+        }
+    } else {
+        crate::types::ResourceId {
+            provider,
+            resource_type: String::new(),
+            name: rest.to_string(),
+        }
+    }
+}
+
 /// Macro to export a `CarinaProvider` implementation as a WASM component.
 ///
 /// This macro generates wit-bindgen bindings in the consumer crate and implements
@@ -514,12 +545,8 @@ macro_rules! export_provider {
                     let proto_states: HashMap<_, _> = states
                         .iter()
                         .map(|(k, s)| {
-                            let dummy_id = proto::ResourceId {
-                                provider: String::new(),
-                                resource_type: String::new(),
-                                name: k.clone(),
-                            };
-                            (k.clone(), wit_to_proto_state(&dummy_id, s))
+                            let parsed_id = helpers::parse_resource_id_string(k);
+                            (k.clone(), wit_to_proto_state(&parsed_id, s))
                         })
                         .collect();
                     let result =
@@ -538,12 +565,8 @@ macro_rules! export_provider {
                     let mut proto_states: HashMap<String, proto::State> = states
                         .iter()
                         .map(|(k, s)| {
-                            let dummy_id = proto::ResourceId {
-                                provider: String::new(),
-                                resource_type: String::new(),
-                                name: k.clone(),
-                            };
-                            (k.clone(), wit_to_proto_state(&dummy_id, s))
+                            let parsed_id = helpers::parse_resource_id_string(k);
+                            (k.clone(), wit_to_proto_state(&parsed_id, s))
                         })
                         .collect();
                     let proto_saved: HashMap<String, HashMap<String, proto::Value>> = saved_attrs
@@ -927,12 +950,8 @@ macro_rules! export_provider {
                     let proto_states: HashMap<_, _> = states
                         .iter()
                         .map(|(k, s)| {
-                            let dummy_id = proto::ResourceId {
-                                provider: String::new(),
-                                resource_type: String::new(),
-                                name: k.clone(),
-                            };
-                            (k.clone(), wit_to_proto_state(&dummy_id, s))
+                            let parsed_id = helpers::parse_resource_id_string(k);
+                            (k.clone(), wit_to_proto_state(&parsed_id, s))
                         })
                         .collect();
                     let result =
@@ -951,12 +970,8 @@ macro_rules! export_provider {
                     let mut proto_states: HashMap<String, proto::State> = states
                         .iter()
                         .map(|(k, s)| {
-                            let dummy_id = proto::ResourceId {
-                                provider: String::new(),
-                                resource_type: String::new(),
-                                name: k.clone(),
-                            };
-                            (k.clone(), wit_to_proto_state(&dummy_id, s))
+                            let parsed_id = helpers::parse_resource_id_string(k);
+                            (k.clone(), wit_to_proto_state(&parsed_id, s))
                         })
                         .collect();
                     let proto_saved: HashMap<String, HashMap<String, proto::Value>> = saved_attrs
