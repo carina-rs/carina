@@ -187,11 +187,11 @@ pub fn wit_to_core_resource(resource: &wit::ResourceDef) -> CoreResource {
 
 // -- LifecycleConfig --
 
-pub fn core_to_wit_lifecycle(_lifecycle: &CoreLifecycle) -> wit::LifecycleConfig {
-    // WIT LifecycleConfig only has prevent_destroy; core LifecycleConfig has
-    // force_delete and create_before_destroy. No direct mapping exists.
+pub fn core_to_wit_lifecycle(lifecycle: &CoreLifecycle) -> wit::LifecycleConfig {
     wit::LifecycleConfig {
         prevent_destroy: false,
+        force_delete: lifecycle.force_delete,
+        create_before_destroy: lifecycle.create_before_destroy,
     }
 }
 
@@ -921,6 +921,51 @@ mod tests {
     }
 
     #[test]
+    fn test_deeply_nested_list_map_roundtrip() {
+        // Simulates IAM role policies: List<Map<String, Map<String, List<Map>>>>
+        let policy_document = CoreValue::Map(
+            vec![
+                (
+                    "version".to_string(),
+                    CoreValue::String("2012-10-17".into()),
+                ),
+                (
+                    "statement".to_string(),
+                    CoreValue::List(vec![CoreValue::Map(
+                        vec![
+                            ("effect".to_string(), CoreValue::String("Allow".into())),
+                            (
+                                "action".to_string(),
+                                CoreValue::String("logs:CreateLogGroup".into()),
+                            ),
+                            ("resource".to_string(), CoreValue::String("*".into())),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    )]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let policies = CoreValue::List(vec![CoreValue::Map(
+            vec![
+                (
+                    "policy_name".to_string(),
+                    CoreValue::String("test-policy".into()),
+                ),
+                ("policy_document".to_string(), policy_document),
+            ]
+            .into_iter()
+            .collect(),
+        )]);
+
+        let wit = core_to_wit_value(&policies);
+        let back = wit_to_core_value(&wit);
+        assert_eq!(policies, back);
+    }
+
+    #[test]
     fn test_struct_field_block_name_roundtrip() {
         let core_type = CoreAttributeType::Struct {
             name: "Transition".into(),
@@ -953,5 +998,38 @@ mod tests {
         } else {
             panic!("Expected Struct type");
         }
+    }
+
+    // -- LifecycleConfig --
+
+    #[test]
+    fn test_lifecycle_force_delete_preserved() {
+        let core = CoreLifecycle {
+            force_delete: true,
+            create_before_destroy: false,
+        };
+        let wit = core_to_wit_lifecycle(&core);
+        assert!(wit.force_delete);
+        assert!(!wit.create_before_destroy);
+    }
+
+    #[test]
+    fn test_lifecycle_create_before_destroy_preserved() {
+        let core = CoreLifecycle {
+            force_delete: false,
+            create_before_destroy: true,
+        };
+        let wit = core_to_wit_lifecycle(&core);
+        assert!(!wit.force_delete);
+        assert!(wit.create_before_destroy);
+    }
+
+    #[test]
+    fn test_lifecycle_default_all_false() {
+        let core = CoreLifecycle::default();
+        let wit = core_to_wit_lifecycle(&core);
+        assert!(!wit.force_delete);
+        assert!(!wit.create_before_destroy);
+        assert!(!wit.prevent_destroy);
     }
 }

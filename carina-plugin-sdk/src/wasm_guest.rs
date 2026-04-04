@@ -325,9 +325,12 @@ macro_rules! export_provider {
             }
 
             fn wit_to_proto_lifecycle(
-                _lc: &wit_types::LifecycleConfig,
+                lc: &wit_types::LifecycleConfig,
             ) -> proto::LifecycleConfig {
-                proto::LifecycleConfig::default()
+                proto::LifecycleConfig {
+                    force_delete: lc.force_delete,
+                    create_before_destroy: lc.create_before_destroy,
+                }
             }
 
             fn proto_to_wit_provider_error(
@@ -728,9 +731,12 @@ macro_rules! export_provider {
             }
 
             fn wit_to_proto_lifecycle(
-                _lc: &wit_types::LifecycleConfig,
+                lc: &wit_types::LifecycleConfig,
             ) -> proto::LifecycleConfig {
-                proto::LifecycleConfig::default()
+                proto::LifecycleConfig {
+                    force_delete: lc.force_delete,
+                    create_before_destroy: lc.create_before_destroy,
+                }
             }
 
             fn proto_to_wit_provider_error(
