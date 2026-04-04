@@ -518,6 +518,22 @@ pub fn cascade_dependent_updates(
             );
 
             if !create_only_refs.is_empty() {
+                // Check if this merge would upgrade an Update to Replace.
+                // If the resource has prevent_destroy, block the upgrade.
+                let is_update_in_plan = plan
+                    .effects()
+                    .iter()
+                    .any(|e| matches!(e, Effect::Update { id, .. } if *id == resource.id));
+                if is_update_in_plan && resource.lifecycle.prevent_destroy {
+                    plan.add_error(PlanError {
+                        resource_id: resource.id.clone(),
+                        message:
+                            "resource has prevent_destroy set, but cascade from a replaced dependency would replace it (which requires destroying the old resource)"
+                                .to_string(),
+                    });
+                    continue;
+                }
+
                 // Only keep hints for attributes that are actually create-only
                 let filtered_hints: Vec<(String, String)> = ref_hints
                     .into_iter()
@@ -590,6 +606,15 @@ pub fn cascade_dependent_updates(
                             from: Box::new(from),
                             to: (*unresolved).clone(),
                         });
+                } else if unresolved.lifecycle.prevent_destroy {
+                    // Cascade would promote to Replace (destroy + recreate),
+                    // but prevent_destroy blocks this.
+                    plan.add_error(PlanError {
+                        resource_id: unresolved.id.clone(),
+                        message:
+                            "resource has prevent_destroy set, but cascade from a replaced dependency would replace it (which requires destroying the old resource)"
+                                .to_string(),
+                    });
                 } else {
                     // Extract ref hints for attributes being promoted
                     let ref_hints: Vec<(String, String)> = unresolved
