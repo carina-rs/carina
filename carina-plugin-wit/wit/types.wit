@@ -58,6 +58,8 @@ interface types {
         create-only: bool,
         read-only: bool,
         write-only: bool,
+        provider-name: option<string>,
+        block-name: option<string>,
     }
 
     /// Attribute type descriptor. Recursive list/map/struct types are encoded

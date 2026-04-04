@@ -371,6 +371,8 @@ macro_rules! export_provider {
                     create_only: a.create_only,
                     read_only: a.read_only,
                     write_only: a.write_only,
+                    provider_name: a.provider_name.clone(),
+                    block_name: a.block_name.clone(),
                 }
             }
 
@@ -777,6 +779,8 @@ macro_rules! export_provider {
                     create_only: a.create_only,
                     read_only: a.read_only,
                     write_only: a.write_only,
+                    provider_name: a.provider_name.clone(),
+                    block_name: a.block_name.clone(),
                 }
             }
 

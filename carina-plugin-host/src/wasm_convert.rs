@@ -426,6 +426,8 @@ fn core_to_wit_attribute_schema(a: &CoreAttributeSchema) -> wit::AttributeSchema
         create_only: a.create_only,
         read_only: a.read_only,
         write_only: a.write_only,
+        provider_name: a.provider_name.clone(),
+        block_name: a.block_name.clone(),
     }
 }
 
@@ -437,11 +439,11 @@ fn wit_to_core_attribute_schema(a: &wit::AttributeSchema) -> CoreAttributeSchema
         default: None,
         description: a.description.clone(),
         completions: None,
-        provider_name: None,
+        provider_name: a.provider_name.clone(),
         create_only: a.create_only,
         read_only: a.read_only,
         removable: None,
-        block_name: None,
+        block_name: a.block_name.clone(),
         write_only: a.write_only,
     }
 }
@@ -838,6 +840,104 @@ mod tests {
         assert_eq!(core_err.resource_id.as_ref().unwrap().provider, "aws");
     }
 
+    // -- Schema attribute with block_name and provider_name roundtrip (issue #1499) --
+
+    #[test]
+    fn test_schema_attribute_block_name_roundtrip() {
+        let core_schema = CoreResourceSchema {
+            resource_type: "iam.role".into(),
+            attributes: HashMap::from([(
+                "policies".into(),
+                CoreAttributeSchema {
+                    name: "policies".into(),
+                    attr_type: CoreAttributeType::list(CoreAttributeType::Struct {
+                        name: "Policy".into(),
+                        fields: vec![CoreStructField {
+                            name: "policy_name".into(),
+                            field_type: CoreAttributeType::String,
+                            required: true,
+                            description: None,
+                            provider_name: Some("PolicyName".into()),
+                            block_name: None,
+                        }],
+                    }),
+                    required: false,
+                    default: None,
+                    description: Some("Inline policies".into()),
+                    completions: None,
+                    provider_name: Some("Policies".into()),
+                    create_only: false,
+                    read_only: false,
+                    removable: None,
+                    block_name: Some("policy".into()),
+                    write_only: false,
+                },
+            )]),
+            description: None,
+            validator: None,
+            data_source: false,
+            name_attribute: None,
+            force_replace: false,
+        };
+
+        let wit = core_to_wit_schema(&core_schema);
+        let back = wit_to_core_schema(&wit);
+
+        let attr = &back.attributes["policies"];
+        assert_eq!(
+            attr.block_name.as_deref(),
+            Some("policy"),
+            "block_name must survive WIT roundtrip"
+        );
+        assert_eq!(
+            attr.provider_name.as_deref(),
+            Some("Policies"),
+            "provider_name must survive WIT roundtrip"
+        );
+    }
+
+    #[test]
+    fn test_schema_attribute_without_block_name_roundtrip() {
+        let core_schema = CoreResourceSchema {
+            resource_type: "ec2.vpc".into(),
+            attributes: HashMap::from([(
+                "cidr_block".into(),
+                CoreAttributeSchema {
+                    name: "cidr_block".into(),
+                    attr_type: CoreAttributeType::String,
+                    required: true,
+                    default: None,
+                    description: None,
+                    completions: None,
+                    provider_name: None,
+                    create_only: false,
+                    read_only: false,
+                    removable: None,
+                    block_name: None,
+                    write_only: false,
+                },
+            )]),
+            description: None,
+            validator: None,
+            data_source: false,
+            name_attribute: None,
+            force_replace: false,
+        };
+
+        let wit = core_to_wit_schema(&core_schema);
+        let back = wit_to_core_schema(&wit);
+
+        let attr = &back.attributes["cidr_block"];
+        assert!(
+            attr.block_name.is_none(),
+            "block_name should remain None when not set"
+        );
+        assert!(
+            attr.provider_name.is_none(),
+            "provider_name should remain None when not set"
+        );
+    }
+
     // -- Custom type degrades to base --
 
     #[test]
@@ -998,6 +1098,114 @@ mod tests {
         } else {
             panic!("Expected Struct type");
         }
+    }
+
+    // -- List<Map> roundtrip for block_name attributes (issue #1499) --
+
+    /// Simulates the IAM role `policies` attribute (block_name "policy"):
+    /// List<Struct{policy_name, policy_document}>
+    #[test]
+    fn test_list_of_maps_policy_attribute_roundtrip() {
+        let policy_document = CoreValue::Map(
+            vec![
+                (
+                    "version".to_string(),
+                    CoreValue::String("2012-10-17".into()),
+                ),
+                (
+                    "statement".to_string(),
+                    CoreValue::List(vec![CoreValue::Map(
+                        vec![
+                            ("effect".to_string(), CoreValue::String("Allow".into())),
+                            (
+                                "action".to_string(),
+                                CoreValue::String("logs:CreateLogGroup".into()),
+                            ),
+                            ("resource".to_string(), CoreValue::String("*".into())),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    )]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let policies = CoreValue::List(vec![CoreValue::Map(
+            vec![
+                (
+                    "policy_name".to_string(),
+                    CoreValue::String("test-policy".into()),
+                ),
+                ("policy_document".to_string(), policy_document),
+            ]
+            .into_iter()
+            .collect(),
+        )]);
+
+        let wit = core_to_wit_value(&policies);
+        assert!(matches!(wit, wit::Value::ListVal(_)));
+        let back = wit_to_core_value(&wit);
+        assert_eq!(policies, back);
+    }
+
+    /// Simulates the EC2 IPAM `operating_regions` attribute (block_name "operating_region"):
+    /// List<Struct{region_name}>
+    #[test]
+    fn test_list_of_maps_operating_region_roundtrip() {
+        let operating_regions = CoreValue::List(vec![CoreValue::Map(
+            vec![(
+                "region_name".to_string(),
+                CoreValue::String("ap-northeast-1".into()),
+            )]
+            .into_iter()
+            .collect(),
+        )]);
+
+        let wit = core_to_wit_value(&operating_regions);
+        assert!(matches!(wit, wit::Value::ListVal(_)));
+        let back = wit_to_core_value(&wit);
+        assert_eq!(operating_regions, back);
+    }
+
+    /// Verifies that List<Map> attributes survive the full value_map roundtrip
+    /// (simulating resource attributes through WIT boundary).
+    #[test]
+    fn test_value_map_with_list_of_maps_roundtrip() {
+        let policies = CoreValue::List(vec![CoreValue::Map(
+            vec![
+                (
+                    "policy_name".to_string(),
+                    CoreValue::String("test-policy".into()),
+                ),
+                (
+                    "policy_document".to_string(),
+                    CoreValue::Map(
+                        vec![(
+                            "version".to_string(),
+                            CoreValue::String("2012-10-17".into()),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    ),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        )]);
+
+        let map: HashMap<String, CoreValue> = vec![
+            ("role_name".into(), CoreValue::String("test-role".into())),
+            ("policies".into(), policies.clone()),
+        ]
+        .into_iter()
+        .collect();
+
+        let wit = core_to_wit_value_map(&map);
+        let back = wit_to_core_value_map(&wit);
+
+        assert_eq!(map, back);
+        assert_eq!(back.get("policies"), Some(&policies));
     }
 
     // -- LifecycleConfig --
