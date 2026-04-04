@@ -68,14 +68,20 @@ enum WasmBindings {
 use crate::wasm_bindings::carina::provider::types as wit_types;
 
 impl WasmBindings {
-    async fn call_info(&self, store: &mut Store<HostState>) -> wasmtime::Result<String> {
+    async fn call_info(
+        &self,
+        store: &mut Store<HostState>,
+    ) -> wasmtime::Result<wit_types::ProviderInfo> {
         match self {
             WasmBindings::Basic(b) => b.carina_provider_provider().call_info(store).await,
             WasmBindings::Http(b) => b.carina_provider_provider().call_info(store).await,
         }
     }
 
-    async fn call_schemas(&self, store: &mut Store<HostState>) -> wasmtime::Result<String> {
+    async fn call_schemas(
+        &self,
+        store: &mut Store<HostState>,
+    ) -> wasmtime::Result<Vec<wit_types::ResourceSchema>> {
         match self {
             WasmBindings::Basic(b) => b.carina_provider_provider().call_schemas(store).await,
             WasmBindings::Http(b) => b.carina_provider_provider().call_schemas(store).await,
@@ -125,7 +131,7 @@ impl WasmBindings {
         store: &mut Store<HostState>,
         id: &wit_types::ResourceId,
         identifier: Option<&str>,
-    ) -> wasmtime::Result<Result<wit_types::State, String>> {
+    ) -> wasmtime::Result<Result<wit_types::State, wit_types::ProviderError>> {
         match self {
             WasmBindings::Basic(b) => {
                 b.carina_provider_provider()
@@ -144,7 +150,7 @@ impl WasmBindings {
         &self,
         store: &mut Store<HostState>,
         resource: &wit_types::ResourceDef,
-    ) -> wasmtime::Result<Result<wit_types::State, String>> {
+    ) -> wasmtime::Result<Result<wit_types::State, wit_types::ProviderError>> {
         match self {
             WasmBindings::Basic(b) => {
                 b.carina_provider_provider()
@@ -166,7 +172,7 @@ impl WasmBindings {
         identifier: &str,
         from: &wit_types::State,
         to: &wit_types::ResourceDef,
-    ) -> wasmtime::Result<Result<wit_types::State, String>> {
+    ) -> wasmtime::Result<Result<wit_types::State, wit_types::ProviderError>> {
         match self {
             WasmBindings::Basic(b) => {
                 b.carina_provider_provider()
@@ -186,17 +192,17 @@ impl WasmBindings {
         store: &mut Store<HostState>,
         id: &wit_types::ResourceId,
         identifier: &str,
-        options: &str,
-    ) -> wasmtime::Result<Result<(), String>> {
+        lifecycle: wit_types::LifecycleConfig,
+    ) -> wasmtime::Result<Result<(), wit_types::ProviderError>> {
         match self {
             WasmBindings::Basic(b) => {
                 b.carina_provider_provider()
-                    .call_delete(store, id, identifier, options)
+                    .call_delete(store, id, identifier, lifecycle)
                     .await
             }
             WasmBindings::Http(b) => {
                 b.carina_provider_provider()
-                    .call_delete(store, id, identifier, options)
+                    .call_delete(store, id, identifier, lifecycle)
                     .await
             }
         }
@@ -433,18 +439,18 @@ impl WasmProviderFactory {
                     (store, bindings, false)
                 }
             };
-        let info_json = bindings
+        let wit_info = bindings
             .call_info(&mut store)
             .await
             .map_err(|e| format!("Failed to call info(): {e}"))?;
 
-        let schemas_json = bindings
+        let wit_schemas = bindings
             .call_schemas(&mut store)
             .await
             .map_err(|e| format!("Failed to call schemas(): {e}"))?;
 
-        let (name, display_name) = wasm_convert::json_to_provider_info(&info_json);
-        let schemas: Vec<ResourceSchema> = wasm_convert::json_to_schemas(&schemas_json);
+        let (name, display_name) = wasm_convert::wit_to_provider_info(&wit_info);
+        let schemas: Vec<ResourceSchema> = wasm_convert::wit_to_schemas(&wit_schemas);
 
         let name_static: &'static str = Box::leak(name.into_boxed_str());
         let display_name_static: &'static str = Box::leak(display_name.into_boxed_str());
@@ -523,18 +529,18 @@ impl WasmProviderFactory {
                     (store, bindings, false)
                 }
             };
-        let info_json = bindings
+        let wit_info = bindings
             .call_info(&mut store)
             .await
             .map_err(|e| format!("Failed to call info(): {e}"))?;
 
-        let schemas_json = bindings
+        let wit_schemas = bindings
             .call_schemas(&mut store)
             .await
             .map_err(|e| format!("Failed to call schemas(): {e}"))?;
 
-        let (name, display_name) = wasm_convert::json_to_provider_info(&info_json);
-        let schemas: Vec<ResourceSchema> = wasm_convert::json_to_schemas(&schemas_json);
+        let (name, display_name) = wasm_convert::wit_to_provider_info(&wit_info);
+        let schemas: Vec<ResourceSchema> = wasm_convert::wit_to_schemas(&wit_schemas);
 
         let name_static: &'static str = Box::leak(name.into_boxed_str());
         let display_name_static: &'static str = Box::leak(display_name.into_boxed_str());
@@ -698,7 +704,7 @@ impl Provider for WasmProvider {
                 .map_err(|e| ProviderError::new(format!("WASM trap in read: {e}")))?;
             match result {
                 Ok(wit_state) => Ok(wasm_convert::wit_to_core_state(&wit_state, &id)),
-                Err(err_json) => Err(wasm_convert::json_to_provider_error(&err_json)),
+                Err(wit_err) => Err(wasm_convert::wit_to_provider_error(&wit_err)),
             }
         })
     }
@@ -715,7 +721,7 @@ impl Provider for WasmProvider {
                 .map_err(|e| ProviderError::new(format!("WASM trap in create: {e}")))?;
             match result {
                 Ok(wit_state) => Ok(wasm_convert::wit_to_core_state(&wit_state, &id)),
-                Err(err_json) => Err(wasm_convert::json_to_provider_error(&err_json)),
+                Err(wit_err) => Err(wasm_convert::wit_to_provider_error(&wit_err)),
             }
         })
     }
@@ -741,7 +747,7 @@ impl Provider for WasmProvider {
                 .map_err(|e| ProviderError::new(format!("WASM trap in update: {e}")))?;
             match result {
                 Ok(wit_state) => Ok(wasm_convert::wit_to_core_state(&wit_state, &id)),
-                Err(err_json) => Err(wasm_convert::json_to_provider_error(&err_json)),
+                Err(wit_err) => Err(wasm_convert::wit_to_provider_error(&wit_err)),
             }
         })
     }
@@ -754,17 +760,17 @@ impl Provider for WasmProvider {
     ) -> BoxFuture<'_, ProviderResult<()>> {
         let wit_id = wasm_convert::core_to_wit_resource_id(id);
         let identifier = identifier.to_string();
-        let options_json = wasm_convert::lifecycle_to_json(lifecycle);
+        let wit_lifecycle = wasm_convert::core_to_wit_lifecycle(lifecycle);
         Box::pin(async move {
             let mut store = self.store.lock().await;
             let result = self
                 .bindings
-                .call_delete(&mut store, &wit_id, &identifier, &options_json)
+                .call_delete(&mut store, &wit_id, &identifier, wit_lifecycle)
                 .await
                 .map_err(|e| ProviderError::new(format!("WASM trap in delete: {e}")))?;
             match result {
                 Ok(()) => Ok(()),
-                Err(err_json) => Err(wasm_convert::json_to_provider_error(&err_json)),
+                Err(wit_err) => Err(wasm_convert::wit_to_provider_error(&wit_err)),
             }
         })
     }

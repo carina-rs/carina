@@ -6,6 +6,7 @@ interface types {
     }
 
     /// Attribute values serialized as JSON strings for complex/nested types.
+    /// Simple scalar values use typed variants; list and map values are JSON-encoded strings.
     variant value {
         bool-val(bool),
         int-val(s64),
@@ -26,5 +27,62 @@ interface types {
     record resource-def {
         id: resource-id,
         attributes: list<tuple<string, value>>,
+    }
+
+    record lifecycle-config {
+        prevent-destroy: bool,
+    }
+
+    record provider-error {
+        message: string,
+        resource-id: option<resource-id>,
+        is-timeout: bool,
+    }
+
+    record resource-schema {
+        resource-type: string,
+        attributes: list<attribute-schema>,
+        description: option<string>,
+        data-source: bool,
+        name-attribute: option<string>,
+        force-replace: bool,
+    }
+
+    record attribute-schema {
+        name: string,
+        attr-type: attribute-type,
+        required: bool,
+        description: option<string>,
+        create-only: bool,
+        read-only: bool,
+        write-only: bool,
+    }
+
+    /// Attribute type descriptor. Recursive list/map/struct types are encoded
+    /// as JSON strings to avoid WIT's restriction on recursive type definitions.
+    variant attribute-type {
+        string-type,
+        int-type,
+        float-type,
+        bool-type,
+        string-enum(list<string>),
+        /// JSON-encoded attribute-type for the element type
+        list-type(string),
+        /// JSON-encoded attribute-type for the value type
+        map-type(string),
+        struct-type(struct-def),
+        /// JSON-encoded list of member attribute-types
+        union-type(string),
+    }
+
+    record struct-def {
+        name: string,
+        /// JSON-encoded list of struct-field records
+        fields: string,
+    }
+
+    record provider-info {
+        name: string,
+        display-name: string,
     }
 }
