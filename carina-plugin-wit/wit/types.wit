@@ -31,6 +31,8 @@ interface types {
 
     record lifecycle-config {
         prevent-destroy: bool,
+        force-delete: bool,
+        create-before-destroy: bool,
     }
 
     record provider-error {
