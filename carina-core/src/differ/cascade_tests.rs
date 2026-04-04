@@ -901,3 +901,216 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
         }
     }
 }
+
+#[test]
+fn cascade_prevent_destroy_blocks_promotion_to_replace() {
+    // When resource A is being replaced and resource B depends on A
+    // via a create-only attribute, B would normally be promoted to Replace.
+    // But if B has prevent_destroy: true, it should generate a PlanError instead.
+
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let vpc_id = ResourceId::new("ec2.vpc", "my-vpc");
+    let subnet_id = ResourceId::new("ec2.subnet", "my-subnet");
+
+    let vpc = Resource::new("ec2.vpc", "my-vpc")
+        .with_binding("vpc")
+        .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
+
+    let mut subnet = Resource::new("ec2.subnet", "my-subnet")
+        .with_binding("subnet")
+        .with_attribute(
+            "vpc_id",
+            Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
+        )
+        .with_attribute("cidr_block", Value::String("10.1.1.0/24".to_string()));
+    subnet.lifecycle.prevent_destroy = true;
+
+    let unresolved_resources = vec![vpc.clone(), subnet.clone()];
+
+    let mut current_states = HashMap::new();
+    let mut vpc_attrs = HashMap::new();
+    vpc_attrs.insert(
+        "cidr_block".to_string(),
+        Value::String("10.0.0.0/16".to_string()),
+    );
+    vpc_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
+    current_states.insert(
+        vpc_id.clone(),
+        State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
+    );
+
+    let mut subnet_attrs = HashMap::new();
+    subnet_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
+    subnet_attrs.insert(
+        "cidr_block".to_string(),
+        Value::String("10.1.1.0/24".to_string()),
+    );
+    current_states.insert(
+        subnet_id.clone(),
+        State::existing(subnet_id.clone(), subnet_attrs).with_identifier("subnet-123"),
+    );
+
+    // Schema: vpc_id is create-only on ec2.subnet
+    let subnet_schema = ResourceSchema::new("ec2.subnet")
+        .attribute(
+            AttributeSchema::new("vpc_id", AttributeType::String)
+                .required()
+                .create_only(),
+        )
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::String).required());
+
+    let mut schemas = HashMap::new();
+    schemas.insert("ec2.subnet".to_string(), subnet_schema);
+
+    // Build a plan with Replace for VPC (create_before_destroy)
+    let mut plan = Plan::new();
+    plan.add(Effect::Replace {
+        id: vpc_id.clone(),
+        from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
+        to: vpc.clone().with_binding("vpc"),
+        lifecycle: LifecycleConfig {
+            create_before_destroy: true,
+            ..Default::default()
+        },
+        changed_create_only: vec!["cidr_block".to_string()],
+        cascading_updates: vec![],
+        temporary_name: None,
+        cascade_ref_hints: vec![],
+    });
+
+    // Apply cascade
+    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
+
+    // The subnet should NOT be promoted to Replace because it has prevent_destroy.
+    // Instead, a PlanError should be generated.
+    assert!(
+        plan.has_errors(),
+        "Expected PlanError for subnet with prevent_destroy, but got no errors"
+    );
+
+    let errors = plan.errors();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].resource_id, subnet_id);
+    assert!(
+        errors[0].message.contains("prevent_destroy"),
+        "Error message should mention prevent_destroy, got: {}",
+        errors[0].message
+    );
+
+    // The subnet should NOT appear as a Replace effect in the plan
+    let subnet_effects: Vec<_> = plan
+        .effects()
+        .iter()
+        .filter(|e| *e.resource_id() == subnet_id)
+        .collect();
+    assert!(
+        subnet_effects.is_empty(),
+        "Subnet should not have any effect when prevent_destroy blocks promotion"
+    );
+}
+
+#[test]
+fn cascade_prevent_destroy_blocks_merge_upgrade_to_replace() {
+    // When resource B already has an Update effect in the plan and would be
+    // upgraded to Replace via cascade (merge path), prevent_destroy should block it.
+
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let vpc_id = ResourceId::new("ec2.vpc", "my-vpc");
+    let subnet_id = ResourceId::new("ec2.subnet", "my-subnet");
+
+    let vpc = Resource::new("ec2.vpc", "my-vpc")
+        .with_binding("vpc")
+        .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
+
+    let mut subnet = Resource::new("ec2.subnet", "my-subnet")
+        .with_binding("subnet")
+        .with_attribute(
+            "vpc_id",
+            Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
+        )
+        .with_attribute("tags", Value::String("new-tag".to_string()))
+        .with_attribute("cidr_block", Value::String("10.1.1.0/24".to_string()));
+    subnet.lifecycle.prevent_destroy = true;
+
+    let unresolved_resources = vec![vpc.clone(), subnet.clone()];
+
+    let mut current_states = HashMap::new();
+    let mut vpc_attrs = HashMap::new();
+    vpc_attrs.insert(
+        "cidr_block".to_string(),
+        Value::String("10.0.0.0/16".to_string()),
+    );
+    vpc_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
+    current_states.insert(
+        vpc_id.clone(),
+        State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
+    );
+
+    let mut subnet_attrs = HashMap::new();
+    subnet_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
+    subnet_attrs.insert("tags".to_string(), Value::String("old-tag".to_string()));
+    subnet_attrs.insert(
+        "cidr_block".to_string(),
+        Value::String("10.1.1.0/24".to_string()),
+    );
+    current_states.insert(
+        subnet_id.clone(),
+        State::existing(subnet_id.clone(), subnet_attrs).with_identifier("subnet-123"),
+    );
+
+    // Schema: vpc_id is create-only, tags is NOT
+    let subnet_schema = ResourceSchema::new("ec2.subnet")
+        .attribute(
+            AttributeSchema::new("vpc_id", AttributeType::String)
+                .required()
+                .create_only(),
+        )
+        .attribute(AttributeSchema::new("tags", AttributeType::String))
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::String).required());
+
+    let mut schemas = HashMap::new();
+    schemas.insert("ec2.subnet".to_string(), subnet_schema);
+
+    // Build a plan with Replace for VPC and Update for subnet (tags changed)
+    let mut plan = Plan::new();
+    plan.add(Effect::Replace {
+        id: vpc_id.clone(),
+        from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
+        to: vpc.clone().with_binding("vpc"),
+        lifecycle: LifecycleConfig {
+            create_before_destroy: true,
+            ..Default::default()
+        },
+        changed_create_only: vec!["cidr_block".to_string()],
+        cascading_updates: vec![],
+        temporary_name: None,
+        cascade_ref_hints: vec![],
+    });
+    plan.add(Effect::Update {
+        id: subnet_id.clone(),
+        from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
+        to: subnet.clone().with_binding("subnet"),
+        changed_attributes: vec!["tags".to_string()],
+    });
+
+    // Apply cascade
+    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
+
+    // The subnet should NOT be upgraded to Replace because it has prevent_destroy.
+    // A PlanError should be generated instead.
+    assert!(
+        plan.has_errors(),
+        "Expected PlanError for subnet with prevent_destroy on merge upgrade"
+    );
+
+    let errors = plan.errors();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].resource_id, subnet_id);
+    assert!(
+        errors[0].message.contains("prevent_destroy"),
+        "Error message should mention prevent_destroy, got: {}",
+        errors[0].message
+    );
+}
