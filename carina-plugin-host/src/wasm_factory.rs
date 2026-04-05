@@ -320,6 +320,9 @@ pub struct WasmProviderFactory {
     display_name_static: &'static str,
     schemas: Vec<ResourceSchema>,
     enable_http: bool,
+    /// Reusable WASM instance from factory initialization.
+    /// Used by `validate_config()` to avoid creating a throwaway instance.
+    init_instance: Mutex<(Store<HostState>, WasmBindings)>,
 }
 
 impl WasmProviderFactory {
@@ -449,9 +452,6 @@ impl WasmProviderFactory {
         let name_static: &'static str = Box::leak(name.into_boxed_str());
         let display_name_static: &'static str = Box::leak(display_name.into_boxed_str());
 
-        // Drop the temporary instance
-        drop(store);
-
         Ok(Self {
             engine,
             component,
@@ -460,6 +460,7 @@ impl WasmProviderFactory {
             display_name_static,
             schemas,
             enable_http,
+            init_instance: Mutex::new((store, bindings)),
         })
     }
 
@@ -539,8 +540,6 @@ impl WasmProviderFactory {
         let name_static: &'static str = Box::leak(name.into_boxed_str());
         let display_name_static: &'static str = Box::leak(display_name.into_boxed_str());
 
-        drop(store);
-
         Ok(Self {
             engine,
             component,
@@ -549,6 +548,7 @@ impl WasmProviderFactory {
             display_name_static,
             schemas,
             enable_http,
+            init_instance: Mutex::new((store, bindings)),
         })
     }
 
@@ -593,20 +593,14 @@ impl ProviderFactory for WasmProviderFactory {
     }
 
     fn validate_config(&self, attributes: &HashMap<String, Value>) -> Result<(), String> {
-        let engine = self.engine.clone();
-        let component = self.component.clone();
-        let enable_http = self.enable_http;
         let wit_attrs = wasm_convert::core_to_wit_value_map(attributes);
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                let (mut store, bindings) = if enable_http {
-                    create_instance_with_http(&engine, &component).await?
-                } else {
-                    create_instance(&engine, &component).await?
-                };
+                let mut guard = self.init_instance.lock().await;
+                let (ref mut store, ref bindings) = *guard;
                 bindings
-                    .call_validate_config(&mut store, &wit_attrs)
+                    .call_validate_config(store, &wit_attrs)
                     .await
                     .map_err(|e| format!("Failed to call validate_config(): {e}"))?
             })
