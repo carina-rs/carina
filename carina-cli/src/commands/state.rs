@@ -1142,7 +1142,7 @@ mod tests {
         // Should get LockNotFound (the local backend works), not a config error
         match &result {
             Err(AppError::Config(msg)) if msg.contains("Lock with ID") => {
-                // This is the expected LockNotFound error mapped to AppError::Config
+                // Expected: local backend found no lock file for the dummy ID
             }
             Err(AppError::Config(msg)) if msg.contains("No backend configuration found") => {
                 panic!(
@@ -1150,8 +1150,11 @@ mod tests {
                     msg
                 );
             }
+            Ok(()) => {
+                panic!("expected LockNotFound error for dummy lock ID, got Ok");
+            }
             other => {
-                panic!("unexpected result: {:?}", other);
+                panic!("unexpected error: {:?}", other);
             }
         }
     }
