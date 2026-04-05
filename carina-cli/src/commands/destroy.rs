@@ -93,7 +93,7 @@ pub async fn run_destroy(
         None
     };
 
-    let op_result = run_destroy_locked(
+    let op_result = crate::signal::run_with_ctrl_c(run_destroy_locked(
         &mut parsed,
         auto_approve,
         backend.as_ref(),
@@ -102,14 +102,16 @@ pub async fn run_destroy(
         refresh,
         force,
         base_dir,
-    )
+    ))
     .await;
 
     // Always release lock if it was acquired
     if let Some(ref li) = lock_info {
         let release_result = backend.release_lock(li).await.map_err(AppError::Backend);
 
-        if release_result.is_ok() && op_result.is_ok() {
+        if release_result.is_ok()
+            && (op_result.is_ok() || matches!(op_result, Err(AppError::Interrupted)))
+        {
             println!("  {} Lock released", "✓".green());
         }
 

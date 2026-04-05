@@ -21,6 +21,10 @@ pub enum AppError {
     /// Configuration errors (missing attributes, invalid paths, etc.)
     #[error("{0}")]
     Config(String),
+
+    /// Operation interrupted by user (Ctrl+C / SIGINT)
+    #[error("Operation cancelled by user")]
+    Interrupted,
 }
 
 impl From<String> for AppError {
@@ -96,6 +100,12 @@ mod tests {
         let app_err: AppError = "some error".into();
         assert!(matches!(app_err, AppError::Config(_)));
         assert_eq!(app_err.to_string(), "some error");
+    }
+
+    #[test]
+    fn interrupted_error() {
+        let app_err = AppError::Interrupted;
+        assert_eq!(app_err.to_string(), "Operation cancelled by user");
     }
 
     #[test]

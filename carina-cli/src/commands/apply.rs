@@ -966,22 +966,25 @@ pub async fn run_apply(
         );
     }
 
-    // All code after lock acquisition is wrapped so that lock release is guaranteed
-    let op_result = run_apply_locked(
+    // All code after lock acquisition is wrapped so that lock release is guaranteed.
+    // Ctrl+C cancels the operation and returns Interrupted so the lock is still released.
+    let op_result = crate::signal::run_with_ctrl_c(run_apply_locked(
         &ctx,
         &mut parsed,
         auto_approve,
         backend.as_ref(),
         lock_info.as_ref(),
         base_dir,
-    )
+    ))
     .await;
 
     // Always release lock if it was acquired
     if let Some(ref li) = lock_info {
         let release_result = backend.release_lock(li).await.map_err(AppError::Backend);
 
-        if release_result.is_ok() && op_result.is_ok() {
+        if release_result.is_ok()
+            && (op_result.is_ok() || matches!(op_result, Err(AppError::Interrupted)))
+        {
             println!("  {} Lock released", "✓".green());
         }
 
@@ -1364,20 +1367,22 @@ pub async fn run_apply_from_plan(
 
     let source_path = std::path::PathBuf::from(&plan_file.source_path);
     let base_dir = get_base_dir(&source_path);
-    let op_result = run_apply_from_plan_locked(
+    let op_result = crate::signal::run_with_ctrl_c(run_apply_from_plan_locked(
         plan_file,
         auto_approve,
         backend.as_ref(),
         lock_info.as_ref(),
         base_dir,
-    )
+    ))
     .await;
 
     // Always release lock if it was acquired
     if let Some(ref li) = lock_info {
         let release_result = backend.release_lock(li).await.map_err(AppError::Backend);
 
-        if release_result.is_ok() && op_result.is_ok() {
+        if release_result.is_ok()
+            && (op_result.is_ok() || matches!(op_result, Err(AppError::Interrupted)))
+        {
             println!("  {} Lock released", "✓".green());
         }
 
