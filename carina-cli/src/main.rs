@@ -2,6 +2,7 @@ mod commands;
 mod display;
 mod error;
 mod provider_resolver;
+mod version_resolver;
 mod wiring;
 
 use std::path::PathBuf;
