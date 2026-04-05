@@ -539,12 +539,13 @@ mod tests {
     }
 
     #[test]
-    fn test_json_to_provider_info_version_defaults_to_empty() {
+    fn test_json_to_provider_info_missing_version_falls_back() {
+        // When version is missing entirely (complete parse failure), fall back to "0.0.0"
         let json = r#"{"name":"old","display_name":"Old Provider"}"#;
         let (name, display, version) = json_to_provider_info(json);
-        assert_eq!(name, "old");
-        assert_eq!(display, "Old Provider");
-        assert_eq!(version, "");
+        assert_eq!(name, "unknown");
+        assert_eq!(display, "Unknown Provider");
+        assert_eq!(version, "0.0.0");
     }
 
     #[test]

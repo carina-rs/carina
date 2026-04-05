@@ -46,7 +46,6 @@ impl LockFile {
             .find(|e| e.source == source && e.version == version)
     }
 
-    #[allow(dead_code)]
     pub fn find_by_source(&self, source: &str) -> Option<&LockEntry> {
         self.provider.iter().find(|e| e.source == source)
     }
@@ -352,6 +351,10 @@ pub fn resolve_single_config(base_dir: &Path, config: &ProviderConfig) -> Result
     let version = resolve_version(source, config, &lock_file, false)?;
 
     let binary_path = resolve_provider(base_dir, source, &version, &config.name, &mut lock_file)?;
+
+    if let Some(entry) = lock_file.provider.iter_mut().find(|e| e.source == source) {
+        entry.constraint = config.version.as_ref().map(|c| c.raw.clone());
+    }
 
     lock_file
         .save(&lock_path)

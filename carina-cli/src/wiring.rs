@@ -73,7 +73,7 @@ pub fn build_factories_from_providers(
 ) -> Vec<Box<dyn ProviderFactory>> {
     if let Err(e) = crate::provider_resolver::validate_lock_constraints(base_dir, providers) {
         eprintln!("{}", e.red());
-        return Vec::new();
+        std::process::exit(1);
     }
 
     let mut factories: Vec<Box<dyn ProviderFactory>> = Vec::new();
