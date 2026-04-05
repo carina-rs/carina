@@ -29,6 +29,12 @@ impl VersionConstraint {
     }
 }
 
+impl PartialEq for VersionConstraint {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw
+    }
+}
+
 impl fmt::Display for VersionConstraint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.raw)
@@ -100,6 +106,15 @@ mod tests {
     fn display_shows_raw() {
         let c = VersionConstraint::parse("~0.5.0").unwrap();
         assert_eq!(format!("{c}"), "~0.5.0");
+    }
+
+    #[test]
+    fn partial_eq_by_raw() {
+        let a = VersionConstraint::parse("~0.5.0").unwrap();
+        let b = VersionConstraint::parse("~0.5.0").unwrap();
+        let c = VersionConstraint::parse("^1.0.0").unwrap();
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 
     #[test]
