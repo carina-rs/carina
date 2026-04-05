@@ -774,6 +774,25 @@ impl WasmProviderFactory {
     pub fn version(&self) -> &str {
         &self.version
     }
+
+    /// Verify that this provider's version satisfies the given constraint.
+    pub fn verify_version(&self, constraint_raw: &str) -> Result<(), String> {
+        let req = semver::VersionReq::parse(constraint_raw)
+            .map_err(|e| format!("Invalid version constraint '{}': {}", constraint_raw, e))?;
+        let actual = semver::Version::parse(&self.version).map_err(|e| {
+            format!(
+                "Provider '{}' reports invalid version '{}': {}",
+                self.name_static, self.version, e
+            )
+        })?;
+        if !req.matches(&actual) {
+            return Err(format!(
+                "Provider '{}' version {} does not satisfy constraint '{}'",
+                self.name_static, actual, constraint_raw
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl ProviderFactory for WasmProviderFactory {

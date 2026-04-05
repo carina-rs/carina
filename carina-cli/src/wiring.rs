@@ -131,7 +131,12 @@ pub fn build_factories_from_providers(
                     carina_plugin_host::WasmProviderFactory::new(binary_path.clone()),
                 )
             })
-            .map(|f| Box::new(f) as Box<dyn ProviderFactory>)
+            .and_then(|f| {
+                if let Some(constraint) = &config.version {
+                    f.verify_version(&constraint.raw)?;
+                }
+                Ok(Box::new(f) as Box<dyn ProviderFactory>)
+            })
             .map_err(|e| format!("Failed to load WASM provider: {e}"))
         };
 
