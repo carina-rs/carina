@@ -38,29 +38,46 @@ use crate::wasm_convert;
 /// [`HTTP_ALLOWED_EXACT_HOSTS`] for exact-match entries.
 const HTTP_ALLOWED_HOST_SUFFIXES: &[&str] = &[".amazonaws.com", ".amazonaws.com.cn"];
 
-/// Exact hosts that are always permitted (e.g., EC2 Instance Metadata Service).
-const HTTP_ALLOWED_EXACT_HOSTS: &[&str] = &["169.254.169.254"];
+/// EC2 Instance Metadata Service address.
+const IMDS_HOST: &str = "169.254.169.254";
+
+/// Connect timeout for IMDS requests. On EC2, IMDS responds in <10ms.
+/// A 1-second timeout lets non-EC2 environments fail fast instead of
+/// hanging for the SDK's default timeout.
+const IMDS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Strip port from authority (e.g., "s3.amazonaws.com:443" -> "s3.amazonaws.com").
+fn host_without_port(host: &str) -> &str {
+    host.split(':').next().unwrap_or(host)
+}
 
 /// Returns `true` if the given host (authority without port) is allowed
 /// by the HTTP allow-list.
 fn is_host_allowed(host: &str) -> bool {
-    // Strip port if present (e.g., "s3.amazonaws.com:443" -> "s3.amazonaws.com")
-    let host_without_port = host.split(':').next().unwrap_or(host);
-    HTTP_ALLOWED_EXACT_HOSTS.contains(&host_without_port)
+    let h = host_without_port(host);
+    h == IMDS_HOST
         || HTTP_ALLOWED_HOST_SUFFIXES
             .iter()
-            .any(|suffix| host_without_port.ends_with(suffix))
+            .any(|suffix| h.ends_with(suffix))
+}
+
+/// Returns `true` if the host is the EC2 Instance Metadata Service.
+fn is_imds_host(host: &str) -> bool {
+    host_without_port(host) == IMDS_HOST
 }
 
 /// Custom `WasiHttpHooks` that restricts outgoing HTTP requests to
-/// hosts matching [`HTTP_ALLOWED_HOST_SUFFIXES`] or [`HTTP_ALLOWED_EXACT_HOSTS`].
+/// hosts matching [`HTTP_ALLOWED_HOST_SUFFIXES`] or [`IMDS_HOST`].
+///
+/// IMDS requests are capped at [`IMDS_CONNECT_TIMEOUT`] so that non-EC2
+/// environments fail fast rather than waiting for the SDK's default timeout.
 struct AllowListHttpHooks;
 
 impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
     fn send_request(
         &mut self,
         request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
-        config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
+        mut config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
     ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>
     {
         let authority = match request.uri().authority() {
@@ -75,6 +92,19 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
             return Err(
                 wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::HttpRequestDenied.into(),
             );
+        }
+        // Cap timeouts for IMDS so non-EC2 environments fail fast.
+        // On EC2, IMDS responds in <10ms; 1s is generous.
+        if is_imds_host(authority) {
+            if config.connect_timeout > IMDS_CONNECT_TIMEOUT {
+                config.connect_timeout = IMDS_CONNECT_TIMEOUT;
+            }
+            if config.first_byte_timeout > IMDS_CONNECT_TIMEOUT {
+                config.first_byte_timeout = IMDS_CONNECT_TIMEOUT;
+            }
+            if config.between_bytes_timeout > IMDS_CONNECT_TIMEOUT {
+                config.between_bytes_timeout = IMDS_CONNECT_TIMEOUT;
+            }
         }
         Ok(wasmtime_wasi_http::p2::default_send_request(
             request, config,
@@ -410,6 +440,7 @@ const WASM_ENV_ALLOWLIST: &[&str] = &[
     "AWS_REGION",
     "AWS_DEFAULT_REGION",
     "AWS_ENDPOINT_URL",
+    "AWS_EC2_METADATA_DISABLED",
     "HOME",
     "RUST_LOG",
 ];
@@ -1087,6 +1118,7 @@ mod tests {
         assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_REGION"));
         assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_DEFAULT_REGION"));
         assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_ENDPOINT_URL"));
+        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_EC2_METADATA_DISABLED"));
         assert!(WASM_ENV_ALLOWLIST.contains(&"HOME"));
         assert!(WASM_ENV_ALLOWLIST.contains(&"RUST_LOG"));
     }
@@ -1181,5 +1213,20 @@ mod tests {
         assert!(is_host_allowed("169.254.169.254"));
         // IMDS with explicit port
         assert!(is_host_allowed("169.254.169.254:80"));
+    }
+
+    #[test]
+    fn test_is_imds_host() {
+        assert!(is_imds_host("169.254.169.254"));
+        assert!(is_imds_host("169.254.169.254:80"));
+        assert!(!is_imds_host("s3.amazonaws.com"));
+        assert!(!is_imds_host("169.254.170.2"));
+    }
+
+    #[test]
+    fn test_imds_connect_timeout_is_short() {
+        // IMDS timeout should be short enough for non-EC2 environments
+        assert!(IMDS_CONNECT_TIMEOUT <= std::time::Duration::from_secs(2));
+        assert!(IMDS_CONNECT_TIMEOUT >= std::time::Duration::from_secs(1));
     }
 }
