@@ -38,8 +38,8 @@ use crate::wasm_convert;
 /// [`HTTP_ALLOWED_EXACT_HOSTS`] for exact-match entries.
 const HTTP_ALLOWED_HOST_SUFFIXES: &[&str] = &[".amazonaws.com", ".amazonaws.com.cn"];
 
-/// EC2 Instance Metadata Service address.
-const IMDS_HOST: &str = "169.254.169.254";
+/// Metadata service addresses for EC2 IMDS and ECS task metadata.
+const METADATA_HOSTS: &[&str] = &["169.254.169.254", "169.254.170.2"];
 
 /// Connect timeout for IMDS requests. On EC2, IMDS responds in <10ms.
 /// A 1-second timeout lets non-EC2 environments fail fast instead of
@@ -55,21 +55,21 @@ fn host_without_port(host: &str) -> &str {
 /// by the HTTP allow-list.
 fn is_host_allowed(host: &str) -> bool {
     let h = host_without_port(host);
-    h == IMDS_HOST
+    METADATA_HOSTS.contains(&h)
         || HTTP_ALLOWED_HOST_SUFFIXES
             .iter()
             .any(|suffix| h.ends_with(suffix))
 }
 
-/// Returns `true` if the host is the EC2 Instance Metadata Service.
-fn is_imds_host(host: &str) -> bool {
-    host_without_port(host) == IMDS_HOST
+/// Returns `true` if the host is a metadata service endpoint (EC2 IMDS or ECS).
+fn is_metadata_host(host: &str) -> bool {
+    METADATA_HOSTS.contains(&host_without_port(host))
 }
 
 /// Custom `WasiHttpHooks` that restricts outgoing HTTP requests to
-/// hosts matching [`HTTP_ALLOWED_HOST_SUFFIXES`] or [`IMDS_HOST`].
+/// hosts matching [`HTTP_ALLOWED_HOST_SUFFIXES`] or [`METADATA_HOSTS`].
 ///
-/// IMDS requests are capped at [`IMDS_CONNECT_TIMEOUT`] so that non-EC2
+/// Metadata requests are capped at [`IMDS_CONNECT_TIMEOUT`] so that non-EC2/ECS
 /// environments fail fast rather than waiting for the SDK's default timeout.
 struct AllowListHttpHooks;
 
@@ -93,9 +93,9 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
                 wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::HttpRequestDenied.into(),
             );
         }
-        // Cap timeouts for IMDS so non-EC2 environments fail fast.
+        // Cap timeouts for metadata endpoints so non-EC2/ECS environments fail fast.
         // On EC2, IMDS responds in <10ms; 1s is generous.
-        if is_imds_host(authority) {
+        if is_metadata_host(authority) {
             if config.connect_timeout > IMDS_CONNECT_TIMEOUT {
                 config.connect_timeout = IMDS_CONNECT_TIMEOUT;
             }
@@ -441,6 +441,8 @@ const WASM_ENV_ALLOWLIST: &[&str] = &[
     "AWS_DEFAULT_REGION",
     "AWS_ENDPOINT_URL",
     "AWS_EC2_METADATA_DISABLED",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
     "HOME",
     "RUST_LOG",
 ];
@@ -1119,6 +1121,8 @@ mod tests {
         assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_DEFAULT_REGION"));
         assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_ENDPOINT_URL"));
         assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_EC2_METADATA_DISABLED"));
+        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"));
+        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_CONTAINER_CREDENTIALS_FULL_URI"));
         assert!(WASM_ENV_ALLOWLIST.contains(&"HOME"));
         assert!(WASM_ENV_ALLOWLIST.contains(&"RUST_LOG"));
     }
@@ -1216,17 +1220,35 @@ mod tests {
     }
 
     #[test]
-    fn test_is_imds_host() {
-        assert!(is_imds_host("169.254.169.254"));
-        assert!(is_imds_host("169.254.169.254:80"));
-        assert!(!is_imds_host("s3.amazonaws.com"));
-        assert!(!is_imds_host("169.254.170.2"));
-    }
-
-    #[test]
     fn test_imds_connect_timeout_is_short() {
         // IMDS timeout should be short enough for non-EC2 environments
         assert!(IMDS_CONNECT_TIMEOUT <= std::time::Duration::from_secs(2));
         assert!(IMDS_CONNECT_TIMEOUT >= std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_is_metadata_host() {
+        // EC2 IMDS
+        assert!(is_metadata_host("169.254.169.254"));
+        assert!(is_metadata_host("169.254.169.254:80"));
+        // ECS metadata endpoint
+        assert!(is_metadata_host("169.254.170.2"));
+        assert!(is_metadata_host("169.254.170.2:80"));
+        // Non-metadata hosts
+        assert!(!is_metadata_host("s3.amazonaws.com"));
+        assert!(!is_metadata_host("169.254.169.1"));
+    }
+
+    #[test]
+    fn test_http_allowlist_permits_ecs_metadata() {
+        // ECS Task Metadata endpoint should be allowed
+        assert!(is_host_allowed("169.254.170.2"));
+        assert!(is_host_allowed("169.254.170.2:80"));
+    }
+
+    #[test]
+    fn test_ecs_env_vars_in_allowlist() {
+        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"));
+        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_CONTAINER_CREDENTIALS_FULL_URI"));
     }
 }
