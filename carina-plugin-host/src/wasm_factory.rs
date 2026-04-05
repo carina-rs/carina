@@ -26,12 +26,61 @@ use crate::wasm_bindings::CarinaProvider;
 use crate::wasm_bindings_http::CarinaProviderWithHttp;
 use crate::wasm_convert;
 
+// -- HTTP allow-list hooks --
+
+/// HTTP allow-list patterns for outgoing requests from WASM plugins.
+///
+/// Only hosts matching these suffix patterns are permitted. All other
+/// requests are rejected with `ErrorCode::HttpRequestDenied`.
+const HTTP_ALLOWED_HOST_SUFFIXES: &[&str] = &[".amazonaws.com", ".amazonaws.com.cn"];
+
+/// Returns `true` if the given host (authority without port) is allowed
+/// by the HTTP allow-list.
+fn is_host_allowed(host: &str) -> bool {
+    // Strip port if present (e.g., "s3.amazonaws.com:443" -> "s3.amazonaws.com")
+    let host_without_port = host.split(':').next().unwrap_or(host);
+    HTTP_ALLOWED_HOST_SUFFIXES
+        .iter()
+        .any(|suffix| host_without_port.ends_with(suffix))
+}
+
+/// Custom `WasiHttpHooks` that restricts outgoing HTTP requests to
+/// hosts matching [`HTTP_ALLOWED_HOST_SUFFIXES`].
+struct AllowListHttpHooks;
+
+impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
+    fn send_request(
+        &mut self,
+        request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+        config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
+    ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>
+    {
+        let authority = match request.uri().authority() {
+            Some(a) => a.as_str(),
+            None => "",
+        };
+        if !is_host_allowed(authority) {
+            log::warn!(
+                "WASM plugin HTTP request blocked: host {:?} is not in the allow-list",
+                authority,
+            );
+            return Err(
+                wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::HttpRequestDenied.into(),
+            );
+        }
+        Ok(wasmtime_wasi_http::p2::default_send_request(
+            request, config,
+        ))
+    }
+}
+
 // -- Host state for WASI --
 
 struct HostState {
     wasi_ctx: WasiCtx,
     http_ctx: Option<WasiHttpCtx>,
     table: ResourceTable,
+    http_hooks: AllowListHttpHooks,
 }
 
 impl WasiView for HostState {
@@ -51,7 +100,7 @@ impl WasiHttpView for HostState {
                 .as_mut()
                 .expect("HTTP not enabled for this provider"),
             table: &mut self.table,
-            hooks: wasmtime_wasi_http::p2::default_hooks(),
+            hooks: &mut self.http_hooks,
         }
     }
 }
@@ -270,6 +319,7 @@ async fn create_instance(
         wasi_ctx,
         http_ctx: None,
         table: ResourceTable::new(),
+        http_hooks: AllowListHttpHooks,
     };
     let mut store = Store::new(engine, host_state);
 
@@ -320,6 +370,7 @@ async fn create_instance_with_http(
         wasi_ctx,
         http_ctx: Some(WasiHttpCtx::new()),
         table: ResourceTable::new(),
+        http_hooks: AllowListHttpHooks,
     };
     let mut store = Store::new(engine, host_state);
 
@@ -943,5 +994,43 @@ mod tests {
         // allowlisted variables are not set in the environment.
         // This confirms the `if let Ok(val)` guard handles missing vars.
         let _ctx = build_sandboxed_wasi_ctx();
+    }
+
+    #[test]
+    fn test_http_allowlist_permits_amazonaws_com() {
+        assert!(is_host_allowed("s3.amazonaws.com"));
+        assert!(is_host_allowed("ec2.us-east-1.amazonaws.com"));
+        assert!(is_host_allowed("sts.amazonaws.com"));
+        assert!(is_host_allowed(
+            "cloudformation.ap-northeast-1.amazonaws.com"
+        ));
+    }
+
+    #[test]
+    fn test_http_allowlist_permits_amazonaws_com_cn() {
+        assert!(is_host_allowed("s3.amazonaws.com.cn"));
+        assert!(is_host_allowed("ec2.cn-north-1.amazonaws.com.cn"));
+        assert!(is_host_allowed("sts.cn-northwest-1.amazonaws.com.cn"));
+    }
+
+    #[test]
+    fn test_http_allowlist_permits_with_port() {
+        assert!(is_host_allowed("s3.amazonaws.com:443"));
+        assert!(is_host_allowed("ec2.cn-north-1.amazonaws.com.cn:443"));
+    }
+
+    #[test]
+    fn test_http_allowlist_blocks_other_hosts() {
+        assert!(!is_host_allowed("evil.example.com"));
+        assert!(!is_host_allowed("attacker.io"));
+        assert!(!is_host_allowed("localhost"));
+        assert!(!is_host_allowed("169.254.169.254"));
+        assert!(!is_host_allowed(""));
+        // Ensure partial matches don't pass
+        assert!(!is_host_allowed("not-amazonaws.com"));
+        assert!(!is_host_allowed("amazonaws.com.evil.com"));
+        assert!(!is_host_allowed("fakeamazonaws.com"));
+        // Bare domain without service prefix is not a valid AWS endpoint
+        assert!(!is_host_allowed("amazonaws.com"));
     }
 }

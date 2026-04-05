@@ -864,6 +864,7 @@ dependencies = [
  "carina-core",
  "carina-provider-protocol",
  "dirs",
+ "hyper 1.8.1",
  "log",
  "serde",
  "serde_json",
