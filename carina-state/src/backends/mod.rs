@@ -36,6 +36,21 @@ pub fn create_local_backend() -> Box<dyn StateBackend> {
     Box::new(LocalBackend::new())
 }
 
+/// Resolve a backend from an optional parser BackendConfig.
+///
+/// If a config is provided, converts it to a StateBackendConfig and creates the
+/// appropriate backend. If no config is provided, falls back to a local backend.
+pub async fn resolve_backend(
+    backend_config: Option<&carina_core::parser::BackendConfig>,
+) -> BackendResult<Box<dyn StateBackend>> {
+    if let Some(config) = backend_config {
+        let state_config = BackendConfig::from(config);
+        create_backend(&state_config).await
+    } else {
+        Ok(create_local_backend())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -49,6 +64,34 @@ mod tests {
         };
 
         let result = create_backend(&config).await;
+        assert!(result.is_err());
+
+        if let Err(BackendError::UnsupportedBackend(name)) = result {
+            assert_eq!(name, "unsupported");
+        } else {
+            panic!("Expected UnsupportedBackend error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_backend_none_returns_local() {
+        let backend = resolve_backend(None).await;
+        assert!(backend.is_ok(), "None config should return a local backend");
+        // Local backend read_state returns Ok(None) when no state file exists
+        let state = backend.unwrap().read_state().await;
+        assert!(state.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_backend_invalid_config_returns_error() {
+        use carina_core::parser::BackendConfig as ParserBackendConfig;
+
+        let config = ParserBackendConfig {
+            backend_type: "unsupported".to_string(),
+            attributes: HashMap::new(),
+        };
+
+        let result = resolve_backend(Some(&config)).await;
         assert!(result.is_err());
 
         if let Err(BackendError::UnsupportedBackend(name)) = result {

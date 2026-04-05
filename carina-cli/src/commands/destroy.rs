@@ -17,10 +17,7 @@ use carina_core::effect::Effect;
 use carina_core::plan::Plan;
 use carina_core::provider::Provider;
 use carina_core::resource::{Resource, ResourceId, State, Value};
-use carina_state::{
-    BackendConfig as StateBackendConfig, LockInfo, StateBackend, create_backend,
-    create_local_backend,
-};
+use carina_state::{LockInfo, StateBackend, resolve_backend};
 
 use carina_core::parser::ProviderContext;
 
@@ -55,14 +52,9 @@ pub async fn run_destroy(
 
     // Check for backend configuration - use local backend by default
     let backend_config = parsed.backend.as_ref();
-    let backend: Box<dyn StateBackend> = if let Some(config) = backend_config {
-        let state_config = StateBackendConfig::from(config);
-        create_backend(&state_config)
-            .await
-            .map_err(AppError::Backend)?
-    } else {
-        create_local_backend()
-    };
+    let backend: Box<dyn StateBackend> = resolve_backend(backend_config)
+        .await
+        .map_err(AppError::Backend)?;
 
     let mut protected_bucket: Option<String> = None;
 
