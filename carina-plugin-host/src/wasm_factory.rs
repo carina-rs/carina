@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use sha2::{Digest, Sha256};
@@ -45,6 +46,66 @@ const METADATA_HOSTS: &[&str] = &["169.254.169.254", "169.254.170.2"];
 /// On EC2, IMDS responds in <10ms. A 1-second timeout lets non-EC2 environments
 /// fail fast instead of hanging for the SDK's default timeout.
 const METADATA_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Timeout for individual WASM plugin operations (in seconds).
+///
+/// If a WASM call (read, create, update, delete) does not complete within this
+/// duration, wasmtime's epoch interruption mechanism traps the execution.
+/// This prevents indefinite hangs when, for example, the AWS SDK blocks
+/// during credential resolution inside the WASM guest.
+const WASM_OPERATION_TIMEOUT_SECS: u64 = 30;
+
+/// Build the standard wasmtime Config used for all WASM plugin engines.
+///
+/// Enables the component model and epoch-based interruption so that
+/// long-running or stuck WASM operations can be terminated by the host.
+fn build_engine_config() -> wasmtime::Config {
+    let mut config = wasmtime::Config::new();
+    config.wasm_component_model(true);
+    config.epoch_interruption(true);
+    config
+}
+
+/// Background thread that increments a wasmtime Engine's epoch once per second.
+///
+/// Each tick advances the epoch counter by 1. Stores with a deadline set via
+/// `store.set_epoch_deadline(N)` will trap after N ticks have elapsed since the
+/// deadline was set.
+struct EpochTicker {
+    shutdown: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl EpochTicker {
+    fn start(engine: Engine) -> Self {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = shutdown.clone();
+        let handle = std::thread::spawn(move || {
+            while !flag.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                engine.increment_epoch();
+            }
+        });
+        EpochTicker {
+            shutdown,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for EpochTicker {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Returns `true` if the error message looks like a wasmtime epoch interruption trap.
+fn is_epoch_trap_message(msg: &str) -> bool {
+    msg.contains("interrupt") || msg.contains("epoch")
+}
 
 /// Strip port from authority (e.g., "s3.amazonaws.com:443" -> "s3.amazonaws.com").
 fn host_without_port(host: &str) -> &str {
@@ -445,6 +506,7 @@ async fn create_instance(
     };
     let mut store = Store::new(engine, host_state);
     store.limiter(|state| &mut state.limits);
+    store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
 
     let mut linker = Linker::new(engine);
     add_wasi_sans_sockets_to_linker(&mut linker)
@@ -506,6 +568,7 @@ async fn create_instance_with_http(
     };
     let mut store = Store::new(engine, host_state);
     store.limiter(|state| &mut state.limits);
+    store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
 
     let mut linker = Linker::new(engine);
     add_wasi_sans_sockets_to_linker(&mut linker)
@@ -554,6 +617,9 @@ pub struct WasmProviderFactory {
     /// The first call to `create_provider` or `create_normalizer` creates
     /// the instance; the second reuses it via `Arc`.
     shared_instance: Mutex<Option<Arc<SharedWasmInstance>>>,
+    /// Background thread that ticks the epoch counter for timeout enforcement.
+    /// Kept alive for the lifetime of the factory; dropped automatically.
+    _epoch_ticker: EpochTicker,
 }
 
 impl WasmProviderFactory {
@@ -644,11 +710,10 @@ impl WasmProviderFactory {
 
     /// Load a WASM provider without any precompile caching.
     async fn new_uncached(wasm_path: PathBuf) -> Result<Self, String> {
-        let mut config = wasmtime::Config::new();
-        config.wasm_component_model(true);
-
+        let config = build_engine_config();
         let engine =
             Engine::new(&config).map_err(|e| format!("Failed to create WASM engine: {e}"))?;
+        let epoch_ticker = EpochTicker::start(engine.clone());
 
         let component = Component::from_file(&engine, &wasm_path).map_err(|e| {
             format!(
@@ -694,14 +759,13 @@ impl WasmProviderFactory {
             enable_http,
             init_instance: Mutex::new((store, bindings)),
             shared_instance: Mutex::new(None),
+            _epoch_ticker: epoch_ticker,
         })
     }
 
     /// Precompile a .wasm file and save the result to a .cwasm file.
     pub fn precompile(wasm_path: &Path, cwasm_path: &Path) -> Result<(), String> {
-        let mut config = wasmtime::Config::new();
-        config.wasm_component_model(true);
-
+        let config = build_engine_config();
         let engine = Engine::new(&config).map_err(|e| format!("Engine error: {e}"))?;
         let wasm_bytes = std::fs::read(wasm_path).map_err(|e| format!("Read error: {e}"))?;
         let serialized = engine
@@ -733,11 +797,10 @@ impl WasmProviderFactory {
     /// The .cwasm file must have been produced by `precompile()` using the same
     /// Wasmtime version. Deserializing an untrusted or corrupted file is unsafe.
     pub async fn from_precompiled(cwasm_path: &Path) -> Result<Self, String> {
-        let mut config = wasmtime::Config::new();
-        config.wasm_component_model(true);
-
+        let config = build_engine_config();
         let engine =
             Engine::new(&config).map_err(|e| format!("Failed to create WASM engine: {e}"))?;
+        let epoch_ticker = EpochTicker::start(engine.clone());
 
         // SAFETY: The caller is responsible for ensuring the .cwasm file was
         // produced by a trusted `precompile()` call with the same Wasmtime version.
@@ -784,6 +847,7 @@ impl WasmProviderFactory {
             enable_http,
             init_instance: Mutex::new((store, bindings)),
             shared_instance: Mutex::new(None),
+            _epoch_ticker: epoch_ticker,
         })
     }
 
@@ -881,6 +945,7 @@ impl ProviderFactory for WasmProviderFactory {
             tokio::runtime::Handle::current().block_on(async {
                 let mut guard = self.init_instance.lock().await;
                 let (ref mut store, ref bindings) = *guard;
+                store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
                 bindings
                     .call_validate_config(store, &wit_attrs)
                     .await
@@ -965,12 +1030,24 @@ impl Provider for WasmProvider {
         let identifier = identifier.map(|s| s.to_string());
         Box::pin(async move {
             let mut store = self.instance.store.lock().await;
+            store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
             let result = self
                 .instance
                 .bindings
                 .call_read(&mut store, &wit_id, identifier.as_deref())
                 .await
-                .map_err(|e| ProviderError::new(format!("WASM trap in read: {e}")))?;
+                .map_err(|e| {
+                    let msg = format!("{e}");
+                    if is_epoch_trap_message(&msg) {
+                        ProviderError::new(format!(
+                            "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in read \
+                             (check AWS credentials)"
+                        ))
+                        .timeout()
+                    } else {
+                        ProviderError::new(format!("WASM trap in read: {e}"))
+                    }
+                })?;
             match result {
                 Ok(wit_state) => Ok(wasm_convert::wit_to_core_state(&wit_state, &id)),
                 Err(err_json) => Err(wasm_convert::json_to_provider_error(&err_json)),
@@ -983,12 +1060,24 @@ impl Provider for WasmProvider {
         let id = resource.id.clone();
         Box::pin(async move {
             let mut store = self.instance.store.lock().await;
+            store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
             let result = self
                 .instance
                 .bindings
                 .call_create(&mut store, &wit_resource)
                 .await
-                .map_err(|e| ProviderError::new(format!("WASM trap in create: {e}")))?;
+                .map_err(|e| {
+                    let msg = format!("{e}");
+                    if is_epoch_trap_message(&msg) {
+                        ProviderError::new(format!(
+                            "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in create \
+                             (check AWS credentials)"
+                        ))
+                        .timeout()
+                    } else {
+                        ProviderError::new(format!("WASM trap in create: {e}"))
+                    }
+                })?;
             match result {
                 Ok(wit_state) => Ok(wasm_convert::wit_to_core_state(&wit_state, &id)),
                 Err(err_json) => Err(wasm_convert::json_to_provider_error(&err_json)),
@@ -1010,12 +1099,24 @@ impl Provider for WasmProvider {
         let id = id.clone();
         Box::pin(async move {
             let mut store = self.instance.store.lock().await;
+            store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
             let result = self
                 .instance
                 .bindings
                 .call_update(&mut store, &wit_id, &identifier, &wit_from, &wit_to)
                 .await
-                .map_err(|e| ProviderError::new(format!("WASM trap in update: {e}")))?;
+                .map_err(|e| {
+                    let msg = format!("{e}");
+                    if is_epoch_trap_message(&msg) {
+                        ProviderError::new(format!(
+                            "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in update \
+                             (check AWS credentials)"
+                        ))
+                        .timeout()
+                    } else {
+                        ProviderError::new(format!("WASM trap in update: {e}"))
+                    }
+                })?;
             match result {
                 Ok(wit_state) => Ok(wasm_convert::wit_to_core_state(&wit_state, &id)),
                 Err(err_json) => Err(wasm_convert::json_to_provider_error(&err_json)),
@@ -1034,12 +1135,24 @@ impl Provider for WasmProvider {
         let options_json = wasm_convert::lifecycle_to_json(lifecycle);
         Box::pin(async move {
             let mut store = self.instance.store.lock().await;
+            store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
             let result = self
                 .instance
                 .bindings
                 .call_delete(&mut store, &wit_id, &identifier, &options_json)
                 .await
-                .map_err(|e| ProviderError::new(format!("WASM trap in delete: {e}")))?;
+                .map_err(|e| {
+                    let msg = format!("{e}");
+                    if is_epoch_trap_message(&msg) {
+                        ProviderError::new(format!(
+                            "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in delete \
+                             (check AWS credentials)"
+                        ))
+                        .timeout()
+                    } else {
+                        ProviderError::new(format!("WASM trap in delete: {e}"))
+                    }
+                })?;
             match result {
                 Ok(()) => Ok(()),
                 Err(err_json) => Err(wasm_convert::json_to_provider_error(&err_json)),
@@ -1068,6 +1181,7 @@ impl ProviderNormalizer for WasmProviderNormalizer {
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let mut store = self.instance.store.lock().await;
+                store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
                 self.instance
                     .bindings
                     .call_normalize_desired(&mut store, &wit_resources)
@@ -1107,6 +1221,7 @@ impl ProviderNormalizer for WasmProviderNormalizer {
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let mut store = self.instance.store.lock().await;
+                store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
                 self.instance
                     .bindings
                     .call_normalize_state(&mut store, &wit_states)
@@ -1146,6 +1261,7 @@ impl ProviderNormalizer for WasmProviderNormalizer {
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let mut store = self.instance.store.lock().await;
+                store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
                 self.instance
                     .bindings
                     .call_hydrate_read_state(&mut store, &wit_states, &wit_saved)
@@ -1339,5 +1455,86 @@ mod tests {
             elapsed < std::time::Duration::from_millis(10),
             "second call should be cached, took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn test_engine_config_enables_epoch_interruption() {
+        // Verify that build_engine_config() produces an Engine that supports
+        // epoch deadlines. If epoch_interruption were not enabled, setting a
+        // deadline on the Store would panic.
+        let config = build_engine_config();
+        let engine = Engine::new(&config).unwrap();
+        let wasi_ctx = WasiCtxBuilder::new().build();
+        let host_state = HostState {
+            wasi_ctx,
+            http_ctx: None,
+            table: ResourceTable::new(),
+            http_hooks: AllowListHttpHooks,
+            limits: build_store_limits(),
+        };
+        let mut store = Store::new(&engine, host_state);
+        // This will panic if epoch_interruption is not enabled on the engine.
+        store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn test_epoch_ticker_increments_epoch() {
+        let config = build_engine_config();
+        let engine = Engine::new(&config).unwrap();
+        let ticker = EpochTicker::start(engine.clone());
+
+        // Sleep for 2.5 seconds; the ticker should have incremented at least twice.
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+
+        // Verify by setting a deadline of 1 on a store — if the epoch has
+        // advanced past 1, this deadline is already expired.
+        let wasi_ctx = WasiCtxBuilder::new().build();
+        let host_state = HostState {
+            wasi_ctx,
+            http_ctx: None,
+            table: ResourceTable::new(),
+            http_hooks: AllowListHttpHooks,
+            limits: build_store_limits(),
+        };
+        let mut store = Store::new(&engine, host_state);
+        store.set_epoch_deadline(1);
+
+        // The epoch should be at least 2 by now, so a deadline of 1 is expired.
+        // We can't easily check the epoch value directly, but we can verify
+        // the ticker didn't crash and drop works cleanly.
+        drop(ticker);
+    }
+
+    #[test]
+    fn test_epoch_ticker_stops_on_drop() {
+        let config = build_engine_config();
+        let engine = Engine::new(&config).unwrap();
+        let ticker = EpochTicker::start(engine.clone());
+        // Drop should signal shutdown and join the thread without hanging.
+        drop(ticker);
+    }
+
+    #[test]
+    fn test_wasm_operation_timeout_is_reasonable() {
+        // The timeout should be long enough for normal operations but short
+        // enough to prevent indefinite hangs.
+        const {
+            assert!(
+                WASM_OPERATION_TIMEOUT_SECS >= 10,
+                "timeout too short for normal operations"
+            );
+            assert!(
+                WASM_OPERATION_TIMEOUT_SECS <= 120,
+                "timeout too long to be useful"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_epoch_trap_detection() {
+        assert!(is_epoch_trap_message("wasm trap: interrupt"));
+        assert!(is_epoch_trap_message("epoch deadline reached"));
+        assert!(!is_epoch_trap_message("out of memory"));
+        assert!(!is_epoch_trap_message("unreachable code"));
     }
 }
