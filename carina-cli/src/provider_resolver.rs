@@ -337,12 +337,16 @@ pub fn resolve_single_config(base_dir: &Path, config: &ProviderConfig) -> Result
         .as_deref()
         .ok_or_else(|| format!("Provider '{}' has no source", config.name))?;
 
-    let version = config.version.as_deref().ok_or_else(|| {
-        format!(
-            "Provider '{}' has source but no version. Add: version = \"x.y.z\"",
-            config.name
-        )
-    })?;
+    let version = config
+        .version
+        .as_ref()
+        .map(|v| v.raw.as_str())
+        .ok_or_else(|| {
+            format!(
+                "Provider '{}' has source but no version. Add: version = \"x.y.z\"",
+                config.name
+            )
+        })?;
 
     let lock_path = base_dir.join("carina.lock");
     let mut lock_file = LockFile::load(&lock_path).unwrap_or_default();
@@ -376,12 +380,16 @@ pub fn resolve_all(
             _ => continue,
         };
 
-        let version = config.version.as_deref().ok_or_else(|| {
-            format!(
-                "Provider '{}' has source but no version. Add: version = \"x.y.z\"",
-                config.name
-            )
-        })?;
+        let version = config
+            .version
+            .as_ref()
+            .map(|v| v.raw.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "Provider '{}' has source but no version. Add: version = \"x.y.z\"",
+                    config.name
+                )
+            })?;
 
         let binary_path =
             resolve_provider(base_dir, source, version, &config.name, &mut lock_file)?;

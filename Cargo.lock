@@ -784,14 +784,14 @@ dependencies = [
 
 [[package]]
 name = "carina-aws-types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "carina-core",
 ]
 
 [[package]]
 name = "carina-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -827,12 +827,13 @@ dependencies = [
 
 [[package]]
 name = "carina-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "futures",
  "pest",
  "pest_derive",
+ "semver",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -842,7 +843,7 @@ dependencies = [
 
 [[package]]
 name = "carina-lsp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "carina-core",
  "carina-state",
@@ -859,7 +860,7 @@ dependencies = [
 
 [[package]]
 name = "carina-plugin-host"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "carina-core",
  "carina-provider-protocol",
@@ -878,7 +879,7 @@ dependencies = [
 
 [[package]]
 name = "carina-plugin-sdk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
@@ -892,7 +893,7 @@ dependencies = [
 
 [[package]]
 name = "carina-provider-mock"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "carina-core",
  "carina-plugin-sdk",
@@ -903,7 +904,7 @@ dependencies = [
 
 [[package]]
 name = "carina-provider-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -911,7 +912,7 @@ dependencies = [
 
 [[package]]
 name = "carina-state"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -929,7 +930,7 @@ dependencies = [
 
 [[package]]
 name = "carina-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "carina-core",
  "crossterm",

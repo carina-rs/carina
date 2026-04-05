@@ -10,6 +10,7 @@ use crate::resource::{Expr, LifecycleConfig, Resource, ResourceId, ResourceKind,
 use crate::schema::{
     validate_ipv4_address, validate_ipv4_cidr, validate_ipv6_address, validate_ipv6_cidr,
 };
+use crate::version_constraint::VersionConstraint;
 use pest::Parser;
 use pest_derive::Parser;
 use std::collections::{HashMap, HashSet};
@@ -292,10 +293,10 @@ pub struct ProviderConfig {
     /// Extracted from the provider block and not passed to the provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// Provider version constraint (e.g., "0.5.0").
+    /// Provider version constraint (e.g., "~0.5.0", "^1.2.0").
     /// Extracted from the provider block and not passed to the provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
+    pub version: Option<VersionConstraint>,
 }
 
 /// Backend configuration for state storage
@@ -1878,7 +1879,12 @@ fn parse_provider_block(
 
     // Extract version from attributes if present
     let version = if let Some(Value::String(v)) = attributes.remove("version") {
-        Some(v)
+        Some(VersionConstraint::parse(&v).map_err(|e| {
+            pest::error::Error::new_from_pos(
+                pest::error::ErrorVariant::CustomError { message: e },
+                pest::Position::from_start(""),
+            )
+        })?)
     } else {
         None
     };
@@ -5902,7 +5908,7 @@ aws.s3.bucket {
             provider.source.as_deref(),
             Some("github.com/carina-rs/carina-provider-mock")
         );
-        assert_eq!(provider.version.as_deref(), Some("0.1.0"));
+        assert_eq!(provider.version.as_ref().unwrap().raw, "0.1.0");
         // source and version should NOT be in attributes
         assert!(!provider.attributes.contains_key("source"));
         assert!(!provider.attributes.contains_key("version"));
@@ -5919,6 +5925,34 @@ aws.s3.bucket {
         let provider = &parsed.providers[0];
         assert!(provider.source.is_none());
         assert!(provider.version.is_none());
+    }
+
+    #[test]
+    fn parse_provider_block_with_version_constraint() {
+        let input = r#"
+            provider mock {
+                source = "github.com/carina-rs/carina-provider-mock"
+                version = "~0.5.0"
+            }
+        "#;
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        let provider = &parsed.providers[0];
+        let vc = provider.version.as_ref().unwrap();
+        assert_eq!(vc.raw, "~0.5.0");
+        assert!(vc.matches("0.5.3").unwrap());
+        assert!(!vc.matches("0.6.0").unwrap());
+    }
+
+    #[test]
+    fn parse_provider_block_with_invalid_version_constraint() {
+        let input = r#"
+            provider mock {
+                source = "github.com/carina-rs/carina-provider-mock"
+                version = "not-valid"
+            }
+        "#;
+        let result = parse(input, &ProviderContext::default());
+        assert!(result.is_err());
     }
 
     #[test]
