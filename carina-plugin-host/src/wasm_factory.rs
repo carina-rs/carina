@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use sha2::{Digest, Sha256};
 
@@ -70,7 +70,6 @@ fn is_metadata_host(host: &str) -> bool {
 ///
 /// Uses parallel TCP connect attempts with a 1-second timeout.
 /// Called once at startup; result is cached by the caller.
-#[allow(dead_code)]
 fn probe_metadata_endpoints() -> bool {
     use std::net::{SocketAddr, TcpStream};
 
@@ -86,6 +85,13 @@ fn probe_metadata_endpoints() -> bool {
             .collect();
         handles.into_iter().any(|h| h.join().unwrap_or(false))
     })
+}
+
+/// Returns `true` if any metadata endpoint is reachable.
+/// Result is cached for the lifetime of the process.
+fn is_metadata_available() -> bool {
+    static RESULT: OnceLock<bool> = OnceLock::new();
+    *RESULT.get_or_init(probe_metadata_endpoints)
 }
 
 /// Custom `WasiHttpHooks` that restricts outgoing HTTP requests to
@@ -477,6 +483,11 @@ fn build_sandboxed_wasi_ctx() -> WasiCtx {
         if let Ok(val) = std::env::var(key) {
             builder.env(key, &val);
         }
+    }
+    // Auto-disable IMDS if metadata endpoints are unreachable,
+    // unless the user has explicitly set the variable.
+    if std::env::var("AWS_EC2_METADATA_DISABLED").is_err() && !is_metadata_available() {
+        builder.env("AWS_EC2_METADATA_DISABLED", "true");
     }
     builder.build()
 }
@@ -1287,5 +1298,18 @@ mod tests {
     fn test_ecs_env_vars_in_allowlist() {
         assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"));
         assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_CONTAINER_CREDENTIALS_FULL_URI"));
+    }
+
+    #[test]
+    fn test_metadata_probe_result_is_cached() {
+        let first = is_metadata_available();
+        let start = std::time::Instant::now();
+        let second = is_metadata_available();
+        let elapsed = start.elapsed();
+        assert_eq!(first, second);
+        assert!(
+            elapsed < std::time::Duration::from_millis(10),
+            "second call should be cached, took {elapsed:?}"
+        );
     }
 }
