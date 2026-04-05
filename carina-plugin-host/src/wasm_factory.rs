@@ -9,6 +9,9 @@ use tokio::sync::Mutex;
 use wasmtime::component::ResourceTable;
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Engine, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime_wasi::cli::{WasiCli, WasiCliView as _};
+use wasmtime_wasi::filesystem::{WasiFilesystem, WasiFilesystemView as _};
+use wasmtime_wasi::random::WasiRandom;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
@@ -325,6 +328,46 @@ fn build_store_limits() -> StoreLimits {
         .build()
 }
 
+/// Add WASI interfaces to the linker, excluding `wasi:sockets`.
+///
+/// Instead of `wasmtime_wasi::p2::add_to_linker_async()` which adds ALL
+/// interfaces (including TCP/UDP sockets), this function selectively links
+/// only the interfaces that WASM provider plugins actually need:
+///
+/// - `wasi:io`         (poll, streams, error)
+/// - `wasi:clocks`     (wall-clock, monotonic-clock)
+/// - `wasi:random`     (random, insecure, insecure-seed)
+/// - `wasi:cli`        (stderr, environment, exit, terminal, stdin, stdout)
+/// - `wasi:filesystem`  (types, preopens)
+///
+/// This prevents a malicious plugin from opening raw TCP/UDP connections.
+fn add_wasi_sans_sockets_to_linker<T: WasiView>(linker: &mut Linker<T>) -> wasmtime::Result<()> {
+    use wasmtime_wasi::p2::bindings::{cli, filesystem, random};
+
+    // Start with the proxy interfaces (io + clocks + random::random + basic cli).
+    wasmtime_wasi::p2::add_to_linker_proxy_interfaces_async(linker)?;
+
+    // Add remaining random interfaces.
+    random::insecure::add_to_linker::<T, WasiRandom>(linker, |t| t.ctx().ctx.random())?;
+    random::insecure_seed::add_to_linker::<T, WasiRandom>(linker, |t| t.ctx().ctx.random())?;
+
+    // Add remaining cli interfaces.
+    let exit_opts = cli::exit::LinkOptions::default();
+    cli::exit::add_to_linker::<T, WasiCli>(linker, &exit_opts, T::cli)?;
+    cli::environment::add_to_linker::<T, WasiCli>(linker, T::cli)?;
+    cli::terminal_input::add_to_linker::<T, WasiCli>(linker, T::cli)?;
+    cli::terminal_output::add_to_linker::<T, WasiCli>(linker, T::cli)?;
+    cli::terminal_stdin::add_to_linker::<T, WasiCli>(linker, T::cli)?;
+    cli::terminal_stdout::add_to_linker::<T, WasiCli>(linker, T::cli)?;
+    cli::terminal_stderr::add_to_linker::<T, WasiCli>(linker, T::cli)?;
+
+    // Add filesystem interfaces.
+    filesystem::types::add_to_linker::<T, WasiFilesystem>(linker, T::filesystem)?;
+    filesystem::preopens::add_to_linker::<T, WasiFilesystem>(linker, T::filesystem)?;
+
+    Ok(())
+}
+
 async fn create_instance(
     engine: &Engine,
     component: &Component,
@@ -341,7 +384,7 @@ async fn create_instance(
     store.limiter(|state| &mut state.limits);
 
     let mut linker = Linker::new(engine);
-    wasmtime_wasi::p2::add_to_linker_async(&mut linker)
+    add_wasi_sans_sockets_to_linker(&mut linker)
         .map_err(|e| format!("Failed to add WASI to linker: {e}"))?;
 
     let bindings = CarinaProvider::instantiate_async(&mut store, component, &linker)
@@ -394,7 +437,7 @@ async fn create_instance_with_http(
     store.limiter(|state| &mut state.limits);
 
     let mut linker = Linker::new(engine);
-    wasmtime_wasi::p2::add_to_linker_async(&mut linker)
+    add_wasi_sans_sockets_to_linker(&mut linker)
         .map_err(|e| format!("Failed to add WASI to linker: {e}"))?;
     wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
         .map_err(|e| format!("Failed to add wasi:http to linker: {e}"))?;
