@@ -22,7 +22,7 @@ If you installed Carina via Homebrew or GitHub Releases, `carina-lsp` is already
 To build from source instead:
 
 ```bash
-cargo install --path carina-lsp
+cargo install --git https://github.com/carina-rs/carina.git carina-lsp
 ```
 
 Make sure the `carina-lsp` binary is in your `PATH`.
