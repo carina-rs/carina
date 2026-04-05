@@ -284,11 +284,38 @@ async fn create_instance(
     Ok((store, WasmBindings::Basic(bindings)))
 }
 
+/// Environment variables allowed to pass through to WASM plugins.
+///
+/// Only variables needed by the AWS SDK and for debugging are included.
+/// All other host environment variables are hidden from plugins.
+const WASM_ENV_ALLOWLIST: &[&str] = &[
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_ENDPOINT_URL",
+    "HOME",
+    "RUST_LOG",
+];
+
+/// Build a WASI context that only exposes allowlisted environment variables.
+fn build_sandboxed_wasi_ctx() -> WasiCtx {
+    let mut builder = WasiCtxBuilder::new();
+    builder.inherit_stderr();
+    for key in WASM_ENV_ALLOWLIST {
+        if let Ok(val) = std::env::var(key) {
+            builder.env(key, &val);
+        }
+    }
+    builder.build()
+}
+
 async fn create_instance_with_http(
     engine: &Engine,
     component: &Component,
 ) -> Result<(Store<HostState>, WasmBindings), String> {
-    let wasi_ctx = WasiCtxBuilder::new().inherit_stderr().inherit_env().build();
+    let wasi_ctx = build_sandboxed_wasi_ctx();
     let host_state = HostState {
         wasi_ctx,
         http_ctx: Some(WasiHttpCtx::new()),
@@ -879,5 +906,42 @@ impl ProviderNormalizer for WasmProviderNormalizer {
             }
             Err(e) => log::error!("WASM trap in hydrate_read_state: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_wasm_env_allowlist_contains_required_vars() {
+        // Verify the allowlist contains the expected AWS and utility variables
+        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_ACCESS_KEY_ID"));
+        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_SECRET_ACCESS_KEY"));
+        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_SESSION_TOKEN"));
+        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_REGION"));
+        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_DEFAULT_REGION"));
+        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_ENDPOINT_URL"));
+        assert!(WASM_ENV_ALLOWLIST.contains(&"HOME"));
+        assert!(WASM_ENV_ALLOWLIST.contains(&"RUST_LOG"));
+    }
+
+    #[test]
+    fn test_wasm_env_allowlist_excludes_sensitive_vars() {
+        // Verify that common sensitive/unrelated variables are NOT in the allowlist
+        assert!(!WASM_ENV_ALLOWLIST.contains(&"PATH"));
+        assert!(!WASM_ENV_ALLOWLIST.contains(&"SHELL"));
+        assert!(!WASM_ENV_ALLOWLIST.contains(&"USER"));
+        assert!(!WASM_ENV_ALLOWLIST.contains(&"SSH_AUTH_SOCK"));
+        assert!(!WASM_ENV_ALLOWLIST.contains(&"GITHUB_TOKEN"));
+        assert!(!WASM_ENV_ALLOWLIST.contains(&"DATABASE_URL"));
+    }
+
+    #[test]
+    fn test_build_sandboxed_wasi_ctx_does_not_panic() {
+        // Verify that building the sandboxed context succeeds even when
+        // allowlisted variables are not set in the environment.
+        // This confirms the `if let Ok(val)` guard handles missing vars.
+        let _ctx = build_sandboxed_wasi_ctx();
     }
 }
