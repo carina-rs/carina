@@ -5,14 +5,10 @@
 //! the state lock before exiting.  A second Ctrl+C force-exits the process.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use colored::Colorize;
 
 use crate::error::AppError;
-
-/// Global flag: set to `true` after the first Ctrl+C is received.
-static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 /// Run `op` until completion, or until the user presses Ctrl+C.
 ///
@@ -30,10 +26,9 @@ where
     tokio::select! {
         result = op => result,
         _ = tokio::signal::ctrl_c() => {
-            INTERRUPTED.store(true, Ordering::SeqCst);
             eprintln!(
                 "\n{}",
-                "Interrupted! Releasing state lock before exit..."
+                "Interrupted! Cleaning up before exit..."
                     .yellow()
                     .bold()
             );
@@ -54,10 +49,4 @@ where
             Err(AppError::Interrupted)
         }
     }
-}
-
-/// Returns `true` if a Ctrl+C has been received.
-#[allow(dead_code)]
-pub fn was_interrupted() -> bool {
-    INTERRUPTED.load(Ordering::SeqCst)
 }
