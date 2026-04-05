@@ -9,15 +9,17 @@ description: How to install Carina and set up provider plugins.
 brew install carina-rs/tap/carina
 ```
 
+This installs both `carina` (CLI) and `carina-lsp` (Language Server).
+
 ## GitHub Releases
 
-Download pre-built binaries from [GitHub Releases](https://github.com/carina-rs/carina/releases/latest). Available for macOS (aarch64, x86_64) and Linux (aarch64, x86_64).
+Download pre-built binaries from [GitHub Releases](https://github.com/carina-rs/carina/releases/latest). Available for macOS (aarch64, x86_64) and Linux (aarch64, x86_64). Each archive contains both `carina` and `carina-lsp`.
 
 ```bash
 # macOS (Apple Silicon)
 curl -LO https://github.com/carina-rs/carina/releases/latest/download/carina-0.2.0-macos-aarch64.tar.gz
 tar xzf carina-0.2.0-macos-aarch64.tar.gz
-sudo mv carina /usr/local/bin/
+sudo mv carina carina-lsp /usr/local/bin/
 ```
 
 ## Build from source
