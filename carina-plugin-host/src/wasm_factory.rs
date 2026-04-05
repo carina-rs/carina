@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use wasmtime::component::ResourceTable;
 use wasmtime::component::{Component, Linker};
-use wasmtime::{Engine, Store};
+use wasmtime::{Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
@@ -81,6 +81,7 @@ struct HostState {
     http_ctx: Option<WasiHttpCtx>,
     table: ResourceTable,
     http_hooks: AllowListHttpHooks,
+    limits: StoreLimits,
 }
 
 impl WasiView for HostState {
@@ -310,6 +311,20 @@ impl WasmBindings {
     }
 }
 
+/// Build `StoreLimits` used for every WASM plugin store.
+///
+/// * 256 MB max linear memory – the AWSCC provider uses ~45 MB for
+///   `validate`, so this gives plenty of headroom.
+/// * 20 000 table elements.
+/// * 10 component instances.
+fn build_store_limits() -> StoreLimits {
+    StoreLimitsBuilder::new()
+        .memory_size(256 * 1024 * 1024) // 256 MB
+        .table_elements(20_000)
+        .instances(10)
+        .build()
+}
+
 async fn create_instance(
     engine: &Engine,
     component: &Component,
@@ -320,8 +335,10 @@ async fn create_instance(
         http_ctx: None,
         table: ResourceTable::new(),
         http_hooks: AllowListHttpHooks,
+        limits: build_store_limits(),
     };
     let mut store = Store::new(engine, host_state);
+    store.limiter(|state| &mut state.limits);
 
     let mut linker = Linker::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)
@@ -371,8 +388,10 @@ async fn create_instance_with_http(
         http_ctx: Some(WasiHttpCtx::new()),
         table: ResourceTable::new(),
         http_hooks: AllowListHttpHooks,
+        limits: build_store_limits(),
     };
     let mut store = Store::new(engine, host_state);
+    store.limiter(|state| &mut state.limits);
 
     let mut linker = Linker::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)
@@ -1017,6 +1036,34 @@ mod tests {
     fn test_http_allowlist_permits_with_port() {
         assert!(is_host_allowed("s3.amazonaws.com:443"));
         assert!(is_host_allowed("ec2.cn-north-1.amazonaws.com.cn:443"));
+    }
+
+    #[test]
+    fn test_store_limits_are_configured() {
+        // Verify that build_store_limits() returns sensible values by
+        // exercising the ResourceLimiter trait methods on the result.
+        use wasmtime::ResourceLimiter;
+
+        let mut limits = build_store_limits();
+
+        // memory_growing: requesting up to 256 MB should succeed
+        assert!(limits.memory_growing(0, 256 * 1024 * 1024, None).unwrap());
+
+        // memory_growing: requesting beyond 256 MB should be denied
+        assert!(
+            !limits
+                .memory_growing(0, 256 * 1024 * 1024 + 1, None)
+                .unwrap()
+        );
+
+        // table_growing: requesting up to 20_000 elements should succeed
+        assert!(limits.table_growing(0, 20_000, None).unwrap());
+
+        // table_growing: requesting beyond 20_000 should be denied
+        assert!(!limits.table_growing(0, 20_001, None).unwrap());
+
+        // instances: should be capped at 10
+        assert_eq!(limits.instances(), 10);
     }
 
     #[test]
