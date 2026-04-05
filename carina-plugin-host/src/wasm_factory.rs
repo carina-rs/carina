@@ -32,24 +32,28 @@ use crate::wasm_convert;
 
 // -- HTTP allow-list hooks --
 
-/// HTTP allow-list patterns for outgoing requests from WASM plugins.
+/// HTTP allow-list suffix patterns for outgoing requests from WASM plugins.
 ///
-/// Only hosts matching these suffix patterns are permitted. All other
-/// requests are rejected with `ErrorCode::HttpRequestDenied`.
+/// Hosts matching these suffix patterns are permitted. See also
+/// [`HTTP_ALLOWED_EXACT_HOSTS`] for exact-match entries.
 const HTTP_ALLOWED_HOST_SUFFIXES: &[&str] = &[".amazonaws.com", ".amazonaws.com.cn"];
+
+/// Exact hosts that are always permitted (e.g., EC2 Instance Metadata Service).
+const HTTP_ALLOWED_EXACT_HOSTS: &[&str] = &["169.254.169.254"];
 
 /// Returns `true` if the given host (authority without port) is allowed
 /// by the HTTP allow-list.
 fn is_host_allowed(host: &str) -> bool {
     // Strip port if present (e.g., "s3.amazonaws.com:443" -> "s3.amazonaws.com")
     let host_without_port = host.split(':').next().unwrap_or(host);
-    HTTP_ALLOWED_HOST_SUFFIXES
-        .iter()
-        .any(|suffix| host_without_port.ends_with(suffix))
+    HTTP_ALLOWED_EXACT_HOSTS.contains(&host_without_port)
+        || HTTP_ALLOWED_HOST_SUFFIXES
+            .iter()
+            .any(|suffix| host_without_port.ends_with(suffix))
 }
 
 /// Custom `WasiHttpHooks` that restricts outgoing HTTP requests to
-/// hosts matching [`HTTP_ALLOWED_HOST_SUFFIXES`].
+/// hosts matching [`HTTP_ALLOWED_HOST_SUFFIXES`] or [`HTTP_ALLOWED_EXACT_HOSTS`].
 struct AllowListHttpHooks;
 
 impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
@@ -1190,7 +1194,6 @@ mod tests {
         assert!(!is_host_allowed("evil.example.com"));
         assert!(!is_host_allowed("attacker.io"));
         assert!(!is_host_allowed("localhost"));
-        assert!(!is_host_allowed("169.254.169.254"));
         assert!(!is_host_allowed(""));
         // Ensure partial matches don't pass
         assert!(!is_host_allowed("not-amazonaws.com"));
@@ -1198,5 +1201,13 @@ mod tests {
         assert!(!is_host_allowed("fakeamazonaws.com"));
         // Bare domain without service prefix is not a valid AWS endpoint
         assert!(!is_host_allowed("amazonaws.com"));
+    }
+
+    #[test]
+    fn test_http_allowlist_permits_imds() {
+        // EC2 Instance Metadata Service (IMDS) endpoint
+        assert!(is_host_allowed("169.254.169.254"));
+        // IMDS with explicit port
+        assert!(is_host_allowed("169.254.169.254:80"));
     }
 }

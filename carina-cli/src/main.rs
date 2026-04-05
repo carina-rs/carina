@@ -2,6 +2,7 @@ mod commands;
 mod display;
 mod error;
 mod provider_resolver;
+mod signal;
 mod version_resolver;
 mod wiring;
 
@@ -319,8 +320,16 @@ async fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("{} {}", "Error:".red().bold(), e);
-        std::process::exit(1);
+        match e {
+            error::AppError::Interrupted => {
+                // Exit code 130 = 128 + 2 (SIGINT), the Unix convention
+                std::process::exit(130);
+            }
+            _ => {
+                eprintln!("{} {}", "Error:".red().bold(), e);
+                std::process::exit(1);
+            }
+        }
     }
 }
 
