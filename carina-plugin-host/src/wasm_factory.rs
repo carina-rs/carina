@@ -41,10 +41,10 @@ const HTTP_ALLOWED_HOST_SUFFIXES: &[&str] = &[".amazonaws.com", ".amazonaws.com.
 /// Metadata service addresses for EC2 IMDS and ECS task metadata.
 const METADATA_HOSTS: &[&str] = &["169.254.169.254", "169.254.170.2"];
 
-/// Connect timeout for IMDS requests. On EC2, IMDS responds in <10ms.
-/// A 1-second timeout lets non-EC2 environments fail fast instead of
-/// hanging for the SDK's default timeout.
-const IMDS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+/// Connect timeout used when probing and capping metadata endpoint requests.
+/// On EC2, IMDS responds in <10ms. A 1-second timeout lets non-EC2 environments
+/// fail fast instead of hanging for the SDK's default timeout.
+const METADATA_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Strip port from authority (e.g., "s3.amazonaws.com:443" -> "s3.amazonaws.com").
 fn host_without_port(host: &str) -> &str {
@@ -66,10 +66,32 @@ fn is_metadata_host(host: &str) -> bool {
     METADATA_HOSTS.contains(&host_without_port(host))
 }
 
+/// Probe metadata endpoints and return true if any is reachable.
+///
+/// Uses parallel TCP connect attempts with a 1-second timeout.
+/// Called once at startup; result is cached by the caller.
+#[allow(dead_code)]
+fn probe_metadata_endpoints() -> bool {
+    use std::net::{SocketAddr, TcpStream};
+
+    std::thread::scope(|s| {
+        let handles: Vec<_> = METADATA_HOSTS
+            .iter()
+            .map(|host| {
+                s.spawn(move || {
+                    let addr: SocketAddr = format!("{host}:80").parse().unwrap();
+                    TcpStream::connect_timeout(&addr, METADATA_PROBE_TIMEOUT).is_ok()
+                })
+            })
+            .collect();
+        handles.into_iter().any(|h| h.join().unwrap_or(false))
+    })
+}
+
 /// Custom `WasiHttpHooks` that restricts outgoing HTTP requests to
 /// hosts matching [`HTTP_ALLOWED_HOST_SUFFIXES`] or [`METADATA_HOSTS`].
 ///
-/// Metadata requests are capped at [`IMDS_CONNECT_TIMEOUT`] so that non-EC2/ECS
+/// Metadata requests are capped at [`METADATA_PROBE_TIMEOUT`] so that non-EC2/ECS
 /// environments fail fast rather than waiting for the SDK's default timeout.
 struct AllowListHttpHooks;
 
@@ -96,14 +118,14 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
         // Cap timeouts for metadata endpoints so non-EC2/ECS environments fail fast.
         // On EC2, IMDS responds in <10ms; 1s is generous.
         if is_metadata_host(authority) {
-            if config.connect_timeout > IMDS_CONNECT_TIMEOUT {
-                config.connect_timeout = IMDS_CONNECT_TIMEOUT;
+            if config.connect_timeout > METADATA_PROBE_TIMEOUT {
+                config.connect_timeout = METADATA_PROBE_TIMEOUT;
             }
-            if config.first_byte_timeout > IMDS_CONNECT_TIMEOUT {
-                config.first_byte_timeout = IMDS_CONNECT_TIMEOUT;
+            if config.first_byte_timeout > METADATA_PROBE_TIMEOUT {
+                config.first_byte_timeout = METADATA_PROBE_TIMEOUT;
             }
-            if config.between_bytes_timeout > IMDS_CONNECT_TIMEOUT {
-                config.between_bytes_timeout = IMDS_CONNECT_TIMEOUT;
+            if config.between_bytes_timeout > METADATA_PROBE_TIMEOUT {
+                config.between_bytes_timeout = METADATA_PROBE_TIMEOUT;
             }
         }
         Ok(wasmtime_wasi_http::p2::default_send_request(
@@ -1222,8 +1244,23 @@ mod tests {
     #[test]
     fn test_imds_connect_timeout_is_short() {
         // IMDS timeout should be short enough for non-EC2 environments
-        assert!(IMDS_CONNECT_TIMEOUT <= std::time::Duration::from_secs(2));
-        assert!(IMDS_CONNECT_TIMEOUT >= std::time::Duration::from_secs(1));
+        assert!(METADATA_PROBE_TIMEOUT <= std::time::Duration::from_secs(2));
+        assert!(METADATA_PROBE_TIMEOUT >= std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_metadata_probe_returns_false_on_unreachable() {
+        let start = std::time::Instant::now();
+        let result = probe_metadata_endpoints();
+        let elapsed = start.elapsed();
+        assert!(
+            !result,
+            "probe should return false on non-metadata environment"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "probe took too long: {elapsed:?}"
+        );
     }
 
     #[test]
