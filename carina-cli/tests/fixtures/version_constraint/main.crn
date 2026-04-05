@@ -1,0 +1,4 @@
+provider mock {
+    source = "github.com/carina-rs/carina-provider-mock"
+    version = "~0.1.0"
+}
