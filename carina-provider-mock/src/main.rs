@@ -27,6 +27,7 @@ impl CarinaProvider for MockProcessProvider {
             name: "mock".into(),
             display_name: "Mock Provider (Process)".into(),
             capabilities: vec![],
+            version: env!("CARGO_PKG_VERSION").to_string(),
         }
     }
 

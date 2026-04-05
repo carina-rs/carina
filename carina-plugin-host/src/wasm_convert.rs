@@ -215,12 +215,16 @@ pub fn json_to_provider_error(json: &str) -> carina_core::provider::ProviderErro
     }
 }
 
-/// Deserialize JSON to (name, display_name) tuple from ProviderInfo.
-pub fn json_to_provider_info(json: &str) -> (String, String) {
+/// Deserialize JSON to (name, display_name, version) tuple from ProviderInfo.
+pub fn json_to_provider_info(json: &str) -> (String, String, String) {
     if let Ok(info) = serde_json::from_str::<proto::ProviderInfo>(json) {
-        (info.name, info.display_name)
+        (info.name, info.display_name, info.version)
     } else {
-        ("unknown".to_string(), "Unknown Provider".to_string())
+        (
+            "unknown".to_string(),
+            "Unknown Provider".to_string(),
+            "0.0.0".to_string(),
+        )
     }
 }
 
@@ -527,10 +531,21 @@ mod tests {
 
     #[test]
     fn test_json_to_provider_info_valid() {
-        let json = r#"{"name":"aws","display_name":"AWS Provider"}"#;
-        let (name, display) = json_to_provider_info(json);
+        let json = r#"{"name":"aws","display_name":"AWS Provider","version":"1.0.0"}"#;
+        let (name, display, version) = json_to_provider_info(json);
         assert_eq!(name, "aws");
         assert_eq!(display, "AWS Provider");
+        assert_eq!(version, "1.0.0");
+    }
+
+    #[test]
+    fn test_json_to_provider_info_missing_version_falls_back() {
+        // When version is missing entirely (complete parse failure), fall back to "0.0.0"
+        let json = r#"{"name":"old","display_name":"Old Provider"}"#;
+        let (name, display, version) = json_to_provider_info(json);
+        assert_eq!(name, "unknown");
+        assert_eq!(display, "Unknown Provider");
+        assert_eq!(version, "0.0.0");
     }
 
     #[test]

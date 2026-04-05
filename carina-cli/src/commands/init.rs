@@ -7,7 +7,7 @@ use carina_core::parser::ProviderContext;
 
 use crate::provider_resolver;
 
-pub fn run_init(path: &Path) -> Result<(), String> {
+pub fn run_init(path: &Path, upgrade: bool) -> Result<(), String> {
     let base_dir = get_base_dir(path);
     let path_buf = path.to_path_buf();
 
@@ -30,12 +30,13 @@ pub fn run_init(path: &Path) -> Result<(), String> {
         return Ok(());
     }
 
+    let action = if upgrade { "Upgrading" } else { "Resolving" };
     println!(
         "{}",
-        format!("Resolving {} provider(s)...", github_providers.len()).cyan()
+        format!("{} {} provider(s)...", action, github_providers.len()).cyan()
     );
 
-    let resolved = provider_resolver::resolve_all(base_dir, &loaded.parsed.providers)?;
+    let resolved = provider_resolver::resolve_all(base_dir, &loaded.parsed.providers, upgrade)?;
 
     println!(
         "{}",

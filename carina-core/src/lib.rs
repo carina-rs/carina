@@ -26,3 +26,4 @@ pub mod schema;
 pub mod utils;
 pub mod validation;
 pub mod value;
+pub mod version_constraint;

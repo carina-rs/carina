@@ -16,6 +16,8 @@ pub struct LockEntry {
     pub name: String,
     pub source: String,
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraint: Option<String>,
     pub sha256: String,
 }
 
@@ -42,6 +44,10 @@ impl LockFile {
         self.provider
             .iter()
             .find(|e| e.source == source && e.version == version)
+    }
+
+    pub fn find_by_source(&self, source: &str) -> Option<&LockEntry> {
+        self.provider.iter().find(|e| e.source == source)
     }
 
     pub fn upsert(&mut self, entry: LockEntry) {
@@ -268,6 +274,7 @@ pub fn resolve_provider(
                 name: name.to_string(),
                 source: source.to_string(),
                 version: version.to_string(),
+                constraint: None,
                 sha256: hash,
             });
             println!(
@@ -320,6 +327,7 @@ pub fn resolve_provider(
         name: name.to_string(),
         source: source.to_string(),
         version: version.to_string(),
+        constraint: None,
         sha256: hash,
     });
 
@@ -337,17 +345,16 @@ pub fn resolve_single_config(base_dir: &Path, config: &ProviderConfig) -> Result
         .as_deref()
         .ok_or_else(|| format!("Provider '{}' has no source", config.name))?;
 
-    let version = config.version.as_deref().ok_or_else(|| {
-        format!(
-            "Provider '{}' has source but no version. Add: version = \"x.y.z\"",
-            config.name
-        )
-    })?;
-
     let lock_path = base_dir.join("carina.lock");
     let mut lock_file = LockFile::load(&lock_path).unwrap_or_default();
 
-    let binary_path = resolve_provider(base_dir, source, version, &config.name, &mut lock_file)?;
+    let version = resolve_version(source, config, &lock_file, false)?;
+
+    let binary_path = resolve_provider(base_dir, source, &version, &config.name, &mut lock_file)?;
+
+    if let Some(entry) = lock_file.provider.iter_mut().find(|e| e.source == source) {
+        entry.constraint = config.version.as_ref().map(|c| c.raw.clone());
+    }
 
     lock_file
         .save(&lock_path)
@@ -361,10 +368,52 @@ pub fn is_wasm_provider(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext == "wasm")
 }
 
+/// Resolve the exact version to use for a provider.
+fn resolve_version(
+    source: &str,
+    config: &ProviderConfig,
+    lock_file: &LockFile,
+    upgrade: bool,
+) -> Result<String, String> {
+    if !upgrade && let Some(lock_entry) = lock_file.find_by_source(source) {
+        match &config.version {
+            Some(constraint) if constraint.matches(&lock_entry.version).unwrap_or(false) => {
+                return Ok(lock_entry.version.clone());
+            }
+            None => {
+                return Ok(lock_entry.version.clone());
+            }
+            _ => {}
+        }
+    }
+
+    match &config.version {
+        Some(constraint) => {
+            let tags = crate::version_resolver::fetch_release_tags(source)?;
+            let resolved = crate::version_resolver::resolve_from_tags(&tags, &constraint.req)
+                .ok_or_else(|| {
+                    format!(
+                        "No release of '{}' matches constraint '{}'. Available: {}",
+                        config.name,
+                        constraint.raw,
+                        tags.join(", ")
+                    )
+                })?;
+            Ok(resolved.version.to_string())
+        }
+        None => {
+            let tag = crate::version_resolver::fetch_latest_tag(source)?;
+            let version = tag.strip_prefix('v').unwrap_or(&tag);
+            Ok(version.to_string())
+        }
+    }
+}
+
 /// Resolve all providers that need GitHub source resolution.
 pub fn resolve_all(
     base_dir: &Path,
     providers: &[ProviderConfig],
+    upgrade: bool,
 ) -> Result<HashMap<String, PathBuf>, String> {
     let lock_path = base_dir.join("carina.lock");
     let mut lock_file = LockFile::load(&lock_path).unwrap_or_default();
@@ -376,15 +425,15 @@ pub fn resolve_all(
             _ => continue,
         };
 
-        let version = config.version.as_deref().ok_or_else(|| {
-            format!(
-                "Provider '{}' has source but no version. Add: version = \"x.y.z\"",
-                config.name
-            )
-        })?;
+        let version = resolve_version(source, config, &lock_file, upgrade)?;
 
         let binary_path =
-            resolve_provider(base_dir, source, version, &config.name, &mut lock_file)?;
+            resolve_provider(base_dir, source, &version, &config.name, &mut lock_file)?;
+
+        if let Some(entry) = lock_file.provider.iter_mut().find(|e| e.source == source) {
+            entry.constraint = config.version.as_ref().map(|c| c.raw.clone());
+        }
+
         resolved.insert(config.name.clone(), binary_path);
     }
 
@@ -395,6 +444,44 @@ pub fn resolve_all(
     }
 
     Ok(resolved)
+}
+
+/// Validate that locked provider versions still satisfy the configured constraints.
+///
+/// Called before plan/apply to catch cases where the lock file and constraints have
+/// drifted out of sync (e.g., the user tightened a constraint after last `carina init`).
+pub fn validate_lock_constraints(
+    base_dir: &Path,
+    providers: &[ProviderConfig],
+) -> Result<(), String> {
+    let lock_path = base_dir.join("carina.lock");
+    let lock_file = match LockFile::load(&lock_path) {
+        Some(lf) => lf,
+        None => return Ok(()),
+    };
+
+    for config in providers {
+        let source = match &config.source {
+            Some(s) if !s.starts_with("file://") => s.as_str(),
+            _ => continue,
+        };
+
+        let constraint = match &config.version {
+            Some(c) => c,
+            None => continue,
+        };
+
+        if let Some(lock_entry) = lock_file.find_by_source(source)
+            && !constraint.matches(&lock_entry.version).unwrap_or(false)
+        {
+            return Err(format!(
+                "Provider '{}' locked at version {}, but constraint '{}' requires a different version.\nRun `carina init --upgrade` to resolve.",
+                config.name, lock_entry.version, constraint.raw
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -509,6 +596,7 @@ mod tests {
             name: "awscc".into(),
             source: "github.com/carina-rs/carina-provider-awscc".into(),
             version: "0.1.0".into(),
+            constraint: None,
             sha256: "abc123".into(),
         });
 
@@ -527,12 +615,14 @@ mod tests {
             name: "awscc".into(),
             source: "github.com/carina-rs/carina-provider-awscc".into(),
             version: "0.1.0".into(),
+            constraint: None,
             sha256: "old_hash".into(),
         });
         lock.upsert(LockEntry {
             name: "awscc".into(),
             source: "github.com/carina-rs/carina-provider-awscc".into(),
             version: "0.2.0".into(),
+            constraint: None,
             sha256: "new_hash".into(),
         });
 
@@ -553,5 +643,34 @@ mod tests {
             hash,
             "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
         );
+    }
+
+    #[test]
+    fn lock_entry_with_constraint_roundtrip() {
+        let lock = LockFile {
+            provider: vec![LockEntry {
+                name: "aws".to_string(),
+                source: "github.com/carina-rs/carina-provider-aws".to_string(),
+                version: "0.5.2".to_string(),
+                constraint: Some("~0.5.0".to_string()),
+                sha256: "abc123".to_string(),
+            }],
+        };
+        let toml_str = toml::to_string_pretty(&lock).unwrap();
+        let loaded: LockFile = toml::from_str(&toml_str).unwrap();
+        assert_eq!(loaded.provider[0].constraint.as_deref(), Some("~0.5.0"));
+    }
+
+    #[test]
+    fn lock_entry_without_constraint_deserializes() {
+        let toml_str = r#"
+[[provider]]
+name = "aws"
+source = "github.com/carina-rs/carina-provider-aws"
+version = "0.5.0"
+sha256 = "abc123"
+"#;
+        let lock: LockFile = toml::from_str(toml_str).unwrap();
+        assert!(lock.provider[0].constraint.is_none());
     }
 }

@@ -71,6 +71,11 @@ pub fn build_factories_from_providers(
     providers: &[ProviderConfig],
     base_dir: &Path,
 ) -> Vec<Box<dyn ProviderFactory>> {
+    if let Err(e) = crate::provider_resolver::validate_lock_constraints(base_dir, providers) {
+        eprintln!("{}", e.red());
+        std::process::exit(1);
+    }
+
     let mut factories: Vec<Box<dyn ProviderFactory>> = Vec::new();
 
     for config in providers {
@@ -126,7 +131,12 @@ pub fn build_factories_from_providers(
                     carina_plugin_host::WasmProviderFactory::new(binary_path.clone()),
                 )
             })
-            .map(|f| Box::new(f) as Box<dyn ProviderFactory>)
+            .and_then(|f| {
+                if let Some(constraint) = &config.version {
+                    f.verify_version(&constraint.raw)?;
+                }
+                Ok(Box::new(f) as Box<dyn ProviderFactory>)
+            })
             .map_err(|e| format!("Failed to load WASM provider: {e}"))
         };
 
