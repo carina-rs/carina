@@ -17,13 +17,15 @@ The Carina LSP (`carina-lsp`) provides:
 
 ## Installation
 
-Build the LSP server from source:
+If you installed Carina via Homebrew or GitHub Releases, `carina-lsp` is already included -- no additional installation is needed.
+
+To build from source instead:
 
 ```bash
 cargo install --path carina-lsp
 ```
 
-This installs the `carina-lsp` binary. Make sure it is in your `PATH`.
+Make sure the `carina-lsp` binary is in your `PATH`.
 
 ## VS Code setup
 
