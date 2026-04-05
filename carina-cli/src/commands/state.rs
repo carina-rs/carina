@@ -583,12 +583,21 @@ pub async fn run_state_refresh(
         None
     };
 
-    let op_result =
-        run_state_refresh_locked(&mut parsed, backend.as_ref(), lock_info.as_ref(), base_dir).await;
+    let op_result = crate::signal::run_with_ctrl_c(run_state_refresh_locked(
+        &mut parsed,
+        backend.as_ref(),
+        lock_info.as_ref(),
+        base_dir,
+    ))
+    .await;
 
     // Always release lock if it was acquired
     if let Some(ref li) = lock_info {
         let release_result = backend.release_lock(li).await.map_err(AppError::Backend);
+
+        if release_result.is_ok() && matches!(op_result, Err(AppError::Interrupted)) {
+            println!("  {} Lock released", "✓".green());
+        }
 
         op_result?;
         release_result
