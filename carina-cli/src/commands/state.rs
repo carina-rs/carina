@@ -190,15 +190,14 @@ pub async fn run_force_unlock(
 ) -> Result<(), AppError> {
     let parsed = load_configuration_with_config(path, provider_context)?.parsed;
 
-    let backend_config = parsed
-        .backend
-        .as_ref()
-        .ok_or("No backend configuration found. force-unlock requires a backend.")?;
-
-    let state_config = StateBackendConfig::from(backend_config);
-    let backend = create_backend(&state_config)
-        .await
-        .map_err(AppError::Backend)?;
+    let backend: Box<dyn StateBackend> = if let Some(config) = parsed.backend.as_ref() {
+        let state_config = StateBackendConfig::from(config);
+        create_backend(&state_config)
+            .await
+            .map_err(AppError::Backend)?
+    } else {
+        create_local_backend()
+    };
 
     println!("{}", "Force unlocking state...".yellow().bold());
     println!("Lock ID: {}", lock_id);
@@ -1121,6 +1120,40 @@ mod tests {
         let state = load_fixture_state();
         let output = format_state_show(&state);
         insta::assert_snapshot!(output);
+    }
+
+    // --- run_force_unlock tests ---
+
+    #[tokio::test]
+    async fn force_unlock_without_backend_uses_local_backend() {
+        // When no backend block is configured, run_force_unlock should
+        // fall back to create_local_backend() instead of erroring with
+        // "No backend configuration found. force-unlock requires a backend."
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        // Use the state fixture which has no backend block
+        let path = PathBuf::from(format!("{}/tests/fixtures/state", manifest_dir));
+        let provider_context = ProviderContext::default();
+
+        // Call force-unlock with a dummy lock ID.
+        // The local backend will return LockNotFound because there is no lock file,
+        // but crucially it should NOT return "No backend configuration found".
+        let result = run_force_unlock("dummy-lock-id", &path, &provider_context).await;
+
+        // Should get LockNotFound (the local backend works), not a config error
+        match &result {
+            Err(AppError::Config(msg)) if msg.contains("Lock with ID") => {
+                // This is the expected LockNotFound error mapped to AppError::Config
+            }
+            Err(AppError::Config(msg)) if msg.contains("No backend configuration found") => {
+                panic!(
+                    "force-unlock should fall back to local backend, got: {}",
+                    msg
+                );
+            }
+            other => {
+                panic!("unexpected result: {:?}", other);
+            }
+        }
     }
 
     // --- build_plan_from_state tests ---
