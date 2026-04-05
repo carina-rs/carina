@@ -32,10 +32,10 @@ use crate::wasm_convert;
 
 // -- HTTP allow-list hooks --
 
-/// HTTP allow-list patterns for outgoing requests from WASM plugins.
+/// HTTP allow-list suffix patterns for outgoing requests from WASM plugins.
 ///
-/// Only hosts matching these suffix patterns are permitted. All other
-/// requests are rejected with `ErrorCode::HttpRequestDenied`.
+/// Hosts matching these suffix patterns are permitted. See also
+/// [`HTTP_ALLOWED_EXACT_HOSTS`] for exact-match entries.
 const HTTP_ALLOWED_HOST_SUFFIXES: &[&str] = &[".amazonaws.com", ".amazonaws.com.cn"];
 
 /// Exact hosts that are always permitted (e.g., EC2 Instance Metadata Service).
@@ -53,7 +53,7 @@ fn is_host_allowed(host: &str) -> bool {
 }
 
 /// Custom `WasiHttpHooks` that restricts outgoing HTTP requests to
-/// hosts matching [`HTTP_ALLOWED_HOST_SUFFIXES`].
+/// hosts matching [`HTTP_ALLOWED_HOST_SUFFIXES`] or [`HTTP_ALLOWED_EXACT_HOSTS`].
 struct AllowListHttpHooks;
 
 impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
