@@ -164,6 +164,9 @@ enum Commands {
         /// Path to directory containing .crn files
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Re-resolve all provider versions from constraints, ignoring lock file
+        #[arg(long)]
+        upgrade: bool,
     },
     /// Lint .crn files for style issues
     Lint {
@@ -301,8 +304,8 @@ async fn main() {
             run_force_unlock(&lock_id, &path, &provider_context).await
         }
         Commands::State { command } => run_state_command(command, &provider_context).await,
-        Commands::Init { path } => {
-            if let Err(e) = commands::init::run_init(&path) {
+        Commands::Init { path, upgrade } => {
+            if let Err(e) = commands::init::run_init(&path, upgrade) {
                 eprintln!("{}", format!("Error: {e}").red());
                 std::process::exit(1);
             }
