@@ -1030,5 +1030,7 @@ mod tests {
         assert!(!is_host_allowed("not-amazonaws.com"));
         assert!(!is_host_allowed("amazonaws.com.evil.com"));
         assert!(!is_host_allowed("fakeamazonaws.com"));
+        // Bare domain without service prefix is not a valid AWS endpoint
+        assert!(!is_host_allowed("amazonaws.com"));
     }
 }
