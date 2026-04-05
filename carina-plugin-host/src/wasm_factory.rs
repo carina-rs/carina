@@ -1260,14 +1260,14 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_probe_returns_false_on_unreachable() {
+    fn test_metadata_probe_completes_within_timeout() {
+        // Verify that the probe completes within a reasonable time.
+        // On EC2/ECS the probe returns true (metadata is available).
+        // On local/CI-without-metadata the probe returns false.
+        // Either result is valid; we only check that it doesn't hang.
         let start = std::time::Instant::now();
-        let result = probe_metadata_endpoints();
+        let _result = probe_metadata_endpoints();
         let elapsed = start.elapsed();
-        assert!(
-            !result,
-            "probe should return false on non-metadata environment"
-        );
         assert!(
             elapsed < std::time::Duration::from_secs(3),
             "probe took too long: {elapsed:?}"
