@@ -70,11 +70,11 @@ export default defineConfig({
                 { label: 'module info', link: '/reference/cli/module-info/' },
               ],
             },
-            {
-              label: 'Providers',
-              autogenerate: { directory: 'reference/providers' },
-            },
           ],
+        },
+        {
+          label: 'Providers',
+          autogenerate: { directory: 'reference/providers' },
         },
       ],
     }),

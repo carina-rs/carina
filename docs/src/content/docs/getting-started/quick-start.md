@@ -16,7 +16,7 @@ mkdir my-infra && cd my-infra
 ```crn
 // main.crn
 provider awscc {
-  source  = "file:///path/to/carina_provider_awscc.wasm"
+  source  = "github.com/carina-rs/carina-provider-awscc"
   version = "0.2.0"
   region  = "ap-northeast-1"
 }
@@ -37,7 +37,7 @@ Replace the `source` path with the actual path to your built WASM provider plugi
 Check that the syntax and schema are correct:
 
 ```bash
-carina validate .
+carina validate
 ```
 
 This parses the `.crn` files in the current directory and reports any errors. No AWS credentials are needed.
@@ -47,7 +47,7 @@ This parses the `.crn` files in the current directory and reports any errors. No
 Preview what Carina will create:
 
 ```bash
-aws-vault exec my-profile -- carina plan .
+carina plan
 ```
 
 The plan output shows each resource and the action Carina will take (Create, Update, Delete, or Replace).
@@ -57,7 +57,7 @@ The plan output shows each resource and the action Carina will take (Create, Upd
 Create the resources:
 
 ```bash
-aws-vault exec my-profile -- carina apply .
+carina apply
 ```
 
 Carina executes the plan and records the result in `carina.state.json`. This state file tracks which resources Carina manages and their current attributes.
@@ -67,7 +67,7 @@ Carina executes the plan and records the result in `carina.state.json`. This sta
 Tear down all managed resources:
 
 ```bash
-aws-vault exec my-profile -- carina destroy .
+carina destroy
 ```
 
 This deletes every resource recorded in the state file.
