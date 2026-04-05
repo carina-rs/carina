@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
@@ -449,6 +450,21 @@ async fn create_instance_with_http(
     Ok((store, WasmBindings::Http(bindings)))
 }
 
+// -- SharedWasmInstance --
+
+/// A single WASM instance (store + bindings) shared between `WasmProvider`
+/// and `WasmProviderNormalizer`. Both hold an `Arc` to this struct and
+/// serialize access through the `Mutex<Store<HostState>>`.
+struct SharedWasmInstance {
+    store: Mutex<Store<HostState>>,
+    bindings: WasmBindings,
+}
+
+// Safety: The Store is behind a Mutex, so concurrent access is serialized.
+// The bindings are only used while the store mutex is held.
+unsafe impl Send for SharedWasmInstance {}
+unsafe impl Sync for SharedWasmInstance {}
+
 // -- WasmProviderFactory --
 
 pub struct WasmProviderFactory {
@@ -463,6 +479,10 @@ pub struct WasmProviderFactory {
     /// Reusable WASM instance from factory initialization.
     /// Used by `validate_config()` to avoid creating a throwaway instance.
     init_instance: Mutex<(Store<HostState>, WasmBindings)>,
+    /// Lazily created shared instance for provider + normalizer.
+    /// The first call to `create_provider` or `create_normalizer` creates
+    /// the instance; the second reuses it via `Arc`.
+    shared_instance: Mutex<Option<Arc<SharedWasmInstance>>>,
 }
 
 impl WasmProviderFactory {
@@ -601,6 +621,7 @@ impl WasmProviderFactory {
             schemas,
             enable_http,
             init_instance: Mutex::new((store, bindings)),
+            shared_instance: Mutex::new(None),
         })
     }
 
@@ -689,6 +710,7 @@ impl WasmProviderFactory {
             schemas,
             enable_http,
             init_instance: Mutex::new((store, bindings)),
+            shared_instance: Mutex::new(None),
         })
     }
 
@@ -720,6 +742,28 @@ impl WasmProviderFactory {
             .map_err(|e| format!("Provider initialization failed: {e}"))?;
 
         Ok((store, bindings))
+    }
+
+    /// Get or create the shared WASM instance for provider + normalizer.
+    ///
+    /// The first call creates and initializes a new instance; subsequent calls
+    /// return an `Arc` to the same instance. This avoids creating two separate
+    /// WASM instances for the provider and normalizer.
+    async fn get_or_create_shared_instance(
+        &self,
+        attributes: &HashMap<String, Value>,
+    ) -> Result<Arc<SharedWasmInstance>, String> {
+        let mut guard = self.shared_instance.lock().await;
+        if let Some(ref instance) = *guard {
+            return Ok(Arc::clone(instance));
+        }
+        let (store, bindings) = self.create_initialized_instance(attributes).await?;
+        let instance = Arc::new(SharedWasmInstance {
+            store: Mutex::new(store),
+            bindings,
+        });
+        *guard = Some(Arc::clone(&instance));
+        Ok(instance)
     }
 }
 
@@ -761,13 +805,12 @@ impl ProviderFactory for WasmProviderFactory {
     ) -> BoxFuture<'_, Box<dyn Provider>> {
         let attrs = attributes.clone();
         Box::pin(async move {
-            let (store, bindings) = self
-                .create_initialized_instance(&attrs)
+            let instance = self
+                .get_or_create_shared_instance(&attrs)
                 .await
                 .expect("Failed to create WASM provider instance");
             Box::new(WasmProvider {
-                store: Mutex::new(store),
-                bindings,
+                instance,
                 name: self.name_static,
             }) as Box<dyn Provider>
         })
@@ -779,11 +822,11 @@ impl ProviderFactory for WasmProviderFactory {
     ) -> BoxFuture<'_, Option<Box<dyn ProviderNormalizer>>> {
         let attrs = attributes.clone();
         Box::pin(async move {
-            match self.create_initialized_instance(&attrs).await {
-                Ok((store, bindings)) => Some(Box::new(WasmProviderNormalizer {
-                    store: Mutex::new(store),
-                    bindings,
-                }) as Box<dyn ProviderNormalizer>),
+            match self.get_or_create_shared_instance(&attrs).await {
+                Ok(instance) => {
+                    Some(Box::new(WasmProviderNormalizer { instance })
+                        as Box<dyn ProviderNormalizer>)
+                }
                 Err(e) => {
                     log::error!("Failed to create WASM normalizer instance: {e}");
                     None
@@ -800,13 +843,12 @@ impl ProviderFactory for WasmProviderFactory {
 // -- WasmProvider --
 
 pub struct WasmProvider {
-    store: Mutex<Store<HostState>>,
-    bindings: WasmBindings,
+    instance: Arc<SharedWasmInstance>,
     name: &'static str,
 }
 
-// Safety: The Store is behind a Mutex, so concurrent access is serialized.
-// The bindings are only used while the store mutex is held.
+// Safety: SharedWasmInstance.store is behind a Mutex, so concurrent access is
+// serialized. The bindings are only used while the store mutex is held.
 unsafe impl Send for WasmProvider {}
 unsafe impl Sync for WasmProvider {}
 
@@ -824,8 +866,9 @@ impl Provider for WasmProvider {
         let id = id.clone();
         let identifier = identifier.map(|s| s.to_string());
         Box::pin(async move {
-            let mut store = self.store.lock().await;
+            let mut store = self.instance.store.lock().await;
             let result = self
+                .instance
                 .bindings
                 .call_read(&mut store, &wit_id, identifier.as_deref())
                 .await
@@ -841,8 +884,9 @@ impl Provider for WasmProvider {
         let wit_resource = wasm_convert::core_to_wit_resource(resource);
         let id = resource.id.clone();
         Box::pin(async move {
-            let mut store = self.store.lock().await;
+            let mut store = self.instance.store.lock().await;
             let result = self
+                .instance
                 .bindings
                 .call_create(&mut store, &wit_resource)
                 .await
@@ -867,8 +911,9 @@ impl Provider for WasmProvider {
         let wit_to = wasm_convert::core_to_wit_resource(to);
         let id = id.clone();
         Box::pin(async move {
-            let mut store = self.store.lock().await;
+            let mut store = self.instance.store.lock().await;
             let result = self
+                .instance
                 .bindings
                 .call_update(&mut store, &wit_id, &identifier, &wit_from, &wit_to)
                 .await
@@ -890,8 +935,9 @@ impl Provider for WasmProvider {
         let identifier = identifier.to_string();
         let options_json = wasm_convert::lifecycle_to_json(lifecycle);
         Box::pin(async move {
-            let mut store = self.store.lock().await;
+            let mut store = self.instance.store.lock().await;
             let result = self
+                .instance
                 .bindings
                 .call_delete(&mut store, &wit_id, &identifier, &options_json)
                 .await
@@ -907,8 +953,7 @@ impl Provider for WasmProvider {
 // -- WasmProviderNormalizer --
 
 pub struct WasmProviderNormalizer {
-    store: Mutex<Store<HostState>>,
-    bindings: WasmBindings,
+    instance: Arc<SharedWasmInstance>,
 }
 
 // Safety: Same rationale as WasmProvider.
@@ -924,8 +969,9 @@ impl ProviderNormalizer for WasmProviderNormalizer {
 
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                let mut store = self.store.lock().await;
-                self.bindings
+                let mut store = self.instance.store.lock().await;
+                self.instance
+                    .bindings
                     .call_normalize_desired(&mut store, &wit_resources)
                     .await
             })
@@ -962,8 +1008,9 @@ impl ProviderNormalizer for WasmProviderNormalizer {
 
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                let mut store = self.store.lock().await;
-                self.bindings
+                let mut store = self.instance.store.lock().await;
+                self.instance
+                    .bindings
                     .call_normalize_state(&mut store, &wit_states)
                     .await
             })
@@ -1000,8 +1047,9 @@ impl ProviderNormalizer for WasmProviderNormalizer {
 
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                let mut store = self.store.lock().await;
-                self.bindings
+                let mut store = self.instance.store.lock().await;
+                self.instance
+                    .bindings
                     .call_hydrate_read_state(&mut store, &wit_states, &wit_saved)
                     .await
             })
