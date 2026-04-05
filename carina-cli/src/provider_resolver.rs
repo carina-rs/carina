@@ -16,6 +16,8 @@ pub struct LockEntry {
     pub name: String,
     pub source: String,
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraint: Option<String>,
     pub sha256: String,
 }
 
@@ -42,6 +44,11 @@ impl LockFile {
         self.provider
             .iter()
             .find(|e| e.source == source && e.version == version)
+    }
+
+    #[allow(dead_code)]
+    pub fn find_by_source(&self, source: &str) -> Option<&LockEntry> {
+        self.provider.iter().find(|e| e.source == source)
     }
 
     pub fn upsert(&mut self, entry: LockEntry) {
@@ -268,6 +275,7 @@ pub fn resolve_provider(
                 name: name.to_string(),
                 source: source.to_string(),
                 version: version.to_string(),
+                constraint: None,
                 sha256: hash,
             });
             println!(
@@ -320,6 +328,7 @@ pub fn resolve_provider(
         name: name.to_string(),
         source: source.to_string(),
         version: version.to_string(),
+        constraint: None,
         sha256: hash,
     });
 
@@ -517,6 +526,7 @@ mod tests {
             name: "awscc".into(),
             source: "github.com/carina-rs/carina-provider-awscc".into(),
             version: "0.1.0".into(),
+            constraint: None,
             sha256: "abc123".into(),
         });
 
@@ -535,12 +545,14 @@ mod tests {
             name: "awscc".into(),
             source: "github.com/carina-rs/carina-provider-awscc".into(),
             version: "0.1.0".into(),
+            constraint: None,
             sha256: "old_hash".into(),
         });
         lock.upsert(LockEntry {
             name: "awscc".into(),
             source: "github.com/carina-rs/carina-provider-awscc".into(),
             version: "0.2.0".into(),
+            constraint: None,
             sha256: "new_hash".into(),
         });
 
@@ -561,5 +573,34 @@ mod tests {
             hash,
             "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
         );
+    }
+
+    #[test]
+    fn lock_entry_with_constraint_roundtrip() {
+        let lock = LockFile {
+            provider: vec![LockEntry {
+                name: "aws".to_string(),
+                source: "github.com/carina-rs/carina-provider-aws".to_string(),
+                version: "0.5.2".to_string(),
+                constraint: Some("~0.5.0".to_string()),
+                sha256: "abc123".to_string(),
+            }],
+        };
+        let toml_str = toml::to_string_pretty(&lock).unwrap();
+        let loaded: LockFile = toml::from_str(&toml_str).unwrap();
+        assert_eq!(loaded.provider[0].constraint.as_deref(), Some("~0.5.0"));
+    }
+
+    #[test]
+    fn lock_entry_without_constraint_deserializes() {
+        let toml_str = r#"
+[[provider]]
+name = "aws"
+source = "github.com/carina-rs/carina-provider-aws"
+version = "0.5.0"
+sha256 = "abc123"
+"#;
+        let lock: LockFile = toml::from_str(toml_str).unwrap();
+        assert!(lock.provider[0].constraint.is_none());
     }
 }
