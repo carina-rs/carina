@@ -37,6 +37,37 @@ awscc.ec2.vpc {
 
 The S3 backend stores state in the specified bucket and key. It also supports state locking to prevent concurrent modifications.
 
+### Automatic bucket creation
+
+By default, `carina apply` automatically creates the S3 bucket if it doesn't exist. This lets you get started without any manual setup:
+
+```crn
+backend s3 {
+  bucket      = "my-carina-state"
+  key         = "production/carina.state.json"
+  region      = "ap-northeast-1"
+  auto_create = true  # This is the default; can be omitted
+}
+```
+
+When the bucket is auto-created, Carina:
+
+1. Creates the S3 bucket with versioning enabled and public access blocked
+2. Appends an `aws.s3.bucket` resource definition to your `.crn` file
+3. Registers the bucket as a **protected resource** in state, preventing it from being accidentally modified or destroyed
+
+`carina plan` shows the upcoming bucket creation as a bootstrap plan before the main resource plan.
+
+To disable auto-creation and require the bucket to exist beforehand, set `auto_create = false`. If the bucket is missing, `carina plan` and `carina apply` will fail with an error.
+
+To delete an auto-created state bucket, use:
+
+```bash
+carina state bucket-delete <bucket-name> --force
+```
+
+This is a destructive operation that removes the bucket and all state history.
+
 ## Importing existing resources
 
 To bring an existing cloud resource under Carina management, use the `import` block:
