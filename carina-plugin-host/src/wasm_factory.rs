@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use sha2::{Digest, Sha256};
 
@@ -38,29 +38,74 @@ use crate::wasm_convert;
 /// [`HTTP_ALLOWED_EXACT_HOSTS`] for exact-match entries.
 const HTTP_ALLOWED_HOST_SUFFIXES: &[&str] = &[".amazonaws.com", ".amazonaws.com.cn"];
 
-/// Exact hosts that are always permitted (e.g., EC2 Instance Metadata Service).
-const HTTP_ALLOWED_EXACT_HOSTS: &[&str] = &["169.254.169.254"];
+/// Metadata service addresses for EC2 IMDS and ECS task metadata.
+const METADATA_HOSTS: &[&str] = &["169.254.169.254", "169.254.170.2"];
+
+/// Connect timeout used when probing and capping metadata endpoint requests.
+/// On EC2, IMDS responds in <10ms. A 1-second timeout lets non-EC2 environments
+/// fail fast instead of hanging for the SDK's default timeout.
+const METADATA_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Strip port from authority (e.g., "s3.amazonaws.com:443" -> "s3.amazonaws.com").
+fn host_without_port(host: &str) -> &str {
+    host.split(':').next().unwrap_or(host)
+}
 
 /// Returns `true` if the given host (authority without port) is allowed
 /// by the HTTP allow-list.
 fn is_host_allowed(host: &str) -> bool {
-    // Strip port if present (e.g., "s3.amazonaws.com:443" -> "s3.amazonaws.com")
-    let host_without_port = host.split(':').next().unwrap_or(host);
-    HTTP_ALLOWED_EXACT_HOSTS.contains(&host_without_port)
+    let h = host_without_port(host);
+    METADATA_HOSTS.contains(&h)
         || HTTP_ALLOWED_HOST_SUFFIXES
             .iter()
-            .any(|suffix| host_without_port.ends_with(suffix))
+            .any(|suffix| h.ends_with(suffix))
+}
+
+/// Returns `true` if the host is a metadata service endpoint (EC2 IMDS or ECS).
+fn is_metadata_host(host: &str) -> bool {
+    METADATA_HOSTS.contains(&host_without_port(host))
+}
+
+/// Probe metadata endpoints and return true if any is reachable.
+///
+/// Uses parallel TCP connect attempts with a 1-second timeout.
+/// Called once at startup; result is cached by the caller.
+fn probe_metadata_endpoints() -> bool {
+    use std::net::{SocketAddr, TcpStream};
+
+    std::thread::scope(|s| {
+        let handles: Vec<_> = METADATA_HOSTS
+            .iter()
+            .map(|host| {
+                s.spawn(move || {
+                    let addr: SocketAddr = format!("{host}:80").parse().unwrap();
+                    TcpStream::connect_timeout(&addr, METADATA_PROBE_TIMEOUT).is_ok()
+                })
+            })
+            .collect();
+        handles.into_iter().any(|h| h.join().unwrap_or(false))
+    })
+}
+
+/// Returns `true` if any metadata endpoint is reachable.
+/// Result is cached for the lifetime of the process.
+fn is_metadata_available() -> bool {
+    static RESULT: OnceLock<bool> = OnceLock::new();
+    *RESULT.get_or_init(probe_metadata_endpoints)
 }
 
 /// Custom `WasiHttpHooks` that restricts outgoing HTTP requests to
-/// hosts matching [`HTTP_ALLOWED_HOST_SUFFIXES`] or [`HTTP_ALLOWED_EXACT_HOSTS`].
+/// hosts matching [`HTTP_ALLOWED_HOST_SUFFIXES`] or [`METADATA_HOSTS`].
+///
+/// Metadata requests are capped at [`METADATA_PROBE_TIMEOUT`] so that non-EC2/ECS
+/// environments fail fast rather than waiting for the SDK's default timeout.
 struct AllowListHttpHooks;
 
 impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
     fn send_request(
         &mut self,
         request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
-        config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
+        mut config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
     ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>
     {
         let authority = match request.uri().authority() {
@@ -75,6 +120,19 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
             return Err(
                 wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::HttpRequestDenied.into(),
             );
+        }
+        // Cap timeouts for metadata endpoints so non-EC2/ECS environments fail fast.
+        // On EC2, IMDS responds in <10ms; 1s is generous.
+        if is_metadata_host(authority) {
+            if config.connect_timeout > METADATA_PROBE_TIMEOUT {
+                config.connect_timeout = METADATA_PROBE_TIMEOUT;
+            }
+            if config.first_byte_timeout > METADATA_PROBE_TIMEOUT {
+                config.first_byte_timeout = METADATA_PROBE_TIMEOUT;
+            }
+            if config.between_bytes_timeout > METADATA_PROBE_TIMEOUT {
+                config.between_bytes_timeout = METADATA_PROBE_TIMEOUT;
+            }
         }
         Ok(wasmtime_wasi_http::p2::default_send_request(
             request, config,
@@ -410,6 +468,9 @@ const WASM_ENV_ALLOWLIST: &[&str] = &[
     "AWS_REGION",
     "AWS_DEFAULT_REGION",
     "AWS_ENDPOINT_URL",
+    "AWS_EC2_METADATA_DISABLED",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
     "HOME",
     "RUST_LOG",
 ];
@@ -422,6 +483,11 @@ fn build_sandboxed_wasi_ctx() -> WasiCtx {
         if let Ok(val) = std::env::var(key) {
             builder.env(key, &val);
         }
+    }
+    // Auto-disable IMDS if metadata endpoints are unreachable,
+    // unless the user has explicitly set the variable.
+    if std::env::var("AWS_EC2_METADATA_DISABLED").is_err() && !is_metadata_available() {
+        builder.env("AWS_EC2_METADATA_DISABLED", "true");
     }
     builder.build()
 }
@@ -1115,6 +1181,9 @@ mod tests {
         assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_REGION"));
         assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_DEFAULT_REGION"));
         assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_ENDPOINT_URL"));
+        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_EC2_METADATA_DISABLED"));
+        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"));
+        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_CONTAINER_CREDENTIALS_FULL_URI"));
         assert!(WASM_ENV_ALLOWLIST.contains(&"HOME"));
         assert!(WASM_ENV_ALLOWLIST.contains(&"RUST_LOG"));
     }
@@ -1209,5 +1278,66 @@ mod tests {
         assert!(is_host_allowed("169.254.169.254"));
         // IMDS with explicit port
         assert!(is_host_allowed("169.254.169.254:80"));
+    }
+
+    #[test]
+    fn test_imds_connect_timeout_is_short() {
+        // IMDS timeout should be short enough for non-EC2 environments
+        assert!(METADATA_PROBE_TIMEOUT <= std::time::Duration::from_secs(2));
+        assert!(METADATA_PROBE_TIMEOUT >= std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_metadata_probe_completes_within_timeout() {
+        // Verify that the probe completes within a reasonable time.
+        // On EC2/ECS the probe returns true (metadata is available).
+        // On local/CI-without-metadata the probe returns false.
+        // Either result is valid; we only check that it doesn't hang.
+        let start = std::time::Instant::now();
+        let _result = probe_metadata_endpoints();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "probe took too long: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn test_is_metadata_host() {
+        // EC2 IMDS
+        assert!(is_metadata_host("169.254.169.254"));
+        assert!(is_metadata_host("169.254.169.254:80"));
+        // ECS metadata endpoint
+        assert!(is_metadata_host("169.254.170.2"));
+        assert!(is_metadata_host("169.254.170.2:80"));
+        // Non-metadata hosts
+        assert!(!is_metadata_host("s3.amazonaws.com"));
+        assert!(!is_metadata_host("169.254.169.1"));
+    }
+
+    #[test]
+    fn test_http_allowlist_permits_ecs_metadata() {
+        // ECS Task Metadata endpoint should be allowed
+        assert!(is_host_allowed("169.254.170.2"));
+        assert!(is_host_allowed("169.254.170.2:80"));
+    }
+
+    #[test]
+    fn test_ecs_env_vars_in_allowlist() {
+        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"));
+        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_CONTAINER_CREDENTIALS_FULL_URI"));
+    }
+
+    #[test]
+    fn test_metadata_probe_result_is_cached() {
+        let first = is_metadata_available();
+        let start = std::time::Instant::now();
+        let second = is_metadata_available();
+        let elapsed = start.elapsed();
+        assert_eq!(first, second);
+        assert!(
+            elapsed < std::time::Duration::from_millis(10),
+            "second call should be cached, took {elapsed:?}"
+        );
     }
 }
