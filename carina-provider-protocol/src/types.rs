@@ -131,6 +131,8 @@ pub struct ProviderInfo {
     pub display_name: String,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub version: String,
 }
 
 /// Provider error returned from operations.
@@ -299,6 +301,7 @@ mod tests {
             name: "test".into(),
             display_name: "Test Provider".into(),
             capabilities: vec!["normalize_desired".into(), "normalize_state".into()],
+            version: "1.2.3".into(),
         };
         let json = serde_json::to_string(&info).unwrap();
         let back: ProviderInfo = serde_json::from_str(&json).unwrap();
