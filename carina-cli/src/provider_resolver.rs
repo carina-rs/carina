@@ -346,21 +346,12 @@ pub fn resolve_single_config(base_dir: &Path, config: &ProviderConfig) -> Result
         .as_deref()
         .ok_or_else(|| format!("Provider '{}' has no source", config.name))?;
 
-    let version = config
-        .version
-        .as_ref()
-        .map(|v| v.raw.as_str())
-        .ok_or_else(|| {
-            format!(
-                "Provider '{}' has source but no version. Add: version = \"x.y.z\"",
-                config.name
-            )
-        })?;
-
     let lock_path = base_dir.join("carina.lock");
     let mut lock_file = LockFile::load(&lock_path).unwrap_or_default();
 
-    let binary_path = resolve_provider(base_dir, source, version, &config.name, &mut lock_file)?;
+    let version = resolve_version(source, config, &lock_file, false)?;
+
+    let binary_path = resolve_provider(base_dir, source, &version, &config.name, &mut lock_file)?;
 
     lock_file
         .save(&lock_path)
@@ -374,10 +365,52 @@ pub fn is_wasm_provider(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext == "wasm")
 }
 
+/// Resolve the exact version to use for a provider.
+fn resolve_version(
+    source: &str,
+    config: &ProviderConfig,
+    lock_file: &LockFile,
+    upgrade: bool,
+) -> Result<String, String> {
+    if !upgrade && let Some(lock_entry) = lock_file.find_by_source(source) {
+        match &config.version {
+            Some(constraint) if constraint.matches(&lock_entry.version).unwrap_or(false) => {
+                return Ok(lock_entry.version.clone());
+            }
+            None => {
+                return Ok(lock_entry.version.clone());
+            }
+            _ => {}
+        }
+    }
+
+    match &config.version {
+        Some(constraint) => {
+            let tags = crate::version_resolver::fetch_release_tags(source)?;
+            let resolved = crate::version_resolver::resolve_from_tags(&tags, &constraint.req)
+                .ok_or_else(|| {
+                    format!(
+                        "No release of '{}' matches constraint '{}'. Available: {}",
+                        config.name,
+                        constraint.raw,
+                        tags.join(", ")
+                    )
+                })?;
+            Ok(resolved.version.to_string())
+        }
+        None => {
+            let tag = crate::version_resolver::fetch_latest_tag(source)?;
+            let version = tag.strip_prefix('v').unwrap_or(&tag);
+            Ok(version.to_string())
+        }
+    }
+}
+
 /// Resolve all providers that need GitHub source resolution.
 pub fn resolve_all(
     base_dir: &Path,
     providers: &[ProviderConfig],
+    upgrade: bool,
 ) -> Result<HashMap<String, PathBuf>, String> {
     let lock_path = base_dir.join("carina.lock");
     let mut lock_file = LockFile::load(&lock_path).unwrap_or_default();
@@ -389,19 +422,15 @@ pub fn resolve_all(
             _ => continue,
         };
 
-        let version = config
-            .version
-            .as_ref()
-            .map(|v| v.raw.as_str())
-            .ok_or_else(|| {
-                format!(
-                    "Provider '{}' has source but no version. Add: version = \"x.y.z\"",
-                    config.name
-                )
-            })?;
+        let version = resolve_version(source, config, &lock_file, upgrade)?;
 
         let binary_path =
-            resolve_provider(base_dir, source, version, &config.name, &mut lock_file)?;
+            resolve_provider(base_dir, source, &version, &config.name, &mut lock_file)?;
+
+        if let Some(entry) = lock_file.provider.iter_mut().find(|e| e.source == source) {
+            entry.constraint = config.version.as_ref().map(|c| c.raw.clone());
+        }
+
         resolved.insert(config.name.clone(), binary_path);
     }
 
@@ -412,6 +441,44 @@ pub fn resolve_all(
     }
 
     Ok(resolved)
+}
+
+/// Validate that locked provider versions still satisfy the configured constraints.
+///
+/// Called before plan/apply to catch cases where the lock file and constraints have
+/// drifted out of sync (e.g., the user tightened a constraint after last `carina init`).
+pub fn validate_lock_constraints(
+    base_dir: &Path,
+    providers: &[ProviderConfig],
+) -> Result<(), String> {
+    let lock_path = base_dir.join("carina.lock");
+    let lock_file = match LockFile::load(&lock_path) {
+        Some(lf) => lf,
+        None => return Ok(()),
+    };
+
+    for config in providers {
+        let source = match &config.source {
+            Some(s) if !s.starts_with("file://") => s.as_str(),
+            _ => continue,
+        };
+
+        let constraint = match &config.version {
+            Some(c) => c,
+            None => continue,
+        };
+
+        if let Some(lock_entry) = lock_file.find_by_source(source)
+            && !constraint.matches(&lock_entry.version).unwrap_or(false)
+        {
+            return Err(format!(
+                "Provider '{}' locked at version {}, but constraint '{}' requires a different version.\nRun `carina init --upgrade` to resolve.",
+                config.name, lock_entry.version, constraint.raw
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
