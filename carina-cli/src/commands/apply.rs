@@ -24,10 +24,7 @@ use carina_core::resolver::resolve_refs_with_state_and_remote;
 use carina_core::resource::{Expr, Resource, ResourceId, State, Value};
 use carina_core::schema::ResourceSchema;
 use carina_core::value::format_value;
-use carina_state::{
-    BackendConfig as StateBackendConfig, LockInfo, ResourceState, StateBackend, StateFile,
-    create_backend, create_local_backend,
-};
+use carina_state::{LockInfo, ResourceState, StateBackend, StateFile, resolve_backend};
 
 use carina_core::parser::ProviderContext;
 
@@ -769,14 +766,9 @@ pub async fn run_apply(
 
     // Check for backend configuration - use local backend by default
     let backend_config = parsed.backend.as_ref();
-    let backend: Box<dyn StateBackend> = if let Some(config) = backend_config {
-        let state_config = StateBackendConfig::from(config);
-        create_backend(&state_config)
-            .await
-            .map_err(AppError::Backend)?
-    } else {
-        create_local_backend()
-    };
+    let backend: Box<dyn StateBackend> = resolve_backend(backend_config)
+        .await
+        .map_err(AppError::Backend)?;
 
     // Handle bootstrap if S3 backend is configured
     #[allow(unused_assignments)]
@@ -1337,14 +1329,9 @@ pub async fn run_apply_from_plan(
     );
 
     // Set up backend
-    let backend: Box<dyn StateBackend> = if let Some(config) = plan_file.backend_config.as_ref() {
-        let state_config = StateBackendConfig::from(config);
-        create_backend(&state_config)
-            .await
-            .map_err(AppError::Backend)?
-    } else {
-        create_local_backend()
-    };
+    let backend: Box<dyn StateBackend> = resolve_backend(plan_file.backend_config.as_ref())
+        .await
+        .map_err(AppError::Backend)?;
 
     // Acquire lock (unless --lock=false)
     let lock_info: Option<LockInfo> = if lock {

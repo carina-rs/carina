@@ -15,7 +15,7 @@ use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::value::{format_value, json_to_dsl_value};
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, LockInfo, ResourceState, StateBackend,
-    StateFile, create_backend, create_local_backend,
+    StateFile, create_backend, resolve_backend,
 };
 
 use super::validate_and_resolve_with_config;
@@ -190,14 +190,9 @@ pub async fn run_force_unlock(
 ) -> Result<(), AppError> {
     let parsed = load_configuration_with_config(path, provider_context)?.parsed;
 
-    let backend: Box<dyn StateBackend> = if let Some(config) = parsed.backend.as_ref() {
-        let state_config = StateBackendConfig::from(config);
-        create_backend(&state_config)
-            .await
-            .map_err(AppError::Backend)?
-    } else {
-        create_local_backend()
-    };
+    let backend: Box<dyn StateBackend> = resolve_backend(parsed.backend.as_ref())
+        .await
+        .map_err(AppError::Backend)?;
 
     println!("{}", "Force unlocking state...".yellow().bold());
     println!("Lock ID: {}", lock_id);
@@ -227,14 +222,9 @@ async fn load_state_file(
     let loaded = load_configuration_with_config(path, provider_context)?;
     let parsed = loaded.parsed;
 
-    let backend: Box<dyn StateBackend> = if let Some(config) = parsed.backend.as_ref() {
-        let state_config = StateBackendConfig::from(config);
-        create_backend(&state_config)
-            .await
-            .map_err(AppError::Backend)?
-    } else {
-        create_local_backend()
-    };
+    let backend: Box<dyn StateBackend> = resolve_backend(parsed.backend.as_ref())
+        .await
+        .map_err(AppError::Backend)?;
 
     let state_file = backend.read_state().await.map_err(AppError::Backend)?;
     state_file.ok_or_else(|| AppError::Config("No state file found.".to_string()))
@@ -553,15 +543,9 @@ pub async fn run_state_refresh(
     validate_and_resolve_with_config(&mut parsed, base_dir, true, provider_context)?;
 
     // Create backend
-    let backend_config = parsed.backend.as_ref();
-    let backend: Box<dyn StateBackend> = if let Some(config) = backend_config {
-        let state_config = StateBackendConfig::from(config);
-        create_backend(&state_config)
-            .await
-            .map_err(AppError::Backend)?
-    } else {
-        create_local_backend()
-    };
+    let backend: Box<dyn StateBackend> = resolve_backend(parsed.backend.as_ref())
+        .await
+        .map_err(AppError::Backend)?;
 
     // Acquire lock (unless --lock=false)
     let lock_info: Option<LockInfo> = if lock {
