@@ -1,5 +1,5 @@
-let outer = import "outer_module"
+let outer = import 'outer_module'
 
 let web = outer {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 }

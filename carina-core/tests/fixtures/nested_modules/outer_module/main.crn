@@ -1,4 +1,4 @@
-let inner = import "../inner_module"
+let inner = import '../inner_module'
 
 arguments {
   cidr_block: string
@@ -9,6 +9,6 @@ let net = inner {
 }
 
 let sg = awscc.ec2.security_group {
-  group_description = "test"
+  group_description = 'test'
   vpc_id = net.vpc_id
 }
