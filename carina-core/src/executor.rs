@@ -696,13 +696,13 @@ fn build_dependency_map(
             // dependencies (before resolution). These are handled as reverse deps
             // below (for delete ordering) rather than forward deps, to avoid
             // deadlocks where a Replace waits for a Delete that also waits for it.
-            if !matches!(effect, Effect::Replace { .. }) {
-                if let Some(unresolved) = unresolved_resources.get(effect.resource_id()) {
-                    let unresolved_deps = get_resource_dependencies(unresolved);
-                    for dep_binding in &unresolved_deps {
-                        if let Some(&dep_idx) = binding_to_idx.get(dep_binding) {
-                            dep_indices.insert(dep_idx);
-                        }
+            if !matches!(effect, Effect::Replace { .. })
+                && let Some(unresolved) = unresolved_resources.get(effect.resource_id())
+            {
+                let unresolved_deps = get_resource_dependencies(unresolved);
+                for dep_binding in &unresolved_deps {
+                    if let Some(&dep_idx) = binding_to_idx.get(dep_binding) {
+                        dep_indices.insert(dep_idx);
                     }
                 }
             }
