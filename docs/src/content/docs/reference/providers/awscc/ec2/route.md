@@ -14,7 +14,7 @@ Specifies a route in a route table. For more information, see [Routes](https://d
 
 ```crn
 let vpc = awscc.ec2.vpc {
-  cidr_block           = "10.0.0.0/16"
+  cidr_block           = '10.0.0.0/16'
   enable_dns_support   = true
   enable_dns_hostnames = true
 }
@@ -32,7 +32,7 @@ let rt = awscc.ec2.route_table {
 
 awscc.ec2.route {
   route_table_id         = rt.route_table_id
-  destination_cidr_block = "0.0.0.0/0"
+  destination_cidr_block = '0.0.0.0/0'
   gateway_id             = igw_attachment.internet_gateway_id
 }
 ```

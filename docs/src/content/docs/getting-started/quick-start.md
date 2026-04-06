@@ -16,16 +16,16 @@ mkdir my-infra && cd my-infra
 ```crn
 // main.crn
 provider awscc {
-  source  = "github.com/carina-rs/carina-provider-awscc"
-  version = "0.2.0"
-  region  = "ap-northeast-1"
+  source  = 'github.com/carina-rs/carina-provider-awscc'
+  version = '0.2.0'
+  region  = 'ap-northeast-1'
 }
 
 awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 
   tags = {
-    Name = "my-first-vpc"
+    Name = 'my-first-vpc'
   }
 }
 ```

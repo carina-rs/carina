@@ -15,20 +15,20 @@ Specifies a network address translation (NAT) gateway in the specified subnet. Y
 
 ```crn
 let vpc = awscc.ec2.vpc {
-  cidr_block           = "10.0.0.0/16"
+  cidr_block           = '10.0.0.0/16'
   enable_dns_support   = true
   enable_dns_hostnames = true
 }
 
 let public_subnet = awscc.ec2.subnet {
   vpc_id                  = vpc.vpc_id
-  cidr_block              = "10.0.1.0/24"
-  availability_zone       = "ap-northeast-1a"
+  cidr_block              = '10.0.1.0/24'
+  availability_zone       = 'ap-northeast-1a'
   map_public_ip_on_launch = true
 }
 
 let eip = awscc.ec2.eip {
-  domain = "vpc"
+  domain = 'vpc'
 }
 
 awscc.ec2.nat_gateway {
@@ -36,7 +36,7 @@ awscc.ec2.nat_gateway {
   subnet_id     = public_subnet.subnet_id
 
   tags = {
-    Environment = "example"
+    Environment = 'example'
   }
 }
 ```

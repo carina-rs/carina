@@ -16,8 +16,8 @@ upper(string: string) -> string
 ```
 
 ```crn
-upper("hello")        # => "HELLO"
-upper("Hello World")  # => "HELLO WORLD"
+upper('hello')        # => 'HELLO'
+upper('Hello World')  # => 'HELLO WORLD'
 ```
 
 ### `lower`
@@ -29,8 +29,8 @@ lower(string: string) -> string
 ```
 
 ```crn
-lower("HELLO")        # => "hello"
-lower("Hello World")  # => "hello world"
+lower('HELLO')        # => 'hello'
+lower('Hello World')  # => 'hello world'
 ```
 
 ### `trim`
@@ -42,8 +42,8 @@ trim(string: string) -> string
 ```
 
 ```crn
-trim("  hello  ")   # => "hello"
-trim("\n hello \t")  # => "hello"
+trim('  hello  ')   # => 'hello'
+trim('\n hello \t')  # => 'hello'
 ```
 
 ### `replace`
@@ -55,9 +55,9 @@ replace(search: string, replacement: string, string: string) -> string
 ```
 
 ```crn
-replace("-", "_", "hello-world")      # => "hello_world"
-"hello-world" |> replace("-", "_")    # => "hello_world" (pipe form)
-replace("::", ".", "foo::bar::baz")   # => "foo.bar.baz"
+replace('-', '_', 'hello-world')      # => 'hello_world'
+'hello-world' |> replace('-', '_')    # => 'hello_world' (pipe form)
+replace('::', '.', 'foo::bar::baz')   # => 'foo.bar.baz'
 ```
 
 ### `split`
@@ -69,9 +69,9 @@ split(separator: string, string: string) -> list
 ```
 
 ```crn
-split("-", "a-b-c")      # => ["a", "b", "c"]
-"a-b-c" |> split("-")    # => ["a", "b", "c"] (pipe form)
-split("::", "a::b::c")   # => ["a", "b", "c"]
+split('-', 'a-b-c')      # => ['a', 'b', 'c']
+'a-b-c' |> split('-')    # => ['a', 'b', 'c'] (pipe form)
+split('::', 'a::b::c')   # => ['a', 'b', 'c']
 ```
 
 ### `join`
@@ -83,9 +83,9 @@ join(separator: string, list: list) -> string
 ```
 
 ```crn
-join("-", ["a", "b", "c"])    # => "a-b-c"
-["a", "b", "c"] |> join("-") # => "a-b-c" (pipe form)
-join(", ", ["hello", 42])     # => "hello, 42"
+join('-', ['a', 'b', 'c'])    # => 'a-b-c'
+['a', 'b', 'c'] |> join('-') # => 'a-b-c' (pipe form)
+join(', ', ['hello', 42])     # => 'hello, 42'
 ```
 
 ## List Functions
@@ -101,7 +101,7 @@ concat(items: list, base_list: list) -> list
 ```crn
 concat([3, 4], [1, 2])          # => [1, 2, 3, 4]
 [1, 2] |> concat([3, 4])        # => [1, 2, 3, 4] (pipe form)
-concat(["c"], ["a", "b"])        # => ["a", "b", "c"]
+concat(['c'], ['a', 'b'])        # => ['a', 'b', 'c']
 ```
 
 ### `flatten`
@@ -114,7 +114,7 @@ flatten(list: list) -> list
 
 ```crn
 flatten([[1, 2], [3, 4]])     # => [1, 2, 3, 4]
-flatten([["a", "b"], ["c"]])  # => ["a", "b", "c"]
+flatten([['a', 'b'], ['c']])  # => ['a', 'b', 'c']
 flatten([[1, 2], 3, [4]])     # => [1, 2, 3, 4]
 ```
 
@@ -135,7 +135,7 @@ length(value: list | map | string) -> int
 ```crn
 length([1, 2, 3])       # => 3
 length({a = 1, b = 2})  # => 2
-length("hello")         # => 5
+length('hello')         # => 5
 length([])              # => 0
 ```
 
@@ -151,23 +151,23 @@ When applied to a list of maps, returns a list of the extracted values:
 
 ```crn
 let subnets = [
-  { name = "a", subnet_id = "id-1" },
-  { name = "b", subnet_id = "id-2" },
+  { name = 'a', subnet_id = 'id-1' },
+  { name = 'b', subnet_id = 'id-2' },
 ]
 
-map(".subnet_id", subnets)       # => ["id-1", "id-2"]
-subnets |> map(".subnet_id")     # => ["id-1", "id-2"] (pipe form)
+map('.subnet_id', subnets)       # => ['id-1', 'id-2']
+subnets |> map('.subnet_id')     # => ['id-1', 'id-2'] (pipe form)
 ```
 
 When applied to a map of maps, returns a map with the same keys and extracted values:
 
 ```crn
 let envs = {
-  dev = { cidr = "10.0.0.0/16", name = "development" }
-  stg = { cidr = "10.1.0.0/16", name = "staging" }
+  dev = { cidr = '10.0.0.0/16', name = 'development' }
+  stg = { cidr = '10.1.0.0/16', name = 'staging' }
 }
 
-envs |> map(".cidr")  # => { dev = "10.0.0.0/16", stg = "10.1.0.0/16" }
+envs |> map('.cidr')  # => { dev = '10.0.0.0/16', stg = '10.1.0.0/16' }
 ```
 
 ## Map Functions
@@ -181,7 +181,7 @@ keys(map: map) -> list
 ```
 
 ```crn
-keys({ b = 2, a = 1, c = 3 })  # => ["a", "b", "c"]
+keys({ b = 2, a = 1, c = 3 })  # => ['a', 'b', 'c']
 keys({})                         # => []
 ```
 
@@ -207,8 +207,8 @@ lookup(map: map, key: string, default: any) -> any
 ```
 
 ```crn
-lookup({ a = "one", b = "two" }, "a", "default")  # => "one"
-lookup({ a = "one", b = "two" }, "c", "default")  # => "default"
+lookup({ a = 'one', b = 'two' }, 'a', 'default')  # => 'one'
+lookup({ a = 'one', b = 'two' }, 'c', 'default')  # => 'default'
 ```
 
 ## Numeric Functions
@@ -256,18 +256,18 @@ cidr_subnet(prefix: string, newbits: int, netnum: int) -> string
 - `netnum`: subnet number within the new address space
 
 ```crn
-cidr_subnet("10.0.0.0/16", 8, 0)    # => "10.0.0.0/24"
-cidr_subnet("10.0.0.0/16", 8, 1)    # => "10.0.1.0/24"
-cidr_subnet("10.0.0.0/16", 8, 255)  # => "10.0.255.0/24"
-cidr_subnet("10.0.0.0/8", 8, 10)    # => "10.10.0.0/16"
+cidr_subnet('10.0.0.0/16', 8, 0)    # => '10.0.0.0/24'
+cidr_subnet('10.0.0.0/16', 8, 1)    # => '10.0.1.0/24'
+cidr_subnet('10.0.0.0/16', 8, 255)  # => '10.0.255.0/24'
+cidr_subnet('10.0.0.0/8', 8, 10)    # => '10.10.0.0/16'
 ```
 
 This is commonly used with `for` expressions to allocate subnets:
 
 ```crn
-let vpcs = for (i, env) in ["dev", "stg"] {
+let vpcs = for (i, env) in ['dev', 'stg'] {
   awscc.ec2.vpc {
-    cidr_block = cidr_subnet("10.0.0.0/8", 8, i)
+    cidr_block = cidr_subnet('10.0.0.0/8', 8, i)
   }
 }
 ```
@@ -283,8 +283,8 @@ env(name: string) -> string
 ```
 
 ```crn
-let home = env("HOME")
-let db_host = env("DB_HOST")
+let home = env('HOME')
+let db_host = env('DB_HOST')
 ```
 
 ## Security Functions
@@ -299,7 +299,7 @@ secret(value: any) -> secret
 
 ```crn
 awscc.rds.db_instance {
-  master_user_password = secret(env("DB_PASSWORD"))
+  master_user_password = secret(env('DB_PASSWORD'))
 }
 ```
 
@@ -313,14 +313,14 @@ decrypt(ciphertext: string, key?: string) -> string
 
 ```crn
 # Key embedded in ciphertext (e.g., AWS KMS encrypted blob)
-let password = decrypt("AQICAHh...")
+let password = decrypt('AQICAHh...')
 
 # Explicit key
-let password = decrypt("AQICAHh...", "alias/my-key")
+let password = decrypt('AQICAHh...', 'alias/my-key')
 
 # Combined with secret() to prevent storing the decrypted value in state
 awscc.rds.db_instance {
-  master_user_password = secret(decrypt("AQICAHh..."))
+  master_user_password = secret(decrypt('AQICAHh...'))
 }
 ```
 

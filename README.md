@@ -46,22 +46,22 @@ provider aws {
 }
 
 let main_vpc = aws.vpc {
-  name       = "main-vpc"
-  cidr_block = "10.0.0.0/16"
+  name       = 'main-vpc'
+  cidr_block = '10.0.0.0/16'
 }
 
 let web_sg = aws.security_group {
-  name   = "web-sg"
+  name   = 'web-sg'
   vpc_id = main_vpc.id
 }
 
 aws.security_group.ingress_rule {
-  name              = "http"
+  name              = 'http'
   security_group_id = web_sg.id
   from_port         = 80
   to_port           = 80
-  protocol          = "tcp"
-  cidr_blocks       = ["0.0.0.0/0"]
+  protocol          = 'tcp'
+  cidr_blocks       = ['0.0.0.0/0']
 }
 ```
 
@@ -124,11 +124,11 @@ provider aws {
 
 ```hcl
 aws.security_group.ingress_rule {
-  name              = "http"
+  name              = 'http'
   security_group_id = web_sg.id
   from_port         = 80
   to_port           = 80
-  protocol          = "tcp"
+  protocol          = 'tcp'
 }
 ```
 
@@ -136,7 +136,7 @@ aws.security_group.ingress_rule {
 
 ```hcl
 let web_sg = aws.security_group {
-  name   = "web-sg"
+  name   = 'web-sg'
   vpc_id = main_vpc.id
 }
 ```
@@ -148,14 +148,14 @@ Use the `read` keyword to reference existing infrastructure without managing its
 ```hcl
 # Read an existing VPC (data source)
 let existing_vpc = read aws.vpc {
-  name = "production-vpc"
+  name = 'production-vpc'
 }
 
 # Create a new subnet that references the existing VPC
 let app_subnet = aws.subnet {
-  name              = "app-subnet"
+  name              = 'app-subnet'
   vpc_id            = existing_vpc.id
-  cidr_block        = "10.0.100.0/24"
+  cidr_block        = '10.0.100.0/24'
   availability_zone = aws.AvailabilityZone.ap_northeast_1a
 }
 ```
@@ -183,22 +183,22 @@ Some resources support nested objects for inline configuration. Use repeated blo
 
 ```hcl
 awscc.ec2.security_group {
-  name              = "web-sg"
+  name              = 'web-sg'
   vpc_id            = vpc.vpc_id
-  group_description = "Web server security group"
+  group_description = 'Web server security group'
 
   security_group_ingress {
-    ip_protocol = "tcp"
+    ip_protocol = 'tcp'
     from_port   = 80
     to_port     = 80
-    cidr_ip     = "0.0.0.0/0"
+    cidr_ip     = '0.0.0.0/0'
   }
 
   security_group_ingress {
-    ip_protocol = "tcp"
+    ip_protocol = 'tcp'
     from_port   = 443
     to_port     = 443
-    cidr_ip     = "0.0.0.0/0"
+    cidr_ip     = '0.0.0.0/0'
   }
 }
 ```
@@ -208,10 +208,10 @@ Array syntax is also supported:
 ```hcl
   security_group_ingress = [
     {
-      ip_protocol = "tcp"
+      ip_protocol = 'tcp'
       from_port   = 80
       to_port     = 80
-      cidr_ip     = "0.0.0.0/0"
+      cidr_ip     = '0.0.0.0/0'
     }
   ]
 ```
@@ -234,25 +234,25 @@ output {
 }
 
 let web_sg = aws.security_group {
-  name        = "web-sg"
+  name        = 'web-sg'
   vpc_id      = input.vpc
-  description = "Security group for web servers"
+  description = 'Security group for web servers'
 }
 ```
 
 **Using modules**:
 
 ```hcl
-let web_tier = import "./modules/web_tier"
+let web_tier = import './modules/web_tier'
 
 let main_vpc = aws.vpc {
-  name       = "main-vpc"
-  cidr_block = "10.0.0.0/16"
+  name       = 'main-vpc'
+  cidr_block = '10.0.0.0/16'
 }
 
 web_tier {
   vpc         = main_vpc.id
-  cidr_blocks = ["10.0.1.0/24", "10.0.2.0/25"]
+  cidr_blocks = ['10.0.1.0/24', '10.0.2.0/25']
 }
 ```
 
@@ -428,8 +428,8 @@ Store state in an S3 bucket:
 
 ```hcl
 backend s3 {
-  bucket      = "my-carina-state"
-  key         = "infra/prod/carina.crnstate"
+  bucket      = 'my-carina-state'
+  key         = 'infra/prod/carina.crnstate'
   region      = aws.Region.ap_northeast_1
   encrypt     = true
   auto_create = true  # Automatically create the bucket if it doesn't exist
@@ -440,7 +440,7 @@ provider aws {
 }
 
 aws.s3.bucket {
-  name = "my-app-data"
+  name = 'my-app-data'
 }
 ```
 

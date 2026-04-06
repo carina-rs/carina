@@ -22,12 +22,12 @@ Examples:
 
 ```crn
 awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 
   tags = {
-    Name = upper("my-vpc")              # "MY-VPC"
-    Env  = replace("_", "-", "my_env")  # "my-env"
-    Id   = join("-", ["vpc", "prod"])    # "vpc-prod"
+    Name = upper('my-vpc')              # 'MY-VPC'
+    Env  = replace('_', '-', 'my_env')  # 'my-env'
+    Id   = join('-', ['vpc', 'prod'])    # 'vpc-prod'
   }
 }
 ```
@@ -47,14 +47,14 @@ awscc.ec2.vpc {
 Examples:
 
 ```crn
-let parts1 = ["web", "test"]
-let parts2 = ["vpc"]
+let parts1 = ['web', 'test']
+let parts2 = ['vpc']
 
 awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 
   tags = {
-    Name = join("-", concat(parts2, parts1))  # "web-test-vpc"
+    Name = join('-', concat(parts2, parts1))  # 'web-test-vpc'
   }
 }
 ```
@@ -75,10 +75,10 @@ awscc.ec2.vpc {
 Example:
 
 ```crn
-let vpcs = for (i, env) in ["dev", "stg"] {
+let vpcs = for (i, env) in ['dev', 'stg'] {
   awscc.ec2.vpc {
-    cidr_block = cidr_subnet("10.0.0.0/8", 8, i)
-    # i=0 -> "10.0.0.0/16", i=1 -> "10.1.0.0/16"
+    cidr_block = cidr_subnet('10.0.0.0/8', 8, i)
+    # i=0 -> '10.0.0.0/16', i=1 -> '10.1.0.0/16'
 
     tags = {
       Name = "vpc-${env}"
@@ -101,14 +101,14 @@ Define reusable logic with the `fn` keyword:
 
 ```crn
 fn tag_name(env: string, service: string): string {
-  join("-", [env, service, "vpc"])
+  join('-', [env, service, 'vpc'])
 }
 
 awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 
   tags = {
-    Name = tag_name("production", "web")  # "production-web-vpc"
+    Name = tag_name('production', 'web')  # 'production-web-vpc'
   }
 }
 ```
@@ -141,7 +141,7 @@ fn subnet_name(env: string, tier: string, index: int): string {
 Parameters can have default values:
 
 ```crn
-fn make_tags(name: string, env: string = "dev"): map(string) {
+fn make_tags(name: string, env: string = 'dev'): map(string) {
   {
     Name        = name
     Environment = env
@@ -155,20 +155,20 @@ The pipe operator `|>` passes the result of the left side as the **last** argume
 
 ```crn
 # Without pipe
-let result = join("-", split("_", upper("hello_world")))
+let result = join('-', split('_', upper('hello_world')))
 
 # With pipe -- reads left to right
-let result = "hello_world" |> upper() |> split("_") |> join("-")
-# Result: "HELLO-WORLD"
+let result = 'hello_world' |> upper() |> split('_') |> join('-')
+# Result: 'HELLO-WORLD'
 ```
 
 The pipe operator is especially useful with collection functions:
 
 ```crn
-let names = ["web", "api", "worker"]
+let names = ['web', 'api', 'worker']
 
 # Extract and transform
-let result = names |> join(", ")
+let result = names |> join(', ')
 ```
 
 ## Compose operator
@@ -176,9 +176,9 @@ let result = names |> join(", ")
 The compose operator `>>` creates a new function by chaining two partially applied functions (closures). Both sides must be closures:
 
 ```crn
-# split("_") is a closure (1 of 2 args provided)
-# join("-") is a closure (1 of 2 args provided)
-let transform = split("_") >> join("-")
+# split('_') is a closure (1 of 2 args provided)
+# join('-') is a closure (1 of 2 args provided)
+let transform = split('_') >> join('-')
 ```
 
 The resulting function applies the left function first, then passes the result to the right function.
@@ -189,10 +189,10 @@ When you call a built-in function with fewer arguments than it expects, you get 
 
 ```crn
 # replace expects 3 args; giving 2 returns a closure
-let dashify = replace("_", "-")
+let dashify = replace('_', '-')
 
 # The closure is called when the last argument arrives (via pipe)
-let result = "hello_world" |> dashify()  # "hello-world"
+let result = 'hello_world' |> dashify()  # 'hello-world'
 ```
 
 This works naturally with the pipe operator, since the piped value fills in the last argument.

@@ -13,7 +13,7 @@ Allocates an internet gateway for use with a VPC. After creating the Internet ga
 ```crn
 awscc.ec2.internet_gateway {
   tags = {
-    Environment = "example"
+    Environment = 'example'
   }
 }
 ```

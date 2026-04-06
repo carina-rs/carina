@@ -12,29 +12,29 @@ Resource Type definition for AWS::EC2::SecurityGroup
 
 ```crn
 let vpc = awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 }
 
 awscc.ec2.security_group {
   vpc_id            = vpc.vpc_id
-  group_description = "Example security group"
+  group_description = 'Example security group'
 
   security_group_ingress {
-    ip_protocol = "tcp"
+    ip_protocol = 'tcp'
     from_port   = 80
     to_port     = 80
-    cidr_ip     = "0.0.0.0/0"
+    cidr_ip     = '0.0.0.0/0'
   }
 
   security_group_ingress {
-    ip_protocol = "tcp"
+    ip_protocol = 'tcp'
     from_port   = 443
     to_port     = 443
-    cidr_ip     = "0.0.0.0/0"
+    cidr_ip     = '0.0.0.0/0'
   }
 
   tags = {
-    Environment = "example"
+    Environment = 'example'
   }
 }
 ```

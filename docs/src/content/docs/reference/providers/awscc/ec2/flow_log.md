@@ -12,7 +12,7 @@ Specifies a VPC flow log, which enables you to capture IP traffic for a specific
 
 ```crn
 let vpc = awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 }
 
 awscc.ec2.flow_log {
@@ -20,10 +20,10 @@ awscc.ec2.flow_log {
   resource_type        = VPC
   traffic_type         = ALL
   log_destination_type = s3
-  log_destination      = "arn:aws:s3:::example-flow-logs-bucket"
+  log_destination      = 'arn:aws:s3:::example-flow-logs-bucket'
 
   tags = {
-    Environment = "example"
+    Environment = 'example'
   }
 }
 ```

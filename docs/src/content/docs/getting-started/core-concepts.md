@@ -39,9 +39,9 @@ Configure a provider in your `.crn` file:
 
 ```crn
 provider awscc {
-  source  = "file:///path/to/carina_provider_awscc.wasm"
-  version = "0.2.0"
-  region  = "ap-northeast-1"
+  source  = 'file:///path/to/carina_provider_awscc.wasm'
+  version = '0.2.0'
+  region  = 'ap-northeast-1'
 }
 ```
 
@@ -85,7 +85,7 @@ When no other resource needs to reference it:
 
 ```crn
 awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 }
 ```
 
@@ -95,12 +95,12 @@ When you need to reference a resource's attributes:
 
 ```crn
 let vpc = awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 }
 
 awscc.ec2.subnet {
   vpc_id     = vpc.vpc_id
-  cidr_block = "10.0.1.0/24"
+  cidr_block = '10.0.1.0/24'
 }
 ```
 
@@ -118,7 +118,7 @@ Control resource behavior during updates and deletions:
 
 ```crn
 awscc.s3.bucket {
-  bucket_name = "my-bucket"
+  bucket_name = 'my-bucket'
 
   lifecycle {
     force_delete = true

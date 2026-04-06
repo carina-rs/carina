@@ -12,20 +12,20 @@ Describes a subnet.
 
 ```crn
 let vpc = aws.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 
   tags = {
-    Environment = "example"
+    Environment = 'example'
   }
 }
 
 aws.ec2.subnet {
   vpc_id            = vpc.vpc_id
-  cidr_block        = "10.0.1.0/24"
+  cidr_block        = '10.0.1.0/24'
   availability_zone = aws.AvailabilityZone.ap_northeast_1a
 
   tags = {
-    Environment = "example"
+    Environment = 'example'
   }
 }
 ```

@@ -13,7 +13,7 @@ Specifies a route table for the specified VPC. After you create a route table, y
 
 ```crn
 let vpc = awscc.ec2.vpc {
-  cidr_block           = "10.0.0.0/16"
+  cidr_block           = '10.0.0.0/16'
   enable_dns_support   = true
   enable_dns_hostnames = true
 }
@@ -22,7 +22,7 @@ awscc.ec2.route_table {
   vpc_id = vpc.vpc_id
 
   tags = {
-    Environment = "example"
+    Environment = 'example'
   }
 }
 ```

@@ -22,7 +22,7 @@ let vpc = awscc.ec2.vpc {
   cidr_block = cidr_block
 
   tags = {
-    Name = "module-vpc"
+    Name = 'module-vpc'
   }
 }
 
@@ -32,7 +32,7 @@ let subnet = awscc.ec2.subnet {
   availability_zone = az
 
   tags = {
-    Name = "module-subnet"
+    Name = 'module-subnet'
   }
 }
 
@@ -77,12 +77,12 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let network = import "./modules/network"
+let network = import './modules/network'
 
 network {
-  cidr_block  = "10.0.0.0/16"
-  subnet_cidr = "10.0.1.0/24"
-  az          = "ap-northeast-1a"
+  cidr_block  = '10.0.0.0/16'
+  subnet_cidr = '10.0.1.0/24'
+  az          = 'ap-northeast-1a'
 }
 ```
 
@@ -93,18 +93,18 @@ The `import` expression loads the module and binds it to a name. You then call t
 To use a module's output attributes, bind the module call with `let`:
 
 ```crn
-let network = import "./modules/network"
+let network = import './modules/network'
 
 let net = network {
-  cidr_block  = "10.0.0.0/16"
-  subnet_cidr = "10.0.1.0/24"
-  az          = "ap-northeast-1a"
+  cidr_block  = '10.0.0.0/16'
+  subnet_cidr = '10.0.1.0/24'
+  az          = 'ap-northeast-1a'
 }
 
 # Use module output to create another resource
 awscc.ec2.route_table {
   vpc_id = net.vpc_id
-  tags   = { Name = "my-route-table" }
+  tags   = { Name = 'my-route-table' }
 }
 ```
 
@@ -122,7 +122,7 @@ Directory modules are useful when a module grows large or needs helper files. Th
 Both forms are imported the same way:
 
 ```crn
-let network = import "./modules/network"
+let network = import './modules/network'
 ```
 
 ## Nested modules
@@ -132,7 +132,7 @@ A module can import other modules. This lets you compose infrastructure from sma
 For example, `modules/network_with_rt/main.crn` can import the network module:
 
 ```crn
-let network = import "../network"
+let network = import '../network'
 
 arguments {
   cidr_block : string
@@ -150,7 +150,7 @@ let rt = awscc.ec2.route_table {
   vpc_id = net.vpc_id
 
   tags = {
-    Name = "nested-module-rt"
+    Name = 'nested-module-rt'
   }
 }
 
@@ -167,11 +167,11 @@ Import paths are relative to the module file's location.
 Modules can be called inside `for` expressions to create multiple instances:
 
 ```crn
-let vpc_mod = import "./modules/vpc_only"
+let vpc_mod = import './modules/vpc_only'
 
 let cidrs = {
-  dev = "10.0.0.0/16"
-  stg = "10.1.0.0/16"
+  dev = '10.0.0.0/16'
+  stg = '10.1.0.0/16'
 }
 
 let networks = for name, cidr in cidrs {

@@ -13,23 +13,23 @@ Creates a new role for your AWS-account.
 
 ```crn
 awscc.iam.role {
-  role_name = "my-example-role"
+  role_name = 'my-example-role'
 
   assume_role_policy_document = {
-    version = "2012-10-17"
+    version = '2012-10-17'
     statement {
-      effect = "Allow"
+      effect = 'Allow'
 
       principal = {
-        service = "lambda.amazonaws.com"
+        service = 'lambda.amazonaws.com'
       }
 
-      action = "sts:AssumeRole"
+      action = 'sts:AssumeRole'
     }
   }
 
   tags = {
-    Environment = "example"
+    Environment = 'example'
   }
 }
 ```

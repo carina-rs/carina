@@ -12,8 +12,8 @@ The Carina DSL is a statically-aware language with the following value types.
 Strings are enclosed in double quotes:
 
 ```crn
-let name = "my-vpc"
-let region = "ap-northeast-1"
+let name = 'my-vpc'
+let region = 'ap-northeast-1'
 ```
 
 #### Escape Sequences
@@ -34,10 +34,10 @@ Strings support the following escape sequences:
 Embed expressions inside strings with `${}`:
 
 ```crn
-let env = "prod"
-let name = "vpc-${env}"           # => "vpc-prod"
+let env = 'prod'
+let name = "vpc-${env}"           # => 'vpc-prod'
 let cidr = "${base_cidr}"         # => value of base_cidr
-let tag = "${env}-${service}"     # => "prod-web"
+let tag = "${env}-${service}"     # => 'prod-web'
 ```
 
 Any expression can appear inside `${}`, including function calls:
@@ -81,7 +81,7 @@ let public = false
 Ordered sequences enclosed in square brackets:
 
 ```crn
-let zones = ["ap-northeast-1a", "ap-northeast-1c", "ap-northeast-1d"]
+let zones = ['ap-northeast-1a', 'ap-northeast-1c', 'ap-northeast-1d']
 let ports = [80, 443, 8080]
 let empty = []
 ```
@@ -90,7 +90,7 @@ Lists can contain mixed types and a trailing comma is allowed:
 
 ```crn
 let mixed = [
-  "hello",
+  'hello',
   42,
   true,
 ]
@@ -102,8 +102,8 @@ Key-value collections enclosed in curly braces. Keys are identifiers (unquoted),
 
 ```crn
 let config = {
-  dev = "10.0.0.0/16"
-  stg = "10.1.0.0/16"
+  dev = '10.0.0.0/16'
+  stg = '10.1.0.0/16'
 }
 ```
 
@@ -111,11 +111,11 @@ Maps are also used for resource tags and nested configuration:
 
 ```crn
 awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 
   tags = {
-    Name        = "main"
-    Environment = "prod"
+    Name        = 'main'
+    Environment = 'prod'
   }
 }
 ```
@@ -165,12 +165,12 @@ When a resource is bound with `let`, its attributes can be accessed using dot no
 
 ```crn
 let vpc = awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 }
 
 let subnet = awscc.ec2.subnet {
   vpc_id     = vpc.vpc_id      # Reference vpc's vpc_id attribute
-  cidr_block = "10.0.1.0/24"
+  cidr_block = '10.0.1.0/24'
 }
 ```
 
@@ -188,7 +188,7 @@ Use square brackets to access list elements or map values:
 
 ```crn
 let first_zone = zones[0]
-let dev_cidr = config["dev"]
+let dev_cidr = config['dev']
 ```
 
 Index and field access can be combined:
@@ -242,5 +242,5 @@ attributes {
 The `null` literal represents the absence of a value. It can only appear in [validate expressions](/reference/dsl/expressions/#validate-expressions) such as `require` statements and argument validation:
 
 ```crn
-require value != null, "Value must not be null"
+require value != null, 'Value must not be null'
 ```

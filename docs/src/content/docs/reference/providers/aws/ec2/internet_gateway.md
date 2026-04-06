@@ -12,10 +12,10 @@ Describes an internet gateway.
 
 ```crn
 let vpc = aws.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 
   tags = {
-    Environment = "example"
+    Environment = 'example'
   }
 }
 
@@ -23,7 +23,7 @@ aws.ec2.internet_gateway {
   vpc_id = vpc.vpc_id
 
   tags = {
-    Environment = "example"
+    Environment = 'example'
   }
 }
 ```

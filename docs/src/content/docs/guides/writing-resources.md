@@ -21,13 +21,13 @@ The simplest way to define a resource is an **anonymous resource**. Use this whe
 
 ```crn
 awscc.ec2.vpc {
-  cidr_block           = "10.0.0.0/16"
+  cidr_block           = '10.0.0.0/16'
   enable_dns_support   = true
   enable_dns_hostnames = true
   instance_tenancy     = default
 
   tags = {
-    Environment = "production"
+    Environment = 'production'
   }
 }
 ```
@@ -40,13 +40,13 @@ When another resource needs to reference attributes from a resource, use a `let`
 
 ```crn
 let vpc = awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 }
 
 awscc.ec2.subnet {
   vpc_id            = vpc.vpc_id
-  cidr_block        = "10.0.1.0/24"
-  availability_zone = "ap-northeast-1a"
+  cidr_block        = '10.0.1.0/24'
+  availability_zone = 'ap-northeast-1a'
 }
 ```
 
@@ -61,7 +61,7 @@ Resource attributes support several value types:
 ```crn
 awscc.ec2.vpc {
   # String
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 
   # Boolean
   enable_dns_support = true
@@ -74,8 +74,8 @@ awscc.ec2.vpc {
 
   # Map
   tags = {
-    Name        = "my-vpc"
-    Environment = "production"
+    Name        = 'my-vpc'
+    Environment = 'production'
   }
 }
 ```
@@ -85,10 +85,10 @@ awscc.ec2.vpc {
 Strings support interpolation with `${}`:
 
 ```crn
-let env = "production"
+let env = 'production'
 
 awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 
   tags = {
     Name = "vpc-${env}"
@@ -102,31 +102,31 @@ Some resources have nested configuration blocks. Repeat the block name to add mu
 
 ```crn
 let vpc = awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 }
 
 awscc.ec2.security_group {
   vpc_id            = vpc.vpc_id
-  group_description = "Web server security group"
+  group_description = 'Web server security group'
 
   security_group_ingress {
-    ip_protocol = "tcp"
+    ip_protocol = 'tcp'
     from_port   = 80
     to_port     = 80
-    cidr_ip     = "0.0.0.0/0"
-    description = "Allow HTTP"
+    cidr_ip     = '0.0.0.0/0'
+    description = 'Allow HTTP'
   }
 
   security_group_ingress {
-    ip_protocol = "tcp"
+    ip_protocol = 'tcp'
     from_port   = 443
     to_port     = 443
-    cidr_ip     = "0.0.0.0/0"
-    description = "Allow HTTPS"
+    cidr_ip     = '0.0.0.0/0'
+    description = 'Allow HTTPS'
   }
 
   tags = {
-    Name = "web-sg"
+    Name = 'web-sg'
   }
 }
 ```
@@ -137,10 +137,10 @@ You can define local variables inside a resource block with `let`. These are sco
 
 ```crn
 awscc.ec2.vpc {
-  let env  = "production"
+  let env  = 'production'
   let name = "local-let-${env}"
 
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 
   tags = {
     Name = name
@@ -171,7 +171,7 @@ Carina supports line comments with `//` or `#`, and block comments with `/* ... 
    block comment */
 
 awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"  # inline comment
+  cidr_block = '10.0.0.0/16'  # inline comment
 }
 ```
 
@@ -185,23 +185,23 @@ provider awscc {
 }
 
 let vpc = awscc.ec2.vpc {
-  cidr_block           = "10.0.0.0/16"
+  cidr_block           = '10.0.0.0/16'
   enable_dns_support   = true
   enable_dns_hostnames = true
 
   tags = {
-    Name = "my-vpc"
+    Name = 'my-vpc'
   }
 }
 
 awscc.ec2.subnet {
   vpc_id                  = vpc.vpc_id
-  cidr_block              = "10.0.1.0/24"
-  availability_zone       = "ap-northeast-1a"
+  cidr_block              = '10.0.1.0/24'
+  availability_zone       = 'ap-northeast-1a'
   map_public_ip_on_launch = true
 
   tags = {
-    Name = "public-subnet"
+    Name = 'public-subnet'
   }
 }
 
@@ -209,7 +209,7 @@ awscc.ec2.route_table {
   vpc_id = vpc.vpc_id
 
   tags = {
-    Name = "public-rt"
+    Name = 'public-rt'
   }
 }
 ```

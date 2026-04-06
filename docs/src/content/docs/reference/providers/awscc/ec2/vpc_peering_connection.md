@@ -12,11 +12,11 @@ Resource Type definition for AWS::EC2::VPCPeeringConnection
 
 ```crn
 let vpc1 = awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 }
 
 let vpc2 = awscc.ec2.vpc {
-  cidr_block = "10.1.0.0/16"
+  cidr_block = '10.1.0.0/16'
 }
 
 awscc.ec2.vpc_peering_connection {
@@ -24,7 +24,7 @@ awscc.ec2.vpc_peering_connection {
   peer_vpc_id = vpc2.vpc_id
 
   tags = {
-    Environment = "example"
+    Environment = 'example'
   }
 }
 ```

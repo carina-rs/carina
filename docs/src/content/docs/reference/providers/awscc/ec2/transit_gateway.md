@@ -12,10 +12,10 @@ Resource Type definition for AWS::EC2::TransitGateway
 
 ```crn
 awscc.ec2.transit_gateway {
-  description = "Example Transit Gateway"
+  description = 'Example Transit Gateway'
 
   tags = {
-    Environment = "example"
+    Environment = 'example'
   }
 }
 ```

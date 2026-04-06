@@ -14,14 +14,14 @@ The ``AWS::S3::Bucket`` resource creates an Amazon S3 bucket in the same AWS Reg
 
 ```crn
 awscc.s3.bucket {
-  bucket_name = "my-example-bucket"
+  bucket_name = 'my-example-bucket'
 
   versioning_configuration = {
     status = Enabled
   }
 
   tags = {
-    Environment = "example"
+    Environment = 'example'
   }
 }
 ```

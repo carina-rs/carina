@@ -16,19 +16,19 @@ Adds the specified outbound (egress) rule to a security group.
 
 ```crn
 let vpc = awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 }
 
 let sg = awscc.ec2.security_group {
   vpc_id            = vpc.vpc_id
-  group_description = "Example security group"
+  group_description = 'Example security group'
 }
 
 awscc.ec2.security_group_egress {
   group_id    = sg.group_id
-  description = "Allow all outbound traffic"
+  description = 'Allow all outbound traffic'
   ip_protocol = all
-  cidr_ip     = "0.0.0.0/0"
+  cidr_ip     = '0.0.0.0/0'
 }
 ```
 
