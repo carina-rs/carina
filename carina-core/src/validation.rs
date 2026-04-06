@@ -715,6 +715,7 @@ let vpc = awscc.ec2.vpc {
             data_source: false,
             name_attribute: None,
             force_replace: false,
+            operation_config: None,
         }
     }
 
