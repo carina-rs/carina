@@ -1,6 +1,6 @@
 arguments {
   region: string {
-    description = "AWS region"
+    description = 'AWS region'
   }
 }
 
@@ -10,9 +10,9 @@ attributes {
 }
 
 let logs_bucket = awscc.s3.bucket {
-  bucket_name = "app-logs"
+  bucket_name = 'app-logs'
 }
 
 let event_queue = awscc.sqs.queue {
-  queue_name = "events"
+  queue_name = 'events'
 }
