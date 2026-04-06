@@ -1,13 +1,13 @@
 arguments {
   vpc_id: awscc.ec2.vpc {
-    description = "The VPC to deploy resources into"
+    description = 'The VPC to deploy resources into'
   }
   environment: string {
-    description = "Deployment environment name"
+    description = 'Deployment environment name'
   }
   instance_type: string {
-    description = "EC2 instance type"
-    default     = "t3.micro"
+    description = 'EC2 instance type'
+    default     = 't3.micro'
   }
   enable_monitoring: bool = true
 }
@@ -18,7 +18,7 @@ attributes {
 }
 
 let web_sg = awscc.ec2.security_group {
-  group_description = "Web security group"
+  group_description = 'Web security group'
   vpc_id            = vpc_id
 }
 

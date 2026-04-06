@@ -3,5 +3,5 @@ attributes {
 }
 
 let my_bucket = awscc.s3.bucket {
-  bucket_name = "static-assets"
+  bucket_name = 'static-assets'
 }

@@ -7,18 +7,18 @@ provider awscc {
 }
 
 moved {
-  from = awscc.ec2.vpc "old_vpc"
-  to   = awscc.ec2.vpc "new_vpc"
+  from = awscc.ec2.vpc 'old_vpc'
+  to   = awscc.ec2.vpc 'new_vpc'
 }
 
 let new_vpc = awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
   tags = {
-    Name = "updated"
+    Name = 'updated'
   }
 }
 
 awscc.ec2.subnet {
   vpc_id     = new_vpc.vpc_id
-  cidr_block = "10.0.1.0/24"
+  cidr_block = '10.0.1.0/24'
 }

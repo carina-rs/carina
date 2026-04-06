@@ -6,5 +6,5 @@ provider awscc {
 }
 
 awscc.ec2.vpc {
-  cidr_block = "not-a-cidr"
+  cidr_block = 'not-a-cidr'
 }

@@ -1,10 +1,10 @@
 arguments {
   name: string {
-    description = "Resource name prefix"
+    description = 'Resource name prefix'
   }
   env: string {
-    description = "Environment label"
-    default     = "dev"
+    description = 'Environment label'
+    default     = 'dev'
   }
 }
 

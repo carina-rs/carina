@@ -5,15 +5,15 @@ provider awscc {
 }
 
 let vpc = awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 
   tags = {
-    Name = "read-only-test"
+    Name = 'read-only-test'
   }
 }
 
 awscc.ec2.subnet {
   vpc_id            = vpc.vpc_id
-  cidr_block        = "10.0.1.0/24"
-  availability_zone = "ap-northeast-1a"
+  cidr_block        = '10.0.1.0/24'
+  availability_zone = 'ap-northeast-1a'
 }

@@ -1,5 +1,5 @@
-let a = import "cycle_a"
+let a = import 'cycle_a'
 
 let res = a {
-  value = "test"
+  value = 'test'
 }

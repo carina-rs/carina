@@ -6,5 +6,5 @@ provider awscc {
 }
 
 awscc.ec2.security_group {
-  vpc_id = "vpc-12345678abcdef012"
+  vpc_id = 'vpc-12345678abcdef012'
 }
