@@ -48,6 +48,17 @@
               ]
             }
           ]
+        },
+        {
+          "name": "string.quoted.single.crn",
+          "begin": "'",
+          "end": "'",
+          "patterns": [
+            {
+              "name": "constant.character.escape.crn",
+              "match": "\\\\."
+            }
+          ]
         }
       ]
     },
