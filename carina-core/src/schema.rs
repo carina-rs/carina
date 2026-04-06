@@ -681,6 +681,27 @@ impl AttributeSchema {
     }
 }
 
+/// Per-resource operational configuration for provider-specific timeouts and retries.
+///
+/// Providers can set these on individual resource schemas to override default
+/// polling/retry behavior. This avoids hardcoding resource-type string matches
+/// in provider implementations.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OperationConfig {
+    /// Polling timeout for delete operations in seconds.
+    /// Default: provider-specific (e.g., 600s for CloudControl).
+    pub delete_timeout_secs: Option<u64>,
+    /// Maximum retry attempts for retryable delete errors.
+    /// Default: provider-specific (e.g., 12 for CloudControl).
+    pub delete_max_retries: Option<u32>,
+    /// Polling timeout for create operations in seconds.
+    /// Default: provider-specific (e.g., 600s for CloudControl).
+    pub create_timeout_secs: Option<u64>,
+    /// Maximum retry attempts for retryable create errors.
+    /// Default: provider-specific (e.g., 12 for CloudControl).
+    pub create_max_retries: Option<u32>,
+}
+
 /// Resource schema
 #[derive(Debug, Clone)]
 pub struct ResourceSchema {
@@ -701,6 +722,9 @@ pub struct ResourceSchema {
     /// Used for resource types where the provider API rejects updates
     /// despite the schema indicating update support.
     pub force_replace: bool,
+    /// Per-resource operational config (timeouts, retries).
+    /// When None, provider defaults are used.
+    pub operation_config: Option<OperationConfig>,
 }
 
 impl ResourceSchema {
@@ -713,6 +737,7 @@ impl ResourceSchema {
             data_source: false,
             name_attribute: None,
             force_replace: false,
+            operation_config: None,
         }
     }
 
@@ -743,6 +768,11 @@ impl ResourceSchema {
 
     pub fn force_replace(mut self) -> Self {
         self.force_replace = true;
+        self
+    }
+
+    pub fn with_operation_config(mut self, config: OperationConfig) -> Self {
+        self.operation_config = Some(config);
         self
     }
 
@@ -2882,5 +2912,34 @@ mod tests {
             Some(Value::List(items)) => assert_eq!(items.len(), 1),
             other => panic!("expected List, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_operation_config_default() {
+        let config = OperationConfig::default();
+        assert_eq!(config.delete_timeout_secs, None);
+        assert_eq!(config.delete_max_retries, None);
+        assert_eq!(config.create_timeout_secs, None);
+        assert_eq!(config.create_max_retries, None);
+    }
+
+    #[test]
+    fn test_resource_schema_with_operation_config() {
+        let schema =
+            ResourceSchema::new("ec2.transit_gateway").with_operation_config(OperationConfig {
+                delete_timeout_secs: Some(1800),
+                delete_max_retries: Some(24),
+                ..Default::default()
+            });
+        let config = schema.operation_config.unwrap();
+        assert_eq!(config.delete_timeout_secs, Some(1800));
+        assert_eq!(config.delete_max_retries, Some(24));
+        assert_eq!(config.create_timeout_secs, None);
+    }
+
+    #[test]
+    fn test_resource_schema_without_operation_config() {
+        let schema = ResourceSchema::new("ec2.vpc");
+        assert!(schema.operation_config.is_none());
     }
 }

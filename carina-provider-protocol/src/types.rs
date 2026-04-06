@@ -157,6 +157,21 @@ pub struct ResourceSchema {
     pub name_attribute: Option<String>,
     #[serde(default)]
     pub force_replace: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_config: Option<OperationConfig>,
+}
+
+/// Per-resource operational configuration for timeouts and retries.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OperationConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_timeout_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_max_retries: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_timeout_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_max_retries: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,5 +355,39 @@ mod tests {
         let json = serde_json::to_string(&attr).unwrap();
         let back: AttributeType = serde_json::from_str(&json).unwrap();
         assert_eq!(json, serde_json::to_string(&back).unwrap());
+    }
+
+    #[test]
+    fn test_operation_config_serialization() {
+        let config = OperationConfig {
+            delete_timeout_secs: Some(1800),
+            delete_max_retries: Some(24),
+            create_timeout_secs: None,
+            create_max_retries: None,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"delete_timeout_secs\":1800"));
+        assert!(!json.contains("create_timeout_secs"));
+
+        let back: OperationConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.delete_timeout_secs, Some(1800));
+        assert_eq!(back.create_timeout_secs, None);
+    }
+
+    #[test]
+    fn test_resource_schema_with_operation_config() {
+        let json = r#"{"resource_type":"ec2.tgw","attributes":{},"operation_config":{"delete_timeout_secs":1800}}"#;
+        let schema: ResourceSchema = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            schema.operation_config.unwrap().delete_timeout_secs,
+            Some(1800)
+        );
+    }
+
+    #[test]
+    fn test_resource_schema_without_operation_config() {
+        let json = r#"{"resource_type":"ec2.vpc","attributes":{}}"#;
+        let schema: ResourceSchema = serde_json::from_str(json).unwrap();
+        assert!(schema.operation_config.is_none());
     }
 }
