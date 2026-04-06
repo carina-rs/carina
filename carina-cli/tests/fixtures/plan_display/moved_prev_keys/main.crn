@@ -9,7 +9,7 @@ provider awscc {
 
 moved {
   from = awscc.ec2.vpc 'old_vpc'
-  to   = awscc.ec2.vpc 'new_vpc'
+  to = awscc.ec2.vpc 'new_vpc'
 }
 
 let new_vpc = awscc.ec2.vpc {
