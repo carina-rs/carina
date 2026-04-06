@@ -906,6 +906,9 @@ pub struct State {
     pub attributes: HashMap<String, Value>,
     /// Whether this state exists
     pub exists: bool,
+    /// Binding names this resource depended on when it was last applied.
+    /// Used by the executor to determine delete ordering during replace operations.
+    pub dependency_bindings: Vec<String>,
 }
 
 impl State {
@@ -915,6 +918,7 @@ impl State {
             identifier: None,
             attributes: HashMap::new(),
             exists: false,
+            dependency_bindings: Vec::new(),
         }
     }
 
@@ -924,11 +928,17 @@ impl State {
             identifier: None,
             attributes,
             exists: true,
+            dependency_bindings: Vec::new(),
         }
     }
 
     pub fn with_identifier(mut self, identifier: impl Into<String>) -> Self {
         self.identifier = Some(identifier.into());
+        self
+    }
+
+    pub fn with_dependency_bindings(mut self, deps: Vec<String>) -> Self {
+        self.dependency_bindings = deps;
         self
     }
 }

@@ -691,14 +691,7 @@ fn build_dependency_map(
                     dep_indices.insert(dep_idx);
                 }
             }
-            // For non-Replace effects, also consider unresolved resource dependencies.
-            // For Replace effects, unresolved deps represent the OLD resource's
-            // dependencies (before resolution). These are handled as reverse deps
-            // below (for delete ordering) rather than forward deps, to avoid
-            // deadlocks where a Replace waits for a Delete that also waits for it.
-            if !matches!(effect, Effect::Replace { .. })
-                && let Some(unresolved) = unresolved_resources.get(effect.resource_id())
-            {
+            if let Some(unresolved) = unresolved_resources.get(effect.resource_id()) {
                 let unresolved_deps = get_resource_dependencies(unresolved);
                 for dep_binding in &unresolved_deps {
                     if let Some(&dep_idx) = binding_to_idx.get(dep_binding) {
@@ -721,23 +714,17 @@ fn build_dependency_map(
                 }
             }
         }
-        // For Replace effects (especially CBD), the old resource (from) may depend
-        // on a resource that is being deleted. The delete of that parent must wait
-        // for this Replace to complete first (old resource deleted during Replace).
-        // Use unresolved_resources to get the original (pre-resolution) dependencies.
-        if let Effect::Replace { .. } = effect {
-            let unresolved_deps: HashSet<String> =
-                if let Some(unresolved) = unresolved_resources.get(effect.resource_id()) {
-                    get_resource_dependencies(unresolved)
-                } else {
-                    HashSet::new()
-                };
-            for dep_binding in &unresolved_deps {
-                if let Some(&dep_idx) = binding_to_idx.get(dep_binding) {
-                    // Only add reverse dep if the dependency is a Delete effect
-                    if matches!(&effects[dep_idx], Effect::Delete { .. }) {
-                        reverse_deps.push((dep_idx, idx));
-                    }
+        // For Replace effects (especially CBD), the old resource (from) may have
+        // depended on a resource that is now being deleted. The delete of that
+        // parent must wait for this Replace to complete first (the old resource
+        // is deleted during the Replace's delete phase).
+        // Use from.dependency_bindings (recorded in state) for the old dependencies.
+        if let Effect::Replace { from, .. } = effect {
+            for dep_binding in &from.dependency_bindings {
+                if let Some(&dep_idx) = binding_to_idx.get(dep_binding)
+                    && matches!(&effects[dep_idx], Effect::Delete { .. })
+                {
+                    reverse_deps.push((dep_idx, idx));
                 }
             }
         }
@@ -3785,10 +3772,11 @@ mod tests {
         let tgw_a_deps: HashSet<String> = HashSet::new();
 
         // attachment: Replace (CBD)
-        // from: depends on tgw_a
-        let attachment_from =
-            State::existing(attachment_id.clone(), HashMap::new()).with_identifier("attach-old");
-        // to: depends on tgw_b (different TGW)
+        // from: depends on tgw_a (recorded in state's dependency_bindings)
+        let attachment_from = State::existing(attachment_id.clone(), HashMap::new())
+            .with_identifier("attach-old")
+            .with_dependency_bindings(vec!["tgw_a".to_string()]);
+        // to: depends on tgw_b (different TGW — dependency changed)
         let mut attachment_to = Resource::new("test", "attachment");
         attachment_to.binding = Some("attachment".to_string());
         attachment_to.dependency_bindings = vec!["tgw_b".to_string()];
@@ -3835,14 +3823,9 @@ mod tests {
         // tgw_a: delete (should happen AFTER attachment replace completes)
         provider.push_delete(Ok(()));
 
-        // The from resource of the attachment depends on tgw_a
-        let mut attachment_unresolved = Resource::new("test", "attachment");
-        attachment_unresolved.binding = Some("attachment".to_string());
-        attachment_unresolved.dependency_bindings = vec!["tgw_a".to_string()];
-
         let input = ExecutionInput {
             plan: &plan,
-            unresolved_resources: &HashMap::from([(attachment_id.clone(), attachment_unresolved)]),
+            unresolved_resources: &HashMap::new(),
             binding_map: HashMap::new(),
             current_states: HashMap::new(),
         };

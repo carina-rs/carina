@@ -173,6 +173,7 @@ impl StateFile {
                 identifier: Some(identifier.to_string()),
                 attributes: attrs,
                 exists: true,
+                dependency_bindings: rs.unwrap().dependency_bindings.clone(),
             };
         }
         State::not_found(resource.id.clone())
@@ -207,6 +208,7 @@ impl StateFile {
                     identifier: Some(identifier.clone()),
                     attributes: attrs,
                     exists: true,
+                    dependency_bindings: rs.dependency_bindings.clone(),
                 };
                 result.insert(id, state);
             }
@@ -750,6 +752,7 @@ mod tests {
             .into_iter()
             .collect(),
             exists: true,
+            dependency_bindings: Vec::new(),
         };
 
         let existing = ResourceState::new("s3.bucket", "my-bucket", "awscc").with_protected(true);
@@ -779,6 +782,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             exists: true,
+            dependency_bindings: Vec::new(),
         };
 
         let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -971,6 +975,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             exists: true,
+            dependency_bindings: Vec::new(),
         };
 
         let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1159,6 +1164,7 @@ mod tests {
             .into_iter()
             .collect(),
             exists: true,
+            dependency_bindings: Vec::new(),
         };
 
         let mut rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1202,6 +1208,7 @@ mod tests {
             .into_iter()
             .collect(),
             exists: true,
+            dependency_bindings: Vec::new(),
         };
 
         let mut rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1237,6 +1244,7 @@ mod tests {
             .into_iter()
             .collect(),
             exists: true,
+            dependency_bindings: Vec::new(),
         };
 
         let mut rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1308,6 +1316,7 @@ mod tests {
             .into_iter()
             .collect(),
             exists: true,
+            dependency_bindings: Vec::new(),
         };
 
         let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1359,6 +1368,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             exists: true,
+            dependency_bindings: Vec::new(),
         };
 
         let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1417,6 +1427,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             exists: true,
+            dependency_bindings: Vec::new(),
         };
 
         let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1471,6 +1482,7 @@ mod tests {
             .into_iter()
             .collect(),
             exists: true,
+            dependency_bindings: Vec::new(),
         };
 
         let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();

@@ -408,6 +408,7 @@ pub fn redact_secrets_in_state(state: &crate::resource::State) -> crate::resourc
         identifier: state.identifier.clone(),
         attributes: redact_secrets_in_attributes(&state.attributes),
         exists: state.exists,
+        dependency_bindings: state.dependency_bindings.clone(),
     }
 }
 

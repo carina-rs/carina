@@ -421,6 +421,7 @@ mod tests {
                 attributes: vec![("vpc_id".to_string(), Value::String("vpc-abc".to_string()))]
                     .into_iter()
                     .collect(),
+                dependency_bindings: Vec::new(),
             },
         );
 
