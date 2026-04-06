@@ -2427,6 +2427,7 @@ fn build_state_after_apply_persists_write_only_attributes() {
                 Value::String("10.0.0.0/16".to_string()),
             )]),
             exists: true,
+            dependency_bindings: Vec::new(),
         },
     )]);
 
@@ -2501,6 +2502,7 @@ fn build_state_after_apply_write_only_detects_value_change() {
                 Value::String("10.0.0.0/24".to_string()),
             )]),
             exists: true,
+            dependency_bindings: Vec::new(),
         },
     )]);
 
