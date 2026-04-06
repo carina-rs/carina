@@ -14,10 +14,10 @@ Specifies an Elastic IP (EIP) address and can, optionally, associate it with an 
 
 ```crn
 awscc.ec2.eip {
-  domain = "vpc"
+  domain = 'vpc'
 
   tags = {
-    Environment = "example"
+    Environment = 'example'
   }
 }
 ```

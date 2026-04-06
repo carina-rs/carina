@@ -12,7 +12,7 @@ Resource Type definition for AWS::EC2::VPCGatewayAttachment
 
 ```crn
 let vpc = awscc.ec2.vpc {
-  cidr_block           = "10.0.0.0/16"
+  cidr_block           = '10.0.0.0/16'
   enable_dns_support   = true
   enable_dns_hostnames = true
 }

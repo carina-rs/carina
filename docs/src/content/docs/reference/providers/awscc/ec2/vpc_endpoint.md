@@ -15,35 +15,35 @@ Specifies a VPC endpoint. A VPC endpoint provides a private connection between y
 
 ```crn
 let vpc = awscc.ec2.vpc {
-  cidr_block           = "10.0.0.0/16"
+  cidr_block           = '10.0.0.0/16'
   enable_dns_support   = true
   enable_dns_hostnames = true
 }
 
 let subnet = awscc.ec2.subnet {
   vpc_id            = vpc.vpc_id
-  cidr_block        = "10.0.100.0/24"
-  availability_zone = "ap-northeast-1a"
+  cidr_block        = '10.0.100.0/24'
+  availability_zone = 'ap-northeast-1a'
 }
 
 let sg = awscc.ec2.security_group {
   vpc_id            = vpc.vpc_id
-  group_description = "SG for VPC Endpoint"
+  group_description = 'SG for VPC Endpoint'
 }
 
 awscc.ec2.security_group_ingress {
   group_id    = sg.group_id
-  description = "Allow HTTPS from VPC"
-  ip_protocol = "tcp"
+  description = 'Allow HTTPS from VPC'
+  ip_protocol = 'tcp'
   from_port   = 443
   to_port     = 443
-  cidr_ip     = "10.0.0.0/16"
+  cidr_ip     = '10.0.0.0/16'
 }
 
 awscc.ec2.vpc_endpoint {
   vpc_id              = vpc.vpc_id
-  service_name        = "com.amazonaws.ap-northeast-1.ecr.dkr"
-  vpc_endpoint_type   = "Interface"
+  service_name        = 'com.amazonaws.ap-northeast-1.ecr.dkr'
+  vpc_endpoint_type   = 'Interface'
   subnet_ids          = [subnet.subnet_id]
   security_group_ids  = [sg.group_id]
   private_dns_enabled = true

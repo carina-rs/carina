@@ -12,13 +12,13 @@ Describes a VPC.
 
 ```crn
 aws.ec2.vpc {
-  cidr_block           = "10.0.0.0/16"
+  cidr_block           = '10.0.0.0/16'
   enable_dns_support   = true
   enable_dns_hostnames = true
   instance_tenancy     = aws.ec2.vpc.InstanceTenancy.default
 
   tags = {
-    Environment = "example"
+    Environment = 'example'
   }
 }
 ```

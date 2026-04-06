@@ -17,9 +17,9 @@ Add a `backend` block to your `.crn` file:
 
 ```crn
 backend s3 {
-  bucket = "my-carina-state"
-  key    = "production/carina.state.json"
-  region = "ap-northeast-1"
+  bucket = 'my-carina-state'
+  key    = 'production/carina.state.json'
+  region = 'ap-northeast-1'
 }
 
 provider awscc {
@@ -27,10 +27,10 @@ provider awscc {
 }
 
 awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 
   tags = {
-    Name = "my-vpc"
+    Name = 'my-vpc'
   }
 }
 ```
@@ -43,9 +43,9 @@ By default, `carina apply` automatically creates the S3 bucket if it doesn't exi
 
 ```crn
 backend s3 {
-  bucket      = "my-carina-state"
-  key         = "production/carina.state.json"
-  region      = "ap-northeast-1"
+  bucket      = 'my-carina-state'
+  key         = 'production/carina.state.json'
+  region      = 'ap-northeast-1'
   auto_create = true  # This is the default; can be omitted
 }
 ```
@@ -74,15 +74,15 @@ To bring an existing cloud resource under Carina management, use the `import` bl
 
 ```crn
 import {
-  to = awscc.ec2.vpc "my-vpc"
-  id = "vpc-0abc123def456"
+  to = awscc.ec2.vpc 'my-vpc'
+  id = 'vpc-0abc123def456'
 }
 
 awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 
   tags = {
-    Name = "my-vpc"
+    Name = 'my-vpc'
   }
 }
 ```
@@ -98,15 +98,15 @@ When you rename a resource or reorganize your code, use the `moved` block to upd
 
 ```crn
 moved {
-  from = awscc.ec2.vpc "vpc"
-  to   = awscc.ec2.vpc "main_vpc"
+  from = awscc.ec2.vpc 'vpc'
+  to   = awscc.ec2.vpc 'main_vpc'
 }
 
 awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 
   tags = {
-    Name = "my-vpc"
+    Name = 'my-vpc'
   }
 }
 ```
@@ -119,7 +119,7 @@ To stop managing a resource without destroying it in the cloud, use the `removed
 
 ```crn
 removed {
-  from = awscc.ec2.vpc "main_vpc"
+  from = awscc.ec2.vpc 'main_vpc'
 }
 ```
 
@@ -131,15 +131,15 @@ To read outputs from another Carina project's state, use `remote_state`:
 
 ```crn
 let network = remote_state {
-  path = "network.state.json"
+  path = 'network.state.json'
 }
 
 awscc.ec2.security_group {
-  group_description = "Web security group"
+  group_description = 'Web security group'
   vpc_id            = network.vpc.vpc_id
 
   tags = {
-    Name = "web-sg"
+    Name = 'web-sg'
   }
 }
 ```
@@ -149,10 +149,10 @@ The `remote_state` block loads another project's state file and makes its resour
 You can also specify the backend type explicitly:
 
 ```crn
-let network = remote_state "s3" {
-  bucket = "carina-state"
-  key    = "network/carina.state.json"
-  region = "ap-northeast-1"
+let network = remote_state 's3' {
+  bucket = 'carina-state'
+  key    = 'network/carina.state.json'
+  region = 'ap-northeast-1'
 }
 ```
 

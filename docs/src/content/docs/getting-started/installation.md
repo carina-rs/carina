@@ -48,9 +48,9 @@ Carina uses WASM-based provider plugins. When you specify a `source` and `versio
 
 ```crn
 provider awscc {
-    source = "github.com/carina-rs/carina-provider-awscc"
-    version = "0.2.0"
-    region = "ap-northeast-1"
+    source = 'github.com/carina-rs/carina-provider-awscc'
+    version = '0.2.0'
+    region = 'ap-northeast-1'
 }
 ```
 

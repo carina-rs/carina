@@ -18,9 +18,9 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let vpcs = for env in ["dev", "stg"] {
+let vpcs = for env in ['dev', 'stg'] {
   awscc.ec2.vpc {
-    cidr_block = "10.0.0.0/16"
+    cidr_block = '10.0.0.0/16'
 
     tags = {
       Name        = "vpc-${env}"
@@ -37,9 +37,9 @@ This creates two VPCs, one for each environment.
 Use the `(index, value)` form to access the iteration index:
 
 ```crn
-let vpcs = for (i, env) in ["dev", "stg"] {
+let vpcs = for (i, env) in ['dev', 'stg'] {
   awscc.ec2.vpc {
-    cidr_block = cidr_subnet("10.0.0.0/8", 8, i)
+    cidr_block = cidr_subnet('10.0.0.0/8', 8, i)
 
     tags = {
       Name        = "vpc-${env}"
@@ -57,8 +57,8 @@ Use `key, value` binding to iterate over map entries:
 
 ```crn
 let cidrs = {
-  dev = "10.0.0.0/16"
-  stg = "10.1.0.0/16"
+  dev = '10.0.0.0/16'
+  stg = '10.1.0.0/16'
 }
 
 let vpcs = for name, cidr in cidrs {
@@ -78,9 +78,9 @@ let vpcs = for name, cidr in cidrs {
 The result of a `for` expression is a list. You can access individual elements with index syntax:
 
 ```crn
-let vpcs = for env in ["dev", "stg"] {
+let vpcs = for env in ['dev', 'stg'] {
   awscc.ec2.vpc {
-    cidr_block = "10.0.0.0/16"
+    cidr_block = '10.0.0.0/16'
 
     tags = {
       Name = "vpc-${env}"
@@ -91,11 +91,11 @@ let vpcs = for env in ["dev", "stg"] {
 # Reference the first VPC's attributes
 awscc.ec2.subnet {
   vpc_id            = vpcs[0].vpc_id
-  cidr_block        = "10.0.1.0/24"
-  availability_zone = "ap-northeast-1a"
+  cidr_block        = '10.0.1.0/24'
+  availability_zone = 'ap-northeast-1a'
 
   tags = {
-    Name = "dev-subnet"
+    Name = 'dev-subnet'
   }
 }
 ```
@@ -106,11 +106,11 @@ You can define local `let` bindings inside a `for` body:
 
 ```crn
 let vpc = awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 }
 
-let subnets = for (i, az) in ["ap-northeast-1a", "ap-northeast-1c"] {
-  let cidr = cidr_subnet("10.0.0.0/16", 8, i)
+let subnets = for (i, az) in ['ap-northeast-1a', 'ap-northeast-1c'] {
+  let cidr = cidr_subnet('10.0.0.0/16', 8, i)
 
   awscc.ec2.subnet {
     vpc_id            = vpc.vpc_id
@@ -141,10 +141,10 @@ let enabled = true
 
 let vpc = if enabled {
   awscc.ec2.vpc {
-    cidr_block = "10.0.0.0/16"
+    cidr_block = '10.0.0.0/16'
 
     tags = {
-      Name = "conditional-vpc"
+      Name = 'conditional-vpc'
     }
   }
 }
@@ -160,10 +160,10 @@ Use `if`/`else` as a value expression to choose between two values:
 let is_production = true
 
 awscc.ec2.vpc {
-  cidr_block = if is_production { "10.0.0.0/16" } else { "172.16.0.0/16" }
+  cidr_block = if is_production { '10.0.0.0/16' } else { '172.16.0.0/16' }
 
   tags = {
-    Name = if is_production { "prod-vpc" } else { "dev-vpc" }
+    Name = if is_production { 'prod-vpc' } else { 'dev-vpc' }
   }
 }
 ```
@@ -176,15 +176,15 @@ You can use `if` expressions inside `for` bodies and vice versa:
 
 ```crn
 let environments = {
-  dev = "10.0.0.0/16"
-  stg = "10.1.0.0/16"
-  prd = "10.2.0.0/16"
+  dev = '10.0.0.0/16'
+  stg = '10.1.0.0/16'
+  prd = '10.2.0.0/16'
 }
 
 let vpcs = for name, cidr in environments {
   awscc.ec2.vpc {
     cidr_block           = cidr
-    enable_dns_hostnames = if name == "prd" { true } else { false }
+    enable_dns_hostnames = if name == 'prd' { true } else { false }
 
     tags = {
       Name        = "vpc-${name}"

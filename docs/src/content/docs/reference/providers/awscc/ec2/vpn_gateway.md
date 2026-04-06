@@ -16,7 +16,7 @@ awscc.ec2.vpn_gateway {
   type = awscc.ec2.vpn_gateway.Type.ipsec.1
 
   tags = {
-    Environment = "example"
+    Environment = 'example'
   }
 }
 ```

@@ -17,23 +17,23 @@ provider awscc {
 
 # Backend configuration (optional)
 backend s3 {
-  bucket = "my-state-bucket"
-  key    = "infra/carina.state.json"
-  region = "ap-northeast-1"
+  bucket = 'my-state-bucket'
+  key    = 'infra/carina.state.json'
+  region = 'ap-northeast-1'
 }
 
 # Resource declarations
 let vpc = awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 
   tags = {
-    Name = "main"
+    Name = 'main'
   }
 }
 
 awscc.ec2.internet_gateway {
   tags = {
-    Name = "main"
+    Name = 'main'
   }
 }
 ```
@@ -90,10 +90,10 @@ When you do not need to reference a resource elsewhere, declare it without a bin
 
 ```crn
 awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 
   tags = {
-    Name = "main"
+    Name = 'main'
   }
 }
 ```
@@ -106,28 +106,28 @@ Use `let` to bind a name to a resource so you can reference its attributes:
 
 ```crn
 let vpc = awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 
   tags = {
-    Name = "main"
+    Name = 'main'
   }
 }
 
 let subnet = awscc.ec2.subnet {
   vpc_id            = vpc.vpc_id
-  cidr_block        = "10.0.1.0/24"
-  availability_zone = "ap-northeast-1a"
+  cidr_block        = '10.0.1.0/24'
+  availability_zone = 'ap-northeast-1a'
 }
 ```
 
 The `let` keyword is also used to bind non-resource values:
 
 ```crn
-let cidr = "10.0.0.0/16"
-let environments = ["dev", "stg", "prod"]
+let cidr = '10.0.0.0/16'
+let environments = ['dev', 'stg', 'prod']
 let config = {
-  dev = "10.0.0.0/16"
-  stg = "10.1.0.0/16"
+  dev = '10.0.0.0/16'
+  stg = '10.1.0.0/16'
 }
 ```
 
@@ -168,7 +168,7 @@ Attributes are key-value pairs inside a resource block:
 
 ```crn
 awscc.ec2.vpc {
-  cidr_block           = "10.0.0.0/16"
+  cidr_block           = '10.0.0.0/16'
   enable_dns_support   = true
   enable_dns_hostnames = true
 }
@@ -183,7 +183,7 @@ awscc.ec2.ipam {
   tier = advanced
 
   operating_region {
-    region_name = "ap-northeast-1"
+    region_name = 'ap-northeast-1'
   }
 }
 ```
@@ -194,7 +194,7 @@ Use `let` inside a resource block to create block-scoped variables. These are ev
 
 ```crn
 awscc.ec2.vpc {
-  let base_cidr = "10.0.0.0/16"
+  let base_cidr = '10.0.0.0/16'
 
   cidr_block = base_cidr
 
@@ -210,9 +210,9 @@ The `backend` block configures where Carina stores state:
 
 ```crn
 backend s3 {
-  bucket = "my-state-bucket"
-  key    = "infra/carina.state.json"
-  region = "ap-northeast-1"
+  bucket = 'my-state-bucket'
+  key    = 'infra/carina.state.json'
+  region = 'ap-northeast-1'
 }
 ```
 
@@ -226,15 +226,15 @@ Import an existing cloud resource into Carina's state:
 
 ```crn
 import {
-  to = awscc.ec2.vpc "imported_vpc"
-  id = "vpc-0123456789abcdef0"
+  to = awscc.ec2.vpc 'imported_vpc'
+  id = 'vpc-0123456789abcdef0'
 }
 
 awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 
   tags = {
-    Name = "imported"
+    Name = 'imported'
   }
 }
 ```
@@ -245,8 +245,8 @@ Rename a resource in state without destroying and recreating it:
 
 ```crn
 moved {
-  from = awscc.ec2.vpc "old_name"
-  to   = awscc.ec2.vpc "new_name"
+  from = awscc.ec2.vpc 'old_name'
+  to   = awscc.ec2.vpc 'new_name'
 }
 ```
 
@@ -256,7 +256,7 @@ Remove a resource from Carina's state without deleting the actual cloud resource
 
 ```crn
 removed {
-  from = awscc.ec2.vpc "old_vpc"
+  from = awscc.ec2.vpc 'old_vpc'
 }
 ```
 
@@ -266,7 +266,7 @@ Reference resources managed by another Carina project:
 
 ```crn
 let network = remote_state {
-  path = "network.state.json"
+  path = 'network.state.json'
 }
 
 awscc.ec2.security_group {
@@ -277,10 +277,10 @@ awscc.ec2.security_group {
 Remote state with an S3 backend:
 
 ```crn
-let network = remote_state "s3" {
-  bucket = "my-state-bucket"
-  key    = "network/carina.state.json"
-  region = "ap-northeast-1"
+let network = remote_state 's3' {
+  bucket = 'my-state-bucket'
+  key    = 'network/carina.state.json'
+  region = 'ap-northeast-1'
 }
 ```
 
@@ -306,14 +306,14 @@ Define reusable functions with `fn`:
 
 ```crn
 fn tag_name(env: string, service: string): string {
-  join("-", [env, service, "vpc"])
+  join('-', [env, service, 'vpc'])
 }
 
 awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 
   tags = {
-    Name = tag_name("prod", "web")
+    Name = tag_name('prod', 'web')
   }
 }
 ```
@@ -325,8 +325,8 @@ See [Expressions](/reference/dsl/expressions/) for details on function definitio
 Assert conditions that must be true, with a custom error message if they fail:
 
 ```crn
-require length(subnets) > 0, "At least one subnet must be specified"
-require cidr_block != "", "CIDR block cannot be empty"
+require length(subnets) > 0, 'At least one subnet must be specified'
+require cidr_block != '', 'CIDR block cannot be empty'
 ```
 
 The condition is a [validate expression](/reference/dsl/expressions/#validate-expressions) that supports comparison operators (`==`, `!=`, `>`, `<`, `>=`, `<=`) and logical operators (`&&`, `||`, `!`).

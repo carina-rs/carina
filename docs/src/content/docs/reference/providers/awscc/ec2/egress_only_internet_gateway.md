@@ -12,14 +12,14 @@ Resource Type definition for AWS::EC2::EgressOnlyInternetGateway
 
 ```crn
 let vpc = awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 }
 
 awscc.ec2.egress_only_internet_gateway {
   vpc_id = vpc.vpc_id
 
   tags = {
-    Environment = "example"
+    Environment = 'example'
   }
 }
 ```

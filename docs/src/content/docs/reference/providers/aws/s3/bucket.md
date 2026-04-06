@@ -10,12 +10,12 @@ CloudFormation Type: `AWS::S3::Bucket`
 
 ```crn
 aws.s3.bucket {
-  bucket = "carina-example-s3-bucket"
+  bucket = 'carina-example-s3-bucket'
 
   versioning_status = aws.s3.bucket.VersioningStatus.Enabled
 
   tags = {
-    Environment = "example"
+    Environment = 'example'
   }
 }
 ```

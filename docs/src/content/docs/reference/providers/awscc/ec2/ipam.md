@@ -12,15 +12,15 @@ Resource Schema of AWS::EC2::IPAM Type
 
 ```crn
 awscc.ec2.ipam {
-  description = "Example IPAM"
+  description = 'Example IPAM'
   tier        = free
 
   operating_region {
-    region_name = "ap-northeast-1"
+    region_name = 'ap-northeast-1'
   }
 
   tags = {
-    Environment = "example"
+    Environment = 'example'
   }
 }
 ```

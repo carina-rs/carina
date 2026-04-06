@@ -12,9 +12,9 @@ The `for` expression iterates over a list or map to create multiple resources or
 ### Iterating Over a List
 
 ```crn
-let vpcs = for env in ["dev", "stg"] {
+let vpcs = for env in ['dev', 'stg'] {
   awscc.ec2.vpc {
-    cidr_block = "10.0.0.0/16"
+    cidr_block = '10.0.0.0/16'
 
     tags = {
       Name        = "vpc-${env}"
@@ -29,9 +29,9 @@ let vpcs = for env in ["dev", "stg"] {
 Use `(index, value)` to access both the index and the element:
 
 ```crn
-let vpcs = for (i, env) in ["dev", "stg"] {
+let vpcs = for (i, env) in ['dev', 'stg'] {
   awscc.ec2.vpc {
-    cidr_block = cidr_subnet("10.0.0.0/8", 8, i)
+    cidr_block = cidr_subnet('10.0.0.0/8', 8, i)
 
     tags = {
       Name        = "for-list-test-${env}"
@@ -47,8 +47,8 @@ Use `key, value` to iterate over map entries:
 
 ```crn
 let cidrs = {
-  dev = "10.0.0.0/16"
-  stg = "10.1.0.0/16"
+  dev = '10.0.0.0/16'
+  stg = '10.1.0.0/16'
 }
 
 let vpcs = for name, cidr in cidrs {
@@ -74,7 +74,7 @@ let networks = for name, cidr in cidrs {
   network {
     cidr_block  = cidr
     subnet_cidr = subnet_cidr
-    az          = "ap-northeast-1a"
+    az          = 'ap-northeast-1a'
   }
 }
 ```
@@ -106,10 +106,10 @@ if is_production {
 
 ```crn
 awscc.ec2.vpc {
-  cidr_block = if is_production { "10.0.0.0/16" } else { "172.16.0.0/16" }
+  cidr_block = if is_production { '10.0.0.0/16' } else { '172.16.0.0/16' }
 
   tags = {
-    Name = if is_production { "prod-vpc" } else { "dev-vpc" }
+    Name = if is_production { 'prod-vpc' } else { 'dev-vpc' }
   }
 }
 ```
@@ -120,7 +120,7 @@ awscc.ec2.vpc {
 
 ```crn
 if is_production {
-  let cidr = "10.0.0.0/16"
+  let cidr = '10.0.0.0/16'
 
   awscc.ec2.vpc {
     cidr_block = cidr
@@ -134,20 +134,20 @@ if is_production {
 
 ```crn
 # Top-level value binding
-let env = "prod"
-let zones = ["ap-northeast-1a", "ap-northeast-1c"]
+let env = 'prod'
+let zones = ['ap-northeast-1a', 'ap-northeast-1c']
 
 # Top-level resource binding
 let vpc = awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
+  cidr_block = '10.0.0.0/16'
 }
 
 # Module import binding
-let network = import "./modules/network"
+let network = import './modules/network'
 
 # Remote state binding
 let shared = remote_state {
-  path = "shared.state.json"
+  path = 'shared.state.json'
 }
 ```
 
@@ -159,26 +159,26 @@ The pipe operator passes the result of the left expression as the last argument 
 
 ```crn
 # Without pipe: nested calls are hard to read
-let result = join("-", concat(["vpc"], ["prod", "web"]))
+let result = join('-', concat(['vpc'], ['prod', 'web']))
 
 # With pipe: reads left to right
-let result = ["prod", "web"] |> concat(["vpc"]) |> join("-")
+let result = ['prod', 'web'] |> concat(['vpc']) |> join('-')
 ```
 
 The pipe operator works with any built-in function. The piped value becomes the last argument:
 
 ```crn
 # These are equivalent:
-join("-", ["a", "b", "c"])
-["a", "b", "c"] |> join("-")
+join('-', ['a', 'b', 'c'])
+['a', 'b', 'c'] |> join('-')
 
 # These are equivalent:
-replace("-", "_", "hello-world")
-"hello-world" |> replace("-", "_")
+replace('-', '_', 'hello-world')
+'hello-world' |> replace('-', '_')
 
 # These are equivalent:
-split(",", "a,b,c")
-"a,b,c" |> split(",")
+split(',', 'a,b,c')
+'a,b,c' |> split(',')
 ```
 
 ### Chaining Multiple Pipes
@@ -186,9 +186,9 @@ split(",", "a,b,c")
 Multiple pipe operations can be chained for complex transformations:
 
 ```crn
-let result = ["prod", "web"]
-  |> concat(["vpc"])
-  |> join("-")
+let result = ['prod', 'web']
+  |> concat(['vpc'])
+  |> join('-')
   |> upper()
 ```
 
@@ -198,26 +198,26 @@ The compose operator (`>>`) combines two partially applied functions into a new 
 
 ```crn
 # Compose split and join into a single function
-let transform = split(",") >> join("-")
+let transform = split(',') >> join('-')
 
 # Apply the composed function via pipe
-let result = "a,b,c" |> transform()
-# => "a-b-c"
+let result = 'a,b,c' |> transform()
+# => 'a-b-c'
 ```
 
 Compose works with any partially applied built-in function:
 
 ```crn
 # Extract IDs from a list of maps, then join them
-let pipeline = map(".id") >> join(", ")
-let result = [{ id = "1" }, { id = "2" }] |> pipeline()
-# => "1, 2"
+let pipeline = map('.id') >> join(', ')
+let result = [{ id = '1' }, { id = '2' }] |> pipeline()
+# => '1, 2'
 ```
 
 Three or more functions can be composed:
 
 ```crn
-let transform = split(",") >> join("-") >> split("-")
+let transform = split(',') >> join('-') >> split('-')
 ```
 
 The compose operator binds tighter than the pipe operator, so `f >> g |> h` means `(f >> g) |> h`.
@@ -228,8 +228,8 @@ Functions are called with parentheses:
 
 ```crn
 let len = length(zones)
-let subnet = cidr_subnet("10.0.0.0/16", 8, 1)
-let name = join("-", ["prod", "web", "vpc"])
+let subnet = cidr_subnet('10.0.0.0/16', 8, 1)
+let name = join('-', ['prod', 'web', 'vpc'])
 ```
 
 ### Partial Application
@@ -239,18 +239,18 @@ When a built-in function is called with fewer arguments than it expects, it retu
 ```crn
 # split expects 2 args: split(separator, string)
 # Providing only 1 creates a closure
-let split_by_comma = split(",")
+let split_by_comma = split(',')
 
 # The closure can be used with pipe (parentheses are required)
-let parts = "a,b,c" |> split_by_comma()
+let parts = 'a,b,c' |> split_by_comma()
 ```
 
 This is particularly useful with the pipe operator:
 
 ```crn
-let result = "hello-world" |> replace("-", "_")
-# replace(search, replacement, string) gets "-" and "_" captured,
-# then "hello-world" is supplied as the third argument via pipe
+let result = 'hello-world' |> replace('-', '_')
+# replace(search, replacement, string) gets '-' and '_' captured,
+# then 'hello-world' is supplied as the third argument via pipe
 ```
 
 ## User-Defined Functions
@@ -259,7 +259,7 @@ Define functions with `fn`. Parameters can have optional type annotations and de
 
 ```crn
 fn tag_name(env: string, service: string): string {
-  join("-", [env, service, "vpc"])
+  join('-', [env, service, 'vpc'])
 }
 ```
 
@@ -271,7 +271,7 @@ Function parameters support:
 - No annotation: `name` (any type accepted)
 
 ```crn
-fn make_tags(env: string, service: string, team: string = "platform") {
+fn make_tags(env: string, service: string, team: string = 'platform') {
   {
     Environment = env
     Service     = service
@@ -286,7 +286,7 @@ Functions can contain `let` bindings before the return expression:
 
 ```crn
 fn subnet_name(env: string, az: string): string {
-  let short_az = replace("ap-northeast-1", "", az)
+  let short_az = replace('ap-northeast-1', '', az)
   "${env}-subnet-${short_az}"
 }
 ```
@@ -297,7 +297,7 @@ The optional return type annotation follows the parameter list with a colon:
 
 ```crn
 fn cidr_for_env(env: string): string {
-  lookup({ dev = "10.0.0.0/16", stg = "10.1.0.0/16" }, env, "10.99.0.0/16")
+  lookup({ dev = '10.0.0.0/16', stg = '10.1.0.0/16' }, env, '10.99.0.0/16')
 }
 ```
 
@@ -329,11 +329,11 @@ Validate expressions are boolean expressions used in `arguments` blocks for inpu
 ```crn
 arguments {
   instance_count: int {
-    description = "Number of instances to create"
+    description = 'Number of instances to create'
     default     = 1
     validation {
       condition     = instance_count >= 1 && instance_count <= 10
-      error_message = "Instance count must be between 1 and 10"
+      error_message = 'Instance count must be between 1 and 10'
     }
   }
 }
@@ -346,7 +346,7 @@ arguments {
   name: string {
     validation {
       condition     = length(name) > 0
-      error_message = "Name must not be empty"
+      error_message = 'Name must not be empty'
     }
   }
 }

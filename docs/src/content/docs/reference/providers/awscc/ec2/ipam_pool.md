@@ -12,26 +12,26 @@ Resource Schema of AWS::EC2::IPAMPool Type
 
 ```crn
 let ipam = awscc.ec2.ipam {
-  description = "Example IPAM"
+  description = 'Example IPAM'
   tier        = free
 
   operating_region {
-    region_name = "ap-northeast-1"
+    region_name = 'ap-northeast-1'
   }
 }
 
 awscc.ec2.ipam_pool {
   ipam_scope_id  = ipam.private_default_scope_id
-  address_family = "IPv4"
-  locale         = "ap-northeast-1"
-  description    = "Example IPv4 IPAM Pool"
+  address_family = 'IPv4'
+  locale         = 'ap-northeast-1'
+  description    = 'Example IPv4 IPAM Pool'
 
   provisioned_cidr {
-    cidr = "10.0.0.0/8"
+    cidr = '10.0.0.0/8'
   }
 
   tags = {
-    Environment = "example"
+    Environment = 'example'
   }
 }
 ```

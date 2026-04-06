@@ -16,11 +16,11 @@ The ``AWS::Logs::LogGroup`` resource specifies a log group. A log group defines 
 
 ```crn
 awscc.logs.log_group {
-  log_group_name    = "/example/my-app"
+  log_group_name    = '/example/my-app'
   retention_in_days = 30
 
   tags = {
-    Environment = "example"
+    Environment = 'example'
   }
 }
 ```

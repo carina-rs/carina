@@ -22,7 +22,7 @@ let vpc = awscc.ec2.vpc {
   cidr_block = cidr_block
 
   tags = {
-    Name = "module-test"
+    Name = 'module-test'
   }
 }
 
@@ -32,7 +32,7 @@ let subnet = awscc.ec2.subnet {
   availability_zone = az
 
   tags = {
-    Name = "module-test-subnet"
+    Name = 'module-test-subnet'
   }
 }
 
@@ -65,7 +65,7 @@ Parameters can have default values:
 ```crn
 arguments {
   cidr_block: string
-  az        : string = "ap-northeast-1a"
+  az        : string = 'ap-northeast-1a'
   enable_dns: bool   = true
 }
 ```
@@ -77,19 +77,19 @@ Parameters can use an expanded block form for description, default values, and v
 ```crn
 arguments {
   instance_count: int {
-    description = "Number of instances to create"
+    description = 'Number of instances to create'
     default     = 1
     validation {
       condition     = instance_count >= 1 && instance_count <= 10
-      error_message = "Instance count must be between 1 and 10"
+      error_message = 'Instance count must be between 1 and 10'
     }
   }
 
   cidr_block: string {
-    description = "The CIDR block for the VPC"
+    description = 'The CIDR block for the VPC'
     validation {
       condition     = length(cidr_block) > 0
-      error_message = "CIDR block cannot be empty"
+      error_message = 'CIDR block cannot be empty'
     }
   }
 }
@@ -139,12 +139,12 @@ attributes {
 Use `import` to load a module, then call it by name with arguments:
 
 ```crn
-let network = import "./modules/network"
+let network = import './modules/network'
 
 network {
-  cidr_block  = "10.0.0.0/16"
-  subnet_cidr = "10.0.1.0/24"
-  az          = "ap-northeast-1a"
+  cidr_block  = '10.0.0.0/16'
+  subnet_cidr = '10.0.1.0/24'
+  az          = 'ap-northeast-1a'
 }
 ```
 
@@ -153,12 +153,12 @@ network {
 When a module call is bound with `let`, its `attributes` values can be accessed with dot notation:
 
 ```crn
-let network = import "./modules/network"
+let network = import './modules/network'
 
 let net = network {
-  cidr_block  = "10.0.0.0/16"
-  subnet_cidr = "10.0.1.0/24"
-  az          = "ap-northeast-1a"
+  cidr_block  = '10.0.0.0/16'
+  subnet_cidr = '10.0.1.0/24'
+  az          = 'ap-northeast-1a'
 }
 
 awscc.ec2.security_group {
@@ -181,10 +181,10 @@ Import paths are resolved relative to the file containing the `import` statement
 
 ```crn
 # From project/main.crn, imports project/modules/network/main.crn
-let network = import "./modules/network"
+let network = import './modules/network'
 
 # Relative path from current file
-let helper = import "../shared/helper"
+let helper = import '../shared/helper'
 ```
 
 ## Nested Modules
@@ -194,7 +194,7 @@ Modules can import and use other modules:
 ```crn
 # modules/network_with_rt/main.crn
 
-let network = import "../network"
+let network = import '../network'
 
 arguments {
   cidr_block : string
@@ -212,7 +212,7 @@ let rt = awscc.ec2.route_table {
   vpc_id = net.vpc_id
 
   tags = {
-    Name = "nested-module-test-rt"
+    Name = 'nested-module-test-rt'
   }
 }
 
@@ -227,18 +227,18 @@ attributes {
 Modules can be used inside `for` expressions to create multiple instances:
 
 ```crn
-let network = import "./modules/network"
+let network = import './modules/network'
 
 let cidrs = {
-  dev = "10.0.0.0/16"
-  stg = "10.1.0.0/16"
+  dev = '10.0.0.0/16'
+  stg = '10.1.0.0/16'
 }
 
 let networks = for name, cidr in cidrs {
   network {
     cidr_block  = cidr
     subnet_cidr = cidr_subnet(cidr, 8, 1)
-    az          = "ap-northeast-1a"
+    az          = 'ap-northeast-1a'
   }
 }
 ```
