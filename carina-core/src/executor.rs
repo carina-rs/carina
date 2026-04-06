@@ -691,7 +691,14 @@ fn build_dependency_map(
                     dep_indices.insert(dep_idx);
                 }
             }
-            if let Some(unresolved) = unresolved_resources.get(effect.resource_id()) {
+            // For non-Replace effects, also consider unresolved resource dependencies.
+            // For Replace effects, unresolved deps represent the OLD resource's
+            // dependencies (before resolution). These are handled as reverse deps
+            // below (for delete ordering) rather than forward deps, to avoid
+            // deadlocks where a Replace waits for a Delete that also waits for it.
+            if !matches!(effect, Effect::Replace { .. })
+                && let Some(unresolved) = unresolved_resources.get(effect.resource_id())
+            {
                 let unresolved_deps = get_resource_dependencies(unresolved);
                 for dep_binding in &unresolved_deps {
                     if let Some(&dep_idx) = binding_to_idx.get(dep_binding) {
@@ -711,6 +718,26 @@ fn build_dependency_map(
             for dep_binding in dependencies {
                 if let Some(&dep_idx) = binding_to_idx.get(dep_binding) {
                     reverse_deps.push((dep_idx, idx));
+                }
+            }
+        }
+        // For Replace effects (especially CBD), the old resource (from) may depend
+        // on a resource that is being deleted. The delete of that parent must wait
+        // for this Replace to complete first (old resource deleted during Replace).
+        // Use unresolved_resources to get the original (pre-resolution) dependencies.
+        if let Effect::Replace { .. } = effect {
+            let unresolved_deps: HashSet<String> =
+                if let Some(unresolved) = unresolved_resources.get(effect.resource_id()) {
+                    get_resource_dependencies(unresolved)
+                } else {
+                    HashSet::new()
+                };
+            for dep_binding in &unresolved_deps {
+                if let Some(&dep_idx) = binding_to_idx.get(dep_binding) {
+                    // Only add reverse dep if the dependency is a Delete effect
+                    if matches!(&effects[dep_idx], Effect::Delete { .. }) {
+                        reverse_deps.push((dep_idx, idx));
+                    }
                 }
             }
         }
@@ -3736,5 +3763,104 @@ mod tests {
                 })
             })
         }
+    }
+
+    /// Regression test: when a resource is deleted and a dependent resource is
+    /// replaced (CBD), the delete must wait for the replace to complete.
+    ///
+    /// Scenario (TGW attachment):
+    ///   - tgw_a: Delete (binding removed from .crn)
+    ///   - tgw_attachment: Replace (CBD) — from depends on tgw_a, to depends on tgw_b
+    ///
+    /// Without the fix, both execute in parallel and tgw_a delete fails because
+    /// the old attachment (which references tgw_a) hasn't been deleted yet.
+    #[tokio::test]
+    async fn test_delete_waits_for_replace_cbd_of_dependent() {
+        let provider = MockProvider::new();
+        let tgw_a_id = ResourceId::new("test", "tgw_a");
+        let tgw_b_id = ResourceId::new("test", "tgw_b");
+        let attachment_id = ResourceId::new("test", "attachment");
+
+        // tgw_a is being deleted (binding removed from desired config)
+        let tgw_a_deps: HashSet<String> = HashSet::new();
+
+        // attachment: Replace (CBD)
+        // from: depends on tgw_a
+        let attachment_from =
+            State::existing(attachment_id.clone(), HashMap::new()).with_identifier("attach-old");
+        // to: depends on tgw_b (different TGW)
+        let mut attachment_to = Resource::new("test", "attachment");
+        attachment_to.binding = Some("attachment".to_string());
+        attachment_to.dependency_bindings = vec!["tgw_b".to_string()];
+
+        let cbd_lifecycle = LifecycleConfig {
+            create_before_destroy: true,
+            ..Default::default()
+        };
+
+        let mut plan = Plan::new();
+
+        // tgw_b: Create (new resource)
+        let mut tgw_b = Resource::new("test", "tgw_b");
+        tgw_b.binding = Some("tgw_b".to_string());
+        plan.add(Effect::Create(tgw_b));
+
+        // tgw_a: Delete
+        plan.add(Effect::Delete {
+            id: tgw_a_id.clone(),
+            identifier: "tgw-old".to_string(),
+            lifecycle: Default::default(),
+            binding: Some("tgw_a".to_string()),
+            dependencies: tgw_a_deps,
+        });
+
+        // attachment: Replace (CBD) — from depends on tgw_a
+        plan.add(Effect::Replace {
+            id: attachment_id.clone(),
+            from: Box::new(attachment_from),
+            to: attachment_to,
+            lifecycle: cbd_lifecycle,
+            changed_create_only: vec!["transit_gateway_id".to_string()],
+            cascading_updates: vec![],
+            temporary_name: None,
+            cascade_ref_hints: vec![],
+        });
+
+        // tgw_b create
+        provider.push_create(Ok(ok_state(&tgw_b_id)));
+        // attachment CBD: create new
+        provider.push_create(Ok(ok_state(&attachment_id)));
+        // attachment CBD: delete old
+        provider.push_delete(Ok(()));
+        // tgw_a: delete (should happen AFTER attachment replace completes)
+        provider.push_delete(Ok(()));
+
+        // The from resource of the attachment depends on tgw_a
+        let mut attachment_unresolved = Resource::new("test", "attachment");
+        attachment_unresolved.binding = Some("attachment".to_string());
+        attachment_unresolved.dependency_bindings = vec!["tgw_a".to_string()];
+
+        let input = ExecutionInput {
+            plan: &plan,
+            unresolved_resources: &HashMap::from([(attachment_id.clone(), attachment_unresolved)]),
+            binding_map: HashMap::new(),
+            current_states: HashMap::new(),
+        };
+
+        let observer = MockObserver::new();
+        let result = execute_plan(&provider, input, &observer).await;
+
+        assert_eq!(result.success_count, 3);
+        assert_eq!(result.failure_count, 0);
+
+        let calls = provider.calls();
+        // tgw_b create must happen first (attachment depends on it)
+        assert_eq!(calls[0], ("create".to_string(), tgw_b_id.to_string()));
+        // attachment create (CBD: create before delete)
+        assert_eq!(calls[1], ("create".to_string(), attachment_id.to_string()));
+        // attachment delete (old)
+        assert_eq!(calls[2], ("delete".to_string(), attachment_id.to_string()));
+        // tgw_a delete MUST come after attachment replace completes
+        assert_eq!(calls[3], ("delete".to_string(), tgw_a_id.to_string()));
     }
 }
