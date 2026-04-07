@@ -5,7 +5,7 @@ use colored::Colorize;
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::parser::ProviderContext;
 
-use crate::provider_resolver;
+use carina_provider_resolver;
 
 pub fn run_init(path: &Path, upgrade: bool) -> Result<(), String> {
     let base_dir = get_base_dir(path);
@@ -36,7 +36,8 @@ pub fn run_init(path: &Path, upgrade: bool) -> Result<(), String> {
         format!("{} {} provider(s)...", action, github_providers.len()).cyan()
     );
 
-    let resolved = provider_resolver::resolve_all(base_dir, &loaded.parsed.providers, upgrade)?;
+    let resolved =
+        carina_provider_resolver::resolve_all(base_dir, &loaded.parsed.providers, upgrade)?;
 
     println!(
         "{}",
