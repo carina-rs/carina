@@ -1017,6 +1017,25 @@ async fn run_apply_locked(
     let multi = refresh_multi_progress();
     let current_states: HashMap<ResourceId, State> = {
         let provider_ref = &provider;
+        // Pre-build dependency_bindings from state file so we can restore them
+        // after refresh. Provider.read() doesn't know about this metadata (#1565).
+        let saved_dep_bindings: HashMap<ResourceId, Vec<String>> = state_file
+            .as_ref()
+            .map(|sf| {
+                sorted_resources
+                    .iter()
+                    .filter_map(|r| {
+                        let rs =
+                            sf.find_resource(&r.id.provider, &r.id.resource_type, &r.id.name)?;
+                        if rs.dependency_bindings.is_empty() {
+                            None
+                        } else {
+                            Some((r.id.clone(), rs.dependency_bindings.clone()))
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let results: Vec<Result<(ResourceId, State), AppError>> =
             stream::iter(sorted_resources.iter().filter(|r| !r.is_virtual()))
                 .map(|resource| {
@@ -1024,11 +1043,15 @@ async fn run_apply_locked(
                     let identifier = state_file
                         .as_ref()
                         .and_then(|sf| sf.get_identifier_for_resource(resource));
+                    let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
                     async move {
-                        let state =
+                        let mut state =
                             read_with_retry(provider_ref, &resource.id, identifier.as_deref())
                                 .await
                                 .map_err(AppError::Provider)?;
+                        if let Some(deps) = dep_bindings {
+                            state.dependency_bindings = deps;
+                        }
                         progress.finish();
                         Ok((resource.id.clone(), state))
                     }
