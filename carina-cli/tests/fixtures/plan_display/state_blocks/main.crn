@@ -18,5 +18,5 @@ removed {
 # Rename a security group binding
 moved {
   from = awscc.ec2.security_group 'old-sg'
-  to   = awscc.ec2.security_group 'renamed-sg'
+  to = awscc.ec2.security_group 'renamed-sg'
 }

@@ -197,8 +197,8 @@ impl Formatter {
                 if token.text == "import" {
                     continue;
                 }
-                if token.text.starts_with('"') {
-                    self.write(&token.text);
+                if token.text.starts_with('"') || token.text.starts_with('\'') {
+                    self.write_token(&token.text);
                     break;
                 }
             }
@@ -215,7 +215,7 @@ impl Formatter {
                 && self.is_identifier(&token.text)
                 && token.text != "backend"
             {
-                self.write(&token.text);
+                self.write_token(&token.text);
                 break;
             }
         }
@@ -249,7 +249,7 @@ impl Formatter {
                         self.write(", ");
                         continue;
                     }
-                    self.write(&token.text);
+                    self.write_token(&token.text);
                 }
                 CstChild::Node(n) => {
                     if n.kind == NodeKind::ValidateExpr {
@@ -300,12 +300,12 @@ impl Formatter {
                     if !wrote_keyword
                         && (token.text == "to" || token.text == "from" || token.text == "id")
                     {
-                        self.write(&token.text);
+                        self.write_token(&token.text);
                         wrote_keyword = true;
                     } else if token.text == "=" {
                         self.write(" = ");
                     } else {
-                        self.write(&token.text);
+                        self.write_token(&token.text);
                     }
                 }
                 CstChild::Node(child_node) => {
@@ -324,11 +324,11 @@ impl Formatter {
         for child in &node.children {
             if let CstChild::Token(token) = child {
                 if first {
-                    self.write(&token.text);
+                    self.write_token(&token.text);
                     first = false;
                 } else {
                     self.write(" ");
-                    self.write(&token.text);
+                    self.write_token(&token.text);
                 }
             }
         }
@@ -342,7 +342,7 @@ impl Formatter {
             if let CstChild::Token(token) = child
                 && self.is_identifier(&token.text)
             {
-                self.write(&token.text);
+                self.write_token(&token.text);
                 break;
             }
         }
@@ -369,7 +369,7 @@ impl Formatter {
                 && self.is_identifier(&token.text)
                 && token.text != "provider"
             {
-                self.write(&token.text);
+                self.write_token(&token.text);
                 break;
             }
         }
@@ -521,7 +521,7 @@ impl Formatter {
                 CstChild::Token(token) => {
                     if !wrote_name && self.is_identifier(&token.text) && token.text != "arguments" {
                         key_len = token.text.len();
-                        self.write(&token.text);
+                        self.write_token(&token.text);
                         wrote_name = true;
                     } else if token.text == ":" && !wrote_colon {
                         // Add padding for alignment before colon
@@ -536,10 +536,10 @@ impl Formatter {
                         wrote_equals = true;
                     } else if wrote_colon && !wrote_equals {
                         // Type primitive
-                        self.write(&token.text);
+                        self.write_token(&token.text);
                     } else if wrote_equals {
                         // Default value
-                        self.write(&token.text);
+                        self.write_token(&token.text);
                     }
                 }
                 CstChild::Node(n) => {
@@ -566,14 +566,14 @@ impl Formatter {
             match child {
                 CstChild::Token(token) => {
                     if !wrote_name && self.is_identifier(&token.text) && token.text != "arguments" {
-                        self.write(&token.text);
+                        self.write_token(&token.text);
                         wrote_name = true;
                     } else if token.text == ":" && !wrote_colon {
                         self.write(": ");
                         wrote_colon = true;
                     } else if wrote_colon {
                         // Type primitive
-                        self.write(&token.text);
+                        self.write_token(&token.text);
                     }
                 }
                 CstChild::Node(n) => {
@@ -653,7 +653,7 @@ impl Formatter {
                 CstChild::Token(token) => {
                     if !wrote_key && self.is_identifier(&token.text) {
                         key_len = token.text.len();
-                        self.write(&token.text);
+                        self.write_token(&token.text);
                         wrote_key = true;
                     } else if token.text == "=" && !wrote_equals {
                         if align_to > 0 && key_len < align_to {
@@ -664,7 +664,7 @@ impl Formatter {
                         wrote_equals = true;
                     } else if wrote_equals {
                         // Value token (string, number, etc.)
-                        self.write(&token.text);
+                        self.write_token(&token.text);
                     }
                 }
                 CstChild::Node(n) => {
@@ -693,7 +693,7 @@ impl Formatter {
                     if !wrote_name && self.is_identifier(&token.text) && token.text != "attributes"
                     {
                         key_len = token.text.len();
-                        self.write(&token.text);
+                        self.write_token(&token.text);
                         wrote_name = true;
                     } else if token.text == ":" && !wrote_colon {
                         // Add padding for alignment before colon
@@ -708,10 +708,10 @@ impl Formatter {
                         wrote_equals = true;
                     } else if wrote_colon && !wrote_equals {
                         // Type primitive
-                        self.write(&token.text);
+                        self.write_token(&token.text);
                     } else if wrote_equals {
                         // Value
-                        self.write(&token.text);
+                        self.write_token(&token.text);
                     }
                 }
                 CstChild::Node(n) => {
@@ -738,7 +738,7 @@ impl Formatter {
                     } else if token.text == ")" {
                         self.write(")");
                     } else {
-                        self.write(&token.text);
+                        self.write_token(&token.text);
                     }
                 }
                 CstChild::Node(n) => {
@@ -769,12 +769,12 @@ impl Formatter {
                         continue;
                     }
                     if !found_name && self.is_identifier(&token.text) {
-                        self.write(&token.text);
+                        self.write_token(&token.text);
                         found_name = true;
                         continue;
                     }
                     if found_equals {
-                        self.write(&token.text);
+                        self.write_token(&token.text);
                     }
                 }
                 CstChild::Node(n) => {
@@ -797,7 +797,7 @@ impl Formatter {
             if let CstChild::Token(token) = child
                 && token.text.contains('.')
             {
-                self.write(&token.text);
+                self.write_token(&token.text);
                 break;
             }
         }
@@ -824,7 +824,7 @@ impl Formatter {
             if let CstChild::Token(token) = child
                 && token.text.contains('.')
             {
-                self.write(&token.text);
+                self.write_token(&token.text);
                 break;
             }
         }
@@ -851,7 +851,7 @@ impl Formatter {
             if let CstChild::Token(token) = child
                 && token.text.contains('.')
             {
-                self.write(&token.text);
+                self.write_token(&token.text);
                 break;
             }
         }
@@ -915,7 +915,7 @@ impl Formatter {
                         self.write("}");
                         continue;
                     }
-                    self.write(&token.text);
+                    self.write_token(&token.text);
                 }
                 CstChild::Node(n) => {
                     if n.kind == NodeKind::FnParam {
@@ -958,7 +958,7 @@ impl Formatter {
                     } else if token.text == ":" {
                         self.write(": ");
                     } else {
-                        self.write(&token.text);
+                        self.write_token(&token.text);
                     }
                 }
                 CstChild::Node(n) => {
@@ -999,7 +999,7 @@ impl Formatter {
                         self.write("}");
                         continue;
                     }
-                    self.write(&token.text);
+                    self.write_token(&token.text);
                 }
                 CstChild::Node(n) => {
                     if n.kind == NodeKind::ForBinding {
@@ -1053,7 +1053,7 @@ impl Formatter {
                         self.write("}");
                         continue;
                     }
-                    self.write(&token.text);
+                    self.write_token(&token.text);
                 }
                 CstChild::Node(n) => {
                     if n.kind == NodeKind::ElseClause {
@@ -1093,7 +1093,7 @@ impl Formatter {
                         self.write("}");
                         continue;
                     }
-                    self.write(&token.text);
+                    self.write_token(&token.text);
                 }
                 CstChild::Node(n) => {
                     self.write_indent();
@@ -1142,7 +1142,7 @@ impl Formatter {
             if let CstChild::Token(token) = child
                 && self.is_identifier(&token.text)
             {
-                self.write(&token.text);
+                self.write_token(&token.text);
                 break;
             }
         }
@@ -1553,7 +1553,7 @@ impl Formatter {
                 CstChild::Token(token) => {
                     if !wrote_key && self.is_identifier(&token.text) {
                         key_len = token.text.len();
-                        self.write(&token.text);
+                        self.write_token(&token.text);
                         wrote_key = true;
 
                         // Add padding for alignment
@@ -1565,7 +1565,7 @@ impl Formatter {
                         self.write(" = ");
                         wrote_equals = true;
                     } else if wrote_equals {
-                        self.write(&token.text);
+                        self.write_token(&token.text);
                     }
                 }
                 CstChild::Node(n) => {
@@ -1594,7 +1594,7 @@ impl Formatter {
                     if token.text == "|>" {
                         self.write(" |> ");
                     } else {
-                        self.write(&token.text);
+                        self.write_token(&token.text);
                     }
                 }
                 CstChild::Node(n) => {
@@ -1617,7 +1617,7 @@ impl Formatter {
                     if token.text == ">>" {
                         self.write(" >> ");
                     } else {
-                        self.write(&token.text);
+                        self.write_token(&token.text);
                     }
                 }
                 CstChild::Node(n) => {
@@ -1644,7 +1644,7 @@ impl Formatter {
                     } else if token.text == "," {
                         self.write(", ");
                     } else {
-                        self.write(&token.text);
+                        self.write_token(&token.text);
                     }
                 }
                 CstChild::Node(n) => {
@@ -1665,7 +1665,7 @@ impl Formatter {
         for child in &node.children {
             match child {
                 CstChild::Token(token) if self.is_identifier(&token.text) => {
-                    self.write(&token.text);
+                    self.write_token(&token.text);
                 }
                 CstChild::Node(n) if n.kind == NodeKind::FieldAccess => {
                     self.format_field_access(n);
@@ -1684,7 +1684,7 @@ impl Formatter {
             if let CstChild::Token(token) = child
                 && self.is_identifier(&token.text)
             {
-                self.write(&token.text);
+                self.write_token(&token.text);
             }
         }
     }
@@ -1697,7 +1697,7 @@ impl Formatter {
                     if token.text == "[" || token.text == "]" {
                         continue;
                     }
-                    self.write(&token.text);
+                    self.write_token(&token.text);
                 }
                 CstChild::Node(n) => {
                     self.format_node(n);
@@ -1725,7 +1725,7 @@ impl Formatter {
                     if !first {
                         self.write(", ");
                     }
-                    self.write(&token.text);
+                    self.write_token(&token.text);
                     first = false;
                 }
                 CstChild::Node(n) => {
@@ -1828,7 +1828,7 @@ impl Formatter {
                 CstChild::Token(token) => {
                     if !wrote_key && self.is_identifier(&token.text) {
                         key_len = token.text.len();
-                        self.write(&token.text);
+                        self.write_token(&token.text);
                         wrote_key = true;
 
                         // Add padding for alignment
@@ -1843,7 +1843,7 @@ impl Formatter {
                         // Skip trailing comma - we'll handle it consistently
                         continue;
                     } else if wrote_equals {
-                        self.write(&token.text);
+                        self.write_token(&token.text);
                     }
                 }
                 CstChild::Node(n) => {
@@ -1858,11 +1858,37 @@ impl Formatter {
         self.write_newline();
     }
 
+    fn normalize_string_quotes(s: &str) -> String {
+        if !s.starts_with('"') {
+            return s.to_string();
+        }
+        let inner = &s[1..s.len() - 1];
+        if inner.contains("${") || inner.contains('\'') {
+            return s.to_string();
+        }
+        if inner.contains("\\n")
+            || inner.contains("\\r")
+            || inner.contains("\\t")
+            || inner.contains("\\\"")
+        {
+            return s.to_string();
+        }
+        format!("'{}'", inner)
+    }
+
+    fn write_token(&mut self, text: &str) {
+        if text.starts_with('"') {
+            self.write(&Self::normalize_string_quotes(text));
+        } else {
+            self.write(text);
+        }
+    }
+
     fn format_default(&mut self, node: &CstNode) {
         for child in &node.children {
             match child {
                 CstChild::Token(token) => {
-                    self.write(&token.text);
+                    self.write_token(&token.text);
                 }
                 CstChild::Node(n) => {
                     self.format_node(n);
@@ -1937,7 +1963,7 @@ mod tests {
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
 
-        assert!(result.contains("  name = \"test\""));
+        assert!(result.contains("  name = 'test'"));
     }
 
     #[test]
@@ -2001,12 +2027,12 @@ mod tests {
         // Map should be formatted with entries on separate lines
         assert!(result.contains("tags = {"), "missing 'tags = {{'");
         assert!(
-            result.contains("Environment = \"dev\""),
+            result.contains("Environment = 'dev'"),
             "missing Environment"
         );
         // With alignment, Project has extra spaces to align with Environment
         assert!(
-            result.contains("Project") && result.contains("= \"test\""),
+            result.contains("Project") && result.contains("= 'test'"),
             "missing Project"
         );
         // Map entries should be on separate lines (not all on one line)
@@ -2170,7 +2196,7 @@ mod tests {
         let result = format(input, &config).unwrap();
 
         assert_eq!(
-            result, "awscc.ec2.vpc {\n  cidr_block = \"10.0.0.0/16\"\n}\n",
+            result, "awscc.ec2.vpc {\n  cidr_block = '10.0.0.0/16'\n}\n",
             "Non-empty block should remain multi-line, got: {:?}",
             result
         );
@@ -2208,7 +2234,7 @@ mod tests {
         let result = format(input, &config).unwrap();
 
         assert!(result.contains("security_group_ingress {"));
-        assert!(result.contains("    ip_protocol = \"tcp\""));
+        assert!(result.contains("    ip_protocol = 'tcp'"));
         assert!(result.contains("    from_port"));
         assert!(result.contains("    to_port"));
 
@@ -2236,7 +2262,7 @@ mod tests {
         let result = format(input, &config).unwrap();
 
         assert!(result.contains("statement {"));
-        assert!(result.contains("effect = \"Allow\""));
+        assert!(result.contains("effect = 'Allow'"));
 
         // Idempotency
         let second = format(&result, &config).unwrap();
@@ -2256,12 +2282,8 @@ mod tests {
   }]
 }
 "#;
-        let expected = r#"awscc.ec2.ipam {
-  operating_region {
-    region_name = "ap-northeast-1"
-  }
-}
-"#;
+        let expected =
+            "awscc.ec2.ipam {\n  operating_region {\n    region_name = 'ap-northeast-1'\n  }\n}\n";
         let config = FormatConfig::default();
         // block_names maps attribute name -> block name for conversion
         let block_names: std::collections::HashMap<String, String> = [(
@@ -2294,19 +2316,7 @@ mod tests {
   }
 }
 "#;
-        let expected = r#"awscc.s3.bucket {
-  lifecycle_configuration = {
-    rule {
-      id     = "expire-old-objects"
-      status = "Enabled"
-    }
-    rule {
-      id     = "transition-to-glacier"
-      status = "Enabled"
-    }
-  }
-}
-"#;
+        let expected = "awscc.s3.bucket {\n  lifecycle_configuration = {\n    rule {\n      id     = 'expire-old-objects'\n      status = 'Enabled'\n    }\n    rule {\n      id     = 'transition-to-glacier'\n      status = 'Enabled'\n    }\n  }\n}\n";
         let config = FormatConfig::default();
         let block_names: std::collections::HashMap<String, String> =
             [("rules".to_string(), "rule".to_string())]
@@ -2335,17 +2345,7 @@ mod tests {
   }
 }
 "#;
-        let expected = r#"awscc.s3.bucket {
-  bucket_encryption = {
-    server_side_encryption_configuration {
-      bucket_key_enabled                = true
-      server_side_encryption_by_default = {
-        sse_algorithm = "AES256"
-      }
-    }
-  }
-}
-"#;
+        let expected = "awscc.s3.bucket {\n  bucket_encryption = {\n    server_side_encryption_configuration {\n      bucket_key_enabled                = true\n      server_side_encryption_by_default = {\n        sse_algorithm = 'AES256'\n      }\n    }\n  }\n}\n";
         let config = FormatConfig::default();
         let block_names: std::collections::HashMap<String, String> = [(
             "server_side_encryption_configuration".to_string(),
@@ -2365,12 +2365,8 @@ mod tests {
     #[test]
     fn test_convert_block_syntax_is_idempotent() {
         // Already in block syntax should remain unchanged
-        let input = r#"awscc.ec2.ipam {
-  operating_region {
-    region_name = "ap-northeast-1"
-  }
-}
-"#;
+        let input =
+            "awscc.ec2.ipam {\n  operating_region {\n    region_name = 'ap-northeast-1'\n  }\n}\n";
         let config = FormatConfig::default();
         let block_names: std::collections::HashMap<String, String> = [(
             "operating_regions".to_string(),
@@ -2437,7 +2433,7 @@ mod tests {
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
         assert!(
-            result.contains("config[\"key\"].value"),
+            result.contains("config['key'].value"),
             "Expected string index access in:\n{}",
             result
         );
@@ -2502,15 +2498,7 @@ mod tests {
         };
         let result = format(input, &config).unwrap();
 
-        let expected = r#"awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
-
-  tags = {
-    Name        = "test"
-    Environment = "dev"
-  }
-}
-"#;
+        let expected = "awscc.ec2.vpc {\n  cidr_block = '10.0.0.0/16'\n\n  tags = {\n    Name        = 'test'\n    Environment = 'dev'\n  }\n}\n";
         assert_eq!(result, expected, "Expected blank line before map attribute");
     }
 
@@ -2534,16 +2522,7 @@ mod tests {
 
         // tags should be in its own group (no padding)
         // enable_dns should be in its own group (no padding)
-        let expected = r#"awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
-
-  tags = {
-    Name = "test"
-  }
-
-  enable_dns = true
-}
-"#;
+        let expected = "awscc.ec2.vpc {\n  cidr_block = '10.0.0.0/16'\n\n  tags = {\n    Name = 'test'\n  }\n\n  enable_dns = true\n}\n";
         assert_eq!(
             result, expected,
             "Alignment should reset at blank line boundaries"
@@ -2566,14 +2545,7 @@ mod tests {
         };
         let result = format(input, &config).unwrap();
 
-        let expected = r#"awscc.ec2.vpc {
-  tags = {
-    Name = "test"
-  }
-
-  cidr_block = "10.0.0.0/16"
-}
-"#;
+        let expected = "awscc.ec2.vpc {\n  tags = {\n    Name = 'test'\n  }\n\n  cidr_block = '10.0.0.0/16'\n}\n";
         assert_eq!(
             result, expected,
             "No leading blank line when map is first attribute"
@@ -2596,14 +2568,7 @@ mod tests {
         };
         let result = format(input, &config).unwrap();
 
-        let expected = r#"awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
-
-  tags = {
-    Name = "test"
-  }
-}
-"#;
+        let expected = "awscc.ec2.vpc {\n  cidr_block = '10.0.0.0/16'\n\n  tags = {\n    Name = 'test'\n  }\n}\n";
         assert_eq!(
             result, expected,
             "No trailing blank line when map is last attribute"
@@ -2625,12 +2590,7 @@ mod tests {
         };
         let result = format(input, &config).unwrap();
 
-        let expected = r#"awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
-  tags       = {}
-  enable_dns = true
-}
-"#;
+        let expected = "awscc.ec2.vpc {\n  cidr_block = '10.0.0.0/16'\n  tags       = {}\n  enable_dns = true\n}\n";
         assert_eq!(result, expected, "Empty maps should not get blank lines");
     }
 
@@ -2669,7 +2629,8 @@ mod tests {
 "#;
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
-        assert_eq!(result, input);
+        let expected = "arguments {\n  vpc: awscc.ec2.vpc {\n    description = 'The VPC to deploy into'\n  }\n  port: int {\n    description = 'Web server port'\n    default     = 8080\n  }\n}\n";
+        assert_eq!(result, expected);
     }
 
     #[test]
@@ -2687,7 +2648,8 @@ mod tests {
 "#;
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
-        assert_eq!(result, input);
+        let expected = "arguments {\n  enable_https: bool = true\n  vpc: awscc.ec2.vpc {\n    description = 'The VPC to deploy into'\n  }\n  port: int {\n    description = 'Web server port'\n    default     = 8080\n  }\n}\n";
+        assert_eq!(result, expected);
     }
 
     #[test]
@@ -2722,14 +2684,7 @@ mod tests {
             align_attributes: true,
             ..Default::default()
         };
-        let expected = r#"arguments {
-  short      : bool = true
-  longer_name: string = "hello"
-  vpc: awscc.ec2.vpc {
-    description = "The VPC"
-  }
-}
-"#;
+        let expected = "arguments {\n  short      : bool = true\n  longer_name: string = 'hello'\n  vpc: awscc.ec2.vpc {\n    description = 'The VPC'\n  }\n}\n";
         let result = format(input, &config).unwrap();
         assert_eq!(result, expected);
     }
@@ -2757,7 +2712,7 @@ mod tests {
     fn format_fn_def_simple() {
         let config = FormatConfig::default();
         let input = "fn greet(name) {\n  join(\" \", [\"hello\",name])\n}\n";
-        let expected = "fn greet(name) {\n  join(\" \", [\"hello\", name])\n}\n";
+        let expected = "fn greet(name) {\n  join(' ', ['hello', name])\n}\n";
         let result = format(input, &config).unwrap();
         assert_eq!(result, expected);
     }
@@ -2766,7 +2721,7 @@ mod tests {
     fn format_fn_def_with_default_param() {
         let config = FormatConfig::default();
         let input = "fn tag(env,suffix=\"default\") {\n  join(\"-\", [env, suffix])\n}\n";
-        let expected = "fn tag(env, suffix = \"default\") {\n  join(\"-\", [env, suffix])\n}\n";
+        let expected = "fn tag(env, suffix = 'default') {\n  join('-', [env, suffix])\n}\n";
         let result = format(input, &config).unwrap();
         assert_eq!(result, expected);
     }
@@ -2775,7 +2730,7 @@ mod tests {
     fn format_fn_def_with_local_let() {
         let config = FormatConfig::default();
         let input = "fn name(env,az) {\n  let prefix=join(\"-\",[env,\"subnet\"])\n  join(\"-\",[prefix,az])\n}\n";
-        let expected = "fn name(env, az) {\n  let prefix = join(\"-\", [env, \"subnet\"])\n  join(\"-\", [prefix, az])\n}\n";
+        let expected = "fn name(env, az) {\n  let prefix = join('-', [env, 'subnet'])\n  join('-', [prefix, az])\n}\n";
         let result = format(input, &config).unwrap();
         assert_eq!(result, expected);
     }
@@ -2794,7 +2749,8 @@ mod tests {
         let config = FormatConfig::default();
         let input =
             "fn tag(env:string,suffix:string=\"default\") {\n  join(\"-\", [env, suffix])\n}\n";
-        let expected = "fn tag(env: string, suffix: string = \"default\") {\n  join(\"-\", [env, suffix])\n}\n";
+        let expected =
+            "fn tag(env: string, suffix: string = 'default') {\n  join('-', [env, suffix])\n}\n";
         let result = format(input, &config).unwrap();
         assert_eq!(result, expected);
     }
@@ -2830,7 +2786,7 @@ mod tests {
     fn format_fn_def_with_resource_return_type() {
         let config = FormatConfig::default();
         let input = "fn make():awscc.ec2.vpc {\n  awscc.ec2.vpc {\n    cidr_block = \"10.0.0.0/16\"\n  }\n}\n";
-        let expected = "fn make(): awscc.ec2.vpc {\n  awscc.ec2.vpc {\n    cidr_block = \"10.0.0.0/16\"\n  }\n}\n";
+        let expected = "fn make(): awscc.ec2.vpc {\n  awscc.ec2.vpc {\n    cidr_block = '10.0.0.0/16'\n  }\n}\n";
         let result = format(input, &config).unwrap();
         assert_eq!(result, expected);
     }
@@ -2884,7 +2840,7 @@ require   port >= 1 && port <= 65535  , "port must be valid"
         // The formatter normalizes spacing around "require" keyword and comma,
         // but preserves validate expression content as-is (opaque)
         assert!(
-            result.contains("require port >= 1 && port <= 65535, \"port must be valid\""),
+            result.contains("require port >= 1 && port <= 65535, 'port must be valid'"),
             "Unexpected output:\n{}",
             result
         );
@@ -2895,6 +2851,12 @@ require   port >= 1 && port <= 65535  , "port must be valid"
         let input = "aws.iam.role {\n  name   = \"my-role\"\n  policy = <<EOT\n{\n  \"Version\": \"2012-10-17\"\n}\nEOT\n}\n";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
+        // name should be normalized to single quotes
+        assert!(
+            result.contains("'my-role'"),
+            "name should be normalized to single quotes. Got:\n{}",
+            result
+        );
         // Heredoc should be preserved in output
         assert!(
             result.contains("<<EOT"),
@@ -2916,5 +2878,86 @@ require   port >= 1 && port <= 65535  , "port must be valid"
         let first = format(input, &config).unwrap();
         let second = format(&first, &config).unwrap();
         assert_eq!(first, second, "Formatting should be idempotent");
+    }
+
+    #[test]
+    fn test_format_normalizes_double_to_single_quotes() {
+        let input = "aws.s3.bucket {\n  name = \"my-bucket\"\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert!(
+            result.contains("name = 'my-bucket'"),
+            "Double-quoted literal should be normalized to single quotes. Got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_preserves_double_quotes_for_interpolation() {
+        let input = "aws.s3.bucket {\n  name = \"vpc-${env}\"\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert!(
+            result.contains("name = \"vpc-${env}\""),
+            "Interpolated string should keep double quotes. Got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_preserves_single_quotes() {
+        let input = "aws.s3.bucket {\n  name = 'my-bucket'\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert!(
+            result.contains("name = 'my-bucket'"),
+            "Single-quoted string should be preserved. Got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_normalizes_quotes_in_list() {
+        let input = "aws.s3.bucket {\n  tags = [\"a\", \"b\"]\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert!(
+            result.contains("'a'") && result.contains("'b'"),
+            "Double-quoted literals in lists should be normalized. Got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_preserves_double_quotes_with_single_quote_char() {
+        let input = "aws.s3.bucket {\n  name = \"it's\"\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert!(
+            result.contains("name = \"it's\""),
+            "String containing single quote should keep double quotes. Got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_normalizes_import_path_quotes() {
+        let input = "let m = import \"./modules/web\"\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert!(
+            result.contains("import './modules/web'"),
+            "Import path should be normalized to single quotes. Got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_quote_normalization_idempotent() {
+        let input = "aws.s3.bucket {\n  name = \"my-bucket\"\n  tag  = \"vpc-${env}\"\n}\n";
+        let config = FormatConfig::default();
+        let first = format(input, &config).unwrap();
+        let second = format(&first, &config).unwrap();
+        assert_eq!(first, second, "Quote normalization should be idempotent");
     }
 }
