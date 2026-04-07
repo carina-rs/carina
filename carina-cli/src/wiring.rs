@@ -641,6 +641,26 @@ pub async fn create_plan_from_parsed_with_remote(
         // In identifier-based approach, if there's no identifier in state, the resource doesn't exist.
         // Skip virtual resources (module attribute containers) — they have no infrastructure.
         let provider_ref = &provider;
+        // Pre-build a map of dependency_bindings from the state file so we can
+        // restore them after refresh. Provider.read() returns fresh attributes but
+        // doesn't know about dependency_bindings (carina-only metadata).
+        let saved_dep_bindings: HashMap<ResourceId, Vec<String>> = state_file
+            .as_ref()
+            .map(|sf| {
+                sorted_resources
+                    .iter()
+                    .filter_map(|r| {
+                        let rs =
+                            sf.find_resource(&r.id.provider, &r.id.resource_type, &r.id.name)?;
+                        if rs.dependency_bindings.is_empty() {
+                            None
+                        } else {
+                            Some((r.id.clone(), rs.dependency_bindings.clone()))
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let results: Vec<Result<(ResourceId, State), AppError>> =
             stream::iter(sorted_resources.iter().filter(|r| !r.is_virtual()))
                 .map(|resource| {
@@ -648,11 +668,16 @@ pub async fn create_plan_from_parsed_with_remote(
                     let identifier = state_file
                         .as_ref()
                         .and_then(|sf| sf.get_identifier_for_resource(resource));
+                    let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
                     async move {
-                        let state =
+                        let mut state =
                             read_with_retry(provider_ref, &resource.id, identifier.as_deref())
                                 .await
                                 .map_err(AppError::Provider)?;
+                        // Restore dependency_bindings from state file (#1565).
+                        if let Some(deps) = dep_bindings {
+                            state.dependency_bindings = deps;
+                        }
                         progress.finish();
                         Ok((resource.id.clone(), state))
                     }
@@ -677,9 +702,10 @@ pub async fn create_plan_from_parsed_with_remote(
                 stream::iter(orphan_states)
                     .map(|(id, state)| {
                         let progress = RefreshProgress::begin_multi(&multi, &id);
-                        // Preserve _binding metadata from state file so orphan
-                        // Delete effects retain their binding after refresh (#1548).
+                        // Preserve _binding and dependency_bindings from state file
+                        // so orphan Delete effects retain metadata after refresh (#1548, #1565).
                         let binding = state.attributes.get("_binding").cloned();
+                        let dep_bindings = state.dependency_bindings.clone();
                         async move {
                             let mut refreshed =
                                 read_with_retry(provider_ref, &id, state.identifier.as_deref())
@@ -687,6 +713,9 @@ pub async fn create_plan_from_parsed_with_remote(
                                     .map_err(AppError::Provider)?;
                             if let Some(b) = binding {
                                 refreshed.attributes.insert("_binding".to_string(), b);
+                            }
+                            if !dep_bindings.is_empty() {
+                                refreshed.dependency_bindings = dep_bindings;
                             }
                             progress.finish();
                             Ok((id, refreshed))
