@@ -677,11 +677,17 @@ pub async fn create_plan_from_parsed_with_remote(
                 stream::iter(orphan_states)
                     .map(|(id, state)| {
                         let progress = RefreshProgress::begin_multi(&multi, &id);
+                        // Preserve _binding metadata from state file so orphan
+                        // Delete effects retain their binding after refresh (#1548).
+                        let binding = state.attributes.get("_binding").cloned();
                         async move {
-                            let refreshed =
+                            let mut refreshed =
                                 read_with_retry(provider_ref, &id, state.identifier.as_deref())
                                     .await
                                     .map_err(AppError::Provider)?;
+                            if let Some(b) = binding {
+                                refreshed.attributes.insert("_binding".to_string(), b);
+                            }
                             progress.finish();
                             Ok((id, refreshed))
                         }
