@@ -673,20 +673,11 @@ fn build_dependency_map(
     effects: &[Effect],
     unresolved_resources: &HashMap<ResourceId, Resource>,
 ) -> HashMap<usize, HashSet<usize>> {
-    // Build binding -> effect index mapping, plus a secondary lookup for Delete
-    // effects that lost their binding (e.g., orphan _binding lost during provider
-    // refresh). For let-bound resources, the resource ID name equals the original
-    // binding name, so we use it as a fallback key. A Delete with binding: None
-    // can't also appear as a Create/Update with the same name in the same plan,
-    // so there is no collision risk with binding_to_idx. (#1548)
+    // Build binding -> effect index mapping
     let mut binding_to_idx: HashMap<String, usize> = HashMap::new();
-    let mut name_to_delete_idx: HashMap<&str, usize> = HashMap::new();
     for (idx, effect) in effects.iter().enumerate() {
         if let Some(binding) = effect.binding_name() {
             binding_to_idx.insert(binding, idx);
-        }
-        if matches!(effect, Effect::Delete { binding: None, .. }) {
-            name_to_delete_idx.insert(&effect.resource_id().name, idx);
         }
     }
 
@@ -718,10 +709,7 @@ fn build_dependency_map(
     for (idx, effect) in effects.iter().enumerate() {
         if let Effect::Delete { dependencies, .. } = effect {
             for dep_binding in dependencies {
-                if let Some(&dep_idx) = binding_to_idx
-                    .get(dep_binding)
-                    .or_else(|| name_to_delete_idx.get(dep_binding.as_str()))
-                {
+                if let Some(&dep_idx) = binding_to_idx.get(dep_binding) {
                     reverse_deps.push((dep_idx, idx));
                 }
             }
@@ -733,9 +721,7 @@ fn build_dependency_map(
         // Use from.dependency_bindings (recorded in state) for the old dependencies.
         if let Effect::Replace { from, .. } = effect {
             for dep_binding in &from.dependency_bindings {
-                if let Some(&dep_idx) = binding_to_idx
-                    .get(dep_binding)
-                    .or_else(|| name_to_delete_idx.get(dep_binding.as_str()))
+                if let Some(&dep_idx) = binding_to_idx.get(dep_binding)
                     && matches!(&effects[dep_idx], Effect::Delete { .. })
                 {
                     reverse_deps.push((dep_idx, idx));
@@ -3560,99 +3546,6 @@ mod tests {
         let events = observer.events();
         assert!(events.iter().any(|e| e.starts_with("started:")));
         assert!(events.iter().any(|e| e.starts_with("succeeded:")));
-    }
-
-    /// Regression test for #1548: Delete effect without binding must still be found
-    /// by `build_dependency_map` when a Replace(CBD) effect's `from.dependency_bindings`
-    /// references it. This happens when an orphan resource loses its `_binding` during
-    /// provider refresh.
-    #[test]
-    fn test_build_dependency_map_delete_without_binding() {
-        let mut plan = Plan::new();
-
-        // tgw_a: Delete — binding is None (orphan lost _binding during refresh)
-        plan.add(Effect::Delete {
-            id: ResourceId::new("ec2.transit_gateway", "tgw_a"),
-            identifier: "tgw-old".to_string(),
-            lifecycle: LifecycleConfig::default(),
-            binding: None, // <-- the bug: no binding
-            dependencies: HashSet::new(),
-        });
-
-        // tgw_b: Create
-        let mut tgw_b = Resource::new("test", "tgw_b");
-        tgw_b.binding = Some("tgw_b".to_string());
-        plan.add(Effect::Create(tgw_b));
-
-        // attachment: Replace (CBD) — from depends on tgw_a
-        let attachment_from = State::existing(
-            ResourceId::new("ec2.transit_gateway_attachment", "attachment"),
-            HashMap::new(),
-        )
-        .with_identifier("attach-old")
-        .with_dependency_bindings(vec!["tgw_a".to_string()]);
-
-        let mut attachment_to = Resource::new("ec2.transit_gateway_attachment", "attachment");
-        attachment_to.binding = Some("attachment".to_string());
-        attachment_to.dependency_bindings = vec!["tgw_b".to_string()];
-
-        plan.add(Effect::Replace {
-            id: ResourceId::new("ec2.transit_gateway_attachment", "attachment"),
-            from: Box::new(attachment_from),
-            to: attachment_to,
-            lifecycle: LifecycleConfig {
-                create_before_destroy: true,
-                ..Default::default()
-            },
-            changed_create_only: vec!["transit_gateway_id".to_string()],
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        });
-
-        let deps = build_dependency_map(plan.effects(), &HashMap::new());
-
-        // tgw_a delete (idx 0) must depend on attachment replace (idx 2)
-        // because the old attachment depended on tgw_a
-        assert!(
-            deps[&0].contains(&2),
-            "tgw_a delete should wait for attachment replace even without binding. deps: {:?}",
-            deps
-        );
-    }
-
-    /// Regression test for #1548: Delete→Delete reverse deps must work when the parent
-    /// Delete has binding: None (orphan lost _binding during refresh).
-    #[test]
-    fn test_build_dependency_map_delete_reverse_deps_without_binding() {
-        let mut plan = Plan::new();
-
-        // vpc: Delete — binding is None (orphan lost _binding during refresh)
-        plan.add(Effect::Delete {
-            id: ResourceId::new("ec2.vpc", "vpc"),
-            identifier: "vpc-123".to_string(),
-            lifecycle: LifecycleConfig::default(),
-            binding: None, // <-- no binding
-            dependencies: HashSet::new(),
-        });
-
-        // subnet: Delete — depends on "vpc"
-        plan.add(Effect::Delete {
-            id: ResourceId::new("ec2.subnet", "my-subnet"),
-            identifier: "subnet-456".to_string(),
-            lifecycle: LifecycleConfig::default(),
-            binding: Some("subnet".to_string()),
-            dependencies: HashSet::from(["vpc".to_string()]),
-        });
-
-        let deps = build_dependency_map(plan.effects(), &HashMap::new());
-
-        // vpc delete (idx 0) must depend on subnet delete (idx 1)
-        assert!(
-            deps[&0].contains(&1),
-            "vpc delete should depend on subnet delete even without binding. deps: {:?}",
-            deps
-        );
     }
 
     /// Regression test for #1195: build_dependency_map also respects delete dependencies.
