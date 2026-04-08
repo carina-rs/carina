@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use carina_core::formatter::{self, FormatConfig};
@@ -18,7 +18,6 @@ use crate::semantic_tokens::{self, SemanticTokensProvider};
 use crate::workspace;
 
 /// Calculate the end position (line, character) of a text document.
-/// Returns (last_line, last_character) using character counts (not byte lengths).
 pub fn document_end_position(text: &str) -> (u32, u32) {
     let line_count = text.chars().filter(|&c| c == '\n').count();
     let last_line = line_count as u32;
@@ -67,22 +66,32 @@ impl ProviderState {
     }
 }
 
+/// Function type for building provider factories from configs and a base directory.
+/// This callback is provided by main.rs to keep provider-specific wiring out of the library.
+pub type FactoryBuilder = Arc<
+    dyn Fn(&[carina_core::parser::ProviderConfig], &Path) -> Vec<Box<dyn ProviderFactory>>
+        + Send
+        + Sync,
+>;
+
 pub struct Backend {
     client: Client,
     documents: DashMap<Url, Document>,
     providers: tokio::sync::RwLock<ProviderState>,
     provider_context: Arc<ProviderContext>,
     workspace_root: tokio::sync::OnceCell<Option<PathBuf>>,
+    factory_builder: Option<FactoryBuilder>,
 }
 
 impl Backend {
     pub fn new(
         client: Client,
-        factories: Vec<Box<dyn ProviderFactory>>,
         provider_context: ProviderContext,
+        factory_builder: Option<FactoryBuilder>,
     ) -> Self {
         let provider_context = Arc::new(provider_context);
-        let state = ProviderState::new(&factories, &provider_context);
+        // Start with empty schemas — they will be loaded asynchronously after initialize
+        let state = ProviderState::new(&[], &provider_context);
 
         Self {
             client,
@@ -90,6 +99,7 @@ impl Backend {
             providers: tokio::sync::RwLock::new(state),
             provider_context,
             workspace_root: tokio::sync::OnceCell::new(),
+            factory_builder,
         }
     }
 
@@ -117,10 +127,15 @@ impl Backend {
         }
     }
 
-    /// Reload provider schemas by re-scanning workspace .crn files.
-    async fn reload_schemas(&self) {
+    /// Load or reload provider schemas from workspace .crn files.
+    async fn load_schemas(&self) {
         let workspace_root = match self.workspace_root() {
             Some(root) => root.clone(),
+            None => return,
+        };
+
+        let factory_builder = match &self.factory_builder {
+            Some(builder) => builder,
             None => return,
         };
 
@@ -129,28 +144,50 @@ impl Backend {
             return;
         }
 
-        // Build factories (this is the main.rs wiring logic, but we can't
-        // call it from the library. Pass empty factories if no WASM available.)
-        // For now, rediscover uses the factories built at startup.
-        // Full reload requires re-building WASM factories which is done in main.rs.
-        // This handler will be most useful when the workspace root is set and
-        // factories can be rebuilt. For now, log the change.
+        // Build factories using the injected builder (runs WASM loading)
+        let factories = tokio::task::spawn_blocking({
+            let configs = provider_configs.clone();
+            let dir = workspace_root.clone();
+            let builder = Arc::clone(factory_builder);
+            move || builder(&configs, &dir)
+        })
+        .await
+        .unwrap_or_default();
+
+        if factories.is_empty() {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!(
+                        "Found {} provider(s) but no WASM binaries cached. Run `carina init` to download.",
+                        provider_configs.len()
+                    ),
+                )
+                .await;
+            return;
+        }
+
+        let new_state = ProviderState::new(&factories, &self.provider_context);
+        *self.providers.write().await = new_state;
+
         self.client
             .log_message(
                 MessageType::INFO,
-                format!(
-                    "Provider config changed, found {} provider(s). Restart LSP for full reload.",
-                    provider_configs.len()
-                ),
+                format!("Loaded {} provider schema(s)", factories.len()),
             )
             .await;
+
+        // Re-run diagnostics on all open documents with new schemas
+        let uris: Vec<Url> = self.documents.iter().map(|r| r.key().clone()).collect();
+        for uri in uris {
+            self.update_diagnostics(uri).await;
+        }
     }
 }
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
-        // Capture workspace root from rootUri or workspaceFolders
         let root = params
             .root_uri
             .as_ref()
@@ -215,6 +252,9 @@ impl LanguageServer for Backend {
         self.client
             .log_message(MessageType::INFO, "Carina LSP server initialized")
             .await;
+
+        // Load provider schemas asynchronously (doesn't block the event loop)
+        self.load_schemas().await;
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -252,7 +292,7 @@ impl LanguageServer for Backend {
             .any(|c| c.uri.as_str().ends_with(".crn"));
 
         if has_crn_changes {
-            self.reload_schemas().await;
+            self.load_schemas().await;
         }
     }
 
