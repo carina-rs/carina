@@ -1,4 +1,4 @@
-//! Workspace scanning: discover and parse provider configurations from .crn files.
+//! Workspace scanning: discover provider configurations from .crn files.
 
 use std::fs;
 use std::path::Path;

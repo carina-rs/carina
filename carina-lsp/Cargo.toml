@@ -18,6 +18,8 @@ path = "src/main.rs"
 
 [dependencies]
 carina-core = { path = "../carina-core" }
+carina-plugin-host = { path = "../carina-plugin-host" }
+carina-provider-resolver = { path = "../carina-provider-resolver" }
 carina-state = { path = "../carina-state" }
 tower-lsp = "0.20"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util"] }
