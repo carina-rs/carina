@@ -424,11 +424,13 @@ pub trait ProviderFactory: Send + Sync {
         vec![]
     }
 
-    /// Region completions for this provider.
-    /// Returns a list of `CompletionValue` with DSL-format region values
-    /// (e.g., "aws.Region.ap_northeast_1") and display names.
-    fn region_completions(&self) -> Vec<crate::schema::CompletionValue> {
-        vec![]
+    /// Config attribute completions for this provider.
+    /// Returns a map of attribute name → completion candidates.
+    /// For example, an AWS provider returns `{"region": [CompletionValue { value: "aws.Region.ap_northeast_1", ... }]}`.
+    fn config_completions(
+        &self,
+    ) -> std::collections::HashMap<String, Vec<crate::schema::CompletionValue>> {
+        std::collections::HashMap::new()
     }
 
     /// Maps a DSL alias value back to the canonical AWS value.

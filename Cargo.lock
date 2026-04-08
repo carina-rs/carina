@@ -843,6 +843,8 @@ name = "carina-lsp"
 version = "0.2.0"
 dependencies = [
  "carina-core",
+ "carina-plugin-host",
+ "carina-provider-resolver",
  "carina-state",
  "dashmap 6.1.0",
  "env_logger",

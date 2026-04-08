@@ -44,7 +44,7 @@ impl ProviderState {
         let provider_names: Vec<String> = factories.iter().map(|f| f.name().to_string()).collect();
         let region_completions: Vec<CompletionValue> = factories
             .iter()
-            .flat_map(|f| f.region_completions())
+            .flat_map(|f| f.config_completions().remove("region").unwrap_or_default())
             .collect();
         let factories_arc: Arc<Vec<Box<dyn ProviderFactory>>> = Arc::new(Vec::new());
 
