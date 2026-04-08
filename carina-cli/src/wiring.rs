@@ -71,7 +71,7 @@ pub fn build_factories_from_providers(
     providers: &[ProviderConfig],
     base_dir: &Path,
 ) -> Vec<Box<dyn ProviderFactory>> {
-    if let Err(e) = crate::provider_resolver::validate_lock_constraints(base_dir, providers) {
+    if let Err(e) = carina_provider_resolver::validate_lock_constraints(base_dir, providers) {
         eprintln!("{}", e.red());
         std::process::exit(1);
     }
@@ -87,7 +87,7 @@ pub fn build_factories_from_providers(
         let binary_path = if let Some(path) = source.strip_prefix("file://") {
             std::path::PathBuf::from(path)
         } else if source.starts_with("github.com/") {
-            match crate::provider_resolver::resolve_single_config(base_dir, config) {
+            match carina_provider_resolver::resolve_single_config(base_dir, config) {
                 Ok(path) => path,
                 Err(e) => {
                     eprintln!(
@@ -113,7 +113,7 @@ pub fn build_factories_from_providers(
             continue;
         };
 
-        if !crate::provider_resolver::is_wasm_provider(&binary_path) {
+        if !carina_provider_resolver::is_wasm_provider(&binary_path) {
             eprintln!(
                 "{}",
                 format!(
@@ -535,14 +535,14 @@ async fn load_source_provider(
     let binary_path = if let Some(path) = source.strip_prefix("file://") {
         std::path::PathBuf::from(path)
     } else if source.starts_with("github.com/") {
-        crate::provider_resolver::resolve_single_config(base_dir, config)?
+        carina_provider_resolver::resolve_single_config(base_dir, config)?
     } else {
         return Err(format!(
             "Unsupported source format: {source}. Use file:// for local binaries or github.com/owner/repo for remote."
         ));
     };
 
-    if !crate::provider_resolver::is_wasm_provider(&binary_path) {
+    if !carina_provider_resolver::is_wasm_provider(&binary_path) {
         return Err(format!(
             "Provider '{}': native binaries are no longer supported. Use a .wasm component instead.",
             config.name

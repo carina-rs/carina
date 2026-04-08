@@ -801,6 +801,7 @@ dependencies = [
  "carina-core",
  "carina-plugin-host",
  "carina-provider-mock",
+ "carina-provider-resolver",
  "carina-state",
  "carina-tui",
  "chrono",
@@ -808,7 +809,6 @@ dependencies = [
  "clap_complete",
  "colored",
  "env_logger",
- "flate2",
  "futures",
  "indicatif",
  "insta",
@@ -816,14 +816,10 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "sha2",
  "similar",
- "tar",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "toml 0.8.23",
- "ureq",
 ]
 
 [[package]]
@@ -910,6 +906,22 @@ version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "carina-provider-resolver"
+version = "0.2.0"
+dependencies = [
+ "carina-core",
+ "flate2",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "toml 0.8.23",
+ "ureq",
 ]
 
 [[package]]

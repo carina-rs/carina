@@ -7,6 +7,7 @@ members = [
     "carina-plugin-host",
     "carina-plugin-sdk",
     "carina-provider-mock",
+    "carina-provider-resolver",
     "carina-provider-protocol",
     "carina-state",
     "carina-tui",
