@@ -17,7 +17,7 @@ mkdir my-infra && cd my-infra
 // main.crn
 provider awscc {
   source  = 'github.com/carina-rs/carina-provider-awscc'
-  version = '0.2.0'
+  version = '0.3.0'
   region  = 'ap-northeast-1'
 }
 

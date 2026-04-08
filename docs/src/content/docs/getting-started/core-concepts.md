@@ -40,7 +40,7 @@ Configure a provider in your `.crn` file:
 ```crn
 provider awscc {
   source  = 'file:///path/to/carina_provider_awscc.wasm'
-  version = '0.2.0'
+  version = '0.3.0'
   region  = 'ap-northeast-1'
 }
 ```
