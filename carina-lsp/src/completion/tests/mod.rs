@@ -19,7 +19,7 @@ pub(super) fn test_provider() -> CompletionProvider {
     let provider_names: Vec<String> = factories.iter().map(|f| f.name().to_string()).collect();
     let region_completions: Vec<CompletionValue> = factories
         .iter()
-        .flat_map(|f| f.region_completions())
+        .flat_map(|f| f.config_completions().remove("region").unwrap_or_default())
         .collect();
     let custom_type_names: Vec<String> = vec![];
     CompletionProvider::new(
