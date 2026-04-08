@@ -8,6 +8,7 @@ license = "MIT"
 doctest = false
 
 [dependencies]
+carina-aws-types = { path = "../carina-aws-types" }
 carina-core = { path = "../carina-core" }
 carina-provider-protocol = { path = "../carina-provider-protocol" }
 semver = "1"

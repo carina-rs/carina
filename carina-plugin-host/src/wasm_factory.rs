@@ -954,6 +954,10 @@ impl ProviderFactory for WasmProviderFactory {
         })
     }
 
+    fn region_completions(&self) -> Vec<carina_core::schema::CompletionValue> {
+        carina_aws_types::region_completions(self.name_static)
+    }
+
     fn extract_region(&self, attributes: &HashMap<String, Value>) -> String {
         if let Some(Value::String(region)) = attributes.get("region") {
             carina_core::utils::convert_region_value(region)
