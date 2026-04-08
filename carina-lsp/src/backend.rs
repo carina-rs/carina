@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use carina_core::formatter::{self, FormatConfig};
@@ -37,6 +38,7 @@ pub struct Backend {
     hover_provider: HoverProvider,
     semantic_tokens_provider: SemanticTokensProvider,
     provider_context: Arc<ProviderContext>,
+    workspace_root: tokio::sync::OnceCell<Option<PathBuf>>,
 }
 
 impl Backend {
@@ -79,7 +81,13 @@ impl Backend {
             semantic_tokens_provider: SemanticTokensProvider::new(&region_completions),
             hover_provider: HoverProvider::new(Arc::clone(&schemas), region_completions),
             provider_context,
+            workspace_root: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// Returns the workspace root path, if available.
+    pub fn workspace_root(&self) -> Option<&PathBuf> {
+        self.workspace_root.get().and_then(|opt| opt.as_ref())
     }
 
     async fn update_diagnostics(&self, uri: Url) {
@@ -100,7 +108,21 @@ impl Backend {
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        // Capture workspace root from rootUri or workspaceFolders
+        let root = params
+            .root_uri
+            .as_ref()
+            .and_then(|uri| uri.to_file_path().ok())
+            .or_else(|| {
+                params
+                    .workspace_folders
+                    .as_ref()
+                    .and_then(|folders| folders.first())
+                    .and_then(|f| f.uri.to_file_path().ok())
+            });
+        let _ = self.workspace_root.set(root);
+
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
