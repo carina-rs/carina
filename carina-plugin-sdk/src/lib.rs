@@ -99,6 +99,22 @@ pub trait CarinaProvider {
         lifecycle: &LifecycleConfig,
     ) -> Result<(), ProviderError>;
 
+    /// Return provider config attribute completions.
+    /// Key is attribute name (e.g., "region"), value is list of completion candidates.
+    fn config_completions(&self) -> HashMap<String, Vec<CompletionValue>> {
+        HashMap::new()
+    }
+
+    /// Return identity attribute names for anonymous resource ID computation.
+    fn identity_attributes(&self) -> Vec<String> {
+        vec![]
+    }
+
+    /// Return enum alias mappings: resource_type -> attr_name -> alias -> canonical_value.
+    fn enum_aliases(&self) -> HashMap<String, HashMap<String, HashMap<String, String>>> {
+        HashMap::new()
+    }
+
     /// Normalize desired resources (optional).
     fn normalize_desired(&self, resources: Vec<Resource>) -> Vec<Resource> {
         resources

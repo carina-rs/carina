@@ -321,6 +321,23 @@ macro_rules! export_provider {
                     }
                 }
 
+                fn provider_config_completions() -> String {
+                    let provider = get_provider().lock().unwrap();
+                    let completions = $crate::CarinaProvider::config_completions(&*provider);
+                    serde_json::to_string(&completions).unwrap_or_else(|_| "{}".to_string())
+                }
+
+                fn identity_attributes() -> Vec<String> {
+                    let provider = get_provider().lock().unwrap();
+                    $crate::CarinaProvider::identity_attributes(&*provider)
+                }
+
+                fn get_enum_aliases() -> String {
+                    let provider = get_provider().lock().unwrap();
+                    let aliases = $crate::CarinaProvider::enum_aliases(&*provider);
+                    serde_json::to_string(&aliases).unwrap_or_else(|_| "{}".to_string())
+                }
+
                 fn normalize_desired(
                     resources: Vec<wit_types::ResourceDef>,
                 ) -> Vec<wit_types::ResourceDef> {
@@ -621,6 +638,23 @@ macro_rules! export_provider {
                         Ok(()) => Ok(()),
                         Err(e) => Err(serde_json::to_string(&e).unwrap_or_else(|_| e.message.clone())),
                     }
+                }
+
+                fn provider_config_completions() -> String {
+                    let provider = get_provider().lock().unwrap();
+                    let completions = $crate::CarinaProvider::config_completions(&*provider);
+                    serde_json::to_string(&completions).unwrap_or_else(|_| "{}".to_string())
+                }
+
+                fn identity_attributes() -> Vec<String> {
+                    let provider = get_provider().lock().unwrap();
+                    $crate::CarinaProvider::identity_attributes(&*provider)
+                }
+
+                fn get_enum_aliases() -> String {
+                    let provider = get_provider().lock().unwrap();
+                    let aliases = $crate::CarinaProvider::enum_aliases(&*provider);
+                    serde_json::to_string(&aliases).unwrap_or_else(|_| "{}".to_string())
                 }
 
                 fn normalize_desired(

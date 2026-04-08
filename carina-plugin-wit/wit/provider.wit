@@ -17,6 +17,20 @@ interface provider {
     /// options is JSON-serialized provider options map
     delete: func(id: resource-id, identifier: string, options: string) -> result<_, string>;
 
+    /// Returns JSON-serialized HashMap<String, Vec<CompletionValue>> where key is
+    /// the config attribute name (e.g., "region") and value is a list of completion
+    /// candidates with { value, description }.
+    provider-config-completions: func() -> string;
+
+    /// Returns the list of identity attribute names used for anonymous resource
+    /// ID computation (e.g., ["region"]).
+    identity-attributes: func() -> list<string>;
+
+    /// Returns JSON-serialized HashMap<String, HashMap<String, HashMap<String, String>>>
+    /// for DSL enum alias resolution.
+    /// Structure: resource_type -> attr_name -> alias -> canonical_value.
+    get-enum-aliases: func() -> string;
+
     normalize-desired: func(resources: list<resource-def>) -> list<resource-def>;
     normalize-state: func(
         states: list<tuple<string, state>>,

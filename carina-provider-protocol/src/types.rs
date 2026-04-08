@@ -134,6 +134,13 @@ pub struct ProviderInfo {
     pub version: String,
 }
 
+/// Completion value for LSP completions, serializable for WIT transport.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionValue {
+    pub value: String,
+    pub description: String,
+}
+
 /// Provider error returned from operations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderError {
