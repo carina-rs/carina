@@ -551,7 +551,7 @@ pub mod validators {
 }
 
 /// Completion value for LSP completions
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompletionValue {
     /// The value to insert (e.g., "aws.vpc.InstanceTenancy.default")
     pub value: String,

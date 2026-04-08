@@ -25,7 +25,7 @@ use carina_core::provider::{
 use carina_core::resource::{
     Expr, LifecycleConfig, Resource, ResourceId, State, Value, contains_resource_ref,
 };
-use carina_core::schema::ResourceSchema;
+use carina_core::schema::{CompletionValue, ResourceSchema};
 
 use crate::wasm_bindings::CarinaProvider;
 use crate::wasm_bindings_http::CarinaProviderWithHttp;
@@ -256,6 +256,60 @@ impl WasmBindings {
         match self {
             WasmBindings::Basic(b) => b.carina_provider_provider().call_schemas(store).await,
             WasmBindings::Http(b) => b.carina_provider_provider().call_schemas(store).await,
+        }
+    }
+
+    async fn call_provider_config_completions(
+        &self,
+        store: &mut Store<HostState>,
+    ) -> wasmtime::Result<String> {
+        match self {
+            WasmBindings::Basic(b) => {
+                b.carina_provider_provider()
+                    .call_provider_config_completions(store)
+                    .await
+            }
+            WasmBindings::Http(b) => {
+                b.carina_provider_provider()
+                    .call_provider_config_completions(store)
+                    .await
+            }
+        }
+    }
+
+    async fn call_identity_attributes(
+        &self,
+        store: &mut Store<HostState>,
+    ) -> wasmtime::Result<Vec<String>> {
+        match self {
+            WasmBindings::Basic(b) => {
+                b.carina_provider_provider()
+                    .call_identity_attributes(store)
+                    .await
+            }
+            WasmBindings::Http(b) => {
+                b.carina_provider_provider()
+                    .call_identity_attributes(store)
+                    .await
+            }
+        }
+    }
+
+    async fn call_get_enum_aliases(
+        &self,
+        store: &mut Store<HostState>,
+    ) -> wasmtime::Result<String> {
+        match self {
+            WasmBindings::Basic(b) => {
+                b.carina_provider_provider()
+                    .call_get_enum_aliases(store)
+                    .await
+            }
+            WasmBindings::Http(b) => {
+                b.carina_provider_provider()
+                    .call_get_enum_aliases(store)
+                    .await
+            }
         }
     }
 
@@ -609,6 +663,9 @@ pub struct WasmProviderFactory {
     display_name_static: &'static str,
     version: String,
     schemas: Vec<ResourceSchema>,
+    cached_config_completions: HashMap<String, Vec<CompletionValue>>,
+    cached_identity_attributes: Vec<String>,
+    cached_enum_aliases: HashMap<String, HashMap<String, HashMap<String, String>>>,
     enable_http: bool,
     /// Reusable WASM instance from factory initialization.
     /// Used by `validate_config()` to avoid creating a throwaway instance.
@@ -627,6 +684,37 @@ impl WasmProviderFactory {
     /// Returns `None` if the home directory cannot be determined.
     fn default_cache_dir() -> Option<PathBuf> {
         dirs::home_dir().map(|h| h.join(".carina").join("cache"))
+    }
+
+    /// Load provider metadata from WIT functions. Returns empty defaults on failure.
+    async fn load_metadata(
+        bindings: &WasmBindings,
+        store: &mut Store<HostState>,
+    ) -> (
+        HashMap<String, Vec<CompletionValue>>,
+        Vec<String>,
+        HashMap<String, HashMap<String, HashMap<String, String>>>,
+    ) {
+        let config_completions_json = bindings
+            .call_provider_config_completions(store)
+            .await
+            .unwrap_or_else(|_| "{}".to_string());
+        let config_completions: HashMap<String, Vec<CompletionValue>> =
+            serde_json::from_str(&config_completions_json).unwrap_or_default();
+
+        let identity_attributes = bindings
+            .call_identity_attributes(store)
+            .await
+            .unwrap_or_default();
+
+        let enum_aliases_json = bindings
+            .call_get_enum_aliases(store)
+            .await
+            .unwrap_or_else(|_| "{}".to_string());
+        let enum_aliases: HashMap<String, HashMap<String, HashMap<String, String>>> =
+            serde_json::from_str(&enum_aliases_json).unwrap_or_default();
+
+        (config_completions, identity_attributes, enum_aliases)
     }
 
     /// Compute a cache-safe filename for the given wasm path.
@@ -745,6 +833,9 @@ impl WasmProviderFactory {
         let (name, display_name, version) = wasm_convert::json_to_provider_info(&info_json);
         let schemas: Vec<ResourceSchema> = wasm_convert::json_to_schemas(&schemas_json);
 
+        let (cached_config_completions, cached_identity_attributes, cached_enum_aliases) =
+            Self::load_metadata(&bindings, &mut store).await;
+
         let name_static: &'static str = Box::leak(name.into_boxed_str());
         let display_name_static: &'static str = Box::leak(display_name.into_boxed_str());
 
@@ -756,6 +847,9 @@ impl WasmProviderFactory {
             display_name_static,
             version,
             schemas,
+            cached_config_completions,
+            cached_identity_attributes,
+            cached_enum_aliases,
             enable_http,
             init_instance: Mutex::new((store, bindings)),
             shared_instance: Mutex::new(None),
@@ -833,6 +927,9 @@ impl WasmProviderFactory {
         let (name, display_name, version) = wasm_convert::json_to_provider_info(&info_json);
         let schemas: Vec<ResourceSchema> = wasm_convert::json_to_schemas(&schemas_json);
 
+        let (cached_config_completions, cached_identity_attributes, cached_enum_aliases) =
+            Self::load_metadata(&bindings, &mut store).await;
+
         let name_static: &'static str = Box::leak(name.into_boxed_str());
         let display_name_static: &'static str = Box::leak(display_name.into_boxed_str());
 
@@ -844,6 +941,9 @@ impl WasmProviderFactory {
             display_name_static,
             version,
             schemas,
+            cached_config_completions,
+            cached_identity_attributes,
+            cached_enum_aliases,
             enable_http,
             init_instance: Mutex::new((store, bindings)),
             shared_instance: Mutex::new(None),
@@ -960,6 +1060,30 @@ impl ProviderFactory for WasmProviderFactory {
         } else {
             "ap-northeast-1".to_string()
         }
+    }
+
+    fn config_completions(&self) -> HashMap<String, Vec<CompletionValue>> {
+        self.cached_config_completions.clone()
+    }
+
+    fn identity_attributes(&self) -> Vec<&str> {
+        self.cached_identity_attributes
+            .iter()
+            .map(|s| s.as_str())
+            .collect()
+    }
+
+    fn get_enum_alias_reverse(
+        &self,
+        resource_type: &str,
+        attr_name: &str,
+        value: &str,
+    ) -> Option<String> {
+        self.cached_enum_aliases
+            .get(resource_type)
+            .and_then(|attrs| attrs.get(attr_name))
+            .and_then(|aliases| aliases.get(value))
+            .cloned()
     }
 
     fn create_provider(

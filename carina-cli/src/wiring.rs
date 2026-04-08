@@ -408,7 +408,7 @@ fn resolve_value_alias(
             let raw = utils::convert_enum_value(s);
             if let Some(canonical) = factory.get_enum_alias_reverse(resource_type, attr_name, &raw)
             {
-                *s = canonical.to_string();
+                *s = canonical;
             }
         }
         Value::List(items) => {
