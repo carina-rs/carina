@@ -5,7 +5,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower_lsp::{LspService, Server};
 
 use carina_core::parser::ProviderContext;
-use carina_core::provider::ProviderFactory;
 use carina_lsp::Backend;
 
 struct TestClient {
@@ -21,12 +20,11 @@ impl TestClient {
         let (server_writer, client_reader) = tokio::io::duplex(1024 * 1024);
 
         let (service, socket) = LspService::new(|client| {
-            let factories: Vec<Box<dyn ProviderFactory>> = vec![];
             let provider_context = ProviderContext {
                 decryptor: None,
                 validators: HashMap::new(),
             };
-            Backend::new(client, factories, provider_context)
+            Backend::new(client, provider_context, None)
         });
 
         tokio::spawn(async move {

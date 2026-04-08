@@ -8,10 +8,6 @@ use tower_lsp::{LspService, Server};
 use carina_lsp::Backend;
 
 /// Build provider factories from discovered provider configs.
-///
-/// For each provider config with a `source`, resolves the cached WASM binary
-/// and loads it as a `WasmProviderFactory`. Providers without source or with
-/// missing/invalid WASM binaries are skipped with a log warning.
 fn build_factories(providers: &[ProviderConfig], base_dir: &Path) -> Vec<Box<dyn ProviderFactory>> {
     let mut factories: Vec<Box<dyn ProviderFactory>> = Vec::new();
 
@@ -79,25 +75,17 @@ async fn main() {
     let stdout = tokio::io::stdout();
 
     let (service, socket) = LspService::new(|client| {
-        let cwd = std::env::current_dir().ok();
-        let factories = if let Some(ref dir) = cwd {
-            let providers = carina_lsp::workspace::discover_providers(dir);
-            if providers.is_empty() {
-                vec![]
-            } else {
-                build_factories(&providers, dir)
-            }
-        } else {
-            vec![]
-        };
-
-        log::info!("LSP: loaded {} provider factories", factories.len());
-
         let provider_context = ProviderContext {
             decryptor: None,
             validators: HashMap::new(),
         };
-        Backend::new(client, factories, provider_context)
+
+        // Pass factory builder callback — actual WASM loading happens asynchronously
+        // after initialize, not during server construction.
+        let factory_builder: carina_lsp::backend::FactoryBuilder =
+            std::sync::Arc::new(build_factories);
+
+        Backend::new(client, provider_context, Some(factory_builder))
     });
     Server::new(stdin, stdout, socket).serve(service).await;
 }
