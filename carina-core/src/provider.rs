@@ -444,7 +444,7 @@ pub trait ProviderFactory: Send + Sync {
         _resource_type: &str,
         _attr_name: &str,
         _value: &str,
-    ) -> Option<&'static str> {
+    ) -> Option<String> {
         None
     }
 }
