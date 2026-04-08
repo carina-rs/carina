@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "carina-aws-types",
     "carina-cli",
     "carina-core",
     "carina-lsp",

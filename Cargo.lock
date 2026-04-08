@@ -783,13 +783,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "carina-aws-types"
-version = "0.2.0"
-dependencies = [
- "carina-core",
-]
-
-[[package]]
 name = "carina-cli"
 version = "0.2.0"
 dependencies = [
