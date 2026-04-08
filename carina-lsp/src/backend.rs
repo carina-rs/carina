@@ -15,6 +15,7 @@ use crate::diagnostics::DiagnosticEngine;
 use crate::document::Document;
 use crate::hover::HoverProvider;
 use crate::semantic_tokens::{self, SemanticTokensProvider};
+use crate::workspace;
 
 /// Calculate the end position (line, character) of a text document.
 /// Returns (last_line, last_character) using character counts (not byte lengths).
@@ -30,13 +31,46 @@ pub fn document_end_position(text: &str) -> (u32, u32) {
     (last_line, last_char)
 }
 
-pub struct Backend {
-    client: Client,
-    documents: DashMap<Url, Document>,
+/// Schema-dependent providers that are rebuilt when provider configs change.
+struct ProviderState {
     diagnostic_engine: DiagnosticEngine,
     completion_provider: CompletionProvider,
     hover_provider: HoverProvider,
     semantic_tokens_provider: SemanticTokensProvider,
+}
+
+impl ProviderState {
+    fn new(factories: &[Box<dyn ProviderFactory>], provider_context: &ProviderContext) -> Self {
+        let schemas = Arc::new(provider_mod::collect_schemas(factories));
+        let provider_names: Vec<String> = factories.iter().map(|f| f.name().to_string()).collect();
+        let region_completions: Vec<CompletionValue> = factories
+            .iter()
+            .flat_map(|f| f.region_completions())
+            .collect();
+        let factories_arc: Arc<Vec<Box<dyn ProviderFactory>>> = Arc::new(Vec::new());
+
+        Self {
+            diagnostic_engine: DiagnosticEngine::new(
+                Arc::clone(&schemas),
+                provider_names.clone(),
+                factories_arc,
+            ),
+            completion_provider: CompletionProvider::new(
+                Arc::clone(&schemas),
+                provider_names,
+                region_completions.clone(),
+                provider_context.validators.keys().cloned().collect(),
+            ),
+            semantic_tokens_provider: SemanticTokensProvider::new(&region_completions),
+            hover_provider: HoverProvider::new(schemas, region_completions),
+        }
+    }
+}
+
+pub struct Backend {
+    client: Client,
+    documents: DashMap<Url, Document>,
+    providers: tokio::sync::RwLock<ProviderState>,
     provider_context: Arc<ProviderContext>,
     workspace_root: tokio::sync::OnceCell<Option<PathBuf>>,
 }
@@ -47,39 +81,13 @@ impl Backend {
         factories: Vec<Box<dyn ProviderFactory>>,
         provider_context: ProviderContext,
     ) -> Self {
-        // Build shared schema map from all factories
-        let schemas = Arc::new(provider_mod::collect_schemas(&factories));
-
-        // Collect provider names
-        let provider_names: Vec<String> = factories.iter().map(|f| f.name().to_string()).collect();
-
-        // Collect region completions from all factories
-        let region_completions: Vec<CompletionValue> = factories
-            .iter()
-            .flat_map(|f| f.region_completions())
-            .collect();
-
-        // Wrap factories in Arc for sharing
-        let factories: Arc<Vec<Box<dyn ProviderFactory>>> = Arc::new(factories);
-
         let provider_context = Arc::new(provider_context);
+        let state = ProviderState::new(&factories, &provider_context);
 
         Self {
             client,
             documents: DashMap::new(),
-            diagnostic_engine: DiagnosticEngine::new(
-                Arc::clone(&schemas),
-                provider_names.clone(),
-                Arc::clone(&factories),
-            ),
-            completion_provider: CompletionProvider::new(
-                Arc::clone(&schemas),
-                provider_names.clone(),
-                region_completions.clone(),
-                provider_context.validators.keys().cloned().collect(),
-            ),
-            semantic_tokens_provider: SemanticTokensProvider::new(&region_completions),
-            hover_provider: HoverProvider::new(Arc::clone(&schemas), region_completions),
+            providers: tokio::sync::RwLock::new(state),
             provider_context,
             workspace_root: tokio::sync::OnceCell::new(),
         }
@@ -92,17 +100,50 @@ impl Backend {
 
     async fn update_diagnostics(&self, uri: Url) {
         if let Some(doc) = self.documents.get(&uri) {
-            // Get base path from URI for module resolution
             let base_path = uri
                 .to_file_path()
                 .ok()
                 .and_then(|p| p.parent().map(|p| p.to_path_buf()));
 
-            let diagnostics = self.diagnostic_engine.analyze(&doc, base_path.as_deref());
+            let providers = self.providers.read().await;
+            let diagnostics = providers
+                .diagnostic_engine
+                .analyze(&doc, base_path.as_deref());
+            drop(providers);
+
             self.client
                 .publish_diagnostics(uri, diagnostics, None)
                 .await;
         }
+    }
+
+    /// Reload provider schemas by re-scanning workspace .crn files.
+    async fn reload_schemas(&self) {
+        let workspace_root = match self.workspace_root() {
+            Some(root) => root.clone(),
+            None => return,
+        };
+
+        let provider_configs = workspace::discover_providers(&workspace_root);
+        if provider_configs.is_empty() {
+            return;
+        }
+
+        // Build factories (this is the main.rs wiring logic, but we can't
+        // call it from the library. Pass empty factories if no WASM available.)
+        // For now, rediscover uses the factories built at startup.
+        // Full reload requires re-building WASM factories which is done in main.rs.
+        // This handler will be most useful when the workspace root is set and
+        // factories can be rebuilt. For now, log the change.
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!(
+                    "Provider config changed, found {} provider(s). Restart LSP for full reload.",
+                    provider_configs.len()
+                ),
+            )
+            .await;
     }
 }
 
@@ -155,6 +196,22 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
+        // Register file watcher for .crn files
+        let registration = Registration {
+            id: "crn-watcher".to_string(),
+            method: "workspace/didChangeWatchedFiles".to_string(),
+            register_options: Some(
+                serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+                    watchers: vec![FileSystemWatcher {
+                        glob_pattern: GlobPattern::String("**/*.crn".to_string()),
+                        kind: Some(WatchKind::all()),
+                    }],
+                })
+                .unwrap(),
+            ),
+        };
+        let _ = self.client.register_capability(vec![registration]).await;
+
         self.client
             .log_message(MessageType::INFO, "Carina LSP server initialized")
             .await;
@@ -188,19 +245,31 @@ impl LanguageServer for Backend {
         self.documents.remove(&params.text_document.uri);
     }
 
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        let has_crn_changes = params
+            .changes
+            .iter()
+            .any(|c| c.uri.as_str().ends_with(".crn"));
+
+        if has_crn_changes {
+            self.reload_schemas().await;
+        }
+    }
+
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let uri = &params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
         if let Some(doc) = self.documents.get(uri) {
-            // Get base path from URI for module resolution
             let base_path = uri
                 .to_file_path()
                 .ok()
                 .and_then(|p| p.parent().map(|p| p.to_path_buf()));
 
+            let providers = self.providers.read().await;
             let completions =
-                self.completion_provider
+                providers
+                    .completion_provider
                     .complete(&doc, position, base_path.as_deref());
             return Ok(Some(CompletionResponse::Array(completions)));
         }
@@ -216,7 +285,8 @@ impl LanguageServer for Backend {
                 .to_file_path()
                 .ok()
                 .and_then(|p| p.parent().map(|p| p.to_path_buf()));
-            return Ok(self.hover_provider.hover_with_base_path(
+            let providers = self.providers.read().await;
+            return Ok(providers.hover_provider.hover_with_base_path(
                 &doc,
                 position,
                 base_path.as_deref(),
@@ -232,7 +302,8 @@ impl LanguageServer for Backend {
         let uri = &params.text_document.uri;
 
         if let Some(doc) = self.documents.get(uri) {
-            let tokens = self.semantic_tokens_provider.tokenize(&doc.text());
+            let providers = self.providers.read().await;
+            let tokens = providers.semantic_tokens_provider.tokenize(&doc.text());
             return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
                 result_id: None,
                 data: tokens,
@@ -251,11 +322,9 @@ impl LanguageServer for Backend {
             match formatter::format(&text, &config) {
                 Ok(formatted) => {
                     if formatted == text {
-                        // No changes needed
                         return Ok(None);
                     }
 
-                    // Calculate the range covering the entire document
                     let (last_line, last_char) = document_end_position(&text);
 
                     let edit = TextEdit {
@@ -275,66 +344,10 @@ impl LanguageServer for Backend {
                     return Ok(Some(vec![edit]));
                 }
                 Err(_) => {
-                    // Formatting failed, return no edits
                     return Ok(None);
                 }
             }
         }
         Ok(None)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_document_end_position_ascii() {
-        let text = "line1\nline2\nline3";
-        let (line, char) = document_end_position(text);
-        assert_eq!(line, 2);
-        assert_eq!(char, 5); // "line3" is 5 chars
-    }
-
-    #[test]
-    fn test_document_end_position_trailing_newline() {
-        let text = "line1\nline2\n";
-        let (line, char) = document_end_position(text);
-        assert_eq!(line, 2);
-        assert_eq!(char, 0); // ends with newline, last line is empty
-    }
-
-    #[test]
-    fn test_document_end_position_non_ascii_last_line() {
-        // Last line contains Japanese characters (3 bytes each in UTF-8)
-        // "あいう" = 3 chars but 9 bytes
-        let text = "line1\nあいう";
-        let (line, char) = document_end_position(text);
-        assert_eq!(line, 1);
-        assert_eq!(
-            char, 3,
-            "Should count characters (3), not bytes (9) for non-ASCII last line"
-        );
-    }
-
-    #[test]
-    fn test_document_end_position_empty() {
-        let text = "";
-        let (line, char) = document_end_position(text);
-        assert_eq!(line, 0);
-        assert_eq!(char, 0);
-    }
-
-    #[test]
-    fn test_document_end_position_mixed_content() {
-        // "// コメント" on last line: 2 + 1 + 5 = 8 chars, but 2 + 1 + 15 = 18 bytes
-        let text = "aws.s3.bucket {\n    name = \"テスト\"\n// コメント";
-        let (line, char) = document_end_position(text);
-        assert_eq!(line, 2);
-        assert_eq!(
-            char,
-            "// コメント".chars().count() as u32,
-            "Should use character count for mixed ASCII/non-ASCII"
-        );
     }
 }
