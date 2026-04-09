@@ -6,6 +6,7 @@ pub mod init;
 pub mod lint;
 pub mod module;
 pub mod plan;
+pub mod skills;
 pub mod state;
 pub mod validate;
 
