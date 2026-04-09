@@ -388,9 +388,11 @@ pub struct ResourceState {
     pub desired_keys: Vec<String>,
     /// The binding name for this resource (from `let` bindings in DSL).
     /// Stored so orphan Delete effects can have tree structure.
+    #[serde(default)]
     pub binding: Option<String>,
     /// Binding names of resources this resource depends on (via ResourceRef).
     /// Stored so orphan Delete effects can have tree structure.
+    #[serde(default)]
     pub dependency_bindings: Vec<String>,
     /// Attribute names that are write-only (not returned by the provider API).
     /// Their values are persisted from the user's desired state so that changes
@@ -730,6 +732,27 @@ mod tests {
         let deserialized: ResourceState = serde_json::from_str(json).unwrap();
         assert_eq!(deserialized.binding, Some("my_bucket".to_string()));
         assert_eq!(deserialized.dependency_bindings, vec!["vpc", "subnet"]);
+    }
+
+    #[test]
+    fn test_resource_state_deserialization_without_v3_fields() {
+        // v2 state files don't have binding or dependency_bindings fields
+        let json = r#"{
+            "resource_type": "s3.bucket",
+            "name": "my-bucket",
+            "provider": "aws",
+            "attributes": {"region": "ap-northeast-1"},
+            "protected": false,
+            "lifecycle": {},
+            "prefixes": {},
+            "name_overrides": {},
+            "desired_keys": []
+        }"#;
+
+        let deserialized: ResourceState = serde_json::from_str(json).unwrap();
+        assert_eq!(deserialized.binding, None);
+        assert!(deserialized.dependency_bindings.is_empty());
+        assert!(deserialized.write_only_attributes.is_empty());
     }
 
     #[test]
