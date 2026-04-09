@@ -225,7 +225,8 @@ impl CompletionProvider {
                 return completions;
             }
             // Fall back to type-based completions
-            completions.extend(self.completions_for_type(&attr_schema.attr_type));
+            completions
+                .extend(self.completions_for_type(&attr_schema.attr_type, Some(resource_type)));
             return completions;
         }
 
@@ -624,7 +625,11 @@ impl CompletionProvider {
         }
     }
 
-    pub(super) fn completions_for_type(&self, attr_type: &AttributeType) -> Vec<CompletionItem> {
+    pub(super) fn completions_for_type(
+        &self,
+        attr_type: &AttributeType,
+        resource_type: Option<&str>,
+    ) -> Vec<CompletionItem> {
         match attr_type {
             AttributeType::Bool => {
                 vec![
@@ -647,7 +652,15 @@ impl CompletionProvider {
                 values,
                 namespace,
                 to_dsl,
-            } => self.string_enum_completions(name, values, namespace.as_deref(), *to_dsl),
+            } => {
+                // Use explicit namespace if available, otherwise derive from resource_type
+                let effective_ns = namespace.as_deref().or(if !name.is_empty() {
+                    resource_type
+                } else {
+                    None
+                });
+                self.string_enum_completions(name, values, effective_ns, *to_dsl)
+            }
             AttributeType::Int => {
                 vec![] // No specific completions for integers
             }
@@ -667,15 +680,15 @@ impl CompletionProvider {
                 self.availability_zone_completions(namespace.as_deref().unwrap_or(""), name)
             }
             // List(non-Struct): delegate to inner type completions
-            AttributeType::List { inner, .. } => self.completions_for_type(inner),
+            AttributeType::List { inner, .. } => self.completions_for_type(inner, resource_type),
             // Map: delegate to inner value type completions
-            AttributeType::Map(inner) => self.completions_for_type(inner),
+            AttributeType::Map(inner) => self.completions_for_type(inner, resource_type),
             // Union: collect completions from all member types
             AttributeType::Union(members) => {
                 let mut completions = Vec::new();
                 let mut seen_labels = std::collections::HashSet::new();
                 for member in members {
-                    for item in self.completions_for_type(member) {
+                    for item in self.completions_for_type(member, resource_type) {
                         if seen_labels.insert(item.label.clone()) {
                             completions.push(item);
                         }

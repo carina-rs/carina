@@ -452,7 +452,7 @@ impl CompletionProvider {
             && let Some(fields) = self.resolve_struct_fields_for_path(schema, attr_path)
             && let Some(field) = fields.iter().find(|f| f.name == field_name)
         {
-            self.completions_for_type(&field.field_type)
+            self.completions_for_type(&field.field_type, Some(resource_type))
         } else {
             vec![]
         }

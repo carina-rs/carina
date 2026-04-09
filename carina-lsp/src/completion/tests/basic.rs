@@ -920,3 +920,67 @@ fn context_detection_type_position_in_attributes() {
         context
     );
 }
+
+#[test]
+fn string_enum_completion_derives_namespace_from_resource_type() {
+    // When a StringEnum has name but no namespace (WASM provider case),
+    // completions should use the resource_type as namespace to produce DSL format.
+    let provider = test_provider_with_nameless_enum();
+    let doc = create_document(
+        r#"awscc.s3.bucket {
+versioning_status =
+}"#,
+    );
+    let position = Position {
+        line: 1,
+        character: 24,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+
+    assert!(
+        completions
+            .iter()
+            .any(|c| c.label == "awscc.s3.bucket.VersioningStatus.Enabled"),
+        "Should produce DSL-format enum completion. Got: {:?}",
+        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+    assert!(
+        completions
+            .iter()
+            .any(|c| c.label == "awscc.s3.bucket.VersioningStatus.Suspended"),
+        "Should include all enum variants in DSL format"
+    );
+    // Should NOT have quoted string format
+    assert!(
+        !completions.iter().any(|c| c.label == "\"Enabled\""),
+        "Should not show quoted string format"
+    );
+}
+
+#[test]
+fn string_enum_completion_in_struct_derives_namespace() {
+    // StringEnum inside a struct field should also derive namespace from resource_type.
+    let provider = test_provider_with_nameless_enum();
+    let doc = create_document(
+        r#"awscc.s3.bucket {
+versioning_configuration {
+    status =
+}
+}"#,
+    );
+    let position = Position {
+        line: 2,
+        character: 14,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+
+    assert!(
+        completions
+            .iter()
+            .any(|c| c.label == "awscc.s3.bucket.VersioningStatus.Enabled"),
+        "Should produce DSL-format enum completion inside struct. Got: {:?}",
+        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+}

@@ -167,13 +167,15 @@ fn list_string_enum_completions() {
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
 
-    let completions =
-        provider.completions_for_type(&AttributeType::list(AttributeType::StringEnum {
+    let completions = provider.completions_for_type(
+        &AttributeType::list(AttributeType::StringEnum {
             name: "Protocol".to_string(),
             values: vec!["tcp".to_string(), "udp".to_string(), "icmp".to_string()],
             namespace: None,
             to_dsl: None,
-        }));
+        }),
+        None,
+    );
 
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
@@ -212,15 +214,18 @@ fn union_completions_include_member_types() {
     use carina_core::schema::AttributeType;
 
     let provider = test_provider();
-    let completions = provider.completions_for_type(&AttributeType::Union(vec![
-        AttributeType::StringEnum {
-            name: "Mode".to_string(),
-            values: vec!["active".to_string(), "passive".to_string()],
-            namespace: None,
-            to_dsl: None,
-        },
-        AttributeType::Bool,
-    ]));
+    let completions = provider.completions_for_type(
+        &AttributeType::Union(vec![
+            AttributeType::StringEnum {
+                name: "Mode".to_string(),
+                values: vec!["active".to_string(), "passive".to_string()],
+                namespace: None,
+                to_dsl: None,
+            },
+            AttributeType::Bool,
+        ]),
+        None,
+    );
 
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
@@ -253,10 +258,10 @@ fn union_completions_dedup_labels() {
     use carina_core::schema::AttributeType;
 
     let provider = test_provider();
-    let completions = provider.completions_for_type(&AttributeType::Union(vec![
-        AttributeType::Bool,
-        AttributeType::Bool,
-    ]));
+    let completions = provider.completions_for_type(
+        &AttributeType::Union(vec![AttributeType::Bool, AttributeType::Bool]),
+        None,
+    );
 
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     let true_count = labels.iter().filter(|&&l| l == "true").count();
@@ -273,7 +278,7 @@ fn map_completions_delegate_to_inner_type() {
 
     let provider = test_provider();
     let completions =
-        provider.completions_for_type(&AttributeType::Map(Box::new(AttributeType::Bool)));
+        provider.completions_for_type(&AttributeType::Map(Box::new(AttributeType::Bool)), None);
 
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
