@@ -122,6 +122,11 @@ pub fn embedded_docs() -> Vec<EmbeddedDoc> {
             title: "CLI: docs",
             content: include_str!("../../../docs/src/content/docs/reference/cli/docs.md"),
         },
+        EmbeddedDoc {
+            name: "reference/cli/skills",
+            title: "CLI: skills",
+            content: include_str!("../../../docs/src/content/docs/reference/cli/skills.md"),
+        },
     ]
 }
 
