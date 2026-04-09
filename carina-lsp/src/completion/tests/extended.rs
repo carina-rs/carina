@@ -1110,3 +1110,45 @@ fn struct_field_completion_with_assignment_syntax() {
         labels
     );
 }
+
+/// When cursor is after `outer =` (a Struct-typed attribute), the completion
+/// should offer `{` snippet, not built-in functions like `cidr_subnet`.
+#[test]
+fn struct_attr_value_completion_shows_brace_not_builtins() {
+    let provider = test_provider_with_nested_structs();
+    let doc = create_document(
+        r#"test.nested.resource {
+outer =
+}"#,
+    );
+    // Cursor after "outer =" (line 1)
+    let position = Position {
+        line: 1,
+        character: 8,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    // Should NOT contain built-in functions
+    assert!(
+        !labels.contains(&"cidr_subnet"),
+        "Struct attribute value should not show built-in functions. Got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.contains(&"flatten"),
+        "Struct attribute value should not show built-in functions. Got: {:?}",
+        labels
+    );
+
+    // Should contain a `{` completion for opening a struct block
+    let has_brace = completions
+        .iter()
+        .any(|c| c.insert_text.as_deref().is_some_and(|t| t.contains('{')));
+    assert!(
+        has_brace,
+        "Struct attribute value should offer '{{}}' snippet. Got labels: {:?}",
+        labels
+    );
+}
