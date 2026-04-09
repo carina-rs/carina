@@ -6,15 +6,25 @@ use carina_core::provider::ProviderFactory;
 use tower_lsp::{LspService, Server};
 
 use carina_lsp::Backend;
+use carina_lsp::backend::FactoryBuildResult;
 
 /// Build provider factories from discovered provider configs.
-fn build_factories(providers: &[ProviderConfig], base_dir: &Path) -> Vec<Box<dyn ProviderFactory>> {
+/// Returns loaded factories and a map of provider name -> error reason for failures.
+fn build_factories(providers: &[ProviderConfig], base_dir: &Path) -> FactoryBuildResult {
     let mut factories: Vec<Box<dyn ProviderFactory>> = Vec::new();
+    let mut errors: HashMap<String, String> = HashMap::new();
 
     for config in providers {
         let source = match &config.source {
             Some(s) => s,
-            None => continue,
+            None => {
+                errors.insert(
+                    config.name.clone(),
+                    "no source configured. Add `source = 'github.com/...'` to the provider block."
+                        .to_string(),
+                );
+                continue;
+            }
         };
 
         let binary_path = if let Some(path) = source.strip_prefix("file://") {
@@ -23,24 +33,22 @@ fn build_factories(providers: &[ProviderConfig], base_dir: &Path) -> Vec<Box<dyn
             match carina_provider_resolver::resolve_single_config(base_dir, config) {
                 Ok(path) => path,
                 Err(e) => {
-                    log::warn!("LSP: failed to resolve provider '{}': {}", config.name, e);
+                    errors.insert(config.name.clone(), e);
                     continue;
                 }
             }
         } else {
-            log::warn!(
-                "LSP: unsupported source format for provider '{}': {}",
-                config.name,
-                source
+            errors.insert(
+                config.name.clone(),
+                format!("unsupported source format: {}", source),
             );
             continue;
         };
 
         if !carina_provider_resolver::is_wasm_provider(&binary_path) {
-            log::warn!(
-                "LSP: provider '{}' is not a WASM component: {}",
-                config.name,
-                binary_path.display()
+            errors.insert(
+                config.name.clone(),
+                format!("not a WASM component: {}", binary_path.display()),
             );
             continue;
         }
@@ -59,12 +67,12 @@ fn build_factories(providers: &[ProviderConfig], base_dir: &Path) -> Vec<Box<dyn
                 factories.push(Box::new(factory));
             }
             Err(e) => {
-                log::warn!("LSP: failed to load WASM provider '{}': {}", config.name, e);
+                errors.insert(config.name.clone(), format!("failed to load WASM: {}", e));
             }
         }
     }
 
-    factories
+    (factories, errors)
 }
 
 #[tokio::main]

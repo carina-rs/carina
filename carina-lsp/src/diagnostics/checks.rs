@@ -76,7 +76,7 @@ impl DiagnosticEngine {
         diagnostics
     }
 
-    /// Check for unloaded providers and show info-level diagnostics on the provider block.
+    /// Check for providers that failed to load and show info-level diagnostics on the provider block.
     pub(super) fn check_unloaded_providers(
         &self,
         doc: &Document,
@@ -86,9 +86,9 @@ impl DiagnosticEngine {
         let text = doc.text();
 
         for provider in &parsed.providers {
-            if !self.unloaded_providers.contains(&provider.name) {
+            let Some(reason) = self.provider_errors.get(&provider.name) else {
                 continue;
-            }
+            };
 
             // Find the provider block position
             let provider_pattern = format!("provider {}", provider.name);
@@ -102,10 +102,7 @@ impl DiagnosticEngine {
                         col,
                         end_col,
                         DiagnosticSeverity::INFORMATION,
-                        format!(
-                            "Provider '{}' is not installed. Run `carina init` to install provider plugins.",
-                            provider.name
-                        ),
+                        format!("Provider '{}' is not loaded: {}", provider.name, reason),
                     ));
                     break;
                 }

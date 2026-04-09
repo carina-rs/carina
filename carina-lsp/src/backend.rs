@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -43,7 +43,7 @@ impl ProviderState {
     fn new(
         factories: Vec<Box<dyn ProviderFactory>>,
         provider_context: &ProviderContext,
-        unloaded_providers: HashSet<String>,
+        provider_errors: HashMap<String, String>,
     ) -> Self {
         let schemas = Arc::new(provider_mod::collect_schemas(&factories));
         let provider_names: Vec<String> = factories.iter().map(|f| f.name().to_string()).collect();
@@ -58,7 +58,7 @@ impl ProviderState {
                 provider_names.clone(),
                 factories_arc,
             )
-            .with_unloaded_providers(unloaded_providers),
+            .with_provider_errors(provider_errors),
             completion_provider: CompletionProvider::new(
                 Arc::clone(&schemas),
                 provider_names,
@@ -71,13 +71,16 @@ impl ProviderState {
     }
 }
 
+/// Result of building provider factories: loaded factories + per-provider error messages.
+pub type FactoryBuildResult = (
+    Vec<Box<dyn ProviderFactory>>,
+    HashMap<String, String>, // provider name -> error reason
+);
+
 /// Function type for building provider factories from configs and a base directory.
 /// This callback is provided by main.rs to keep provider-specific wiring out of the library.
-pub type FactoryBuilder = Arc<
-    dyn Fn(&[carina_core::parser::ProviderConfig], &Path) -> Vec<Box<dyn ProviderFactory>>
-        + Send
-        + Sync,
->;
+pub type FactoryBuilder =
+    Arc<dyn Fn(&[carina_core::parser::ProviderConfig], &Path) -> FactoryBuildResult + Send + Sync>;
 
 pub struct Backend {
     client: Client,
@@ -96,7 +99,7 @@ impl Backend {
     ) -> Self {
         let provider_context = Arc::new(provider_context);
         // Start with empty schemas — they will be loaded asynchronously after initialize
-        let state = ProviderState::new(vec![], &provider_context, HashSet::new());
+        let state = ProviderState::new(vec![], &provider_context, HashMap::new());
 
         Self {
             client,
@@ -148,7 +151,7 @@ impl Backend {
         if provider_configs.is_empty() {
             // Clear schemas when no providers are configured
             *self.providers.write().await =
-                ProviderState::new(vec![], &self.provider_context, HashSet::new());
+                ProviderState::new(vec![], &self.provider_context, HashMap::new());
             let uris: Vec<Url> = self.documents.iter().map(|r| r.key().clone()).collect();
             for uri in uris {
                 self.update_diagnostics(uri).await;
@@ -157,7 +160,7 @@ impl Backend {
         }
 
         // Build factories using the injected builder (runs WASM loading)
-        let factories = tokio::task::spawn_blocking({
+        let (factories, provider_errors) = tokio::task::spawn_blocking({
             let configs = provider_configs.clone();
             let dir = workspace_root.clone();
             let builder = Arc::clone(factory_builder);
@@ -166,33 +169,19 @@ impl Backend {
         .await
         .unwrap_or_default();
 
-        // Determine which declared providers failed to load
-        let loaded_names: HashSet<String> =
-            factories.iter().map(|f| f.name().to_string()).collect();
-        let unloaded_providers: HashSet<String> = provider_configs
-            .iter()
-            .filter(|p| !loaded_names.contains(&p.name))
-            .map(|p| p.name.clone())
-            .collect();
-
-        if !unloaded_providers.is_empty() {
-            self.client
-                .log_message(
-                    MessageType::WARNING,
-                    format!(
-                        "Provider(s) not loaded: {}. Run `carina init` to install.",
-                        unloaded_providers
-                            .iter()
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                )
-                .await;
+        if !provider_errors.is_empty() {
+            for (name, reason) in &provider_errors {
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("Provider '{}' not loaded: {}", name, reason),
+                    )
+                    .await;
+            }
         }
 
         let factory_count = factories.len();
-        let new_state = ProviderState::new(factories, &self.provider_context, unloaded_providers);
+        let new_state = ProviderState::new(factories, &self.provider_context, provider_errors);
         *self.providers.write().await = new_state;
 
         self.client

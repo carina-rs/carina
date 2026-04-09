@@ -4,7 +4,7 @@ mod validation;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -62,8 +62,8 @@ pub struct DiagnosticEngine {
     schemas: Arc<HashMap<String, ResourceSchema>>,
     provider_names: Vec<String>,
     factories: Arc<Vec<Box<dyn ProviderFactory>>>,
-    /// Provider names declared in .crn but not loaded (plugin missing).
-    unloaded_providers: HashSet<String>,
+    /// Providers that failed to load: name -> error reason.
+    provider_errors: HashMap<String, String>,
 }
 
 impl DiagnosticEngine {
@@ -76,12 +76,12 @@ impl DiagnosticEngine {
             schemas,
             provider_names,
             factories,
-            unloaded_providers: HashSet::new(),
+            provider_errors: HashMap::new(),
         }
     }
 
-    pub fn with_unloaded_providers(mut self, unloaded: HashSet<String>) -> Self {
-        self.unloaded_providers = unloaded;
+    pub fn with_provider_errors(mut self, errors: HashMap<String, String>) -> Self {
+        self.provider_errors = errors;
         self
     }
 
@@ -132,8 +132,8 @@ impl DiagnosticEngine {
                 let full_resource_type = format!("{}.{}", provider, resource.id.resource_type);
 
                 if !self.schemas.contains_key(&full_resource_type) {
-                    // If the provider is declared but not loaded, show INFO instead of ERROR
-                    if self.unloaded_providers.contains(provider) {
+                    // If the provider failed to load, show INFO with the reason
+                    if let Some(reason) = self.provider_errors.get(provider) {
                         if let Some((line, col)) =
                             self.find_resource_position(doc, &resource.id.resource_type)
                         {
@@ -146,10 +146,7 @@ impl DiagnosticEngine {
                                 col,
                                 end_col,
                                 DiagnosticSeverity::INFORMATION,
-                                format!(
-                                    "Provider '{}' is not installed. Run `carina init` to enable schema validation.",
-                                    provider
-                                ),
+                                format!("Provider '{}' is not loaded: {}", provider, reason),
                             ));
                         }
                     } else if let Some((line, col)) =
