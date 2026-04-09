@@ -779,6 +779,7 @@ mod tests {
             default_tags: HashMap::new(),
             source: None,
             version: None,
+            revision: None,
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -985,6 +986,7 @@ mod tests {
             default_tags: HashMap::new(),
             source: None,
             version: None,
+            revision: None,
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
@@ -1025,6 +1027,7 @@ mod tests {
             default_tags: HashMap::new(),
             source: None,
             version: None,
+            revision: None,
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
@@ -1070,6 +1073,7 @@ mod tests {
             default_tags: HashMap::new(),
             source: None,
             version: None,
+            revision: None,
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1174,6 +1178,7 @@ mod tests {
             default_tags: HashMap::new(),
             source: None,
             version: None,
+            revision: None,
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
@@ -1281,6 +1286,7 @@ mod tests {
             default_tags: HashMap::new(),
             source: None,
             version: None,
+            revision: None,
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1472,6 +1478,7 @@ mod tests {
             default_tags: HashMap::new(),
             source: None,
             version: None,
+            revision: None,
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1577,6 +1584,7 @@ mod tests {
             default_tags: HashMap::new(),
             source: None,
             version: None,
+            revision: None,
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1650,6 +1658,7 @@ mod tests {
             default_tags: HashMap::new(),
             source: None,
             version: None,
+            revision: None,
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1708,6 +1717,7 @@ mod tests {
             default_tags: HashMap::new(),
             source: None,
             version: None,
+            revision: None,
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1805,6 +1815,7 @@ mod tests {
             default_tags: HashMap::new(),
             source: None,
             version: None,
+            revision: None,
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1849,6 +1860,7 @@ mod tests {
             default_tags: HashMap::new(),
             source: None,
             version: None,
+            revision: None,
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -2039,6 +2051,7 @@ mod tests {
             default_tags: HashMap::new(),
             source: None,
             version: None,
+            revision: None,
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 

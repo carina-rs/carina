@@ -297,6 +297,10 @@ pub struct ProviderConfig {
     /// Extracted from the provider block and not passed to the provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<VersionConstraint>,
+    /// Git revision (branch, tag, or commit SHA) to resolve the provider from CI artifacts.
+    /// Mutually exclusive with `version`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
 }
 
 /// Backend configuration for state storage
@@ -1889,12 +1893,33 @@ fn parse_provider_block(
         None
     };
 
+    // Extract revision from attributes if present
+    let revision = if let Some(Value::String(r)) = attributes.remove("revision") {
+        Some(r)
+    } else {
+        None
+    };
+
+    // Validate that version and revision are mutually exclusive
+    if version.is_some() && revision.is_some() {
+        return Err(ParseError::Syntax(pest::error::Error::new_from_pos(
+            pest::error::ErrorVariant::CustomError {
+                message: format!(
+                    "Provider '{}': 'version' and 'revision' are mutually exclusive",
+                    name
+                ),
+            },
+            pest::Position::from_start(""),
+        )));
+    }
+
     Ok(ProviderConfig {
         name,
         attributes,
         default_tags,
         source,
         version,
+        revision,
     })
 }
 
@@ -5953,6 +5978,59 @@ aws.s3.bucket {
         "#;
         let result = parse(input, &ProviderContext::default());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_provider_block_with_revision() {
+        let input = r#"
+            provider mock {
+                source = "github.com/carina-rs/carina-provider-mock"
+                revision = "feature-branch"
+            }
+        "#;
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(parsed.providers.len(), 1);
+
+        let provider = &parsed.providers[0];
+        assert_eq!(provider.name, "mock");
+        assert_eq!(
+            provider.source.as_deref(),
+            Some("github.com/carina-rs/carina-provider-mock")
+        );
+        assert_eq!(provider.revision.as_deref(), Some("feature-branch"));
+        assert!(provider.version.is_none());
+        assert!(!provider.attributes.contains_key("revision"));
+    }
+
+    #[test]
+    fn parse_provider_block_with_revision_sha() {
+        let input = r#"
+            provider mock {
+                source = "github.com/carina-rs/carina-provider-mock"
+                revision = "abc123def456"
+            }
+        "#;
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        let provider = &parsed.providers[0];
+        assert_eq!(provider.revision.as_deref(), Some("abc123def456"));
+    }
+
+    #[test]
+    fn parse_provider_block_version_and_revision_mutually_exclusive() {
+        let input = r#"
+            provider mock {
+                source = "github.com/carina-rs/carina-provider-mock"
+                version = "0.1.0"
+                revision = "main"
+            }
+        "#;
+        let result = parse(input, &ProviderContext::default());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "Error should mention mutual exclusivity, got: {err}"
+        );
     }
 
     #[test]

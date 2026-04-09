@@ -284,6 +284,7 @@ fn plan_file_serde_round_trip() {
             default_tags: HashMap::new(),
             source: None,
             version: None,
+            revision: None,
         }],
         backend_config: Some(BackendConfig {
             backend_type: "s3".to_string(),
@@ -551,6 +552,7 @@ fn make_awscc_provider(region_dsl: &str) -> ProviderConfig {
         default_tags: HashMap::new(),
         source: None,
         version: None,
+        revision: None,
     }
 }
 
