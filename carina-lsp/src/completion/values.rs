@@ -678,14 +678,42 @@ impl CompletionProvider {
             arguments: None,
         };
 
-        vec![CompletionItem {
-            label: "region".to_string(),
-            kind: Some(CompletionItemKind::PROPERTY),
-            detail: Some("Provider region".to_string()),
-            insert_text: Some("region = ".to_string()),
-            command: Some(trigger_suggest),
-            ..Default::default()
-        }]
+        vec![
+            CompletionItem {
+                label: "region".to_string(),
+                kind: Some(CompletionItemKind::PROPERTY),
+                detail: Some("Provider region".to_string()),
+                insert_text: Some("region = ".to_string()),
+                command: Some(trigger_suggest.clone()),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "source".to_string(),
+                kind: Some(CompletionItemKind::PROPERTY),
+                detail: Some("Provider source (e.g., github.com/owner/repo)".to_string()),
+                insert_text: Some("source = \"$0\"".to_string()),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "version".to_string(),
+                kind: Some(CompletionItemKind::PROPERTY),
+                detail: Some("Version constraint (e.g., ~0.5.0)".to_string()),
+                insert_text: Some("version = \"$0\"".to_string()),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "revision".to_string(),
+                kind: Some(CompletionItemKind::PROPERTY),
+                detail: Some(
+                    "Git revision (branch, tag, or SHA) for CI artifact resolution".to_string(),
+                ),
+                insert_text: Some("revision = \"$0\"".to_string()),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                ..Default::default()
+            },
+        ]
     }
 
     pub(super) fn generic_value_completions(&self) -> Vec<CompletionItem> {

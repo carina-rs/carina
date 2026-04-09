@@ -18,6 +18,12 @@ pub struct LockEntry {
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub constraint: Option<String>,
+    /// Git revision (branch, tag, or commit SHA) specified in the provider block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    /// Resolved commit SHA for revision-based providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_sha: Option<String>,
     pub sha256: String,
 }
 
@@ -48,6 +54,12 @@ impl LockFile {
 
     pub fn find_by_source(&self, source: &str) -> Option<&LockEntry> {
         self.provider.iter().find(|e| e.source == source)
+    }
+
+    pub fn find_by_source_and_sha(&self, source: &str, sha: &str) -> Option<&LockEntry> {
+        self.provider
+            .iter()
+            .find(|e| e.source == source && e.resolved_sha.as_deref() == Some(sha))
     }
 
     pub fn upsert(&mut self, entry: LockEntry) {
@@ -275,6 +287,8 @@ pub fn resolve_provider(
                 source: source.to_string(),
                 version: version.to_string(),
                 constraint: None,
+                revision: None,
+                resolved_sha: None,
                 sha256: hash,
             });
             println!(
@@ -328,6 +342,8 @@ pub fn resolve_provider(
         source: source.to_string(),
         version: version.to_string(),
         constraint: None,
+        revision: None,
+        resolved_sha: None,
         sha256: hash,
     });
 
@@ -348,13 +364,24 @@ pub fn resolve_single_config(base_dir: &Path, config: &ProviderConfig) -> Result
     let lock_path = base_dir.join("carina.lock");
     let mut lock_file = LockFile::load(&lock_path).unwrap_or_default();
 
-    let version = resolve_version(source, config, &lock_file, false)?;
+    let binary_path = if let Some(revision) = &config.revision {
+        let (path, _sha) = crate::revision_resolver::resolve_provider_by_revision(
+            base_dir,
+            source,
+            revision,
+            &config.name,
+            &mut lock_file,
+        )?;
+        path
+    } else {
+        let version = resolve_version(source, config, &lock_file, false)?;
+        let path = resolve_provider(base_dir, source, &version, &config.name, &mut lock_file)?;
 
-    let binary_path = resolve_provider(base_dir, source, &version, &config.name, &mut lock_file)?;
-
-    if let Some(entry) = lock_file.provider.iter_mut().find(|e| e.source == source) {
-        entry.constraint = config.version.as_ref().map(|c| c.raw.clone());
-    }
+        if let Some(entry) = lock_file.provider.iter_mut().find(|e| e.source == source) {
+            entry.constraint = config.version.as_ref().map(|c| c.raw.clone());
+        }
+        path
+    };
 
     lock_file
         .save(&lock_path)
@@ -425,14 +452,24 @@ pub fn resolve_all(
             _ => continue,
         };
 
-        let version = resolve_version(source, config, &lock_file, upgrade)?;
+        let binary_path = if let Some(revision) = &config.revision {
+            let (path, _sha) = crate::revision_resolver::resolve_provider_by_revision(
+                base_dir,
+                source,
+                revision,
+                &config.name,
+                &mut lock_file,
+            )?;
+            path
+        } else {
+            let version = resolve_version(source, config, &lock_file, upgrade)?;
+            let path = resolve_provider(base_dir, source, &version, &config.name, &mut lock_file)?;
 
-        let binary_path =
-            resolve_provider(base_dir, source, &version, &config.name, &mut lock_file)?;
-
-        if let Some(entry) = lock_file.provider.iter_mut().find(|e| e.source == source) {
-            entry.constraint = config.version.as_ref().map(|c| c.raw.clone());
-        }
+            if let Some(entry) = lock_file.provider.iter_mut().find(|e| e.source == source) {
+                entry.constraint = config.version.as_ref().map(|c| c.raw.clone());
+            }
+            path
+        };
 
         resolved.insert(config.name.clone(), binary_path);
     }
@@ -461,6 +498,11 @@ pub fn validate_lock_constraints(
     };
 
     for config in providers {
+        // Skip revision-based providers — they don't use semver constraints
+        if config.revision.is_some() {
+            continue;
+        }
+
         let source = match &config.source {
             Some(s) if !s.starts_with("file://") => s.as_str(),
             _ => continue,
@@ -597,6 +639,8 @@ mod tests {
             source: "github.com/carina-rs/carina-provider-awscc".into(),
             version: "0.1.0".into(),
             constraint: None,
+            revision: None,
+            resolved_sha: None,
             sha256: "abc123".into(),
         });
 
@@ -616,6 +660,8 @@ mod tests {
             source: "github.com/carina-rs/carina-provider-awscc".into(),
             version: "0.1.0".into(),
             constraint: None,
+            revision: None,
+            resolved_sha: None,
             sha256: "old_hash".into(),
         });
         lock.upsert(LockEntry {
@@ -623,6 +669,8 @@ mod tests {
             source: "github.com/carina-rs/carina-provider-awscc".into(),
             version: "0.2.0".into(),
             constraint: None,
+            revision: None,
+            resolved_sha: None,
             sha256: "new_hash".into(),
         });
 
@@ -653,6 +701,8 @@ mod tests {
                 source: "github.com/carina-rs/carina-provider-aws".to_string(),
                 version: "0.5.2".to_string(),
                 constraint: Some("~0.5.0".to_string()),
+                revision: None,
+                resolved_sha: None,
                 sha256: "abc123".to_string(),
             }],
         };
