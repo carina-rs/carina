@@ -62,6 +62,8 @@ pub struct DiagnosticEngine {
     schemas: Arc<HashMap<String, ResourceSchema>>,
     provider_names: Vec<String>,
     factories: Arc<Vec<Box<dyn ProviderFactory>>>,
+    /// Providers that failed to load: name -> error reason.
+    provider_errors: HashMap<String, String>,
 }
 
 impl DiagnosticEngine {
@@ -74,7 +76,13 @@ impl DiagnosticEngine {
             schemas,
             provider_names,
             factories,
+            provider_errors: HashMap::new(),
         }
+    }
+
+    pub fn with_provider_errors(mut self, errors: HashMap<String, String>) -> Self {
+        self.provider_errors = errors;
+        self
     }
 
     pub fn analyze(&self, doc: &Document, base_path: Option<&Path>) -> Vec<Diagnostic> {
@@ -100,6 +108,9 @@ impl DiagnosticEngine {
             // Check provider region
             diagnostics.extend(self.check_provider_region(doc, parsed));
 
+            // Check for unloaded providers
+            diagnostics.extend(self.check_unloaded_providers(doc, parsed));
+
             // Check module calls
             if let Some(base) = base_path {
                 diagnostics.extend(self.check_module_calls(doc, parsed, base));
@@ -121,8 +132,24 @@ impl DiagnosticEngine {
                 let full_resource_type = format!("{}.{}", provider, resource.id.resource_type);
 
                 if !self.schemas.contains_key(&full_resource_type) {
-                    // Find the line where this resource is defined
-                    if let Some((line, col)) =
+                    // If the provider failed to load, show INFO with the reason
+                    if let Some(reason) = self.provider_errors.get(provider) {
+                        if let Some((line, col)) =
+                            self.find_resource_position(doc, &resource.id.resource_type)
+                        {
+                            let end_col = col
+                                + resource.id.resource_type.len() as u32
+                                + provider.len() as u32
+                                + 1;
+                            diagnostics.push(carina_diagnostic(
+                                line,
+                                col,
+                                end_col,
+                                DiagnosticSeverity::INFORMATION,
+                                format!("Provider '{}' is not loaded: {}", provider, reason),
+                            ));
+                        }
+                    } else if let Some((line, col)) =
                         self.find_resource_position(doc, &resource.id.resource_type)
                     {
                         let end_col = col
