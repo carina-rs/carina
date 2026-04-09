@@ -502,7 +502,7 @@ async fn run_state_bucket_delete(
         .resource_type()
         .ok_or("Backend does not specify a resource type")?;
     let base_dir = get_base_dir(path);
-    let factories = build_factories_from_providers(&parsed.providers, base_dir);
+    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
     let ctx = WiringContext::new(factories);
     let factory = provider_mod::find_factory(ctx.factories(), backend_provider_name)
         .ok_or_else(|| format!("No provider factory found for '{}'", backend_provider_name))?;
@@ -609,7 +609,7 @@ pub(crate) async fn run_state_refresh_locked(
     lock: Option<&LockInfo>,
     base_dir: &std::path::Path,
 ) -> Result<(), AppError> {
-    let factories = build_factories_from_providers(&parsed.providers, base_dir);
+    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
     let ctx = WiringContext::new(factories);
 
     // Read current state from backend

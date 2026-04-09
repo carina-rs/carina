@@ -125,7 +125,7 @@ async fn run_destroy_locked(
     force: bool,
     base_dir: &std::path::Path,
 ) -> Result<(), AppError> {
-    let factories = build_factories_from_providers(&parsed.providers, base_dir);
+    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
     let ctx = WiringContext::new(factories);
 
     // Read current state from backend

@@ -67,16 +67,20 @@ impl WiringContext {
 /// For each provider with a `source`, resolves the WASM component path and creates a
 /// `WasmProviderFactory`. Providers without `source` are skipped (handled
 /// later in `get_provider_with_ctx`).
+///
+/// Returns `(factories, load_errors)` where `load_errors` maps provider names
+/// to their failure reasons, so callers can show accurate diagnostics.
 pub fn build_factories_from_providers(
     providers: &[ProviderConfig],
     base_dir: &Path,
-) -> Vec<Box<dyn ProviderFactory>> {
+) -> (Vec<Box<dyn ProviderFactory>>, HashMap<String, String>) {
     if let Err(e) = carina_provider_resolver::validate_lock_constraints(base_dir, providers) {
         eprintln!("{}", e.red());
         std::process::exit(1);
     }
 
     let mut factories: Vec<Box<dyn ProviderFactory>> = Vec::new();
+    let mut load_errors: HashMap<String, String> = HashMap::new();
 
     for config in providers {
         let source = match &config.source {
@@ -90,38 +94,32 @@ pub fn build_factories_from_providers(
             match carina_provider_resolver::resolve_single_config(base_dir, config) {
                 Ok(path) => path,
                 Err(e) => {
-                    eprintln!(
-                        "{}",
-                        format!(
-                            "Failed to resolve provider '{}' from '{}': {}",
-                            config.name, source, e
-                        )
-                        .red()
+                    let reason = format!(
+                        "Failed to resolve provider '{}' from '{}': {}",
+                        config.name, source, e
                     );
+                    eprintln!("{}", reason.red());
+                    load_errors.insert(config.name.clone(), reason);
                     continue;
                 }
             }
         } else {
-            eprintln!(
-                "{}",
-                format!(
-                    "Unsupported source format for provider '{}': {}. Use file:// or github.com/owner/repo.",
-                    config.name, source
-                )
-                .red()
+            let reason = format!(
+                "Unsupported source format for provider '{}': {}. Use file:// or github.com/owner/repo.",
+                config.name, source
             );
+            eprintln!("{}", reason.red());
+            load_errors.insert(config.name.clone(), reason);
             continue;
         };
 
         if !carina_provider_resolver::is_wasm_provider(&binary_path) {
-            eprintln!(
-                "{}",
-                format!(
-                    "Provider '{}': native binaries are no longer supported. Use a .wasm component instead.",
-                    config.name
-                )
-                .red()
+            let reason = format!(
+                "Provider '{}': native binaries are no longer supported. Use a .wasm component instead.",
+                config.name
             );
+            eprintln!("{}", reason.red());
+            load_errors.insert(config.name.clone(), reason);
             continue;
         }
 
@@ -145,15 +143,14 @@ pub fn build_factories_from_providers(
                 factories.push(factory);
             }
             Err(e) => {
-                eprintln!(
-                    "{}",
-                    format!("Failed to load provider '{}': {}", config.name, e).red()
-                );
+                let reason = format!("Failed to load provider '{}': {}", config.name, e);
+                eprintln!("{}", reason.red());
+                load_errors.insert(config.name.clone(), reason);
             }
         }
     }
 
-    factories
+    (factories, load_errors)
 }
 
 pub fn validate_resources_with_ctx(
@@ -568,7 +565,7 @@ pub async fn create_providers_from_configs(
     configs: &[ProviderConfig],
     base_dir: &Path,
 ) -> ProviderRouter {
-    let factories = build_factories_from_providers(configs, base_dir);
+    let (factories, _) = build_factories_from_providers(configs, base_dir);
     let ctx = WiringContext::new(factories);
     let mut router = ProviderRouter::new();
 
@@ -623,7 +620,7 @@ pub async fn create_plan_from_parsed_with_remote(
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     base_dir: &Path,
 ) -> Result<PlanContext, AppError> {
-    let factories = build_factories_from_providers(&parsed.providers, base_dir);
+    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
     let ctx = WiringContext::new(factories);
     let sorted_resources =
         sort_resources_by_dependencies(&parsed.resources).map_err(AppError::Validation)?;

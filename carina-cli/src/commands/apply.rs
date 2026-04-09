@@ -760,7 +760,7 @@ pub async fn run_apply(
     let backend_file = loaded.backend_file;
 
     let base_dir = get_base_dir(path);
-    let factories = build_factories_from_providers(&parsed.providers, base_dir);
+    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
     let ctx = WiringContext::new(factories);
     validate_and_resolve_with_config(&mut parsed, base_dir, false, provider_context)?;
 
@@ -1621,7 +1621,7 @@ async fn run_apply_from_plan_locked(
     execute_state_only_effects(plan, &mut result);
 
     // Build schemas for write-only attribute persistence
-    let factories = build_factories_from_providers(&plan_file.provider_configs, base_dir);
+    let (factories, _) = build_factories_from_providers(&plan_file.provider_configs, base_dir);
     let ctx = WiringContext::new(factories);
 
     finalize_apply(FinalizeApplyInput {

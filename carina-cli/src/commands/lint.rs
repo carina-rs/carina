@@ -35,7 +35,7 @@ pub fn run_lint(path: &PathBuf, provider_context: &ProviderContext) -> Result<()
     module_resolver::resolve_modules_with_config(&mut parsed, base_dir, provider_context)
         .map_err(|e| format!("Module resolution error: {}", e))?;
 
-    let provider_factories = build_factories_from_providers(&parsed.providers, base_dir);
+    let (provider_factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
     let ctx = WiringContext::new(provider_factories);
     let factories = ctx.factories();
     let schemas = ctx.schemas();
