@@ -2477,7 +2477,7 @@ mod tests {
     }
 
     impl Provider for MockProvider {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "mock"
         }
 
@@ -3265,7 +3265,7 @@ mod tests {
         }
 
         impl Provider for DelayedProvider {
-            fn name(&self) -> &'static str {
+            fn name(&self) -> &str {
                 "delayed"
             }
 
@@ -3691,7 +3691,7 @@ mod tests {
     }
 
     impl Provider for RecordingMockProvider {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "recording_mock"
         }
 

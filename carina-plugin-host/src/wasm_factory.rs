@@ -659,8 +659,8 @@ pub struct WasmProviderFactory {
     component: Component,
     #[allow(dead_code)]
     wasm_path: PathBuf,
-    name_static: &'static str,
-    display_name_static: &'static str,
+    name: String,
+    display_name: String,
     version: String,
     schemas: Vec<ResourceSchema>,
     cached_config_completions: HashMap<String, Vec<CompletionValue>>,
@@ -836,15 +836,12 @@ impl WasmProviderFactory {
         let (cached_config_completions, cached_identity_attributes, cached_enum_aliases) =
             Self::load_metadata(&bindings, &mut store).await;
 
-        let name_static: &'static str = Box::leak(name.into_boxed_str());
-        let display_name_static: &'static str = Box::leak(display_name.into_boxed_str());
-
         Ok(Self {
             engine,
             component,
             wasm_path,
-            name_static,
-            display_name_static,
+            name,
+            display_name,
             version,
             schemas,
             cached_config_completions,
@@ -930,15 +927,12 @@ impl WasmProviderFactory {
         let (cached_config_completions, cached_identity_attributes, cached_enum_aliases) =
             Self::load_metadata(&bindings, &mut store).await;
 
-        let name_static: &'static str = Box::leak(name.into_boxed_str());
-        let display_name_static: &'static str = Box::leak(display_name.into_boxed_str());
-
         Ok(Self {
             engine,
             component,
             wasm_path: cwasm_path.to_path_buf(),
-            name_static,
-            display_name_static,
+            name,
+            display_name,
             version,
             schemas,
             cached_config_completions,
@@ -1016,13 +1010,13 @@ impl WasmProviderFactory {
         let actual = semver::Version::parse(&self.version).map_err(|e| {
             format!(
                 "Provider '{}' reports invalid version '{}': {}",
-                self.name_static, self.version, e
+                self.name, self.version, e
             )
         })?;
         if !req.matches(&actual) {
             return Err(format!(
                 "Provider '{}' version {} does not satisfy constraint '{}'",
-                self.name_static, actual, constraint_raw
+                self.name, actual, constraint_raw
             ));
         }
         Ok(())
@@ -1031,11 +1025,11 @@ impl WasmProviderFactory {
 
 impl ProviderFactory for WasmProviderFactory {
     fn name(&self) -> &str {
-        self.name_static
+        &self.name
     }
 
     fn display_name(&self) -> &str {
-        self.display_name_static
+        &self.display_name
     }
 
     fn validate_config(&self, attributes: &HashMap<String, Value>) -> Result<(), String> {
@@ -1098,7 +1092,7 @@ impl ProviderFactory for WasmProviderFactory {
                 .expect("Failed to create WASM provider instance");
             Box::new(WasmProvider {
                 instance,
-                name: self.name_static,
+                name: self.name.clone(),
             }) as Box<dyn Provider>
         })
     }
@@ -1131,7 +1125,7 @@ impl ProviderFactory for WasmProviderFactory {
 
 pub struct WasmProvider {
     instance: Arc<SharedWasmInstance>,
-    name: &'static str,
+    name: String,
 }
 
 // Safety: SharedWasmInstance.store is behind a Mutex, so concurrent access is
@@ -1140,8 +1134,8 @@ unsafe impl Send for WasmProvider {}
 unsafe impl Sync for WasmProvider {}
 
 impl Provider for WasmProvider {
-    fn name(&self) -> &'static str {
-        self.name
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn read(

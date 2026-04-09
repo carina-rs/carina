@@ -48,7 +48,7 @@ impl TestProvider {
 }
 
 impl Provider for TestProvider {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "test"
     }
 
@@ -1540,7 +1540,7 @@ impl RecordingProvider {
 }
 
 impl Provider for RecordingProvider {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "test"
     }
 
@@ -1599,7 +1599,7 @@ impl Provider for RecordingProvider {
 struct RenameFailProvider;
 
 impl Provider for RenameFailProvider {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "test"
     }
 
