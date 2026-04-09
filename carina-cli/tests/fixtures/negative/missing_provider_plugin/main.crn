@@ -1,0 +1,11 @@
+# Negative test: provider plugin not installed
+# Expected: validation error about missing provider plugin
+# The provider block has no 'source', so no plugin is resolved.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.s3.bucket {
+  bucket_name = 'test-bucket'
+}
