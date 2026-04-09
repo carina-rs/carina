@@ -61,7 +61,7 @@ run_benchmark() {
 
     for i in $(seq 1 "$ITERATIONS"); do
         # Clean state
-        rm -f "$workdir/carina.state.json" "$workdir/.carina.lock"
+        rm -f "$workdir/carina.state.json" "$workdir/carina.state.lock"
 
         # Create (apply)
         local t
