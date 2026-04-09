@@ -60,6 +60,10 @@ enum Commands {
         /// Path to directory containing .crn files
         #[arg(default_value = ".")]
         path: PathBuf,
+
+        /// Output results as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Show execution plan without applying changes
     Plan {
@@ -86,6 +90,10 @@ enum Commands {
         /// Refresh state from provider before planning (default: true)
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         refresh: bool,
+
+        /// Output plan as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Apply changes to reach the desired state
     Apply {
@@ -292,9 +300,20 @@ async fn main() {
         detail,
         tui,
         refresh,
+        json,
     } = cli.command
     {
-        match run_plan(&path, out.as_ref(), detail, tui, refresh, &provider_context).await {
+        match run_plan(
+            &path,
+            out.as_ref(),
+            detail,
+            tui,
+            refresh,
+            json,
+            &provider_context,
+        )
+        .await
+        {
             Ok(has_changes) => {
                 if detailed_exitcode && has_changes {
                     std::process::exit(2);
@@ -309,7 +328,7 @@ async fn main() {
     }
 
     let result = match cli.command {
-        Commands::Validate { path } => run_validate(&path, &provider_context),
+        Commands::Validate { path, json } => run_validate(&path, json, &provider_context),
         Commands::Plan { .. } => unreachable!(),
         Commands::Apply {
             path,

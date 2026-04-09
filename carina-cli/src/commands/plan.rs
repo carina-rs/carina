@@ -64,12 +64,45 @@ pub struct CurrentStateEntry {
     pub state: State,
 }
 
+fn build_plan_file(
+    path: &Path,
+    parsed: &carina_core::parser::ParsedFile,
+    state_file: &Option<StateFile>,
+    ctx: &crate::wiring::PlanContext,
+) -> PlanFile {
+    PlanFile {
+        version: 1,
+        carina_version: env!("CARGO_PKG_VERSION").to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        source_path: path.display().to_string(),
+        state_lineage: state_file.as_ref().map(|s| s.lineage.clone()),
+        state_serial: state_file.as_ref().map(|s| s.serial),
+        provider_configs: parsed.providers.clone(),
+        backend_config: parsed.backend.clone(),
+        plan: redact_secrets_in_plan(&ctx.plan),
+        sorted_resources: ctx
+            .sorted_resources
+            .iter()
+            .map(redact_secrets_in_resource)
+            .collect(),
+        current_states: ctx
+            .current_states
+            .iter()
+            .map(|(id, state)| CurrentStateEntry {
+                id: id.clone(),
+                state: redact_secrets_in_state(state),
+            })
+            .collect(),
+    }
+}
+
 pub async fn run_plan(
     path: &PathBuf,
     out: Option<&PathBuf>,
     detail: DetailLevel,
     tui: bool,
     refresh: bool,
+    json: bool,
     provider_context: &ProviderContext,
 ) -> Result<bool, AppError> {
     let mut parsed = load_configuration_with_config(path, provider_context)?.parsed;
@@ -224,7 +257,12 @@ pub async fn run_plan(
         })
         .collect();
 
-    if tui {
+    if json {
+        let plan_file = build_plan_file(path, &parsed, &state_file, &ctx);
+        let json_str = serde_json::to_string_pretty(&plan_file)
+            .map_err(|e| format!("Failed to serialize plan: {}", e))?;
+        println!("{}", json_str);
+    } else if tui {
         carina_tui::run(&ctx.plan, wiring.schemas())
             .map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
     } else {
@@ -239,35 +277,10 @@ pub async fn run_plan(
 
     // Save plan to file if --out was specified
     if let Some(out_path) = out {
-        // Redact secrets before serializing to prevent plaintext secret leakage
-        let plan_file = PlanFile {
-            version: 1,
-            carina_version: env!("CARGO_PKG_VERSION").to_string(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            source_path: path.display().to_string(),
-            state_lineage: state_file.as_ref().map(|s| s.lineage.clone()),
-            state_serial: state_file.as_ref().map(|s| s.serial),
-            provider_configs: parsed.providers.clone(),
-            backend_config: parsed.backend.clone(),
-            plan: redact_secrets_in_plan(&ctx.plan),
-            sorted_resources: ctx
-                .sorted_resources
-                .iter()
-                .map(redact_secrets_in_resource)
-                .collect(),
-            current_states: ctx
-                .current_states
-                .iter()
-                .map(|(id, state)| CurrentStateEntry {
-                    id: id.clone(),
-                    state: redact_secrets_in_state(state),
-                })
-                .collect(),
-        };
-
-        let json = serde_json::to_string_pretty(&plan_file)
+        let plan_file = build_plan_file(path, &parsed, &state_file, &ctx);
+        let json_out = serde_json::to_string_pretty(&plan_file)
             .map_err(|e| format!("Failed to serialize plan: {}", e))?;
-        fs::write(out_path, json).map_err(|e| format!("Failed to write plan file: {}", e))?;
+        fs::write(out_path, json_out).map_err(|e| format!("Failed to write plan file: {}", e))?;
 
         println!();
         println!(
