@@ -938,18 +938,25 @@ versioning_status =
 
     let completions = provider.complete(&doc, position, None);
 
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    // Should produce bare enum value completions (not full namespace path)
     assert!(
-        completions
-            .iter()
-            .any(|c| c.label == "awscc.s3.bucket.VersioningStatus.Enabled"),
-        "Should produce DSL-format enum completion. Got: {:?}",
-        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+        labels.contains(&"Enabled"),
+        "Should produce bare enum completion. Got: {:?}",
+        labels
     );
     assert!(
-        completions
+        labels.contains(&"Suspended"),
+        "Should include all enum variants as bare values"
+    );
+    // Should NOT have full namespaced format
+    assert!(
+        !completions
             .iter()
-            .any(|c| c.label == "awscc.s3.bucket.VersioningStatus.Suspended"),
-        "Should include all enum variants in DSL format"
+            .any(|c| c.label.contains("awscc.s3.bucket")),
+        "Should not show full namespace path. Got: {:?}",
+        labels
     );
     // Should NOT have quoted string format
     assert!(
@@ -976,11 +983,10 @@ versioning_configuration {
 
     let completions = provider.complete(&doc, position, None);
 
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
-        completions
-            .iter()
-            .any(|c| c.label == "awscc.s3.bucket.VersioningStatus.Enabled"),
-        "Should produce DSL-format enum completion inside struct. Got: {:?}",
-        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+        labels.contains(&"Enabled"),
+        "Should produce bare enum completion inside struct. Got: {:?}",
+        labels
     );
 }

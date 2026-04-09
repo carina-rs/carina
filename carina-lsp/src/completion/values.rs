@@ -1008,20 +1008,20 @@ impl CompletionProvider {
 
     pub(super) fn string_enum_completions(
         &self,
-        type_name: &str,
+        _type_name: &str,
         values: &[String],
         namespace: Option<&str>,
         to_dsl: Option<fn(&str) -> String>,
     ) -> Vec<CompletionItem> {
         match namespace {
-            Some(ns) => {
-                let prefix = format!("{}.{}", ns, type_name);
+            Some(_) => {
+                // Bare enum values — the schema context resolves them automatically
                 values
                     .iter()
                     .map(|value| {
                         let dsl_value = to_dsl.map_or_else(|| value.clone(), |f| f(value));
                         CompletionItem {
-                            label: format!("{}.{}", prefix, dsl_value),
+                            label: dsl_value,
                             kind: Some(CompletionItemKind::ENUM_MEMBER),
                             detail: Some(value.clone()),
                             ..Default::default()
