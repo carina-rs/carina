@@ -277,7 +277,7 @@ pub fn resolve_provider(
 
     // 3. Try downloading WASM first (platform-independent).
     let wasm_url = download_url_wasm(source, version)?;
-    println!("Downloading WASM provider '{}' from {}", name, wasm_url);
+    eprintln!("Downloading WASM provider '{}' from {}", name, wasm_url);
     match download_to_file(&wasm_url, &wasm_path) {
         Ok(()) => {
             let hash =
@@ -291,7 +291,7 @@ pub fn resolve_provider(
                 resolved_sha: None,
                 sha256: hash,
             });
-            println!(
+            eprintln!(
                 "Installed WASM provider '{}' ({}@{})",
                 name, source, version
             );
@@ -311,7 +311,7 @@ pub fn resolve_provider(
     let target = detect_target()?;
     let url = download_url(source, version, &target)?;
 
-    println!("Downloading provider '{}' from {}", name, url);
+    eprintln!("Downloading provider '{}' from {}", name, url);
 
     let tmp_archive = base_dir
         .join(".carina")
@@ -347,7 +347,7 @@ pub fn resolve_provider(
         sha256: hash,
     });
 
-    println!("Installed provider '{}' ({}@{})", name, source, version);
+    eprintln!("Installed provider '{}' ({}@{})", name, source, version);
 
     Ok(binary_path)
 }
