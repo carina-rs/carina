@@ -675,9 +675,20 @@ fn build_dependency_map(
 ) -> HashMap<usize, HashSet<usize>> {
     // Build binding -> effect index mapping
     let mut binding_to_idx: HashMap<String, usize> = HashMap::new();
+    // Fallback: ResourceId name -> effect index for Delete effects without bindings.
+    // When a resource loses its `let` binding (e.g., becomes anonymous in a new .crn),
+    // the Delete effect has binding: None. But other effects may still reference the
+    // old binding name via state-recorded dependency_bindings. The name-based lookup
+    // allows resolving these dependencies.
+    let mut name_to_delete_idx: HashMap<String, usize> = HashMap::new();
     for (idx, effect) in effects.iter().enumerate() {
         if let Some(binding) = effect.binding_name() {
             binding_to_idx.insert(binding, idx);
+        }
+        if let Effect::Delete { id, binding, .. } = effect
+            && binding.is_none()
+        {
+            name_to_delete_idx.insert(id.name.clone(), idx);
         }
     }
 
@@ -703,13 +714,21 @@ fn build_dependency_map(
         deps_of.insert(idx, dep_indices);
     }
 
+    // Helper: look up effect index by binding name, falling back to Delete-by-name.
+    let lookup_idx = |binding: &str| -> Option<usize> {
+        binding_to_idx
+            .get(binding)
+            .or_else(|| name_to_delete_idx.get(binding))
+            .copied()
+    };
+
     // For Delete effects, add reverse dependencies: if subnet depends on vpc,
     // the vpc delete must wait for subnet delete (children deleted before parents).
     let mut reverse_deps: Vec<(usize, usize)> = Vec::new();
     for (idx, effect) in effects.iter().enumerate() {
         if let Effect::Delete { dependencies, .. } = effect {
             for dep_binding in dependencies {
-                if let Some(&dep_idx) = binding_to_idx.get(dep_binding) {
+                if let Some(dep_idx) = lookup_idx(dep_binding) {
                     reverse_deps.push((dep_idx, idx));
                 }
             }
@@ -721,7 +740,7 @@ fn build_dependency_map(
         // Use from.dependency_bindings (recorded in state) for the old dependencies.
         if let Effect::Replace { from, .. } = effect {
             for dep_binding in &from.dependency_bindings {
-                if let Some(&dep_idx) = binding_to_idx.get(dep_binding)
+                if let Some(dep_idx) = lookup_idx(dep_binding)
                     && matches!(&effects[dep_idx], Effect::Delete { .. })
                 {
                     reverse_deps.push((dep_idx, idx));
@@ -3844,6 +3863,88 @@ mod tests {
         // attachment delete (old)
         assert_eq!(calls[2], ("delete".to_string(), attachment_id.to_string()));
         // tgw_a delete MUST come after attachment replace completes
+        assert_eq!(calls[3], ("delete".to_string(), tgw_a_id.to_string()));
+    }
+
+    /// Regression test for carina-provider-awscc#47:
+    /// When the Delete effect has binding: None (because the resource became anonymous
+    /// in step2), the reverse dependency from Replace(CBD).from.dependency_bindings
+    /// must still be resolved via the resource's state-recorded binding.
+    #[tokio::test]
+    async fn test_delete_waits_for_replace_cbd_even_when_delete_binding_is_none() {
+        let provider = MockProvider::new();
+        let tgw_a_id = ResourceId::new("test", "tgw_a");
+        let tgw_b_id = ResourceId::new("test", "tgw_b");
+        let attachment_id = ResourceId::new("test", "attachment");
+
+        // tgw_a Delete has binding: None (anonymous in step2 .crn)
+        // but state recorded it as "tgw_a"
+        let tgw_a_deps: HashSet<String> = HashSet::new();
+
+        // attachment Replace (CBD): from depends on tgw_a (state-recorded)
+        let attachment_from = State::existing(attachment_id.clone(), HashMap::new())
+            .with_identifier("attach-old")
+            .with_dependency_bindings(vec!["tgw_a".to_string()]);
+        let mut attachment_to = Resource::new("test", "attachment");
+        attachment_to.binding = Some("attachment".to_string());
+        attachment_to.dependency_bindings = vec!["tgw_b".to_string()];
+
+        let cbd_lifecycle = LifecycleConfig {
+            create_before_destroy: true,
+            ..Default::default()
+        };
+
+        let mut plan = Plan::new();
+
+        // tgw_b: Create
+        let mut tgw_b = Resource::new("test", "tgw_b");
+        tgw_b.binding = Some("tgw_b".to_string());
+        plan.add(Effect::Create(tgw_b));
+
+        // tgw_a: Delete — binding is None (the key difference from the previous test)
+        plan.add(Effect::Delete {
+            id: tgw_a_id.clone(),
+            identifier: "tgw-old".to_string(),
+            lifecycle: Default::default(),
+            binding: None,
+            dependencies: tgw_a_deps,
+        });
+
+        // attachment: Replace (CBD)
+        plan.add(Effect::Replace {
+            id: attachment_id.clone(),
+            from: Box::new(attachment_from),
+            to: attachment_to,
+            lifecycle: cbd_lifecycle,
+            changed_create_only: vec!["transit_gateway_id".to_string()],
+            cascading_updates: vec![],
+            temporary_name: None,
+            cascade_ref_hints: vec![],
+        });
+
+        provider.push_create(Ok(ok_state(&tgw_b_id)));
+        provider.push_create(Ok(ok_state(&attachment_id)));
+        provider.push_delete(Ok(()));
+        provider.push_delete(Ok(()));
+
+        let input = ExecutionInput {
+            plan: &plan,
+            unresolved_resources: &HashMap::new(),
+            binding_map: HashMap::new(),
+            current_states: HashMap::new(),
+        };
+
+        let observer = MockObserver::new();
+        let result = execute_plan(&provider, input, &observer).await;
+
+        assert_eq!(result.success_count, 3);
+        assert_eq!(result.failure_count, 0);
+
+        let calls = provider.calls();
+        assert_eq!(calls[0], ("create".to_string(), tgw_b_id.to_string()));
+        assert_eq!(calls[1], ("create".to_string(), attachment_id.to_string()));
+        assert_eq!(calls[2], ("delete".to_string(), attachment_id.to_string()));
+        // tgw_a delete MUST still come after attachment replace, even though binding is None
         assert_eq!(calls[3], ("delete".to_string(), tgw_a_id.to_string()));
     }
 }
