@@ -33,7 +33,7 @@ macro_rules! skip_if_no_wasm {
     };
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_precompile_cache_creation() {
     let wasm = skip_if_no_wasm!();
     let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
@@ -53,7 +53,7 @@ async fn test_precompile_cache_creation() {
     assert_eq!(factory.name(), "mock");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_from_file_cached_creates_cache() {
     let wasm = skip_if_no_wasm!();
     let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
@@ -74,7 +74,7 @@ async fn test_from_file_cached_creates_cache() {
     assert!(cwasm_path.exists(), ".cwasm cache file should be created");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_from_file_cached_uses_cache() {
     let wasm = skip_if_no_wasm!();
     let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
@@ -96,7 +96,7 @@ async fn test_from_file_cached_uses_cache() {
     assert!(factory2.schemas().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_from_file_cached_recovers_from_stale_cache() {
     let wasm = skip_if_no_wasm!();
     let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
@@ -125,7 +125,7 @@ async fn test_from_file_cached_recovers_from_stale_cache() {
     assert_eq!(factory.name(), "mock");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_precompiled_factory_creates_provider() {
     let wasm = skip_if_no_wasm!();
     let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
@@ -142,7 +142,7 @@ async fn test_precompiled_factory_creates_provider() {
     assert_eq!(provider.name(), "mock");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_new_uses_default_cache() {
     let wasm = skip_if_no_wasm!();
 

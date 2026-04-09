@@ -28,7 +28,7 @@ macro_rules! skip_if_no_wasm {
     };
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_mock_provider_factory() {
     let path = skip_if_no_wasm!();
     let factory = WasmProviderFactory::new(path)
@@ -43,7 +43,7 @@ async fn test_wasm_mock_provider_factory() {
     assert!(schemas.is_empty(), "Mock provider should have no schemas");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_mock_provider_create_and_read() {
     let path = skip_if_no_wasm!();
     let factory = WasmProviderFactory::new(path)
@@ -102,7 +102,7 @@ async fn test_wasm_mock_provider_create_and_read() {
     assert_eq!(read_state.attributes.get("count"), Some(&Value::Int(42)));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_mock_provider_update_and_delete() {
     let path = skip_if_no_wasm!();
     let factory = WasmProviderFactory::new(path)
@@ -171,7 +171,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
     assert!(deleted_state.attributes.is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_mock_provider_normalizer() {
     let path = skip_if_no_wasm!();
     let factory = WasmProviderFactory::new(path)
