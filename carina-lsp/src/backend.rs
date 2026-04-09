@@ -140,6 +140,12 @@ impl Backend {
 
         let provider_configs = workspace::discover_providers(&workspace_root);
         if provider_configs.is_empty() {
+            // Clear schemas when no providers are configured
+            *self.providers.write().await = ProviderState::new(vec![], &self.provider_context);
+            let uris: Vec<Url> = self.documents.iter().map(|r| r.key().clone()).collect();
+            for uri in uris {
+                self.update_diagnostics(uri).await;
+            }
             return;
         }
 
