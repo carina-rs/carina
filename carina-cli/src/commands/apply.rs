@@ -1069,13 +1069,42 @@ async fn run_apply_locked(
 
     // Seed current_states with orphaned resources from state file (#844).
     // These are resources tracked in state but removed from the .crn config.
+    // Refresh each orphan via provider.read() to verify it still exists (#1598).
     let mut current_states = current_states;
     let mut orphan_dependencies: HashMap<ResourceId, Vec<String>> = HashMap::new();
     if let Some(sf) = state_file.as_ref() {
         let desired_ids: HashSet<ResourceId> =
             sorted_resources.iter().map(|r| r.id.clone()).collect();
-        for (id, state) in sf.build_orphan_states(&desired_ids) {
-            current_states.entry(id).or_insert(state);
+        let orphan_states: Vec<(ResourceId, State)> =
+            sf.build_orphan_states(&desired_ids).into_iter().collect();
+        let provider_ref = &provider;
+        let orphan_results: Vec<Result<(ResourceId, State), AppError>> =
+            stream::iter(orphan_states)
+                .map(|(id, state)| {
+                    let binding = state.attributes.get("_binding").cloned();
+                    let dep_bindings = state.dependency_bindings.clone();
+                    async move {
+                        let mut refreshed =
+                            read_with_retry(provider_ref, &id, state.identifier.as_deref())
+                                .await
+                                .map_err(AppError::Provider)?;
+                        if let Some(b) = binding {
+                            refreshed.attributes.insert("_binding".to_string(), b);
+                        }
+                        if !dep_bindings.is_empty() {
+                            refreshed.dependency_bindings = dep_bindings;
+                        }
+                        Ok((id, refreshed))
+                    }
+                })
+                .buffer_unordered(5)
+                .collect()
+                .await;
+        for result in orphan_results {
+            let (id, refreshed) = result?;
+            if refreshed.exists {
+                current_states.entry(id).or_insert(refreshed);
+            }
         }
         orphan_dependencies = sf.build_orphan_dependencies(&desired_ids);
     }
