@@ -322,6 +322,13 @@ impl AttributeType {
             }
 
             (AttributeType::Map(inner), Value::Map(map)) => {
+                // Detect Key/Value list structure flattened into a map (e.g., { key = "Name", value = "..." })
+                let has_key = map.keys().any(|k| k.eq_ignore_ascii_case("key"));
+                let has_value = map.keys().any(|k| k.eq_ignore_ascii_case("value"));
+                if has_key && has_value {
+                    return Err(TypeError::MapKeyValueKeys);
+                }
+
                 for (k, v) in map {
                     inner.validate(v).map_err(|e| TypeError::MapValueError {
                         key: k.clone(),
@@ -483,6 +490,11 @@ pub enum TypeError {
 
     #[error("'{attribute}' cannot use block syntax; use map assignment: {attribute} = {{ ... }}")]
     BlockSyntaxNotAllowed { attribute: String },
+
+    #[error(
+        "Map contains both 'key' and 'value' as keys, which looks like a Key/Value list was flattened into a map. Use meaningful keys instead: {{ Name = '...' }}"
+    )]
+    MapKeyValueKeys,
 }
 
 impl Value {
@@ -2941,5 +2953,65 @@ mod tests {
     fn test_resource_schema_without_operation_config() {
         let schema = ResourceSchema::new("ec2.vpc");
         assert!(schema.operation_config.is_none());
+    }
+
+    #[test]
+    fn test_map_validates_key_value_keys_error() {
+        let map_type = AttributeType::Map(Box::new(AttributeType::String));
+        let value = Value::Map(
+            [
+                ("key".to_string(), Value::String("Project".to_string())),
+                ("value".to_string(), Value::String("carina".to_string())),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let result = map_type.validate(&value);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), TypeError::MapKeyValueKeys));
+    }
+
+    #[test]
+    fn test_map_validates_key_value_keys_case_insensitive() {
+        let map_type = AttributeType::Map(Box::new(AttributeType::String));
+        let value = Value::Map(
+            [
+                ("Key".to_string(), Value::String("Project".to_string())),
+                ("Value".to_string(), Value::String("carina".to_string())),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let result = map_type.validate(&value);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), TypeError::MapKeyValueKeys));
+    }
+
+    #[test]
+    fn test_map_validates_normal_keys_ok() {
+        let map_type = AttributeType::Map(Box::new(AttributeType::String));
+        let value = Value::Map(
+            [
+                ("Project".to_string(), Value::String("carina".to_string())),
+                ("ManagedBy".to_string(), Value::String("carina".to_string())),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert!(map_type.validate(&value).is_ok());
+    }
+
+    #[test]
+    fn test_map_validates_only_key_no_error() {
+        let map_type = AttributeType::Map(Box::new(AttributeType::String));
+        let value = Value::Map(
+            [
+                ("key".to_string(), Value::String("something".to_string())),
+                ("env".to_string(), Value::String("prod".to_string())),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert!(map_type.validate(&value).is_ok());
     }
 }
