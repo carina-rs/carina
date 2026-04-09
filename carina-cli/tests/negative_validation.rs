@@ -93,3 +93,8 @@ fn missing_required_attribute() {
 fn invalid_region() {
     assert_validate_fails("invalid_region.crn", "region");
 }
+
+#[test]
+fn missing_provider_plugin() {
+    assert_validate_fails("missing_provider_plugin", "has no source configured");
+}

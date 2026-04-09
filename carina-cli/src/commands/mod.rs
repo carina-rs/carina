@@ -59,6 +59,30 @@ pub fn validate_and_resolve_with_config(
     let factories = build_factories_from_providers(&parsed.providers, base_dir);
     let ctx = WiringContext::new(factories);
 
+    // Check for declared providers whose plugins failed to load
+    if !skip_resource_validation {
+        let mut errors = Vec::new();
+        for provider in &parsed.providers {
+            let loaded = ctx.factories().iter().any(|f| f.name() == provider.name);
+            if !loaded {
+                if provider.source.is_some() {
+                    errors.push(format!(
+                        "Provider '{}' plugin failed to load. Run `carina init` to install provider plugins.",
+                        provider.name
+                    ));
+                } else {
+                    errors.push(format!(
+                        "Provider '{}' has no source configured. Add `source = 'github.com/...'` to the provider block.",
+                        provider.name
+                    ));
+                }
+            }
+        }
+        if !errors.is_empty() {
+            return Err(AppError::Validation(errors.join("\n")));
+        }
+    }
+
     // Validate provider region
     validate_provider_region_with_ctx(&ctx, parsed)?;
 
