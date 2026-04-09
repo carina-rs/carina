@@ -7,23 +7,32 @@ use carina_core::parser::{self, ProviderConfig, ProviderContext};
 
 /// Discover all provider configurations from .crn files in a workspace directory.
 ///
-/// Scans the directory (non-recursively) for files ending in `.crn`,
+/// Recursively scans the directory for files ending in `.crn`,
 /// parses each one, and collects all `provider` blocks. Duplicate provider
 /// names are deduplicated (first occurrence wins). Unreadable or unparseable
 /// files are silently skipped.
 pub fn discover_providers(workspace_root: &Path) -> Vec<ProviderConfig> {
-    let entries = match fs::read_dir(workspace_root) {
-        Ok(entries) => entries,
-        Err(_) => return Vec::new(),
-    };
-
     let mut seen_names = std::collections::HashSet::new();
     let mut providers = Vec::new();
+    discover_providers_recursive(workspace_root, &mut seen_names, &mut providers);
+    providers
+}
+
+fn discover_providers_recursive(
+    dir: &Path,
+    seen_names: &mut std::collections::HashSet<String>,
+    providers: &mut Vec<ProviderConfig>,
+) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "crn")
-            && path.is_file()
+        if path.is_dir() {
+            discover_providers_recursive(&path, seen_names, providers);
+        } else if path.extension().is_some_and(|ext| ext == "crn")
             && let Ok(content) = fs::read_to_string(&path)
         {
             let ctx = ProviderContext::default();
@@ -36,8 +45,6 @@ pub fn discover_providers(workspace_root: &Path) -> Vec<ProviderConfig> {
             }
         }
     }
-
-    providers
 }
 
 #[cfg(test)]
@@ -145,6 +152,22 @@ mod tests {
 
         let providers = discover_providers(dir.path());
         assert!(providers.is_empty());
+    }
+
+    #[test]
+    fn discover_providers_recursive_nested_directories() {
+        let dir = TempDir::new().unwrap();
+        let nested = dir.path().join("modules").join("web");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join("main.crn"),
+            "provider awscc {\n  region = 'ap-northeast-1'\n}\n",
+        )
+        .unwrap();
+
+        let providers = discover_providers(dir.path());
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name, "awscc");
     }
 
     #[test]
