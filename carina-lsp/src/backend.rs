@@ -39,15 +39,14 @@ struct ProviderState {
 }
 
 impl ProviderState {
-    fn new(factories: &[Box<dyn ProviderFactory>], provider_context: &ProviderContext) -> Self {
-        let schemas = Arc::new(provider_mod::collect_schemas(factories));
+    fn new(factories: Vec<Box<dyn ProviderFactory>>, provider_context: &ProviderContext) -> Self {
+        let schemas = Arc::new(provider_mod::collect_schemas(&factories));
         let provider_names: Vec<String> = factories.iter().map(|f| f.name().to_string()).collect();
         let region_completions: Vec<CompletionValue> = factories
             .iter()
             .flat_map(|f| f.config_completions().remove("region").unwrap_or_default())
             .collect();
-        let factories_arc: Arc<Vec<Box<dyn ProviderFactory>>> = Arc::new(Vec::new());
-
+        let factories_arc = Arc::new(factories);
         Self {
             diagnostic_engine: DiagnosticEngine::new(
                 Arc::clone(&schemas),
@@ -91,7 +90,7 @@ impl Backend {
     ) -> Self {
         let provider_context = Arc::new(provider_context);
         // Start with empty schemas — they will be loaded asynchronously after initialize
-        let state = ProviderState::new(&[], &provider_context);
+        let state = ProviderState::new(vec![], &provider_context);
 
         Self {
             client,
@@ -167,13 +166,14 @@ impl Backend {
             return;
         }
 
-        let new_state = ProviderState::new(&factories, &self.provider_context);
+        let factory_count = factories.len();
+        let new_state = ProviderState::new(factories, &self.provider_context);
         *self.providers.write().await = new_state;
 
         self.client
             .log_message(
                 MessageType::INFO,
-                format!("Loaded {} provider schema(s)", factories.len()),
+                format!("Loaded {} provider schema(s)", factory_count),
             )
             .await;
 
