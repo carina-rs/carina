@@ -84,3 +84,32 @@ pub(super) fn test_provider_with_nested_structs() -> CompletionProvider {
 
     CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![])
 }
+
+/// Provider with StringEnum that has name but no namespace (simulates WASM provider).
+pub(super) fn test_provider_with_nameless_enum() -> CompletionProvider {
+    // Top-level attribute with StringEnum (no namespace)
+    let status_enum = AttributeType::StringEnum {
+        name: "VersioningStatus".to_string(),
+        values: vec!["Enabled".to_string(), "Suspended".to_string()],
+        namespace: None,
+        to_dsl: None,
+    };
+
+    // Nested struct field with StringEnum (no namespace)
+    let versioning_struct = AttributeType::Struct {
+        name: "VersioningConfiguration".to_string(),
+        fields: vec![StructField::new("status", status_enum.clone())],
+    };
+
+    let schema = ResourceSchema::new("awscc.s3.bucket")
+        .attribute(AttributeSchema::new("versioning_status", status_enum))
+        .attribute(AttributeSchema::new(
+            "versioning_configuration",
+            versioning_struct,
+        ));
+
+    let mut schemas = HashMap::new();
+    schemas.insert("awscc.s3.bucket".to_string(), schema);
+
+    CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![])
+}

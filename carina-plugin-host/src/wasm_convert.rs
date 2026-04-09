@@ -283,8 +283,8 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
         proto::AttributeType::Int => CoreAttributeType::Int,
         proto::AttributeType::Float => CoreAttributeType::Float,
         proto::AttributeType::Bool => CoreAttributeType::Bool,
-        proto::AttributeType::StringEnum { values } => CoreAttributeType::StringEnum {
-            name: String::new(),
+        proto::AttributeType::StringEnum { values, name } => CoreAttributeType::StringEnum {
+            name: name.clone(),
             values: values.clone(),
             namespace: None,
             to_dsl: None,

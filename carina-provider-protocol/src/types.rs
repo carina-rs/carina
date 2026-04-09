@@ -217,6 +217,8 @@ pub enum AttributeType {
     #[serde(rename = "string_enum")]
     StringEnum {
         values: Vec<String>,
+        #[serde(default)]
+        name: String,
     },
     #[serde(rename = "list")]
     List {
