@@ -13,6 +13,7 @@ use colored::Colorize;
 use base64::Engine;
 use commands::apply::{run_apply, run_apply_from_plan};
 use commands::destroy::run_destroy;
+use commands::docs;
 use commands::fmt::run_fmt;
 use commands::lint::run_lint;
 use commands::module::{ModuleCommands, run_module_command};
@@ -179,6 +180,20 @@ enum Commands {
         #[arg(value_enum)]
         shell: Shell,
     },
+    /// Display embedded documentation
+    Docs {
+        /// List all available documents
+        #[arg(long)]
+        list: bool,
+
+        /// Search documents for a keyword
+        #[arg(long)]
+        search: Option<String>,
+
+        /// Show a specific document by name
+        #[arg()]
+        name: Option<String>,
+    },
 }
 
 /// Create the parser configuration with AWS KMS decryptor.
@@ -314,6 +329,24 @@ async fn main() {
         Commands::Completions { shell } => {
             generate(shell, &mut Cli::command(), "carina", &mut std::io::stdout());
             Ok(())
+        }
+        Commands::Docs { list, search, name } => {
+            let output: Result<String, error::AppError> = if list {
+                Ok(docs::run_docs_list())
+            } else if let Some(query) = search {
+                Ok(docs::run_docs_search(&query))
+            } else if let Some(doc_name) = name {
+                docs::run_docs_show(&doc_name)
+            } else {
+                Ok(docs::run_docs_default())
+            };
+            match output {
+                Ok(text) => {
+                    println!("{text}");
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
         }
     };
 
