@@ -67,12 +67,7 @@ pub fn validate_and_resolve_with_config(
             if !loaded {
                 if let Some(reason) = load_errors.get(&provider.name) {
                     errors.push(reason.clone());
-                } else if provider.source.is_some() {
-                    errors.push(format!(
-                        "Provider '{}' plugin is not installed. Run `carina init` to install provider plugins.",
-                        provider.name
-                    ));
-                } else {
+                } else if provider.source.is_none() {
                     errors.push(format!(
                         "Provider '{}' has no source configured. Add `source = 'github.com/...'` to the provider block.",
                         provider.name
