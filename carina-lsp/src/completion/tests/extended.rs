@@ -1059,3 +1059,54 @@ awscc.ec2.security_group {
         labels
     );
 }
+
+#[test]
+fn struct_field_completion_with_assignment_syntax() {
+    // Bug #1627: `outer = {` (assignment syntax) was not detected as nested struct block
+    let provider = test_provider_with_nested_structs();
+    let text = r#"let r = test.nested.resource {
+    outer = {
+
+    }
+}"#;
+    let context = provider.get_completion_context(
+        text,
+        Position {
+            line: 2,
+            character: 8,
+        },
+    );
+    assert!(
+        matches!(
+            context,
+            CompletionContext::InsideStructBlock {
+                ref resource_type,
+                ref attr_path,
+            } if resource_type == "test.nested.resource"
+                && attr_path == &["outer".to_string()]
+        ),
+        "Should detect InsideStructBlock for assignment syntax 'outer = {{}}', got: {:?}",
+        context
+    );
+
+    // Verify completions return struct fields, not top-level attributes
+    let completions = provider.complete(
+        &create_document(text),
+        Position {
+            line: 2,
+            character: 8,
+        },
+        None,
+    );
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"inner"),
+        "Should have 'inner' struct field. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"outer_field"),
+        "Should have 'outer_field' struct field. Got: {:?}",
+        labels
+    );
+}

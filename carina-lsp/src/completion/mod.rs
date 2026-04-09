@@ -186,15 +186,19 @@ impl CompletionProvider {
                 }
             }
 
-            // At brace_depth >= 1, detect nested block: "identifier {" (without "=")
-            if brace_depth >= 1
-                && trimmed.ends_with('{')
-                && !trimmed.contains('=')
-                && !resource_type.is_empty()
-            {
-                let name = trimmed.trim_end_matches('{').trim();
+            // At brace_depth >= 1, detect nested block in two forms:
+            //   - block syntax: "identifier {"
+            //   - assignment syntax: "identifier = {"
+            if brace_depth >= 1 && trimmed.ends_with('{') && !resource_type.is_empty() {
+                let before_brace = trimmed.trim_end_matches('{').trim();
+                let name = if before_brace.contains('=') {
+                    // Assignment syntax: "name = {" → extract name before "="
+                    before_brace.split('=').next().unwrap_or("").trim()
+                } else {
+                    // Block syntax: "name {"
+                    before_brace
+                };
                 if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                    // Truncate to current depth level and push the new block name
                     let depth_index = (brace_depth - 1) as usize;
                     nested_block_names.truncate(depth_index);
                     nested_block_names.push(name.to_string());
