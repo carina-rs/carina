@@ -113,17 +113,12 @@ main() {
     fi
 
     # sccache (configured via .cargo/config.toml) is incompatible with cargo's
-    # incremental compilation: cargo sets CARGO_INCREMENTAL=1 internally for dev
-    # profile, and sccache refuses to run when it's set. Disable sccache for
-    # pre-commit checks by overriding RUSTC_WRAPPER, and enable incremental
-    # compilation directly for faster checks.
-    clippy_env=()
-    if [[ "$RUSTC_WRAPPER" == *sccache* ]] || { [ -f .cargo/config.toml ] && grep -q 'sccache' .cargo/config.toml 2>/dev/null; }; then
-        clippy_env=(env RUSTC_WRAPPER="")
-        export CARGO_INCREMENTAL=1
-    else
-        export CARGO_INCREMENTAL=1
-    fi
+    # incremental compilation. Always disable sccache and enable incremental
+    # compilation for pre-commit checks. We unconditionally clear RUSTC_WRAPPER
+    # because cargo resolves .cargo/config.toml from parent directories, so
+    # sccache may be active even when no config exists in the current worktree.
+    clippy_env=(env RUSTC_WRAPPER="")
+    export CARGO_INCREMENTAL=1
 
     fmt_log=$(mktemp)
     clippy_log=$(mktemp)
