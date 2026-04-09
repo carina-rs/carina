@@ -193,13 +193,26 @@ impl CompletionProvider {
             });
         }
 
-        // Always include built-in function completions in value position
-        completions.extend(self.builtin_function_completions());
-
         // Look up the attribute type from schema
         if let Some(schema) = self.schemas.get(resource_type)
             && let Some(attr_schema) = schema.attributes.get(attr_name)
         {
+            // Struct types: offer `{ }` snippet only, no built-in functions
+            if matches!(&attr_schema.attr_type, AttributeType::Struct { .. }) {
+                completions.push(CompletionItem {
+                    label: "{ }".to_string(),
+                    kind: Some(CompletionItemKind::SNIPPET),
+                    detail: Some("Open struct block".to_string()),
+                    insert_text: Some("{\n  $0\n}".to_string()),
+                    insert_text_format: Some(InsertTextFormat::SNIPPET),
+                    ..Default::default()
+                });
+                return completions;
+            }
+
+            // Include built-in function completions for non-Struct value positions
+            completions.extend(self.builtin_function_completions());
+
             // First check if schema defines completions for this attribute
             if let Some(schema_completions) = &attr_schema.completions {
                 completions.extend(schema_completions.iter().map(|c| CompletionItem {
@@ -215,6 +228,9 @@ impl CompletionProvider {
             completions.extend(self.completions_for_type(&attr_schema.attr_type));
             return completions;
         }
+
+        // No schema found — include built-in function completions as fallback
+        completions.extend(self.builtin_function_completions());
 
         // Fall back to generic value completions
         completions.extend(self.generic_value_completions());
