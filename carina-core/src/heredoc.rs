@@ -1,12 +1,13 @@
 //! Heredoc preprocessing for the Carina DSL.
 //!
-//! Heredocs (`<<MARKER ... MARKER` and `<<-MARKER ... MARKER`) are preprocessed
-//! before pest parsing, since pest's declarative grammar cannot handle dynamic
-//! closing markers.
+//! Heredocs are preprocessed before pest parsing, since pest's declarative
+//! grammar cannot handle dynamic closing markers.
 //!
-//! Two modes:
-//! - `<<MARKER` — literal heredoc, content preserved as-is
-//! - `<<-MARKER` — indented heredoc, common leading whitespace is stripped
+//! Modes:
+//! - `<<MARKER` — interpolating heredoc (`${...}` is expanded)
+//! - `<<-MARKER` — interpolating + indented (common leading whitespace stripped)
+//! - `<<'MARKER'` — literal heredoc (`${...}` is NOT expanded)
+//! - `<<-'MARKER'` — literal + indented
 
 /// Result of preprocessing: the transformed source and a list of heredoc
 /// replacements (for the formatter to restore them in the output).
@@ -38,6 +39,7 @@ pub fn preprocess_heredocs(input: &str) -> Result<PreprocessResult, HeredocError
 
             let marker = heredoc_start.marker;
             let strip_indent = heredoc_start.strip_indent;
+            let quoted = heredoc_start.quoted;
 
             // Save original heredoc text for formatter round-trip
             let mut original = String::new();
@@ -80,8 +82,14 @@ pub fn preprocess_heredocs(input: &str) -> Result<PreprocessResult, HeredocError
                 body_lines.join("\n")
             };
 
-            // Escape for embedding in a double-quoted string
-            let escaped = escape_for_double_quote(&body);
+            // Escape for embedding in a double-quoted string.
+            // Quoted heredocs (<<'EOT') escape ${...} to prevent interpolation.
+            // Unquoted heredocs (<<EOT) leave ${...} intact for interpolation.
+            let escaped = if quoted {
+                escape_for_double_quote(&body)
+            } else {
+                escape_for_double_quote_interpolating(&body)
+            };
             result.push('"');
             result.push_str(&escaped);
             result.push('"');
@@ -143,6 +151,7 @@ fn preprocess_single_heredoc(heredoc_text: &str) -> Option<String> {
     let first_line = lines[0];
     let heredoc_start = find_heredoc_start_in_fragment(first_line)?;
     let strip_indent = heredoc_start.strip_indent;
+    let quoted = heredoc_start.quoted;
 
     // Body is everything except first and last lines
     let body_lines: Vec<&str> = if lines.len() > 2 {
@@ -159,7 +168,11 @@ fn preprocess_single_heredoc(heredoc_text: &str) -> Option<String> {
         body_lines.join("\n")
     };
 
-    let escaped = escape_for_double_quote(&body);
+    let escaped = if quoted {
+        escape_for_double_quote(&body)
+    } else {
+        escape_for_double_quote_interpolating(&body)
+    };
     Some(format!("\"{}\"", escaped))
 }
 
@@ -174,6 +187,10 @@ fn find_heredoc_start_in_fragment(line: &str) -> Option<HeredocStart<'_>> {
     if strip_indent {
         j += 1;
     }
+    let quoted = j < bytes.len() && bytes[j] == b'\'';
+    if quoted {
+        j += 1;
+    }
     let marker_start = j;
     while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
         j += 1;
@@ -186,6 +203,7 @@ fn find_heredoc_start_in_fragment(line: &str) -> Option<HeredocStart<'_>> {
         prefix_end: 0,
         marker,
         strip_indent,
+        quoted,
     })
 }
 
@@ -210,7 +228,7 @@ fn strip_common_indent(lines: &[&str]) -> String {
         .join("\n")
 }
 
-/// Escape a string for embedding inside double quotes.
+/// Escape a string for embedding inside double quotes (literal — escapes `${`).
 fn escape_for_double_quote(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
@@ -218,6 +236,15 @@ fn escape_for_double_quote(s: &str) -> String {
         .replace('\r', "\\r")
         .replace('\t', "\\t")
         .replace("${", "\\${")
+}
+
+/// Escape for double quotes but preserve `${...}` for interpolation.
+fn escape_for_double_quote_interpolating(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
 }
 
 /// Check if a line contains a heredoc start (`<<MARKER` or `<<-MARKER`).
@@ -241,6 +268,8 @@ struct HeredocStart<'a> {
     marker: &'a str,
     /// Whether to strip common leading whitespace (`<<-`)
     strip_indent: bool,
+    /// Whether the marker is quoted (`<<'EOT'`) — literal, no interpolation
+    quoted: bool,
 }
 
 /// Find a `<<MARKER` or `<<-MARKER` pattern in a line.
@@ -296,11 +325,20 @@ fn find_heredoc_start(line: &str) -> Option<HeredocStart<'_>> {
             if strip_indent {
                 j += 1;
             }
+            // Check for quoted marker: <<'EOT' or <<-'EOT'
+            let quoted = j < bytes.len() && bytes[j] == b'\'';
+            if quoted {
+                j += 1;
+            }
             let marker_start = j;
             while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
                 j += 1;
             }
             let marker = &line[marker_start..j];
+            // Consume closing quote if quoted
+            if quoted && j < bytes.len() && bytes[j] == b'\'' {
+                j += 1;
+            }
             if !marker.is_empty() {
                 let rest = line[j..].trim();
                 if rest.is_empty() {
@@ -308,6 +346,7 @@ fn find_heredoc_start(line: &str) -> Option<HeredocStart<'_>> {
                         prefix_end,
                         marker,
                         strip_indent,
+                        quoted,
                     });
                 }
             }
@@ -368,10 +407,26 @@ mod tests {
     }
 
     #[test]
-    fn test_heredoc_with_interpolation_escaped() {
+    fn test_unquoted_heredoc_allows_interpolation() {
+        // <<EOT (unquoted) should NOT escape ${...} — allows interpolation
         let input = "x = <<EOT\n${hello}\nEOT\n";
         let result = preprocess_heredocs(input).unwrap();
+        assert_eq!(result.source, "x = \"${hello}\"\n");
+    }
+
+    #[test]
+    fn test_quoted_heredoc_escapes_interpolation() {
+        // <<'EOT' (quoted) should escape ${...} — literal, no interpolation
+        let input = "x = <<'EOT'\n${hello}\nEOT\n";
+        let result = preprocess_heredocs(input).unwrap();
         assert_eq!(result.source, "x = \"\\${hello}\"\n");
+    }
+
+    #[test]
+    fn test_quoted_indented_heredoc() {
+        let input = "x = <<-'EOT'\n    hello\n    world\n    EOT\n";
+        let result = preprocess_heredocs(input).unwrap();
+        assert_eq!(result.source, "x = \"hello\\nworld\"\n");
     }
 
     #[test]
