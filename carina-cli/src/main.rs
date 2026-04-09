@@ -18,6 +18,7 @@ use commands::fmt::run_fmt;
 use commands::lint::run_lint;
 use commands::module::{ModuleCommands, run_module_command};
 use commands::plan::run_plan;
+use commands::skills;
 use commands::state::{StateCommands, run_force_unlock, run_state_command};
 use commands::validate::run_validate;
 
@@ -180,6 +181,11 @@ enum Commands {
         #[arg(value_enum)]
         shell: Shell,
     },
+    /// Manage Agent Skills (install/update/uninstall SKILL.md)
+    Skills {
+        #[command(subcommand)]
+        command: SkillsCommands,
+    },
     /// Display embedded documentation
     Docs {
         /// List all available documents
@@ -194,6 +200,22 @@ enum Commands {
         #[arg()]
         name: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum SkillsCommands {
+    /// List embedded skills
+    List,
+    /// Install skills to ~/.agents/skills/carina/
+    Install,
+    /// Update installed skills to the embedded version
+    Update,
+    /// Reinstall skills (force overwrite)
+    Reinstall,
+    /// Remove installed skills
+    Uninstall,
+    /// Show install status and version comparison
+    Status,
 }
 
 /// Create the parser configuration with AWS KMS decryptor.
@@ -329,6 +351,23 @@ async fn main() {
         Commands::Completions { shell } => {
             generate(shell, &mut Cli::command(), "carina", &mut std::io::stdout());
             Ok(())
+        }
+        Commands::Skills { command } => {
+            let output = match command {
+                SkillsCommands::List => Ok(skills::run_skills_list()),
+                SkillsCommands::Install => skills::run_skills_install(),
+                SkillsCommands::Update => skills::run_skills_update(),
+                SkillsCommands::Reinstall => skills::run_skills_reinstall(),
+                SkillsCommands::Uninstall => skills::run_skills_uninstall(),
+                SkillsCommands::Status => skills::run_skills_status(),
+            };
+            match output {
+                Ok(text) => {
+                    println!("{text}");
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
         }
         Commands::Docs { list, search, name } => {
             let output: Result<String, error::AppError> = if list {
