@@ -42,6 +42,42 @@ Warnings are printed after the success message:
 
 On failure, Carina prints the error and exits with code `1`.
 
+## Flags
+
+### `--json`
+
+Output results as structured JSON instead of human-readable text.
+
+```bash
+carina validate --json
+```
+
+```json
+{
+  "status": "ok",
+  "resource_count": 3,
+  "resources": [
+    "aws.s3.bucket.my-bucket",
+    "aws.ec2.vpc.main",
+    "aws.ec2.subnet.public"
+  ]
+}
+```
+
+When warnings are present, they are included in the output:
+
+```json
+{
+  "status": "ok",
+  "resource_count": 2,
+  "resources": ["aws.s3.bucket.my-bucket", "aws.ec2.vpc.main"],
+  "warnings": [
+    {"type": "unused_binding", "message": "Unused let binding 'temp'"},
+    {"type": "duplicate_attribute", "message": "Duplicate attribute 'tags' at line 12", "file": "main.crn"}
+  ]
+}
+```
+
 ## Examples
 
 Validate the current directory:

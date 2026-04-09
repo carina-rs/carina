@@ -51,6 +51,7 @@ Output groups attributes under each resource:
 | Flag | Description |
 |------|-------------|
 | `--tui` | Display state in interactive TUI mode |
+| `--json` | Output full state as JSON |
 
 ### `lookup`
 

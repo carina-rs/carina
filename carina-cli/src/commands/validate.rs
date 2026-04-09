@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use colored::Colorize;
+use serde::Serialize;
 
 use carina_core::config_loader::{
     find_crn_files_in_dir, get_base_dir, load_configuration_with_config,
@@ -13,20 +14,41 @@ use super::validate_and_resolve_with_config;
 use crate::error::AppError;
 use crate::wiring::check_unused_bindings;
 
-pub fn run_validate(path: &PathBuf, provider_context: &ProviderContext) -> Result<(), AppError> {
+#[derive(Serialize)]
+struct ValidateOutput {
+    status: &'static str,
+    resource_count: usize,
+    resources: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<ValidateWarning>,
+}
+
+#[derive(Serialize)]
+struct ValidateWarning {
+    #[serde(rename = "type")]
+    warning_type: &'static str,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file: Option<String>,
+}
+
+pub fn run_validate(
+    path: &PathBuf,
+    json: bool,
+    provider_context: &ProviderContext,
+) -> Result<(), AppError> {
     let loaded = load_configuration_with_config(path, provider_context)?;
     let mut parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
 
-    println!("{}", "Validating...".cyan());
+    if !json {
+        println!("{}", "Validating...".cyan());
+    }
 
     validate_and_resolve_with_config(&mut parsed, base_dir, false, provider_context)?;
 
     // Check for unused let bindings (warnings, not errors)
-    // Use unresolved_parsed because resolve_resource_refs resolves intermediate
-    // ResourceRef values away (e.g., igw_attachment.id -> igw.id), making
-    // intermediate bindings appear unused even though they are structurally needed.
     let unused_warnings = check_unused_bindings(&loaded.unresolved_parsed);
 
     // Check for duplicate attribute keys
@@ -52,6 +74,36 @@ pub fn run_validate(path: &PathBuf, provider_context: &ProviderContext) -> Resul
                 ),
             ));
         }
+    }
+
+    if json {
+        let mut warnings = Vec::new();
+        for binding in &unused_warnings {
+            warnings.push(ValidateWarning {
+                warning_type: "unused_binding",
+                message: format!("Unused let binding '{}'", binding),
+                file: None,
+            });
+        }
+        for (file_path, message) in &duplicate_warnings {
+            warnings.push(ValidateWarning {
+                warning_type: "duplicate_attribute",
+                message: message.clone(),
+                file: Some(file_path.display().to_string()),
+            });
+        }
+        let output = ValidateOutput {
+            status: "ok",
+            resource_count: parsed.resources.len(),
+            resources: parsed.resources.iter().map(|r| r.id.to_string()).collect(),
+            warnings,
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output)
+                .map_err(|e| format!("Failed to serialize: {}", e))?
+        );
+        return Ok(());
     }
 
     println!(
@@ -87,4 +139,56 @@ pub fn run_validate(path: &PathBuf, provider_context: &ProviderContext) -> Resul
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_output_serialization() {
+        let output = ValidateOutput {
+            status: "ok",
+            resource_count: 2,
+            resources: vec![
+                "aws.s3.bucket.my-bucket".to_string(),
+                "aws.ec2.vpc.main".to_string(),
+            ],
+            warnings: vec![],
+        };
+        let json = serde_json::to_string(&output).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["status"], "ok");
+        assert_eq!(parsed["resource_count"], 2);
+        assert_eq!(parsed["resources"].as_array().unwrap().len(), 2);
+        // warnings should be omitted when empty
+        assert!(parsed.get("warnings").is_none());
+    }
+
+    #[test]
+    fn test_validate_output_with_warnings() {
+        let output = ValidateOutput {
+            status: "ok",
+            resource_count: 1,
+            resources: vec!["aws.s3.bucket.test".to_string()],
+            warnings: vec![
+                ValidateWarning {
+                    warning_type: "unused_binding",
+                    message: "Unused let binding 'temp'".to_string(),
+                    file: None,
+                },
+                ValidateWarning {
+                    warning_type: "duplicate_attribute",
+                    message: "Duplicate attribute 'tags'".to_string(),
+                    file: Some("main.crn".to_string()),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&output).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["warnings"].as_array().unwrap().len(), 2);
+        assert_eq!(parsed["warnings"][0]["type"], "unused_binding");
+        assert!(parsed["warnings"][0].get("file").is_none());
+        assert_eq!(parsed["warnings"][1]["file"], "main.crn");
+    }
 }

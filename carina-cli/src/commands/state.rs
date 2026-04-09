@@ -157,6 +157,10 @@ pub enum StateCommands {
         /// Display state in interactive TUI mode
         #[arg(long)]
         tui: bool,
+
+        /// Output state as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -178,7 +182,9 @@ pub async fn run_state_command(
         StateCommands::Lookup { query, path, json } => {
             run_state_lookup(&query, &path, json, provider_context).await
         }
-        StateCommands::Show { path, tui } => run_state_show(&path, tui, provider_context).await,
+        StateCommands::Show { path, tui, json } => {
+            run_state_show(&path, tui, json, provider_context).await
+        }
     }
 }
 
@@ -384,9 +390,17 @@ fn format_state_show(state: &StateFile) -> String {
 async fn run_state_show(
     path: &PathBuf,
     tui: bool,
+    json: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
     let state = load_state_file(path, provider_context).await?;
+
+    if json {
+        let json_str = serde_json::to_string_pretty(&state)
+            .map_err(|e| format!("Failed to serialize state: {}", e))?;
+        println!("{}", json_str);
+        return Ok(());
+    }
 
     if state.resources.is_empty() {
         println!("No resources in state.");

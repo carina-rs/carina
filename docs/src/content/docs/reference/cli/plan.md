@@ -59,6 +59,14 @@ When set to `false`, Carina uses cached state and prints a warning. The plan may
 carina plan --refresh=false
 ```
 
+### `--json`
+
+Output the plan as structured JSON instead of human-readable text. The output uses the same format as `--out` (PlanFile), including effects, resource definitions, and current states. Secrets are redacted.
+
+```bash
+carina plan --json
+```
+
 ## Examples
 
 Plan from the current directory:
