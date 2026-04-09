@@ -56,7 +56,7 @@ pub fn validate_and_resolve_with_config(
     skip_resource_validation: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let factories = build_factories_from_providers(&parsed.providers, base_dir);
+    let (factories, load_errors) = build_factories_from_providers(&parsed.providers, base_dir);
     let ctx = WiringContext::new(factories);
 
     // Check for declared providers whose plugins failed to load
@@ -65,12 +65,9 @@ pub fn validate_and_resolve_with_config(
         for provider in &parsed.providers {
             let loaded = ctx.factories().iter().any(|f| f.name() == provider.name);
             if !loaded {
-                if provider.source.is_some() {
-                    errors.push(format!(
-                        "Provider '{}' plugin failed to load. Run `carina init` to install provider plugins.",
-                        provider.name
-                    ));
-                } else {
+                if let Some(reason) = load_errors.get(&provider.name) {
+                    errors.push(reason.clone());
+                } else if provider.source.is_none() {
                     errors.push(format!(
                         "Provider '{}' has no source configured. Add `source = 'github.com/...'` to the provider block.",
                         provider.name
@@ -111,4 +108,98 @@ pub fn validate_and_resolve_with_config(
     compute_anonymous_identifiers_with_ctx(&ctx, &mut parsed.resources, &parsed.providers)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use carina_core::parser::ProviderConfig;
+    use std::collections::{HashMap, HashSet};
+
+    fn empty_parsed_file() -> ParsedFile {
+        ParsedFile {
+            providers: vec![],
+            resources: vec![],
+            variables: HashMap::new(),
+            imports: vec![],
+            module_calls: vec![],
+            arguments: vec![],
+            attribute_params: vec![],
+            backend: None,
+            state_blocks: vec![],
+            user_functions: HashMap::new(),
+            remote_states: vec![],
+            requires: vec![],
+            structural_bindings: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn test_provider_load_error_shows_actual_reason() {
+        // When a provider with source fails to load, the error message should
+        // contain the actual failure reason, NOT "Run `carina init`".
+        // Use an unsupported source format to trigger a load failure without needing Tokio.
+        let mut parsed = empty_parsed_file();
+        parsed.providers.push(ProviderConfig {
+            name: "fakeprovider".to_string(),
+            source: Some("badscheme://not-a-valid-source".to_string()),
+            attributes: HashMap::new(),
+            default_tags: HashMap::new(),
+            version: None,
+            revision: None,
+        });
+
+        let base_dir = std::path::Path::new("/tmp/nonexistent-carina-test");
+        let result = validate_and_resolve_with_config(
+            &mut parsed,
+            base_dir,
+            false,
+            &ProviderContext::default(),
+        );
+
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        // Should NOT suggest "carina init" when the actual problem is a load failure
+        assert!(
+            !msg.contains("Run `carina init`"),
+            "Error should not suggest 'carina init' when the actual failure is known. Got: {}",
+            msg
+        );
+        // Should contain the actual failure reason from build_factories_from_providers
+        assert!(
+            msg.contains("Unsupported source format for provider 'fakeprovider'"),
+            "Error should show actual failure reason. Got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_provider_without_source_shows_source_hint() {
+        // A provider without source should tell the user to add source config.
+        let mut parsed = empty_parsed_file();
+        parsed.providers.push(ProviderConfig {
+            name: "awscc".to_string(),
+            source: None,
+            attributes: HashMap::new(),
+            default_tags: HashMap::new(),
+            version: None,
+            revision: None,
+        });
+
+        let base_dir = std::path::Path::new("/tmp/nonexistent-carina-test");
+        let result = validate_and_resolve_with_config(
+            &mut parsed,
+            base_dir,
+            false,
+            &ProviderContext::default(),
+        );
+
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("has no source configured"),
+            "Error should tell user to add source. Got: {}",
+            msg
+        );
+    }
 }

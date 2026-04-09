@@ -202,7 +202,7 @@ pub async fn run_plan(
         println!();
     }
 
-    let factories = build_factories_from_providers(&parsed.providers, base_dir);
+    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
     let wiring = WiringContext::new(factories);
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
     if let Some(sf) = state_file.as_ref() {
