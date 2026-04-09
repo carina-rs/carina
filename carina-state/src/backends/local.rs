@@ -416,6 +416,21 @@ impl StateBackend for LocalBackend {
             .await
             .map_err(|e| BackendError::Io(format!("Failed to rename temp lock file: {}", e)))?;
 
+        // Re-read and verify our lock was not clobbered by a concurrent process.
+        // This closes the TOCTOU window between the initial read and the rename.
+        let verify_content = tokio::fs::read_to_string(&self.lock_path)
+            .await
+            .map_err(|e| BackendError::Io(format!("Failed to verify lock after renewal: {}", e)))?;
+        let verify_lock: LockInfo = serde_json::from_str(&verify_content).map_err(|e| {
+            BackendError::InvalidState(format!("Failed to parse lock after renewal: {}", e))
+        })?;
+        if verify_lock.id != renewed.id {
+            return Err(BackendError::LockNotHeld(format!(
+                "lock was replaced during renewal: expected {}, found {}",
+                renewed.id, verify_lock.id
+            )));
+        }
+
         Ok(renewed)
     }
 
