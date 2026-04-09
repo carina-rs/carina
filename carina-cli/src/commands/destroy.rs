@@ -1016,7 +1016,7 @@ mod tests {
     }
 
     impl Provider for SequenceProvider {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "sequence-mock"
         }
 

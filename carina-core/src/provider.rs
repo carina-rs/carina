@@ -84,7 +84,7 @@ pub type SavedAttrs = HashMap<ResourceId, HashMap<String, Value>>;
 /// to perform actual API calls against its infrastructure.
 pub trait Provider: Send + Sync {
     /// Name of this Provider (e.g., "aws")
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
 
     /// Get the current state of a resource
     ///
@@ -286,7 +286,7 @@ impl ProviderRouter {
 }
 
 impl Provider for ProviderRouter {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "router"
     }
 
@@ -491,7 +491,7 @@ pub fn schema_key_for_resource(
 /// Provider implementation for Box<dyn Provider>
 /// This enables dynamic dispatch for Providers
 impl Provider for Box<dyn Provider> {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         (**self).name()
     }
 
@@ -535,7 +535,7 @@ mod tests {
     struct MockProvider;
 
     impl Provider for MockProvider {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "mock"
         }
 
@@ -812,7 +812,7 @@ mod tests {
         struct NormalizingProvider;
 
         impl Provider for NormalizingProvider {
-            fn name(&self) -> &'static str {
+            fn name(&self) -> &str {
                 "normalizing"
             }
 
