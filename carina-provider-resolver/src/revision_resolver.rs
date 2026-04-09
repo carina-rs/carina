@@ -278,7 +278,7 @@ pub fn resolve_provider_by_revision(
         // Reuse locked SHA if revision matches
         lock_entry.resolved_sha.clone().unwrap()
     } else {
-        println!(
+        eprintln!(
             "Resolving revision '{}' for provider '{}'...",
             revision, name
         );
@@ -306,7 +306,7 @@ pub fn resolve_provider_by_revision(
     }
 
     // 3. Download from CI artifacts
-    println!(
+    eprintln!(
         "Downloading provider '{}' from CI artifacts ({source}@{})...",
         name,
         &sha[..sha.len().min(12)]
@@ -329,7 +329,7 @@ pub fn resolve_provider_by_revision(
         sha256: hash,
     });
 
-    println!(
+    eprintln!(
         "Installed provider '{}' ({source}@{})",
         name,
         &sha[..sha.len().min(12)]
