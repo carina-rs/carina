@@ -371,6 +371,7 @@ pub fn resolve_single_config(base_dir: &Path, config: &ProviderConfig) -> Result
             revision,
             &config.name,
             &mut lock_file,
+            false,
         )?;
         path
     } else {
@@ -459,6 +460,7 @@ pub fn resolve_all(
                 revision,
                 &config.name,
                 &mut lock_file,
+                upgrade,
             )?;
             path
         } else {

@@ -267,15 +267,17 @@ pub fn resolve_provider_by_revision(
     revision: &str,
     name: &str,
     lock_file: &mut super::provider_resolver::LockFile,
+    upgrade: bool,
 ) -> Result<(PathBuf, String), String> {
     let token = get_github_token()?;
 
     // 1. Resolve revision to SHA
-    let sha = if let Some(lock_entry) = lock_file.find_by_source(source)
+    let sha = if !upgrade
+        && let Some(lock_entry) = lock_file.find_by_source(source)
         && lock_entry.revision.as_deref() == Some(revision)
         && lock_entry.resolved_sha.is_some()
     {
-        // Reuse locked SHA if revision matches
+        // Reuse locked SHA if revision matches (skip on upgrade)
         lock_entry.resolved_sha.clone().unwrap()
     } else {
         eprintln!(
