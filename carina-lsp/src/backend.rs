@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -39,7 +40,11 @@ struct ProviderState {
 }
 
 impl ProviderState {
-    fn new(factories: Vec<Box<dyn ProviderFactory>>, provider_context: &ProviderContext) -> Self {
+    fn new(
+        factories: Vec<Box<dyn ProviderFactory>>,
+        provider_context: &ProviderContext,
+        unloaded_providers: HashSet<String>,
+    ) -> Self {
         let schemas = Arc::new(provider_mod::collect_schemas(&factories));
         let provider_names: Vec<String> = factories.iter().map(|f| f.name().to_string()).collect();
         let region_completions: Vec<CompletionValue> = factories
@@ -52,7 +57,8 @@ impl ProviderState {
                 Arc::clone(&schemas),
                 provider_names.clone(),
                 factories_arc,
-            ),
+            )
+            .with_unloaded_providers(unloaded_providers),
             completion_provider: CompletionProvider::new(
                 Arc::clone(&schemas),
                 provider_names,
@@ -90,7 +96,7 @@ impl Backend {
     ) -> Self {
         let provider_context = Arc::new(provider_context);
         // Start with empty schemas — they will be loaded asynchronously after initialize
-        let state = ProviderState::new(vec![], &provider_context);
+        let state = ProviderState::new(vec![], &provider_context, HashSet::new());
 
         Self {
             client,
@@ -141,7 +147,8 @@ impl Backend {
         let provider_configs = workspace::discover_providers(&workspace_root);
         if provider_configs.is_empty() {
             // Clear schemas when no providers are configured
-            *self.providers.write().await = ProviderState::new(vec![], &self.provider_context);
+            *self.providers.write().await =
+                ProviderState::new(vec![], &self.provider_context, HashSet::new());
             let uris: Vec<Url> = self.documents.iter().map(|r| r.key().clone()).collect();
             for uri in uris {
                 self.update_diagnostics(uri).await;
@@ -159,21 +166,33 @@ impl Backend {
         .await
         .unwrap_or_default();
 
-        if factories.is_empty() {
+        // Determine which declared providers failed to load
+        let loaded_names: HashSet<String> =
+            factories.iter().map(|f| f.name().to_string()).collect();
+        let unloaded_providers: HashSet<String> = provider_configs
+            .iter()
+            .filter(|p| !loaded_names.contains(&p.name))
+            .map(|p| p.name.clone())
+            .collect();
+
+        if !unloaded_providers.is_empty() {
             self.client
                 .log_message(
                     MessageType::WARNING,
                     format!(
-                        "Found {} provider(s) but no WASM binaries cached. Run `carina init` to download.",
-                        provider_configs.len()
+                        "Provider(s) not loaded: {}. Run `carina init` to install.",
+                        unloaded_providers
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     ),
                 )
                 .await;
-            return;
         }
 
         let factory_count = factories.len();
-        let new_state = ProviderState::new(factories, &self.provider_context);
+        let new_state = ProviderState::new(factories, &self.provider_context, unloaded_providers);
         *self.providers.write().await = new_state;
 
         self.client

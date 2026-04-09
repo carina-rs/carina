@@ -76,6 +76,45 @@ impl DiagnosticEngine {
         diagnostics
     }
 
+    /// Check for unloaded providers and show info-level diagnostics on the provider block.
+    pub(super) fn check_unloaded_providers(
+        &self,
+        doc: &Document,
+        parsed: &ParsedFile,
+    ) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
+        let text = doc.text();
+
+        for provider in &parsed.providers {
+            if !self.unloaded_providers.contains(&provider.name) {
+                continue;
+            }
+
+            // Find the provider block position
+            let provider_pattern = format!("provider {}", provider.name);
+            for (line_idx, line) in text.lines().enumerate() {
+                let trimmed = line.trim();
+                if trimmed.starts_with(&provider_pattern) {
+                    let col = position::leading_whitespace_chars(line);
+                    let end_col = col + trimmed.find('{').unwrap_or(trimmed.len()) as u32;
+                    diagnostics.push(carina_diagnostic(
+                        line_idx as u32,
+                        col,
+                        end_col,
+                        DiagnosticSeverity::INFORMATION,
+                        format!(
+                            "Provider '{}' is not installed. Run `carina init` to install provider plugins.",
+                            provider.name
+                        ),
+                    ));
+                    break;
+                }
+            }
+        }
+
+        diagnostics
+    }
+
     /// Find the position of the region attribute in a provider block
     pub(super) fn find_provider_region_position(
         &self,

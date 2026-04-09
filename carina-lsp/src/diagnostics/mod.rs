@@ -4,7 +4,7 @@ mod validation;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -62,6 +62,8 @@ pub struct DiagnosticEngine {
     schemas: Arc<HashMap<String, ResourceSchema>>,
     provider_names: Vec<String>,
     factories: Arc<Vec<Box<dyn ProviderFactory>>>,
+    /// Provider names declared in .crn but not loaded (plugin missing).
+    unloaded_providers: HashSet<String>,
 }
 
 impl DiagnosticEngine {
@@ -74,7 +76,13 @@ impl DiagnosticEngine {
             schemas,
             provider_names,
             factories,
+            unloaded_providers: HashSet::new(),
         }
+    }
+
+    pub fn with_unloaded_providers(mut self, unloaded: HashSet<String>) -> Self {
+        self.unloaded_providers = unloaded;
+        self
     }
 
     pub fn analyze(&self, doc: &Document, base_path: Option<&Path>) -> Vec<Diagnostic> {
@@ -100,6 +108,9 @@ impl DiagnosticEngine {
             // Check provider region
             diagnostics.extend(self.check_provider_region(doc, parsed));
 
+            // Check for unloaded providers
+            diagnostics.extend(self.check_unloaded_providers(doc, parsed));
+
             // Check module calls
             if let Some(base) = base_path {
                 diagnostics.extend(self.check_module_calls(doc, parsed, base));
@@ -121,8 +132,27 @@ impl DiagnosticEngine {
                 let full_resource_type = format!("{}.{}", provider, resource.id.resource_type);
 
                 if !self.schemas.contains_key(&full_resource_type) {
-                    // Find the line where this resource is defined
-                    if let Some((line, col)) =
+                    // If the provider is declared but not loaded, show INFO instead of ERROR
+                    if self.unloaded_providers.contains(provider) {
+                        if let Some((line, col)) =
+                            self.find_resource_position(doc, &resource.id.resource_type)
+                        {
+                            let end_col = col
+                                + resource.id.resource_type.len() as u32
+                                + provider.len() as u32
+                                + 1;
+                            diagnostics.push(carina_diagnostic(
+                                line,
+                                col,
+                                end_col,
+                                DiagnosticSeverity::INFORMATION,
+                                format!(
+                                    "Provider '{}' is not installed. Run `carina init` to enable schema validation.",
+                                    provider
+                                ),
+                            ));
+                        }
+                    } else if let Some((line, col)) =
                         self.find_resource_position(doc, &resource.id.resource_type)
                     {
                         let end_col = col
