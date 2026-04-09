@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use carina_core::parser::ProviderConfig;
 
-/// A single provider entry in carina.lock.
+/// A single provider entry in carina-providers.lock.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockEntry {
     pub name: String,
@@ -27,7 +27,7 @@ pub struct LockEntry {
     pub sha256: String,
 }
 
-/// The full carina.lock file.
+/// The full carina-providers.lock file.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LockFile {
     #[serde(default)]
@@ -361,7 +361,7 @@ pub fn resolve_single_config(base_dir: &Path, config: &ProviderConfig) -> Result
         .as_deref()
         .ok_or_else(|| format!("Provider '{}' has no source", config.name))?;
 
-    let lock_path = base_dir.join("carina.lock");
+    let lock_path = base_dir.join("carina-providers.lock");
     let mut lock_file = LockFile::load(&lock_path).unwrap_or_default();
 
     let binary_path = if let Some(revision) = &config.revision {
@@ -386,7 +386,7 @@ pub fn resolve_single_config(base_dir: &Path, config: &ProviderConfig) -> Result
 
     lock_file
         .save(&lock_path)
-        .map_err(|e| format!("Failed to save carina.lock: {e}"))?;
+        .map_err(|e| format!("Failed to save carina-providers.lock: {e}"))?;
 
     Ok(binary_path)
 }
@@ -443,7 +443,7 @@ pub fn resolve_all(
     providers: &[ProviderConfig],
     upgrade: bool,
 ) -> Result<HashMap<String, PathBuf>, String> {
-    let lock_path = base_dir.join("carina.lock");
+    let lock_path = base_dir.join("carina-providers.lock");
     let mut lock_file = LockFile::load(&lock_path).unwrap_or_default();
     let mut resolved = HashMap::new();
 
@@ -479,7 +479,7 @@ pub fn resolve_all(
     if !resolved.is_empty() {
         lock_file
             .save(&lock_path)
-            .map_err(|e| format!("Failed to save carina.lock: {e}"))?;
+            .map_err(|e| format!("Failed to save carina-providers.lock: {e}"))?;
     }
 
     Ok(resolved)
@@ -493,7 +493,7 @@ pub fn validate_lock_constraints(
     base_dir: &Path,
     providers: &[ProviderConfig],
 ) -> Result<(), String> {
-    let lock_path = base_dir.join("carina.lock");
+    let lock_path = base_dir.join("carina-providers.lock");
     let lock_file = match LockFile::load(&lock_path) {
         Some(lf) => lf,
         None => return Ok(()),
@@ -633,7 +633,7 @@ mod tests {
     #[test]
     fn test_lock_file_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let lock_path = dir.path().join("carina.lock");
+        let lock_path = dir.path().join("carina-providers.lock");
 
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
