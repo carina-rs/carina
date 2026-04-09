@@ -4,7 +4,7 @@ description: "AWS ORGANIZATIONS account resource reference"
 ---
 
 
-CloudFormation Type: `UNKNOWN`
+CloudFormation Type: `AWS::Organizations::Account`
 
 Contains information about an Amazon Web Services account that is a member of an organization.
 
