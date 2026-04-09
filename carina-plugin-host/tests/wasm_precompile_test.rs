@@ -65,13 +65,14 @@ async fn test_from_file_cached_creates_cache() {
 
     assert_eq!(factory.name(), "mock");
 
-    // .cwasm should have been created in cache dir (stem matches the .wasm filename stem)
-    let wasm_stem = wasm
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .expect("wasm path should have a stem");
-    let cwasm_path = cache_dir.path().join(format!("{wasm_stem}.cwasm"));
-    assert!(cwasm_path.exists(), ".cwasm cache file should be created");
+    // .cwasm should have been created in cache dir
+    // cache_key() includes a content hash, so look for any .cwasm file
+    let cwasm_files: Vec<_> = std::fs::read_dir(cache_dir.path())
+        .expect("read_dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "cwasm"))
+        .collect();
+    assert_eq!(cwasm_files.len(), 1, ".cwasm cache file should be created");
 }
 
 #[tokio::test(flavor = "multi_thread")]
