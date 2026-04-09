@@ -721,15 +721,22 @@ impl WasmProviderFactory {
     ///
     /// The filename includes a SHA-256 hash of the canonical wasm path and the
     /// crate version so that different files or crate upgrades never collide.
+    /// Compute a cache-safe filename for the given wasm path.
+    ///
+    /// The filename includes a SHA-256 hash of the file content, canonical path,
+    /// and crate version. Changing any of these produces a different cache key,
+    /// ensuring the precompiled cache is invalidated on provider upgrades.
     fn cache_key(wasm_path: &Path) -> String {
         let canonical = wasm_path
             .canonicalize()
             .unwrap_or_else(|_| wasm_path.to_path_buf());
         let mut hasher = Sha256::new();
         hasher.update(canonical.to_string_lossy().as_bytes());
-        // Include the crate version so cache is invalidated on upgrades.
-        // Component::deserialize also checks wasmtime compatibility, but this
-        // avoids unnecessary recompile-on-error cycles.
+        // Include file content so replacing a .wasm at the same path invalidates cache.
+        if let Ok(content) = std::fs::read(wasm_path) {
+            hasher.update(&content);
+        }
+        // Include the crate version so cache is invalidated on host upgrades.
         hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
         let hash = format!("{:x}", hasher.finalize());
         let stem = wasm_path
@@ -1654,5 +1661,36 @@ mod tests {
         assert!(is_epoch_trap_message("epoch deadline reached"));
         assert!(!is_epoch_trap_message("out of memory"));
         assert!(!is_epoch_trap_message("unreachable code"));
+    }
+
+    #[test]
+    fn test_cache_key_changes_when_content_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let wasm_path = dir.path().join("provider.wasm");
+
+        // Write initial content
+        std::fs::write(&wasm_path, b"content_v1").unwrap();
+        let key1 = WasmProviderFactory::cache_key(&wasm_path);
+
+        // Change content at same path
+        std::fs::write(&wasm_path, b"content_v2").unwrap();
+        let key2 = WasmProviderFactory::cache_key(&wasm_path);
+
+        assert_ne!(
+            key1, key2,
+            "cache key should change when file content changes"
+        );
+    }
+
+    #[test]
+    fn test_cache_key_stable_for_same_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let wasm_path = dir.path().join("provider.wasm");
+        std::fs::write(&wasm_path, b"same_content").unwrap();
+
+        let key1 = WasmProviderFactory::cache_key(&wasm_path);
+        let key2 = WasmProviderFactory::cache_key(&wasm_path);
+
+        assert_eq!(key1, key2, "cache key should be stable for same content");
     }
 }
