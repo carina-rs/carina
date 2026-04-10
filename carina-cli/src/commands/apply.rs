@@ -1208,6 +1208,7 @@ async fn run_apply_locked(
         &parsed.state_blocks,
         &state_file,
         &moved_pairs,
+        schemas,
     );
 
     // Check for prevent_destroy violations

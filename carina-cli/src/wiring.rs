@@ -832,7 +832,13 @@ pub async fn create_plan_from_parsed_with_remote(
     cascade_dependent_updates(&mut plan, &sorted_resources, &current_states, ctx.schemas());
 
     // Add state block effects (import/removed/moved) to the plan
-    add_state_block_effects(&mut plan, &parsed.state_blocks, state_file, &moved_pairs);
+    add_state_block_effects(
+        &mut plan,
+        &parsed.state_blocks,
+        state_file,
+        &moved_pairs,
+        ctx.schemas(),
+    );
 
     let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
         .iter()
@@ -920,6 +926,7 @@ pub fn add_state_block_effects(
     state_blocks: &[StateBlock],
     state_file: &Option<StateFile>,
     moved_pairs: &[(ResourceId, ResourceId)],
+    schemas: &HashMap<String, ResourceSchema>,
 ) {
     // Collect resource IDs that are covered by removed blocks
     // to suppress orphan Delete effects
@@ -933,15 +940,25 @@ pub fn add_state_block_effects(
     for block in state_blocks {
         match block {
             StateBlock::Import { to, id } => {
+                // Try exact match first; fall back to matching against anonymous
+                // resources via the schema's name_attribute. This lets users write
+                // `to = awscc.s3.bucket 'carina-rs-state'` without needing the
+                // auto-generated hash name.
+                let effective_to = resolve_import_target(to, plan, state_file, schemas);
+
                 // Skip if resource already exists in state
                 let already_in_state = state_file.as_ref().is_some_and(|sf| {
-                    sf.find_resource(&to.provider, &to.resource_type, &to.name)
-                        .is_some()
+                    sf.find_resource(
+                        &effective_to.provider,
+                        &effective_to.resource_type,
+                        &effective_to.name,
+                    )
+                    .is_some()
                 });
                 if !already_in_state {
-                    suppress_create.insert(to.clone());
+                    suppress_create.insert(effective_to.clone());
                     new_effects.push(Effect::Import {
-                        id: to.clone(),
+                        id: effective_to,
                         identifier: id.clone(),
                     });
                 }
@@ -991,6 +1008,67 @@ pub fn add_state_block_effects(
     for effect in new_effects {
         plan.add(effect);
     }
+}
+
+/// Resolve an import block's `to` address to a matching resource in the plan or state.
+///
+/// Tries exact match first (by provider, resource_type, name). If no exact match
+/// exists, falls back to matching `to.name` against the `name_attribute` values of:
+/// 1. Anonymous resources in the plan's Create effects (pre-apply case)
+/// 2. Resources in the state file (already-imported case)
+///
+/// This lets users write `to = awscc.s3.bucket 'carina-rs-state'` without needing
+/// the auto-generated hash name, matching against `bucket_name = 'carina-rs-state'`.
+fn resolve_import_target(
+    to: &ResourceId,
+    plan: &Plan,
+    state_file: &Option<StateFile>,
+    schemas: &HashMap<String, ResourceSchema>,
+) -> ResourceId {
+    let name_attr = schemas
+        .get(&to.display_type())
+        .and_then(|s| s.name_attribute.as_deref());
+
+    // Single pass: prefer exact id match, otherwise remember the first name_attribute match.
+    let mut fallback_id: Option<ResourceId> = None;
+    for effect in plan.effects() {
+        let Effect::Create(resource) = effect else {
+            continue;
+        };
+        if resource.id == *to {
+            return to.clone();
+        }
+        if fallback_id.is_some() {
+            continue;
+        }
+        if resource.id.provider != to.provider || resource.id.resource_type != to.resource_type {
+            continue;
+        }
+        if let Some(attr) = name_attr
+            && let Some(Value::String(s)) = resource.get_attr(attr)
+            && s == &to.name
+        {
+            fallback_id = Some(resource.id.clone());
+        }
+    }
+    if let Some(id) = fallback_id {
+        return id;
+    }
+
+    // Fallback: match by name_attribute value in state file (already-imported case)
+    if let Some(attr) = name_attr
+        && let Some(sf) = state_file.as_ref()
+    {
+        for rs in sf.resources_by_type(&to.provider, &to.resource_type) {
+            if let Some(serde_json::Value::String(s)) = rs.attributes.get(attr)
+                && s == &to.name
+            {
+                return ResourceId::with_provider(&rs.provider, &rs.resource_type, &rs.name);
+            }
+        }
+    }
+
+    to.clone()
 }
 
 /// Check whether a `ProviderError` is an AWS throttling error that should be retried.
@@ -1400,6 +1478,92 @@ mod tests {
         assert_eq!(
             resources[0].get_attr("vpc_id"),
             Some(&Value::String("vpc-12345".to_string())),
+        );
+    }
+
+    #[test]
+    fn import_fallback_matches_anonymous_resource_by_name_attribute() {
+        use carina_core::effect::Effect;
+        use carina_core::plan::Plan;
+        use carina_core::resource::{Resource, ResourceId, Value};
+        use carina_core::schema::ResourceSchema;
+
+        // Schema with name_attribute = "bucket_name"
+        let bucket_schema =
+            ResourceSchema::new("awscc.s3.bucket").with_name_attribute("bucket_name");
+        let mut schemas = HashMap::new();
+        schemas.insert("awscc.s3.bucket".to_string(), bucket_schema);
+
+        // Anonymous resource with hash name but bucket_name = "carina-rs-state"
+        let mut resource = Resource::with_provider("awscc", "s3.bucket", "s3_bucket_1d43a664");
+        resource.set_attr(
+            "bucket_name".to_string(),
+            Value::String("carina-rs-state".to_string()),
+        );
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(resource));
+
+        // Import block with the logical name (not the hash)
+        let state_blocks = vec![StateBlock::Import {
+            to: ResourceId::with_provider("awscc", "s3.bucket", "carina-rs-state"),
+            id: "carina-rs-state".to_string(),
+        }];
+
+        add_state_block_effects(&mut plan, &state_blocks, &None, &[], &schemas);
+
+        // Expect only an Import effect (no Create) targeting the anonymous hash name
+        let effects = plan.effects();
+        assert_eq!(
+            effects.len(),
+            1,
+            "Expected only Import effect, got {effects:?}"
+        );
+        match &effects[0] {
+            Effect::Import { id, identifier } => {
+                assert_eq!(
+                    id.name, "s3_bucket_1d43a664",
+                    "Import should target the anonymous hash name"
+                );
+                assert_eq!(identifier, "carina-rs-state");
+            }
+            other => panic!("Expected Import effect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_fallback_skips_when_already_in_state_by_name_attribute() {
+        use carina_core::plan::Plan;
+        use carina_core::resource::ResourceId;
+        use carina_core::schema::ResourceSchema;
+        use carina_state::state::{ResourceState, StateFile};
+
+        let bucket_schema =
+            ResourceSchema::new("awscc.s3.bucket").with_name_attribute("bucket_name");
+        let mut schemas = HashMap::new();
+        schemas.insert("awscc.s3.bucket".to_string(), bucket_schema);
+
+        // State has the resource under its anonymous hash name
+        let mut state_file = StateFile::new();
+        let mut rs = ResourceState::new("s3.bucket", "s3_bucket_1d43a664", "awscc");
+        rs.attributes.insert(
+            "bucket_name".to_string(),
+            serde_json::Value::String("carina-rs-state".to_string()),
+        );
+        state_file.resources.push(rs);
+
+        let mut plan = Plan::new();
+        let state_blocks = vec![StateBlock::Import {
+            to: ResourceId::with_provider("awscc", "s3.bucket", "carina-rs-state"),
+            id: "carina-rs-state".to_string(),
+        }];
+
+        add_state_block_effects(&mut plan, &state_blocks, &Some(state_file), &[], &schemas);
+
+        // Already in state (via fallback match) — no Import effect should be emitted
+        assert_eq!(
+            plan.effects().len(),
+            0,
+            "Import should be skipped when fallback-matched resource is already in state"
         );
     }
 }
