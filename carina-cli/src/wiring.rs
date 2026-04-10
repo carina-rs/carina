@@ -739,10 +739,19 @@ pub async fn create_plan_from_parsed_with_remote(
                         .and_then(|sf| sf.get_identifier_for_resource(resource));
                     let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
                     async move {
-                        let mut state =
+                        // Data sources carry user-supplied inputs that need
+                        // to reach the provider — route them through
+                        // `read_data_source_with_retry` instead of the
+                        // identifier-based refresh.
+                        let mut state = if resource.is_data_source() {
+                            read_data_source_with_retry(provider_ref, resource)
+                                .await
+                                .map_err(AppError::Provider)?
+                        } else {
                             read_with_retry(provider_ref, &resource.id, identifier.as_deref())
                                 .await
-                                .map_err(AppError::Provider)?;
+                                .map_err(AppError::Provider)?
+                        };
                         // Restore dependency_bindings from state file (#1565).
                         if let Some(deps) = dep_bindings {
                             state.dependency_bindings = deps;
@@ -1182,6 +1191,34 @@ pub async fn read_with_retry(
                 eprintln!(
                     "  Throttled reading {}, retrying in {}s...",
                     id,
+                    delay.as_secs()
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!()
+}
+
+/// Read a data source resource via the provider with retry on throttling errors.
+///
+/// Same backoff policy as [`read_with_retry`] but uses [`Provider::read_data_source`]
+/// so the provider receives the full [`Resource`] (including user-supplied input
+/// attributes) rather than just the identifier.
+pub async fn read_data_source_with_retry(
+    provider: &dyn Provider,
+    resource: &Resource,
+) -> Result<State, ProviderError> {
+    let max_retries = 3;
+    for attempt in 0..=max_retries {
+        match provider.read_data_source(resource).await {
+            Ok(state) => return Ok(state),
+            Err(e) if attempt < max_retries && is_throttling_error(&e) => {
+                let delay = Duration::from_secs(1 << attempt); // 1s, 2s, 4s
+                eprintln!(
+                    "  Throttled reading {}, retrying in {}s...",
+                    resource.id,
                     delay.as_secs()
                 );
                 tokio::time::sleep(delay).await;

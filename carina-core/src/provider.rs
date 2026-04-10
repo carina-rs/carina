@@ -96,6 +96,42 @@ pub trait Provider: Send + Sync {
         identifier: Option<&str>,
     ) -> BoxFuture<'_, ProviderResult<State>>;
 
+    /// Read a data source resource.
+    ///
+    /// Unlike [`Provider::read`], this receives the full [`Resource`] so the
+    /// provider can see the user-supplied input attributes (e.g. the
+    /// `identity_store_id` + `user_name` that `aws.identitystore.user`
+    /// needs to resolve itself via the AWS SDK).
+    ///
+    /// The default implementation falls back to `read(&resource.id, None)`
+    /// for zero-input data sources such as `aws.sts.caller_identity`. If the
+    /// resource carries any user-supplied input attributes (keys not
+    /// starting with `_`, which marks parser-internal fields like `_type`
+    /// and `_data_source`), the default implementation returns an error
+    /// rather than silently dropping the inputs. Providers whose data
+    /// sources require inputs must override this method and dispatch on
+    /// `resource.id.resource_type`.
+    fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+        let user_input_count = resource
+            .attributes
+            .keys()
+            .filter(|k| !k.starts_with('_'))
+            .count();
+        if user_input_count > 0 {
+            let id = resource.id.clone();
+            let provider_name = self.name().to_string();
+            return Box::pin(async move {
+                Err(ProviderError::new(format!(
+                    "data source {id} has {user_input_count} input attribute(s) but provider \
+                     '{provider_name}' does not implement read_data_source for this resource type"
+                ))
+                .for_resource(id))
+            });
+        }
+        let id = resource.id.clone();
+        Box::pin(async move { self.read(&id, None).await })
+    }
+
     /// Create a resource
     ///
     /// Returns State with identifier set to the AWS internal ID (e.g., vpc-xxx)
@@ -297,6 +333,13 @@ impl Provider for ProviderRouter {
     ) -> BoxFuture<'_, ProviderResult<State>> {
         match self.get_provider_or_error(&id.provider) {
             Ok(provider) => provider.read(id, identifier),
+            Err(e) => Box::pin(async move { Err(e) }),
+        }
+    }
+
+    fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+        match self.get_provider_or_error(&resource.id.provider) {
+            Ok(provider) => provider.read_data_source(resource),
             Err(e) => Box::pin(async move { Err(e) }),
         }
     }
@@ -515,6 +558,10 @@ impl Provider for Box<dyn Provider> {
         (**self).read(id, identifier)
     }
 
+    fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+        (**self).read_data_source(resource)
+    }
+
     fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
         (**self).create(resource)
     }
@@ -604,6 +651,190 @@ mod tests {
         let id = ResourceId::new("test", "example");
         let state = provider.read(&id, None).await.unwrap();
         assert!(!state.exists);
+    }
+
+    /// A provider that only accepts a data source when the full `Resource`
+    /// carrying its input attributes is delivered. Exercises the new
+    /// `read_data_source` path introduced to enable resources like
+    /// `identitystore.user` that look themselves up by user-provided inputs.
+    struct InputAwareProvider;
+
+    impl Provider for InputAwareProvider {
+        fn name(&self) -> &str {
+            "input-aware"
+        }
+
+        fn read(
+            &self,
+            id: &ResourceId,
+            _identifier: Option<&str>,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            let id = id.clone();
+            // Intentionally fails if the data source path doesn't deliver
+            // the full Resource — the legacy `read(&id, None)` route has no
+            // access to input attributes.
+            Box::pin(async move {
+                Err(ProviderError::new("read(&id, None) cannot see inputs").for_resource(id))
+            })
+        }
+
+        fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+            // Echoes the resource's input attributes back into state so the
+            // test can assert they were delivered.
+            let id = resource.id.clone();
+            let attrs = resource.attributes.clone();
+            Box::pin(async move {
+                Ok(State::existing(
+                    id,
+                    crate::resource::Expr::resolve_map(&attrs),
+                ))
+            })
+        }
+
+        fn create(&self, _resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+            Box::pin(async { Err(ProviderError::new("not supported")) })
+        }
+
+        fn update(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _from: &State,
+            _to: &Resource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            Box::pin(async { Err(ProviderError::new("not supported")) })
+        }
+
+        fn delete(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _lifecycle: &LifecycleConfig,
+        ) -> BoxFuture<'_, ProviderResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn read_data_source_default_delegates_to_read_for_zero_input() {
+        // MockProvider doesn't override read_data_source — the default impl
+        // must fall back to read(&resource.id, None). For MockProvider this
+        // returns not_found. Preserves backward compatibility for existing
+        // zero-input data sources like sts.caller_identity.
+        let provider = MockProvider;
+        let resource = Resource::new("test", "example");
+        let state = provider.read_data_source(&resource).await.unwrap();
+        assert!(!state.exists);
+    }
+
+    #[tokio::test]
+    async fn read_data_source_default_ignores_internal_markers() {
+        // The parser writes `_type` and `_data_source` into attributes for
+        // every `read ...` expression. These are not user inputs and must
+        // not trigger the "missing override" error in the default impl.
+        let provider = MockProvider;
+        let mut resource = Resource::new("sts.caller_identity", "caller");
+        resource.set_attr(
+            "_type".to_string(),
+            Value::String("aws.sts.caller_identity".to_string()),
+        );
+        resource.set_attr("_data_source".to_string(), Value::Bool(true));
+        let state = provider.read_data_source(&resource).await.unwrap();
+        assert!(!state.exists);
+    }
+
+    #[tokio::test]
+    async fn read_data_source_default_errors_with_user_inputs() {
+        // A resource carrying real user inputs reached the default impl —
+        // that means the provider forgot to override read_data_source for
+        // this resource type. The default impl must return a clear error
+        // rather than silently discarding the inputs and calling read().
+        let provider = MockProvider;
+        let mut resource = Resource::new("identitystore.user", "mizzy");
+        resource.set_attr(
+            "_type".to_string(),
+            Value::String("aws.identitystore.user".to_string()),
+        );
+        resource.set_attr("_data_source".to_string(), Value::Bool(true));
+        resource.set_attr(
+            "user_name".to_string(),
+            Value::String("gosukenator@gmail.com".to_string()),
+        );
+        let err = provider.read_data_source(&resource).await.unwrap_err();
+        assert!(
+            err.message.contains("does not implement read_data_source"),
+            "err={err:?}"
+        );
+        assert!(
+            err.message.contains("mock"),
+            "err should include provider name: {err:?}"
+        );
+        assert!(
+            err.message.contains("identitystore.user"),
+            "err should include resource id: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_data_source_override_receives_full_resource() {
+        // InputAwareProvider's override echoes the resource attributes into
+        // state. If dispatch actually uses the override, the echoed input is
+        // visible; if it falls through to read() by mistake, the test fails
+        // because InputAwareProvider::read returns an error.
+        let provider = InputAwareProvider;
+        let mut resource = Resource::new("identitystore.user", "mizzy");
+        resource.set_attr(
+            "identity_store_id".to_string(),
+            Value::String("d-9567916d09".to_string()),
+        );
+        resource.set_attr(
+            "user_name".to_string(),
+            Value::String("gosukenator@gmail.com".to_string()),
+        );
+
+        let state = provider.read_data_source(&resource).await.unwrap();
+        assert!(state.exists);
+        assert_eq!(
+            state.attributes.get("identity_store_id"),
+            Some(&Value::String("d-9567916d09".to_string()))
+        );
+        assert_eq!(
+            state.attributes.get("user_name"),
+            Some(&Value::String("gosukenator@gmail.com".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn box_dyn_provider_forwards_read_data_source_override() {
+        // When the provider is held as Box<dyn Provider>, the override must
+        // still be called. Without explicit forwarding in the impl, Rust
+        // would use the trait's default impl and bypass the override.
+        let provider: Box<dyn Provider> = Box::new(InputAwareProvider);
+        let mut resource = Resource::new("identitystore.user", "mizzy");
+        resource.set_attr("user_name".to_string(), Value::String("x".to_string()));
+        let state = provider.read_data_source(&resource).await.unwrap();
+        assert!(state.exists);
+        assert_eq!(
+            state.attributes.get("user_name"),
+            Some(&Value::String("x".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_router_dispatches_read_data_source_to_override() {
+        // The router must route read_data_source to the underlying provider
+        // so that overrides work across provider boundaries.
+        let mut router = ProviderRouter::new();
+        router.add_provider("input-aware".to_string(), Box::new(InputAwareProvider));
+
+        let mut resource = Resource::with_provider("input-aware", "identitystore.user", "mizzy");
+        resource.set_attr("user_name".to_string(), Value::String("x".to_string()));
+        let state = router.read_data_source(&resource).await.unwrap();
+        assert!(state.exists);
+        assert_eq!(
+            state.attributes.get("user_name"),
+            Some(&Value::String("x".to_string()))
+        );
     }
 
     #[tokio::test]
