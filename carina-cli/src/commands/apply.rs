@@ -36,8 +36,8 @@ use crate::display::{format_effect, print_plan};
 use crate::error::AppError;
 use crate::wiring::{
     WiringContext, build_factories_from_providers, create_providers_from_configs,
-    get_provider_with_ctx, read_with_retry, reconcile_anonymous_identifiers_with_ctx,
-    reconcile_prefixed_names, resolve_names_with_ctx,
+    get_provider_with_ctx, read_data_source_with_retry, read_with_retry,
+    reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names, resolve_names_with_ctx,
 };
 
 /// Format a duration as a human-readable string like "3.2s" or "1m 5.3s".
@@ -1049,10 +1049,19 @@ async fn run_apply_locked(
                         .and_then(|sf| sf.get_identifier_for_resource(resource));
                     let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
                     async move {
-                        let mut state =
+                        // Data sources need the full Resource so providers
+                        // can see user-supplied inputs (e.g. `user_name`
+                        // for `aws.identitystore.user`). Regular resources
+                        // route through the identifier-based refresh.
+                        let mut state = if resource.is_data_source() {
+                            read_data_source_with_retry(provider_ref, resource)
+                                .await
+                                .map_err(AppError::Provider)?
+                        } else {
                             read_with_retry(provider_ref, &resource.id, identifier.as_deref())
                                 .await
-                                .map_err(AppError::Provider)?;
+                                .map_err(AppError::Provider)?
+                        };
                         if let Some(deps) = dep_bindings {
                             state.dependency_bindings = deps;
                         }
