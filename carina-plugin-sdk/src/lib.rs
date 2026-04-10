@@ -88,6 +88,45 @@ pub trait CarinaProvider {
     /// Read current state of a resource.
     fn read(&self, id: &ResourceId, identifier: Option<&str>) -> Result<State, ProviderError>;
 
+    /// Read a data source resource.
+    ///
+    /// Unlike [`CarinaProvider::read`], this receives the full [`Resource`]
+    /// so the plugin can see user-supplied input attributes (e.g. the
+    /// `user_name` for `aws.identitystore.user`). The default falls back
+    /// to `read(&resource.id, None)` for zero-input data sources such as
+    /// `aws.sts.caller_identity`. If the resource carries any non-`_`-
+    /// prefixed input attributes, the default returns an error instead of
+    /// silently dropping them — the plugin must override this method for
+    /// data sources whose reads require those inputs. This mirrors the
+    /// `carina_core::provider::Provider::read_data_source` default
+    /// behaviour so both native and WASM plugins have the same semantics.
+    fn read_data_source(&self, resource: &Resource) -> Result<State, ProviderError> {
+        // Mirrors `carina_core::provider::Provider::read_data_source`'s
+        // default: reject any resource carrying non-`_` user inputs to
+        // avoid silently dropping them. The error message can't include a
+        // provider name here because the `CarinaProvider` trait has no
+        // `name()` accessor (unlike `carina_core::provider::Provider`) —
+        // the plugin's info is carried separately via `info()`.
+        let user_input_count = resource
+            .attributes
+            .keys()
+            .filter(|k| !k.starts_with('_'))
+            .count();
+        if user_input_count > 0 {
+            return Err(ProviderError {
+                message: format!(
+                    "plugin provider does not implement read_data_source for '{}' \
+                     but the resource has {user_input_count} user-supplied input \
+                     attribute(s); refusing to drop them",
+                    resource.id.resource_type
+                ),
+                resource_id: Some(resource.id.clone()),
+                is_timeout: false,
+            });
+        }
+        self.read(&resource.id, None)
+    }
+
     /// Create a new resource.
     fn create(&self, resource: &Resource) -> Result<State, ProviderError>;
 

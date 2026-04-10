@@ -64,6 +64,21 @@ impl CarinaProvider for MockProcessProvider {
         }
     }
 
+    /// Exercise the `read_data_source` path end-to-end through the WASM
+    /// bridge: echo the user-supplied inputs back into state plus a
+    /// sentinel `__mock_read_data_source__` flag so integration tests can
+    /// verify the override actually ran (rather than the trait default).
+    fn read_data_source(&self, resource: &Resource) -> Result<State, ProviderError> {
+        let mut attributes = resource.attributes.clone();
+        attributes.insert("__mock_read_data_source__".to_string(), Value::Bool(true));
+        Ok(State {
+            id: resource.id.clone(),
+            identifier: Some("mock-id".into()),
+            attributes,
+            exists: true,
+        })
+    }
+
     fn create(&self, resource: &Resource) -> Result<State, ProviderError> {
         let mut states = self.states.lock().unwrap();
         let key = Self::resource_key(&resource.id);

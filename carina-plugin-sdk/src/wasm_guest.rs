@@ -276,6 +276,17 @@ macro_rules! export_provider {
                     }
                 }
 
+                fn read_data_source(
+                    res: wit_types::ResourceDef,
+                ) -> Result<wit_types::State, String> {
+                    let provider = get_provider().lock().unwrap();
+                    let proto_res = wit_to_proto_resource(&res);
+                    match $crate::CarinaProvider::read_data_source(&*provider, &proto_res) {
+                        Ok(state) => Ok(proto_to_wit_state(&state)),
+                        Err(e) => Err(serde_json::to_string(&e).unwrap_or_else(|_| e.message.clone())),
+                    }
+                }
+
                 fn create(
                     res: wit_types::ResourceDef,
                 ) -> Result<wit_types::State, String> {
@@ -598,6 +609,17 @@ macro_rules! export_provider {
                         &proto_id,
                         identifier.as_deref(),
                     ) {
+                        Ok(state) => Ok(proto_to_wit_state(&state)),
+                        Err(e) => Err(serde_json::to_string(&e).unwrap_or_else(|_| e.message.clone())),
+                    }
+                }
+
+                fn read_data_source(
+                    res: wit_types::ResourceDef,
+                ) -> Result<wit_types::State, String> {
+                    let provider = get_provider().lock().unwrap();
+                    let proto_res = wit_to_proto_resource(&res);
+                    match $crate::CarinaProvider::read_data_source(&*provider, &proto_res) {
                         Ok(state) => Ok(proto_to_wit_state(&state)),
                         Err(e) => Err(serde_json::to_string(&e).unwrap_or_else(|_| e.message.clone())),
                     }
