@@ -216,6 +216,7 @@ fn build_plan_and_states_from_fixture(
         &parsed.state_blocks,
         &state_file,
         &moved_pairs,
+        wiring.schemas(),
     );
 
     let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
