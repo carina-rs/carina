@@ -8,6 +8,7 @@
 //! This module is only compiled for `target_arch = "wasm32"`.
 
 use std::fmt;
+use std::time::Duration;
 
 use aws_smithy_runtime_api::client::http::{
     HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings, SharedHttpClient,
@@ -20,7 +21,9 @@ use aws_smithy_runtime_api::http::Response;
 use aws_smithy_types::body::SdkBody;
 
 use wasi::http::outgoing_handler;
-use wasi::http::types::{Fields, IncomingBody, Method, OutgoingBody, OutgoingRequest, Scheme};
+use wasi::http::types::{
+    Fields, IncomingBody, Method, OutgoingBody, OutgoingRequest, RequestOptions, Scheme,
+};
 use wasi::io::streams::StreamError;
 
 /// An HTTP client that uses wasi:http/outgoing-handler for making requests.
@@ -58,22 +61,66 @@ impl Default for WasiHttpClient {
 impl HttpClient for WasiHttpClient {
     fn http_connector(
         &self,
-        _settings: &HttpConnectorSettings,
+        settings: &HttpConnectorSettings,
         _components: &RuntimeComponents,
     ) -> SharedHttpConnector {
-        SharedHttpConnector::new(self.clone())
+        SharedHttpConnector::new(WasiHttpConnector {
+            connect_timeout: settings.connect_timeout(),
+            read_timeout: settings.read_timeout(),
+        })
     }
 }
 
-impl HttpConnector for WasiHttpClient {
-    fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
-        HttpConnectorFuture::ready(make_request(request))
+/// An HTTP connector that carries SDK-supplied timeouts into wasi:http requests.
+#[derive(Clone)]
+struct WasiHttpConnector {
+    connect_timeout: Option<Duration>,
+    read_timeout: Option<Duration>,
+}
+
+impl fmt::Debug for WasiHttpConnector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WasiHttpConnector")
+            .field("connect_timeout", &self.connect_timeout)
+            .field("read_timeout", &self.read_timeout)
+            .finish()
     }
+}
+
+impl HttpConnector for WasiHttpConnector {
+    fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+        let options = build_request_options(self.connect_timeout, self.read_timeout);
+        HttpConnectorFuture::ready(make_request(request, options))
+    }
+}
+
+/// Build wasi:http RequestOptions from SDK-supplied timeouts.
+///
+/// wasi:http Duration is nanoseconds (u64), so we convert from std::time::Duration.
+fn build_request_options(
+    connect_timeout: Option<Duration>,
+    read_timeout: Option<Duration>,
+) -> Option<RequestOptions> {
+    if connect_timeout.is_none() && read_timeout.is_none() {
+        return None;
+    }
+    let opts = RequestOptions::new();
+    if let Some(t) = connect_timeout {
+        let _ = opts.set_connect_timeout(Some(t.as_nanos() as u64));
+    }
+    if let Some(t) = read_timeout {
+        let _ = opts.set_first_byte_timeout(Some(t.as_nanos() as u64));
+        let _ = opts.set_between_bytes_timeout(Some(t.as_nanos() as u64));
+    }
+    Some(opts)
 }
 
 /// Convert an AWS SDK HttpRequest to a wasi:http outgoing request, execute it,
 /// and convert the response back.
-fn make_request(request: HttpRequest) -> Result<Response<SdkBody>, ConnectorError> {
+fn make_request(
+    request: HttpRequest,
+    options: Option<RequestOptions>,
+) -> Result<Response<SdkBody>, ConnectorError> {
     // Parse the URI
     let uri = request.uri().to_string();
     let parsed = uri
@@ -145,8 +192,8 @@ fn make_request(request: HttpRequest) -> Result<Response<SdkBody>, ConnectorErro
     OutgoingBody::finish(outgoing_body, None)
         .map_err(|e| ConnectorError::other(format!("Failed to finish body: {e:?}").into(), None))?;
 
-    // Send the request
-    let future_response = outgoing_handler::handle(outgoing_req, None).map_err(|e| {
+    // Send the request (with timeout options if provided)
+    let future_response = outgoing_handler::handle(outgoing_req, options).map_err(|e| {
         ConnectorError::other(format!("outgoing-handler error: {e:?}").into(), None)
     })?;
 
