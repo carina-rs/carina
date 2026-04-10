@@ -301,6 +301,17 @@ pub fn validate_enum_namespace(s: &str, type_name: &str, namespace: &str) -> Res
             if parts[ns_parts.len()] != type_name {
                 return Err(format!("expected format {}.{}.value", namespace, type_name));
             }
+            // Reject double-namespace: if the value portion repeats the
+            // namespace+type_name pattern (e.g., "awscc.Region.awscc.Region.x"),
+            // the type_name appears again in a position that would start a
+            // second namespace.
+            let value_parts = &parts[ns_parts.len() + 1..];
+            if value_parts.contains(&type_name) {
+                return Err(format!(
+                    "repeated namespace (contains '{}' twice)",
+                    type_name
+                ));
+            }
         }
         _ => {
             return Err(format!(
@@ -736,6 +747,23 @@ mod tests {
                 "awscc.ec2.vpn_gateway"
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_namespace_rejects_double_namespace() {
+        // "awscc.Region.awscc.Region.ap_northeast_1" has Region repeated
+        assert!(
+            validate_enum_namespace(
+                "awscc.Region.awscc.Region.ap_northeast_1",
+                "Region",
+                "awscc"
+            )
+            .is_err()
+        );
+        // Same pattern with aws provider
+        assert!(
+            validate_enum_namespace("aws.Region.aws.Region.us_west_2", "Region", "aws").is_err()
         );
     }
 
