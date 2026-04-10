@@ -3,7 +3,7 @@
 //! Functions for generating random suffixes, resolving attribute prefixes,
 //! reconciling prefixed names with state, and computing anonymous resource identifiers.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::parser::ProviderConfig;
 use crate::resource::{Resource, ResourceId, Value};
@@ -296,6 +296,49 @@ fn extract_hash_from_identifier(identifier: &str) -> Option<u64> {
     }
 }
 
+/// Build a SimHash over the combined set of provider identity values plus
+/// a resource's user-specified attributes (non-`_`-prefixed, flattened).
+///
+/// This is the shared feature set used by both `compute_anonymous_identifiers`
+/// (when the schema has no create-only attributes) and `compute_resource_simhash`
+/// so the two always agree on what a resource's anonymous ID would be.
+fn simhash_from_identity_and_resource(
+    identity_values: &BTreeMap<String, String>,
+    resource: &Resource,
+) -> u64 {
+    let mut simhash_values = identity_values.clone();
+    for (key, value) in &resource.attributes {
+        if key.starts_with('_') {
+            continue;
+        }
+        flatten_value_for_simhash(key, value, &mut simhash_values);
+    }
+    compute_simhash(&simhash_values)
+}
+
+/// Compute the SimHash `compute_anonymous_identifiers` would produce for a
+/// single resource. Used by `detect_anonymous_to_named_renames` to recover the
+/// anonymous ID of a resource that has since been wrapped in a `let` binding.
+fn compute_resource_simhash(
+    resource: &Resource,
+    providers: &[ProviderConfig],
+    identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
+) -> u64 {
+    let mut identity_values: BTreeMap<String, String> = BTreeMap::new();
+    if !resource.id.provider.is_empty() {
+        let identity_attrs = identity_attributes_fn(&resource.id.provider);
+        if let Some(pc) = providers.iter().find(|p| p.name == resource.id.provider) {
+            for attr_name in &identity_attrs {
+                if let Some(value) = pc.attributes.get(attr_name.as_str()) {
+                    identity_values.insert(attr_name.clone(), deterministic_value_string(value));
+                }
+            }
+        }
+    }
+
+    simhash_from_identity_and_resource(&identity_values, resource)
+}
+
 /// Compute stable identifiers for anonymous resources (those with empty ResourceId.name).
 /// Uses create-only properties and provider identity attributes to generate a deterministic hash.
 ///
@@ -365,22 +408,7 @@ pub fn compute_anonymous_identifiers(
         let hash_str = if use_simhash {
             // Use SimHash for locality-sensitive hashing: similar inputs produce
             // similar hashes, enabling Hamming distance reconciliation.
-            // Include identity attributes in the hash for provider distinction.
-            //
-            // Flatten Map/List values into individual features so that changing
-            // a single entry within a map (e.g., one tag) only flips a few bits
-            // in the SimHash, keeping the Hamming distance small.
-            let mut simhash_values: BTreeMap<String, String> = BTreeMap::new();
-            for (k, v) in &identity_values {
-                simhash_values.insert(k.clone(), v.clone());
-            }
-            for (key, value) in &resource.attributes {
-                if key.starts_with('_') {
-                    continue;
-                }
-                flatten_value_for_simhash(key, value, &mut simhash_values);
-            }
-            let simhash = compute_simhash(&simhash_values);
+            let simhash = simhash_from_identity_and_resource(&identity_values, resource);
             format!("{:016x}", simhash)
         } else {
             // Use standard hash for create-only properties
@@ -578,8 +606,14 @@ pub fn reconcile_anonymous_identifiers(
 /// Matching rules:
 /// 1. Only `let`-bound resources are candidates (those with `binding.is_some()`)
 /// 2. The resource's binding name must not already exist in state
-/// 3. There must be exactly one orphaned anonymous state entry whose create-only
-///    attribute values all match the new resource (ambiguous matches are skipped)
+/// 3. For resources whose schema has create-only attributes: there must be
+///    exactly one orphaned anonymous state entry whose create-only attribute
+///    values all match the new resource (ambiguous matches are skipped)
+/// 4. For resources with no create-only attributes (e.g., `awscc.sso.instance`):
+///    fall back to SimHash Hamming-distance matching, using the same SimHash
+///    that `compute_anonymous_identifiers` would have produced. This requires
+///    `providers` and `identity_attributes_fn` so identity values (e.g.,
+///    region) contribute to the hash just like they did at creation time.
 ///
 /// An "orphaned" state entry is one whose name is not used by any current DSL
 /// resource (so it would otherwise appear as a Delete in the plan).
@@ -588,6 +622,8 @@ pub fn detect_anonymous_to_named_renames(
     schemas: &HashMap<String, ResourceSchema>,
     schema_key_fn: &dyn Fn(&Resource) -> String,
     find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
+    providers: &[ProviderConfig],
+    identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
 ) -> Vec<(ResourceId, ResourceId)> {
     // Collect the set of resource names currently used in the DSL per
     // (provider, resource_type). Any state entry not in this set is an orphan.
@@ -616,22 +652,6 @@ pub fn detect_anonymous_to_named_renames(
             continue;
         };
 
-        let create_only_attrs = schema.create_only_attributes();
-        if create_only_attrs.is_empty() {
-            continue;
-        }
-
-        // Collect this resource's create-only values.
-        let mut resource_co_values: HashMap<&str, String> = HashMap::new();
-        for attr_name in &create_only_attrs {
-            if let Some(Value::String(v)) = resource.get_attr(attr_name) {
-                resource_co_values.insert(attr_name, v.clone());
-            }
-        }
-        if resource_co_values.is_empty() {
-            continue;
-        }
-
         let state_entries = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
 
         // Skip if the binding name already exists in state — nothing to rename.
@@ -647,36 +667,83 @@ pub fn detect_anonymous_to_named_renames(
             .cloned()
             .unwrap_or_default();
 
-        // Find orphaned state entries whose create-only values all match.
-        let mut matches: Vec<&str> = Vec::new();
-        for entry in &state_entries {
-            if used_in_dsl.contains(&entry.name) {
-                continue;
-            }
-            // Only consider state entries that look like anonymous hash names.
-            if extract_hash_from_identifier(&entry.name).is_none() {
-                continue;
-            }
-            let all_match = resource_co_values.iter().all(|(attr, value)| {
-                entry
-                    .create_only_values
-                    .get(*attr)
-                    .is_some_and(|v| v == value)
-            });
-            if all_match {
-                matches.push(&entry.name);
+        // Collect this resource's create-only values (may be empty if the
+        // schema has no create-only attributes or none are set).
+        let create_only_attrs = schema.create_only_attributes();
+        let mut resource_co_values: HashMap<&str, String> = HashMap::new();
+        for attr_name in &create_only_attrs {
+            if let Some(Value::String(v)) = resource.get_attr(attr_name) {
+                resource_co_values.insert(attr_name, v.clone());
             }
         }
 
-        // Only rename on a unique match to avoid rebinding the wrong state entry.
-        if matches.len() == 1 {
-            let from = ResourceId::with_provider(
-                &resource.id.provider,
-                &resource.id.resource_type,
-                matches[0],
-            );
-            let to = resource.id.clone();
-            renames.push((from, to));
+        let matched_name: Option<&str> = if !resource_co_values.is_empty() {
+            // Create-only path: find orphaned entries whose create-only values all match.
+            let mut matches: Vec<&str> = Vec::new();
+            for entry in &state_entries {
+                if used_in_dsl.contains(&entry.name) {
+                    continue;
+                }
+                if extract_hash_from_identifier(&entry.name).is_none() {
+                    continue;
+                }
+                let all_match = resource_co_values.iter().all(|(attr, value)| {
+                    entry
+                        .create_only_values
+                        .get(*attr)
+                        .is_some_and(|v| v == value)
+                });
+                if all_match {
+                    matches.push(&entry.name);
+                }
+            }
+            // Only rename on a unique match to avoid rebinding the wrong entry.
+            if matches.len() == 1 {
+                Some(matches[0])
+            } else {
+                None
+            }
+        } else {
+            // SimHash fallback (rule 4 in the function doc). Pick the orphan
+            // entry closest to the computed SimHash; tie → ambiguous, skip.
+            let resource_hash =
+                compute_resource_simhash(resource, providers, identity_attributes_fn);
+            let mut best: Option<(&str, u32)> = None;
+            let mut best_unique = true;
+            for entry in &state_entries {
+                if used_in_dsl.contains(&entry.name) {
+                    continue;
+                }
+                // Only consider state entries written via the SimHash path
+                // (16-hex suffix). 8-hex entries come from the create-only
+                // hash scheme and are meaningless to XOR with a 64-bit SimHash.
+                if entry.name.rsplit('_').next().map(str::len) != Some(16) {
+                    continue;
+                }
+                let Some(state_hash) = extract_hash_from_identifier(&entry.name) else {
+                    continue;
+                };
+                let distance = (resource_hash ^ state_hash).count_ones();
+                if distance >= SIMHASH_HAMMING_THRESHOLD {
+                    continue;
+                }
+                match best {
+                    None => best = Some((&entry.name, distance)),
+                    Some((_, d)) if distance < d => {
+                        best = Some((&entry.name, distance));
+                        best_unique = true;
+                    }
+                    Some((_, d)) if distance == d => best_unique = false,
+                    _ => {}
+                }
+            }
+            best.and_then(|(name, _)| if best_unique { Some(name) } else { None })
+        };
+
+        if let Some(name) = matched_name {
+            let from =
+                ResourceId::with_provider(&resource.id.provider, &resource.id.resource_type, name);
+            renames.push((from, resource.id.clone()));
         }
     }
 
@@ -2365,6 +2432,8 @@ mod tests {
             &schemas,
             &schema_key_fn,
             &|_provider, _rt| state_entries.clone(),
+            &[],
+            &|_provider| Vec::new(),
         );
 
         assert_eq!(renames.len(), 1);
@@ -2395,6 +2464,8 @@ mod tests {
             &schemas,
             &schema_key_fn,
             &|_provider, _rt| state_entries.clone(),
+            &[],
+            &|_provider| Vec::new(),
         );
         assert!(renames.is_empty());
     }
@@ -2422,6 +2493,8 @@ mod tests {
             &schemas,
             &schema_key_fn,
             &|_provider, _rt| state_entries.clone(),
+            &[],
+            &|_provider| Vec::new(),
         );
         assert!(renames.is_empty());
     }
@@ -2457,6 +2530,8 @@ mod tests {
             &schemas,
             &schema_key_fn,
             &|_provider, _rt| state_entries.clone(),
+            &[],
+            &|_provider| Vec::new(),
         );
         assert!(renames.is_empty());
     }
@@ -2485,7 +2560,295 @@ mod tests {
             &schemas,
             &schema_key_fn,
             &|_provider, _rt| state_entries.clone(),
+            &[],
+            &|_provider| Vec::new(),
         );
         assert!(renames.is_empty());
+    }
+
+    /// Schema with NO create-only attributes — like `awscc.sso.instance`.
+    fn make_sso_instance_schema_no_create_only() -> (String, ResourceSchema) {
+        let schema = ResourceSchema::new("awscc.sso.instance")
+            .attribute(AttributeSchema::new("name", AttributeType::String));
+        ("awscc.sso.instance".to_string(), schema)
+    }
+
+    #[test]
+    fn test_detect_rename_no_create_only_matches_by_simhash() {
+        // Regression test for carina#1670:
+        // Schema has no create-only attrs (e.g. awscc.sso.instance). The
+        // anonymous → let-bound rename must still be detected so `carina plan`
+        // shows a Move rather than Delete+Create, which would destroy the
+        // Identity Center instance and all of its users/groups.
+        let (key, schema) = make_sso_instance_schema_no_create_only();
+        let schemas: HashMap<String, ResourceSchema> = vec![(key, schema)].into_iter().collect();
+        let providers: Vec<ProviderConfig> = Vec::new();
+        let identity_fn = |_: &str| -> Vec<String> { Vec::new() };
+
+        // Step 1: generate the anonymous ID the previous `apply` would have
+        // written to state, using the same inputs and the same code path.
+        let mut anon = Resource::with_provider("awscc", "sso.instance", "");
+        anon.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
+        let mut anon_vec = vec![anon];
+        compute_anonymous_identifiers(
+            &mut anon_vec,
+            &providers,
+            &schemas,
+            &schema_key_fn,
+            &identity_fn,
+        )
+        .unwrap();
+        let anonymous_name = anon_vec[0].id.name.clone();
+        assert!(
+            anonymous_name.starts_with("sso_instance_"),
+            "expected hash-derived name, got {anonymous_name}"
+        );
+
+        // Step 2: user wraps the same resource in a `let` binding.
+        let mut let_bound = Resource::with_provider("awscc", "sso.instance", "sso");
+        let_bound.binding = Some("sso".to_string());
+        let_bound.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
+        let resources = vec![let_bound];
+
+        // Step 3: state still has the orphan anonymous entry.
+        let state_entries = vec![AnonymousIdStateInfo {
+            name: anonymous_name.clone(),
+            create_only_values: HashMap::new(),
+        }];
+
+        // Step 4: detect_anonymous_to_named_renames should match via SimHash.
+        let renames = detect_anonymous_to_named_renames(
+            &resources,
+            &schemas,
+            &schema_key_fn,
+            &|_provider, _rt| state_entries.clone(),
+            &providers,
+            &identity_fn,
+        );
+
+        assert_eq!(renames.len(), 1, "expected one rename, got {:?}", renames);
+        assert_eq!(renames[0].0.name, anonymous_name);
+        assert_eq!(renames[0].1.name, "sso");
+    }
+
+    #[test]
+    fn test_detect_rename_no_create_only_skips_when_attributes_differ_too_much() {
+        // If the let-bound resource's attributes drift beyond the SimHash
+        // Hamming threshold from any orphan, no rename is emitted and the
+        // user falls back to delete+create (or a `moved` block if they want
+        // to preserve state).
+        let (key, schema) = make_sso_instance_schema_no_create_only();
+        let schemas: HashMap<String, ResourceSchema> = vec![(key, schema)].into_iter().collect();
+        let providers: Vec<ProviderConfig> = Vec::new();
+        let identity_fn = |_: &str| -> Vec<String> { Vec::new() };
+
+        // Anonymous snapshot with many attributes.
+        let mut anon = Resource::with_provider("awscc", "sso.instance", "");
+        anon.set_attr("name".to_string(), Value::String("old-name".to_string()));
+        let mut tags = std::collections::HashMap::new();
+        tags.insert("k1".to_string(), Value::String("v1".to_string()));
+        tags.insert("k2".to_string(), Value::String("v2".to_string()));
+        anon.set_attr("tags".to_string(), Value::Map(tags));
+        let mut anon_vec = vec![anon];
+        compute_anonymous_identifiers(
+            &mut anon_vec,
+            &providers,
+            &schemas,
+            &schema_key_fn,
+            &identity_fn,
+        )
+        .unwrap();
+        let anonymous_name = anon_vec[0].id.name.clone();
+
+        // Let-bound resource with wildly different attributes.
+        let mut let_bound = Resource::with_provider("awscc", "sso.instance", "sso");
+        let_bound.binding = Some("sso".to_string());
+        let_bound.set_attr(
+            "name".to_string(),
+            Value::String("completely-different".to_string()),
+        );
+        let mut different_tags = std::collections::HashMap::new();
+        different_tags.insert("other1".to_string(), Value::String("foo".to_string()));
+        different_tags.insert("other2".to_string(), Value::String("bar".to_string()));
+        different_tags.insert("other3".to_string(), Value::String("baz".to_string()));
+        let_bound.set_attr("tags".to_string(), Value::Map(different_tags));
+        let resources = vec![let_bound];
+
+        let state_entries = vec![AnonymousIdStateInfo {
+            name: anonymous_name,
+            create_only_values: HashMap::new(),
+        }];
+
+        let renames = detect_anonymous_to_named_renames(
+            &resources,
+            &schemas,
+            &schema_key_fn,
+            &|_provider, _rt| state_entries.clone(),
+            &providers,
+            &identity_fn,
+        );
+        assert!(
+            renames.is_empty(),
+            "attributes differ too much, should not rename: {:?}",
+            renames
+        );
+    }
+
+    #[test]
+    fn test_detect_rename_no_create_only_picks_closest_among_multiple_candidates() {
+        // Two orphans: one is an exact SimHash match, the other is off by a
+        // few bits but still within the Hamming threshold. The exact match
+        // must win — this exercises the `distance < d` branch of the picker.
+        let (key, schema) = make_sso_instance_schema_no_create_only();
+        let schemas: HashMap<String, ResourceSchema> = vec![(key, schema)].into_iter().collect();
+        let providers: Vec<ProviderConfig> = Vec::new();
+        let identity_fn = |_: &str| -> Vec<String> { Vec::new() };
+
+        // Compute the exact-match name.
+        let mut anon = Resource::with_provider("awscc", "sso.instance", "");
+        anon.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
+        let mut anon_vec = vec![anon];
+        compute_anonymous_identifiers(
+            &mut anon_vec,
+            &providers,
+            &schemas,
+            &schema_key_fn,
+            &identity_fn,
+        )
+        .unwrap();
+        let exact_name = anon_vec[0].id.name.clone();
+
+        // Construct a "close but not equal" orphan by flipping the last hex
+        // char of the SimHash — guarantees a small nonzero Hamming distance
+        // well under the threshold.
+        let mut chars: Vec<char> = exact_name.chars().collect();
+        let last = chars.last_mut().unwrap();
+        *last = if *last == '0' { 'f' } else { '0' };
+        let nearby_name: String = chars.into_iter().collect();
+        assert_ne!(exact_name, nearby_name);
+
+        // Place the nearby entry first so the picker must prefer the later
+        // exact match via the `distance < d` branch.
+        let state_entries = vec![
+            AnonymousIdStateInfo {
+                name: nearby_name.clone(),
+                create_only_values: HashMap::new(),
+            },
+            AnonymousIdStateInfo {
+                name: exact_name.clone(),
+                create_only_values: HashMap::new(),
+            },
+        ];
+
+        let mut let_bound = Resource::with_provider("awscc", "sso.instance", "sso");
+        let_bound.binding = Some("sso".to_string());
+        let_bound.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
+        let resources = vec![let_bound];
+
+        let renames = detect_anonymous_to_named_renames(
+            &resources,
+            &schemas,
+            &schema_key_fn,
+            &|_provider, _rt| state_entries.clone(),
+            &providers,
+            &identity_fn,
+        );
+
+        assert_eq!(renames.len(), 1);
+        assert_eq!(
+            renames[0].0.name, exact_name,
+            "should prefer the exact SimHash match over the nearby one"
+        );
+    }
+
+    #[test]
+    fn test_detect_rename_no_create_only_skips_8_char_hash_entries() {
+        // An 8-hex state entry (from the create-only hash path) must not
+        // match against a 16-hex SimHash — the hashes use different schemes
+        // and comparing them by Hamming distance is meaningless.
+        let (key, schema) = make_sso_instance_schema_no_create_only();
+        let schemas: HashMap<String, ResourceSchema> = vec![(key, schema)].into_iter().collect();
+        let providers: Vec<ProviderConfig> = Vec::new();
+        let identity_fn = |_: &str| -> Vec<String> { Vec::new() };
+
+        let mut let_bound = Resource::with_provider("awscc", "sso.instance", "sso");
+        let_bound.binding = Some("sso".to_string());
+        let_bound.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
+        let resources = vec![let_bound];
+
+        // 8-hex suffix (standard hash scheme), not a SimHash.
+        let state_entries = vec![AnonymousIdStateInfo {
+            name: "sso_instance_a3f2b1c8".to_string(),
+            create_only_values: HashMap::new(),
+        }];
+
+        let renames = detect_anonymous_to_named_renames(
+            &resources,
+            &schemas,
+            &schema_key_fn,
+            &|_provider, _rt| state_entries.clone(),
+            &providers,
+            &identity_fn,
+        );
+        assert!(
+            renames.is_empty(),
+            "8-hex entries must not match the SimHash branch: {:?}",
+            renames
+        );
+    }
+
+    #[test]
+    fn test_detect_rename_no_create_only_skips_when_two_orphans_tie_on_distance() {
+        // Two orphans both within the Hamming threshold with identical distance
+        // to the let-bound resource — ambiguous, must skip.
+        let (key, schema) = make_sso_instance_schema_no_create_only();
+        let schemas: HashMap<String, ResourceSchema> = vec![(key, schema)].into_iter().collect();
+        let providers: Vec<ProviderConfig> = Vec::new();
+        let identity_fn = |_: &str| -> Vec<String> { Vec::new() };
+
+        // Compute the target SimHash.
+        let mut anon = Resource::with_provider("awscc", "sso.instance", "");
+        anon.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
+        let mut anon_vec = vec![anon];
+        compute_anonymous_identifiers(
+            &mut anon_vec,
+            &providers,
+            &schemas,
+            &schema_key_fn,
+            &identity_fn,
+        )
+        .unwrap();
+        let anonymous_name = anon_vec[0].id.name.clone();
+
+        // Two state entries with the exact same name hash → same distance (0).
+        let state_entries = vec![
+            AnonymousIdStateInfo {
+                name: anonymous_name.clone(),
+                create_only_values: HashMap::new(),
+            },
+            AnonymousIdStateInfo {
+                name: anonymous_name,
+                create_only_values: HashMap::new(),
+            },
+        ];
+
+        let mut let_bound = Resource::with_provider("awscc", "sso.instance", "sso");
+        let_bound.binding = Some("sso".to_string());
+        let_bound.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
+        let resources = vec![let_bound];
+
+        let renames = detect_anonymous_to_named_renames(
+            &resources,
+            &schemas,
+            &schema_key_fn,
+            &|_provider, _rt| state_entries.clone(),
+            &providers,
+            &identity_fn,
+        );
+        assert!(
+            renames.is_empty(),
+            "two orphans tie on distance, should skip to avoid rebinding wrong entry: {:?}",
+            renames
+        );
     }
 }
