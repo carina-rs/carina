@@ -53,6 +53,16 @@ impl BackendLock {
         }
     }
 
+    /// Build a lock snapshot representing the implicit local backend that
+    /// is used when no `backend` block is configured. Allows
+    /// `check_backend_lock` to detect local → remote transitions.
+    pub fn local_default() -> Self {
+        Self {
+            backend_type: "local".to_string(),
+            attributes: BTreeMap::new(),
+        }
+    }
+
     /// Path to the lock file under `base_dir`.
     pub fn lock_path(base_dir: &Path) -> PathBuf {
         base_dir.join(LOCK_DIR).join(LOCK_FILE)
@@ -193,5 +203,18 @@ mod tests {
         let a = BackendLock::from_config(&make_config("b", "us-east-1"));
         let b = BackendLock::from_config(&make_config("b", "us-east-1"));
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn local_default_differs_from_remote() {
+        let local = BackendLock::local_default();
+        assert_eq!(local.backend_type, "local");
+        assert!(local.attributes.is_empty());
+        let s3 = BackendLock::from_config(&make_config("b", "us-east-1"));
+        assert_ne!(local, s3);
+        let diff = local.describe_diff(&s3);
+        assert!(diff.contains("backend type"));
+        assert!(diff.contains("local"));
+        assert!(diff.contains("s3"));
     }
 }
