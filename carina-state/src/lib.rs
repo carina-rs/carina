@@ -44,12 +44,14 @@
 //! ```
 
 pub mod backend;
+pub mod backend_lock;
 pub mod backends;
 pub mod lock;
 pub mod state;
 
 // Re-export main types for convenience
 pub use backend::{BackendConfig, BackendError, BackendResult, StateBackend};
+pub use backend_lock::BackendLock;
 pub use backends::{LocalBackend, create_backend, create_local_backend, resolve_backend};
 pub use lock::LockInfo;
 pub use state::{ResourceState, StateFile, check_and_migrate, check_and_migrate_bytes};

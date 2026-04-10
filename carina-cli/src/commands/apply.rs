@@ -753,6 +753,7 @@ pub async fn run_apply(
     path: &PathBuf,
     auto_approve: bool,
     lock: bool,
+    reconfigure: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
     let loaded = load_configuration_with_config(path, provider_context)?;
@@ -763,6 +764,9 @@ pub async fn run_apply(
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
     let ctx = WiringContext::new(factories);
     validate_and_resolve_with_config(&mut parsed, base_dir, false, provider_context)?;
+
+    // Detect backend reconfiguration before touching any state
+    crate::commands::check_backend_lock(base_dir, parsed.backend.as_ref(), reconfigure)?;
 
     // Check for backend configuration - use local backend by default
     let backend_config = parsed.backend.as_ref();

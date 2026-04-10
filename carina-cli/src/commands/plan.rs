@@ -96,6 +96,7 @@ fn build_plan_file(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_plan(
     path: &PathBuf,
     out: Option<&PathBuf>,
@@ -103,12 +104,16 @@ pub async fn run_plan(
     tui: bool,
     refresh: bool,
     json: bool,
+    reconfigure: bool,
     provider_context: &ProviderContext,
 ) -> Result<bool, AppError> {
     let mut parsed = load_configuration_with_config(path, provider_context)?.parsed;
 
     let base_dir = get_base_dir(path);
     validate_and_resolve_with_config(&mut parsed, base_dir, false, provider_context)?;
+
+    // Detect backend reconfiguration before touching any state
+    crate::commands::check_backend_lock(base_dir, parsed.backend.as_ref(), reconfigure)?;
 
     // Check for backend configuration and load state
     // Use local backend by default if no backend is configured
