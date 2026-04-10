@@ -14,7 +14,9 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use carina_core::module_resolver;
-use carina_core::parser::{ParsedFile, ProviderContext};
+use carina_core::parser::{BackendConfig, ParsedFile, ProviderContext};
+use carina_state::BackendLock;
+use carina_state::backend::BackendConfig as StateBackendConfig;
 
 use crate::error::AppError;
 use crate::wiring::{
@@ -22,6 +24,55 @@ use crate::wiring::{
     resolve_names_with_ctx, validate_module_calls, validate_provider_region_with_ctx,
     validate_resource_ref_types_with_ctx, validate_resources_with_ctx,
 };
+
+/// Detect whether the `backend` block in the current configuration has
+/// changed since the last run, by comparing against `.carina/backend-lock.json`
+/// under `base_dir`.
+///
+/// - If no lock exists yet, the current config is written as the new lock.
+/// - If the lock matches, nothing happens.
+/// - If the lock differs and `reconfigure` is `false`, returns an error
+///   explaining the change and asking the user to re-run with `--reconfigure`.
+/// - If `reconfigure` is `true`, overwrites the lock with the new config.
+///
+/// When `backend_config` is `None` (local default backend), no check is
+/// performed — local state lives alongside the `.crn` files and is not
+/// subject to silent redirection.
+pub fn check_backend_lock(
+    base_dir: &Path,
+    backend_config: Option<&BackendConfig>,
+    reconfigure: bool,
+) -> Result<(), AppError> {
+    let Some(config) = backend_config else {
+        return Ok(());
+    };
+    let state_config = StateBackendConfig::from(config);
+    let current = BackendLock::from_config(&state_config);
+    let existing = BackendLock::load(base_dir).map_err(AppError::Backend)?;
+
+    match existing {
+        Some(existing) if existing != current => {
+            if reconfigure {
+                current.save(base_dir).map_err(AppError::Backend)?;
+                Ok(())
+            } else {
+                Err(AppError::Config(format!(
+                    "Backend configuration has changed since the last run:\n\n{}\n\n\
+                     Changing backend settings can silently redirect Carina at a \
+                     different state file, which may cause state loss or drift. \
+                     If this change is intentional, re-run with --reconfigure to \
+                     accept the new configuration.",
+                    existing.describe_diff(&current)
+                )))
+            }
+        }
+        Some(_) => Ok(()),
+        None => {
+            current.save(base_dir).map_err(AppError::Backend)?;
+            Ok(())
+        }
+    }
+}
 
 /// Run the common validation and module resolution pipeline.
 ///
@@ -114,7 +165,73 @@ pub fn validate_and_resolve_with_config(
 mod tests {
     use super::*;
     use carina_core::parser::ProviderConfig;
+    use carina_core::resource::Value;
     use std::collections::{HashMap, HashSet};
+
+    fn s3_backend_config(bucket: &str, region: &str) -> BackendConfig {
+        let mut attributes = HashMap::new();
+        attributes.insert("bucket".to_string(), Value::String(bucket.to_string()));
+        attributes.insert("region".to_string(), Value::String(region.to_string()));
+        BackendConfig {
+            backend_type: "s3".to_string(),
+            attributes,
+        }
+    }
+
+    #[test]
+    fn check_backend_lock_creates_lock_on_first_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = s3_backend_config("my-bucket", "us-east-1");
+        let result = check_backend_lock(tmp.path(), Some(&config), false);
+        assert!(result.is_ok());
+        assert!(tmp.path().join(".carina/backend-lock.json").exists());
+    }
+
+    #[test]
+    fn check_backend_lock_passes_when_config_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = s3_backend_config("my-bucket", "us-east-1");
+        check_backend_lock(tmp.path(), Some(&config), false).unwrap();
+        let result = check_backend_lock(tmp.path(), Some(&config), false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_backend_lock_blocks_on_bucket_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = s3_backend_config("old-bucket", "us-east-1");
+        let new = s3_backend_config("new-bucket", "us-east-1");
+        check_backend_lock(tmp.path(), Some(&old), false).unwrap();
+        let err = check_backend_lock(tmp.path(), Some(&new), false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Backend configuration has changed"));
+        assert!(msg.contains("bucket"));
+        assert!(msg.contains("old-bucket"));
+        assert!(msg.contains("new-bucket"));
+        assert!(msg.contains("--reconfigure"));
+    }
+
+    #[test]
+    fn check_backend_lock_accepts_change_with_reconfigure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = s3_backend_config("old-bucket", "us-east-1");
+        let new = s3_backend_config("new-bucket", "us-east-1");
+        check_backend_lock(tmp.path(), Some(&old), false).unwrap();
+        let result = check_backend_lock(tmp.path(), Some(&new), true);
+        assert!(result.is_ok());
+        // Subsequent check with new config should now pass without reconfigure
+        let result2 = check_backend_lock(tmp.path(), Some(&new), false);
+        assert!(result2.is_ok());
+    }
+
+    #[test]
+    fn check_backend_lock_skips_when_no_backend_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = check_backend_lock(tmp.path(), None, false);
+        assert!(result.is_ok());
+        // No lock file should be created for local-only setups
+        assert!(!tmp.path().join(".carina/backend-lock.json").exists());
+    }
 
     fn empty_parsed_file() -> ParsedFile {
         ParsedFile {
