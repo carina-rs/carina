@@ -226,6 +226,18 @@ pub fn reconcile_prefixed_names(resources: &mut [Resource], state_file: &Option<
     });
 }
 
+/// Look up a provider's identity attributes through its factory.
+fn identity_attributes_for_provider(ctx: &WiringContext, name: &str) -> Vec<String> {
+    provider_mod::find_factory(ctx.factories(), name)
+        .map(|f| {
+            f.identity_attributes()
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Detect and apply anonymous → let-bound resource renames.
 ///
 /// Mirrors `materialize_moved_states` but for synthetic rename pairs produced
@@ -235,6 +247,7 @@ pub fn reconcile_prefixed_names(resources: &mut [Resource], state_file: &Option<
 pub fn apply_anonymous_to_named_renames(
     ctx: &WiringContext,
     resources: &[Resource],
+    providers: &[ProviderConfig],
     current_states: &mut HashMap<ResourceId, State>,
     prev_desired_keys: &mut HashMap<ResourceId, Vec<String>>,
     saved_attrs: &mut HashMap<ResourceId, HashMap<String, Value>>,
@@ -274,6 +287,8 @@ pub fn apply_anonymous_to_named_renames(
                 })
                 .collect()
         },
+        providers,
+        &|name| identity_attributes_for_provider(ctx, name),
     );
 
     for (from, to) in &renames {
@@ -342,16 +357,7 @@ pub fn compute_anonymous_identifiers_with_ctx(
         providers,
         ctx.schemas(),
         &|r| provider_mod::schema_key_for_resource(ctx.factories(), r),
-        &|name| {
-            provider_mod::find_factory(ctx.factories(), name)
-                .map(|f| {
-                    f.identity_attributes()
-                        .into_iter()
-                        .map(|s| s.to_string())
-                        .collect()
-                })
-                .unwrap_or_default()
-        },
+        &|name| identity_attributes_for_provider(ctx, name),
     )
     .map_err(AppError::Config)
 }
@@ -885,6 +891,7 @@ pub async fn create_plan_from_parsed_with_remote(
     moved_pairs.extend(apply_anonymous_to_named_renames(
         &ctx,
         &resources,
+        &parsed.providers,
         &mut current_states,
         &mut prev_desired_keys,
         &mut saved_attrs,
