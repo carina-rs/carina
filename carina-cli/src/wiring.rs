@@ -226,6 +226,72 @@ pub fn reconcile_prefixed_names(resources: &mut [Resource], state_file: &Option<
     });
 }
 
+/// Detect and apply anonymous → let-bound resource renames.
+///
+/// Mirrors `materialize_moved_states` but for synthetic rename pairs produced
+/// by `identifier::detect_anonymous_to_named_renames`. Transfers state,
+/// `prev_desired_keys`, and `saved_attrs` from the old anonymous name to the
+/// new binding name so the differ sees the resource under its new identity.
+pub fn apply_anonymous_to_named_renames(
+    ctx: &WiringContext,
+    resources: &[Resource],
+    current_states: &mut HashMap<ResourceId, State>,
+    prev_desired_keys: &mut HashMap<ResourceId, Vec<String>>,
+    saved_attrs: &mut HashMap<ResourceId, HashMap<String, Value>>,
+    state_file: &Option<StateFile>,
+) -> Vec<(ResourceId, ResourceId)> {
+    let Some(sf) = state_file.as_ref() else {
+        return Vec::new();
+    };
+
+    let renames = identifier::detect_anonymous_to_named_renames(
+        resources,
+        ctx.schemas(),
+        &|r| provider_mod::schema_key_for_resource(ctx.factories(), r),
+        &|provider, resource_type| {
+            let schema_key = format!("{}.{}", provider, resource_type);
+            let create_only_attrs = ctx
+                .schemas()
+                .get(&schema_key)
+                .map(|s| s.create_only_attributes())
+                .unwrap_or_default();
+            sf.resources_by_type(provider, resource_type)
+                .into_iter()
+                .map(|sr| {
+                    let create_only_values = create_only_attrs
+                        .iter()
+                        .filter_map(|attr| {
+                            sr.attributes
+                                .get(*attr)
+                                .and_then(|v| v.as_str())
+                                .map(|s| (attr.to_string(), s.to_string()))
+                        })
+                        .collect();
+                    AnonymousIdStateInfo {
+                        name: sr.name.clone(),
+                        create_only_values,
+                    }
+                })
+                .collect()
+        },
+    );
+
+    for (from, to) in &renames {
+        if let Some(mut state) = current_states.remove(from) {
+            state.id = to.clone();
+            current_states.insert(to.clone(), state);
+        }
+        if let Some(keys) = prev_desired_keys.remove(from) {
+            prev_desired_keys.insert(to.clone(), keys);
+        }
+        if let Some(attrs) = saved_attrs.remove(from) {
+            saved_attrs.insert(to.clone(), attrs);
+        }
+    }
+
+    renames
+}
+
 pub fn reconcile_anonymous_identifiers_with_ctx(
     ctx: &WiringContext,
     resources: &mut [Resource],
@@ -803,13 +869,27 @@ pub async fn create_plan_from_parsed_with_remote(
     // Pre-process moved blocks: transfer state, prev_desired_keys, and
     // saved_attrs from old name to new name so the differ sees attribute
     // changes (including removals) and produces Update/Replace effects.
-    let moved_pairs = materialize_moved_states(
+    let mut moved_pairs = materialize_moved_states(
         &mut current_states,
         &mut prev_desired_keys,
         &mut saved_attrs,
         &parsed.state_blocks,
         state_file,
     );
+
+    // Detect let-bound resources that were previously anonymous with matching
+    // create-only attributes, and transfer their state the same way a user-
+    // written `moved` block would. This turns a dangerous delete+create plan
+    // into an in-place rename for resources whose destruction has side effects
+    // (e.g., awscc.sso.instance).
+    moved_pairs.extend(apply_anonymous_to_named_renames(
+        &ctx,
+        &resources,
+        &mut current_states,
+        &mut prev_desired_keys,
+        &mut saved_attrs,
+        state_file,
+    ));
 
     // Build lifecycles map from state file for orphaned resource deletion
     let lifecycles = state_file

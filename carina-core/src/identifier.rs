@@ -3,7 +3,7 @@
 //! Functions for generating random suffixes, resolving attribute prefixes,
 //! reconciling prefixed names with state, and computing anonymous resource identifiers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::parser::ProviderConfig;
 use crate::resource::{Resource, ResourceId, Value};
@@ -561,6 +561,126 @@ pub fn reconcile_anonymous_identifiers(
             );
         }
     }
+}
+
+/// Detect let-bound (named) resources that were previously anonymous.
+///
+/// When a user converts an anonymous resource to a `let`-bound resource while
+/// preserving the same create-only attributes, the old state entry (with a
+/// hash-derived name) doesn't match the new binding name. Without this
+/// detection the differ treats the change as delete + create, which for
+/// destructive resources (e.g., `awscc.sso.instance`) can wipe out live data.
+///
+/// Returns a list of `(old_anonymous_name, new_binding_name)` pairs for each
+/// matched rename. Callers should transfer state entries from the old name to
+/// the new name before running the differ (similar to `materialize_moved_states`).
+///
+/// Matching rules:
+/// 1. Only `let`-bound resources are candidates (those with `binding.is_some()`)
+/// 2. The resource's binding name must not already exist in state
+/// 3. There must be exactly one orphaned anonymous state entry whose create-only
+///    attribute values all match the new resource (ambiguous matches are skipped)
+///
+/// An "orphaned" state entry is one whose name is not used by any current DSL
+/// resource (so it would otherwise appear as a Delete in the plan).
+pub fn detect_anonymous_to_named_renames(
+    resources: &[Resource],
+    schemas: &HashMap<String, ResourceSchema>,
+    schema_key_fn: &dyn Fn(&Resource) -> String,
+    find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
+) -> Vec<(ResourceId, ResourceId)> {
+    // Collect the set of resource names currently used in the DSL per
+    // (provider, resource_type). Any state entry not in this set is an orphan.
+    let mut used_names: HashMap<(String, String), HashSet<String>> = HashMap::new();
+    for resource in resources {
+        let key = (
+            resource.id.provider.clone(),
+            resource.id.resource_type.clone(),
+        );
+        used_names
+            .entry(key)
+            .or_default()
+            .insert(resource.id.name.clone());
+    }
+
+    let mut renames: Vec<(ResourceId, ResourceId)> = Vec::new();
+
+    for resource in resources {
+        // Only rename let-bound resources whose binding was previously anonymous.
+        if resource.binding.is_none() {
+            continue;
+        }
+
+        let schema_key = schema_key_fn(resource);
+        let Some(schema) = schemas.get(&schema_key) else {
+            continue;
+        };
+
+        let create_only_attrs = schema.create_only_attributes();
+        if create_only_attrs.is_empty() {
+            continue;
+        }
+
+        // Collect this resource's create-only values.
+        let mut resource_co_values: HashMap<&str, String> = HashMap::new();
+        for attr_name in &create_only_attrs {
+            if let Some(Value::String(v)) = resource.get_attr(attr_name) {
+                resource_co_values.insert(attr_name, v.clone());
+            }
+        }
+        if resource_co_values.is_empty() {
+            continue;
+        }
+
+        let state_entries = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
+
+        // Skip if the binding name already exists in state — nothing to rename.
+        if state_entries.iter().any(|e| e.name == resource.id.name) {
+            continue;
+        }
+
+        let used_in_dsl = used_names
+            .get(&(
+                resource.id.provider.clone(),
+                resource.id.resource_type.clone(),
+            ))
+            .cloned()
+            .unwrap_or_default();
+
+        // Find orphaned state entries whose create-only values all match.
+        let mut matches: Vec<&str> = Vec::new();
+        for entry in &state_entries {
+            if used_in_dsl.contains(&entry.name) {
+                continue;
+            }
+            // Only consider state entries that look like anonymous hash names.
+            if extract_hash_from_identifier(&entry.name).is_none() {
+                continue;
+            }
+            let all_match = resource_co_values.iter().all(|(attr, value)| {
+                entry
+                    .create_only_values
+                    .get(*attr)
+                    .is_some_and(|v| v == value)
+            });
+            if all_match {
+                matches.push(&entry.name);
+            }
+        }
+
+        // Only rename on a unique match to avoid rebinding the wrong state entry.
+        if matches.len() == 1 {
+            let from = ResourceId::with_provider(
+                &resource.id.provider,
+                &resource.id.resource_type,
+                matches[0],
+            );
+            let to = resource.id.clone();
+            renames.push((from, to));
+        }
+    }
+
+    renames
 }
 
 #[cfg(test)]
@@ -2211,5 +2331,161 @@ mod tests {
             resources[1].id.name, "ingress_https",
             "ingress_https should not be renamed to ingress_http"
         );
+    }
+
+    fn make_sso_instance_schema() -> (String, ResourceSchema) {
+        let schema = ResourceSchema::new("awscc.sso.instance")
+            .attribute(AttributeSchema::new("name", AttributeType::String).create_only());
+        ("awscc.sso.instance".to_string(), schema)
+    }
+
+    #[test]
+    fn test_detect_rename_unique_match_by_create_only_attrs() {
+        // Scenario: state has an anonymous sso.instance with name="carina-rs".
+        // DSL now defines it as a let-bound resource with the same name.
+        // detect_anonymous_to_named_renames should emit a rename from the
+        // anonymous hash name to the binding name.
+        let (key, schema) = make_sso_instance_schema();
+        let schemas: HashMap<String, ResourceSchema> = vec![(key, schema)].into_iter().collect();
+
+        let mut resource = Resource::with_provider("awscc", "sso.instance", "sso");
+        resource.binding = Some("sso".to_string());
+        resource.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
+        let resources = vec![resource];
+
+        let state_entries = vec![AnonymousIdStateInfo {
+            name: "sso_instance_0ac0620303071530".to_string(),
+            create_only_values: vec![("name".to_string(), "carina-rs".to_string())]
+                .into_iter()
+                .collect(),
+        }];
+
+        let renames = detect_anonymous_to_named_renames(
+            &resources,
+            &schemas,
+            &schema_key_fn,
+            &|_provider, _rt| state_entries.clone(),
+        );
+
+        assert_eq!(renames.len(), 1);
+        assert_eq!(renames[0].0.name, "sso_instance_0ac0620303071530");
+        assert_eq!(renames[0].1.name, "sso");
+    }
+
+    #[test]
+    fn test_detect_rename_skips_when_binding_already_in_state() {
+        // If state already has an entry for the binding name, nothing to rename.
+        let (key, schema) = make_sso_instance_schema();
+        let schemas: HashMap<String, ResourceSchema> = vec![(key, schema)].into_iter().collect();
+
+        let mut resource = Resource::with_provider("awscc", "sso.instance", "sso");
+        resource.binding = Some("sso".to_string());
+        resource.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
+        let resources = vec![resource];
+
+        let state_entries = vec![AnonymousIdStateInfo {
+            name: "sso".to_string(),
+            create_only_values: vec![("name".to_string(), "carina-rs".to_string())]
+                .into_iter()
+                .collect(),
+        }];
+
+        let renames = detect_anonymous_to_named_renames(
+            &resources,
+            &schemas,
+            &schema_key_fn,
+            &|_provider, _rt| state_entries.clone(),
+        );
+        assert!(renames.is_empty());
+    }
+
+    #[test]
+    fn test_detect_rename_ignores_anonymous_resources() {
+        // Anonymous resources (binding=None) are not candidates for this rename.
+        let (key, schema) = make_sso_instance_schema();
+        let schemas: HashMap<String, ResourceSchema> = vec![(key, schema)].into_iter().collect();
+
+        let mut resource = Resource::with_provider("awscc", "sso.instance", "sso_instance_new");
+        // No binding set
+        resource.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
+        let resources = vec![resource];
+
+        let state_entries = vec![AnonymousIdStateInfo {
+            name: "sso_instance_0ac0620303071530".to_string(),
+            create_only_values: vec![("name".to_string(), "carina-rs".to_string())]
+                .into_iter()
+                .collect(),
+        }];
+
+        let renames = detect_anonymous_to_named_renames(
+            &resources,
+            &schemas,
+            &schema_key_fn,
+            &|_provider, _rt| state_entries.clone(),
+        );
+        assert!(renames.is_empty());
+    }
+
+    #[test]
+    fn test_detect_rename_skips_ambiguous_matches() {
+        // Two orphan state entries match — skip to avoid rebinding the wrong one.
+        let (key, schema) = make_sso_instance_schema();
+        let schemas: HashMap<String, ResourceSchema> = vec![(key, schema)].into_iter().collect();
+
+        let mut resource = Resource::with_provider("awscc", "sso.instance", "sso");
+        resource.binding = Some("sso".to_string());
+        resource.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
+        let resources = vec![resource];
+
+        let state_entries = vec![
+            AnonymousIdStateInfo {
+                name: "sso_instance_aaaabbbbccccdddd".to_string(),
+                create_only_values: vec![("name".to_string(), "carina-rs".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+            AnonymousIdStateInfo {
+                name: "sso_instance_1111222233334444".to_string(),
+                create_only_values: vec![("name".to_string(), "carina-rs".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+        ];
+
+        let renames = detect_anonymous_to_named_renames(
+            &resources,
+            &schemas,
+            &schema_key_fn,
+            &|_provider, _rt| state_entries.clone(),
+        );
+        assert!(renames.is_empty());
+    }
+
+    #[test]
+    fn test_detect_rename_ignores_non_hash_state_names() {
+        // A state entry with a non-hash name (e.g., another let binding) is not
+        // treated as an anonymous candidate and must not be silently renamed.
+        let (key, schema) = make_sso_instance_schema();
+        let schemas: HashMap<String, ResourceSchema> = vec![(key, schema)].into_iter().collect();
+
+        let mut resource = Resource::with_provider("awscc", "sso.instance", "sso");
+        resource.binding = Some("sso".to_string());
+        resource.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
+        let resources = vec![resource];
+
+        let state_entries = vec![AnonymousIdStateInfo {
+            name: "my_custom_binding".to_string(),
+            create_only_values: vec![("name".to_string(), "carina-rs".to_string())]
+                .into_iter()
+                .collect(),
+        }];
+
+        let renames = detect_anonymous_to_named_renames(
+            &resources,
+            &schemas,
+            &schema_key_fn,
+            &|_provider, _rt| state_entries.clone(),
+        );
+        assert!(renames.is_empty());
     }
 }
