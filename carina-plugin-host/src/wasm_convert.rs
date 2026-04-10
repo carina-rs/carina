@@ -245,7 +245,7 @@ fn proto_schema_to_core(s: &proto::ResourceSchema) -> CoreResourceSchema {
             .map(|(name, a)| (name.clone(), proto_attr_schema_to_core(a)))
             .collect(),
         description: s.description.clone(),
-        validator: None,
+        validator: build_validator_from_types(&s.validators),
         data_source: s.data_source,
         name_attribute: s.name_attribute.clone(),
         force_replace: s.force_replace,
@@ -258,6 +258,43 @@ fn proto_schema_to_core(s: &proto::ResourceSchema) -> CoreResourceSchema {
             }
         }),
     }
+}
+
+/// Reconstruct a validator function from serializable `ValidatorType` declarations.
+fn build_validator_from_types(
+    types: &[proto::ValidatorType],
+) -> Option<carina_core::schema::ResourceValidator> {
+    if types.is_empty() {
+        return None;
+    }
+    // Currently only TagsKeyValueCheck exists. When more variants are added,
+    // compose validators by collecting checks and running all of them.
+    if types.contains(&proto::ValidatorType::TagsKeyValueCheck) {
+        Some(validate_tags_key_value)
+    } else {
+        None
+    }
+}
+
+fn validate_tags_key_value(
+    attrs: &HashMap<String, CoreValue>,
+) -> Result<(), Vec<carina_core::schema::TypeError>> {
+    if let Some(CoreValue::Map(map)) = attrs.get("tags") {
+        let (mut has_key, mut has_value) = (false, false);
+        for k in map.keys() {
+            if k.eq_ignore_ascii_case("key") {
+                has_key = true;
+            } else if k.eq_ignore_ascii_case("value") {
+                has_value = true;
+            }
+            if has_key && has_value {
+                return Err(vec![carina_core::schema::TypeError::ResourceValidationFailed {
+                    message: "tags map contains both 'key' and 'value' as keys, which looks like a Key/Value pair list. Use flat map syntax instead: tags = { Name = '...' }".to_string(),
+                }]);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn proto_attr_schema_to_core(a: &proto::AttributeSchema) -> CoreAttributeSchema {
@@ -771,5 +808,80 @@ mod tests {
         let wit = core_to_wit_value(&policies);
         let back = wit_to_core_value(&wit);
         assert_eq!(policies, back);
+    }
+
+    #[test]
+    fn test_proto_schema_with_tags_validator_reconstructed() {
+        let proto_schema = proto::ResourceSchema {
+            resource_type: "awscc.s3.bucket".to_string(),
+            attributes: HashMap::new(),
+            description: None,
+            data_source: false,
+            name_attribute: None,
+            force_replace: false,
+            operation_config: None,
+            validators: vec![proto::ValidatorType::TagsKeyValueCheck],
+        };
+        let core_schema = proto_schema_to_core(&proto_schema);
+        assert!(core_schema.validator.is_some());
+    }
+
+    #[test]
+    fn test_proto_schema_without_validators_has_no_validator() {
+        let proto_schema = proto::ResourceSchema {
+            resource_type: "awscc.s3.bucket".to_string(),
+            attributes: HashMap::new(),
+            description: None,
+            data_source: false,
+            name_attribute: None,
+            force_replace: false,
+            operation_config: None,
+            validators: vec![],
+        };
+        let core_schema = proto_schema_to_core(&proto_schema);
+        assert!(core_schema.validator.is_none());
+    }
+
+    #[test]
+    fn test_tags_validator_detects_key_value_pattern() {
+        let proto_schema = proto::ResourceSchema {
+            resource_type: "awscc.s3.bucket".to_string(),
+            attributes: HashMap::new(),
+            description: None,
+            data_source: false,
+            name_attribute: None,
+            force_replace: false,
+            operation_config: None,
+            validators: vec![proto::ValidatorType::TagsKeyValueCheck],
+        };
+        let core_schema = proto_schema_to_core(&proto_schema);
+        let validator = core_schema.validator.unwrap();
+
+        // key/value pattern should fail
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "tags".to_string(),
+            CoreValue::Map(
+                [
+                    ("key".to_string(), CoreValue::String("Project".into())),
+                    ("value".to_string(), CoreValue::String("carina".into())),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        );
+        assert!(validator(&attrs).is_err());
+
+        // normal tags should pass
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "tags".to_string(),
+            CoreValue::Map(
+                [("Project".to_string(), CoreValue::String("carina".into()))]
+                    .into_iter()
+                    .collect(),
+            ),
+        );
+        assert!(validator(&attrs).is_ok());
     }
 }

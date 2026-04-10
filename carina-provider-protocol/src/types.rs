@@ -151,6 +151,18 @@ pub struct ProviderError {
     pub is_timeout: bool,
 }
 
+/// Serializable validator types that can cross the WASM boundary.
+///
+/// Function-pointer validators (`ResourceSchema.validator`) are lost during
+/// WASM serialization. This enum allows providers to declare validators as
+/// data, which the host reconstructs into actual validator functions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidatorType {
+    /// Check that a `tags` map does not use Key/Value pair list structure.
+    TagsKeyValueCheck,
+}
+
 /// Schema types for resource validation and completion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceSchema {
@@ -166,6 +178,8 @@ pub struct ResourceSchema {
     pub force_replace: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_config: Option<OperationConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validators: Vec<ValidatorType>,
 }
 
 /// Per-resource operational configuration for timeouts and retries.
