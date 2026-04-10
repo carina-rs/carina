@@ -234,6 +234,17 @@ pub fn json_to_schemas(json: &str) -> Vec<CoreResourceSchema> {
     proto_schemas.iter().map(proto_schema_to_core).collect()
 }
 
+/// Deserialize a JSON-encoded `HashMap<String, AttributeType>` from a WASM
+/// guest and convert it to core `AttributeType` values.
+pub fn json_to_attribute_types(json: &str) -> HashMap<String, CoreAttributeType> {
+    let proto_types: HashMap<String, proto::AttributeType> =
+        serde_json::from_str(json).unwrap_or_default();
+    proto_types
+        .into_iter()
+        .map(|(k, v)| (k, proto_attr_type_to_core(&v)))
+        .collect()
+}
+
 // -- Protocol schema to core schema conversion --
 
 fn proto_schema_to_core(s: &proto::ResourceSchema) -> CoreResourceSchema {
@@ -321,10 +332,14 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
         proto::AttributeType::Int => CoreAttributeType::Int,
         proto::AttributeType::Float => CoreAttributeType::Float,
         proto::AttributeType::Bool => CoreAttributeType::Bool,
-        proto::AttributeType::StringEnum { values, name } => CoreAttributeType::StringEnum {
+        proto::AttributeType::StringEnum {
+            values,
+            name,
+            namespace,
+        } => CoreAttributeType::StringEnum {
             name: name.clone(),
             values: values.clone(),
-            namespace: None,
+            namespace: namespace.clone(),
             to_dsl: None,
         },
         proto::AttributeType::List { inner, ordered } => CoreAttributeType::List {

@@ -66,7 +66,16 @@ pub trait CarinaProvider {
     /// Return all resource schemas this provider supports.
     fn schemas(&self) -> Vec<ResourceSchema>;
 
-    /// Validate provider configuration attributes.
+    /// Return the types of the provider block's configuration attributes
+    /// (e.g., `region`). The host uses these to validate attributes
+    /// against their declared types *before* calling [`validate_config`].
+    /// This keeps format validation on the host side so fixes in
+    /// `carina-core` take effect without rebuilding provider binaries.
+    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType>;
+
+    /// Validate provider-specific configuration semantics not expressible
+    /// in the attribute type schema. Host-side type validation has
+    /// already run by the time this is called.
     fn validate_config(&self, attrs: &HashMap<String, Value>) -> Result<(), String>;
 
     /// Initialize the provider with configuration.

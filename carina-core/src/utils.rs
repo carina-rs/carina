@@ -239,11 +239,15 @@ pub fn is_dsl_enum_format(s: &str) -> bool {
 /// Handles the following formats:
 /// - No dots: passes through (not a namespaced identifier)
 /// - `TypeName.value` (2-part): validates that the first part matches `type_name`
-/// - Full namespaced form (N-part): validates namespace segments and type_name
+/// - Full namespaced form: exactly `namespace_parts + 2` parts, matching
+///   `<namespace>.<TypeName>.<value>` with no extra segments
 ///
 /// The expected full form length is determined by the namespace:
 /// - `"aws"` (1 segment) → 3 parts: `aws.Region.value`
 /// - `"aws.s3"` (2 segments) → 4 parts: `aws.s3.VersioningStatus.value`
+///
+/// Callers that need to accept enum values containing dots (e.g., `"ipsec.1"`)
+/// must handle that case themselves before calling this function.
 ///
 /// # Arguments
 /// * `s` - The input string to validate
@@ -289,10 +293,9 @@ pub fn validate_enum_namespace(s: &str, type_name: &str, namespace: &str) -> Res
                 ));
             }
         }
-        // Full namespaced form: namespace.TypeName.value
-        // The value part may itself contain dots (e.g., "ipsec.1"), so accept
-        // any part count >= expected_full_len as long as the namespace and type_name match.
-        n if n >= expected_full_len => {
+        // Full namespaced form: namespace.TypeName.value — strictly
+        // `ns_parts.len() + 2` parts. Any extra parts are malformed.
+        n if n == expected_full_len => {
             for (i, &expected) in ns_parts.iter().enumerate() {
                 if parts[i] != expected {
                     return Err(format!("expected format {}.{}.value", namespace, type_name));
@@ -300,17 +303,6 @@ pub fn validate_enum_namespace(s: &str, type_name: &str, namespace: &str) -> Res
             }
             if parts[ns_parts.len()] != type_name {
                 return Err(format!("expected format {}.{}.value", namespace, type_name));
-            }
-            // Reject double-namespace: if the value portion repeats the
-            // namespace+type_name pattern (e.g., "awscc.Region.awscc.Region.x"),
-            // the type_name appears again in a position that would start a
-            // second namespace.
-            let value_parts = &parts[ns_parts.len() + 1..];
-            if value_parts.contains(&type_name) {
-                return Err(format!(
-                    "repeated namespace (contains '{}' twice)",
-                    type_name
-                ));
             }
         }
         _ => {
@@ -735,24 +727,20 @@ mod tests {
         );
     }
 
-    // validate_enum_namespace with dotted values
-
     #[test]
-    fn test_validate_namespace_6_part_dotted_value() {
-        // Value contains a dot: "ipsec.1" → 6 parts total
+    fn test_validate_namespace_strict_rejects_extra_parts() {
+        // validate_enum_namespace is strict: it rejects any part count other
+        // than the exact expected_full_len. Callers handling dotted values
+        // (like "ipsec.1") must do so separately before calling this.
         assert!(
             validate_enum_namespace(
                 "awscc.ec2.vpn_gateway.Type.ipsec.1",
                 "Type",
                 "awscc.ec2.vpn_gateway"
             )
-            .is_ok()
+            .is_err()
         );
-    }
-
-    #[test]
-    fn test_validate_namespace_rejects_double_namespace() {
-        // "awscc.Region.awscc.Region.ap_northeast_1" has Region repeated
+        // Double-namespace patterns are also rejected.
         assert!(
             validate_enum_namespace(
                 "awscc.Region.awscc.Region.ap_northeast_1",
@@ -761,7 +749,6 @@ mod tests {
             )
             .is_err()
         );
-        // Same pattern with aws provider
         assert!(
             validate_enum_namespace("aws.Region.aws.Region.us_west_2", "Region", "aws").is_err()
         );

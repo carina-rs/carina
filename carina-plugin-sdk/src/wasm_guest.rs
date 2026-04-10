@@ -236,6 +236,14 @@ macro_rules! export_provider {
                     serde_json::to_string(&schemas).unwrap_or_else(|_| "[]".to_string())
                 }
 
+                fn provider_config_attribute_types() -> String {
+                    let provider = get_provider().lock().unwrap();
+                    let types = $crate::CarinaProvider::provider_config_attribute_types(
+                        &*provider,
+                    );
+                    serde_json::to_string(&types).unwrap_or_else(|_| "{}".to_string())
+                }
+
                 fn validate_config(
                     attrs: Vec<(String, wit_types::Value)>,
                 ) -> Result<(), String> {
@@ -553,6 +561,14 @@ macro_rules! export_provider {
                     let provider = get_provider().lock().unwrap();
                     let schemas = $crate::CarinaProvider::schemas(&*provider);
                     serde_json::to_string(&schemas).unwrap_or_else(|_| "[]".to_string())
+                }
+
+                fn provider_config_attribute_types() -> String {
+                    let provider = get_provider().lock().unwrap();
+                    let types = $crate::CarinaProvider::provider_config_attribute_types(
+                        &*provider,
+                    );
+                    serde_json::to_string(&types).unwrap_or_else(|_| "{}".to_string())
                 }
 
                 fn validate_config(

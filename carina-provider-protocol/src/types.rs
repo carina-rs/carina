@@ -233,6 +233,11 @@ pub enum AttributeType {
         values: Vec<String>,
         #[serde(default)]
         name: String,
+        /// DSL namespace prefix for enum validation (e.g., `"awscc"`).
+        /// When present, values may be written as
+        /// `{namespace}.{name}.{value}` in the DSL.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
     },
     #[serde(rename = "list")]
     List {

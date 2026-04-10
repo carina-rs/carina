@@ -7,6 +7,13 @@ interface provider {
     /// Returns JSON-serialized Vec<ResourceSchema>
     schemas: func() -> string;
 
+    /// Returns JSON-serialized HashMap<String, AttributeType> describing
+    /// the provider block's configuration attributes (e.g., `region`).
+    /// The host validates provider config against this schema before
+    /// calling `validate-config`, so DSL format bugs in carina-core are
+    /// fixed on the host without rebuilding providers.
+    provider-config-attribute-types: func() -> string;
+
     validate-config: func(attrs: list<tuple<string, value>>) -> result<_, string>;
     initialize: func(attrs: list<tuple<string, value>>) -> result<_, string>;
 

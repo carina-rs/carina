@@ -381,8 +381,20 @@ pub trait ProviderFactory: Send + Sync {
     /// Display name for user-facing messages (e.g., "AWS provider", "AWS Cloud Control provider")
     fn display_name(&self) -> &str;
 
-    /// Validate provider configuration (e.g., region).
-    /// Called before provider instantiation.
+    /// Return the types of the provider block's configuration attributes
+    /// (e.g., `region`).
+    ///
+    /// These are used by the host to validate provider config attributes
+    /// against their declared types *before* calling `validate_config`.
+    /// Keeping format validation (namespace structure, enum membership) on
+    /// the host side means fixes to generic validation logic in
+    /// `carina-core` take effect without rebuilding provider binaries.
+    fn provider_config_attribute_types(&self) -> HashMap<String, crate::schema::AttributeType>;
+
+    /// Validate provider-specific configuration semantics that cannot be
+    /// expressed in the attribute type schema (e.g., cross-attribute
+    /// consistency checks). Type-level validation is handled by the host
+    /// using [`provider_config_attribute_types`] before this is called.
     fn validate_config(&self, attributes: &HashMap<String, Value>) -> Result<(), String>;
 
     /// Extract region from config in SDK format (e.g., "ap-northeast-1").
@@ -719,6 +731,10 @@ mod tests {
 
         fn display_name(&self) -> &str {
             "Mock provider"
+        }
+
+        fn provider_config_attribute_types(&self) -> HashMap<String, crate::schema::AttributeType> {
+            HashMap::new()
         }
 
         fn validate_config(&self, _attributes: &HashMap<String, Value>) -> Result<(), String> {

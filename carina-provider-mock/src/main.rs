@@ -35,6 +35,10 @@ impl CarinaProvider for MockProcessProvider {
         vec![]
     }
 
+    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+        HashMap::new()
+    }
+
     fn validate_config(&self, _attrs: &HashMap<String, Value>) -> Result<(), String> {
         Ok(())
     }

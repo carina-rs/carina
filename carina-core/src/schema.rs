@@ -246,20 +246,31 @@ impl AttributeType {
                     // dots (e.g., "ipsec.1") that would be misinterpreted as
                     // namespace separators.
                     let direct_match = values.iter().any(|v| string_enum_value_matches(s, v));
-                    if !direct_match && let Some(ns) = namespace.as_deref() {
-                        validate_enum_namespace(s, name, ns).map_err(|message| {
-                            TypeError::ValidationFailed {
-                                message: format!("Invalid {} '{}': {}", name, s, message),
-                            }
-                        })?;
-                    }
-
+                    let valid: Vec<&str> = values.iter().map(String::as_str).collect();
                     let variant = if direct_match {
                         s.as_str()
                     } else {
-                        let valid: Vec<&str> = values.iter().map(String::as_str).collect();
                         extract_enum_value_with_values(s, &valid)
                     };
+
+                    // Non-direct matches must have the exact form
+                    // `{namespace}.{name}.{variant}`. This rejects malformed
+                    // inputs like double-namespaced values while still allowing
+                    // enum values that themselves contain dots (e.g., "ipsec.1").
+                    if !direct_match && let Some(ns) = namespace.as_deref() {
+                        let expected_prefix = format!("{}.{}.", ns, name);
+                        let prefix_matches = s.starts_with(&expected_prefix)
+                            && &s[expected_prefix.len()..] == variant;
+                        if !prefix_matches {
+                            // Fall back to strict namespace validation, which
+                            // produces a clear error for the common bare form.
+                            validate_enum_namespace(s, name, ns).map_err(|message| {
+                                TypeError::ValidationFailed {
+                                    message: format!("Invalid {} '{}': {}", name, s, message),
+                                }
+                            })?;
+                        }
+                    }
                     let matches_canonical =
                         values.iter().any(|v| string_enum_value_matches(variant, v));
                     let matches_alias = to_dsl.is_some_and(|f| {
@@ -1569,8 +1580,36 @@ mod tests {
         };
         // Quoted string with dot should match directly
         assert!(t.validate(&Value::String("ipsec.1".to_string())).is_ok());
+        // Fully qualified form should also be accepted
+        assert!(
+            t.validate(&Value::String(
+                "awscc.ec2.vpn_gateway.Type.ipsec.1".to_string()
+            ))
+            .is_ok()
+        );
         // Invalid value should still be rejected
         assert!(t.validate(&Value::String("ipsec.2".to_string())).is_err());
+    }
+
+    #[test]
+    fn validate_string_enum_rejects_double_namespace() {
+        let t = AttributeType::StringEnum {
+            name: "InstanceTenancy".to_string(),
+            values: vec![
+                "default".to_string(),
+                "dedicated".to_string(),
+                "host".to_string(),
+            ],
+            namespace: Some("awscc.ec2.vpc".to_string()),
+            to_dsl: None,
+        };
+        // Double-namespace must be rejected
+        assert!(
+            t.validate(&Value::String(
+                "awscc.ec2.vpc.InstanceTenancy.awscc.ec2.vpc.InstanceTenancy.default".to_string()
+            ))
+            .is_err()
+        );
     }
 
     #[test]
