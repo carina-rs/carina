@@ -162,6 +162,16 @@ pub enum StateCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Migrate state from the local backend to the configured remote backend
+    Migrate {
+        /// Path to directory containing .crn files
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Skip confirmation prompt before deleting the old local state file
+        #[arg(long)]
+        auto_approve: bool,
+    },
 }
 
 /// Run state subcommands
@@ -184,6 +194,9 @@ pub async fn run_state_command(
         }
         StateCommands::Show { path, tui, json } => {
             run_state_show(&path, tui, json, provider_context).await
+        }
+        StateCommands::Migrate { path, auto_approve } => {
+            run_state_migrate(&path, auto_approve, provider_context).await
         }
     }
 }
@@ -868,6 +881,167 @@ fn diff_display_update_resource(
         state.remove_resource(&id.provider, &id.resource_type, &id.name);
     }
 
+    Ok(())
+}
+
+/// Migrate state from the local backend to the configured remote backend.
+///
+/// Intended for the bootstrap use case where a user starts with local state,
+/// provisions the state bucket, and then adds a `backend s3 { ... }` block to
+/// move state to S3. The command:
+///
+/// 1. Verifies a `backend` block is configured in the .crn files
+/// 2. Reads the local `carina.state.json` (or errors if missing)
+/// 3. Writes it to the configured remote backend
+/// 4. Reads it back to verify the write
+/// 5. Prompts to delete the local file (unless `--auto-approve`)
+/// 6. Updates `.carina/backend-lock.json` with the new remote config
+async fn run_state_migrate(
+    path: &PathBuf,
+    auto_approve: bool,
+    provider_context: &ProviderContext,
+) -> Result<(), AppError> {
+    let mut parsed = load_configuration_with_config(path, provider_context)?.parsed;
+    let base_dir = get_base_dir(path);
+    validate_and_resolve_with_config(&mut parsed, base_dir, true, provider_context)?;
+
+    // A backend block is required to know where to migrate to.
+    let backend_config = parsed.backend.as_ref().ok_or_else(|| {
+        AppError::Config(
+            "No `backend` block configured. Add a backend block to your .crn files \
+             before running `carina state migrate`."
+                .to_string(),
+        )
+    })?;
+
+    // Only local → remote is supported in this command.
+    if backend_config.backend_type == "local" {
+        return Err(AppError::Config(
+            "The configured backend is already `local`; nothing to migrate.".to_string(),
+        ));
+    }
+
+    // Local state source path — defaults to `carina.state.json` next to the .crn files.
+    let local_state_path = base_dir.join(carina_state::LocalBackend::DEFAULT_STATE_FILE);
+    if !local_state_path.exists() {
+        return Err(AppError::Config(format!(
+            "No local state file found at {}. There is nothing to migrate.",
+            local_state_path.display()
+        )));
+    }
+
+    println!(
+        "{} {}",
+        "Migrating state from local to".cyan().bold(),
+        backend_config.backend_type
+    );
+    println!("  source: {}", local_state_path.display());
+
+    // Build the source (local) and destination (remote) backends.
+    let local_backend = carina_state::LocalBackend::with_path(local_state_path.clone());
+    let state = local_backend
+        .read_state()
+        .await
+        .map_err(AppError::Backend)?
+        .ok_or_else(|| {
+            AppError::Config(format!(
+                "Local state file at {} is empty or unreadable.",
+                local_state_path.display()
+            ))
+        })?;
+
+    let remote_state_config = StateBackendConfig::from(backend_config);
+    let remote_backend = create_backend(&remote_state_config)
+        .await
+        .map_err(AppError::Backend)?;
+
+    // Refuse to overwrite an existing remote state that has different resources.
+    if let Some(existing) = remote_backend
+        .read_state()
+        .await
+        .map_err(AppError::Backend)?
+        && (existing.lineage != state.lineage || !existing.resources.is_empty())
+    {
+        return Err(AppError::Config(format!(
+            "Remote backend already contains state (lineage {}, {} resources). \
+             Refusing to overwrite. Migrate manually if this is expected.",
+            existing.lineage,
+            existing.resources.len()
+        )));
+    }
+
+    println!("  destination: {} backend", backend_config.backend_type);
+    println!("  resources: {}", state.resources.len());
+
+    // Write state to the remote backend.
+    remote_backend
+        .write_state(&state)
+        .await
+        .map_err(AppError::Backend)?;
+
+    // Verify the write by reading it back.
+    let roundtrip = remote_backend
+        .read_state()
+        .await
+        .map_err(AppError::Backend)?
+        .ok_or_else(|| {
+            AppError::Config(
+                "Failed to read state back from the remote backend after writing.".to_string(),
+            )
+        })?;
+    if roundtrip.lineage != state.lineage || roundtrip.resources.len() != state.resources.len() {
+        return Err(AppError::Config(
+            "State verification failed: the roundtrip read from the remote backend did not \
+             match what was written."
+                .to_string(),
+        ));
+    }
+    println!("  {} remote state verified", "✓".green());
+
+    // Confirm deletion of the local state file unless --auto-approve was passed.
+    if !auto_approve {
+        print!(
+            "\nDelete the local state file at {}? [y/N]: ",
+            local_state_path.display()
+        );
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| AppError::Config(format!("Failed to read input: {e}")))?;
+        let confirmed = matches!(input.trim().to_lowercase().as_str(), "y" | "yes");
+        if !confirmed {
+            println!(
+                "{}",
+                "Aborted. The remote state was written but the local file was left in place."
+                    .yellow()
+            );
+            return Ok(());
+        }
+    }
+
+    std::fs::remove_file(&local_state_path).map_err(|e| {
+        AppError::Config(format!(
+            "Failed to delete {}: {}",
+            local_state_path.display(),
+            e
+        ))
+    })?;
+    println!("  {} deleted local state file", "✓".green());
+
+    // Update the backend lock so subsequent plan/apply runs don't report a
+    // "backend changed" error.
+    let new_lock = carina_state::BackendLock::from_config(&remote_state_config);
+    new_lock.save(base_dir).map_err(AppError::Backend)?;
+    println!("  {} updated backend lock", "✓".green());
+
+    println!(
+        "\n{}",
+        "Migration complete. State is now managed by the remote backend."
+            .green()
+            .bold()
+    );
     Ok(())
 }
 
