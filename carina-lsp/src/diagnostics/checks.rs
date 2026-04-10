@@ -50,7 +50,14 @@ impl DiagnosticEngine {
         diagnostics
     }
 
-    /// Check provider region attribute using factory validate_config
+    /// Check provider block attributes.
+    ///
+    /// Runs host-side type-level validation using
+    /// `ProviderFactory::provider_config_attribute_types`, then delegates to
+    /// `validate_config` for any provider-specific semantic checks. Mirrors
+    /// the CLI flow in `carina_core::validation::validate_provider_config`
+    /// so fixes to generic DSL format validation take effect in LSP without
+    /// rebuilding providers.
     pub(super) fn check_provider_region(
         &self,
         doc: &Document,
@@ -59,9 +66,32 @@ impl DiagnosticEngine {
         let mut diagnostics = Vec::new();
 
         for provider in &parsed.providers {
-            // Find the matching factory for this provider
-            if let Some(factory) = self.factories.iter().find(|f| f.name() == provider.name)
-                && let Err(e) = factory.validate_config(&provider.attributes)
+            let Some(factory) = self.factories.iter().find(|f| f.name() == provider.name) else {
+                continue;
+            };
+
+            // Host-side type-level validation (catches malformed namespace
+            // identifiers, invalid enum values, etc.).
+            let attr_types = factory.provider_config_attribute_types();
+            for (attr_name, value) in &provider.attributes {
+                if let Some(attr_type) = attr_types.get(attr_name)
+                    && let Err(e) = attr_type.validate(value)
+                    && let Some((line, col)) =
+                        self.find_provider_attr_position(doc, &provider.name, attr_name)
+                {
+                    diagnostics.push(carina_diagnostic(
+                        line,
+                        col,
+                        col + attr_name.chars().count() as u32,
+                        DiagnosticSeverity::WARNING,
+                        format!("provider {}: {}: {}", provider.name, attr_name, e),
+                    ));
+                }
+            }
+
+            // Provider-specific validation (semantic checks not expressible
+            // in the attribute type schema).
+            if let Err(e) = factory.validate_config(&provider.attributes)
                 && let Some((line, col)) = self.find_provider_region_position(doc, &provider.name)
             {
                 diagnostics.push(carina_diagnostic(
@@ -118,6 +148,16 @@ impl DiagnosticEngine {
         doc: &Document,
         provider_name: &str,
     ) -> Option<(u32, u32)> {
+        self.find_provider_attr_position(doc, provider_name, "region")
+    }
+
+    /// Find the position of a named attribute in a provider block.
+    pub(super) fn find_provider_attr_position(
+        &self,
+        doc: &Document,
+        provider_name: &str,
+        attr_name: &str,
+    ) -> Option<(u32, u32)> {
         let text = doc.text();
         let mut in_provider = false;
         let provider_pattern = format!("provider {}", provider_name);
@@ -129,7 +169,7 @@ impl DiagnosticEngine {
             }
 
             if in_provider {
-                if trimmed.starts_with("region") {
+                if trimmed.starts_with(attr_name) {
                     return Some((line_idx as u32, position::leading_whitespace_chars(line)));
                 }
 
