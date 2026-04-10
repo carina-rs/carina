@@ -49,11 +49,16 @@ const METADATA_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 
 /// Timeout for individual WASM plugin operations (in seconds).
 ///
-/// If a WASM call (read, create, update, delete) does not complete within this
-/// duration, wasmtime's epoch interruption mechanism traps the execution.
-/// This prevents indefinite hangs when, for example, the AWS SDK blocks
-/// during credential resolution inside the WASM guest.
+/// Used for two layers of timeout enforcement:
+/// 1. Epoch interruption: traps WASM computation that exceeds this budget.
+/// 2. HTTP request cap: limits host-side HTTP calls that epochs cannot reach
+///    (epochs only fire during WASM execution, not during host I/O waits).
 const WASM_OPERATION_TIMEOUT_SECS: u64 = 30;
+
+/// [`WASM_OPERATION_TIMEOUT_SECS`] as a `Duration`, used to cap per-request
+/// HTTP timeouts in the [`AllowListHttpHooks`] layer.
+const HTTP_API_REQUEST_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(WASM_OPERATION_TIMEOUT_SECS);
 
 /// Build the standard wasmtime Config used for all WASM plugin engines.
 ///
@@ -182,19 +187,15 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
                 wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::HttpRequestDenied.into(),
             );
         }
-        // Cap timeouts for metadata endpoints so non-EC2/ECS environments fail fast.
-        // On EC2, IMDS responds in <10ms; 1s is generous.
-        if is_metadata_host(authority) {
-            if config.connect_timeout > METADATA_PROBE_TIMEOUT {
-                config.connect_timeout = METADATA_PROBE_TIMEOUT;
-            }
-            if config.first_byte_timeout > METADATA_PROBE_TIMEOUT {
-                config.first_byte_timeout = METADATA_PROBE_TIMEOUT;
-            }
-            if config.between_bytes_timeout > METADATA_PROBE_TIMEOUT {
-                config.between_bytes_timeout = METADATA_PROBE_TIMEOUT;
-            }
-        }
+        // Metadata gets 1s; all other requests get the epoch budget.
+        let cap = if is_metadata_host(authority) {
+            METADATA_PROBE_TIMEOUT
+        } else {
+            HTTP_API_REQUEST_TIMEOUT
+        };
+        config.connect_timeout = config.connect_timeout.min(cap);
+        config.first_byte_timeout = config.first_byte_timeout.min(cap);
+        config.between_bytes_timeout = config.between_bytes_timeout.min(cap);
         Ok(wasmtime_wasi_http::p2::default_send_request(
             request, config,
         ))
@@ -1661,6 +1662,12 @@ mod tests {
         assert!(is_epoch_trap_message("epoch deadline reached"));
         assert!(!is_epoch_trap_message("out of memory"));
         assert!(!is_epoch_trap_message("unreachable code"));
+    }
+
+    #[test]
+    fn test_http_api_request_timeout_is_longer_than_metadata() {
+        // API requests need more time than metadata probes.
+        assert!(HTTP_API_REQUEST_TIMEOUT > METADATA_PROBE_TIMEOUT);
     }
 
     #[test]
