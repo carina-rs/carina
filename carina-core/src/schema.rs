@@ -454,7 +454,11 @@ pub enum TypeError {
     ValidationFailed { message: String },
 
     #[error("Resource validation failed: {message}")]
-    ResourceValidationFailed { message: String },
+    ResourceValidationFailed {
+        message: String,
+        /// Optional attribute name for precise diagnostic positioning.
+        attribute: Option<String>,
+    },
 
     #[error("Required attribute '{name}' is missing")]
     MissingRequired { name: String },
@@ -537,6 +541,7 @@ pub mod validators {
         match present_fields.len() {
             0 => Err(vec![TypeError::ResourceValidationFailed {
                 message: format!("Exactly one of [{}] must be specified", fields.join(", ")),
+                attribute: None,
             }]),
             1 => Ok(()),
             _ => Err(vec![TypeError::ResourceValidationFailed {
@@ -545,6 +550,7 @@ pub mod validators {
                     fields.join(", "),
                     present_fields.join(", ")
                 ),
+                attribute: present_fields.first().map(|s| s.to_string()),
             }]),
         }
     }
