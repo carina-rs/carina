@@ -389,9 +389,12 @@ pub fn normalize_state_enum_value(
 pub fn convert_region_value(value: &str) -> String {
     // Match any `<provider>.Region.<region_name>` pattern (e.g., "aws.Region.ap_northeast_1")
     if let Some(pos) = value.find(".Region.") {
+        let prefix = &value[..pos];
         let rest = &value[pos + ".Region.".len()..];
-        // Verify the prefix is a simple provider name (no dots except the one before Region)
-        if !value[..pos].contains('.') {
+        // Prefix must be a simple provider name (no dots) and the region part
+        // must not contain dots (rejects double-namespace like
+        // "awscc.Region.awscc.Region.ap_northeast_1").
+        if !prefix.contains('.') && !rest.contains('.') {
             return rest.replace('_', "-");
         }
     }
@@ -773,5 +776,18 @@ mod tests {
     fn test_convert_region_value_passthrough() {
         assert_eq!(convert_region_value("us-east-1"), "us-east-1");
         assert_eq!(convert_region_value("eu-west-1"), "eu-west-1");
+    }
+
+    #[test]
+    fn test_convert_region_value_double_namespace_not_converted() {
+        // Double namespace like "awscc.Region.awscc.Region.ap_northeast_1" must NOT
+        // be partially converted to "awscc.Region.ap-northeast-1" (an invalid region).
+        // It should pass through unchanged so validation can reject it.
+        let input = "awscc.Region.awscc.Region.ap_northeast_1";
+        let result = convert_region_value(input);
+        assert_eq!(
+            result, input,
+            "double namespace must not be partially converted"
+        );
     }
 }

@@ -192,11 +192,31 @@ pub fn validate_no_provider_in_module(parsed: &ParsedFile) -> Result<(), String>
 }
 
 /// Validate provider configuration attributes via `ProviderFactory::validate_config()`.
+///
+/// Also validates region values: if a region attribute looks like a DSL enum
+/// (contains `.Region.`) but fails to convert to a simple region string
+/// (e.g., double namespace `awscc.Region.awscc.Region.ap_northeast_1`),
+/// an error is returned.
 pub fn validate_provider_config(
     parsed: &ParsedFile,
     factories: &[Box<dyn ProviderFactory>],
 ) -> Result<(), String> {
     for provider in &parsed.providers {
+        // Check region value format before delegating to the factory.
+        if let Some(region_value) = provider.attributes.get("region").and_then(|v| match v {
+            crate::resource::Value::String(s) => Some(s.as_str()),
+            _ => None,
+        }) && region_value.contains(".Region.")
+        {
+            let converted = crate::utils::convert_region_value(region_value);
+            if converted.contains('.') {
+                return Err(format!(
+                    "provider {}: invalid region value '{}' (malformed namespace)",
+                    provider.name, region_value,
+                ));
+            }
+        }
+
         if let Some(factory) = factories.iter().find(|f| f.name() == provider.name) {
             factory
                 .validate_config(&provider.attributes)
@@ -1150,5 +1170,46 @@ let vpc = awscc.ec2.vpc {
         parsed.resources.push(caller);
 
         assert!(check_unused_bindings(&parsed).is_empty());
+    }
+
+    #[test]
+    fn validate_provider_config_rejects_double_namespace_region() {
+        let mut parsed = empty_parsed();
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "region".to_string(),
+            crate::resource::Value::String("awscc.Region.awscc.Region.ap_northeast_1".to_string()),
+        );
+        parsed.providers.push(crate::parser::ProviderConfig {
+            name: "awscc".to_string(),
+            attributes: attrs,
+            default_tags: HashMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+        });
+        let result = validate_provider_config(&parsed, &[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("malformed namespace"));
+    }
+
+    #[test]
+    fn validate_provider_config_accepts_valid_region() {
+        let mut parsed = empty_parsed();
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "region".to_string(),
+            crate::resource::Value::String("awscc.Region.ap_northeast_1".to_string()),
+        );
+        parsed.providers.push(crate::parser::ProviderConfig {
+            name: "awscc".to_string(),
+            attributes: attrs,
+            default_tags: HashMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+        });
+        let result = validate_provider_config(&parsed, &[]);
+        assert!(result.is_ok());
     }
 }
