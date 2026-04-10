@@ -35,19 +35,23 @@ use crate::wiring::{
 ///   explaining the change and asking the user to re-run with `--reconfigure`.
 /// - If `reconfigure` is `true`, overwrites the lock with the new config.
 ///
-/// When `backend_config` is `None` (local default backend), no check is
-/// performed — local state lives alongside the `.crn` files and is not
-/// subject to silent redirection.
+/// When no `backend` block is configured, the implicit local backend is
+/// still recorded in the lock. This makes it possible to detect the
+/// local → remote transition (user adds a backend block after having
+/// run carina against local state) — otherwise the lock would be silently
+/// created with the new remote config and the local state abandoned.
 pub fn check_backend_lock(
     base_dir: &Path,
     backend_config: Option<&BackendConfig>,
     reconfigure: bool,
 ) -> Result<(), AppError> {
-    let Some(config) = backend_config else {
-        return Ok(());
+    let current = match backend_config {
+        Some(config) => {
+            let state_config = StateBackendConfig::from(config);
+            BackendLock::from_config(&state_config)
+        }
+        None => BackendLock::local_default(),
     };
-    let state_config = StateBackendConfig::from(config);
-    let current = BackendLock::from_config(&state_config);
     let existing = BackendLock::load(base_dir).map_err(AppError::Backend)?;
 
     match existing {
@@ -225,12 +229,43 @@ mod tests {
     }
 
     #[test]
-    fn check_backend_lock_skips_when_no_backend_configured() {
+    fn check_backend_lock_records_local_default_when_no_backend_configured() {
         let tmp = tempfile::tempdir().unwrap();
         let result = check_backend_lock(tmp.path(), None, false);
         assert!(result.is_ok());
-        // No lock file should be created for local-only setups
-        assert!(!tmp.path().join(".carina/backend-lock.json").exists());
+        // A lock file is created with the implicit local backend, so that a
+        // subsequent transition to a remote backend can be detected.
+        let lock_path = tmp.path().join(".carina/backend-lock.json");
+        assert!(lock_path.exists());
+        let contents = std::fs::read_to_string(&lock_path).unwrap();
+        assert!(contents.contains("\"local\""));
+    }
+
+    #[test]
+    fn check_backend_lock_blocks_local_to_remote_transition() {
+        let tmp = tempfile::tempdir().unwrap();
+        // First run: local default (no backend block)
+        check_backend_lock(tmp.path(), None, false).unwrap();
+        // Second run: user adds an S3 backend
+        let new = s3_backend_config("my-bucket", "us-east-1");
+        let err = check_backend_lock(tmp.path(), Some(&new), false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Backend configuration has changed"));
+        assert!(msg.contains("local"));
+        assert!(msg.contains("s3"));
+        assert!(msg.contains("--reconfigure"));
+    }
+
+    #[test]
+    fn check_backend_lock_allows_local_to_remote_with_reconfigure() {
+        let tmp = tempfile::tempdir().unwrap();
+        check_backend_lock(tmp.path(), None, false).unwrap();
+        let new = s3_backend_config("my-bucket", "us-east-1");
+        let result = check_backend_lock(tmp.path(), Some(&new), true);
+        assert!(result.is_ok());
+        // Subsequent run with the new backend should now pass
+        let result2 = check_backend_lock(tmp.path(), Some(&new), false);
+        assert!(result2.is_ok());
     }
 
     fn empty_parsed_file() -> ParsedFile {
