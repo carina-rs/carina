@@ -202,16 +202,21 @@ pub fn validate_provider_config(
     factories: &[Box<dyn ProviderFactory>],
 ) -> Result<(), String> {
     for provider in &parsed.providers {
-        // Check region value format before delegating to the factory.
+        // Validate region namespace format: if the value contains ".Region.",
+        // it must be exactly `<provider>.Region.<region_name>` where neither
+        // provider nor region_name contains dots.
         if let Some(region_value) = provider.attributes.get("region").and_then(|v| match v {
             crate::resource::Value::String(s) => Some(s.as_str()),
             _ => None,
         }) && region_value.contains(".Region.")
         {
-            let converted = crate::utils::convert_region_value(region_value);
-            if converted.contains('.') {
+            let parts: Vec<&str> = region_value.splitn(3, '.').collect();
+            // Valid form: ["aws", "Region", "ap_northeast_1"] — exactly 3 parts,
+            // middle is "Region", and the region name has no dots.
+            let valid = parts.len() == 3 && parts[1] == "Region" && !parts[2].contains('.');
+            if !valid {
                 return Err(format!(
-                    "provider {}: invalid region value '{}' (malformed namespace)",
+                    "provider {}: invalid region value '{}' (expected <provider>.Region.<region>)",
                     provider.name, region_value,
                 ));
             }
@@ -1190,7 +1195,7 @@ let vpc = awscc.ec2.vpc {
         });
         let result = validate_provider_config(&parsed, &[]);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("malformed namespace"));
+        assert!(result.unwrap_err().contains("invalid region value"));
     }
 
     #[test]
