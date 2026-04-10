@@ -481,15 +481,35 @@ impl DiagnosticEngine {
                             ) {
                                 continue;
                             }
-                            if let Some((line, _col)) =
+                            // Try attribute-level position first, fall back to resource position
+                            let position =
+                                if let carina_core::schema::TypeError::ResourceValidationFailed {
+                                    attribute: Some(attr),
+                                    ..
+                                } = &error
+                                {
+                                    self.find_attribute_position(doc, attr)
+                                } else {
+                                    None
+                                };
+                            let position = position.or_else(|| {
                                 self.find_resource_position(doc, &resource.id.resource_type)
-                            {
+                            });
+                            if let Some((line, col)) = position {
                                 diagnostics.push(carina_diagnostic_range(
                                     Range {
-                                        start: Position { line, character: 0 },
+                                        start: Position {
+                                            line,
+                                            character: col,
+                                        },
                                         end: Position {
-                                            line: line + 1,
-                                            character: 0,
+                                            line,
+                                            character: col
+                                                + doc
+                                                    .text()
+                                                    .lines()
+                                                    .nth(line as usize)
+                                                    .map_or(0, |l| l.trim_end().len() as u32),
                                         },
                                     },
                                     DiagnosticSeverity::ERROR,

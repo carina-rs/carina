@@ -290,6 +290,7 @@ fn validate_tags_key_value(
             if has_key && has_value {
                 return Err(vec![carina_core::schema::TypeError::ResourceValidationFailed {
                     message: "tags map contains both 'key' and 'value' as keys, which looks like a Key/Value pair list. Use flat map syntax instead: tags = { Name = '...' }".to_string(),
+                    attribute: Some("tags".to_string()),
                 }]);
             }
         }

@@ -1333,3 +1333,55 @@ attributes {
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn resource_validation_failed_with_attribute_points_to_attribute_line() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeError};
+    use std::collections::HashMap;
+
+    let schema = ResourceSchema::new("mock.test.resource")
+        .attribute(AttributeSchema::new("name", AttributeType::String).required())
+        .attribute(AttributeSchema::new(
+            "tags",
+            AttributeType::Map(Box::new(AttributeType::String)),
+        ))
+        .with_validator(|attrs| {
+            if let Some(carina_core::resource::Value::Map(map)) = attrs.get("tags") {
+                let has_key = map.keys().any(|k| k.eq_ignore_ascii_case("key"));
+                let has_value = map.keys().any(|k| k.eq_ignore_ascii_case("value"));
+                if has_key && has_value {
+                    return Err(vec![TypeError::ResourceValidationFailed {
+                        message: "tags key/value error".to_string(),
+                        attribute: Some("tags".to_string()),
+                    }]);
+                }
+            }
+            Ok(())
+        });
+
+    let mut schemas = HashMap::new();
+    schemas.insert("mock.test.resource".to_string(), schema);
+    let engine = custom_engine(schemas);
+
+    let doc = create_document(
+        "mock.test.resource {\n  name = 'test'\n  tags = {\n    key = 'Project'\n    value = 'carina'\n  }\n}",
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    let tags_diag = diagnostics
+        .iter()
+        .find(|d| d.message.contains("tags key/value error"));
+    assert!(
+        tags_diag.is_some(),
+        "Should have a tags validation error. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    let diag = tags_diag.unwrap();
+    // The diagnostic should point to the "tags" line (line 2, 0-indexed),
+    // not the resource declaration line (line 0).
+    assert_eq!(
+        diag.range.start.line, 2,
+        "Diagnostic should point to the 'tags' attribute line (line 2), not the resource line. Got line {}",
+        diag.range.start.line
+    );
+}
