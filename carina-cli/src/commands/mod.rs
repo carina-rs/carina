@@ -63,9 +63,12 @@ pub fn check_backend_lock(
                 Err(AppError::Config(format!(
                     "Backend configuration has changed since the last run:\n\n{}\n\n\
                      Changing backend settings can silently redirect Carina at a \
-                     different state file, which may cause state loss or drift. \
-                     If this change is intentional, re-run with --reconfigure to \
-                     accept the new configuration.",
+                     different state file, which may cause state loss or drift.\n\n\
+                     To preserve existing state, run `carina state migrate` — it \
+                     will copy state from the old backend to the new one and \
+                     update the backend lock.\n\n\
+                     To discard the old state and start fresh with the new backend, \
+                     re-run with --reconfigure.",
                     existing.describe_diff(&current)
                 )))
             }
@@ -212,6 +215,8 @@ mod tests {
         assert!(msg.contains("bucket"));
         assert!(msg.contains("old-bucket"));
         assert!(msg.contains("new-bucket"));
+        // Error should hint at both options: migrate (preserve state) and reconfigure (discard).
+        assert!(msg.contains("carina state migrate"));
         assert!(msg.contains("--reconfigure"));
     }
 
