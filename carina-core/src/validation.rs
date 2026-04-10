@@ -191,17 +191,35 @@ pub fn validate_no_provider_in_module(parsed: &ParsedFile) -> Result<(), String>
     Ok(())
 }
 
-/// Validate provider configuration attributes via `ProviderFactory::validate_config()`.
+/// Validate provider configuration attributes.
+///
+/// Runs host-side type-level validation using
+/// [`ProviderFactory::provider_config_attribute_types`] first, then
+/// delegates to [`ProviderFactory::validate_config`] for any
+/// provider-specific semantic checks. Keeping format validation
+/// (namespace structure, enum membership) on the host side means fixes
+/// in `carina-core` take effect without rebuilding provider binaries.
 pub fn validate_provider_config(
     parsed: &ParsedFile,
     factories: &[Box<dyn ProviderFactory>],
 ) -> Result<(), String> {
     for provider in &parsed.providers {
-        if let Some(factory) = factories.iter().find(|f| f.name() == provider.name) {
-            factory
-                .validate_config(&provider.attributes)
-                .map_err(|e| format!("provider {}: {}", provider.name, e))?;
+        let Some(factory) = factories.iter().find(|f| f.name() == provider.name) else {
+            continue;
+        };
+        // Host-side type-level validation.
+        let attr_types = factory.provider_config_attribute_types();
+        for (attr_name, value) in &provider.attributes {
+            if let Some(attr_type) = attr_types.get(attr_name) {
+                attr_type
+                    .validate(value)
+                    .map_err(|e| format!("provider {}: {}: {}", provider.name, attr_name, e))?;
+            }
         }
+        // Provider-specific validation.
+        factory
+            .validate_config(&provider.attributes)
+            .map_err(|e| format!("provider {}: {}", provider.name, e))?;
     }
     Ok(())
 }
