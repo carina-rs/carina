@@ -675,6 +675,33 @@ async fn create_instance_with_http(
     Ok((store, WasmBindings::Http(bindings)))
 }
 
+/// Try HTTP instantiation first, then basic. On double failure, report
+/// both errors: the basic fallback's "wasi:http/types not found" is
+/// misleading when the real cause is in the HTTP path.
+async fn create_instance_auto(
+    engine: &Engine,
+    component: &Component,
+) -> Result<(Store<HostState>, WasmBindings, bool), String> {
+    match create_instance_with_http(engine, component).await {
+        Ok((store, bindings)) => Ok((store, bindings, true)),
+        Err(http_err) => match create_instance(engine, component).await {
+            Ok((store, bindings)) => Ok((store, bindings, false)),
+            Err(basic_err) => Err(format_dual_instantiation_error(&http_err, &basic_err)),
+        },
+    }
+}
+
+/// Format the combined error message when both the HTTP and basic
+/// instantiation attempts fail. Extracted so regressions in the format
+/// (or accidentally dropping one of the two errors) can be unit-tested.
+fn format_dual_instantiation_error(http_err: &str, basic_err: &str) -> String {
+    format!(
+        "Failed to instantiate WASM component; \
+         HTTP-enabled world failed: {http_err}; \
+         basic fallback also failed: {basic_err}"
+    )
+}
+
 // -- SharedWasmInstance --
 
 /// A single WASM instance (store + bindings) shared between `WasmProvider`
@@ -873,16 +900,7 @@ impl WasmProviderFactory {
             )
         })?;
 
-        // Detect whether the component needs HTTP by trying HTTP instantiation first,
-        // then falling back to basic.
-        let (mut store, bindings, enable_http) =
-            match create_instance_with_http(&engine, &component).await {
-                Ok((store, bindings)) => (store, bindings, true),
-                Err(_) => {
-                    let (store, bindings) = create_instance(&engine, &component).await?;
-                    (store, bindings, false)
-                }
-            };
+        let (mut store, bindings, enable_http) = create_instance_auto(&engine, &component).await?;
         let info_json = bindings
             .call_info(&mut store)
             .await
@@ -971,14 +989,7 @@ impl WasmProviderFactory {
                 )
             })?;
 
-        let (mut store, bindings, enable_http) =
-            match create_instance_with_http(&engine, &component).await {
-                Ok((store, bindings)) => (store, bindings, true),
-                Err(_) => {
-                    let (store, bindings) = create_instance(&engine, &component).await?;
-                    (store, bindings, false)
-                }
-            };
+        let (mut store, bindings, enable_http) = create_instance_auto(&engine, &component).await?;
         let info_json = bindings
             .call_info(&mut store)
             .await
@@ -1800,5 +1811,21 @@ mod tests {
         let key2 = WasmProviderFactory::cache_key(&wasm_path);
 
         assert_eq!(key1, key2, "cache key should be stable for same content");
+    }
+
+    /// Regression guard for carina#1681: when both HTTP and basic
+    /// instantiation fail, the combined error must preserve *both* causes.
+    /// Dropping either side re-introduces the misdiagnosis pattern that
+    /// caused the recurring false "wasi:http/types not found" reports.
+    #[test]
+    fn format_dual_instantiation_error_preserves_both_causes() {
+        let msg = format_dual_instantiation_error(
+            "HTTP cause: missing export `foo`",
+            "BASIC cause: wasi:http/types not in linker",
+        );
+        assert!(msg.contains("HTTP cause: missing export `foo`"));
+        assert!(msg.contains("BASIC cause: wasi:http/types not in linker"));
+        assert!(msg.contains("HTTP-enabled world failed"));
+        assert!(msg.contains("basic fallback also failed"));
     }
 }
