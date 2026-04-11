@@ -675,20 +675,34 @@ async fn create_instance_with_http(
     Ok((store, WasmBindings::Http(bindings)))
 }
 
+/// Output of `create_instance_auto`: the instantiated store, the
+/// bindings, and whether the HTTP-enabled world was used.
+type CreateInstanceResult = Result<(Store<HostState>, WasmBindings, bool), String>;
+
 /// Try HTTP instantiation first, then basic. On double failure, report
 /// both errors: the basic fallback's "wasi:http/types not found" is
 /// misleading when the real cause is in the HTTP path.
-async fn create_instance_auto(
-    engine: &Engine,
-    component: &Component,
-) -> Result<(Store<HostState>, WasmBindings, bool), String> {
-    match create_instance_with_http(engine, component).await {
-        Ok((store, bindings)) => Ok((store, bindings, true)),
-        Err(http_err) => match create_instance(engine, component).await {
-            Ok((store, bindings)) => Ok((store, bindings, false)),
-            Err(basic_err) => Err(format_dual_instantiation_error(&http_err, &basic_err)),
-        },
-    }
+///
+/// Returns a boxed future (not `async fn`) to erase the future type at
+/// this call site. Inlining this helper as a plain `async fn` composes
+/// `CarinaProviderWithHttp::instantiate_async` and
+/// `CarinaProvider::instantiate_async` into one anonymous future,
+/// which combined with the deep call chain from `carina-cli` trips
+/// rustc's layout-computation query depth limit on recent stable
+/// toolchains (observed in `cargo check --all-features` CI).
+fn create_instance_auto<'a>(
+    engine: &'a Engine,
+    component: &'a Component,
+) -> BoxFuture<'a, CreateInstanceResult> {
+    Box::pin(async move {
+        match create_instance_with_http(engine, component).await {
+            Ok((store, bindings)) => Ok((store, bindings, true)),
+            Err(http_err) => match create_instance(engine, component).await {
+                Ok((store, bindings)) => Ok((store, bindings, false)),
+                Err(basic_err) => Err(format_dual_instantiation_error(&http_err, &basic_err)),
+            },
+        }
+    })
 }
 
 /// Format the combined error message when both the HTTP and basic
