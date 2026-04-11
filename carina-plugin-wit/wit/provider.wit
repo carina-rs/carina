@@ -18,6 +18,14 @@ interface provider {
     initialize: func(attrs: list<tuple<string, value>>) -> result<_, string>;
 
     read: func(id: resource-id, identifier: option<string>) -> result<state, string>;
+
+    /// Read a data source resource. Receives the full `resource-def` so
+    /// providers can see user-supplied input attributes (e.g. the
+    /// `user_name` for `aws.identitystore.user`). Zero-input data sources
+    /// should still route through `read` on the host side — callers
+    /// dispatch on `resource.is_data_source()` before picking this path.
+    read-data-source: func(res: resource-def) -> result<state, string>;
+
     create: func(res: resource-def) -> result<state, string>;
     update: func(id: resource-id, identifier: string, current: state, to: resource-def) -> result<state, string>;
 

@@ -390,6 +390,25 @@ impl WasmBindings {
         }
     }
 
+    async fn call_read_data_source(
+        &self,
+        store: &mut Store<HostState>,
+        resource: &wit_types::ResourceDef,
+    ) -> wasmtime::Result<Result<wit_types::State, String>> {
+        match self {
+            WasmBindings::Basic(b) => {
+                b.carina_provider_provider()
+                    .call_read_data_source(store, resource)
+                    .await
+            }
+            WasmBindings::Http(b) => {
+                b.carina_provider_provider()
+                    .call_read_data_source(store, resource)
+                    .await
+            }
+        }
+    }
+
     async fn call_create(
         &self,
         store: &mut Store<HostState>,
@@ -1224,6 +1243,36 @@ impl Provider for WasmProvider {
                         .timeout()
                     } else {
                         ProviderError::new(format!("WASM trap in read: {e}"))
+                    }
+                })?;
+            match result {
+                Ok(wit_state) => Ok(wasm_convert::wit_to_core_state(&wit_state, &id)),
+                Err(err_json) => Err(wasm_convert::json_to_provider_error(&err_json)),
+            }
+        })
+    }
+
+    fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+        let wit_resource = wasm_convert::core_to_wit_resource(resource);
+        let id = resource.id.clone();
+        Box::pin(async move {
+            let mut store = self.instance.store.lock().await;
+            store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
+            let result = self
+                .instance
+                .bindings
+                .call_read_data_source(&mut store, &wit_resource)
+                .await
+                .map_err(|e| {
+                    let msg = format!("{e}");
+                    if is_epoch_trap_message(&msg) {
+                        ProviderError::new(format!(
+                            "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in \
+                             read_data_source (check AWS credentials)"
+                        ))
+                        .timeout()
+                    } else {
+                        ProviderError::new(format!("WASM trap in read_data_source: {e}"))
                     }
                 })?;
             match result {
