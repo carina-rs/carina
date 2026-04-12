@@ -1449,3 +1449,31 @@ fn error_when_provider_not_loaded_at_all() {
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn no_undefined_resource_for_namespaced_enum_value() {
+    // provider_names includes "awscc", so awscc.xxx.yyy.EnumType.VALUE
+    // should NOT be flagged as "Undefined resource"
+    let engine = DiagnosticEngine::new(
+        Arc::new(HashMap::new()),
+        vec!["awscc".to_string()],
+        Arc::new(vec![]),
+    );
+    let doc = create_document(
+        r#"awscc.organizations.organization {
+  feature_set = awscc.organizations.organization.FeatureSet.ALL
+}
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let undefined = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Undefined resource"));
+    assert!(
+        undefined.is_none(),
+        "Namespaced enum value should not be flagged as undefined resource. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}

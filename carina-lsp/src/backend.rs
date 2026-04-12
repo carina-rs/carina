@@ -103,21 +103,27 @@ impl ProviderStates {
     /// 2. If not found, check if the file's directory is imported by a caller
     ///    and use the caller's ProviderState
     fn state_for_path(&self, file_path: &Path) -> &ProviderState {
-        // First: walk up to find a config directory
-        let mut dir = file_path.parent();
+        // Start from file_path itself (which is the file's parent directory),
+        // not file_path.parent() — the config dir might be the directory itself.
+        let mut dir = Some(file_path);
         while let Some(d) = dir {
             if let Some(state) = self.by_dir.get(d) {
+                return state;
+            }
+            // Try canonical path in case the by_dir key is different
+            if let Ok(canonical) = d.canonicalize()
+                && canonical != d
+                && let Some(state) = self.by_dir.get(&canonical)
+            {
                 return state;
             }
             dir = d.parent();
         }
 
-        // Second: check import map for module files
-        let file_dir = file_path.parent().unwrap_or(file_path);
-        let canonical = file_dir.canonicalize().unwrap_or(file_dir.to_path_buf());
+        // Check import map for module files
+        let canonical = file_path.canonicalize().unwrap_or(file_path.to_path_buf());
         if let Some(callers) = self.import_map.get(&canonical) {
             for caller_dir in callers {
-                // Walk up from caller to find its config directory
                 let mut dir = Some(caller_dir.as_path());
                 while let Some(d) = dir {
                     if let Some(state) = self.by_dir.get(d) {
@@ -265,7 +271,6 @@ impl Backend {
         states.import_map = import_map;
         let dir_count = states.by_dir.len();
         *self.providers.write().await = states;
-
         self.client
             .log_message(
                 MessageType::INFO,
