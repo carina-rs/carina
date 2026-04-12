@@ -275,9 +275,9 @@ pub fn extract_compact_hint(
             && !s.is_empty()
         {
             let short_key = shorten_attr_name(key);
-            // Resolve DSL enum identifiers (e.g., awscc.AvailabilityZone.ap_northeast_1a -> "ap-northeast-1a")
+            // Strip namespace from DSL enum identifiers (e.g., awscc.AvailabilityZone.ap_northeast_1a -> "ap_northeast_1a")
             let resolved = if is_dsl_enum_format(s) {
-                Cow::Owned(convert_enum_value(s))
+                Cow::Borrowed(convert_enum_value(s))
             } else {
                 Cow::Borrowed(s.as_str())
             };

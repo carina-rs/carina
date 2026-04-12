@@ -1325,10 +1325,10 @@ mod tests {
             "\"Enabled\""
         );
 
-        // 3-part DSL enum with underscore-to-hyphen conversion
+        // 3-part DSL enum: namespace stripped, value returned as-is
         assert_eq!(
             format_value(&Value::String("aws.Region.ap_northeast_1".to_string())),
-            "\"ap-northeast-1\""
+            "\"ap_northeast_1\""
         );
 
         // Regular string should be quoted as-is

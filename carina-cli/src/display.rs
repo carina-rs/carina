@@ -2192,10 +2192,12 @@ mod tests {
         );
 
         let hint = extract_compact_hint(&r, None);
+        // Displays DSL form (underscored) until provider alias tables include
+        // to_dsl reverse mappings (see issue #1675).
         assert_eq!(
             hint,
-            Some("availability_zone: ap-northeast-1a".to_string()),
-            "DSL enum identifiers should be resolved to provider values"
+            Some("availability_zone: ap_northeast_1a".to_string()),
+            "DSL enum identifiers should be stripped of namespace prefix"
         );
     }
 

@@ -475,8 +475,7 @@ fn resolve_value_alias(
     match value {
         Value::String(s) if utils::is_dsl_enum_format(s) => {
             let raw = utils::convert_enum_value(s);
-            if let Some(canonical) = factory.get_enum_alias_reverse(resource_type, attr_name, &raw)
-            {
+            if let Some(canonical) = factory.get_enum_alias_reverse(resource_type, attr_name, raw) {
                 *s = canonical;
             }
         }
