@@ -21,6 +21,14 @@ use crate::wasm_bindings::carina::provider::types as wit;
 ///
 /// List and Map values are serialized to JSON strings because WIT does not
 /// support recursive types.
+///
+/// `ResourceRef`, `Interpolation`, `FunctionCall`, `Closure`, and `Secret`
+/// are expected to have been resolved by the planner/refresh path before
+/// reaching the provider. Hitting one here is a *bug* in an upstream
+/// stage (see #1683 for an example where data source inputs were not
+/// resolved before refresh). In debug/test builds we panic so the bug
+/// is caught at its source; in release builds we log and fall back to
+/// the debug format to avoid crashing a user's plan/apply mid-run.
 pub fn core_to_wit_value(v: &CoreValue) -> wit::Value {
     match v {
         CoreValue::String(s) => wit::Value::StrVal(s.clone()),
@@ -38,9 +46,19 @@ pub fn core_to_wit_value(v: &CoreValue) -> wit::Value {
                 .collect();
             wit::Value::MapVal(serde_json::to_string(&json_map).unwrap())
         }
-        // ResourceRef, Interpolation, FunctionCall, Closure, Secret
-        // should be resolved before reaching the provider.
-        _ => wit::Value::StrVal(format!("{v:?}")),
+        _ => {
+            debug_assert!(
+                false,
+                "core_to_wit_value received unresolved value {v:?}; \
+                 ResourceRef/Interpolation/FunctionCall/Closure/Secret \
+                 must be resolved before reaching the provider"
+            );
+            log::error!(
+                "core_to_wit_value received unresolved value {v:?}; \
+                 passing debug format to the provider — this is a bug"
+            );
+            wit::Value::StrVal(format!("{v:?}"))
+        }
     }
 }
 
@@ -475,6 +493,24 @@ mod tests {
         let wit = core_to_wit_value(&core);
         let back = wit_to_core_value(&wit);
         assert_eq!(core, back);
+    }
+
+    /// Regression guard for carina#1683: `core_to_wit_value` must fail
+    /// loud in debug/test builds when handed an unresolved value. The
+    /// previous silent `format!("{v:?}")` fallback let a raw
+    /// `ResourceRef` flow into the WASM plugin as a literal debug string,
+    /// which the provider then forwarded to the AWS API verbatim.
+    #[test]
+    #[should_panic(expected = "unresolved value")]
+    fn core_to_wit_value_panics_on_unresolved_resource_ref() {
+        use carina_core::resource::{AccessPath, PathSegment};
+        let v = CoreValue::ResourceRef {
+            path: AccessPath(vec![
+                PathSegment::Field("sso".into()),
+                PathSegment::Field("identity_store_id".into()),
+            ]),
+        };
+        let _ = core_to_wit_value(&v);
     }
 
     // -- ResourceId roundtrip --

@@ -37,7 +37,8 @@ use crate::error::AppError;
 use crate::wiring::{
     WiringContext, build_factories_from_providers, create_providers_from_configs,
     get_provider_with_ctx, read_data_source_with_retry, read_with_retry,
-    reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names, resolve_names_with_ctx,
+    reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
+    resolve_data_source_refs_for_refresh, resolve_names_with_ctx,
 };
 
 /// Format a duration as a human-readable string like "3.2s" or "1m 5.3s".
@@ -1014,6 +1015,10 @@ async fn run_apply_locked(
     // Select appropriate Provider based on configuration
     let provider = get_provider_with_ctx(ctx, parsed, base_dir).await;
 
+    // Remote state bindings are loaded up front so data source refs that
+    // reference `remote_state` blocks can be resolved during refresh (#1683).
+    let remote_bindings = super::plan::load_remote_states(&parsed.remote_states, base_dir).await?;
+
     // Read states for all resources using identifier from state
     // In identifier-based approach, if there's no identifier in state, the resource doesn't exist
     // Skip virtual resources (module attribute containers) — they have no infrastructure.
@@ -1040,28 +1045,52 @@ async fn run_apply_locked(
                     .collect()
             })
             .unwrap_or_default();
-        let results: Vec<Result<(ResourceId, State), AppError>> =
-            stream::iter(sorted_resources.iter().filter(|r| !r.is_virtual()))
+
+        // Phase 1: refresh managed (non-data-source) resources in parallel.
+        let phase1_results: Vec<Result<(ResourceId, State), AppError>> = stream::iter(
+            sorted_resources
+                .iter()
+                .filter(|r| !r.is_virtual() && !r.is_data_source()),
+        )
+        .map(|resource| {
+            let progress = RefreshProgress::begin_multi(&multi, &resource.id);
+            let identifier = state_file
+                .as_ref()
+                .and_then(|sf| sf.get_identifier_for_resource(resource));
+            let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
+            async move {
+                let mut state = read_with_retry(provider_ref, &resource.id, identifier.as_deref())
+                    .await
+                    .map_err(AppError::Provider)?;
+                if let Some(deps) = dep_bindings {
+                    state.dependency_bindings = deps;
+                }
+                progress.finish();
+                Ok((resource.id.clone(), state))
+            }
+        })
+        .buffer_unordered(5)
+        .collect()
+        .await;
+        let mut states = HashMap::new();
+        for result in phase1_results {
+            let (id, state) = result?;
+            states.insert(id, state);
+        }
+
+        // Phase 2: resolve data source inputs against phase 1 state and
+        // refresh them via `read_data_source` (#1683).
+        let resolved_data_sources =
+            resolve_data_source_refs_for_refresh(&sorted_resources, &states, &remote_bindings)?;
+        let phase2_results: Vec<Result<(ResourceId, State), AppError>> =
+            stream::iter(resolved_data_sources.iter())
                 .map(|resource| {
                     let progress = RefreshProgress::begin_multi(&multi, &resource.id);
-                    let identifier = state_file
-                        .as_ref()
-                        .and_then(|sf| sf.get_identifier_for_resource(resource));
                     let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
                     async move {
-                        // Data sources need the full Resource so providers
-                        // can see user-supplied inputs (e.g. `user_name`
-                        // for `aws.identitystore.user`). Regular resources
-                        // route through the identifier-based refresh.
-                        let mut state = if resource.is_data_source() {
-                            read_data_source_with_retry(provider_ref, resource)
-                                .await
-                                .map_err(AppError::Provider)?
-                        } else {
-                            read_with_retry(provider_ref, &resource.id, identifier.as_deref())
-                                .await
-                                .map_err(AppError::Provider)?
-                        };
+                        let mut state = read_data_source_with_retry(provider_ref, resource)
+                            .await
+                            .map_err(AppError::Provider)?;
                         if let Some(deps) = dep_bindings {
                             state.dependency_bindings = deps;
                         }
@@ -1072,8 +1101,7 @@ async fn run_apply_locked(
                 .buffer_unordered(5)
                 .collect()
                 .await;
-        let mut states = HashMap::new();
-        for result in results {
+        for result in phase2_results {
             let (id, state) = result?;
             states.insert(id, state);
         }
@@ -1147,9 +1175,6 @@ async fn run_apply_locked(
             binding_map.insert(binding_name.clone(), attrs);
         }
     }
-
-    // Load remote state data sources
-    let remote_bindings = super::plan::load_remote_states(&parsed.remote_states, base_dir).await?;
 
     // Resolve references and enum identifiers, then create initial plan for display
     let mut resources_for_plan = sorted_resources.clone();

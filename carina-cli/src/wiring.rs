@@ -730,29 +730,57 @@ pub async fn create_plan_from_parsed_with_remote(
                     .collect()
             })
             .unwrap_or_default();
-        let results: Vec<Result<(ResourceId, State), AppError>> =
-            stream::iter(sorted_resources.iter().filter(|r| !r.is_virtual()))
+        // Refresh in two phases so data sources can see concrete values
+        // from their dependencies (#1683). Phase 1: managed resources in
+        // parallel. Phase 2: data sources whose input attributes have
+        // been resolved against phase 1's `current_states`.
+        let phase1_results: Vec<Result<(ResourceId, State), AppError>> = stream::iter(
+            sorted_resources
+                .iter()
+                .filter(|r| !r.is_virtual() && !r.is_data_source()),
+        )
+        .map(|resource| {
+            let progress = RefreshProgress::begin_multi(&multi, &resource.id);
+            let identifier = state_file
+                .as_ref()
+                .and_then(|sf| sf.get_identifier_for_resource(resource));
+            let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
+            async move {
+                let mut state = read_with_retry(provider_ref, &resource.id, identifier.as_deref())
+                    .await
+                    .map_err(AppError::Provider)?;
+                // Restore dependency_bindings from state file (#1565).
+                if let Some(deps) = dep_bindings {
+                    state.dependency_bindings = deps;
+                }
+                progress.finish();
+                Ok((resource.id.clone(), state))
+            }
+        })
+        .buffer_unordered(5)
+        .collect()
+        .await;
+        for result in phase1_results {
+            let (id, state) = result?;
+            current_states.insert(id, state);
+        }
+
+        // Phase 2: resolve data source refs against phase 1's state,
+        // then refresh them via `read_data_source`.
+        let resolved_data_sources = resolve_data_source_refs_for_refresh(
+            &sorted_resources,
+            &current_states,
+            remote_bindings,
+        )?;
+        let phase2_results: Vec<Result<(ResourceId, State), AppError>> =
+            stream::iter(resolved_data_sources.iter())
                 .map(|resource| {
                     let progress = RefreshProgress::begin_multi(&multi, &resource.id);
-                    let identifier = state_file
-                        .as_ref()
-                        .and_then(|sf| sf.get_identifier_for_resource(resource));
                     let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
                     async move {
-                        // Data sources carry user-supplied inputs that need
-                        // to reach the provider — route them through
-                        // `read_data_source_with_retry` instead of the
-                        // identifier-based refresh.
-                        let mut state = if resource.is_data_source() {
-                            read_data_source_with_retry(provider_ref, resource)
-                                .await
-                                .map_err(AppError::Provider)?
-                        } else {
-                            read_with_retry(provider_ref, &resource.id, identifier.as_deref())
-                                .await
-                                .map_err(AppError::Provider)?
-                        };
-                        // Restore dependency_bindings from state file (#1565).
+                        let mut state = read_data_source_with_retry(provider_ref, resource)
+                            .await
+                            .map_err(AppError::Provider)?;
                         if let Some(deps) = dep_bindings {
                             state.dependency_bindings = deps;
                         }
@@ -763,7 +791,7 @@ pub async fn create_plan_from_parsed_with_remote(
                 .buffer_unordered(5)
                 .collect()
                 .await;
-        for result in results {
+        for result in phase2_results {
             let (id, state) = result?;
             current_states.insert(id, state);
         }
@@ -1229,6 +1257,28 @@ pub async fn read_data_source_with_retry(
     unreachable!()
 }
 
+/// Resolve `ResourceRef` values in data source input attributes against
+/// already-refreshed `current_states`, returning the data sources ready
+/// to pass to `read_data_source_with_retry` (#1683).
+///
+/// The full `sorted_resources` slice must be passed (not a pre-filtered
+/// data-sources-only slice) because `resolve_refs_with_state_and_remote`
+/// builds its binding map from every resource with a `binding`, including
+/// managed ones that data sources reference.
+pub(crate) fn resolve_data_source_refs_for_refresh(
+    sorted_resources: &[Resource],
+    current_states: &HashMap<ResourceId, State>,
+    remote_bindings: &HashMap<String, HashMap<String, Value>>,
+) -> Result<Vec<Resource>, AppError> {
+    let mut resolved = sorted_resources.to_vec();
+    resolve_refs_with_state_and_remote(&mut resolved, current_states, remote_bindings)
+        .map_err(AppError::Validation)?;
+    Ok(resolved
+        .into_iter()
+        .filter(|r| !r.is_virtual() && r.is_data_source())
+        .collect())
+}
+
 /// Convenience wrappers for tests. Each creates a fresh `WiringContext` internally,
 /// which is acceptable in test code where the overhead is negligible.
 #[cfg(test)]
@@ -1688,6 +1738,69 @@ mod tests {
             plan.effects().len(),
             0,
             "Import should be skipped when fallback-matched resource is already in state"
+        );
+    }
+
+    /// Regression test for carina#1683: data source input attributes that
+    /// reference another resource must be resolved against current state
+    /// *before* being passed to `read_data_source_with_retry`. Without
+    /// resolution the provider receives a debug-formatted `ResourceRef`
+    /// string and ships it to the remote API as a literal.
+    #[test]
+    fn resolve_data_source_refs_replaces_resource_ref_with_concrete_value() {
+        use carina_core::resource::{AccessPath, Expr, PathSegment, ResourceKind};
+
+        let identity_store_id = "d-9067c29a4b";
+
+        // Managed resource with a binding — phase 1 would have refreshed it.
+        let mut sso = Resource::with_provider("awscc", "sso.instance", "carina-rs");
+        sso.binding = Some("sso".to_string());
+
+        // Data source referencing `sso.identity_store_id`.
+        let mut mizzy = Resource::with_provider("aws", "identitystore.user", "mizzy");
+        mizzy.kind = ResourceKind::DataSource;
+        mizzy.attributes.insert(
+            "identity_store_id".to_string(),
+            Expr(Value::ResourceRef {
+                path: AccessPath(vec![
+                    PathSegment::Field("sso".into()),
+                    PathSegment::Field("identity_store_id".into()),
+                ]),
+            }),
+        );
+        mizzy.attributes.insert(
+            "user_name".to_string(),
+            Expr(Value::String("gosukenator@gmail.com".into())),
+        );
+
+        // current_states after phase 1: sso has been refreshed and its
+        // state carries the concrete identity_store_id.
+        let mut current_states: HashMap<ResourceId, State> = HashMap::new();
+        let sso_state = State::existing(
+            sso.id.clone(),
+            HashMap::from([(
+                "identity_store_id".to_string(),
+                Value::String(identity_store_id.into()),
+            )]),
+        );
+        current_states.insert(sso.id.clone(), sso_state);
+
+        let resolved =
+            resolve_data_source_refs_for_refresh(&[sso, mizzy], &current_states, &HashMap::new())
+                .expect("resolution should succeed");
+
+        assert_eq!(resolved.len(), 1, "only the data source should be returned");
+        let resolved_mizzy = &resolved[0];
+        assert_eq!(
+            resolved_mizzy.get_attr("identity_store_id"),
+            Some(&Value::String(identity_store_id.into())),
+            "identity_store_id should be resolved to the concrete state value, \
+             not a ResourceRef"
+        );
+        assert_eq!(
+            resolved_mizzy.get_attr("user_name"),
+            Some(&Value::String("gosukenator@gmail.com".into())),
+            "literal inputs should pass through untouched"
         );
     }
 }
