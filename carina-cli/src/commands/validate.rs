@@ -46,7 +46,7 @@ pub fn run_validate(
         println!("{}", "Validating...".cyan());
     }
 
-    validate_and_resolve_with_config(&mut parsed, base_dir, false, provider_context)?;
+    validate_and_resolve_with_config(&mut parsed, base_dir, false)?;
 
     // Check for unused let bindings (warnings, not errors)
     let unused_warnings = check_unused_bindings(&loaded.unresolved_parsed);

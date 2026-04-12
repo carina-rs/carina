@@ -528,6 +528,109 @@ pub fn collect_schemas(
     all_schemas
 }
 
+/// Extract custom type validators from collected schemas.
+///
+/// Walks all `AttributeType::Custom` types in the schema map and returns
+/// a map of (snake_case type name → validator function) suitable for
+/// populating `ProviderContext.validators`.
+pub fn collect_custom_type_validators(
+    schemas: &HashMap<String, crate::schema::ResourceSchema>,
+) -> HashMap<String, crate::parser::ValidatorFn> {
+    let mut validators: HashMap<String, crate::parser::ValidatorFn> = HashMap::new();
+
+    for schema in schemas.values() {
+        for attr_schema in schema.attributes.values() {
+            collect_validators_from_type(&attr_schema.attr_type, &mut validators);
+        }
+    }
+
+    validators
+}
+
+/// Collect custom type names from schemas without allocating validators.
+///
+/// Cheaper than `collect_custom_type_validators` when only the type names
+/// are needed (e.g., for LSP completions).
+pub fn collect_custom_type_names(
+    schemas: &HashMap<String, crate::schema::ResourceSchema>,
+) -> Vec<String> {
+    let mut names = std::collections::HashSet::new();
+
+    for schema in schemas.values() {
+        for attr_schema in schema.attributes.values() {
+            collect_type_names_from_type(&attr_schema.attr_type, &mut names);
+        }
+    }
+
+    names.into_iter().collect()
+}
+
+/// Recursively extract Custom type validators from an AttributeType.
+fn collect_validators_from_type(
+    attr_type: &crate::schema::AttributeType,
+    validators: &mut HashMap<String, crate::parser::ValidatorFn>,
+) {
+    use crate::schema::AttributeType;
+
+    match attr_type {
+        AttributeType::Custom { name, validate, .. } => {
+            let snake_name = crate::parser::pascal_to_snake(name);
+            validators.entry(snake_name).or_insert_with(|| {
+                let validate_fn = *validate;
+                Box::new(move |s: &str| validate_fn(&crate::resource::Value::String(s.to_string())))
+            });
+        }
+        AttributeType::List { inner, .. } => {
+            collect_validators_from_type(inner, validators);
+        }
+        AttributeType::Map(inner) => {
+            collect_validators_from_type(inner, validators);
+        }
+        AttributeType::Struct { fields, .. } => {
+            for field in fields {
+                collect_validators_from_type(&field.field_type, validators);
+            }
+        }
+        AttributeType::Union(types) => {
+            for t in types {
+                collect_validators_from_type(t, validators);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Recursively collect Custom type names from an AttributeType (names only, no closures).
+fn collect_type_names_from_type(
+    attr_type: &crate::schema::AttributeType,
+    names: &mut std::collections::HashSet<String>,
+) {
+    use crate::schema::AttributeType;
+
+    match attr_type {
+        AttributeType::Custom { name, .. } => {
+            names.insert(crate::parser::pascal_to_snake(name));
+        }
+        AttributeType::List { inner, .. } => {
+            collect_type_names_from_type(inner, names);
+        }
+        AttributeType::Map(inner) => {
+            collect_type_names_from_type(inner, names);
+        }
+        AttributeType::Struct { fields, .. } => {
+            for field in fields {
+                collect_type_names_from_type(&field.field_type, names);
+            }
+        }
+        AttributeType::Union(types) => {
+            for t in types {
+                collect_type_names_from_type(t, names);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Determine the schema lookup key for a resource based on its provider.
 pub fn schema_key_for_resource(
     factories: &[Box<dyn ProviderFactory>],

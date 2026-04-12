@@ -42,7 +42,6 @@ struct ProviderState {
 impl ProviderState {
     fn new(
         factories: Vec<Box<dyn ProviderFactory>>,
-        provider_context: &ProviderContext,
         provider_errors: HashMap<String, String>,
     ) -> Self {
         let schemas = Arc::new(provider_mod::collect_schemas(&factories));
@@ -51,6 +50,8 @@ impl ProviderState {
             .iter()
             .flat_map(|f| f.config_completions().remove("region").unwrap_or_default())
             .collect();
+        // Extract custom type names from provider schemas for completion
+        let custom_type_names = provider_mod::collect_custom_type_names(&schemas);
         let factories_arc = Arc::new(factories);
         Self {
             diagnostic_engine: DiagnosticEngine::new(
@@ -63,7 +64,7 @@ impl ProviderState {
                 Arc::clone(&schemas),
                 provider_names,
                 region_completions.clone(),
-                provider_context.validators.keys().cloned().collect(),
+                custom_type_names,
             ),
             semantic_tokens_provider: SemanticTokensProvider::new(&region_completions),
             hover_provider: HoverProvider::new(schemas, region_completions),
@@ -102,7 +103,7 @@ impl Backend {
     ) -> Self {
         let provider_context = Arc::new(provider_context);
         // Start with empty schemas — they will be loaded asynchronously after initialize
-        let state = ProviderState::new(vec![], &provider_context, HashMap::new());
+        let state = ProviderState::new(vec![], HashMap::new());
 
         Self {
             client,
@@ -153,8 +154,7 @@ impl Backend {
         let provider_configs = workspace::discover_providers(&workspace_root);
         if provider_configs.is_empty() {
             // Clear schemas when no providers are configured
-            *self.providers.write().await =
-                ProviderState::new(vec![], &self.provider_context, HashMap::new());
+            *self.providers.write().await = ProviderState::new(vec![], HashMap::new());
             let uris: Vec<Url> = self.documents.iter().map(|r| r.key().clone()).collect();
             for uri in uris {
                 self.update_diagnostics(uri).await;
@@ -183,7 +183,7 @@ impl Backend {
         }
 
         let factory_count = factories.len();
-        let new_state = ProviderState::new(factories, &self.provider_context, provider_errors);
+        let new_state = ProviderState::new(factories, provider_errors);
         *self.providers.write().await = new_state;
 
         self.client

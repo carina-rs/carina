@@ -567,7 +567,7 @@ pub async fn run_state_refresh(
     let mut parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
-    validate_and_resolve_with_config(&mut parsed, base_dir, true, provider_context)?;
+    validate_and_resolve_with_config(&mut parsed, base_dir, true)?;
 
     // Create backend
     let backend: Box<dyn StateBackend> = resolve_backend(parsed.backend.as_ref())
@@ -903,7 +903,7 @@ async fn run_state_migrate(
 ) -> Result<(), AppError> {
     let mut parsed = load_configuration_with_config(path, provider_context)?.parsed;
     let base_dir = get_base_dir(path);
-    validate_and_resolve_with_config(&mut parsed, base_dir, true, provider_context)?;
+    validate_and_resolve_with_config(&mut parsed, base_dir, true)?;
 
     // A backend block is required to know where to migrate to.
     let backend_config = parsed.backend.as_ref().ok_or_else(|| {

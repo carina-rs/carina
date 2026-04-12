@@ -100,19 +100,24 @@ pub fn validate_and_resolve(
     base_dir: &Path,
     skip_resource_validation: bool,
 ) -> Result<(), AppError> {
-    validate_and_resolve_with_config(
-        parsed,
-        base_dir,
-        skip_resource_validation,
-        &ProviderContext::default(),
-    )
+    validate_and_resolve_with_config(parsed, base_dir, skip_resource_validation)
+}
+
+/// Create a `ProviderContext` with custom type validators extracted from
+/// the already-collected schema map.
+fn enrich_provider_context(
+    schemas: &std::collections::HashMap<String, carina_core::schema::ResourceSchema>,
+) -> ProviderContext {
+    ProviderContext {
+        decryptor: None,
+        validators: carina_core::provider::collect_custom_type_validators(schemas),
+    }
 }
 
 pub fn validate_and_resolve_with_config(
     parsed: &mut ParsedFile,
     base_dir: &Path,
     skip_resource_validation: bool,
-    provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
     let (factories, load_errors) = build_factories_from_providers(&parsed.providers, base_dir);
     let ctx = WiringContext::new(factories);
@@ -144,8 +149,11 @@ pub fn validate_and_resolve_with_config(
     // Validate module call arguments before expansion
     validate_module_calls(parsed, base_dir)?;
 
+    // Enrich provider context with custom type validators from loaded schemas
+    let enriched_context = enrich_provider_context(ctx.schemas());
+
     // Resolve module imports and expand module calls
-    module_resolver::resolve_modules_with_config(parsed, base_dir, provider_context)
+    module_resolver::resolve_modules_with_config(parsed, base_dir, &enriched_context)
         .map_err(|e| format!("Module resolution error: {}", e))?;
 
     // Resolve names (let bindings -> resource names)
@@ -307,12 +315,7 @@ mod tests {
         });
 
         let base_dir = std::path::Path::new("/tmp/nonexistent-carina-test");
-        let result = validate_and_resolve_with_config(
-            &mut parsed,
-            base_dir,
-            false,
-            &ProviderContext::default(),
-        );
+        let result = validate_and_resolve_with_config(&mut parsed, base_dir, false);
 
         let err = result.unwrap_err();
         let msg = err.to_string();
@@ -344,12 +347,7 @@ mod tests {
         });
 
         let base_dir = std::path::Path::new("/tmp/nonexistent-carina-test");
-        let result = validate_and_resolve_with_config(
-            &mut parsed,
-            base_dir,
-            false,
-            &ProviderContext::default(),
-        );
+        let result = validate_and_resolve_with_config(&mut parsed, base_dir, false);
 
         let err = result.unwrap_err();
         let msg = err.to_string();
