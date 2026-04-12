@@ -150,7 +150,8 @@ block_content = { local_binding | attribute | nested_block }
 local_binding = { "let" ~ identifier ~ "=" ~ expression }
 
 // Attribute: key = value
-attribute = { identifier ~ "=" ~ expression }
+// Keys can be identifiers or quoted strings (for keys with dots, colons, etc.)
+attribute = { (identifier | string) ~ "=" ~ expression }
 
 // Nested block: key { ... } (like Terraform's ingress { ... })
 // Supports arbitrary nesting depth (block_content allows nested_block recursively)
@@ -227,7 +228,8 @@ list = { "[" ~ (expression ~ ("," ~ expression)*)? ~ ","? ~ "]" }
 map = { "{" ~ (map_entry | nested_block)* ~ "}" }
 
 // Map entry: key = value (with optional trailing comma)
-map_entry = { identifier ~ "=" ~ expression ~ ","? }
+// Keys can be identifiers or quoted strings (for keys with dots, colons, etc.)
+map_entry = { (identifier | string) ~ "=" ~ expression ~ ","? }
 
 // Resource expression: aws.s3_bucket { ... }
 resource_expr = { namespaced_id ~ "{" ~ block_content* ~ "}" }
