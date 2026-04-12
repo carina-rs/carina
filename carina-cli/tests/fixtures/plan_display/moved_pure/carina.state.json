@@ -1,0 +1,25 @@
+{
+  "version": 4,
+  "serial": 1,
+  "lineage": "test-moved-pure",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "ec2.vpc",
+      "name": "old_vpc",
+      "provider": "awscc",
+      "identifier": "vpc-old123",
+      "attributes": {
+        "vpc_id": "vpc-old123",
+        "cidr_block": "10.0.0.0/16"
+      },
+      "protected": false,
+      "lifecycle": { "force_delete": false, "create_before_destroy": false },
+      "prefixes": {},
+      "name_overrides": {},
+      "desired_keys": ["cidr_block"],
+      "binding": "old_vpc",
+      "dependency_bindings": []
+    }
+  ]
+}

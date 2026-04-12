@@ -179,6 +179,9 @@ struct TreeRenderContext<'a> {
     delete_attributes: Option<&'a HashMap<ResourceId, HashMap<String, Value>>>,
     schemas: Option<&'a HashMap<String, ResourceSchema>>,
     moved_origins: &'a HashMap<ResourceId, ResourceId>,
+    /// ResourceIds that are targets of Update or Replace effects.
+    /// Used to skip Move line display when the move is already shown via annotation.
+    update_or_replace_targets: HashSet<ResourceId>,
 }
 
 impl<'a> TreeRenderContext<'a> {
@@ -399,10 +402,10 @@ impl<'a> TreeRenderContext<'a> {
                 .unwrap();
             }
             Effect::Move { from, to } => {
-                // Skip Move line display when an Update/Replace with "(moved from: ...)"
-                // annotation already exists for this target. The Move effect stays in the
-                // plan for summary counting ("N to move").
-                if self.moved_origins.contains_key(to) {
+                // Skip Move line display when an Update/Replace effect already exists
+                // for this target — those effects show "(moved from: ...)" annotation.
+                // Pure moves (no Update/Replace) must be displayed.
+                if self.update_or_replace_targets.contains(to) {
                     return false;
                 }
                 writeln!(
@@ -541,6 +544,16 @@ fn format_plan_tree(
     // Build the single-parent tree with sorted siblings
     let (roots, dependents) = build_single_parent_tree(plan, &graph);
 
+    let update_or_replace_targets: HashSet<ResourceId> = plan
+        .effects()
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Update { to, .. } => Some(to.id.clone()),
+            Effect::Replace { to, .. } => Some(to.id.clone()),
+            _ => None,
+        })
+        .collect();
+
     let mut ctx = TreeRenderContext {
         out: String::new(),
         printed: HashSet::new(),
@@ -550,6 +563,7 @@ fn format_plan_tree(
         delete_attributes,
         schemas,
         moved_origins,
+        update_or_replace_targets,
     };
 
     // Print from roots

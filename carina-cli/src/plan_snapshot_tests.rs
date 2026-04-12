@@ -520,6 +520,39 @@ fn snapshot_moved_prev_keys() {
     insta::assert_snapshot!(output);
 }
 
+/// Pure move: Move effect with no attribute changes.
+///
+/// State has "old_vpc" with cidr_block=10.0.0.0/16.
+/// After move to "new_vpc", attributes are identical -> Move only, no Update.
+/// The Move line must be visible in the plan tree.
+#[test]
+fn snapshot_moved_pure() {
+    let (plan, schemas, moved_origins) = build_plan_from_fixture("moved_pure");
+    // Pure move should NOT have an Update effect
+    let has_update = plan
+        .effects()
+        .iter()
+        .any(|e| matches!(e, carina_core::effect::Effect::Update { .. }));
+    assert!(
+        !has_update,
+        "Pure move fixture should not produce an Update effect"
+    );
+    // But should have a Move effect
+    let has_move = plan
+        .effects()
+        .iter()
+        .any(|e| matches!(e, carina_core::effect::Effect::Move { .. }));
+    assert!(has_move, "Pure move fixture should produce a Move effect");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &moved_origins,
+    ));
+    insta::assert_snapshot!(output);
+}
+
 /// Ensure no fixture .crn file has unused `let` bindings.
 ///
 /// `let` should only be used when a binding is referenced by another resource.
@@ -547,7 +580,26 @@ fn no_unused_let_bindings_in_fixtures() {
         let loaded = load_configuration(&fixture_dir).unwrap();
         let unused = crate::wiring::check_unused_bindings(&loaded.unresolved_parsed);
         if !unused.is_empty() {
-            failures.push((fixture_name, unused));
+            // Moved block targets are structurally required bindings
+            let move_targets: HashSet<String> = loaded
+                .unresolved_parsed
+                .state_blocks
+                .iter()
+                .filter_map(|sb| {
+                    if let carina_core::parser::StateBlock::Moved { to, .. } = sb {
+                        Some(to.name.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let truly_unused: Vec<String> = unused
+                .into_iter()
+                .filter(|b| !move_targets.contains(b))
+                .collect();
+            if !truly_unused.is_empty() {
+                failures.push((fixture_name, truly_unused));
+            }
         }
     }
 
