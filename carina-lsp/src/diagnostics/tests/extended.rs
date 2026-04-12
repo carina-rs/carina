@@ -1385,3 +1385,67 @@ fn resource_validation_failed_with_attribute_points_to_attribute_line() {
         diag.range.start.line
     );
 }
+
+#[test]
+fn warning_when_provider_loaded_but_schema_missing() {
+    // Provider is loaded but doesn't have a schema for this resource type.
+    // Should show WARNING (not ERROR), not "Unknown resource type".
+    let engine = DiagnosticEngine::new(
+        Arc::new(HashMap::new()),
+        vec!["awscc".to_string()],
+        Arc::new(vec![]),
+    );
+    let doc = create_document(
+        r#"awscc.iam.role {
+  role_name = 'test'
+}
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let unknown_type = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Unknown resource type"));
+    assert!(
+        unknown_type.is_none(),
+        "Loaded provider should not show 'Unknown resource type'. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+
+    let no_schema = diagnostics
+        .iter()
+        .find(|d| d.message.contains("No schema for"));
+    assert!(
+        no_schema.is_some(),
+        "Should show 'No schema' warning. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        no_schema.unwrap().severity,
+        Some(DiagnosticSeverity::WARNING)
+    );
+}
+
+#[test]
+fn error_when_provider_not_loaded_at_all() {
+    // Provider completely unknown — not in provider_names, not in errors.
+    let engine = DiagnosticEngine::new(Arc::new(HashMap::new()), vec![], Arc::new(vec![]));
+    let doc = create_document(
+        r#"awscc.iam.role {
+  role_name = 'test'
+}
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let unknown_type = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Unknown resource type"));
+    assert!(
+        unknown_type.is_some(),
+        "Unknown provider should show 'Unknown resource type'. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}

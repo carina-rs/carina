@@ -72,6 +72,12 @@ impl ProviderState {
     }
 }
 
+impl ProviderState {
+    fn schema_count(&self) -> usize {
+        self.diagnostic_engine.schema_count()
+    }
+}
+
 /// Result of building provider factories: loaded factories + per-provider error messages.
 pub type FactoryBuildResult = (
     Vec<Box<dyn ProviderFactory>>,
@@ -186,10 +192,17 @@ impl Backend {
         let new_state = ProviderState::new(factories, provider_errors);
         *self.providers.write().await = new_state;
 
+        let schema_count = {
+            let providers = self.providers.read().await;
+            providers.schema_count()
+        };
         self.client
             .log_message(
                 MessageType::INFO,
-                format!("Loaded {} provider schema(s)", factory_count),
+                format!(
+                    "Loaded {} provider(s), {} resource type schema(s)",
+                    factory_count, schema_count
+                ),
             )
             .await;
 
