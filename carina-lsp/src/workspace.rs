@@ -93,6 +93,63 @@ fn discover_by_dir_recursive(dir: &Path, result: &mut HashMap<PathBuf, Vec<Provi
     }
 }
 
+/// Build a reverse import map: module directory → set of caller directories.
+///
+/// Scans all `.crn` files in the workspace for `import` statements, resolves
+/// the relative paths to absolute module directories, and maps each module
+/// to the directories that import it. This allows module files to inherit
+/// their callers' provider schemas.
+pub fn discover_import_map(workspace_root: &Path) -> HashMap<PathBuf, Vec<PathBuf>> {
+    let mut result: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+    discover_imports_recursive(workspace_root, &mut result);
+    result
+}
+
+fn discover_imports_recursive(dir: &Path, result: &mut HashMap<PathBuf, Vec<PathBuf>>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            discover_imports_recursive(&path, result);
+        } else if path.extension().is_some_and(|ext| ext == "crn")
+            && let Ok(content) = fs::read_to_string(&path)
+        {
+            let ctx = ProviderContext::default();
+            if let Ok(parsed) = parser::parse(&content, &ctx) {
+                let caller_dir = path.parent().unwrap_or(dir);
+                for import in &parsed.imports {
+                    let module_path = caller_dir.join(&import.path);
+                    // Resolve to canonical directory (strip .crn extension, handle dirs)
+                    let module_dir = if module_path.is_dir() {
+                        module_path
+                    } else if module_path.extension().is_some_and(|ext| ext == "crn") {
+                        module_path.parent().unwrap_or(&module_path).to_path_buf()
+                    } else {
+                        // Try with .crn extension
+                        let with_ext = module_path.with_extension("crn");
+                        if with_ext.exists() {
+                            with_ext.parent().unwrap_or(&module_path).to_path_buf()
+                        } else {
+                            // Might be a directory module
+                            module_path
+                        }
+                    };
+                    // Canonicalize to resolve .. and symlinks
+                    let module_dir = module_dir.canonicalize().unwrap_or(module_dir);
+                    let caller_dir = caller_dir
+                        .canonicalize()
+                        .unwrap_or(caller_dir.to_path_buf());
+                    result.entry(module_dir).or_default().push(caller_dir);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,5 +421,47 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let by_dir = discover_providers_by_dir(dir.path());
         assert!(by_dir.is_empty());
+    }
+
+    #[test]
+    fn discover_import_map_finds_module_callers() {
+        let dir = TempDir::new().unwrap();
+        let caller = dir.path().join("aws").join("github-oidc");
+        let module = dir.path().join("modules").join("github-oidc");
+        fs::create_dir_all(&caller).unwrap();
+        fs::create_dir_all(&module).unwrap();
+
+        // Caller imports the module
+        fs::write(
+            caller.join("main.crn"),
+            "let github = import '../../modules/github-oidc'\n",
+        )
+        .unwrap();
+        // Module has arguments (no provider)
+        fs::write(module.join("main.crn"), "arguments {\n  repo: string\n}\n").unwrap();
+
+        let import_map = discover_import_map(dir.path());
+
+        let module_canonical = module.canonicalize().unwrap();
+        assert!(
+            import_map.contains_key(&module_canonical),
+            "import_map should contain module dir. Keys: {:?}",
+            import_map.keys().collect::<Vec<_>>()
+        );
+
+        let callers = &import_map[&module_canonical];
+        let caller_canonical = caller.canonicalize().unwrap();
+        assert!(
+            callers.contains(&caller_canonical),
+            "callers should contain the caller dir. Got: {:?}",
+            callers
+        );
+    }
+
+    #[test]
+    fn discover_import_map_empty_workspace() {
+        let dir = TempDir::new().unwrap();
+        let import_map = discover_import_map(dir.path());
+        assert!(import_map.is_empty());
     }
 }
