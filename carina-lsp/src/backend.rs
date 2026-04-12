@@ -81,6 +81,9 @@ struct ProviderStates {
     /// Directory → ProviderState. Each directory with provider declarations
     /// gets its own state with its own schemas.
     by_dir: HashMap<PathBuf, ProviderState>,
+    /// Reverse import map: module directory → list of caller directories.
+    /// Used to resolve providers for module files that don't declare their own.
+    import_map: HashMap<PathBuf, Vec<PathBuf>>,
     /// Fallback state for files that don't belong to any config directory.
     empty: ProviderState,
 }
@@ -89,13 +92,18 @@ impl ProviderStates {
     fn new() -> Self {
         Self {
             by_dir: HashMap::new(),
+            import_map: HashMap::new(),
             empty: ProviderState::new(vec![], HashMap::new()),
         }
     }
 
-    /// Find the ProviderState for a given file path by walking up the
-    /// directory tree to find the nearest config directory.
+    /// Find the ProviderState for a given file path.
+    ///
+    /// 1. Walk up the directory tree to find the nearest config directory
+    /// 2. If not found, check if the file's directory is imported by a caller
+    ///    and use the caller's ProviderState
     fn state_for_path(&self, file_path: &Path) -> &ProviderState {
+        // First: walk up to find a config directory
         let mut dir = file_path.parent();
         while let Some(d) = dir {
             if let Some(state) = self.by_dir.get(d) {
@@ -103,6 +111,23 @@ impl ProviderStates {
             }
             dir = d.parent();
         }
+
+        // Second: check import map for module files
+        let file_dir = file_path.parent().unwrap_or(file_path);
+        let canonical = file_dir.canonicalize().unwrap_or(file_dir.to_path_buf());
+        if let Some(callers) = self.import_map.get(&canonical) {
+            for caller_dir in callers {
+                // Walk up from caller to find its config directory
+                let mut dir = Some(caller_dir.as_path());
+                while let Some(d) = dir {
+                    if let Some(state) = self.by_dir.get(d) {
+                        return state;
+                    }
+                    dir = d.parent();
+                }
+            }
+        }
+
         &self.empty
     }
 }
@@ -187,8 +212,12 @@ impl Backend {
         };
 
         let dir_providers = workspace::discover_providers_by_dir(&workspace_root);
+        let import_map = workspace::discover_import_map(&workspace_root);
+
         if dir_providers.is_empty() {
-            *self.providers.write().await = ProviderStates::new();
+            let mut states = ProviderStates::new();
+            states.import_map = import_map;
+            *self.providers.write().await = states;
             let uris: Vec<Url> = self.documents.iter().map(|r| r.key().clone()).collect();
             for uri in uris {
                 self.update_diagnostics(uri).await;
@@ -233,6 +262,7 @@ impl Backend {
             states.by_dir.insert(dir.clone(), state);
         }
 
+        states.import_map = import_map;
         let dir_count = states.by_dir.len();
         *self.providers.write().await = states;
 
