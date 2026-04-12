@@ -797,6 +797,16 @@ fn type_completion_includes_basic_types() {
         string_completion.kind,
         Some(CompletionItemKind::TYPE_PARAMETER)
     );
+
+    // Built-in custom types should always appear (no provider needed)
+    for builtin_custom in &["cidr", "ipv4_address", "ipv6_cidr", "ipv6_address"] {
+        assert!(
+            labels.contains(builtin_custom),
+            "Type completions should include built-in custom type '{}'. Got: {:?}",
+            builtin_custom,
+            labels
+        );
+    }
 }
 
 #[test]
@@ -824,9 +834,8 @@ fn type_completion_includes_generic_constructors() {
 }
 
 #[test]
-#[ignore = "requires provider schemas"]
 fn type_completion_includes_custom_types() {
-    let provider = test_provider();
+    let provider = test_provider_with_custom_types();
     let doc = create_document("arguments {\naddr: ");
     let position = Position {
         line: 1,
@@ -843,8 +852,32 @@ fn type_completion_includes_custom_types() {
         labels
     );
     assert!(
+        labels.contains(&"iam_policy_arn"),
+        "Type completions should include 'iam_policy_arn'. Got: {:?}",
+        labels
+    );
+    assert!(
         labels.contains(&"availability_zone"),
         "Type completions should include 'availability_zone'. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn type_completion_custom_types_inside_list() {
+    let provider = test_provider_with_custom_types();
+    let doc = create_document("arguments {\npolicies: list(");
+    let position = Position {
+        line: 1,
+        character: 15,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"iam_policy_arn"),
+        "Custom types should appear inside list(). Got: {:?}",
         labels
     );
 }
