@@ -239,6 +239,16 @@ git wt
 git wt -d <branch-name>
 ```
 
+### Submodule Initialization
+
+This repo uses a git submodule for `carina-plugin-wit/`. After `git pull` or creating a new worktree, initialize the submodule:
+
+```bash
+git submodule update --init --recursive
+```
+
+Without this, builds will fail because `wit_bindgen::generate!` cannot find the WIT files.
+
 ### Branch Cleanup
 
 After merging a PR, clean up branches:
