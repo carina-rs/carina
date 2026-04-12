@@ -1,5 +1,6 @@
 //! Workspace scanning: discover provider configurations from .crn files.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -42,6 +43,49 @@ fn discover_providers_recursive(
                 for provider in parsed.providers {
                     if seen_names.insert(provider.name.clone()) {
                         providers.push((source_dir.to_path_buf(), provider));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Discover provider configurations grouped by directory.
+///
+/// Unlike `discover_providers` which deduplicates globally, this groups
+/// providers by their source directory. Each directory is an independent
+/// Carina configuration with its own set of providers.
+/// Within a single directory, duplicate provider names are deduplicated.
+pub fn discover_providers_by_dir(workspace_root: &Path) -> HashMap<PathBuf, Vec<ProviderConfig>> {
+    let mut result: HashMap<PathBuf, Vec<ProviderConfig>> = HashMap::new();
+    discover_by_dir_recursive(workspace_root, &mut result);
+    result
+}
+
+fn discover_by_dir_recursive(dir: &Path, result: &mut HashMap<PathBuf, Vec<ProviderConfig>>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            discover_by_dir_recursive(&path, result);
+        } else if path.extension().is_some_and(|ext| ext == "crn")
+            && let Ok(content) = fs::read_to_string(&path)
+        {
+            let ctx = ProviderContext::default();
+            if let Ok(parsed) = parser::parse(&content, &ctx)
+                && !parsed.providers.is_empty()
+            {
+                let source_dir = path.parent().unwrap_or(dir).to_path_buf();
+                let dir_providers = result.entry(source_dir).or_default();
+                let seen: std::collections::HashSet<String> =
+                    dir_providers.iter().map(|p| p.name.clone()).collect();
+                for provider in parsed.providers {
+                    if !seen.contains(&provider.name) {
+                        dir_providers.push(provider);
                     }
                 }
             }
@@ -239,5 +283,86 @@ mod tests {
             "source_dir should be one of the subdirectories, got: {:?}",
             providers[0].0
         );
+    }
+
+    #[test]
+    fn discover_by_dir_groups_by_directory() {
+        let dir = TempDir::new().unwrap();
+        let env_a = dir.path().join("env_a");
+        let env_b = dir.path().join("env_b");
+        fs::create_dir_all(&env_a).unwrap();
+        fs::create_dir_all(&env_b).unwrap();
+
+        fs::write(
+            env_a.join("providers.crn"),
+            "provider aws {\n  region = 'us-east-1'\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            env_b.join("providers.crn"),
+            "provider awscc {\n  region = 'ap-northeast-1'\n}\n",
+        )
+        .unwrap();
+
+        let by_dir = discover_providers_by_dir(dir.path());
+        assert_eq!(by_dir.len(), 2);
+        assert_eq!(by_dir[&env_a].len(), 1);
+        assert_eq!(by_dir[&env_a][0].name, "aws");
+        assert_eq!(by_dir[&env_b].len(), 1);
+        assert_eq!(by_dir[&env_b][0].name, "awscc");
+    }
+
+    #[test]
+    fn discover_by_dir_same_provider_in_different_dirs_not_deduplicated() {
+        let dir = TempDir::new().unwrap();
+        let env_a = dir.path().join("env_a");
+        let env_b = dir.path().join("env_b");
+        fs::create_dir_all(&env_a).unwrap();
+        fs::create_dir_all(&env_b).unwrap();
+
+        // Same provider name in two directories — both should appear
+        fs::write(
+            env_a.join("providers.crn"),
+            "provider aws {\n  region = 'us-east-1'\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            env_b.join("providers.crn"),
+            "provider aws {\n  region = 'ap-northeast-1'\n}\n",
+        )
+        .unwrap();
+
+        let by_dir = discover_providers_by_dir(dir.path());
+        assert_eq!(by_dir.len(), 2);
+        assert!(by_dir.contains_key(&env_a));
+        assert!(by_dir.contains_key(&env_b));
+    }
+
+    #[test]
+    fn discover_by_dir_deduplicates_within_same_directory() {
+        let dir = TempDir::new().unwrap();
+        // Two files in the same directory both declare provider aws
+        fs::write(
+            dir.path().join("a.crn"),
+            "provider aws {\n  region = 'us-east-1'\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("b.crn"),
+            "provider aws {\n  region = 'ap-northeast-1'\n}\n",
+        )
+        .unwrap();
+
+        let by_dir = discover_providers_by_dir(dir.path());
+        assert_eq!(by_dir.len(), 1);
+        assert_eq!(by_dir[dir.path()].len(), 1);
+        assert_eq!(by_dir[dir.path()][0].name, "aws");
+    }
+
+    #[test]
+    fn discover_by_dir_empty_workspace() {
+        let dir = TempDir::new().unwrap();
+        let by_dir = discover_providers_by_dir(dir.path());
+        assert!(by_dir.is_empty());
     }
 }

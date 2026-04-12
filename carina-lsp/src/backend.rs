@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use carina_core::formatter::{self, FormatConfig};
@@ -70,11 +70,40 @@ impl ProviderState {
             hover_provider: HoverProvider::new(schemas, region_completions),
         }
     }
-}
 
-impl ProviderState {
     fn schema_count(&self) -> usize {
         self.diagnostic_engine.schema_count()
+    }
+}
+
+/// Per-directory provider states keyed by configuration directory.
+struct ProviderStates {
+    /// Directory → ProviderState. Each directory with provider declarations
+    /// gets its own state with its own schemas.
+    by_dir: HashMap<PathBuf, ProviderState>,
+    /// Fallback state for files that don't belong to any config directory.
+    empty: ProviderState,
+}
+
+impl ProviderStates {
+    fn new() -> Self {
+        Self {
+            by_dir: HashMap::new(),
+            empty: ProviderState::new(vec![], HashMap::new()),
+        }
+    }
+
+    /// Find the ProviderState for a given file path by walking up the
+    /// directory tree to find the nearest config directory.
+    fn state_for_path(&self, file_path: &Path) -> &ProviderState {
+        let mut dir = file_path.parent();
+        while let Some(d) = dir {
+            if let Some(state) = self.by_dir.get(d) {
+                return state;
+            }
+            dir = d.parent();
+        }
+        &self.empty
     }
 }
 
@@ -95,7 +124,7 @@ pub type FactoryBuilder = Arc<
 pub struct Backend {
     client: Client,
     documents: DashMap<Url, Document>,
-    providers: tokio::sync::RwLock<ProviderState>,
+    providers: tokio::sync::RwLock<ProviderStates>,
     provider_context: Arc<ProviderContext>,
     workspace_root: tokio::sync::OnceCell<Option<PathBuf>>,
     factory_builder: Option<FactoryBuilder>,
@@ -108,13 +137,11 @@ impl Backend {
         factory_builder: Option<FactoryBuilder>,
     ) -> Self {
         let provider_context = Arc::new(provider_context);
-        // Start with empty schemas — they will be loaded asynchronously after initialize
-        let state = ProviderState::new(vec![], HashMap::new());
 
         Self {
             client,
             documents: DashMap::new(),
-            providers: tokio::sync::RwLock::new(state),
+            providers: tokio::sync::RwLock::new(ProviderStates::new()),
             provider_context,
             workspace_root: tokio::sync::OnceCell::new(),
             factory_builder,
@@ -134,9 +161,11 @@ impl Backend {
                 .and_then(|p| p.parent().map(|p| p.to_path_buf()));
 
             let providers = self.providers.read().await;
-            let diagnostics = providers
-                .diagnostic_engine
-                .analyze(&doc, base_path.as_deref());
+            let state = base_path
+                .as_ref()
+                .map(|p| providers.state_for_path(p))
+                .unwrap_or(&providers.empty);
+            let diagnostics = state.diagnostic_engine.analyze(&doc, base_path.as_deref());
             drop(providers);
 
             self.client
@@ -157,10 +186,9 @@ impl Backend {
             None => return,
         };
 
-        let provider_configs = workspace::discover_providers(&workspace_root);
-        if provider_configs.is_empty() {
-            // Clear schemas when no providers are configured
-            *self.providers.write().await = ProviderState::new(vec![], HashMap::new());
+        let dir_providers = workspace::discover_providers_by_dir(&workspace_root);
+        if dir_providers.is_empty() {
+            *self.providers.write().await = ProviderStates::new();
             let uris: Vec<Url> = self.documents.iter().map(|r| r.key().clone()).collect();
             for uri in uris {
                 self.update_diagnostics(uri).await;
@@ -168,40 +196,52 @@ impl Backend {
             return;
         }
 
-        // Build factories using the injected builder (runs WASM loading)
-        let (factories, provider_errors) = tokio::task::spawn_blocking({
-            let configs = provider_configs.clone();
-            let builder = Arc::clone(factory_builder);
-            move || builder(&configs)
-        })
-        .await
-        .unwrap_or_default();
+        // Build factories per directory. Each directory gets its own set of
+        // provider factories loaded from its own provider configs.
+        // WASM loading is cached on disk, so repeated loads are fast.
+        let mut states = ProviderStates::new();
+        let mut total_schemas = 0;
 
-        if !provider_errors.is_empty() {
-            for (name, reason) in &provider_errors {
+        for (dir, configs) in &dir_providers {
+            let dir_configs: Vec<(PathBuf, carina_core::parser::ProviderConfig)> =
+                configs.iter().map(|c| (dir.clone(), c.clone())).collect();
+
+            let (dir_factories, dir_errors) = tokio::task::spawn_blocking({
+                let configs = dir_configs;
+                let builder = Arc::clone(factory_builder);
+                move || builder(&configs)
+            })
+            .await
+            .unwrap_or_default();
+
+            for (name, reason) in &dir_errors {
                 self.client
                     .log_message(
                         MessageType::WARNING,
-                        format!("Provider '{}' not loaded: {}", name, reason),
+                        format!(
+                            "Provider '{}' not loaded in {}: {}",
+                            name,
+                            dir.display(),
+                            reason
+                        ),
                     )
                     .await;
             }
+
+            let state = ProviderState::new(dir_factories, dir_errors);
+            total_schemas += state.schema_count();
+            states.by_dir.insert(dir.clone(), state);
         }
 
-        let factory_count = factories.len();
-        let new_state = ProviderState::new(factories, provider_errors);
-        *self.providers.write().await = new_state;
+        let dir_count = states.by_dir.len();
+        *self.providers.write().await = states;
 
-        let schema_count = {
-            let providers = self.providers.read().await;
-            providers.schema_count()
-        };
         self.client
             .log_message(
                 MessageType::INFO,
                 format!(
-                    "Loaded {} provider(s), {} resource type schema(s)",
-                    factory_count, schema_count
+                    "Loaded providers for {} directory(s), {} resource type schema(s) total",
+                    dir_count, total_schemas
                 ),
             )
             .await;
@@ -336,8 +376,12 @@ impl LanguageServer for Backend {
                 .and_then(|p| p.parent().map(|p| p.to_path_buf()));
 
             let providers = self.providers.read().await;
+            let state = base_path
+                .as_ref()
+                .map(|p| providers.state_for_path(p))
+                .unwrap_or(&providers.empty);
             let completions =
-                providers
+                state
                     .completion_provider
                     .complete(&doc, position, base_path.as_deref());
             return Ok(Some(CompletionResponse::Array(completions)));
@@ -355,7 +399,11 @@ impl LanguageServer for Backend {
                 .ok()
                 .and_then(|p| p.parent().map(|p| p.to_path_buf()));
             let providers = self.providers.read().await;
-            return Ok(providers.hover_provider.hover_with_base_path(
+            let state = base_path
+                .as_ref()
+                .map(|p| providers.state_for_path(p))
+                .unwrap_or(&providers.empty);
+            return Ok(state.hover_provider.hover_with_base_path(
                 &doc,
                 position,
                 base_path.as_deref(),
@@ -371,8 +419,16 @@ impl LanguageServer for Backend {
         let uri = &params.text_document.uri;
 
         if let Some(doc) = self.documents.get(uri) {
+            let base_path = uri
+                .to_file_path()
+                .ok()
+                .and_then(|p| p.parent().map(|p| p.to_path_buf()));
             let providers = self.providers.read().await;
-            let tokens = providers.semantic_tokens_provider.tokenize(&doc.text());
+            let state = base_path
+                .as_ref()
+                .map(|p| providers.state_for_path(p))
+                .unwrap_or(&providers.empty);
+            let tokens = state.semantic_tokens_provider.tokenize(&doc.text());
             return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
                 result_id: None,
                 data: tokens,
