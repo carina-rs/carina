@@ -474,8 +474,11 @@ pub enum TypeError {
     #[error("Required attribute '{name}' is missing")]
     MissingRequired { name: String },
 
-    #[error("Unknown attribute '{name}'")]
-    UnknownAttribute { name: String },
+    #[error("Unknown attribute '{name}'{}", suggestion.as_ref().map(|s| format!(", did you mean '{}'?", s)).unwrap_or_default())]
+    UnknownAttribute {
+        name: String,
+        suggestion: Option<String>,
+    },
 
     #[error("Unknown field '{field}' in {struct_name}{}", suggestion.as_ref().map(|s| format!(", did you mean '{}'?", s)).unwrap_or_default())]
     UnknownStructField {
@@ -882,14 +885,36 @@ impl ResourceSchema {
             }
         }
 
-        // Type check each attribute
+        // Build block_name -> canonical_name map for alias resolution
+        let bn_map = self.block_name_map();
+
+        // Build suggestion candidates (canonical names + block name aliases)
+        let mut known: Vec<&str> = self.attributes.keys().map(|s| s.as_str()).collect();
+        for bn in bn_map.keys() {
+            known.push(bn.as_str());
+        }
+
+        // Type check each attribute and reject unknown ones
         for (name, value) in attributes {
-            if let Some(schema) = self.attributes.get(name)
-                && let Err(e) = schema.attr_type.validate(value)
-            {
-                errors.push(e);
+            // Skip internal attributes (e.g., _binding)
+            if name.starts_with('_') {
+                continue;
             }
-            // Unknown attributes are allowed (for flexibility)
+
+            // Resolve block_name alias to canonical name
+            let canonical = bn_map.get(name).map(|s| s.as_str()).unwrap_or(name);
+
+            if let Some(schema) = self.attributes.get(canonical) {
+                if let Err(e) = schema.attr_type.validate(value) {
+                    errors.push(e);
+                }
+            } else {
+                let suggestion = suggest_similar_name(name, &known);
+                errors.push(TypeError::UnknownAttribute {
+                    name: name.clone(),
+                    suggestion,
+                });
+            }
         }
 
         // Run custom validator if present
@@ -2986,5 +3011,104 @@ mod tests {
     fn test_resource_schema_without_operation_config() {
         let schema = ResourceSchema::new("ec2.vpc");
         assert!(schema.operation_config.is_none());
+    }
+
+    #[test]
+    fn validate_rejects_unknown_attribute() {
+        let schema = ResourceSchema::new("s3.bucket")
+            .attribute(AttributeSchema::new("bucket_name", AttributeType::String));
+
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "bucket_name".to_string(),
+            Value::String("my-bucket".to_string()),
+        );
+        attrs.insert("tags".to_string(), Value::Map(HashMap::new()));
+
+        let result = schema.validate(&attrs);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(&errors[0], TypeError::UnknownAttribute { name, .. } if name == "tags"));
+    }
+
+    #[test]
+    fn validate_allows_known_attributes_only() {
+        let schema = ResourceSchema::new("s3.bucket")
+            .attribute(AttributeSchema::new("bucket_name", AttributeType::String))
+            .attribute(AttributeSchema::new(
+                "tags",
+                AttributeType::Map(Box::new(AttributeType::String)),
+            ));
+
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "bucket_name".to_string(),
+            Value::String("my-bucket".to_string()),
+        );
+        attrs.insert("tags".to_string(), Value::Map(HashMap::new()));
+
+        assert!(schema.validate(&attrs).is_ok());
+    }
+
+    #[test]
+    fn validate_unknown_attribute_with_suggestion() {
+        let schema = ResourceSchema::new("s3.bucket")
+            .attribute(AttributeSchema::new("bucket_name", AttributeType::String));
+
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "bukcet_name".to_string(),
+            Value::String("my-bucket".to_string()),
+        );
+
+        let result = schema.validate(&attrs);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert_eq!(errors.len(), 1);
+        match &errors[0] {
+            TypeError::UnknownAttribute { name, suggestion } => {
+                assert_eq!(name, "bukcet_name");
+                assert_eq!(suggestion.as_deref(), Some("bucket_name"));
+            }
+            other => panic!("Expected UnknownAttribute, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_block_name_alias() {
+        let schema = ResourceSchema::new("ec2.security_group").attribute(
+            AttributeSchema::new(
+                "ingress_rules",
+                AttributeType::List {
+                    inner: Box::new(AttributeType::String),
+                    ordered: false,
+                },
+            )
+            .with_block_name("ingress_rule"),
+        );
+
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "ingress_rule".to_string(),
+            Value::List(vec![Value::String("rule1".to_string())]),
+        );
+
+        assert!(schema.validate(&attrs).is_ok());
+    }
+
+    #[test]
+    fn validate_skips_internal_attributes() {
+        let schema = ResourceSchema::new("s3.bucket")
+            .attribute(AttributeSchema::new("bucket_name", AttributeType::String));
+
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "bucket_name".to_string(),
+            Value::String("my-bucket".to_string()),
+        );
+        attrs.insert("_binding".to_string(), Value::String("b".to_string()));
+
+        assert!(schema.validate(&attrs).is_ok());
     }
 }
