@@ -702,6 +702,22 @@ pub async fn create_plan_from_parsed_with_remote(
 
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
 
+    // Build state-file-derived maps up front so anonymous → let-bound
+    // rename transfer (#1685) can run between refresh phases 1 and 2.
+    // These maps only depend on `state_file`, not on refresh output.
+    let mut saved_attrs = state_file
+        .as_ref()
+        .map(|sf| sf.build_saved_attrs())
+        .unwrap_or_default();
+    let mut prev_desired_keys = state_file
+        .as_ref()
+        .map(|sf| sf.build_desired_keys())
+        .unwrap_or_default();
+    // `moved_pairs` accumulates explicit `moved` block transfers and
+    // detected anonymous → let-bound renames. Populated inside the
+    // refresh block so the later plan-building code sees them.
+    let mut moved_pairs: Vec<(ResourceId, ResourceId)> = Vec::new();
+
     if refresh {
         RefreshProgress::start_header();
         let multi = refresh_multi_progress();
@@ -765,40 +781,11 @@ pub async fn create_plan_from_parsed_with_remote(
             current_states.insert(id, state);
         }
 
-        // Phase 2: resolve data source refs against phase 1's state,
-        // then refresh them via `read_data_source`.
-        let resolved_data_sources = resolve_data_source_refs_for_refresh(
-            &sorted_resources,
-            &current_states,
-            remote_bindings,
-        )?;
-        let phase2_results: Vec<Result<(ResourceId, State), AppError>> =
-            stream::iter(resolved_data_sources.iter())
-                .map(|resource| {
-                    let progress = RefreshProgress::begin_multi(&multi, &resource.id);
-                    let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
-                    async move {
-                        let mut state = read_data_source_with_retry(provider_ref, resource)
-                            .await
-                            .map_err(AppError::Provider)?;
-                        if let Some(deps) = dep_bindings {
-                            state.dependency_bindings = deps;
-                        }
-                        progress.finish();
-                        Ok((resource.id.clone(), state))
-                    }
-                })
-                .buffer_unordered(5)
-                .collect()
-                .await;
-        for result in phase2_results {
-            let (id, state) = result?;
-            current_states.insert(id, state);
-        }
-
-        // Seed current_states with orphaned resources from state file (#844).
-        // These are resources tracked in state but removed from the .crn config.
-        // Refresh each orphan via provider.read() concurrently to verify it still exists (#931).
+        // Refresh orphaned resources (#844). These are tracked in state
+        // but removed from the .crn config — they're looked up by their
+        // *old* name, which includes the pre-rename anonymous name of a
+        // let-bound resource. Must run before the rename transfer below
+        // so that transfer has the old-name state entries to move.
         if let Some(sf) = state_file.as_ref() {
             let desired_ids: HashSet<ResourceId> =
                 sorted_resources.iter().map(|r| r.id.clone()).collect();
@@ -837,6 +824,66 @@ pub async fn create_plan_from_parsed_with_remote(
                 }
             }
         }
+
+        // Hydrate now — before phase 2 resolves data source refs — so
+        // any attributes the provider's read() didn't return are
+        // available when building the binding map (#1685).
+        provider.hydrate_read_state(&mut current_states, &saved_attrs);
+
+        // Transfer state for explicit `moved` blocks and anonymous →
+        // let-bound renames (#1685). Must run before phase 2 so the ref
+        // resolver sees state entries under their *new* binding name.
+        // Detection operates on `sorted_resources` (pre-resolved), which
+        // is sufficient for the common case of literal create-only
+        // attributes; resources with ResourceRef create-only values are
+        // an orthogonal edge case that pre-dates this fix.
+        moved_pairs.extend(materialize_moved_states(
+            &mut current_states,
+            &mut prev_desired_keys,
+            &mut saved_attrs,
+            &parsed.state_blocks,
+            state_file,
+        ));
+        moved_pairs.extend(apply_anonymous_to_named_renames(
+            &ctx,
+            &sorted_resources,
+            &parsed.providers,
+            &mut current_states,
+            &mut prev_desired_keys,
+            &mut saved_attrs,
+            state_file,
+        ));
+
+        // Phase 2: resolve data source refs against the consolidated
+        // `current_states`, then refresh each via `read_data_source`.
+        let resolved_data_sources = resolve_data_source_refs_for_refresh(
+            &sorted_resources,
+            &current_states,
+            remote_bindings,
+        )?;
+        let phase2_results: Vec<Result<(ResourceId, State), AppError>> =
+            stream::iter(resolved_data_sources.iter())
+                .map(|resource| {
+                    let progress = RefreshProgress::begin_multi(&multi, &resource.id);
+                    let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
+                    async move {
+                        let mut state = read_data_source_with_retry(provider_ref, resource)
+                            .await
+                            .map_err(AppError::Provider)?;
+                        if let Some(deps) = dep_bindings {
+                            state.dependency_bindings = deps;
+                        }
+                        progress.finish();
+                        Ok((resource.id.clone(), state))
+                    }
+                })
+                .buffer_unordered(5)
+                .collect()
+                .await;
+        for result in phase2_results {
+            let (id, state) = result?;
+            current_states.insert(id, state);
+        }
     } else {
         // --refresh=false: use cached state from state file instead of calling provider.read()
         if let Some(sf) = state_file.as_ref() {
@@ -851,6 +898,28 @@ pub async fn create_plan_from_parsed_with_remote(
             for (id, state) in sf.build_orphan_states(&desired_ids) {
                 current_states.entry(id).or_insert(state);
             }
+
+            // Transfer state for moved blocks and anonymous → let-bound
+            // renames so the later `resolve_refs_with_state_and_remote`
+            // call (and data-source-input resolution) sees entries
+            // under their current binding names (#1685).
+            provider.hydrate_read_state(&mut current_states, &saved_attrs);
+            moved_pairs.extend(materialize_moved_states(
+                &mut current_states,
+                &mut prev_desired_keys,
+                &mut saved_attrs,
+                &parsed.state_blocks,
+                state_file,
+            ));
+            moved_pairs.extend(apply_anonymous_to_named_renames(
+                &ctx,
+                &sorted_resources,
+                &parsed.providers,
+                &mut current_states,
+                &mut prev_desired_keys,
+                &mut saved_attrs,
+                state_file,
+            ));
         } else {
             // No state file: all resources are new (not found)
             for resource in &sorted_resources {
@@ -867,13 +936,6 @@ pub async fn create_plan_from_parsed_with_remote(
     } else {
         HashMap::new()
     };
-
-    // Restore unreturned attributes from state file (CloudControl doesn't always return them)
-    let mut saved_attrs = state_file
-        .as_ref()
-        .map(|sf| sf.build_saved_attrs())
-        .unwrap_or_default();
-    provider.hydrate_read_state(&mut current_states, &saved_attrs);
 
     // Resolve ResourceRef values and enum identifiers using AWS state
     let mut resources = sorted_resources.clone();
@@ -901,39 +963,6 @@ pub async fn create_plan_from_parsed_with_remote(
     // and current states so the differ sees canonical AWS values.
     resolve_enum_aliases_with_ctx(&ctx, &mut resources);
     resolve_enum_aliases_in_states(&ctx, &mut current_states);
-
-    // Build prev_desired_keys before moved-state transfer
-    // so materialize_moved_states can re-key them under the new resource name.
-    let mut prev_desired_keys = state_file
-        .as_ref()
-        .map(|sf| sf.build_desired_keys())
-        .unwrap_or_default();
-
-    // Pre-process moved blocks: transfer state, prev_desired_keys, and
-    // saved_attrs from old name to new name so the differ sees attribute
-    // changes (including removals) and produces Update/Replace effects.
-    let mut moved_pairs = materialize_moved_states(
-        &mut current_states,
-        &mut prev_desired_keys,
-        &mut saved_attrs,
-        &parsed.state_blocks,
-        state_file,
-    );
-
-    // Detect let-bound resources that were previously anonymous with matching
-    // create-only attributes, and transfer their state the same way a user-
-    // written `moved` block would. This turns a dangerous delete+create plan
-    // into an in-place rename for resources whose destruction has side effects
-    // (e.g., awscc.sso.instance).
-    moved_pairs.extend(apply_anonymous_to_named_renames(
-        &ctx,
-        &resources,
-        &parsed.providers,
-        &mut current_states,
-        &mut prev_desired_keys,
-        &mut saved_attrs,
-        state_file,
-    ));
 
     // Build lifecycles map from state file for orphaned resource deletion
     let lifecycles = state_file

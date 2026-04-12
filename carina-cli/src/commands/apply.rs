@@ -1019,106 +1019,83 @@ async fn run_apply_locked(
     // reference `remote_state` blocks can be resolved during refresh (#1683).
     let remote_bindings = super::plan::load_remote_states(&parsed.remote_states, base_dir).await?;
 
+    // Build state-file-derived maps up front so anonymous → let-bound
+    // rename transfer (#1685) can run between refresh phases 1 and 2.
+    let mut saved_attrs = state_file
+        .as_ref()
+        .map(|sf| sf.build_saved_attrs())
+        .unwrap_or_default();
+    let mut prev_desired_keys = state_file
+        .as_ref()
+        .map(|sf| sf.build_desired_keys())
+        .unwrap_or_default();
+
     // Read states for all resources using identifier from state
     // In identifier-based approach, if there's no identifier in state, the resource doesn't exist
     // Skip virtual resources (module attribute containers) — they have no infrastructure.
     RefreshProgress::start_header();
     let multi = refresh_multi_progress();
-    let current_states: HashMap<ResourceId, State> = {
-        let provider_ref = &provider;
-        // Pre-build dependency_bindings from state file so we can restore them
-        // after refresh. Provider.read() doesn't know about this metadata (#1565).
-        let saved_dep_bindings: HashMap<ResourceId, Vec<String>> = state_file
-            .as_ref()
-            .map(|sf| {
-                sorted_resources
-                    .iter()
-                    .filter_map(|r| {
-                        let rs =
-                            sf.find_resource(&r.id.provider, &r.id.resource_type, &r.id.name)?;
-                        if rs.dependency_bindings.is_empty() {
-                            None
-                        } else {
-                            Some((r.id.clone(), rs.dependency_bindings.clone()))
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Phase 1: refresh managed (non-data-source) resources in parallel.
-        let phase1_results: Vec<Result<(ResourceId, State), AppError>> = stream::iter(
+    let provider_ref = &provider;
+    let mut current_states: HashMap<ResourceId, State> = HashMap::new();
+    // Pre-build dependency_bindings from state file so we can restore them
+    // after refresh. Provider.read() doesn't know about this metadata (#1565).
+    let saved_dep_bindings: HashMap<ResourceId, Vec<String>> = state_file
+        .as_ref()
+        .map(|sf| {
             sorted_resources
                 .iter()
-                .filter(|r| !r.is_virtual() && !r.is_data_source()),
-        )
-        .map(|resource| {
-            let progress = RefreshProgress::begin_multi(&multi, &resource.id);
-            let identifier = state_file
-                .as_ref()
-                .and_then(|sf| sf.get_identifier_for_resource(resource));
-            let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
-            async move {
-                let mut state = read_with_retry(provider_ref, &resource.id, identifier.as_deref())
-                    .await
-                    .map_err(AppError::Provider)?;
-                if let Some(deps) = dep_bindings {
-                    state.dependency_bindings = deps;
-                }
-                progress.finish();
-                Ok((resource.id.clone(), state))
-            }
-        })
-        .buffer_unordered(5)
-        .collect()
-        .await;
-        let mut states = HashMap::new();
-        for result in phase1_results {
-            let (id, state) = result?;
-            states.insert(id, state);
-        }
-
-        // Phase 2: resolve data source inputs against phase 1 state and
-        // refresh them via `read_data_source` (#1683).
-        let resolved_data_sources =
-            resolve_data_source_refs_for_refresh(&sorted_resources, &states, &remote_bindings)?;
-        let phase2_results: Vec<Result<(ResourceId, State), AppError>> =
-            stream::iter(resolved_data_sources.iter())
-                .map(|resource| {
-                    let progress = RefreshProgress::begin_multi(&multi, &resource.id);
-                    let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
-                    async move {
-                        let mut state = read_data_source_with_retry(provider_ref, resource)
-                            .await
-                            .map_err(AppError::Provider)?;
-                        if let Some(deps) = dep_bindings {
-                            state.dependency_bindings = deps;
-                        }
-                        progress.finish();
-                        Ok((resource.id.clone(), state))
+                .filter_map(|r| {
+                    let rs = sf.find_resource(&r.id.provider, &r.id.resource_type, &r.id.name)?;
+                    if rs.dependency_bindings.is_empty() {
+                        None
+                    } else {
+                        Some((r.id.clone(), rs.dependency_bindings.clone()))
                     }
                 })
-                .buffer_unordered(5)
                 .collect()
-                .await;
-        for result in phase2_results {
-            let (id, state) = result?;
-            states.insert(id, state);
-        }
-        states
-    };
+        })
+        .unwrap_or_default();
 
-    // Seed current_states with orphaned resources from state file (#844).
-    // These are resources tracked in state but removed from the .crn config.
-    // Refresh each orphan via provider.read() to verify it still exists (#1598).
-    let mut current_states = current_states;
+    // Phase 1: refresh managed (non-data-source) resources in parallel.
+    let phase1_results: Vec<Result<(ResourceId, State), AppError>> = stream::iter(
+        sorted_resources
+            .iter()
+            .filter(|r| !r.is_virtual() && !r.is_data_source()),
+    )
+    .map(|resource| {
+        let progress = RefreshProgress::begin_multi(&multi, &resource.id);
+        let identifier = state_file
+            .as_ref()
+            .and_then(|sf| sf.get_identifier_for_resource(resource));
+        let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
+        async move {
+            let mut state = read_with_retry(provider_ref, &resource.id, identifier.as_deref())
+                .await
+                .map_err(AppError::Provider)?;
+            if let Some(deps) = dep_bindings {
+                state.dependency_bindings = deps;
+            }
+            progress.finish();
+            Ok((resource.id.clone(), state))
+        }
+    })
+    .buffer_unordered(5)
+    .collect()
+    .await;
+    for result in phase1_results {
+        let (id, state) = result?;
+        current_states.insert(id, state);
+    }
+
+    // Refresh orphaned resources (#844, #1685). Must run before the
+    // rename transfer below so old-name entries are present for
+    // `apply_anonymous_to_named_renames` to transfer.
     let mut orphan_dependencies: HashMap<ResourceId, Vec<String>> = HashMap::new();
     if let Some(sf) = state_file.as_ref() {
         let desired_ids: HashSet<ResourceId> =
             sorted_resources.iter().map(|r| r.id.clone()).collect();
         let orphan_states: Vec<(ResourceId, State)> =
             sf.build_orphan_states(&desired_ids).into_iter().collect();
-        let provider_ref = &provider;
         let orphan_results: Vec<Result<(ResourceId, State), AppError>> =
             stream::iter(orphan_states)
                 .map(|(id, state)| {
@@ -1150,12 +1127,56 @@ async fn run_apply_locked(
         orphan_dependencies = sf.build_orphan_dependencies(&desired_ids);
     }
 
-    // Restore unreturned attributes from state file (CloudControl doesn't always return them)
-    let mut saved_attrs = state_file
-        .as_ref()
-        .map(|sf| sf.build_saved_attrs())
-        .unwrap_or_default();
+    // Hydrate, transfer state for moved blocks and anonymous → let-bound
+    // renames (#1685), then run phase 2 against the consolidated state.
     provider.hydrate_read_state(&mut current_states, &saved_attrs);
+    let moved_pairs = {
+        let mut pairs = crate::wiring::materialize_moved_states(
+            &mut current_states,
+            &mut prev_desired_keys,
+            &mut saved_attrs,
+            &parsed.state_blocks,
+            &state_file,
+        );
+        pairs.extend(crate::wiring::apply_anonymous_to_named_renames(
+            ctx,
+            &sorted_resources,
+            &parsed.providers,
+            &mut current_states,
+            &mut prev_desired_keys,
+            &mut saved_attrs,
+            &state_file,
+        ));
+        pairs
+    };
+
+    // Phase 2: resolve data source inputs against the consolidated state
+    // and refresh them via `read_data_source` (#1683, #1685).
+    let resolved_data_sources =
+        resolve_data_source_refs_for_refresh(&sorted_resources, &current_states, &remote_bindings)?;
+    let phase2_results: Vec<Result<(ResourceId, State), AppError>> =
+        stream::iter(resolved_data_sources.iter())
+            .map(|resource| {
+                let progress = RefreshProgress::begin_multi(&multi, &resource.id);
+                let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
+                async move {
+                    let mut state = read_data_source_with_retry(provider_ref, resource)
+                        .await
+                        .map_err(AppError::Provider)?;
+                    if let Some(deps) = dep_bindings {
+                        state.dependency_bindings = deps;
+                    }
+                    progress.finish();
+                    Ok((resource.id.clone(), state))
+                }
+            })
+            .buffer_unordered(5)
+            .collect()
+            .await;
+    for result in phase2_results {
+        let (id, state) = result?;
+        current_states.insert(id, state);
+    }
 
     // Build initial binding map for reference resolution
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -1202,24 +1223,6 @@ async fn run_apply_locked(
     // and current states so the plan shows canonical AWS values.
     crate::wiring::resolve_enum_aliases_with_ctx(ctx, &mut resources_for_plan);
     crate::wiring::resolve_enum_aliases_in_states(ctx, &mut current_states);
-
-    // Build prev_desired_keys before moved-state transfer so
-    // materialize_moved_states can re-key them under the new resource name.
-    let mut prev_desired_keys = state_file
-        .as_ref()
-        .map(|sf| sf.build_desired_keys())
-        .unwrap_or_default();
-
-    // Pre-process moved blocks: transfer state, prev_desired_keys, and
-    // saved_attrs from old name to new name so the differ sees attribute
-    // changes (including removals) and produces Update/Replace effects.
-    let moved_pairs = crate::wiring::materialize_moved_states(
-        &mut current_states,
-        &mut prev_desired_keys,
-        &mut saved_attrs,
-        &parsed.state_blocks,
-        &state_file,
-    );
 
     let lifecycles = state_file
         .as_ref()
