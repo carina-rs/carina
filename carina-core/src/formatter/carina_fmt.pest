@@ -182,8 +182,8 @@ nested_block = {
     identifier ~ trivia* ~ open_brace ~ block_content* ~ close_brace
 }
 
-// Attribute: key = value
-attribute = { identifier ~ trivia* ~ equals ~ trivia* ~ expression }
+// Attribute: key = value (key can be identifier or quoted string)
+attribute = { (identifier | string) ~ trivia* ~ equals ~ trivia* ~ expression }
 
 identifier = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 
@@ -238,8 +238,8 @@ map = {
 
 map_content = _{ trivia | nested_block | map_entry }
 
-// Map entry: key = value (with optional trailing comma)
-map_entry = { identifier ~ trivia* ~ equals ~ trivia* ~ expression ~ trivia* ~ comma? }
+// Map entry: key = value (with optional trailing comma, key can be identifier or quoted string)
+map_entry = { (identifier | string) ~ trivia* ~ equals ~ trivia* ~ expression ~ trivia* ~ comma? }
 
 // For expression: for var in iterable { body }
 for_expr = {
