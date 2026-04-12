@@ -107,6 +107,14 @@ impl ProviderStates {
     }
 
     fn state_for_path_with_info(&self, file_path: &Path) -> (&ProviderState, Option<PathBuf>) {
+        log::debug!(
+            "state_for_path: looking up file_path={}, by_dir keys={:?}",
+            file_path.display(),
+            self.by_dir
+                .keys()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+        );
         // First: walk up to find a config directory (try both raw and canonical)
         let mut dir = file_path.parent();
         while let Some(d) = dir {
@@ -283,14 +291,18 @@ impl Backend {
 
         states.import_map = import_map;
         let dir_count = states.by_dir.len();
+        let dir_keys: Vec<String> = states
+            .by_dir
+            .keys()
+            .map(|p| p.display().to_string())
+            .collect();
         *self.providers.write().await = states;
-
         self.client
             .log_message(
                 MessageType::INFO,
                 format!(
-                    "Loaded providers for {} directory(s), {} resource type schema(s) total",
-                    dir_count, total_schemas
+                    "Loaded providers for {} directory(s), {} resource type schema(s) total. Dirs: {:?}",
+                    dir_count, total_schemas, dir_keys
                 ),
             )
             .await;
