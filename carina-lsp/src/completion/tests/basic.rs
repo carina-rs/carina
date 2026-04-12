@@ -797,6 +797,16 @@ fn type_completion_includes_basic_types() {
         string_completion.kind,
         Some(CompletionItemKind::TYPE_PARAMETER)
     );
+
+    // Built-in custom types should always appear (no provider needed)
+    for builtin_custom in &["cidr", "ipv4_address", "ipv6_cidr", "ipv6_address"] {
+        assert!(
+            labels.contains(builtin_custom),
+            "Type completions should include built-in custom type '{}'. Got: {:?}",
+            builtin_custom,
+            labels
+        );
+    }
 }
 
 #[test]

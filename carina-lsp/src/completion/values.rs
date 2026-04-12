@@ -935,14 +935,22 @@ impl CompletionProvider {
             .collect()
         };
 
-        // Custom types from provider validators
-        let custom = self.custom_type_names.iter().map(move |name| {
-            type_completion_item(
-                name.clone(),
-                format!("Custom type: {}", name),
-                replacement_range,
-            )
-        });
+        // Custom types: built-in types + provider-extracted types (deduplicated)
+        let builtin_custom = ["cidr", "ipv4_address", "ipv6_cidr", "ipv6_address"];
+        let mut seen_custom = std::collections::HashSet::new();
+        let custom: Vec<CompletionItem> = builtin_custom
+            .iter()
+            .map(|s| s.to_string())
+            .chain(self.custom_type_names.iter().cloned())
+            .filter(|name| seen_custom.insert(name.clone()))
+            .map(|name| {
+                type_completion_item(
+                    name.clone(),
+                    format!("Custom type: {}", name),
+                    replacement_range,
+                )
+            })
+            .collect();
 
         // Resource types from schemas
         let resource = self.schemas.iter().map(move |(resource_type, schema)| {
