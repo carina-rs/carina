@@ -880,18 +880,24 @@ impl CompletionProvider {
         let line_idx = position.line as usize;
         let col = position.character as usize;
 
-        let type_start = if line_idx < lines.len() {
+        let (type_start, inside_generic) = if line_idx < lines.len() {
             let prefix: String = lines[line_idx].chars().take(col).collect();
-            // Find the colon and position right after it (plus any whitespace)
+            // Check if cursor is inside list() or map() — find last open paren after colon
             if let Some(colon_pos) = prefix.rfind(':') {
                 let after_colon = &prefix[colon_pos + 1..];
-                let whitespace_len = after_colon.len() - after_colon.trim_start().len();
-                (colon_pos + 1 + whitespace_len) as u32
+                if let Some(paren_pos) = after_colon.rfind('(') {
+                    // Inside list() or map(): start after the open paren
+                    let abs_paren = colon_pos + 1 + paren_pos + 1;
+                    (abs_paren as u32, true)
+                } else {
+                    let whitespace_len = after_colon.len() - after_colon.trim_start().len();
+                    ((colon_pos + 1 + whitespace_len) as u32, false)
+                }
             } else {
-                position.character
+                (position.character, false)
             }
         } else {
-            position.character
+            (position.character, false)
         };
 
         let replacement_range = Range {
@@ -914,15 +920,20 @@ impl CompletionProvider {
             type_completion_item(name.to_string(), detail.to_string(), replacement_range)
         });
 
-        // Generic type constructors
-        let generic = [
-            ("list(", "List type constructor"),
-            ("map(", "Map type constructor"),
-        ]
-        .iter()
-        .map(|(name, detail)| {
-            type_completion_item(name.to_string(), detail.to_string(), replacement_range)
-        });
+        // Generic type constructors (skip when already inside list()/map())
+        let generic: Vec<CompletionItem> = if inside_generic {
+            vec![]
+        } else {
+            [
+                ("list(", "List type constructor"),
+                ("map(", "Map type constructor"),
+            ]
+            .iter()
+            .map(|(name, detail)| {
+                type_completion_item(name.to_string(), detail.to_string(), replacement_range)
+            })
+            .collect()
+        };
 
         // Custom types from provider validators
         let custom = self.custom_type_names.iter().map(move |name| {

@@ -990,3 +990,51 @@ versioning_configuration {
         labels
     );
 }
+
+#[test]
+fn type_completion_inside_list_shows_basic_types() {
+    let provider = test_provider();
+    let doc = create_document("arguments {\nitems: list(s");
+    let position = Position {
+        line: 1,
+        character: 13,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"string"),
+        "Type completions inside list() should include 'string'. Got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.contains(&"list("),
+        "Type completions inside list() should NOT include 'list('. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn type_completion_inside_map_shows_basic_types() {
+    let provider = test_provider();
+    let doc = create_document("arguments {\ndata: map(");
+    let position = Position {
+        line: 1,
+        character: 11,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"string"),
+        "Type completions inside map() should include 'string'. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"int"),
+        "Type completions inside map() should include 'int'. Got: {:?}",
+        labels
+    );
+}
