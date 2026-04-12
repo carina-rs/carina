@@ -438,6 +438,60 @@ fn next_pair<'a>(
     })
 }
 
+/// Extract a key string from either an identifier or a quoted string pair.
+/// For identifiers, returns the raw text. For strings, extracts the content
+/// without quotes (supports both single-quoted and double-quoted strings).
+fn extract_key_string(pair: pest::iterators::Pair<'_, Rule>) -> Result<String, ParseError> {
+    match pair.as_rule() {
+        Rule::identifier => Ok(pair.as_str().to_string()),
+        Rule::string => {
+            let inner = pair
+                .into_inner()
+                .next()
+                .ok_or_else(|| ParseError::InternalError {
+                    expected: "string content".to_string(),
+                    context: "map/attribute key".to_string(),
+                })?;
+            match inner.as_rule() {
+                Rule::single_quoted_string => {
+                    // Extract content between quotes
+                    let content = inner
+                        .into_inner()
+                        .next()
+                        .map(|p| p.as_str().to_string())
+                        .unwrap_or_default();
+                    Ok(content)
+                }
+                Rule::double_quoted_string => {
+                    let mut result = String::new();
+                    for part in inner.into_inner() {
+                        match part.as_rule() {
+                            Rule::string_part => {
+                                let inner_part = part.into_inner().next().unwrap();
+                                match inner_part.as_rule() {
+                                    Rule::string_literal => result.push_str(inner_part.as_str()),
+                                    Rule::interpolation => {
+                                        return Err(ParseError::InternalError {
+                                            expected: "literal string".to_string(),
+                                            context: "interpolation not supported in map keys"
+                                                .to_string(),
+                                        });
+                                    }
+                                    _ => result.push_str(inner_part.as_str()),
+                                }
+                            }
+                            _ => result.push_str(part.as_str()),
+                        }
+                    }
+                    Ok(result)
+                }
+                _ => Ok(inner.as_str().to_string()),
+            }
+        }
+        _ => Ok(pair.as_str().to_string()),
+    }
+}
+
 /// Helper to get the first inner pair from a pest pair
 fn first_inner<'a>(
     pair: pest::iterators::Pair<'a, Rule>,
@@ -2897,9 +2951,9 @@ fn parse_block_contents(
                     }
                     Rule::attribute => {
                         let mut attr_inner = inner.into_inner();
-                        let key = next_pair(&mut attr_inner, "attribute name", "block content")?
-                            .as_str()
-                            .to_string();
+                        let key_pair =
+                            next_pair(&mut attr_inner, "attribute name", "block content")?;
+                        let key = extract_key_string(key_pair)?;
                         let value = parse_expression(
                             next_pair(&mut attr_inner, "attribute value", "block content")?,
                             &local_ctx,
@@ -2926,9 +2980,8 @@ fn parse_block_contents(
             }
             Rule::attribute => {
                 let mut attr_inner = content_pair.into_inner();
-                let key = next_pair(&mut attr_inner, "attribute name", "block content")?
-                    .as_str()
-                    .to_string();
+                let key_pair = next_pair(&mut attr_inner, "attribute name", "block content")?;
+                let key = extract_key_string(key_pair)?;
                 let value = parse_expression(
                     next_pair(&mut attr_inner, "attribute value", "block content")?,
                     &local_ctx,
@@ -3230,9 +3283,8 @@ fn parse_primary_value(
                 match entry.as_rule() {
                     Rule::map_entry => {
                         let mut entry_inner = entry.into_inner();
-                        let key = next_pair(&mut entry_inner, "map key", "map entry")?
-                            .as_str()
-                            .to_string();
+                        let key_pair = next_pair(&mut entry_inner, "map key", "map entry")?;
+                        let key = extract_key_string(key_pair)?;
                         let value = parse_expression(
                             next_pair(&mut entry_inner, "map value", "map entry")?,
                             ctx,
@@ -9497,5 +9549,66 @@ EOF
             result.variables.get("doc"),
             Some(&Value::String("hello world".to_string()))
         );
+    }
+
+    #[test]
+    fn quoted_string_as_map_key() {
+        let input = r#"
+            let m = {
+                'token.actions.githubusercontent.com:aud' = 'sts.amazonaws.com'
+                "aws:SourceIp" = '10.0.0.0/8'
+            }
+        "#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        if let Some(Value::Map(map)) = result.variables.get("m") {
+            assert_eq!(
+                map.get("token.actions.githubusercontent.com:aud"),
+                Some(&Value::String("sts.amazonaws.com".to_string()))
+            );
+            assert_eq!(
+                map.get("aws:SourceIp"),
+                Some(&Value::String("10.0.0.0/8".to_string()))
+            );
+        } else {
+            panic!("Expected map, got {:?}", result.variables.get("m"));
+        }
+    }
+
+    #[test]
+    fn quoted_string_as_attribute_key_in_block() {
+        let input = r#"
+            awscc.iam.role {
+                name = 'test-role'
+                assume_role_policy_document = {
+                    version = '2012-10-17'
+                    statement {
+                        effect = 'Allow'
+                        action = 'sts:AssumeRoleWithWebIdentity'
+                        condition = {
+                            string_equals = {
+                                'token.actions.githubusercontent.com:aud' = 'sts.amazonaws.com'
+                            }
+                        }
+                    }
+                }
+            }
+        "#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        let resource = &result.resources[0];
+        // Navigate: assume_role_policy_document -> statement[0] -> condition -> string_equals
+        let doc = resource.get_attr("assume_role_policy_document").unwrap();
+        if let Value::Map(doc_map) = doc
+            && let Some(Value::List(statements)) = doc_map.get("statement")
+            && let Value::Map(stmt) = &statements[0]
+            && let Some(Value::Map(condition)) = stmt.get("condition")
+            && let Some(Value::Map(string_equals)) = condition.get("string_equals")
+        {
+            assert_eq!(
+                string_equals.get("token.actions.githubusercontent.com:aud"),
+                Some(&Value::String("sts.amazonaws.com".to_string()))
+            );
+        } else {
+            panic!("Could not navigate to condition key");
+        }
     }
 }
