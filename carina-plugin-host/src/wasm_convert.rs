@@ -23,12 +23,12 @@ use crate::wasm_bindings::carina::provider::types as wit;
 /// support recursive types.
 ///
 /// `ResourceRef`, `Interpolation`, `FunctionCall`, `Closure`, and `Secret`
-/// are expected to have been resolved by the planner/refresh path before
-/// reaching the provider. Hitting one here is a *bug* in an upstream
-/// stage (see #1683 for an example where data source inputs were not
-/// resolved before refresh). In debug/test builds we panic so the bug
-/// is caught at its source; in release builds we log and fall back to
-/// the debug format to avoid crashing a user's plan/apply mid-run.
+/// variants are stringified via `format!("{v:?}")` as a fallback.
+/// Managed-to-managed refs (e.g. `admins.group_id`) are *expected* to be
+/// unresolved at plan time — they get resolved at apply time by the
+/// executor. Data source refs are resolved during refresh phase 2
+/// (#1683); if one slips through, the provider receives a debug string
+/// that will fail at the remote API with a clear error.
 pub fn core_to_wit_value(v: &CoreValue) -> wit::Value {
     match v {
         CoreValue::String(s) => wit::Value::StrVal(s.clone()),
@@ -46,19 +46,11 @@ pub fn core_to_wit_value(v: &CoreValue) -> wit::Value {
                 .collect();
             wit::Value::MapVal(serde_json::to_string(&json_map).unwrap())
         }
-        _ => {
-            debug_assert!(
-                false,
-                "core_to_wit_value received unresolved value {v:?}; \
-                 ResourceRef/Interpolation/FunctionCall/Closure/Secret \
-                 must be resolved before reaching the provider"
-            );
-            log::error!(
-                "core_to_wit_value received unresolved value {v:?}; \
-                 passing debug format to the provider — this is a bug"
-            );
-            wit::Value::StrVal(format!("{v:?}"))
-        }
+        // Managed-to-managed refs (e.g. `admins.group_id`) are expected
+        // here at plan time — they get resolved at apply time by the
+        // executor. Data source refs should have been resolved during
+        // refresh phase 2 (#1683).
+        _ => wit::Value::StrVal(format!("{v:?}")),
     }
 }
 
@@ -495,14 +487,11 @@ mod tests {
         assert_eq!(core, back);
     }
 
-    /// Regression guard for carina#1683: `core_to_wit_value` must fail
-    /// loud in debug/test builds when handed an unresolved value. The
-    /// previous silent `format!("{v:?}")` fallback let a raw
-    /// `ResourceRef` flow into the WASM plugin as a literal debug string,
-    /// which the provider then forwarded to the AWS API verbatim.
+    /// Unresolved `ResourceRef` falls back to debug format (#1687).
+    /// Managed-to-managed refs reach `core_to_wit_value` at plan time
+    /// via `normalize_desired` — they get resolved later by the executor.
     #[test]
-    #[should_panic(expected = "unresolved value")]
-    fn core_to_wit_value_panics_on_unresolved_resource_ref() {
+    fn core_to_wit_value_resource_ref_produces_debug_string() {
         use carina_core::resource::{AccessPath, PathSegment};
         let v = CoreValue::ResourceRef {
             path: AccessPath(vec![
@@ -510,7 +499,10 @@ mod tests {
                 PathSegment::Field("identity_store_id".into()),
             ]),
         };
-        let _ = core_to_wit_value(&v);
+        let wit::Value::StrVal(s) = core_to_wit_value(&v) else {
+            panic!("expected StrVal");
+        };
+        assert!(s.contains("ResourceRef"), "expected debug format, got: {s}");
     }
 
     // -- ResourceId roundtrip --
