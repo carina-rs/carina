@@ -1042,6 +1042,7 @@ mod tests {
 
     #[test]
     fn tree_connector_single_child() {
+        // subnet depends on vpc → subnet is root, vpc is its child
         let mut plan = Plan::new();
         plan.add(Effect::Create(
             Resource::new("ec2.vpc", "my-vpc")
@@ -1058,37 +1059,38 @@ mod tests {
         ));
         let app = App::new(&plan, &std::collections::HashMap::new());
 
-        // Subnet is the only (last) child of VPC
-        let connector = build_tree_connector(1, &app);
+        // vpc (idx 0) is the only child of subnet (idx 1)
+        let connector = build_tree_connector(0, &app);
         assert_eq!(connector, "    └── ");
     }
 
     #[test]
     fn tree_connector_multiple_children() {
+        // instance depends on both subnet_a and subnet_b
         let mut plan = Plan::new();
         plan.add(Effect::Create(
-            Resource::new("ec2.vpc", "my-vpc").with_binding("vpc"),
+            Resource::new("ec2.subnet", "subnet-a").with_binding("subnet_a"),
         ));
         plan.add(Effect::Create(
-            Resource::new("ec2.subnet", "subnet-a")
-                .with_binding("subnet_a")
-                .with_attribute(
-                    "vpc_id",
-                    Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-                ),
+            Resource::new("ec2.subnet", "subnet-b").with_binding("subnet_b"),
         ));
         plan.add(Effect::Create(
-            Resource::new("ec2.subnet", "subnet-b")
-                .with_binding("subnet_b")
+            Resource::new("ec2.instance", "my-instance")
+                .with_binding("inst")
                 .with_attribute(
-                    "vpc_id",
-                    Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
+                    "subnet_a_id",
+                    Value::resource_ref("subnet_a".to_string(), "id".to_string(), vec![]),
+                )
+                .with_attribute(
+                    "subnet_b_id",
+                    Value::resource_ref("subnet_b".to_string(), "id".to_string(), vec![]),
                 ),
         ));
         let app = App::new(&plan, &std::collections::HashMap::new());
 
-        // First child gets ├─, last child gets └─
-        let children = &app.nodes[0].children;
+        // instance (idx 2) is root with subnet_a and subnet_b as children
+        let inst_idx = 2;
+        let children = &app.nodes[inst_idx].children;
         assert_eq!(children.len(), 2);
         let first_child = children[0];
         let last_child = children[1];

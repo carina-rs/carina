@@ -1604,48 +1604,6 @@ mod tests {
         (roots, dependents, graph.effect_bindings, graph.effect_types)
     }
 
-    /// Helper: walk the tree from roots in print order and collect binding names
-    /// in the order they would be printed. This replicates the traversal logic
-    /// from print_effect_tree.
-    fn collect_print_order(
-        roots: &[usize],
-        dependents: &HashMap<usize, Vec<usize>>,
-        effect_bindings: &HashMap<usize, String>,
-    ) -> Vec<String> {
-        let mut printed: HashSet<usize> = HashSet::new();
-        let mut result: Vec<String> = Vec::new();
-
-        fn walk(
-            idx: usize,
-            dependents: &HashMap<usize, Vec<usize>>,
-            effect_bindings: &HashMap<usize, String>,
-            printed: &mut HashSet<usize>,
-            result: &mut Vec<String>,
-        ) {
-            if printed.contains(&idx) {
-                return;
-            }
-            printed.insert(idx);
-            if let Some(binding) = effect_bindings.get(&idx) {
-                result.push(binding.clone());
-            }
-            let children = dependents.get(&idx).cloned().unwrap_or_default();
-            let unprinted: Vec<_> = children
-                .iter()
-                .filter(|c| !printed.contains(c))
-                .cloned()
-                .collect();
-            for child in unprinted {
-                walk(child, dependents, effect_bindings, printed, result);
-            }
-        }
-
-        for &root in roots {
-            walk(root, dependents, effect_bindings, &mut printed, &mut result);
-        }
-        result
-    }
-
     /// Issue #933 (part 1): Siblings under the same parent should be sorted
     /// by (resource_type, binding_name) for deterministic, grouped output.
     ///
@@ -1654,8 +1612,9 @@ mod tests {
     /// sorted by binding name.
     #[test]
     fn test_siblings_sorted_by_resource_type_and_binding() {
-        // VPC is root. Under it: 2 subnets and 2 route tables, added in
-        // interleaved order to expose HashMap non-determinism.
+        // VPC has no deps. 2 route tables and 2 subnets all depend on vpc.
+        // With the flipped tree, the 4 dependents are roots (nothing depends
+        // on them) and they should be sorted by (resource_type, binding_name).
         let vpc = make_resource("ec2.vpc", "vpc", "vpc", &[]);
         let rt_b = make_resource("ec2.route_table", "rt_b", "rt_b", &["vpc"]);
         let subnet_b = make_resource("ec2.subnet", "subnet_b", "subnet_b", &["vpc"]);
@@ -1669,13 +1628,10 @@ mod tests {
         plan.add(Effect::Create(rt_a));
         plan.add(Effect::Create(subnet_a));
 
-        let (roots, dependents, effect_bindings, _effect_types) = build_plan_tree(&plan);
+        let (roots, _dependents, effect_bindings, _effect_types) = build_plan_tree(&plan);
 
-        assert_eq!(roots, vec![0], "VPC should be the only root");
-
-        // Get the children of VPC (index 0)
-        let vpc_children = dependents.get(&0).unwrap();
-        let child_labels: Vec<(String, String)> = vpc_children
+        // Roots should be rt_a, rt_b, subnet_a, subnet_b (nothing depends on them)
+        let root_labels: Vec<(String, String)> = roots
             .iter()
             .map(|&idx| {
                 let binding = effect_bindings.get(&idx).unwrap().clone();
@@ -1689,7 +1645,6 @@ mod tests {
             .collect();
 
         // Expected: sorted by (resource_type, binding_name)
-        // ec2.route_table comes before ec2.subnet alphabetically
         let expected = vec![
             ("ec2.route_table".to_string(), "rt_a".to_string()),
             ("ec2.route_table".to_string(), "rt_b".to_string()),
@@ -1698,27 +1653,24 @@ mod tests {
         ];
 
         assert_eq!(
-            child_labels, expected,
-            "Siblings should be sorted by (resource_type, binding_name). \
+            root_labels, expected,
+            "Roots should be sorted by (resource_type, binding_name). \
              Got: {:?}",
-            child_labels
+            root_labels
         );
     }
 
-    /// Issue #933 (part 2): When a resource depends on multiple resources in
-    /// the tree, it should be placed under the dependency that is closest to
-    /// the root (most ancestral), not an arbitrary one.
+    /// When a dependency is referenced by multiple resources, it should be
+    /// placed under the shallowest dependent (closest to root).
     ///
     /// Scenario:
-    ///   - vpc (root)
-    ///   - sg depends on vpc
-    ///   - vpc_endpoint depends on both vpc and sg
+    ///   - vpc: no deps (depended on by sg and endpoint)
+    ///   - sg: depends on vpc (depended on by endpoint)
+    ///   - endpoint: depends on vpc and sg (nothing depends on it)
     ///
-    /// VPC is an ancestor of SG. The endpoint should be placed under VPC
-    /// (closer to root), not under SG. Currently, the endpoint is added as
-    /// a child of BOTH vpc and sg in the dependents map, and whichever is
-    /// traversed first claims it. This test verifies deterministic placement
-    /// under the most ancestral dependency.
+    /// With flipped tree: endpoint is the only root. Both sg and vpc are
+    /// its dependencies. VPC is depended on by both endpoint (depth 0) and
+    /// sg (depth 1), so VPC should be placed under endpoint (shallowest).
     #[test]
     fn test_parent_selection_prefers_most_ancestral_dependency() {
         let vpc = make_resource("ec2.vpc", "vpc", "vpc", &[]);
@@ -1731,40 +1683,25 @@ mod tests {
         plan.add(Effect::Create(endpoint));
 
         let (roots, dependents, effect_bindings, _) = build_plan_tree(&plan);
-        let _print_order = collect_print_order(&roots, &dependents, &effect_bindings);
 
-        assert_eq!(roots, vec![0], "VPC should be the only root");
+        assert_eq!(roots, vec![2], "endpoint should be the only root");
 
-        // The endpoint (idx 2) should be a direct child of VPC (idx 0),
-        // NOT a child of SG (idx 1). VPC is the most ancestral dependency.
-        //
-        // Expected tree:
-        //   vpc
-        //   ├── sg
-        //   └── endpoint
-        //
-        // NOT:
-        //   vpc
-        //   └── sg
-        //       └── endpoint
-        //
-        // Check via print order: vpc -> sg -> endpoint (sg has no children
-        // because endpoint is under vpc). If endpoint were under sg, we'd
-        // get vpc -> sg -> endpoint too, but we verify via direct children.
-        let vpc_children: Vec<String> = dependents
-            .get(&0)
+        // VPC (idx 0) should be a direct child of endpoint (idx 2),
+        // not nested under sg. endpoint is at depth 0 (shallowest dependent).
+        let endpoint_children: Vec<String> = dependents
+            .get(&2)
             .unwrap()
             .iter()
             .filter_map(|&idx| effect_bindings.get(&idx).cloned())
             .collect();
         assert!(
-            vpc_children.contains(&"endpoint".to_string()),
-            "endpoint should be a direct child of vpc (most ancestral), \
-             not nested under sg. VPC children: {:?}",
-            vpc_children
+            endpoint_children.contains(&"vpc".to_string()),
+            "vpc should be a direct child of endpoint (shallowest dependent). \
+             endpoint children: {:?}",
+            endpoint_children
         );
 
-        // sg should NOT have endpoint as a child (it should only be under vpc)
+        // sg should NOT have vpc as a child (vpc is under endpoint instead)
         let sg_children: Vec<String> = dependents
             .get(&1)
             .unwrap()
@@ -1772,28 +1709,25 @@ mod tests {
             .filter_map(|&idx| effect_bindings.get(&idx).cloned())
             .collect();
         assert!(
-            !sg_children.contains(&"endpoint".to_string()),
-            "endpoint should NOT be a child of sg. SG children: {:?}. \
-             When a resource depends on multiple resources, it should only \
-             be placed under the most ancestral one (vpc), not all of them.",
+            !sg_children.contains(&"vpc".to_string()),
+            "vpc should NOT be a child of sg. SG children: {:?}. \
+             When a dependency is depended on by multiple resources, it should \
+             be placed under the shallowest dependent (endpoint, depth 0).",
             sg_children
         );
     }
 
-    /// Issue #928: A resource that has no dependencies but IS referenced by
-    /// other resources should NOT appear as a disconnected root-level item.
-    /// It should be nested under the resource that references it.
+    /// With the flipped tree, roots are effects that nothing depends on.
     ///
-    /// Scenario (from the issue):
-    ///   - vpc: no deps
-    ///   - rt: depends on vpc
-    ///   - route: depends on rt, igw
-    ///   - igw_attachment: depends on vpc, igw
-    ///   - igw: no deps (but referenced by route and igw_attachment)
+    /// Scenario:
+    ///   - vpc: no deps (depended on by rt, igw_attachment)
+    ///   - rt: depends on vpc (depended on by route)
+    ///   - igw: no deps (depended on by route, igw_attachment)
+    ///   - route: depends on rt, igw (nothing depends on route)
+    ///   - igw_attachment: depends on vpc, igw (nothing depends on igw_attachment)
     ///
-    /// Current (buggy): igw appears as a separate root alongside vpc.
-    /// Expected: igw should be nested under igw_attachment (or route),
-    ///           so only vpc is a root.
+    /// Roots = route and igw_attachment (nothing depends on them).
+    /// VPC and IGW should NOT be roots.
     #[test]
     fn test_referenced_resource_without_deps_should_not_be_root() {
         let vpc = make_resource("ec2.vpc", "vpc", "vpc", &[]);
@@ -1816,29 +1750,30 @@ mod tests {
 
         let roots = compute_roots(&plan);
 
-        // IGW (index 2) should NOT be a root because it is referenced by
-        // other resources in the plan (route and igw_attachment).
-        // Only VPC (index 0) should be a root.
+        // route (idx 3) and igw_attachment (idx 4) are roots.
+        // VPC and IGW are NOT roots (they are depended on by other resources).
         assert_eq!(
             roots,
-            vec![0],
-            "Only vpc should be a root. igw (index 2) is referenced by other resources \
-             and should be nested, not a disconnected root. Got roots: {:?}",
+            vec![3, 4],
+            "route and igw_attachment should be the roots (nothing depends on them). \
+             Got roots: {:?}",
             roots
         );
     }
 
-    /// Issue #933: A dependency-free resource that is referenced by multiple
-    /// resources should be nested under the shallowest referencing resource.
+    /// A dependency referenced by multiple resources should be placed under
+    /// the shallowest dependent (closest to root).
     ///
-    /// Scenario:
-    ///   - vpc (root, depth 0)
-    ///   - rt depends on vpc (depth 1)
-    ///   - igw_attachment depends on vpc, igw (depth 1)
-    ///   - route depends on rt, igw (depth 2, under rt)
-    ///   - igw: no deps (referenced by route at depth 2, igw_attachment at depth 1)
+    /// Scenario (flipped tree):
+    ///   - route (root, depth 0): depends on rt, igw
+    ///   - igw_attachment (root, depth 0): depends on vpc, igw
+    ///   - rt (depth 1): depends on vpc
+    ///   - igw (depth 1): depended on by route and igw_attachment (both depth 0)
+    ///   - vpc (depth 1 or 2): depended on by rt and igw_attachment
     ///
-    /// IGW should be nested under igw_attachment (depth 1), not route (depth 2).
+    /// IGW is depended on by route (depth 0) and igw_attachment (depth 0).
+    /// Both are at the same depth, so tiebreak by sort: ec2.route < ec2.vpc_gateway_attachment.
+    /// IGW should be placed under route.
     #[test]
     fn test_dependency_free_resource_nested_under_shallowest_referencing_resource() {
         let vpc = make_resource("ec2.vpc", "vpc", "vpc", &[]);
@@ -1861,23 +1796,14 @@ mod tests {
 
         let (roots, dependents, effect_bindings, _) = build_plan_tree(&plan);
 
-        assert_eq!(roots, vec![0], "Only vpc should be root");
-
-        // igw_attachment is index 4, route is index 3, igw is index 2
-        // igw should be a child of igw_attachment (depth 1), NOT route (depth 2)
-        let igw_attachment_children: Vec<String> = dependents
-            .get(&4)
-            .unwrap()
-            .iter()
-            .filter_map(|&idx| effect_bindings.get(&idx).cloned())
-            .collect();
-        assert!(
-            igw_attachment_children.contains(&"igw".to_string()),
-            "igw should be nested under igw_attachment (shallowest referencing resource at depth 1). \
-             igw_attachment children: {:?}",
-            igw_attachment_children
+        assert_eq!(
+            roots,
+            vec![3, 4],
+            "route and igw_attachment should be roots"
         );
 
+        // route (idx 3) should have igw as a child (both roots are at depth 0,
+        // route wins tiebreak by resource_type sort)
         let route_children: Vec<String> = dependents
             .get(&3)
             .unwrap()
@@ -1885,10 +1811,24 @@ mod tests {
             .filter_map(|&idx| effect_bindings.get(&idx).cloned())
             .collect();
         assert!(
-            !route_children.contains(&"igw".to_string()),
-            "igw should NOT be nested under route (deeper at depth 2). \
+            route_children.contains(&"igw".to_string()),
+            "igw should be nested under route (shallowest dependent, tiebreak by sort). \
              route children: {:?}",
             route_children
+        );
+
+        // igw_attachment should NOT have igw as a child
+        let igw_attachment_children: Vec<String> = dependents
+            .get(&4)
+            .unwrap()
+            .iter()
+            .filter_map(|&idx| effect_bindings.get(&idx).cloned())
+            .collect();
+        assert!(
+            !igw_attachment_children.contains(&"igw".to_string()),
+            "igw should NOT be under igw_attachment (lost tiebreak). \
+             igw_attachment children: {:?}",
+            igw_attachment_children
         );
     }
 
@@ -2618,35 +2558,27 @@ mod tests {
 
         let (roots, dependents, effect_bindings, _effect_types) = build_plan_tree(&plan);
 
-        // VPC (idx 0) should be the only root
-        assert_eq!(
-            roots,
-            vec![0],
-            "VPC should be the only root. Got roots: {:?} (bindings: {:?})",
-            roots,
-            roots
-                .iter()
-                .filter_map(|i| effect_bindings.get(i))
-                .collect::<Vec<_>>()
+        // SG (idx 1) and Subnet Delete (idx 2) are roots (nothing depends on them).
+        // VPC (idx 0) is depended on by both, so it's a child.
+        let root_bindings: Vec<String> = roots
+            .iter()
+            .filter_map(|&i| effect_bindings.get(&i).cloned())
+            .collect();
+        assert!(
+            !root_bindings.contains(&"vpc".to_string()),
+            "VPC should NOT be a root (it's depended on). Roots: {:?}",
+            root_bindings
         );
 
-        // SG (idx 1) should be a child of VPC
-        let vpc_children: Vec<usize> = dependents.get(&0).cloned().unwrap_or_default();
+        // VPC (idx 0) should be a child of one of the roots
+        let vpc_is_child = roots
+            .iter()
+            .any(|&r| dependents.get(&r).is_some_and(|c| c.contains(&0)));
         assert!(
-            vpc_children.contains(&1),
-            "SG (idx 1) should be a child of VPC. VPC children: {:?}",
-            vpc_children
-        );
-
-        // Subnet Delete (idx 2) should also be a child of VPC.
-        // Currently fails because Delete effects have no binding/dependency info.
-        assert!(
-            vpc_children.contains(&2),
-            "Subnet Delete (idx 2) should be a child of VPC, but Delete effects \
-             have no resource/binding/dependency info so the tree cannot place them. \
-             VPC children: {:?}, all roots: {:?}",
-            vpc_children,
-            roots
+            vpc_is_child,
+            "VPC (idx 0) should be a child of one of the roots. \
+             Roots: {:?}",
+            root_bindings
         );
     }
 
@@ -2705,14 +2637,13 @@ mod tests {
 
         let (roots, dependents, effect_bindings, _effect_types) = build_plan_tree(&plan);
 
-        // VPC (idx 0) should be the only root.
-        // SG has _dependency_bindings metadata that preserves the dependency
-        // on "vpc", so get_resource_dependencies() recovers it.
+        // SG (idx 1) should be the only root (nothing depends on it).
+        // VPC is depended on by SG via dependency_bindings.
         assert_eq!(
             roots,
-            vec![0],
-            "VPC should be the only root. SG should be nested under VPC \
-             because it references vpc.vpc_id in the DSL. Got roots: {:?} \
+            vec![1],
+            "SG should be the only root. VPC should be nested under SG \
+             because SG depends on vpc via dependency_bindings. Got roots: {:?} \
              (bindings: {:?})",
             roots,
             roots
@@ -2721,12 +2652,12 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
-        // SG (idx 1) should be a child of VPC (idx 0)
-        let vpc_children: Vec<usize> = dependents.get(&0).cloned().unwrap_or_default();
+        // VPC (idx 0) should be a child of SG (idx 1)
+        let sg_children: Vec<usize> = dependents.get(&1).cloned().unwrap_or_default();
         assert!(
-            vpc_children.contains(&1),
-            "SG (idx 1) should be a child of VPC. VPC children: {:?}",
-            vpc_children
+            sg_children.contains(&0),
+            "VPC (idx 0) should be a child of SG. SG children: {:?}",
+            sg_children
         );
     }
 

@@ -93,12 +93,16 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
 
 /// Build a single-parent tree from the dependency graph.
 ///
-/// Each resource is assigned to exactly one parent (or is a root). When a
-/// resource depends on multiple resources in the plan, it is placed under the
-/// shallowest (most ancestral) dependency. Ties are broken by
+/// The tree shows dependencies as children: a resource's children are the
+/// resources it depends on (which must be created first). Roots are resources
+/// that no other resource depends on (the "outermost" consumers).
+///
+/// Each resource is assigned to exactly one parent (or is a root). When
+/// multiple resources depend on the same resource, it is placed under the
+/// shallowest (most ancestral) dependent. Ties are broken by
 /// (resource_type, binding_name) for determinism.
 ///
-/// Returns (roots, dependents) where roots are sorted and each parent's
+/// Returns (roots, children) where roots are sorted and each parent's
 /// children are sorted by (resource_type, binding_name).
 pub fn build_single_parent_tree(
     plan: &Plan,
@@ -109,30 +113,26 @@ pub fn build_single_parent_tree(
     let effect_bindings = &graph.effect_bindings;
     let effect_types = &graph.effect_types;
 
-    let effect_binding_set: HashSet<&str> = binding_to_effect.keys().map(|s| s.as_str()).collect();
-
-    // Step 1: Build the full reverse dependency map (all parents)
+    // Step 1: Build forward and reverse dependency maps by resolving binding
+    // names to effect indices in a single pass.
+    let mut all_dependencies: HashMap<usize, Vec<usize>> = HashMap::new();
     let mut all_dependents: HashMap<usize, Vec<usize>> = HashMap::new();
-    for idx in 0..plan.effects().len() {
-        all_dependents.insert(idx, Vec::new());
-    }
     for (idx, deps) in effect_deps {
         for dep in deps {
             if let Some(&dep_idx) = binding_to_effect.get(dep) {
+                all_dependencies.entry(*idx).or_default().push(dep_idx);
                 all_dependents.entry(dep_idx).or_default().push(*idx);
             }
         }
     }
 
-    // Step 2: Identify initial roots (no deps in plan)
-    let mut initial_roots: Vec<usize> = Vec::new();
-    for (idx, deps) in effect_deps {
-        let has_dep_in_plan = deps.iter().any(|d| binding_to_effect.contains_key(d));
-        if !has_dep_in_plan {
-            initial_roots.push(*idx);
+    // Step 2: Identify roots — effects that no other effect depends on
+    let mut roots: Vec<usize> = Vec::new();
+    for idx in 0..plan.effects().len() {
+        if all_dependents.get(&idx).is_none_or(|v| v.is_empty()) {
+            roots.push(idx);
         }
     }
-    initial_roots.sort();
 
     let sort_key = |idx: &usize| -> (String, String) {
         let rtype = effect_types.get(idx).cloned().unwrap_or_default();
@@ -140,114 +140,54 @@ pub fn build_single_parent_tree(
         (rtype, binding)
     };
 
-    // Step 3: Nest no-dep resources under their first dependent (Issue #928)
-    // A no-dep resource can be nested only if every dependent has at least one
-    // other dependency in the plan (besides this resource).
-    let mut nested_under_dependent: HashSet<usize> = HashSet::new();
-    for &idx in &initial_roots {
-        let mut children = all_dependents.get(&idx).cloned().unwrap_or_default();
-        children.sort_by_key(|a| sort_key(a));
-        if !children.is_empty() {
-            let binding_of_idx = effect_bindings.get(&idx).map(|s| s.as_str());
-            let all_dependents_have_other_deps = children.iter().all(|&child_idx| {
-                effect_deps.get(&child_idx).is_some_and(|child_deps| {
-                    child_deps.iter().any(|d| {
-                        effect_binding_set.contains(d.as_str())
-                            && Some(d.as_str()) != binding_of_idx
-                    })
-                })
-            });
-            if all_dependents_have_other_deps {
-                nested_under_dependent.insert(idx);
-            }
-        }
-    }
-
-    // Step 4: Compute final roots
-    let roots: Vec<usize> = initial_roots
-        .iter()
-        .filter(|idx| !nested_under_dependent.contains(idx))
-        .cloned()
-        .collect();
-
-    // Step 5: Compute depth for each resource via BFS from roots
+    // Step 4: Compute depth via BFS from roots through dependencies
     let mut depth: HashMap<usize, usize> = HashMap::new();
     let mut queue: VecDeque<usize> = VecDeque::new();
     for &root in &roots {
         depth.insert(root, 0);
         queue.push_back(root);
     }
-    // Also set depth for nested-under-dependent resources (they will be
-    // children of some non-root resource, but we need them reachable)
     while let Some(node) = queue.pop_front() {
         let d = depth[&node];
-        if let Some(children) = all_dependents.get(&node) {
-            for &child in children {
-                if let std::collections::hash_map::Entry::Vacant(e) = depth.entry(child) {
+        if let Some(deps) = all_dependencies.get(&node) {
+            for &dep in deps {
+                if let std::collections::hash_map::Entry::Vacant(e) = depth.entry(dep) {
                     e.insert(d + 1);
-                    queue.push_back(child);
+                    queue.push_back(dep);
                 }
             }
         }
     }
 
-    // Step 6: For each non-root resource, select a single parent:
-    // the dependency with the shallowest depth (most ancestral).
-    // For nested-under-dependent resources, their parent is the first
-    // dependent (by sort order).
-    let mut dependents: HashMap<usize, Vec<usize>> = HashMap::new();
+    // Step 5: For each non-root effect, select a single parent:
+    // the shallowest effect that depends on it (from all_dependents).
+    let mut children_map: HashMap<usize, Vec<usize>> = HashMap::new();
     for idx in 0..plan.effects().len() {
-        dependents.insert(idx, Vec::new());
-    }
-
-    for (idx, deps) in effect_deps {
-        if roots.contains(idx) || nested_under_dependent.contains(idx) {
+        if roots.contains(&idx) {
             continue;
         }
-        // Find deps that are in the plan
-        let mut parent_candidates: Vec<usize> = deps
-            .iter()
-            .filter_map(|d| binding_to_effect.get(d).cloned())
-            .collect();
-        if parent_candidates.is_empty() {
+        let Some(dependents) = all_dependents.get(&idx) else {
             continue;
-        }
-        // Pick the shallowest parent; break ties by (resource_type, binding_name)
-        parent_candidates.sort_by(|a, b| {
+        };
+        let parent = dependents.iter().copied().min_by(|a, b| {
             let da = depth.get(a).copied().unwrap_or(usize::MAX);
             let db = depth.get(b).copied().unwrap_or(usize::MAX);
             da.cmp(&db).then_with(|| sort_key(a).cmp(&sort_key(b)))
         });
-        let parent = parent_candidates[0];
-        dependents.entry(parent).or_default().push(*idx);
-    }
-
-    // Add nested-under-dependent resources as children of the shallowest
-    // referencing resource. This ensures resources like IGW are nested under
-    // igw_attachment (depth 1) rather than route (depth 2+).
-    for &idx in &nested_under_dependent {
-        let mut children = all_dependents.get(&idx).cloned().unwrap_or_default();
-        // Pick the shallowest dependent; break ties by (resource_type, binding_name)
-        children.sort_by(|a, b| {
-            let da = depth.get(a).copied().unwrap_or(usize::MAX);
-            let db = depth.get(b).copied().unwrap_or(usize::MAX);
-            da.cmp(&db).then_with(|| sort_key(a).cmp(&sort_key(b)))
-        });
-        if let Some(&best_dependent) = children.first() {
-            dependents.entry(best_dependent).or_default().push(idx);
+        if let Some(parent) = parent {
+            children_map.entry(parent).or_default().push(idx);
         }
     }
 
-    // Step 7: Sort each parent's children by (resource_type, binding_name)
-    for children in dependents.values_mut() {
+    // Step 6: Sort each parent's children by (resource_type, binding_name)
+    for children in children_map.values_mut() {
         children.sort_by_key(|a| sort_key(a));
     }
 
     // Also sort roots by (resource_type, binding_name)
-    let mut sorted_roots = roots;
-    sorted_roots.sort_by_key(|a| sort_key(a));
+    roots.sort_by_key(|a| sort_key(a));
 
-    (sorted_roots, dependents)
+    (roots, children_map)
 }
 
 /// Extract a compact hint for anonymous resources.
@@ -341,4 +281,127 @@ pub fn shorten_service_name<'a>(attr_name: &str, value: &'a str) -> Cow<'a, str>
         }
     }
     Cow::Borrowed(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resource::{Resource, Value};
+
+    /// Helper: build plan, graph, and tree, then return (roots, children_map).
+    fn tree_from_plan(plan: &Plan) -> (Vec<usize>, HashMap<usize, Vec<usize>>) {
+        let graph = build_dependency_graph(plan);
+        build_single_parent_tree(plan, &graph)
+    }
+
+    #[test]
+    fn dependencies_are_children() {
+        // vpc has no deps; route_table depends on vpc; subnet depends on vpc.
+        // After flip: route_table and subnet are roots (nothing depends on them),
+        // vpc is a child.
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(
+            Resource::new("ec2.vpc", "my-vpc")
+                .with_binding("vpc")
+                .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string())),
+        ));
+        plan.add(Effect::Create(
+            Resource::new("ec2.route_table", "my-rt")
+                .with_binding("rt")
+                .with_attribute(
+                    "vpc_id",
+                    Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
+                ),
+        ));
+        plan.add(Effect::Create(
+            Resource::new("ec2.subnet", "my-subnet")
+                .with_binding("subnet")
+                .with_attribute(
+                    "vpc_id",
+                    Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
+                ),
+        ));
+
+        let (roots, children) = tree_from_plan(&plan);
+
+        // Roots should be route_table and subnet (nothing depends on them)
+        let root_bindings: Vec<String> = roots
+            .iter()
+            .map(|&i| plan.effects()[i].binding_name().unwrap())
+            .collect();
+        assert!(root_bindings.contains(&"rt".to_string()));
+        assert!(root_bindings.contains(&"subnet".to_string()));
+        assert!(!root_bindings.contains(&"vpc".to_string()));
+
+        // vpc should be a child of one of the roots
+        let vpc_idx = plan
+            .effects()
+            .iter()
+            .position(|e| e.binding_name() == Some("vpc".to_string()))
+            .unwrap();
+        let vpc_is_child_of_a_root = roots
+            .iter()
+            .any(|&r| children.get(&r).is_some_and(|c| c.contains(&vpc_idx)));
+        assert!(vpc_is_child_of_a_root);
+    }
+
+    #[test]
+    fn chain_dependency_becomes_nested_children() {
+        // A depends on B, B depends on C.
+        // After flip: A is root, B is child of A, C is child of B.
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(
+            Resource::new("ec2.vpc", "c").with_binding("c"),
+        ));
+        plan.add(Effect::Create(
+            Resource::new("ec2.subnet", "b")
+                .with_binding("b")
+                .with_attribute(
+                    "ref_c",
+                    Value::resource_ref("c".to_string(), "id".to_string(), vec![]),
+                ),
+        ));
+        plan.add(Effect::Create(
+            Resource::new("ec2.instance", "a")
+                .with_binding("a")
+                .with_attribute(
+                    "ref_b",
+                    Value::resource_ref("b".to_string(), "id".to_string(), vec![]),
+                ),
+        ));
+
+        let (roots, children) = tree_from_plan(&plan);
+
+        // A is the only root (nothing depends on A)
+        assert_eq!(roots.len(), 1);
+        let a_idx = roots[0];
+        assert_eq!(plan.effects()[a_idx].binding_name().unwrap(), "a");
+
+        // B is child of A
+        let a_children = children.get(&a_idx).unwrap();
+        assert_eq!(a_children.len(), 1);
+        let b_idx = a_children[0];
+        assert_eq!(plan.effects()[b_idx].binding_name().unwrap(), "b");
+
+        // C is child of B
+        let b_children = children.get(&b_idx).unwrap();
+        assert_eq!(b_children.len(), 1);
+        let c_idx = b_children[0];
+        assert_eq!(plan.effects()[c_idx].binding_name().unwrap(), "c");
+    }
+
+    #[test]
+    fn no_deps_resources_are_roots() {
+        // Two independent resources with no deps → both are roots.
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(
+            Resource::new("s3.bucket", "a").with_binding("a"),
+        ));
+        plan.add(Effect::Create(
+            Resource::new("s3.bucket", "b").with_binding("b"),
+        ));
+
+        let (roots, _children) = tree_from_plan(&plan);
+        assert_eq!(roots.len(), 2);
+    }
 }

@@ -3,8 +3,8 @@ source: carina-tui/src/tui_snapshot_tests.rs
 expression: output
 ---
 ┌ Plan (Plan: 1 to create, 1 to update, 1 to delete) ──────────────────────────────────────────────────────────────────┐
-│~ ec2.vpc vpc                                                                                                         │
-│    └── + ec2.security_group sg                                                                                       │
+│+ ec2.security_group sg                                                                                               │
+│    └── ~ ec2.vpc vpc                                                                                                 │
 │- ec2.subnet old-subnet                                                                                               │
 │                                                                                                                      │
 │                                                                                                                      │
@@ -30,10 +30,10 @@ expression: output
 │                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ Details ─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│~ ec2.vpc vpc                                                                                                         │
+│+ ec2.security_group sg                                                                                               │
 │                                                                                                                      │
-│  enable_dns_support: (none) -> true                                                                                  │
-│  # (1 unchanged attribute hidden)                                                                                    │
+│  group_description: "Web security group"                                                                             │
+│  vpc_id: vpc.vpc_id →                                                                                                │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │

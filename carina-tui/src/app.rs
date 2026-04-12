@@ -990,15 +990,16 @@ mod tests {
 
         let app = App::new(&plan, &HashMap::new());
 
-        // VPC should be root (depth 0) with subnet as child
-        assert_eq!(app.nodes[0].depth, 0);
-        assert!(app.nodes[0].parent.is_none());
-        assert_eq!(app.nodes[0].children, vec![1]);
+        // Subnet should be root (depth 0) with vpc as child
+        // (subnet depends on vpc, so vpc is its child in the tree)
+        assert_eq!(app.nodes[1].depth, 0);
+        assert!(app.nodes[1].parent.is_none());
+        assert_eq!(app.nodes[1].children, vec![0]);
 
-        // Subnet should be child (depth 1) with VPC as parent
-        assert_eq!(app.nodes[1].depth, 1);
-        assert_eq!(app.nodes[1].parent, Some(0));
-        assert!(app.nodes[1].children.is_empty());
+        // VPC should be child (depth 1) with subnet as parent
+        assert_eq!(app.nodes[0].depth, 1);
+        assert_eq!(app.nodes[0].parent, Some(1));
+        assert!(app.nodes[0].children.is_empty());
     }
 
     #[test]
@@ -1169,12 +1170,13 @@ mod tests {
         // Before search, all 3 nodes visible
         assert_eq!(app.visible_count(), 3);
 
-        // Search for "subnet" - should show subnet + its parent vpc
-        app.search_query = "subnet".to_string();
+        // Search for "vpc" - should show vpc + its ancestor subnet
+        // (subnet is root, vpc is its child in the flipped tree)
+        app.search_query = "vpc".to_string();
         app.update_search_matches();
 
         let visible = app.visible_nodes();
-        assert_eq!(visible.len(), 2); // vpc (ancestor) + subnet (match)
+        assert_eq!(visible.len(), 2); // subnet (ancestor) + vpc (match)
 
         // The s3.bucket should not be visible
         for &idx in &visible {
@@ -1187,23 +1189,23 @@ mod tests {
         let plan = make_tree_plan();
         let mut app = App::new(&plan, &HashMap::new());
 
-        app.search_query = "subnet".to_string();
+        app.search_query = "vpc".to_string();
         app.update_search_matches();
 
         let visible = app.visible_nodes();
-        // vpc is ancestor-only (dimmed)
-        let vpc_idx = visible
-            .iter()
-            .find(|&&idx| app.nodes[idx].resource_type == "ec2.vpc")
-            .unwrap();
-        assert!(app.is_ancestor_only(*vpc_idx));
-
-        // subnet is a match (not dimmed)
+        // subnet is ancestor-only (dimmed) — it's the root parent of vpc
         let subnet_idx = visible
             .iter()
             .find(|&&idx| app.nodes[idx].resource_type == "ec2.subnet")
             .unwrap();
-        assert!(!app.is_ancestor_only(*subnet_idx));
+        assert!(app.is_ancestor_only(*subnet_idx));
+
+        // vpc is a match (not dimmed)
+        let vpc_idx = visible
+            .iter()
+            .find(|&&idx| app.nodes[idx].resource_type == "ec2.vpc")
+            .unwrap();
+        assert!(!app.is_ancestor_only(*vpc_idx));
     }
 
     #[test]
@@ -1211,7 +1213,7 @@ mod tests {
         let plan = make_tree_plan();
         let mut app = App::new(&plan, &HashMap::new());
 
-        app.search_query = "subnet".to_string();
+        app.search_query = "vpc".to_string();
         app.update_search_matches();
         assert_eq!(app.visible_count(), 2);
 
@@ -1238,15 +1240,15 @@ mod tests {
         let plan = make_tree_plan();
         let mut app = App::new(&plan, &HashMap::new());
 
-        app.search_query = "subnet".to_string();
+        app.search_query = "vpc".to_string();
         app.update_search_matches();
 
-        // search_matches should contain only the visible index of the subnet node
+        // search_matches should contain only the visible index of the vpc node
         assert_eq!(app.search_matches.len(), 1);
         let visible = app.visible_nodes();
         let match_vis_idx = app.search_matches[0];
         let match_node_idx = visible[match_vis_idx];
-        assert_eq!(app.nodes[match_node_idx].resource_type, "ec2.subnet");
+        assert_eq!(app.nodes[match_node_idx].resource_type, "ec2.vpc");
     }
 
     #[test]

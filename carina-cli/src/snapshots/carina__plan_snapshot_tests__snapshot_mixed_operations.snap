@@ -4,17 +4,16 @@ expression: output
 ---
 Execution Plan:
 
-  ~ awscc.ec2.vpc vpc
+  + awscc.ec2.security_group 
+      group_description: "Test security group"
       tags:
-        + Environment: "staging"
-      # (3 unchanged attributes hidden)
+        Name: "test-sg"
+      vpc_id: "vpc-0123456789abcdef0"
         │
-        ├─ + awscc.ec2.security_group 
-        │     group_description: "Test security group"
-        │     tags:
-        │       Name: "test-sg"
-        │     vpc_id: "vpc-0123456789abcdef0"
-        │
-        └─ - awscc.ec2.subnet my_subnet
+        └─ ~ awscc.ec2.vpc vpc
+              tags:
+                + Environment: "staging"
+              # (3 unchanged attributes hidden)
+  - awscc.ec2.subnet my_subnet
 
 Plan: 1 to add, 1 to change, 1 to destroy.
