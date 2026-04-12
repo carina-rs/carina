@@ -1551,7 +1551,7 @@ impl Formatter {
         for child in &node.children {
             match child {
                 CstChild::Token(token) => {
-                    if !wrote_key && self.is_identifier(&token.text) {
+                    if !wrote_key && self.is_key_token(&token.text) {
                         key_len = token.text.len();
                         self.write_token(&token.text);
                         wrote_key = true;
@@ -1804,7 +1804,7 @@ impl Formatter {
     fn get_map_entry_key(&self, node: &CstNode) -> Option<String> {
         for child in &node.children {
             if let CstChild::Token(token) = child
-                && self.is_identifier(&token.text)
+                && self.is_key_token(&token.text)
             {
                 return Some(token.text.clone());
             }
@@ -1826,7 +1826,7 @@ impl Formatter {
         for child in &node.children {
             match child {
                 CstChild::Token(token) => {
-                    if !wrote_key && self.is_identifier(&token.text) {
+                    if !wrote_key && self.is_key_token(&token.text) {
                         key_len = token.text.len();
                         self.write_token(&token.text);
                         wrote_key = true;
@@ -1931,6 +1931,16 @@ impl Formatter {
         let mut chars = s.chars();
         chars.next().is_some_and(|c| c.is_ascii_alphabetic())
             && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+
+    /// Check if a token is a valid key (identifier or quoted string).
+    fn is_key_token(&self, s: &str) -> bool {
+        self.is_identifier(s) || self.is_quoted_string(s)
+    }
+
+    fn is_quoted_string(&self, s: &str) -> bool {
+        (s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2)
+            || (s.starts_with('"') && s.ends_with('"') && s.len() >= 2)
     }
 }
 
@@ -2959,5 +2969,30 @@ require   port >= 1 && port <= 65535  , "port must be valid"
         let first = format(input, &config).unwrap();
         let second = format(&first, &config).unwrap();
         assert_eq!(first, second, "Quote normalization should be idempotent");
+    }
+
+    #[test]
+    fn test_format_quoted_map_keys() {
+        let input =
+            "let m = {\n  'token.actions.githubusercontent.com:aud' = 'sts.amazonaws.com'\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert!(
+            result.contains("'token.actions.githubusercontent.com:aud'"),
+            "Quoted map key should be preserved. Got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_quoted_attribute_key_in_block() {
+        let input = "aws.iam.role {\n  name = 'test'\n  'aws:condition' = 'value'\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert!(
+            result.contains("'aws:condition'"),
+            "Quoted attribute key should be preserved. Got:\n{}",
+            result
+        );
     }
 }
