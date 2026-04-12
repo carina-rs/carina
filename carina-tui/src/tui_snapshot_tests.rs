@@ -292,3 +292,78 @@ fn snapshot_filter_mode_route_table() {
     let output = render_tui_with_search(&plan, 120, 40, "rt");
     insta::assert_snapshot!(output);
 }
+
+// ---------------------------------------------------------------------------
+// Move effect dedup: Move suppressed when Update/Replace exists for same target
+// ---------------------------------------------------------------------------
+
+/// Build a plan with Move + Update for the same target (Move should be suppressed).
+fn build_moved_with_changes_plan() -> Plan {
+    let mut plan = Plan::new();
+    plan.add(Effect::Move {
+        from: ResourceId::new("ec2.vpc", "old_vpc"),
+        to: ResourceId::new("ec2.vpc", "new_vpc"),
+    });
+    plan.add(Effect::Update {
+        id: ResourceId::new("ec2.vpc", "new_vpc"),
+        from: Box::new(State::existing(
+            ResourceId::new("ec2.vpc", "new_vpc"),
+            [
+                (
+                    "cidr_block".to_string(),
+                    Value::String("10.0.0.0/16".to_string()),
+                ),
+                ("_binding".to_string(), Value::String("new_vpc".to_string())),
+            ]
+            .into_iter()
+            .collect(),
+        )),
+        to: Resource::new("ec2.vpc", "new_vpc")
+            .with_binding("new_vpc")
+            .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()))
+            .with_attribute(
+                "tags",
+                Value::Map(
+                    [("Name".to_string(), Value::String("updated".to_string()))]
+                        .into_iter()
+                        .collect(),
+                ),
+            ),
+        changed_attributes: vec!["tags".to_string()],
+    });
+    plan.add(Effect::Create(
+        Resource::new("ec2.subnet", "my-subnet")
+            .with_attribute("cidr_block", Value::String("10.0.1.0/24".to_string()))
+            .with_attribute(
+                "vpc_id",
+                Value::resource_ref("new_vpc".to_string(), "vpc_id".to_string(), vec![]),
+            ),
+    ));
+    plan
+}
+
+/// Build a plan with a pure Move (no Update/Replace, Move should be kept).
+fn build_moved_pure_plan() -> Plan {
+    let mut plan = Plan::new();
+    plan.add(Effect::Move {
+        from: ResourceId::new("ec2.vpc", "old_vpc"),
+        to: ResourceId::new("ec2.vpc", "new_vpc"),
+    });
+    plan
+}
+
+#[test]
+fn snapshot_moved_with_changes() {
+    let plan = build_moved_with_changes_plan();
+    // Move should be suppressed; only Update + Create should appear
+    let output = render_tui(&plan, 120, 40, 0);
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_moved_pure() {
+    let plan = build_moved_pure_plan();
+    // Pure move should be displayed as a tree node
+    let output = render_tui(&plan, 120, 40, 0);
+    insta::assert_snapshot!(output);
+}
