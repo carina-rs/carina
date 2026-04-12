@@ -30,6 +30,24 @@ pub(super) fn test_provider() -> CompletionProvider {
     )
 }
 
+pub(super) fn test_provider_with_custom_types() -> CompletionProvider {
+    let factories: Vec<Box<dyn ProviderFactory>> = vec![];
+    let schemas = Arc::new(carina_core::provider::collect_schemas(&factories));
+    let provider_names: Vec<String> = vec!["awscc".to_string()];
+    let region_completions: Vec<CompletionValue> = vec![];
+    let custom_type_names = vec![
+        "arn".to_string(),
+        "iam_policy_arn".to_string(),
+        "availability_zone".to_string(),
+    ];
+    CompletionProvider::new(
+        schemas,
+        provider_names,
+        region_completions,
+        custom_type_names,
+    )
+}
+
 pub(super) fn test_provider_with_block_name_nested() -> CompletionProvider {
     // Nested struct where a StructField has block_name set.
     // Schema: config -> transitions (List<Struct>, block_name="transition") -> each has "days" + "storage_class"
