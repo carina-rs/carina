@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::PathBuf;
 
 use carina_core::parser::{ProviderConfig, ProviderContext};
 use carina_core::provider::ProviderFactory;
@@ -9,12 +9,13 @@ use carina_lsp::Backend;
 use carina_lsp::backend::FactoryBuildResult;
 
 /// Build provider factories from discovered provider configs.
-/// Returns loaded factories and a map of provider name -> error reason for failures.
-fn build_factories(providers: &[ProviderConfig], base_dir: &Path) -> FactoryBuildResult {
+/// Each entry is (source_directory, provider_config) so providers are installed
+/// in the directory containing the `.crn` file, not at the workspace root.
+fn build_factories(providers: &[(PathBuf, ProviderConfig)]) -> FactoryBuildResult {
     let mut factories: Vec<Box<dyn ProviderFactory>> = Vec::new();
     let mut errors: HashMap<String, String> = HashMap::new();
 
-    for config in providers {
+    for (source_dir, config) in providers {
         let source = match &config.source {
             Some(s) => s,
             None => {
@@ -30,7 +31,7 @@ fn build_factories(providers: &[ProviderConfig], base_dir: &Path) -> FactoryBuil
         let binary_path = if let Some(path) = source.strip_prefix("file://") {
             std::path::PathBuf::from(path)
         } else if source.starts_with("github.com/") {
-            match carina_provider_resolver::resolve_single_config(base_dir, config) {
+            match carina_provider_resolver::resolve_single_config(source_dir, config) {
                 Ok(path) => path,
                 Err(e) => {
                     errors.insert(config.name.clone(), e);
