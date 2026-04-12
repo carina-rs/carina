@@ -103,11 +103,22 @@ impl ProviderStates {
     /// 2. If not found, check if the file's directory is imported by a caller
     ///    and use the caller's ProviderState
     fn state_for_path(&self, file_path: &Path) -> &ProviderState {
-        // First: walk up to find a config directory
+        self.state_for_path_with_info(file_path).0
+    }
+
+    fn state_for_path_with_info(&self, file_path: &Path) -> (&ProviderState, Option<PathBuf>) {
+        // First: walk up to find a config directory (try both raw and canonical)
         let mut dir = file_path.parent();
         while let Some(d) = dir {
             if let Some(state) = self.by_dir.get(d) {
-                return state;
+                return (state, Some(d.to_path_buf()));
+            }
+            // Try canonical path in case the by_dir key is different
+            if let Ok(canonical) = d.canonicalize()
+                && canonical != d
+                && let Some(state) = self.by_dir.get(&canonical)
+            {
+                return (state, Some(canonical));
             }
             dir = d.parent();
         }
@@ -117,18 +128,17 @@ impl ProviderStates {
         let canonical = file_dir.canonicalize().unwrap_or(file_dir.to_path_buf());
         if let Some(callers) = self.import_map.get(&canonical) {
             for caller_dir in callers {
-                // Walk up from caller to find its config directory
                 let mut dir = Some(caller_dir.as_path());
                 while let Some(d) = dir {
                     if let Some(state) = self.by_dir.get(d) {
-                        return state;
+                        return (state, Some(d.to_path_buf()));
                     }
                     dir = d.parent();
                 }
             }
         }
 
-        &self.empty
+        (&self.empty, None)
     }
 }
 
@@ -186,10 +196,19 @@ impl Backend {
                 .and_then(|p| p.parent().map(|p| p.to_path_buf()));
 
             let providers = self.providers.read().await;
-            let state = base_path
+            let (state, matched_dir) = base_path
                 .as_ref()
-                .map(|p| providers.state_for_path(p))
-                .unwrap_or(&providers.empty);
+                .map(|p| {
+                    let (s, d) = providers.state_for_path_with_info(p);
+                    (s, d)
+                })
+                .unwrap_or((&providers.empty, None));
+            log::debug!(
+                "Diagnostics for {}: matched config dir = {:?}, provider_names = {:?}",
+                uri,
+                matched_dir,
+                state.diagnostic_engine.provider_names(),
+            );
             let diagnostics = state.diagnostic_engine.analyze(&doc, base_path.as_deref());
             drop(providers);
 

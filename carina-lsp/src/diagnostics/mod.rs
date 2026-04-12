@@ -84,6 +84,10 @@ impl DiagnosticEngine {
         self.schemas.len()
     }
 
+    pub fn provider_names(&self) -> &[String] {
+        &self.provider_names
+    }
+
     pub fn with_provider_errors(mut self, errors: HashMap<String, String>) -> Self {
         self.provider_errors = errors;
         self
