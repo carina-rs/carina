@@ -1387,23 +1387,17 @@ fn resource_validation_failed_with_attribute_points_to_attribute_line() {
 }
 
 #[test]
-fn module_file_no_unknown_resource_type_error() {
-    // Module files have arguments but no provider declarations.
-    // They should not get "Unknown resource type" errors even when the
-    // provider is known to the LSP (schemas loaded from workspace).
+fn warning_when_provider_loaded_but_schema_missing() {
+    // Provider is loaded but doesn't have a schema for this resource type.
+    // Should show WARNING (not ERROR), not "Unknown resource type".
     let engine = DiagnosticEngine::new(
         Arc::new(HashMap::new()),
-        vec!["awscc".to_string()], // provider known but no schemas for iam.role
+        vec!["awscc".to_string()],
         Arc::new(vec![]),
     );
     let doc = create_document(
-        r#"arguments {
-  github_repo: string
-  role_name: string
-}
-
-let role = awscc.iam.role {
-  role_name = role_name
+        r#"awscc.iam.role {
+  role_name = 'test'
 }
 "#,
     );
@@ -1415,26 +1409,30 @@ let role = awscc.iam.role {
         .find(|d| d.message.contains("Unknown resource type"));
     assert!(
         unknown_type.is_none(),
-        "Module file (no provider declarations) should not show 'Unknown resource type'. Got: {:?}",
+        "Loaded provider should not show 'Unknown resource type'. Got: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+
+    let no_schema = diagnostics
+        .iter()
+        .find(|d| d.message.contains("No schema for"));
+    assert!(
+        no_schema.is_some(),
+        "Should show 'No schema' warning. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        no_schema.unwrap().severity,
+        Some(DiagnosticSeverity::WARNING)
     );
 }
 
 #[test]
-fn file_with_provider_still_shows_unknown_resource_type() {
-    // Files WITH provider declarations should still show "Unknown resource type"
-    // for types not in loaded schemas.
-    let engine = DiagnosticEngine::new(
-        Arc::new(HashMap::new()),
-        vec!["awscc".to_string()],
-        Arc::new(vec![]),
-    );
+fn error_when_provider_not_loaded_at_all() {
+    // Provider completely unknown — not in provider_names, not in errors.
+    let engine = DiagnosticEngine::new(Arc::new(HashMap::new()), vec![], Arc::new(vec![]));
     let doc = create_document(
-        r#"provider awscc {
-  region = awscc.Region.ap_northeast_1
-}
-
-awscc.iam.role {
+        r#"awscc.iam.role {
   role_name = 'test'
 }
 "#,
@@ -1447,7 +1445,7 @@ awscc.iam.role {
         .find(|d| d.message.contains("Unknown resource type"));
     assert!(
         unknown_type.is_some(),
-        "File with provider declarations should still show 'Unknown resource type' for unloaded schemas. Got: {:?}",
+        "Unknown provider should show 'Unknown resource type'. Got: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }

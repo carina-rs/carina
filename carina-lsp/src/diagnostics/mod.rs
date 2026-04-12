@@ -80,6 +80,10 @@ impl DiagnosticEngine {
         }
     }
 
+    pub fn schema_count(&self) -> usize {
+        self.schemas.len()
+    }
+
     pub fn with_provider_errors(mut self, errors: HashMap<String, String>) -> Self {
         self.provider_errors = errors;
         self
@@ -126,22 +130,21 @@ impl DiagnosticEngine {
                 }
             }
 
-            // Files without provider declarations (modules) inherit providers from
-            // callers, so skip "Unknown resource type" errors — the schemas may not
-            // be available but that's expected.
-            let has_providers = !parsed.providers.is_empty();
-
             // Check resource types
             for resource in &parsed.resources {
                 let provider = &resource.id.provider;
                 let full_resource_type = format!("{}.{}", provider, resource.id.resource_type);
 
-                if !self.schemas.contains_key(&full_resource_type) && has_providers {
-                    // If the provider failed to load, show INFO with the reason
+                if !self.schemas.contains_key(&full_resource_type) {
+                    let provider_loaded = self.provider_names.contains(&provider.to_string());
+
                     if let Some(reason) = self.provider_errors.get(provider) {
-                        if let Some((line, col)) =
-                            self.find_resource_position(doc, &resource.id.resource_type)
-                        {
+                        // Provider failed to load
+                        if let Some((line, col)) = self.find_resource_type_position(
+                            doc,
+                            provider,
+                            &resource.id.resource_type,
+                        ) {
                             let end_col = col
                                 + resource.id.resource_type.len() as u32
                                 + provider.len() as u32
@@ -154,23 +157,50 @@ impl DiagnosticEngine {
                                 format!("Provider '{}' is not loaded: {}", provider, reason),
                             ));
                         }
-                    } else if let Some((line, col)) =
-                        self.find_resource_position(doc, &resource.id.resource_type)
-                    {
-                        let end_col = col
-                            + resource.id.resource_type.len() as u32
-                            + provider.len() as u32
-                            + 1; // "provider." prefix
-                        diagnostics.push(carina_diagnostic(
-                            line,
-                            col,
-                            end_col,
-                            DiagnosticSeverity::ERROR,
-                            format!(
-                                "Unknown resource type: {}.{}",
-                                provider, resource.id.resource_type
-                            ),
-                        ));
+                    } else if !provider_loaded {
+                        // Provider not loaded at all
+                        if let Some((line, col)) = self.find_resource_type_position(
+                            doc,
+                            provider,
+                            &resource.id.resource_type,
+                        ) {
+                            let end_col = col
+                                + resource.id.resource_type.len() as u32
+                                + provider.len() as u32
+                                + 1;
+                            diagnostics.push(carina_diagnostic(
+                                line,
+                                col,
+                                end_col,
+                                DiagnosticSeverity::ERROR,
+                                format!(
+                                    "Unknown resource type: {}.{}",
+                                    provider, resource.id.resource_type
+                                ),
+                            ));
+                        }
+                    } else {
+                        // Provider loaded but no schema for this resource type
+                        if let Some((line, col)) = self.find_resource_type_position(
+                            doc,
+                            provider,
+                            &resource.id.resource_type,
+                        ) {
+                            let end_col = col
+                                + resource.id.resource_type.len() as u32
+                                + provider.len() as u32
+                                + 1;
+                            diagnostics.push(carina_diagnostic(
+                                line,
+                                col,
+                                end_col,
+                                DiagnosticSeverity::WARNING,
+                                format!(
+                                    "No schema for {}.{} — attribute validation skipped",
+                                    provider, resource.id.resource_type
+                                ),
+                            ));
+                        }
                     }
                 }
 
@@ -180,8 +210,11 @@ impl DiagnosticEngine {
                     // Check data source without `read` keyword
                     if schema.data_source
                         && !resource.is_data_source()
-                        && let Some((line, col)) =
-                            self.find_resource_position(doc, &resource.id.resource_type)
+                        && let Some((line, col)) = self.find_resource_type_position(
+                            doc,
+                            provider,
+                            &resource.id.resource_type,
+                        )
                     {
                         let end_col = col
                             + resource.id.resource_type.len() as u32
@@ -498,7 +531,11 @@ impl DiagnosticEngine {
                                     None
                                 };
                             let position = position.or_else(|| {
-                                self.find_resource_position(doc, &resource.id.resource_type)
+                                self.find_resource_type_position(
+                                    doc,
+                                    provider,
+                                    &resource.id.resource_type,
+                                )
                             });
                             if let Some((line, col)) = position {
                                 diagnostics.push(carina_diagnostic_range(
@@ -646,18 +683,21 @@ impl DiagnosticEngine {
             .collect()
     }
 
-    fn find_resource_position(&self, doc: &Document, resource_type: &str) -> Option<(u32, u32)> {
+    fn find_resource_type_position(
+        &self,
+        doc: &Document,
+        provider: &str,
+        resource_type: &str,
+    ) -> Option<(u32, u32)> {
         let text = doc.text();
+        let pattern = format!("{}.{}", provider, resource_type);
 
         for (line_idx, line) in text.lines().enumerate() {
-            for provider_name in &self.provider_names {
-                let pattern = format!("{}.{}", provider_name, resource_type);
-                if let Some(byte_pos) = line.find(pattern.as_str()) {
-                    return Some((
-                        line_idx as u32,
-                        position::byte_offset_to_char_offset(line, byte_pos),
-                    ));
-                }
+            if let Some(byte_pos) = line.find(pattern.as_str()) {
+                return Some((
+                    line_idx as u32,
+                    position::byte_offset_to_char_offset(line, byte_pos),
+                ));
             }
         }
         None
