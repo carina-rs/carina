@@ -126,12 +126,17 @@ impl DiagnosticEngine {
                 }
             }
 
+            // Files without provider declarations (modules) inherit providers from
+            // callers, so skip "Unknown resource type" errors — the schemas may not
+            // be available but that's expected.
+            let has_providers = !parsed.providers.is_empty();
+
             // Check resource types
             for resource in &parsed.resources {
                 let provider = &resource.id.provider;
                 let full_resource_type = format!("{}.{}", provider, resource.id.resource_type);
 
-                if !self.schemas.contains_key(&full_resource_type) {
+                if !self.schemas.contains_key(&full_resource_type) && has_providers {
                     // If the provider failed to load, show INFO with the reason
                     if let Some(reason) = self.provider_errors.get(provider) {
                         if let Some((line, col)) =

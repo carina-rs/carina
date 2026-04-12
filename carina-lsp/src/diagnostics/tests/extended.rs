@@ -1385,3 +1385,69 @@ fn resource_validation_failed_with_attribute_points_to_attribute_line() {
         diag.range.start.line
     );
 }
+
+#[test]
+fn module_file_no_unknown_resource_type_error() {
+    // Module files have arguments but no provider declarations.
+    // They should not get "Unknown resource type" errors even when the
+    // provider is known to the LSP (schemas loaded from workspace).
+    let engine = DiagnosticEngine::new(
+        Arc::new(HashMap::new()),
+        vec!["awscc".to_string()], // provider known but no schemas for iam.role
+        Arc::new(vec![]),
+    );
+    let doc = create_document(
+        r#"arguments {
+  github_repo: string
+  role_name: string
+}
+
+let role = awscc.iam.role {
+  role_name = role_name
+}
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let unknown_type = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Unknown resource type"));
+    assert!(
+        unknown_type.is_none(),
+        "Module file (no provider declarations) should not show 'Unknown resource type'. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn file_with_provider_still_shows_unknown_resource_type() {
+    // Files WITH provider declarations should still show "Unknown resource type"
+    // for types not in loaded schemas.
+    let engine = DiagnosticEngine::new(
+        Arc::new(HashMap::new()),
+        vec!["awscc".to_string()],
+        Arc::new(vec![]),
+    );
+    let doc = create_document(
+        r#"provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.iam.role {
+  role_name = 'test'
+}
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let unknown_type = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Unknown resource type"));
+    assert!(
+        unknown_type.is_some(),
+        "File with provider declarations should still show 'Unknown resource type' for unloaded schemas. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
