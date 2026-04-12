@@ -74,11 +74,31 @@ pub fn check_backend_lock(
             }
         }
         Some(_) => Ok(()),
-        None => {
-            current.save(base_dir).map_err(AppError::Backend)?;
-            Ok(())
-        }
+        // No lock file yet — don't create one here. The lock is created
+        // when state is first written (apply/destroy), not on plan/validate.
+        None => Ok(()),
     }
+}
+
+/// Save the backend lock file for the current configuration.
+/// Called after state is successfully written to ensure the lock
+/// exists for future backend-change detection.
+pub fn ensure_backend_lock(
+    base_dir: &Path,
+    backend_config: Option<&BackendConfig>,
+) -> Result<(), AppError> {
+    let lock_path = BackendLock::lock_path(base_dir);
+    if lock_path.exists() {
+        return Ok(());
+    }
+    let lock = match backend_config {
+        Some(config) => {
+            let state_config = StateBackendConfig::from(config);
+            BackendLock::from_config(&state_config)
+        }
+        None => BackendLock::local_default(),
+    };
+    lock.save(base_dir).map_err(AppError::Backend)
 }
 
 /// Run the common validation and module resolution pipeline.
@@ -194,11 +214,20 @@ mod tests {
     }
 
     #[test]
-    fn check_backend_lock_creates_lock_on_first_run() {
+    fn check_backend_lock_does_not_create_lock_on_first_run() {
         let tmp = tempfile::tempdir().unwrap();
         let config = s3_backend_config("my-bucket", "us-east-1");
         let result = check_backend_lock(tmp.path(), Some(&config), false);
         assert!(result.is_ok());
+        // Lock should NOT be created by check — only by ensure_backend_lock
+        assert!(!tmp.path().join(".carina/backend-lock.json").exists());
+    }
+
+    #[test]
+    fn ensure_backend_lock_creates_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = s3_backend_config("my-bucket", "us-east-1");
+        ensure_backend_lock(tmp.path(), Some(&config)).unwrap();
         assert!(tmp.path().join(".carina/backend-lock.json").exists());
     }
 
@@ -206,7 +235,7 @@ mod tests {
     fn check_backend_lock_passes_when_config_unchanged() {
         let tmp = tempfile::tempdir().unwrap();
         let config = s3_backend_config("my-bucket", "us-east-1");
-        check_backend_lock(tmp.path(), Some(&config), false).unwrap();
+        ensure_backend_lock(tmp.path(), Some(&config)).unwrap();
         let result = check_backend_lock(tmp.path(), Some(&config), false);
         assert!(result.is_ok());
     }
@@ -216,14 +245,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let old = s3_backend_config("old-bucket", "us-east-1");
         let new = s3_backend_config("new-bucket", "us-east-1");
-        check_backend_lock(tmp.path(), Some(&old), false).unwrap();
+        ensure_backend_lock(tmp.path(), Some(&old)).unwrap();
         let err = check_backend_lock(tmp.path(), Some(&new), false).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("Backend configuration has changed"));
         assert!(msg.contains("bucket"));
         assert!(msg.contains("old-bucket"));
         assert!(msg.contains("new-bucket"));
-        // Error should hint at both options: migrate (preserve state) and reconfigure (discard).
         assert!(msg.contains("carina state migrate"));
         assert!(msg.contains("--reconfigure"));
     }
@@ -233,32 +261,26 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let old = s3_backend_config("old-bucket", "us-east-1");
         let new = s3_backend_config("new-bucket", "us-east-1");
-        check_backend_lock(tmp.path(), Some(&old), false).unwrap();
+        ensure_backend_lock(tmp.path(), Some(&old)).unwrap();
         let result = check_backend_lock(tmp.path(), Some(&new), true);
         assert!(result.is_ok());
-        // Subsequent check with new config should now pass without reconfigure
         let result2 = check_backend_lock(tmp.path(), Some(&new), false);
         assert!(result2.is_ok());
     }
 
     #[test]
-    fn check_backend_lock_records_local_default_when_no_backend_configured() {
+    fn check_backend_lock_no_lock_no_backend_does_not_create_file() {
         let tmp = tempfile::tempdir().unwrap();
         let result = check_backend_lock(tmp.path(), None, false);
         assert!(result.is_ok());
-        // A lock file is created with the implicit local backend, so that a
-        // subsequent transition to a remote backend can be detected.
-        let lock_path = tmp.path().join(".carina/backend-lock.json");
-        assert!(lock_path.exists());
-        let contents = std::fs::read_to_string(&lock_path).unwrap();
-        assert!(contents.contains("\"local\""));
+        assert!(!tmp.path().join(".carina/backend-lock.json").exists());
     }
 
     #[test]
     fn check_backend_lock_blocks_local_to_remote_transition() {
         let tmp = tempfile::tempdir().unwrap();
-        // First run: local default (no backend block)
-        check_backend_lock(tmp.path(), None, false).unwrap();
+        // Simulate first apply with no backend (local default)
+        ensure_backend_lock(tmp.path(), None).unwrap();
         // Second run: user adds an S3 backend
         let new = s3_backend_config("my-bucket", "us-east-1");
         let err = check_backend_lock(tmp.path(), Some(&new), false).unwrap_err();
@@ -272,7 +294,7 @@ mod tests {
     #[test]
     fn check_backend_lock_allows_local_to_remote_with_reconfigure() {
         let tmp = tempfile::tempdir().unwrap();
-        check_backend_lock(tmp.path(), None, false).unwrap();
+        ensure_backend_lock(tmp.path(), None).unwrap();
         let new = s3_backend_config("my-bucket", "us-east-1");
         let result = check_backend_lock(tmp.path(), Some(&new), true);
         assert!(result.is_ok());
