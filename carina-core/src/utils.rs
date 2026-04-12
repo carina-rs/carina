@@ -88,16 +88,16 @@ pub fn extract_enum_value_with_values<'a>(s: &'a str, valid_values: &[&str]) -> 
     extract_enum_value(s)
 }
 
-/// Convert DSL enum value to provider SDK format.
+/// Strip the namespace prefix from a DSL enum identifier and return the raw value.
 ///
 /// Handles the following patterns:
-/// - 2-part: `TypeName.value_name` -> `value-name`
-/// - 3-part: `provider.TypeName.value_name` -> `value-name`
-/// - 4-part: `provider.resource.TypeName.value_name` -> `value-name`
-/// - 5-part: `provider.service.resource.TypeName.value_name` -> `value-name`
+/// - 2-part: `TypeName.value_name` -> `value_name`
+/// - 3-part: `provider.TypeName.value_name` -> `value_name`
+/// - 4-part: `provider.resource.TypeName.value_name` -> `value_name`
+/// - 5-part: `provider.service.resource.TypeName.value_name` -> `value_name`
 ///
 /// The first component of TypeName must be uppercase.
-/// Underscores in the extracted value are replaced with hyphens.
+/// The extracted value is returned as-is without any transformation.
 /// Returns the original value unchanged if it doesn't match any pattern.
 ///
 /// # Examples
@@ -105,20 +105,20 @@ pub fn extract_enum_value_with_values<'a>(s: &'a str, valid_values: &[&str]) -> 
 /// ```
 /// use carina_core::utils::convert_enum_value;
 ///
-/// assert_eq!(convert_enum_value("aws.Region.ap_northeast_1"), "ap-northeast-1");
-/// assert_eq!(convert_enum_value("Region.ap_northeast_1"), "ap-northeast-1");
+/// assert_eq!(convert_enum_value("aws.Region.ap_northeast_1"), "ap_northeast_1");
+/// assert_eq!(convert_enum_value("Region.ap_northeast_1"), "ap_northeast_1");
 /// assert_eq!(convert_enum_value("awscc.ec2.ipam.Tier.advanced"), "advanced");
 /// assert_eq!(convert_enum_value("eu-west-1"), "eu-west-1");
 /// ```
-pub fn convert_enum_value(value: &str) -> String {
+pub fn convert_enum_value(value: &str) -> &str {
     let parts: Vec<&str> = value.split('.').collect();
-    let raw_value = match parts.len() {
+    match parts.len() {
         2 => {
             // TypeName.value pattern
             if parts[0].chars().next().is_some_and(|c| c.is_uppercase()) {
                 parts[1]
             } else {
-                return value.to_string();
+                value
             }
         }
         3 => {
@@ -130,7 +130,7 @@ pub fn convert_enum_value(value: &str) -> String {
             {
                 parts[2]
             } else {
-                return value.to_string();
+                value
             }
         }
         // 4-part: provider.resource.TypeName.value
@@ -143,7 +143,7 @@ pub fn convert_enum_value(value: &str) -> String {
             {
                 parts[3]
             } else {
-                return value.to_string();
+                value
             }
         }
         // 5+ part: provider.service.resource.TypeName.value (value may contain dots)
@@ -157,14 +157,13 @@ pub fn convert_enum_value(value: &str) -> String {
             {
                 // Rejoin all parts after TypeName (index 3) to handle values with dots
                 let value_start = parts[..4].iter().map(|p| p.len() + 1).sum::<usize>();
-                return value[value_start..].replace('_', "-");
+                &value[value_start..]
             } else {
-                return value.to_string();
+                value
             }
         }
-        _ => return value.to_string(),
-    };
-    raw_value.replace('_', "-")
+        _ => value,
+    }
 }
 
 /// Check if a string is in DSL enum format (a namespaced identifier).
@@ -433,7 +432,7 @@ mod tests {
     fn test_convert_enum_value_2_part() {
         assert_eq!(
             convert_enum_value("Region.ap_northeast_1"),
-            "ap-northeast-1"
+            "ap_northeast_1"
         );
     }
 
@@ -441,16 +440,16 @@ mod tests {
     fn test_convert_enum_value_3_part() {
         assert_eq!(
             convert_enum_value("aws.Region.ap_northeast_1"),
-            "ap-northeast-1"
+            "ap_northeast_1"
         );
-        assert_eq!(convert_enum_value("aws.Region.us_east_1"), "us-east-1");
+        assert_eq!(convert_enum_value("aws.Region.us_east_1"), "us_east_1");
         assert_eq!(
             convert_enum_value("aws.AvailabilityZone.ap_northeast_1a"),
-            "ap-northeast-1a"
+            "ap_northeast_1a"
         );
         assert_eq!(
             convert_enum_value("aws.AvailabilityZone.us_east_1b"),
-            "us-east-1b"
+            "us_east_1b"
         );
     }
 
@@ -761,6 +760,22 @@ mod tests {
         assert_eq!(
             convert_enum_value("awscc.ec2.vpn_gateway.Type.ipsec.1"),
             "ipsec.1"
+        );
+    }
+
+    // convert_enum_value: underscores in enum values must be preserved (#1675)
+
+    #[test]
+    fn test_convert_enum_value_preserves_underscores() {
+        // Enum values like AWS_ACCOUNT must not have underscores converted to hyphens
+        assert_eq!(
+            convert_enum_value("awscc.sso.assignment.TargetType.AWS_ACCOUNT"),
+            "AWS_ACCOUNT"
+        );
+        assert_eq!(convert_enum_value("TargetType.AWS_ACCOUNT"), "AWS_ACCOUNT");
+        assert_eq!(
+            convert_enum_value("awscc.sso.assignment.PrincipalType.GROUP"),
+            "GROUP"
         );
     }
 
