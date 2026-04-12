@@ -306,7 +306,15 @@ impl Expr {
         !contains_resource_ref(&self.0)
     }
 
-    /// Extract a resolved `HashMap<String, Value>` from an `Expr` attribute map.
+    /// Extract the inner `Value` of each entry in an `Expr` attribute map.
+    ///
+    /// Despite the legacy name, this method does **not** resolve
+    /// `Value::ResourceRef` / `Value::Interpolation` / `Value::FunctionCall`
+    /// / `Value::Closure` / `Value::Secret` — it simply unwraps
+    /// `Expr` → `Value`. Callers that need concrete values must run
+    /// `carina_core::resolver::resolve_refs_with_state_and_remote` (or an
+    /// equivalent) first. See #1683 for a regression caused by assuming
+    /// this method performed resolution.
     pub fn resolve_map(attrs: &HashMap<String, Expr>) -> HashMap<String, Value> {
         attrs
             .iter()
