@@ -103,50 +103,38 @@ impl ProviderStates {
     /// 2. If not found, check if the file's directory is imported by a caller
     ///    and use the caller's ProviderState
     fn state_for_path(&self, file_path: &Path) -> &ProviderState {
-        self.state_for_path_with_info(file_path).0
-    }
-
-    fn state_for_path_with_info(&self, file_path: &Path) -> (&ProviderState, Option<PathBuf>) {
-        log::debug!(
-            "state_for_path: looking up file_path={}, by_dir keys={:?}",
-            file_path.display(),
-            self.by_dir
-                .keys()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-        );
-        // First: walk up to find a config directory (try both raw and canonical)
-        let mut dir = file_path.parent();
+        // Start from file_path itself (which is the file's parent directory),
+        // not file_path.parent() — the config dir might be the directory itself.
+        let mut dir = Some(file_path);
         while let Some(d) = dir {
             if let Some(state) = self.by_dir.get(d) {
-                return (state, Some(d.to_path_buf()));
+                return state;
             }
             // Try canonical path in case the by_dir key is different
             if let Ok(canonical) = d.canonicalize()
                 && canonical != d
                 && let Some(state) = self.by_dir.get(&canonical)
             {
-                return (state, Some(canonical));
+                return state;
             }
             dir = d.parent();
         }
 
-        // Second: check import map for module files
-        let file_dir = file_path.parent().unwrap_or(file_path);
-        let canonical = file_dir.canonicalize().unwrap_or(file_dir.to_path_buf());
+        // Check import map for module files
+        let canonical = file_path.canonicalize().unwrap_or(file_path.to_path_buf());
         if let Some(callers) = self.import_map.get(&canonical) {
             for caller_dir in callers {
                 let mut dir = Some(caller_dir.as_path());
                 while let Some(d) = dir {
                     if let Some(state) = self.by_dir.get(d) {
-                        return (state, Some(d.to_path_buf()));
+                        return state;
                     }
                     dir = d.parent();
                 }
             }
         }
 
-        (&self.empty, None)
+        &self.empty
     }
 }
 
@@ -204,19 +192,10 @@ impl Backend {
                 .and_then(|p| p.parent().map(|p| p.to_path_buf()));
 
             let providers = self.providers.read().await;
-            let (state, matched_dir) = base_path
+            let state = base_path
                 .as_ref()
-                .map(|p| {
-                    let (s, d) = providers.state_for_path_with_info(p);
-                    (s, d)
-                })
-                .unwrap_or((&providers.empty, None));
-            log::debug!(
-                "Diagnostics for {}: matched config dir = {:?}, provider_names = {:?}",
-                uri,
-                matched_dir,
-                state.diagnostic_engine.provider_names(),
-            );
+                .map(|p| providers.state_for_path(p))
+                .unwrap_or(&providers.empty);
             let diagnostics = state.diagnostic_engine.analyze(&doc, base_path.as_deref());
             drop(providers);
 
@@ -291,18 +270,13 @@ impl Backend {
 
         states.import_map = import_map;
         let dir_count = states.by_dir.len();
-        let dir_keys: Vec<String> = states
-            .by_dir
-            .keys()
-            .map(|p| p.display().to_string())
-            .collect();
         *self.providers.write().await = states;
         self.client
             .log_message(
                 MessageType::INFO,
                 format!(
-                    "Loaded providers for {} directory(s), {} resource type schema(s) total. Dirs: {:?}",
-                    dir_count, total_schemas, dir_keys
+                    "Loaded providers for {} directory(s), {} resource type schema(s) total",
+                    dir_count, total_schemas
                 ),
             )
             .await;
