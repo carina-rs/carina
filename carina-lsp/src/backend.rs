@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use carina_core::formatter::{self, FormatConfig};
@@ -77,10 +77,13 @@ pub type FactoryBuildResult = (
     HashMap<String, String>, // provider name -> error reason
 );
 
-/// Function type for building provider factories from configs and a base directory.
-/// This callback is provided by main.rs to keep provider-specific wiring out of the library.
-pub type FactoryBuilder =
-    Arc<dyn Fn(&[carina_core::parser::ProviderConfig], &Path) -> FactoryBuildResult + Send + Sync>;
+/// Function type for building provider factories from configs with their source directories.
+/// Each tuple is (source_directory, provider_config). The source directory is where the
+/// `.crn` file defining the provider was found, used for installing providers in the
+/// correct location rather than at the workspace root.
+pub type FactoryBuilder = Arc<
+    dyn Fn(&[(PathBuf, carina_core::parser::ProviderConfig)]) -> FactoryBuildResult + Send + Sync,
+>;
 
 pub struct Backend {
     client: Client,
@@ -162,9 +165,8 @@ impl Backend {
         // Build factories using the injected builder (runs WASM loading)
         let (factories, provider_errors) = tokio::task::spawn_blocking({
             let configs = provider_configs.clone();
-            let dir = workspace_root.clone();
             let builder = Arc::clone(factory_builder);
-            move || builder(&configs, &dir)
+            move || builder(&configs)
         })
         .await
         .unwrap_or_default();
