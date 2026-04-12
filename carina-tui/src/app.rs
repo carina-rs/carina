@@ -8,6 +8,7 @@ use carina_core::plan::{Plan, PlanSummary};
 use carina_core::plan_tree::{
     build_dependency_graph, build_single_parent_tree, extract_compact_hint,
 };
+use carina_core::resource::ResourceId;
 use carina_core::schema::ResourceSchema;
 use ratatui::widgets::ListState;
 
@@ -111,6 +112,60 @@ impl App {
 
         // Shorten effect labels: strip provider prefix, use binding or compact hint
         shorten_effect_labels(plan, &mut nodes);
+
+        // Suppress Move nodes when an Update/Replace exists for the same target,
+        // matching CLI behavior (the move info is shown as annotation on Update/Replace).
+        let update_or_replace_targets: HashSet<ResourceId> = plan
+            .effects()
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Update { id, .. } | Effect::Replace { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+
+        let suppressed: HashSet<usize> = plan
+            .effects()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                if let Effect::Move { to, .. } = e
+                    && update_or_replace_targets.contains(to)
+                {
+                    return Some(i);
+                }
+                None
+            })
+            .collect();
+
+        if !suppressed.is_empty() {
+            // Build old→new index mapping for remapping parent/children references
+            let index_map: Vec<Option<usize>> = {
+                let mut map = Vec::with_capacity(nodes.len());
+                let mut new_idx = 0usize;
+                for old_idx in 0..nodes.len() {
+                    if suppressed.contains(&old_idx) {
+                        map.push(None);
+                    } else {
+                        map.push(Some(new_idx));
+                        new_idx += 1;
+                    }
+                }
+                map
+            };
+
+            let mut old_idx = 0;
+            nodes.retain(|_| {
+                let keep = !suppressed.contains(&old_idx);
+                old_idx += 1;
+                keep
+            });
+
+            for node in &mut nodes {
+                node.parent = node.parent.and_then(|p| index_map[p]);
+                node.children = node.children.iter().filter_map(|&c| index_map[c]).collect();
+            }
+        }
 
         let mut list_state = ListState::default();
         if !nodes.is_empty() {
@@ -1381,5 +1436,78 @@ mod tests {
             .find(|r| matches!(r, DetailRow::Attribute { key, .. } if key == "vpc_id"))
             .expect("vpc_id detail row should exist");
         assert!(matches!(ref_row, DetailRow::Attribute { value, .. } if value == "vpc.vpc_id"));
+    }
+
+    #[test]
+    fn move_suppressed_when_update_exists_for_same_target() {
+        let mut plan = Plan::new();
+        // Move from old name to new name
+        plan.add(Effect::Move {
+            from: ResourceId::new("s3.bucket", "old-name"),
+            to: ResourceId::new("s3.bucket", "new-name"),
+        });
+        // Update for the same target
+        plan.add(Effect::Update {
+            id: ResourceId::new("s3.bucket", "new-name"),
+            from: Box::new(State::existing(
+                ResourceId::new("s3.bucket", "new-name"),
+                [(
+                    "versioning".to_string(),
+                    Value::String("Disabled".to_string()),
+                )]
+                .into_iter()
+                .collect(),
+            )),
+            to: Resource::new("s3.bucket", "new-name")
+                .with_attribute("versioning", Value::String("Enabled".to_string())),
+            changed_attributes: vec!["versioning".to_string()],
+        });
+
+        let app = App::new(&plan, &HashMap::new());
+        // Move should be suppressed; only the Update node should remain
+        assert_eq!(app.nodes.len(), 1);
+        assert_eq!(app.nodes[0].kind, EffectKind::Update);
+    }
+
+    #[test]
+    fn move_suppressed_when_replace_exists_for_same_target() {
+        let mut plan = Plan::new();
+        plan.add(Effect::Move {
+            from: ResourceId::new("ec2.vpc", "old-vpc"),
+            to: ResourceId::new("ec2.vpc", "new-vpc"),
+        });
+        plan.add(Effect::Replace {
+            id: ResourceId::new("ec2.vpc", "new-vpc"),
+            from: Box::new(State::existing(
+                ResourceId::new("ec2.vpc", "new-vpc"),
+                [("cidr".to_string(), Value::String("10.0.0.0/16".to_string()))]
+                    .into_iter()
+                    .collect(),
+            )),
+            to: Resource::new("ec2.vpc", "new-vpc"),
+            lifecycle: LifecycleConfig::default(),
+            changed_create_only: vec!["cidr".to_string()],
+            cascading_updates: vec![],
+            temporary_name: None,
+            cascade_ref_hints: vec![],
+        });
+
+        let app = App::new(&plan, &HashMap::new());
+        assert_eq!(app.nodes.len(), 1);
+        assert_eq!(app.nodes[0].symbol, "-/+");
+    }
+
+    #[test]
+    fn pure_move_not_suppressed() {
+        let mut plan = Plan::new();
+        plan.add(Effect::Move {
+            from: ResourceId::new("s3.bucket", "old-name"),
+            to: ResourceId::new("s3.bucket", "new-name"),
+        });
+
+        let app = App::new(&plan, &HashMap::new());
+        // Pure move (no Update/Replace for same target) should be kept
+        assert_eq!(app.nodes.len(), 1);
+        assert_eq!(app.nodes[0].symbol, "->");
     }
 }
