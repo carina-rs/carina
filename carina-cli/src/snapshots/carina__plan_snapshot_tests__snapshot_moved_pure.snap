@@ -1,0 +1,9 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  -> awscc.ec2.vpc new_vpc (moved from: awscc.ec2.vpc.old_vpc)
+
+Plan: 0 to add, 0 to change, 0 to destroy, 1 to move.
