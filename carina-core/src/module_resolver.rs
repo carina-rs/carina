@@ -11,7 +11,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::parser::{
-    CompareOp, ImportStatement, ModuleCall, ParseError, ParsedFile, ProviderContext, ValidateExpr,
+    CompareOp, ImportStatement, ModuleCall, ParseError, ParsedFile, ProviderContext, TypeExpr,
+    ValidateExpr, validate_custom_type,
 };
 use crate::resource::{Expr, LifecycleConfig, Resource, ResourceId, ResourceKind, Value};
 
@@ -353,6 +354,18 @@ impl<'cfg> ModuleResolver<'cfg> {
                 .or_else(|| arg.default.clone())
                 .unwrap();
             argument_values.insert(arg.name.clone(), value);
+        }
+
+        // Type-check argument values against declared types
+        for arg in &module.arguments {
+            let value = argument_values.get(&arg.name).unwrap();
+            check_module_arg_type(
+                &call.module_name,
+                &arg.name,
+                &arg.type_expr,
+                value,
+                self.config,
+            )?;
         }
 
         // Validate argument values against validate blocks
@@ -1083,6 +1096,130 @@ pub fn load_module(path: &Path) -> Option<ParsedFile> {
     } else {
         let content = fs::read_to_string(path).ok()?;
         crate::parser::parse(&content, &ProviderContext::default()).ok()
+    }
+}
+
+/// Check that a module argument value matches the declared type.
+///
+/// Similar to parser's `check_fn_arg_type` for user-defined functions,
+/// this validates module call arguments against their declared `TypeExpr`.
+fn check_module_arg_type(
+    module_name: &str,
+    arg_name: &str,
+    type_expr: &TypeExpr,
+    value: &Value,
+    config: &ProviderContext,
+) -> Result<(), ModuleError> {
+    match check_type_match(type_expr, value, config) {
+        TypeCheckResult::Ok => Ok(()),
+        TypeCheckResult::Mismatch => Err(ModuleError::InvalidArgumentType {
+            module: module_name.to_string(),
+            argument: arg_name.to_string(),
+            expected: type_expr.to_string(),
+        }),
+        TypeCheckResult::ValidationError(e) => Err(ModuleError::InvalidArgumentType {
+            module: module_name.to_string(),
+            argument: arg_name.to_string(),
+            expected: format!("{} ({})", type_expr, e),
+        }),
+    }
+}
+
+enum TypeCheckResult {
+    Ok,
+    Mismatch,
+    ValidationError(String),
+}
+
+fn check_type_match(
+    type_expr: &TypeExpr,
+    value: &Value,
+    config: &ProviderContext,
+) -> TypeCheckResult {
+    match type_expr {
+        // FunctionCall results are not known statically; defer validation
+        _ if matches!(value, Value::FunctionCall { .. }) => TypeCheckResult::Ok,
+        TypeExpr::String => {
+            if matches!(
+                value,
+                Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
+            ) {
+                TypeCheckResult::Ok
+            } else {
+                TypeCheckResult::Mismatch
+            }
+        }
+        TypeExpr::Int => {
+            if matches!(value, Value::Int(_)) {
+                TypeCheckResult::Ok
+            } else {
+                TypeCheckResult::Mismatch
+            }
+        }
+        TypeExpr::Float => {
+            if matches!(value, Value::Float(_)) {
+                TypeCheckResult::Ok
+            } else {
+                TypeCheckResult::Mismatch
+            }
+        }
+        TypeExpr::Bool => {
+            if matches!(value, Value::Bool(_)) {
+                TypeCheckResult::Ok
+            } else {
+                TypeCheckResult::Mismatch
+            }
+        }
+        TypeExpr::List(inner) => {
+            if let Value::List(items) = value {
+                for item in items {
+                    match check_type_match(inner, item, config) {
+                        TypeCheckResult::Ok => {}
+                        other => return other,
+                    }
+                }
+                TypeCheckResult::Ok
+            } else {
+                TypeCheckResult::Mismatch
+            }
+        }
+        TypeExpr::Map(inner) => {
+            if let Value::Map(entries) = value {
+                for v in entries.values() {
+                    match check_type_match(inner, v, config) {
+                        TypeCheckResult::Ok => {}
+                        other => return other,
+                    }
+                }
+                TypeCheckResult::Ok
+            } else {
+                TypeCheckResult::Mismatch
+            }
+        }
+        // Simple types (cidr, arn, iam_policy_arn, etc.) are string subtypes
+        TypeExpr::Simple(name) => {
+            if !matches!(
+                value,
+                Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
+            ) {
+                TypeCheckResult::Mismatch
+            } else if let Err(e) = validate_custom_type(name, value, config) {
+                TypeCheckResult::ValidationError(e)
+            } else {
+                TypeCheckResult::Ok
+            }
+        }
+        // Resource type refs and schema types: accept strings (validated elsewhere)
+        TypeExpr::Ref(_) | TypeExpr::SchemaType { .. } => {
+            if matches!(
+                value,
+                Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
+            ) {
+                TypeCheckResult::Ok
+            } else {
+                TypeCheckResult::Mismatch
+            }
+        }
     }
 }
 
@@ -2747,5 +2884,214 @@ mod tests {
             }
             other => panic!("Expected RequireConstraintFailed, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_argument_type_mismatch_int_for_string() {
+        let resolver = {
+            let mut r = ModuleResolver::new(".");
+            r.imported_modules
+                .insert("test_module".to_string(), create_test_module());
+            r
+        };
+
+        let call = ModuleCall {
+            module_name: "test_module".to_string(),
+            binding_name: Some("my_instance".to_string()),
+            arguments: {
+                let mut args = HashMap::new();
+                // vpc_id expects string, pass int
+                args.insert("vpc_id".to_string(), Value::Int(42));
+                args
+            },
+        };
+
+        let result = resolver.expand_module_call(&call, "my_instance");
+        assert!(
+            matches!(result, Err(ModuleError::InvalidArgumentType { .. })),
+            "Expected InvalidArgumentType error, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_argument_type_mismatch_string_for_bool() {
+        let resolver = {
+            let mut r = ModuleResolver::new(".");
+            r.imported_modules
+                .insert("test_module".to_string(), create_test_module());
+            r
+        };
+
+        let call = ModuleCall {
+            module_name: "test_module".to_string(),
+            binding_name: Some("my_instance".to_string()),
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
+                // enable_flag expects bool, pass string
+                args.insert(
+                    "enable_flag".to_string(),
+                    Value::String("not-a-bool".to_string()),
+                );
+                args
+            },
+        };
+
+        let result = resolver.expand_module_call(&call, "my_instance");
+        assert!(
+            matches!(result, Err(ModuleError::InvalidArgumentType { .. })),
+            "Expected InvalidArgumentType error, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_argument_type_custom_validator() {
+        use crate::parser::ValidatorFn;
+
+        // Create a ProviderContext with a custom "arn" validator
+        let mut validators: HashMap<String, ValidatorFn> = HashMap::new();
+        validators.insert(
+            "arn".to_string(),
+            Box::new(|s: &str| {
+                if s.starts_with("arn:") {
+                    Ok(())
+                } else {
+                    Err(format!("expected ARN format, got '{}'", s))
+                }
+            }),
+        );
+        let config = ProviderContext {
+            decryptor: None,
+            validators,
+        };
+
+        let mut module = create_test_module();
+        module.arguments = vec![ArgumentParameter {
+            name: "policy_arn".to_string(),
+            type_expr: TypeExpr::Simple("arn".to_string()),
+            default: None,
+            description: None,
+            validations: Vec::new(),
+        }];
+
+        let resolver = {
+            let mut r = ModuleResolver::with_config(".", &config);
+            r.imported_modules.insert("test_module".to_string(), module);
+            r
+        };
+
+        // Valid ARN passes
+        let call = ModuleCall {
+            module_name: "test_module".to_string(),
+            binding_name: Some("a".to_string()),
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert(
+                    "policy_arn".to_string(),
+                    Value::String("arn:aws:iam::123456789012:policy/MyPolicy".to_string()),
+                );
+                args
+            },
+        };
+        assert!(resolver.expand_module_call(&call, "a").is_ok());
+
+        // Invalid ARN fails
+        let call_bad = ModuleCall {
+            module_name: "test_module".to_string(),
+            binding_name: Some("b".to_string()),
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert(
+                    "policy_arn".to_string(),
+                    Value::String("not-an-arn".to_string()),
+                );
+                args
+            },
+        };
+        let result = resolver.expand_module_call(&call_bad, "b");
+        assert!(
+            matches!(result, Err(ModuleError::InvalidArgumentType { .. })),
+            "Expected InvalidArgumentType error for invalid ARN, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_argument_type_list_of_custom_type() {
+        use crate::parser::ValidatorFn;
+
+        let mut validators: HashMap<String, ValidatorFn> = HashMap::new();
+        validators.insert(
+            "arn".to_string(),
+            Box::new(|s: &str| {
+                if s.starts_with("arn:") {
+                    Ok(())
+                } else {
+                    Err(format!("expected ARN format, got '{}'", s))
+                }
+            }),
+        );
+        let config = ProviderContext {
+            decryptor: None,
+            validators,
+        };
+
+        let mut module = create_test_module();
+        module.arguments = vec![ArgumentParameter {
+            name: "policy_arns".to_string(),
+            type_expr: TypeExpr::List(Box::new(TypeExpr::Simple("arn".to_string()))),
+            default: None,
+            description: None,
+            validations: Vec::new(),
+        }];
+
+        let resolver = {
+            let mut r = ModuleResolver::with_config(".", &config);
+            r.imported_modules.insert("test_module".to_string(), module);
+            r
+        };
+
+        // Valid list of ARNs
+        let call = ModuleCall {
+            module_name: "test_module".to_string(),
+            binding_name: Some("a".to_string()),
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert(
+                    "policy_arns".to_string(),
+                    Value::List(vec![
+                        Value::String("arn:aws:iam::123:policy/A".to_string()),
+                        Value::String("arn:aws:iam::123:policy/B".to_string()),
+                    ]),
+                );
+                args
+            },
+        };
+        assert!(resolver.expand_module_call(&call, "a").is_ok());
+
+        // List with invalid ARN fails
+        let call_bad = ModuleCall {
+            module_name: "test_module".to_string(),
+            binding_name: Some("b".to_string()),
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert(
+                    "policy_arns".to_string(),
+                    Value::List(vec![
+                        Value::String("arn:aws:iam::123:policy/A".to_string()),
+                        Value::String("not-an-arn".to_string()),
+                    ]),
+                );
+                args
+            },
+        };
+        let result = resolver.expand_module_call(&call_bad, "b");
+        assert!(
+            matches!(result, Err(ModuleError::InvalidArgumentType { .. })),
+            "Expected InvalidArgumentType for list with invalid ARN, got {:?}",
+            result
+        );
     }
 }

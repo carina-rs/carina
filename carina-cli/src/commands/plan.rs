@@ -110,7 +110,7 @@ pub async fn run_plan(
     let mut parsed = load_configuration_with_config(path, provider_context)?.parsed;
 
     let base_dir = get_base_dir(path);
-    validate_and_resolve_with_config(&mut parsed, base_dir, false, provider_context)?;
+    validate_and_resolve_with_config(&mut parsed, base_dir, false)?;
 
     // Detect backend reconfiguration before touching any state
     crate::commands::check_backend_lock(base_dir, parsed.backend.as_ref(), reconfigure)?;

@@ -2245,7 +2245,7 @@ fn prepare_user_function_call<'cfg>(
 ///
 /// Checks built-in validators first, then falls back to custom validators
 /// registered in the [`ProviderContext`].
-fn validate_custom_type(
+pub fn validate_custom_type(
     type_name: &str,
     value: &Value,
     config: &ProviderContext,
