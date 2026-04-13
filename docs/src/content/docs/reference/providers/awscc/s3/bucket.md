@@ -72,6 +72,24 @@ Specifies default encryption for a bucket using server-side encryption with Amaz
 
 A name for the bucket. If you don't specify a name, AWS CloudFormation generates a unique ID and uses that ID for the bucket name. The bucket name must contain only lowercase letters, numbers, periods (.), and dashes (-) and must follow [Amazon S3 bucket restrictions and limitations](https://docs.aws.amazon.com/AmazonS3/latest/dev/BucketRestrictions.html). For more information, see [Rules for naming Amazon S3 buckets](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html) in the *Amazon S3 User Guide*. If you specify a name, you can't perform updates that require replacement of this resource. You can perform updates that require no or some interruption. If you need to replace the resource, specify a new name.
 
+### `bucket_name_prefix`
+
+- **Type:** String
+- **Required:** No
+- **Create-only:** Yes
+- **Write-only:** Yes
+
+
+
+### `bucket_namespace`
+
+- **Type:** [Enum (BucketNamespace)](#bucket_namespace-bucketnamespace)
+- **Required:** No
+- **Create-only:** Yes
+- **Write-only:** Yes
+
+
+
 ### `cors_configuration`
 
 - **Type:** [Struct(CorsConfiguration)](#corsconfiguration)
@@ -242,6 +260,15 @@ Shorthand formats: `Destination` or `Owner.Destination`
 | `SSE-C` | `awscc.s3.bucket.EncryptionType.SSE_C` |
 
 Shorthand formats: `NONE` or `EncryptionType.NONE`
+
+### bucket_namespace (BucketNamespace)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `global` | `awscc.s3.bucket.BucketNamespace.global` |
+| `account-regional` | `awscc.s3.bucket.BucketNamespace.account_regional` |
+
+Shorthand formats: `global` or `BucketNamespace.global`
 
 ### allowed_methods (AllowedMethods)
 
