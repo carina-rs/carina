@@ -456,7 +456,7 @@ impl DiagnosticEngine {
                                         .map(|e| e.to_string())
                                 }
                                 // Validate Map value types
-                                (carina_core::schema::AttributeType::Map(_), Value::Map(_)) => {
+                                (carina_core::schema::AttributeType::Map { .. }, Value::Map(_)) => {
                                     attr_schema
                                         .attr_type
                                         .validate(attr_value)

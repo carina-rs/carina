@@ -682,7 +682,9 @@ impl CompletionProvider {
             // List(non-Struct): delegate to inner type completions
             AttributeType::List { inner, .. } => self.completions_for_type(inner, resource_type),
             // Map: delegate to inner value type completions
-            AttributeType::Map(inner) => self.completions_for_type(inner, resource_type),
+            AttributeType::Map { value: inner, .. } => {
+                self.completions_for_type(inner, resource_type)
+            }
             // Union: collect completions from all member types
             AttributeType::Union(members) => {
                 let mut completions = Vec::new();

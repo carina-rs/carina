@@ -590,7 +590,8 @@ fn collect_validators_from_type(
         AttributeType::List { inner, .. } => {
             collect_validators_from_type(inner, validators);
         }
-        AttributeType::Map(inner) => {
+        AttributeType::Map { key, value: inner } => {
+            collect_validators_from_type(key, validators);
             collect_validators_from_type(inner, validators);
         }
         AttributeType::Struct { fields, .. } => {
@@ -621,7 +622,8 @@ fn collect_type_names_from_type(
         AttributeType::List { inner, .. } => {
             collect_type_names_from_type(inner, names);
         }
-        AttributeType::Map(inner) => {
+        AttributeType::Map { key, value: inner } => {
+            collect_type_names_from_type(key, names);
             collect_type_names_from_type(inner, names);
         }
         AttributeType::Struct { fields, .. } => {

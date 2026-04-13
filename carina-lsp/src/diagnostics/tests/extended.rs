@@ -1343,7 +1343,7 @@ fn resource_validation_failed_with_attribute_points_to_attribute_line() {
         .attribute(AttributeSchema::new("name", AttributeType::String).required())
         .attribute(AttributeSchema::new(
             "tags",
-            AttributeType::Map(Box::new(AttributeType::String)),
+            AttributeType::map(AttributeType::String),
         ))
         .with_validator(|attrs| {
             if let Some(carina_core::resource::Value::Map(map)) = attrs.get("tags") {

@@ -823,7 +823,7 @@ fn secret_in_map_with_refresh_no_false_diff() {
     // Build schema with tags as Map(String)
     let schema = ResourceSchema::new("ec2.vpc").attribute(AttributeSchema::new(
         "tags",
-        AttributeType::Map(Box::new(AttributeType::String)),
+        AttributeType::map(AttributeType::String),
     ));
 
     let desired = HashMap::from([("tags".to_string(), desired_tags)]);
