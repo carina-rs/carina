@@ -88,6 +88,9 @@ impl CompletionProvider {
                 self.region_completions_for_provider(&provider_name)
             }
             CompletionContext::InTypePosition => self.ref_type_completions(position, &text),
+            CompletionContext::InsideImportPath { partial_path } => {
+                self.import_path_completions(&partial_path, base_path)
+            }
             CompletionContext::None => vec![],
         }
     }
@@ -111,6 +114,22 @@ impl CompletionProvider {
             if prefix.contains(&dot_pattern) || prefix.ends_with(&end_pattern) {
                 return CompletionContext::AfterProviderRegion {
                     provider_name: provider_name.clone(),
+                };
+            }
+        }
+
+        // Check if cursor is inside an import path string
+        // e.g., let x = import './modules/|'
+        if let Some(import_pos) = prefix.find("import ") {
+            let after_import = &prefix[import_pos + 7..];
+            let trimmed = after_import.trim_start();
+            if (trimmed.starts_with('\'') || trimmed.starts_with('"'))
+                && !trimmed[1..].contains(trimmed.chars().next().unwrap())
+            {
+                // Inside an unclosed quote after "import"
+                let partial_path = &trimmed[1..]; // strip opening quote
+                return CompletionContext::InsideImportPath {
+                    partial_path: partial_path.to_string(),
                 };
             }
         }
@@ -490,5 +509,8 @@ enum CompletionContext {
         provider_name: String,
     },
     InTypePosition,
+    InsideImportPath {
+        partial_path: String,
+    },
     None,
 }

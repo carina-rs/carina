@@ -382,4 +382,79 @@ impl CompletionProvider {
         }
         None
     }
+
+    /// Generate import path completions from filesystem.
+    ///
+    /// Lists directories and `.crn` files relative to the base_path,
+    /// using the partial_path to determine which directory to list.
+    pub(super) fn import_path_completions(
+        &self,
+        partial_path: &str,
+        base_path: Option<&Path>,
+    ) -> Vec<CompletionItem> {
+        let base = match base_path {
+            Some(b) => b,
+            None => return vec![],
+        };
+
+        // Split partial_path into directory prefix and filename prefix
+        let (dir_part, name_prefix) = if let Some(last_slash) = partial_path.rfind('/') {
+            (
+                &partial_path[..=last_slash],
+                &partial_path[last_slash + 1..],
+            )
+        } else {
+            ("", partial_path)
+        };
+
+        let search_dir = base.join(dir_part);
+        let entries = match std::fs::read_dir(&search_dir) {
+            Ok(entries) => entries,
+            Err(_) => return vec![],
+        };
+
+        let mut completions = Vec::new();
+
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let name = file_name.to_string_lossy();
+
+            // Skip hidden files/dirs
+            if name.starts_with('.') {
+                continue;
+            }
+
+            let path = entry.path();
+            if path.is_dir() {
+                // Directory: suggest as path component
+                if name.starts_with(name_prefix) {
+                    completions.push(CompletionItem {
+                        label: format!("{}/", name),
+                        kind: Some(CompletionItemKind::FOLDER),
+                        insert_text: Some(format!("{}/", name)),
+                        detail: Some("Directory".to_string()),
+                        command: Some(Command {
+                            title: "Trigger Suggest".to_string(),
+                            command: "editor.action.triggerSuggest".to_string(),
+                            arguments: None,
+                        }),
+                        ..Default::default()
+                    });
+                }
+            } else if name.ends_with(".crn") && name.starts_with(name_prefix) {
+                // .crn file: suggest without extension
+                let stem = name.strip_suffix(".crn").unwrap_or(&name);
+                completions.push(CompletionItem {
+                    label: stem.to_string(),
+                    kind: Some(CompletionItemKind::FILE),
+                    insert_text: Some(stem.to_string()),
+                    detail: Some("Carina module".to_string()),
+                    ..Default::default()
+                });
+            }
+        }
+
+        completions.sort_by(|a, b| a.label.cmp(&b.label));
+        completions
+    }
 }
