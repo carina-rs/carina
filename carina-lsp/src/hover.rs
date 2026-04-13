@@ -126,6 +126,13 @@ impl HoverProvider {
             return Some(hover);
         }
 
+        // Check for module call name hover (e.g., hovering on "github" in "github {")
+        if let Some(base) = base_path
+            && let Some(hover) = self.module_call_hover(doc, &word, base)
+        {
+            return Some(hover);
+        }
+
         // Check for module argument description hover (inside module calls)
         if self.is_in_module_call(doc, position)
             && let Some(base) = base_path
@@ -233,6 +240,63 @@ impl HoverProvider {
     }
 
     /// Show hover info for a module call argument, including its description if available.
+    /// Hover on a module call name (e.g., "github" in "github {").
+    /// Shows the module source path and its arguments/attributes summary.
+    fn module_call_hover(&self, doc: &Document, word: &str, base_path: &Path) -> Option<Hover> {
+        let parsed = doc.parsed()?;
+
+        // Check if this word is a module alias (defined by an import)
+        let import = parsed.imports.iter().find(|imp| imp.alias == word)?;
+
+        // Load the module to get its definition
+        let module_path = base_path.join(&import.path);
+        let module_parsed = carina_core::module_resolver::load_module(&module_path)?;
+
+        let mut content = format!("## {}\n\n`{}`\n", word, import.path);
+
+        // Show arguments
+        if !module_parsed.arguments.is_empty() {
+            content.push_str("\n### Arguments\n\n");
+            for arg in &module_parsed.arguments {
+                let required = if arg.default.is_none() {
+                    " **(required)**"
+                } else {
+                    ""
+                };
+                let desc = arg
+                    .description
+                    .as_deref()
+                    .map(|d| format!(" — {}", d))
+                    .unwrap_or_default();
+                content.push_str(&format!(
+                    "- `{}`: `{}`{}{}\n",
+                    arg.name, arg.type_expr, desc, required
+                ));
+            }
+        }
+
+        // Show attributes (outputs)
+        if !module_parsed.attribute_params.is_empty() {
+            content.push_str("\n### Attributes\n\n");
+            for attr in &module_parsed.attribute_params {
+                let type_str = attr
+                    .type_expr
+                    .as_ref()
+                    .map(|t| format!("`{}`", t))
+                    .unwrap_or_default();
+                content.push_str(&format!("- `{}`: {}\n", attr.name, type_str));
+            }
+        }
+
+        Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: content,
+            }),
+            range: None,
+        })
+    }
+
     fn module_argument_hover(
         &self,
         doc: &Document,
