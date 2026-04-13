@@ -337,16 +337,30 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
-        // Register file watcher for .crn files
+        // Register file watchers for .crn files, provider WASMs, and lock files
         let registration = Registration {
             id: "crn-watcher".to_string(),
             method: "workspace/didChangeWatchedFiles".to_string(),
             register_options: Some(
                 serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
-                    watchers: vec![FileSystemWatcher {
-                        glob_pattern: GlobPattern::String("**/*.crn".to_string()),
-                        kind: Some(WatchKind::all()),
-                    }],
+                    watchers: vec![
+                        FileSystemWatcher {
+                            glob_pattern: GlobPattern::String("**/*.crn".to_string()),
+                            kind: Some(WatchKind::all()),
+                        },
+                        FileSystemWatcher {
+                            glob_pattern: GlobPattern::String(
+                                "**/.carina/providers/**/*.wasm".to_string(),
+                            ),
+                            kind: Some(WatchKind::Create | WatchKind::Change),
+                        },
+                        FileSystemWatcher {
+                            glob_pattern: GlobPattern::String(
+                                "**/carina-providers.lock".to_string(),
+                            ),
+                            kind: Some(WatchKind::Create | WatchKind::Change),
+                        },
+                    ],
                 })
                 .unwrap(),
             ),
@@ -390,12 +404,14 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
-        let has_crn_changes = params
-            .changes
-            .iter()
-            .any(|c| c.uri.as_str().ends_with(".crn"));
+        let should_reload = params.changes.iter().any(|c| {
+            let uri = c.uri.as_str();
+            uri.ends_with(".crn")
+                || uri.ends_with(".wasm")
+                || uri.ends_with("carina-providers.lock")
+        });
 
-        if has_crn_changes {
+        if should_reload {
             self.load_schemas().await;
         }
     }
