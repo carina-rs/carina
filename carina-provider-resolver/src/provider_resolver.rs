@@ -446,6 +446,74 @@ pub fn resolve_single_config(base_dir: &Path, config: &ProviderConfig) -> Result
     Ok(binary_path)
 }
 
+/// Find an already-installed provider without downloading.
+///
+/// Checks local project cache, global plugin cache, and lock file entries.
+/// Returns the path to the WASM binary if found, or an error suggesting
+/// `carina init` if not installed.
+///
+/// This is used by the LSP to avoid filesystem side effects from the editor.
+pub fn find_installed_provider(
+    base_dir: &Path,
+    config: &ProviderConfig,
+) -> Result<PathBuf, String> {
+    let source = config
+        .source
+        .as_deref()
+        .ok_or_else(|| format!("Provider '{}' has no source", config.name))?;
+
+    let lock_path = base_dir.join("carina-providers.lock");
+    let lock_file = LockFile::load(&lock_path).unwrap_or_default();
+
+    // Check revision-based cache
+    if let Some(revision) = &config.revision {
+        if let Some(lock_entry) = lock_file.find_by_source(source)
+            && let Some(ref sha) = lock_entry.resolved_sha
+        {
+            let wasm_path = crate::revision_resolver::cache_path_revision(base_dir, source, sha);
+            if wasm_path.exists() {
+                return Ok(wasm_path);
+            }
+            // Check global cache
+            if let Some(global_path) =
+                crate::revision_resolver::global_cache_path_revision(source, sha)
+                && global_path.exists()
+            {
+                return Ok(global_path);
+            }
+        }
+        return Err(format!(
+            "not installed. Run `carina init` in {} to install (revision: {})",
+            base_dir.display(),
+            revision
+        ));
+    }
+
+    // Check version-based cache
+    if let Some(lock_entry) = lock_file.find_by_source(source) {
+        let version = &lock_entry.version;
+        let wasm_path = cache_path_wasm(base_dir, source, version);
+        if wasm_path.exists() {
+            return Ok(wasm_path);
+        }
+        let binary_path = cache_path(base_dir, source, version);
+        if binary_path.exists() {
+            return Ok(binary_path);
+        }
+        // Check global cache
+        if let Some(global_wasm) = global_cache_path_wasm(source, version)
+            && global_wasm.exists()
+        {
+            return Ok(global_wasm);
+        }
+    }
+
+    Err(format!(
+        "not installed. Run `carina init` in {}",
+        base_dir.display()
+    ))
+}
+
 /// Returns true if the given path points to a WASM provider binary.
 pub fn is_wasm_provider(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext == "wasm")

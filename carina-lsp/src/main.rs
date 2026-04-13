@@ -31,7 +31,9 @@ fn build_factories(providers: &[(PathBuf, ProviderConfig)]) -> FactoryBuildResul
         let binary_path = if let Some(path) = source.strip_prefix("file://") {
             std::path::PathBuf::from(path)
         } else if source.starts_with("github.com/") {
-            match carina_provider_resolver::resolve_single_config(source_dir, config) {
+            // LSP uses find_installed_provider (no download) instead of
+            // resolve_single_config to avoid filesystem side effects.
+            match carina_provider_resolver::find_installed_provider(source_dir, config) {
                 Ok(path) => path,
                 Err(e) => {
                     errors.insert(config.name.clone(), e);
