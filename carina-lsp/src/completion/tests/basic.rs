@@ -1093,3 +1093,37 @@ fn module_binding_completion_at_top_level() {
     let github_completion = completions.iter().find(|c| c.label == "github").unwrap();
     assert_eq!(github_completion.kind, Some(CompletionItemKind::MODULE));
 }
+
+#[test]
+fn import_path_completion_lists_directories_and_crn_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let modules_dir = tmp.path().join("modules");
+    std::fs::create_dir_all(&modules_dir).unwrap();
+    std::fs::write(
+        modules_dir.join("web.crn"),
+        "arguments {\n  name: string\n}\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(modules_dir.join("shared")).unwrap();
+
+    let provider = test_provider();
+    let doc = create_document("let web = import './modules/");
+    let position = Position {
+        line: 0,
+        character: 28,
+    };
+
+    let completions = provider.complete(&doc, position, Some(tmp.path()));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"web"),
+        "Should suggest 'web' (.crn file without extension). Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"shared/"),
+        "Should suggest 'shared/' directory. Got: {:?}",
+        labels
+    );
+}
