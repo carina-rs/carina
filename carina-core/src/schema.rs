@@ -424,15 +424,26 @@ impl AttributeType {
 
             // Union type: valid if any member accepts the value
             (AttributeType::Union(types), _) => {
+                let mut struct_error = None;
                 for member in types {
-                    if member.validate(value).is_ok() {
-                        return Ok(());
+                    match member.validate(value) {
+                        Ok(()) => return Ok(()),
+                        Err(e) => {
+                            // Prefer Struct validation errors over generic TypeMismatch
+                            // when the value is a Map — these give actionable feedback
+                            // (e.g., "unknown field 'aaa'") instead of "expected Struct | String, got Map"
+                            if matches!(value, Value::Map(_))
+                                && matches!(member, AttributeType::Struct { .. })
+                            {
+                                struct_error = Some(e);
+                            }
+                        }
                     }
                 }
-                Err(TypeError::TypeMismatch {
+                Err(struct_error.unwrap_or(TypeError::TypeMismatch {
                     expected: self.type_name(),
                     got: value.type_name(),
-                })
+                }))
             }
 
             _ => Err(TypeError::TypeMismatch {
@@ -2437,6 +2448,38 @@ mod tests {
                     vec![]
                 ))
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn union_struct_unknown_field_shows_specific_error() {
+        let principal_type = AttributeType::Union(vec![
+            AttributeType::Struct {
+                name: "Principal".to_string(),
+                fields: vec![
+                    StructField::new("service", AttributeType::String),
+                    StructField::new("federated", AttributeType::String),
+                ],
+            },
+            AttributeType::String,
+        ]);
+
+        let mut map = HashMap::new();
+        map.insert(
+            "federated".to_string(),
+            Value::String("arn:...".to_string()),
+        );
+        map.insert("aaa".to_string(), Value::String("bbb".to_string()));
+
+        let err = principal_type.validate(&Value::Map(map)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("aaa"),
+            "Error should mention unknown field 'aaa'. Got: {msg}"
+        );
+        assert!(
+            msg.contains("Principal"),
+            "Error should mention struct name. Got: {msg}"
         );
     }
 
