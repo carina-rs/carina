@@ -260,6 +260,17 @@ pub enum AttributeType {
     Union {
         members: Vec<AttributeType>,
     },
+    /// Custom type with a name and base type. The validation function is
+    /// resolved on the host side; the protocol only carries the type name
+    /// and underlying base type.
+    #[serde(rename = "custom")]
+    Custom {
+        name: String,
+        base: Box<AttributeType>,
+        /// Optional namespace for enum-style validation
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
