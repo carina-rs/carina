@@ -1129,7 +1129,7 @@ region = awscc.Region.ap_northeast_1
 }
 
 attributes {
-    network: cidr = "not-a-cidr"
+    network: ipv4_cidr = "not-a-cidr"
 }"#,
     );
 

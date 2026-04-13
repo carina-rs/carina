@@ -385,7 +385,7 @@ type ValidateFn = fn(&str) -> Result<(), String>;
 /// Return the validator function for a custom simple type name, if any.
 fn simple_type_validator(name: &str) -> Option<ValidateFn> {
     match name {
-        "cidr" => Some(validate_ipv4_cidr),
+        "ipv4_cidr" => Some(validate_ipv4_cidr),
         "ipv4_address" => Some(validate_ipv4_address),
         "ipv6_cidr" => Some(validate_ipv6_cidr),
         "ipv6_address" => Some(validate_ipv6_address),
@@ -968,18 +968,18 @@ let vpc = awscc.ec2.vpc {
     // --- validate_type_expr_value tests ---
 
     #[test]
-    fn validate_type_expr_value_cidr_valid() {
+    fn validate_type_expr_value_ipv4_cidr_valid() {
         let result = validate_type_expr_value(
-            &TypeExpr::Simple("cidr".to_string()),
+            &TypeExpr::Simple("ipv4_cidr".to_string()),
             &Value::String("10.0.0.0/16".to_string()),
         );
         assert!(result.is_none());
     }
 
     #[test]
-    fn validate_type_expr_value_cidr_invalid() {
+    fn validate_type_expr_value_ipv4_cidr_invalid() {
         let result = validate_type_expr_value(
-            &TypeExpr::Simple("cidr".to_string()),
+            &TypeExpr::Simple("ipv4_cidr".to_string()),
             &Value::String("not-a-cidr".to_string()),
         );
         assert!(result.is_some());
