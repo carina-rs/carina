@@ -99,3 +99,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-features
+
+  binary-build:
+    name: Binary Build (linux-x86_64)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: binary
+      - run: cargo build --release --bin carina
+      - uses: actions/upload-artifact@v4
+        with:
+          name: carina-linux-x86_64
+          path: target/release/carina
+          retention-days: 30
