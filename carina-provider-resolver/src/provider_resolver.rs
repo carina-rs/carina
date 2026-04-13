@@ -119,6 +119,24 @@ pub fn download_url_wasm(source: &str, version: &str) -> Result<String, String> 
     ))
 }
 
+/// Get the global plugin cache directory.
+///
+/// Checks `CARINA_PLUGIN_CACHE_DIR` environment variable first,
+/// then falls back to `~/.carina/plugin-cache/`.
+/// Returns `None` if the home directory cannot be determined.
+pub fn global_cache_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("CARINA_PLUGIN_CACHE_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    dirs::home_dir().map(|home| home.join(".carina").join("plugin-cache"))
+}
+
+/// Resolve the global cache path for a WASM provider.
+fn global_cache_path_wasm(source: &str, version: &str) -> Option<PathBuf> {
+    let repo = source.split('/').next_back().unwrap_or("provider");
+    global_cache_dir().map(|dir| dir.join(source).join(version).join(format!("{repo}.wasm")))
+}
+
 /// Resolve the cache path for a provider binary.
 pub fn cache_path(base_dir: &Path, source: &str, version: &str) -> PathBuf {
     let repo = source.split('/').next_back().unwrap_or("provider");
@@ -243,7 +261,7 @@ pub fn resolve_provider(
     name: &str,
     lock_file: &mut LockFile,
 ) -> Result<PathBuf, String> {
-    // 1. Check WASM cache first.
+    // 1. Check local WASM cache first.
     let wasm_path = cache_path_wasm(base_dir, source, version);
     if wasm_path.exists() {
         if let Some(lock_entry) = lock_file.find(source, version) {
@@ -275,7 +293,36 @@ pub fn resolve_provider(
         return Ok(binary_path);
     }
 
-    // 3. Try downloading WASM first (platform-independent).
+    // 3. Check global plugin cache for WASM.
+    if let Some(global_wasm) = global_cache_path_wasm(source, version)
+        && global_wasm.exists()
+    {
+        // Copy from global cache to local project
+        if let Some(parent) = wasm_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        fs::hard_link(&global_wasm, &wasm_path)
+            .or_else(|_| fs::copy(&global_wasm, &wasm_path).map(|_| ()))
+            .map_err(|e| format!("Failed to link/copy from global cache: {e}"))?;
+        let hash =
+            sha256_file(&wasm_path).map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
+        lock_file.upsert(LockEntry {
+            name: name.to_string(),
+            source: source.to_string(),
+            version: version.to_string(),
+            constraint: None,
+            revision: None,
+            resolved_sha: None,
+            sha256: hash,
+        });
+        eprintln!(
+            "Installed WASM provider '{}' from global cache ({}@{})",
+            name, source, version
+        );
+        return Ok(wasm_path);
+    }
+
+    // 4. Try downloading WASM first (platform-independent).
     let wasm_url = download_url_wasm(source, version)?;
     eprintln!("Downloading WASM provider '{}' from {}", name, wasm_url);
     match download_to_file(&wasm_url, &wasm_path) {
@@ -291,6 +338,14 @@ pub fn resolve_provider(
                 resolved_sha: None,
                 sha256: hash,
             });
+            // Save to global cache
+            if let Some(global_wasm) = global_cache_path_wasm(source, version) {
+                if let Some(parent) = global_wasm.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::hard_link(&wasm_path, &global_wasm)
+                    .or_else(|_| fs::copy(&wasm_path, &global_wasm).map(|_| ()));
+            }
             eprintln!(
                 "Installed WASM provider '{}' ({}@{})",
                 name, source, version
