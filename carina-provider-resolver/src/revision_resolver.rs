@@ -330,6 +330,16 @@ pub fn cache_path_revision(base_dir: &Path, source: &str, sha: &str) -> PathBuf 
         .join(format!("{repo}.wasm"))
 }
 
+fn global_cache_path_revision(source: &str, sha: &str) -> Option<PathBuf> {
+    let repo = source.split('/').next_back().unwrap_or("provider");
+    let sha_prefix = &sha[..sha.len().min(12)];
+    super::provider_resolver::global_cache_dir().map(|dir| {
+        dir.join(source)
+            .join(format!("rev-{sha_prefix}"))
+            .join(format!("{repo}.wasm"))
+    })
+}
+
 /// Resolve a provider by revision: download from CI artifacts if not cached.
 pub fn resolve_provider_by_revision(
     base_dir: &Path,
@@ -377,6 +387,36 @@ pub fn resolve_provider_by_revision(
         return Ok((wasm_path, sha));
     }
 
+    // 2b. Check global plugin cache
+    if let Some(global_wasm) = global_cache_path_revision(source, &sha)
+        && global_wasm.exists()
+    {
+        if let Some(parent) = wasm_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::hard_link(&global_wasm, &wasm_path)
+            .or_else(|_| std::fs::copy(&global_wasm, &wasm_path).map(|_| ()))
+            .map_err(|e| format!("Failed to link/copy from global cache: {e}"))?;
+        let hash = super::provider_resolver::sha256_file(&wasm_path)
+            .map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
+        lock_file.upsert(super::provider_resolver::LockEntry {
+            name: name.to_string(),
+            source: source.to_string(),
+            version: String::new(),
+            constraint: None,
+            revision: Some(revision.to_string()),
+            resolved_sha: Some(sha.clone()),
+            sha256: hash,
+        });
+        eprintln!(
+            "Installed provider '{}' from global cache ({}@{})",
+            name,
+            source,
+            &sha[..sha.len().min(12)]
+        );
+        return Ok((wasm_path, sha));
+    }
+
     // 3. Download from CI artifacts
     eprintln!(
         "Downloading provider '{}' from CI artifacts ({source}@{})...",
@@ -394,6 +434,15 @@ pub fn resolve_provider_by_revision(
             fetch_run_artifacts(source, run_id, &token)
         })?;
     download_artifact(source, artifact_id, &wasm_path, &token)?;
+
+    // Save to global cache
+    if let Some(global_wasm) = global_cache_path_revision(source, &sha) {
+        if let Some(parent) = global_wasm.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::hard_link(&wasm_path, &global_wasm)
+            .or_else(|_| std::fs::copy(&wasm_path, &global_wasm).map(|_| ()));
+    }
 
     let hash = super::provider_resolver::sha256_file(&wasm_path)
         .map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
