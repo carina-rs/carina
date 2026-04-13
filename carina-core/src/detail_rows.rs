@@ -144,6 +144,20 @@ pub enum MapDiffEntryIR {
         old: String,
         new: String,
     },
+    /// Nested map diff: when both old and new values are maps,
+    /// recursively compute key-level diffs instead of showing as one-liner.
+    NestedMapDiff {
+        key: String,
+        entries: Vec<MapDiffEntryIR>,
+    },
+    /// Nested list-of-maps diff: when both old and new values are lists of maps,
+    /// show per-item field-level diffs instead of one-liner.
+    NestedListOfMapsDiff {
+        key: String,
+        modified: Vec<ListOfMapsDiffModified>,
+        added: Vec<String>,
+        removed: Vec<String>,
+    },
 }
 
 /// A modified item in a list-of-maps diff
@@ -163,6 +177,11 @@ pub enum ListOfMapsDiffField {
         key: String,
         old: String,
         new: String,
+    },
+    /// Field value is a nested map that changed — show recursive key-level diffs
+    NestedMapChanged {
+        key: String,
+        entries: Vec<MapDiffEntryIR>,
     },
 }
 
@@ -679,11 +698,30 @@ fn compute_map_diff_entries(old_value: Option<&Value>, new_value: &Value) -> Vec
     for item in diff.iter_by_key() {
         match item {
             crate::diff_helpers::MapDiffItem::Changed(e) => {
-                entries.push(MapDiffEntryIR::Changed {
-                    key: e.key.clone(),
-                    old: format_value_with_key(&e.old_value, Some(&e.key)),
-                    new: format_value_with_key(&e.new_value, Some(&e.key)),
-                });
+                // If both old and new are maps, recursively diff
+                if matches!(&e.old_value, Value::Map(_)) && matches!(&e.new_value, Value::Map(_)) {
+                    let nested = compute_map_diff_entries(Some(&e.old_value), &e.new_value);
+                    entries.push(MapDiffEntryIR::NestedMapDiff {
+                        key: e.key.clone(),
+                        entries: nested,
+                    });
+                } else if is_list_of_maps(&e.new_value) {
+                    // List-of-maps: compute per-item field-level diffs
+                    let (_, modified, added, removed) =
+                        compute_list_of_maps_diff_parts(Some(&e.old_value), &e.new_value);
+                    entries.push(MapDiffEntryIR::NestedListOfMapsDiff {
+                        key: e.key.clone(),
+                        modified,
+                        added,
+                        removed,
+                    });
+                } else {
+                    entries.push(MapDiffEntryIR::Changed {
+                        key: e.key.clone(),
+                        old: format_value_with_key(&e.old_value, Some(&e.key)),
+                        new: format_value_with_key(&e.new_value, Some(&e.key)),
+                    });
+                }
             }
             crate::diff_helpers::MapDiffItem::Added(e) => {
                 entries.push(MapDiffEntryIR::Added {
@@ -832,14 +870,25 @@ fn compute_list_of_maps_diff_parts(
                         .map(|ov| ov.semantically_equal(&new_map[*k]))
                         .unwrap_or(false);
                     if !field_same {
-                        let old_v = old_map
-                            .get(*k)
-                            .map(format_value)
-                            .unwrap_or_else(|| "(none)".to_string());
-                        ListOfMapsDiffField::Changed {
-                            key: k.to_string(),
-                            old: old_v,
-                            new: new_v,
+                        let old_val = old_map.get(*k);
+                        // If both old and new are maps, show recursive diff
+                        if matches!(old_val, Some(Value::Map(_)))
+                            && matches!(&new_map[*k], Value::Map(_))
+                        {
+                            let nested = compute_map_diff_entries(old_val, &new_map[*k]);
+                            ListOfMapsDiffField::NestedMapChanged {
+                                key: k.to_string(),
+                                entries: nested,
+                            }
+                        } else {
+                            let old_v = old_val
+                                .map(format_value)
+                                .unwrap_or_else(|| "(none)".to_string());
+                            ListOfMapsDiffField::Changed {
+                                key: k.to_string(),
+                                old: old_v,
+                                new: new_v,
+                            }
                         }
                     } else {
                         ListOfMapsDiffField::Unchanged {

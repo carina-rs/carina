@@ -15,6 +15,8 @@ plan-compact:
 	cd $(FIXTURES)/compact && $(CARINA) plan --refresh=false --detail none
 plan-map-diff:
 	cd $(FIXTURES)/map_key_diff && $(CARINA) plan --refresh=false
+plan-nested-map-diff:
+	cd $(FIXTURES)/nested_map_diff && $(CARINA) plan --refresh=false
 plan-enum-display:
 	cd $(FIXTURES)/enum_display && $(CARINA) plan --refresh=false
 plan-no-changes-enum:
@@ -69,6 +71,9 @@ plan-fixtures:
 	@echo ""
 	@echo "=== map_key_diff ==="
 	@$(MAKE) plan-map-diff
+	@echo ""
+	@echo "=== nested_map_diff ==="
+	@$(MAKE) plan-nested-map-diff
 	@echo ""
 	@echo "=== enum_display ==="
 	@$(MAKE) plan-enum-display

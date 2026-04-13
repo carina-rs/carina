@@ -1,0 +1,31 @@
+{
+  "version": 3,
+  "serial": 1,
+  "lineage": "test-lineage-nested-map-diff",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "ec2.vpc",
+      "name": "vpc",
+      "provider": "awscc",
+      "identifier": "vpc-0123456789abcdef0",
+      "attributes": {
+        "cidr_block": "10.0.0.0/16",
+        "vpc_id": "vpc-0123456789abcdef0",
+        "config": {
+          "settings": {
+            "mode": "basic",
+            "timeout": "30"
+          }
+        }
+      },
+      "protected": false,
+      "lifecycle": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "desired_keys": ["cidr_block", "config"],
+      "binding": "vpc",
+      "dependency_bindings": []
+    }
+  ]
+}
