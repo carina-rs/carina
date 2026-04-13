@@ -27,6 +27,14 @@ awscc.logs.log_group {
 
 ## Argument Reference
 
+### `bearer_token_authentication_enabled`
+
+- **Type:** Bool
+- **Required:** No
+- **Default:** `false`
+
+
+
 ### `data_protection_policy`
 
 - **Type:** Map(String)
