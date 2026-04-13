@@ -2,13 +2,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::parser::{ModuleCall, ParsedFile, TypeExpr};
+use crate::parser::{ModuleCall, ParsedFile, ProviderContext, TypeExpr, validate_custom_type};
 use crate::provider::ProviderFactory;
 use crate::resource::{Resource, Value};
-use crate::schema::{
-    AttributeType, ResourceSchema, suggest_similar_name, validate_ipv4_address, validate_ipv4_cidr,
-    validate_ipv6_address, validate_ipv6_cidr,
-};
+use crate::schema::{AttributeType, ResourceSchema, suggest_similar_name};
 
 /// Validate resources against their schemas.
 ///
@@ -227,9 +224,11 @@ pub fn validate_provider_config(
 /// Validate module call arguments against module argument types.
 ///
 /// `imported_modules` maps module alias to its argument parameter definitions.
+/// `config` provides custom type validators from providers.
 pub fn validate_module_calls(
     module_calls: &[ModuleCall],
     imported_modules: &HashMap<String, Vec<crate::parser::ArgumentParameter>>,
+    config: &ProviderContext,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
 
@@ -237,7 +236,8 @@ pub fn validate_module_calls(
         if let Some(module_args) = imported_modules.get(&call.module_name) {
             for (arg_name, arg_value) in &call.arguments {
                 if let Some(arg_param) = module_args.iter().find(|a| &a.name == arg_name)
-                    && let Some(error) = validate_type_expr_value(&arg_param.type_expr, arg_value)
+                    && let Some(error) =
+                        validate_type_expr_value(&arg_param.type_expr, arg_value, config)
                 {
                     errors.push(format!(
                         "module {} argument '{}': {}",
@@ -331,23 +331,18 @@ fn collect_resource_refs(value: &Value, refs: &mut HashSet<String>) {
 /// Validate a value against a TypeExpr, returning an error message if invalid.
 ///
 /// Shared validation logic used by both CLI module call validation and LSP diagnostics.
-pub fn validate_type_expr_value(type_expr: &TypeExpr, value: &Value) -> Option<String> {
+/// `config` provides custom type validators from providers (e.g., `iam_policy_arn`).
+pub fn validate_type_expr_value(
+    type_expr: &TypeExpr,
+    value: &Value,
+    config: &ProviderContext,
+) -> Option<String> {
     match (type_expr, value) {
-        (TypeExpr::Simple(name), Value::String(s)) => {
-            simple_type_validator(name).and_then(|validate_fn| validate_fn(s).err())
-        }
+        (TypeExpr::Simple(name), _) => validate_custom_type(name, value, config).err(),
         (TypeExpr::List(inner), Value::List(items)) => {
-            if let TypeExpr::Simple(name) = inner.as_ref()
-                && let Some(validate_fn) = simple_type_validator(name)
-            {
-                for (i, item) in items.iter().enumerate() {
-                    if let Value::String(s) = item {
-                        if let Err(e) = validate_fn(s) {
-                            return Some(format!("Element {}: {}", i, e));
-                        }
-                    } else {
-                        return Some(format!("Element {}: expected string, got {:?}", i, item));
-                    }
+            for (i, item) in items.iter().enumerate() {
+                if let Some(e) = validate_type_expr_value(inner, item, config) {
+                    return Some(format!("Element {}: {}", i, e));
                 }
             }
             None
@@ -380,19 +375,6 @@ pub fn validate_type_expr_value(type_expr: &TypeExpr, value: &Value) -> Option<S
     }
 }
 
-type ValidateFn = fn(&str) -> Result<(), String>;
-
-/// Return the validator function for a custom simple type name, if any.
-fn simple_type_validator(name: &str) -> Option<ValidateFn> {
-    match name {
-        "ipv4_cidr" => Some(validate_ipv4_cidr),
-        "ipv4_address" => Some(validate_ipv4_address),
-        "ipv6_cidr" => Some(validate_ipv6_cidr),
-        "ipv6_address" => Some(validate_ipv6_address),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,6 +396,26 @@ mod tests {
             remote_states: Vec::new(),
             requires: Vec::new(),
             structural_bindings: HashSet::new(),
+        }
+    }
+
+    fn context_with_iam_policy_arn_validator() -> ProviderContext {
+        use crate::parser::ValidatorFn;
+
+        let mut validators: HashMap<String, ValidatorFn> = HashMap::new();
+        validators.insert(
+            "iam_policy_arn".to_string(),
+            Box::new(|s: &str| {
+                if s.starts_with("arn:aws:iam::") {
+                    Ok(())
+                } else {
+                    Err(format!("invalid IAM policy ARN: '{s}'"))
+                }
+            }),
+        );
+        ProviderContext {
+            decryptor: None,
+            validators,
         }
     }
 
@@ -972,6 +974,7 @@ let vpc = awscc.ec2.vpc {
         let result = validate_type_expr_value(
             &TypeExpr::Simple("ipv4_cidr".to_string()),
             &Value::String("10.0.0.0/16".to_string()),
+            &ProviderContext::default(),
         );
         assert!(result.is_none());
     }
@@ -981,6 +984,7 @@ let vpc = awscc.ec2.vpc {
         let result = validate_type_expr_value(
             &TypeExpr::Simple("ipv4_cidr".to_string()),
             &Value::String("not-a-cidr".to_string()),
+            &ProviderContext::default(),
         );
         assert!(result.is_some());
     }
@@ -990,6 +994,7 @@ let vpc = awscc.ec2.vpc {
         let result = validate_type_expr_value(
             &TypeExpr::Simple("ipv4_address".to_string()),
             &Value::String("192.168.1.1".to_string()),
+            &ProviderContext::default(),
         );
         assert!(result.is_none());
     }
@@ -999,6 +1004,7 @@ let vpc = awscc.ec2.vpc {
         let result = validate_type_expr_value(
             &TypeExpr::Simple("ipv4_address".to_string()),
             &Value::String("999.999.999.999".to_string()),
+            &ProviderContext::default(),
         );
         assert!(result.is_some());
     }
@@ -1008,6 +1014,7 @@ let vpc = awscc.ec2.vpc {
         let result = validate_type_expr_value(
             &TypeExpr::Simple("ipv6_cidr".to_string()),
             &Value::String("2001:db8::/32".to_string()),
+            &ProviderContext::default(),
         );
         assert!(result.is_none());
     }
@@ -1017,6 +1024,7 @@ let vpc = awscc.ec2.vpc {
         let result = validate_type_expr_value(
             &TypeExpr::Simple("ipv6_cidr".to_string()),
             &Value::String("not-ipv6-cidr".to_string()),
+            &ProviderContext::default(),
         );
         assert!(result.is_some());
     }
@@ -1026,6 +1034,7 @@ let vpc = awscc.ec2.vpc {
         let result = validate_type_expr_value(
             &TypeExpr::Simple("ipv6_address".to_string()),
             &Value::String("2001:db8::1".to_string()),
+            &ProviderContext::default(),
         );
         assert!(result.is_none());
     }
@@ -1035,27 +1044,40 @@ let vpc = awscc.ec2.vpc {
         let result = validate_type_expr_value(
             &TypeExpr::Simple("ipv6_address".to_string()),
             &Value::String("zzz::zzz".to_string()),
+            &ProviderContext::default(),
         );
         assert!(result.is_some());
     }
 
     #[test]
     fn validate_type_expr_value_bool_mismatch() {
-        let result = validate_type_expr_value(&TypeExpr::Bool, &Value::String("yes".to_string()));
+        let result = validate_type_expr_value(
+            &TypeExpr::Bool,
+            &Value::String("yes".to_string()),
+            &ProviderContext::default(),
+        );
         assert!(result.is_some());
         assert!(result.unwrap().contains("expected bool"));
     }
 
     #[test]
     fn validate_type_expr_value_int_mismatch() {
-        let result = validate_type_expr_value(&TypeExpr::Int, &Value::String("42".to_string()));
+        let result = validate_type_expr_value(
+            &TypeExpr::Int,
+            &Value::String("42".to_string()),
+            &ProviderContext::default(),
+        );
         assert!(result.is_some());
         assert!(result.unwrap().contains("expected int"));
     }
 
     #[test]
     fn validate_type_expr_value_float_mismatch() {
-        let result = validate_type_expr_value(&TypeExpr::Float, &Value::String("3.14".to_string()));
+        let result = validate_type_expr_value(
+            &TypeExpr::Float,
+            &Value::String("3.14".to_string()),
+            &ProviderContext::default(),
+        );
         assert!(result.is_some());
         assert!(result.unwrap().contains("expected float"));
     }
@@ -1069,6 +1091,7 @@ let vpc = awscc.ec2.vpc {
         let result = validate_type_expr_value(
             &TypeExpr::List(Box::new(TypeExpr::Simple("ipv4_address".to_string()))),
             &Value::List(items),
+            &ProviderContext::default(),
         );
         assert!(result.is_some());
         assert!(result.unwrap().contains("Element 1"));
@@ -1076,49 +1099,73 @@ let vpc = awscc.ec2.vpc {
 
     #[test]
     fn validate_type_expr_value_string_type_accepts_string() {
-        let result =
-            validate_type_expr_value(&TypeExpr::String, &Value::String("hello".to_string()));
+        let result = validate_type_expr_value(
+            &TypeExpr::String,
+            &Value::String("hello".to_string()),
+            &ProviderContext::default(),
+        );
         assert!(result.is_none());
     }
 
     #[test]
     fn validate_type_expr_value_string_got_bool() {
-        let result = validate_type_expr_value(&TypeExpr::String, &Value::Bool(true));
+        let result = validate_type_expr_value(
+            &TypeExpr::String,
+            &Value::Bool(true),
+            &ProviderContext::default(),
+        );
         assert!(result.is_some());
         assert!(result.unwrap().contains("expected string, got bool"));
     }
 
     #[test]
     fn validate_type_expr_value_string_got_int() {
-        let result = validate_type_expr_value(&TypeExpr::String, &Value::Int(42));
+        let result = validate_type_expr_value(
+            &TypeExpr::String,
+            &Value::Int(42),
+            &ProviderContext::default(),
+        );
         assert!(result.is_some());
         assert!(result.unwrap().contains("expected string, got int"));
     }
 
     #[test]
     fn validate_type_expr_value_string_got_float() {
-        let result = validate_type_expr_value(&TypeExpr::String, &Value::Float(1.5));
+        let result = validate_type_expr_value(
+            &TypeExpr::String,
+            &Value::Float(1.5),
+            &ProviderContext::default(),
+        );
         assert!(result.is_some());
         assert!(result.unwrap().contains("expected string, got float"));
     }
 
     #[test]
     fn validate_type_expr_value_bool_got_int() {
-        let result = validate_type_expr_value(&TypeExpr::Bool, &Value::Int(1));
+        let result =
+            validate_type_expr_value(&TypeExpr::Bool, &Value::Int(1), &ProviderContext::default());
         assert!(result.is_some());
         assert!(result.unwrap().contains("expected bool, got int"));
     }
 
     #[test]
     fn validate_type_expr_value_int_got_bool() {
-        let result = validate_type_expr_value(&TypeExpr::Int, &Value::Bool(true));
+        let result = validate_type_expr_value(
+            &TypeExpr::Int,
+            &Value::Bool(true),
+            &ProviderContext::default(),
+        );
         assert!(result.is_some());
         assert!(result.unwrap().contains("expected int, got bool"));
     }
 
     #[test]
     fn validate_type_expr_value_float_got_bool() {
-        let result = validate_type_expr_value(&TypeExpr::Float, &Value::Bool(false));
+        let result = validate_type_expr_value(
+            &TypeExpr::Float,
+            &Value::Bool(false),
+            &ProviderContext::default(),
+        );
         assert!(result.is_some());
         assert!(result.unwrap().contains("expected float, got bool"));
     }
@@ -1130,8 +1177,11 @@ let vpc = awscc.ec2.vpc {
             path: "ec2".to_string(),
             type_name: "VpcId".to_string(),
         };
-        let result =
-            validate_type_expr_value(&schema_type, &Value::String("vpc-12345678".to_string()));
+        let result = validate_type_expr_value(
+            &schema_type,
+            &Value::String("vpc-12345678".to_string()),
+            &ProviderContext::default(),
+        );
         assert!(result.is_none());
     }
 
@@ -1142,7 +1192,11 @@ let vpc = awscc.ec2.vpc {
             path: "ec2".to_string(),
             type_name: "VpcId".to_string(),
         };
-        let result = validate_type_expr_value(&schema_type, &Value::Bool(true));
+        let result = validate_type_expr_value(
+            &schema_type,
+            &Value::Bool(true),
+            &ProviderContext::default(),
+        );
         assert!(result.is_some());
         assert!(result.unwrap().contains("expected awscc.ec2.VpcId"));
     }
@@ -1154,7 +1208,8 @@ let vpc = awscc.ec2.vpc {
             path: "ec2".to_string(),
             type_name: "VpcId".to_string(),
         };
-        let result = validate_type_expr_value(&schema_type, &Value::Int(42));
+        let result =
+            validate_type_expr_value(&schema_type, &Value::Int(42), &ProviderContext::default());
         assert!(result.is_some());
         assert!(result.unwrap().contains("expected awscc.ec2.VpcId"));
     }
@@ -1168,5 +1223,76 @@ let vpc = awscc.ec2.vpc {
         parsed.resources.push(caller);
 
         assert!(check_unused_bindings(&parsed).is_empty());
+    }
+
+    #[test]
+    fn validate_type_expr_custom_type_rejects_invalid() {
+        let config = context_with_iam_policy_arn_validator();
+
+        let result = validate_type_expr_value(
+            &TypeExpr::Simple("iam_policy_arn".to_string()),
+            &Value::String("aaaa".to_string()),
+            &config,
+        );
+        assert!(result.is_some(), "Expected validation error for 'aaaa'");
+        assert!(result.unwrap().contains("invalid IAM policy ARN"));
+
+        let result = validate_type_expr_value(
+            &TypeExpr::Simple("iam_policy_arn".to_string()),
+            &Value::String("arn:aws:iam::123456789012:policy/MyPolicy".to_string()),
+            &config,
+        );
+        assert!(result.is_none(), "Expected no error for valid ARN");
+    }
+
+    #[test]
+    fn validate_type_expr_list_custom_type_rejects_invalid() {
+        let config = context_with_iam_policy_arn_validator();
+
+        let result = validate_type_expr_value(
+            &TypeExpr::List(Box::new(TypeExpr::Simple("iam_policy_arn".to_string()))),
+            &Value::List(vec![Value::String("aaaa".to_string())]),
+            &config,
+        );
+        assert!(
+            result.is_some(),
+            "Expected validation error for list element"
+        );
+        assert!(result.unwrap().contains("Element 0"));
+    }
+
+    #[test]
+    fn validate_module_calls_rejects_custom_type() {
+        use crate::parser::ArgumentParameter;
+
+        let config = context_with_iam_policy_arn_validator();
+
+        let mut args = HashMap::new();
+        args.insert(
+            "managed_policy_arns".to_string(),
+            Value::List(vec![Value::String("aaaa".to_string())]),
+        );
+
+        let module_calls = vec![ModuleCall {
+            module_name: "github".to_string(),
+            binding_name: None,
+            arguments: args,
+        }];
+
+        let mut imported_modules = HashMap::new();
+        imported_modules.insert(
+            "github".to_string(),
+            vec![ArgumentParameter {
+                name: "managed_policy_arns".to_string(),
+                type_expr: TypeExpr::List(Box::new(TypeExpr::Simple("iam_policy_arn".to_string()))),
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+        );
+
+        let result = validate_module_calls(&module_calls, &imported_modules, &config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid IAM policy ARN"));
     }
 }

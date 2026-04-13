@@ -507,7 +507,11 @@ pub fn validate_provider_region_with_ctx(
     validation::validate_provider_config(parsed, ctx.factories()).map_err(AppError::Validation)
 }
 
-pub fn validate_module_calls(parsed: &ParsedFile, base_dir: &Path) -> Result<(), AppError> {
+pub fn validate_module_calls(
+    parsed: &ParsedFile,
+    base_dir: &Path,
+    config: &carina_core::parser::ProviderContext,
+) -> Result<(), AppError> {
     let mut imported_modules = HashMap::new();
     for import in &parsed.imports {
         let module_path = base_dir.join(&import.path);
@@ -516,7 +520,7 @@ pub fn validate_module_calls(parsed: &ParsedFile, base_dir: &Path) -> Result<(),
         }
     }
 
-    validation::validate_module_calls(&parsed.module_calls, &imported_modules)
+    validation::validate_module_calls(&parsed.module_calls, &imported_modules, config)
         .map_err(AppError::Validation)
 }
 

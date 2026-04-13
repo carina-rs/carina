@@ -64,6 +64,8 @@ pub struct DiagnosticEngine {
     factories: Arc<Vec<Box<dyn ProviderFactory>>>,
     /// Providers that failed to load: name -> error reason.
     provider_errors: HashMap<String, String>,
+    /// Cached provider context with custom type validators from schemas.
+    provider_context: carina_core::parser::ProviderContext,
 }
 
 impl DiagnosticEngine {
@@ -72,11 +74,16 @@ impl DiagnosticEngine {
         provider_names: Vec<String>,
         factories: Arc<Vec<Box<dyn ProviderFactory>>>,
     ) -> Self {
+        let provider_context = carina_core::parser::ProviderContext {
+            decryptor: None,
+            validators: carina_core::provider::collect_custom_type_validators(&schemas),
+        };
         Self {
             schemas,
             provider_names,
             factories,
             provider_errors: HashMap::new(),
+            provider_context,
         }
     }
 
