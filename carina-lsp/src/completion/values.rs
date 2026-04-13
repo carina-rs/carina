@@ -936,7 +936,7 @@ impl CompletionProvider {
         };
 
         // Custom types: built-in types + provider-extracted types (deduplicated)
-        let builtin_custom = ["cidr", "ipv4_address", "ipv6_cidr", "ipv6_address"];
+        let builtin_custom = ["ipv4_cidr", "ipv4_address", "ipv6_cidr", "ipv6_address"];
         let mut seen_custom = std::collections::HashSet::new();
         let custom: Vec<CompletionItem> = builtin_custom
             .iter()

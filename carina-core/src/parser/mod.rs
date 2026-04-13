@@ -97,7 +97,7 @@ pub enum TypeExpr {
     Bool,
     Int,
     Float,
-    /// Schema type identified by name (e.g., "cidr", "ipv4_address", "arn")
+    /// Schema type identified by name (e.g., "ipv4_cidr", "ipv4_address", "arn")
     Simple(std::string::String),
     List(Box<TypeExpr>),
     Map(Box<TypeExpr>),
@@ -2293,7 +2293,7 @@ fn prepare_user_function_call<'cfg>(
     Ok((child_ctx, substitutions))
 }
 
-/// Validate a value against a custom type (cidr, ipv4_address, etc.).
+/// Validate a value against a custom type (ipv4_cidr, ipv4_address, etc.).
 /// Returns Ok(()) if the value passes validation or cannot be validated statically
 /// (e.g., ResourceRef, FunctionCall, Interpolation are deferred).
 ///
@@ -2305,7 +2305,7 @@ pub fn validate_custom_type(
     config: &ProviderContext,
 ) -> Result<(), String> {
     match (type_name, value) {
-        ("cidr", Value::String(s)) => validate_ipv4_cidr(s),
+        ("ipv4_cidr", Value::String(s)) => validate_ipv4_cidr(s),
         ("ipv4_address", Value::String(s)) => validate_ipv4_address(s),
         ("ipv6_cidr", Value::String(s)) => validate_ipv6_cidr(s),
         ("ipv6_address", Value::String(s)) => validate_ipv6_address(s),
@@ -8349,9 +8349,9 @@ aws.s3.bucket {
 
     #[test]
     fn parse_custom_schema_type_in_fn_param() {
-        // Custom schema types like cidr, ipv4_address, arn should be accepted as type annotations
+        // Custom schema types like ipv4_cidr, ipv4_address, arn should be accepted as type annotations
         let input = r#"
-            fn format_cidr(cidr_block: cidr) {
+            fn format_cidr(cidr_block: ipv4_cidr) {
                 cidr_block
             }
         "#;
@@ -8360,7 +8360,7 @@ aws.s3.bucket {
         assert_eq!(func.params[0].name, "cidr_block");
         assert_eq!(
             func.params[0].param_type,
-            Some(TypeExpr::Simple("cidr".to_string()))
+            Some(TypeExpr::Simple("ipv4_cidr".to_string()))
         );
     }
 
@@ -8397,7 +8397,7 @@ aws.s3.bucket {
     #[test]
     fn parse_custom_type_in_list_generic() {
         let input = r#"
-            fn f(cidrs: list(cidr)) {
+            fn f(cidrs: list(ipv4_cidr)) {
                 cidrs
             }
         "#;
@@ -8406,7 +8406,7 @@ aws.s3.bucket {
         assert_eq!(
             func.params[0].param_type,
             Some(TypeExpr::List(Box::new(TypeExpr::Simple(
-                "cidr".to_string()
+                "ipv4_cidr".to_string()
             ))))
         );
     }
@@ -8415,7 +8415,7 @@ aws.s3.bucket {
     fn parse_custom_type_in_module_arguments() {
         let input = r#"
             arguments {
-                vpc_cidr: cidr
+                vpc_cidr: ipv4_cidr
                 server_ip: ipv4_address
             }
 
@@ -8428,7 +8428,7 @@ aws.s3.bucket {
         assert_eq!(result.arguments[0].name, "vpc_cidr");
         assert_eq!(
             result.arguments[0].type_expr,
-            TypeExpr::Simple("cidr".to_string())
+            TypeExpr::Simple("ipv4_cidr".to_string())
         );
         assert_eq!(result.arguments[1].name, "server_ip");
         assert_eq!(
@@ -8441,7 +8441,7 @@ aws.s3.bucket {
     fn parse_custom_type_in_attributes() {
         let input = r#"
             attributes {
-                block: cidr = vpc.cidr_block
+                block: ipv4_cidr = vpc.cidr_block
             }
 
             let vpc = awscc.ec2.vpc {
@@ -8452,13 +8452,16 @@ aws.s3.bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
             result.attribute_params[0].type_expr,
-            Some(TypeExpr::Simple("cidr".to_string()))
+            Some(TypeExpr::Simple("ipv4_cidr".to_string()))
         );
     }
 
     #[test]
     fn type_expr_display_simple() {
-        assert_eq!(TypeExpr::Simple("cidr".to_string()).to_string(), "cidr");
+        assert_eq!(
+            TypeExpr::Simple("ipv4_cidr".to_string()).to_string(),
+            "ipv4_cidr"
+        );
         assert_eq!(
             TypeExpr::Simple("ipv4_address".to_string()).to_string(),
             "ipv4_address"
@@ -8471,7 +8474,7 @@ aws.s3.bucket {
     #[test]
     fn user_fn_custom_type_cidr_arg_valid() {
         let input = r#"
-            fn f(x: cidr) { x }
+            fn f(x: ipv4_cidr) { x }
 
             let b = aws.s3_bucket {
                 name = f("10.0.0.0/16")
@@ -8484,7 +8487,7 @@ aws.s3.bucket {
     #[test]
     fn user_fn_custom_type_cidr_arg_invalid() {
         let input = r#"
-            fn f(x: cidr) { x }
+            fn f(x: ipv4_cidr) { x }
 
             let b = aws.s3_bucket {
                 name = f("invalid")
@@ -8493,8 +8496,8 @@ aws.s3.bucket {
         let err = parse(input, &ProviderContext::default()).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("type 'cidr' validation failed"),
-            "Expected cidr validation error, got: {msg}"
+            msg.contains("type 'ipv4_cidr' validation failed"),
+            "Expected ipv4_cidr validation error, got: {msg}"
         );
     }
 
@@ -8606,7 +8609,7 @@ aws.s3.bucket {
     fn user_fn_custom_type_arg_resource_ref_skipped() {
         // ResourceRef values should be accepted (resolved later)
         let input = r#"
-            fn f(x: cidr) { x }
+            fn f(x: ipv4_cidr) { x }
 
             let vpc = awscc.ec2.vpc {
                 cidr_block = "10.0.0.0/16"
@@ -8625,7 +8628,7 @@ aws.s3.bucket {
     #[test]
     fn user_fn_custom_type_return_cidr_valid() {
         let input = r#"
-            fn f(): cidr { "10.0.0.0/16" }
+            fn f(): ipv4_cidr { "10.0.0.0/16" }
 
             let b = aws.s3_bucket {
                 name = f()
@@ -8638,7 +8641,7 @@ aws.s3.bucket {
     #[test]
     fn user_fn_custom_type_return_cidr_invalid() {
         let input = r#"
-            fn f(): cidr { "invalid" }
+            fn f(): ipv4_cidr { "invalid" }
 
             let b = aws.s3_bucket {
                 name = f()
@@ -8647,8 +8650,8 @@ aws.s3.bucket {
         let err = parse(input, &ProviderContext::default()).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("return type 'cidr' validation failed"),
-            "Expected cidr validation error, got: {msg}"
+            msg.contains("return type 'ipv4_cidr' validation failed"),
+            "Expected ipv4_cidr validation error, got: {msg}"
         );
     }
 
