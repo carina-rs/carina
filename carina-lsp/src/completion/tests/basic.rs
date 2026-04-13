@@ -1095,6 +1095,38 @@ fn module_binding_completion_at_top_level() {
 }
 
 #[test]
+fn module_call_scaffolding_includes_arguments() {
+    let tmp = tempfile::tempdir().unwrap();
+    let module_dir = tmp.path().join("modules").join("web");
+    std::fs::create_dir_all(&module_dir).unwrap();
+    std::fs::write(
+        module_dir.join("main.crn"),
+        "arguments {\n  name: string\n  port: int\n}\n",
+    )
+    .unwrap();
+
+    let provider = test_provider();
+    let doc = create_document("let web = import './modules/web'\n\nw");
+    let position = Position {
+        line: 2,
+        character: 1,
+    };
+
+    let completions = provider.complete(&doc, position, Some(tmp.path()));
+    let web_completion = completions
+        .iter()
+        .find(|c| c.label == "web")
+        .expect("Should have 'web' completion");
+
+    let snippet = web_completion.insert_text.as_deref().unwrap();
+    assert!(
+        snippet.contains("name") && snippet.contains("port"),
+        "Scaffold should include all arguments. Got:\n{}",
+        snippet
+    );
+}
+
+#[test]
 fn import_path_completion_lists_directories_and_crn_files() {
     let tmp = tempfile::tempdir().unwrap();
     let modules_dir = tmp.path().join("modules");

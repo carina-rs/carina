@@ -55,7 +55,7 @@ impl CompletionProvider {
         let context = self.get_completion_context(&text, position);
 
         match context {
-            CompletionContext::TopLevel => self.top_level_completions(position, &text),
+            CompletionContext::TopLevel => self.top_level_completions(position, &text, base_path),
             CompletionContext::InsideResourceBlock { resource_type } => {
                 self.attribute_completions_for_type(&resource_type)
             }

@@ -15,6 +15,7 @@ impl CompletionProvider {
         &self,
         position: Position,
         text: &str,
+        base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {
         // Calculate the range for resource type replacements
         // Find where the current word/prefix starts on this line
@@ -164,10 +165,12 @@ impl CompletionProvider {
                 let binding = rest[..eq_pos].trim();
                 let after_eq = rest[eq_pos + 1..].trim();
                 if after_eq.starts_with("import ") && !binding.is_empty() && binding != "_" {
+                    // Try to load module and scaffold arguments
+                    let snippet = self.build_module_call_snippet(binding, after_eq, base_path);
                     completions.push(CompletionItem {
                         label: binding.to_string(),
                         kind: Some(CompletionItemKind::MODULE),
-                        insert_text: Some(format!("{} {{\n    ${{1}}\n}}", binding)),
+                        insert_text: Some(snippet),
                         insert_text_format: Some(InsertTextFormat::SNIPPET),
                         detail: Some("Module call".to_string()),
                         ..Default::default()
@@ -381,6 +384,54 @@ impl CompletionProvider {
             }
         }
         None
+    }
+
+    /// Build a snippet for a module call with argument placeholders.
+    ///
+    /// If the module can be loaded, generates a snippet with all arguments
+    /// as tab stops. Falls back to a simple `name { ${1} }` if loading fails.
+    fn build_module_call_snippet(
+        &self,
+        binding: &str,
+        after_eq: &str,
+        base_path: Option<&Path>,
+    ) -> String {
+        // Extract import path from "import 'path'" or "import \"path\""
+        let import_path = after_eq
+            .strip_prefix("import ")
+            .and_then(|s| {
+                s.trim()
+                    .strip_prefix('\'')
+                    .and_then(|s| s.strip_suffix('\''))
+            })
+            .or_else(|| {
+                after_eq
+                    .strip_prefix("import ")
+                    .and_then(|s| s.trim().strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+            });
+
+        if let Some(path) = import_path
+            && let Some(base) = base_path
+            && let Some(parsed) = carina_core::module_resolver::load_module(&base.join(path))
+            && !parsed.arguments.is_empty()
+        {
+            let mut snippet = format!("{} {{\n", binding);
+            let max_len = parsed
+                .arguments
+                .iter()
+                .map(|a| a.name.len())
+                .max()
+                .unwrap_or(0);
+            for (i, arg) in parsed.arguments.iter().enumerate() {
+                let padding = " ".repeat(max_len - arg.name.len());
+                snippet.push_str(&format!("  {}{} = ${{{}}}\n", arg.name, padding, i + 1));
+            }
+            snippet.push('}');
+            return snippet;
+        }
+
+        // Fallback: simple scaffold
+        format!("{} {{\n  ${{1}}\n}}", binding)
     }
 
     /// Generate import path completions from filesystem.
