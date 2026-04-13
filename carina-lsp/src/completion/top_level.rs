@@ -154,6 +154,28 @@ impl CompletionProvider {
             },
         ];
 
+        // Generate module binding completions from import statements
+        // e.g., "let github = import '...'" → suggest "github" with call scaffold
+        for line in lines.iter() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("let ")
+                && let Some(eq_pos) = rest.find('=')
+            {
+                let binding = rest[..eq_pos].trim();
+                let after_eq = rest[eq_pos + 1..].trim();
+                if after_eq.starts_with("import ") && !binding.is_empty() && binding != "_" {
+                    completions.push(CompletionItem {
+                        label: binding.to_string(),
+                        kind: Some(CompletionItemKind::MODULE),
+                        insert_text: Some(format!("{} {{\n    ${{1}}\n}}", binding)),
+                        insert_text_format: Some(InsertTextFormat::SNIPPET),
+                        detail: Some("Module call".to_string()),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
         // Generate resource type completions from schemas
         for (resource_type, schema) in self.schemas.iter() {
             let description = schema

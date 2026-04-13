@@ -1071,3 +1071,25 @@ fn type_completion_inside_map_shows_basic_types() {
         labels
     );
 }
+
+#[test]
+fn module_binding_completion_at_top_level() {
+    let provider = test_provider();
+    let doc = create_document("let github = import './modules/github-oidc'\n\ng");
+    let position = Position {
+        line: 2,
+        character: 1,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"github"),
+        "Top-level completions should include module binding 'github'. Got: {:?}",
+        labels
+    );
+
+    let github_completion = completions.iter().find(|c| c.label == "github").unwrap();
+    assert_eq!(github_completion.kind, Some(CompletionItemKind::MODULE));
+}
