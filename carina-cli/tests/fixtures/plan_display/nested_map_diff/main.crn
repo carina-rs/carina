@@ -1,0 +1,20 @@
+# Nested map diff: keys changed inside a nested map structure
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.vpc {
+  cidr_block = '10.0.0.0/16'
+  config = {
+    settings = {
+      mode = 'advanced'
+      timeout = '60'
+    }
+  }
+}
+
+awscc.ec2.subnet {
+  vpc_id     = vpc.vpc_id
+  cidr_block = '10.0.1.0/24'
+}

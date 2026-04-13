@@ -629,3 +629,16 @@ fn plan_snapshot_remote_state() {
     );
     insta::assert_snapshot!(strip_ansi(&output));
 }
+
+#[test]
+fn snapshot_nested_map_diff() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("nested_map_diff");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+    ));
+    insta::assert_snapshot!(output);
+}

@@ -144,6 +144,12 @@ pub enum MapDiffEntryIR {
         old: String,
         new: String,
     },
+    /// Nested map diff: when both old and new values are maps,
+    /// recursively compute key-level diffs instead of showing as one-liner.
+    NestedMapDiff {
+        key: String,
+        entries: Vec<MapDiffEntryIR>,
+    },
 }
 
 /// A modified item in a list-of-maps diff
@@ -679,11 +685,20 @@ fn compute_map_diff_entries(old_value: Option<&Value>, new_value: &Value) -> Vec
     for item in diff.iter_by_key() {
         match item {
             crate::diff_helpers::MapDiffItem::Changed(e) => {
-                entries.push(MapDiffEntryIR::Changed {
-                    key: e.key.clone(),
-                    old: format_value_with_key(&e.old_value, Some(&e.key)),
-                    new: format_value_with_key(&e.new_value, Some(&e.key)),
-                });
+                // If both old and new are maps, recursively diff
+                if matches!(&e.old_value, Value::Map(_)) && matches!(&e.new_value, Value::Map(_)) {
+                    let nested = compute_map_diff_entries(Some(&e.old_value), &e.new_value);
+                    entries.push(MapDiffEntryIR::NestedMapDiff {
+                        key: e.key.clone(),
+                        entries: nested,
+                    });
+                } else {
+                    entries.push(MapDiffEntryIR::Changed {
+                        key: e.key.clone(),
+                        old: format_value_with_key(&e.old_value, Some(&e.key)),
+                        new: format_value_with_key(&e.new_value, Some(&e.key)),
+                    });
+                }
             }
             crate::diff_helpers::MapDiffItem::Added(e) => {
                 entries.push(MapDiffEntryIR::Added {
