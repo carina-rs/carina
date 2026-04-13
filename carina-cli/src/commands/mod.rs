@@ -12,6 +12,7 @@ pub mod validate;
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 
 use carina_core::module_resolver;
 use carina_core::parser::{BackendConfig, ParsedFile, ProviderContext};
@@ -124,13 +125,20 @@ pub fn validate_and_resolve(
 }
 
 /// Create a `ProviderContext` with custom type validators extracted from
-/// the already-collected schema map.
+/// the already-collected schema map and factory-based validation for WASM providers.
 fn enrich_provider_context(
     schemas: &std::collections::HashMap<String, carina_core::schema::ResourceSchema>,
+    factories: Arc<Vec<Box<dyn carina_core::provider::ProviderFactory>>>,
 ) -> ProviderContext {
     ProviderContext {
         decryptor: None,
         validators: carina_core::provider::collect_custom_type_validators(schemas),
+        custom_type_validator: Some(Box::new(move |type_name: &str, value: &str| {
+            for factory in factories.iter() {
+                factory.validate_custom_type(type_name, value)?;
+            }
+            Ok(())
+        })),
     }
 }
 
@@ -167,7 +175,7 @@ pub fn validate_and_resolve_with_config(
     validate_provider_region_with_ctx(&ctx, parsed)?;
 
     // Enrich provider context with custom type validators from loaded schemas
-    let enriched_context = enrich_provider_context(ctx.schemas());
+    let enriched_context = enrich_provider_context(ctx.schemas(), ctx.factories_arc());
 
     // Validate module call arguments before expansion (needs enriched context for custom type validators)
     validate_module_calls(parsed, base_dir, &enriched_context)?;

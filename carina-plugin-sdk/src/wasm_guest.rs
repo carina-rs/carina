@@ -351,6 +351,18 @@ macro_rules! export_provider {
                     $crate::CarinaProvider::identity_attributes(&*provider)
                 }
 
+                fn validate_custom_type(
+                    type_name: String,
+                    value: String,
+                ) -> Result<(), String> {
+                    let provider = get_provider().lock().unwrap();
+                    $crate::CarinaProvider::validate_custom_type(
+                        &*provider,
+                        &type_name,
+                        &value,
+                    )
+                }
+
                 fn get_enum_aliases() -> String {
                     let provider = get_provider().lock().unwrap();
                     let aliases = $crate::CarinaProvider::enum_aliases(&*provider);
@@ -687,6 +699,18 @@ macro_rules! export_provider {
                 fn identity_attributes() -> Vec<String> {
                     let provider = get_provider().lock().unwrap();
                     $crate::CarinaProvider::identity_attributes(&*provider)
+                }
+
+                fn validate_custom_type(
+                    type_name: String,
+                    value: String,
+                ) -> Result<(), String> {
+                    let provider = get_provider().lock().unwrap();
+                    $crate::CarinaProvider::validate_custom_type(
+                        &*provider,
+                        &type_name,
+                        &value,
+                    )
                 }
 
                 fn get_enum_aliases() -> String {

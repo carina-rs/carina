@@ -163,6 +163,13 @@ pub trait CarinaProvider {
         HashMap::new()
     }
 
+    /// Validate a value against a provider-defined custom type.
+    /// Returns `Ok(())` if the value is valid or the type is unknown.
+    /// Returns `Err(message)` if the value is invalid for the given type.
+    fn validate_custom_type(&self, _type_name: &str, _value: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Normalize desired resources (optional).
     fn normalize_desired(&self, resources: Vec<Resource>) -> Vec<Resource> {
         resources

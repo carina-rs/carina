@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use colored::Colorize;
@@ -43,18 +44,25 @@ pub struct PlanContext {
 /// site (which rebuilds the full schema set every time), create a single
 /// `WiringContext` and pass it through the command execution path.
 pub struct WiringContext {
-    factories: Vec<Box<dyn ProviderFactory>>,
+    factories: Arc<Vec<Box<dyn ProviderFactory>>>,
     schemas: HashMap<String, ResourceSchema>,
 }
 
 impl WiringContext {
     pub fn new(factories: Vec<Box<dyn ProviderFactory>>) -> Self {
         let schemas = provider_mod::collect_schemas(&factories);
-        Self { factories, schemas }
+        Self {
+            factories: Arc::new(factories),
+            schemas,
+        }
     }
 
     pub fn factories(&self) -> &[Box<dyn ProviderFactory>] {
         &self.factories
+    }
+
+    pub fn factories_arc(&self) -> Arc<Vec<Box<dyn ProviderFactory>>> {
+        Arc::clone(&self.factories)
     }
 
     pub fn schemas(&self) -> &HashMap<String, ResourceSchema> {

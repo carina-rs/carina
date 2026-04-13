@@ -2313,9 +2313,13 @@ pub fn validate_custom_type(
         (_, Value::FunctionCall { .. }) => Ok(()), // will be resolved later
         (_, Value::Interpolation(_)) => Ok(()),   // will be resolved later
         (name, Value::String(s)) => {
-            // Check custom validators from config
+            // Check custom validators from config (schema-extracted)
             if let Some(validator) = config.validators.get(name) {
-                validator(s)
+                validator(s)?;
+            }
+            // Fall back to factory-based validator (e.g., WASM providers)
+            if let Some(ref factory_validator) = config.custom_type_validator {
+                factory_validator(name, s)
             } else {
                 Ok(())
             }
@@ -8716,6 +8720,7 @@ aws.s3.bucket {
                 Ok(format!("decrypted:{ciphertext}"))
             })),
             validators: HashMap::new(),
+            custom_type_validator: None,
         };
 
         // decrypt() in resource attributes is resolved during resolve_resource_refs,
@@ -8773,6 +8778,7 @@ aws.s3.bucket {
         let config = ProviderContext {
             decryptor: None,
             validators,
+            custom_type_validator: None,
         };
 
         let result = validate_custom_type(
@@ -8812,6 +8818,7 @@ aws.s3.bucket {
         let config = ProviderContext {
             decryptor: None,
             validators,
+            custom_type_validator: None,
         };
 
         // Test validate_custom_type directly since the grammar may not accept

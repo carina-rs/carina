@@ -74,9 +74,16 @@ impl DiagnosticEngine {
         provider_names: Vec<String>,
         factories: Arc<Vec<Box<dyn ProviderFactory>>>,
     ) -> Self {
+        let factories_clone = Arc::clone(&factories);
         let provider_context = carina_core::parser::ProviderContext {
             decryptor: None,
             validators: carina_core::provider::collect_custom_type_validators(&schemas),
+            custom_type_validator: Some(Box::new(move |type_name: &str, value: &str| {
+                for factory in factories_clone.iter() {
+                    factory.validate_custom_type(type_name, value)?;
+                }
+                Ok(())
+            })),
         };
         Self {
             schemas,

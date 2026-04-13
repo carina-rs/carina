@@ -2965,6 +2965,7 @@ mod tests {
         let config = ProviderContext {
             decryptor: None,
             validators,
+            custom_type_validator: None,
         };
 
         let mut module = create_test_module();
@@ -3036,6 +3037,7 @@ mod tests {
         let config = ProviderContext {
             decryptor: None,
             validators,
+            custom_type_validator: None,
         };
 
         let mut module = create_test_module();
