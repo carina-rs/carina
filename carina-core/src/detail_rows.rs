@@ -438,9 +438,19 @@ fn build_update_rows(
     for key in keys {
         let new_value = &to.attributes[key];
         let old_value = from.attributes.get(key);
-        let is_same = old_value
-            .map(|ov| ov.semantically_equal(new_value))
-            .unwrap_or(false);
+
+        // Use changed_attributes from the differ as the source of truth.
+        // The differ uses type_aware_equal (which handles schema-aware comparison)
+        // while semantically_equal may disagree for edge cases like struct default
+        // tolerance. If the differ says it changed, always show it.
+        let differ_says_changed = changed_attributes.contains(&key.to_string());
+        let is_same = if differ_says_changed {
+            false
+        } else {
+            old_value
+                .map(|ov| ov.semantically_equal(new_value))
+                .unwrap_or(false)
+        };
 
         if is_same {
             continue;
@@ -449,7 +459,25 @@ fn build_update_rows(
         if is_list_of_maps(new_value) {
             rows.push(build_list_of_maps_diff_row(key, old_value, new_value));
         } else if is_both_maps(old_value, new_value) {
-            rows.push(build_map_diff_row(key, old_value, new_value));
+            let row = build_map_diff_row(key, old_value, new_value);
+            // If the map diff produced empty entries (semantically_equal disagrees
+            // with the differ's type_aware_equal), fall back to Changed display
+            if let DetailRow::MapDiff { entries, .. } = &row {
+                if entries.is_empty() {
+                    let old_str = old_value
+                        .map(|v| format_value_with_key(v, Some(key)))
+                        .unwrap_or_else(|| "(none)".to_string());
+                    rows.push(DetailRow::Changed {
+                        key: key.to_string(),
+                        old: old_str,
+                        new: format_value_with_key(new_value, Some(key)),
+                    });
+                } else {
+                    rows.push(row);
+                }
+            } else {
+                rows.push(row);
+            }
         } else {
             let old_str = old_value
                 .map(|v| format_value_with_key(v, Some(key)))
