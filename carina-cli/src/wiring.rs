@@ -565,7 +565,7 @@ pub fn validate_module_attribute_param_types(
             ctx.schemas(),
             &|r| provider_mod::schema_key_for_resource(ctx.factories(), r),
         )
-        .map_err(AppError::Validation)?;
+        .map_err(|e| AppError::Validation(format!("{}: {}", import.path, e)))?;
     }
     Ok(())
 }

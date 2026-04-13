@@ -467,10 +467,76 @@ impl DiagnosticEngine {
                         type_error,
                     ));
                 }
+
+                // ResourceRef type validation: check that the referenced attribute's
+                // schema type is compatible with the declared TypeExpr
+                if let Some(ref type_expr) = attr_param.type_expr
+                    && let Value::ResourceRef { path } = value
+                    && let Some(ref_type_error) = self.check_attribute_ref_type(
+                        type_expr,
+                        path,
+                        &attr_param.name,
+                        &parsed.resources,
+                    )
+                    && let Some((line, col)) =
+                        self.find_attributes_value_position(doc, &attr_param.name)
+                {
+                    diagnostics.push(carina_diagnostic(
+                        line,
+                        col,
+                        col + path.to_dot_string().len() as u32,
+                        DiagnosticSeverity::WARNING,
+                        ref_type_error,
+                    ));
+                }
             }
         }
 
         diagnostics
+    }
+
+    /// Check a ResourceRef value against the declared TypeExpr by looking up
+    /// the referenced resource's schema attribute type.
+    fn check_attribute_ref_type(
+        &self,
+        type_expr: &TypeExpr,
+        path: &carina_core::resource::AccessPath,
+        param_name: &str,
+        resources: &[carina_core::resource::Resource],
+    ) -> Option<String> {
+        let expected_type = match type_expr {
+            TypeExpr::Simple(name) => name.as_str(),
+            _ => return None,
+        };
+
+        let ref_binding = path.binding();
+        let ref_attr = path.attribute();
+
+        // Find the referenced resource
+        let ref_resource = resources
+            .iter()
+            .find(|r| r.binding.as_deref() == Some(ref_binding))?;
+        let schema_key = format!(
+            "{}.{}",
+            ref_resource.id.provider, ref_resource.id.resource_type
+        );
+        // Try without provider prefix too (different providers use different key formats)
+        let ref_schema = self
+            .schemas
+            .get(&schema_key)
+            .or_else(|| self.schemas.get(&ref_resource.id.resource_type))?;
+        let ref_attr_schema = ref_schema.attributes.get(ref_attr)?;
+        let ref_type_name = ref_attr_schema.attr_type.type_name();
+        let ref_type_snake = carina_core::parser::pascal_to_snake(&ref_type_name);
+
+        if ref_type_snake == expected_type {
+            return None;
+        }
+
+        Some(format!(
+            "attribute '{}': type mismatch: expected {}, got {} (from {}.{})",
+            param_name, expected_type, ref_type_snake, ref_binding, ref_attr
+        ))
     }
 
     /// Validate an attributes value against its declared type.
