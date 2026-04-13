@@ -163,6 +163,79 @@ pub fn validate_resource_ref_types(
     }
 }
 
+/// Validate that attribute parameter ResourceRef values have types compatible
+/// with their declared TypeExpr types.
+///
+/// For example, `attributes { role_arn: iam_role_arn = role.role_name }` should
+/// be rejected because `role_name` is `String`, not `IamRoleArn`.
+pub fn validate_attribute_param_ref_types(
+    attribute_params: &[crate::parser::AttributeParameter],
+    resources: &[Resource],
+    schemas: &HashMap<String, ResourceSchema>,
+    schema_key_fn: &dyn Fn(&Resource) -> String,
+) -> Result<(), String> {
+    let mut binding_map: HashMap<String, &Resource> = HashMap::new();
+    for resource in resources {
+        if let Some(ref binding_name) = resource.binding {
+            binding_map.insert(binding_name.clone(), resource);
+        }
+    }
+
+    let mut errors = Vec::new();
+
+    for param in attribute_params {
+        let Some(ref type_expr) = param.type_expr else {
+            continue;
+        };
+        let Some(ref value) = param.value else {
+            continue;
+        };
+
+        // Only check ResourceRef values
+        let Value::ResourceRef { path } = value else {
+            continue;
+        };
+        let ref_binding = path.binding().to_string();
+        let ref_attr = path.attribute().to_string();
+
+        // Get expected type name from TypeExpr
+        let expected_type = match type_expr {
+            crate::parser::TypeExpr::Simple(name) => name.as_str(),
+            _ => continue, // String, Bool, etc. are handled by validate_type_expr_value
+        };
+
+        // Look up referenced resource's schema
+        let Some(ref_resource) = binding_map.get(&ref_binding) else {
+            continue;
+        };
+        let ref_schema_key = schema_key_fn(ref_resource);
+        let Some(ref_schema) = schemas.get(&ref_schema_key) else {
+            continue;
+        };
+        let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr.as_str()) else {
+            continue;
+        };
+
+        let ref_type_name = ref_attr_schema.attr_type.type_name();
+        let ref_type_snake = crate::parser::pascal_to_snake(&ref_type_name);
+
+        if ref_type_snake == expected_type {
+            continue;
+        }
+
+        errors.push(format!(
+            "attribute '{}': type mismatch: expected {}, got {} (from {}.{})",
+            param.name, expected_type, ref_type_snake, ref_binding, ref_attr
+        ));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
 /// Check if an AttributeType is string-compatible (can accept a string value).
 pub fn is_string_compatible_type(attr_type: &AttributeType) -> bool {
     match attr_type {
@@ -1295,5 +1368,86 @@ let vpc = awscc.ec2.vpc {
         let result = validate_module_calls(&module_calls, &imported_modules, &config);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid IAM policy ARN"));
+    }
+
+    #[test]
+    fn attribute_param_ref_type_mismatch_detected() {
+        use crate::parser::AttributeParameter;
+        use crate::schema::{AttributeSchema, ResourceSchema};
+
+        // Build a resource with schema: role_name is String, arn is IamRoleArn (Custom)
+        let role = Resource::with_provider("awscc", "iam.role", "github-role")
+            .with_binding("role")
+            .with_attribute("role_name", Value::String("my-role".to_string()))
+            .with_attribute(
+                "arn",
+                Value::String("arn:aws:iam::123456789012:role/my-role".to_string()),
+            );
+
+        let mut role_schema = ResourceSchema::new("iam.role");
+        role_schema =
+            role_schema.attribute(AttributeSchema::new("role_name", AttributeType::String));
+        role_schema = role_schema.attribute(AttributeSchema::new(
+            "arn",
+            AttributeType::Custom {
+                name: "IamRoleArn".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: |_| Ok(()),
+                namespace: None,
+                to_dsl: None,
+            },
+        ));
+
+        let mut schemas = HashMap::new();
+        schemas.insert("iam.role".to_string(), role_schema);
+
+        let resources = vec![role];
+
+        // Attribute param: role_arn: iam_role_arn = role.role_name (MISMATCH: String vs iam_role_arn)
+        let params_mismatch = vec![AttributeParameter {
+            name: "role_arn".to_string(),
+            type_expr: Some(TypeExpr::Simple("iam_role_arn".to_string())),
+            value: Some(Value::resource_ref(
+                "role".to_string(),
+                "role_name".to_string(),
+                vec![],
+            )),
+        }];
+
+        let result = validate_attribute_param_ref_types(
+            &params_mismatch,
+            &resources,
+            &schemas,
+            &|r: &Resource| r.id.resource_type.clone(),
+        );
+        assert!(
+            result.is_err(),
+            "Should reject String assigned to iam_role_arn"
+        );
+        let err = result.unwrap_err();
+        assert!(err.contains("type mismatch"), "Error: {err}");
+        assert!(err.contains("iam_role_arn"), "Error: {err}");
+
+        // Attribute param: role_arn: iam_role_arn = role.arn (MATCH: IamRoleArn matches iam_role_arn)
+        let params_match = vec![AttributeParameter {
+            name: "role_arn".to_string(),
+            type_expr: Some(TypeExpr::Simple("iam_role_arn".to_string())),
+            value: Some(Value::resource_ref(
+                "role".to_string(),
+                "arn".to_string(),
+                vec![],
+            )),
+        }];
+
+        let result = validate_attribute_param_ref_types(
+            &params_match,
+            &resources,
+            &schemas,
+            &|r: &Resource| r.id.resource_type.clone(),
+        );
+        assert!(
+            result.is_ok(),
+            "Should accept IamRoleArn assigned to iam_role_arn"
+        );
     }
 }
