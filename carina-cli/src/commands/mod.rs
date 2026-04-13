@@ -22,7 +22,8 @@ use carina_state::backend::BackendConfig as StateBackendConfig;
 use crate::error::AppError;
 use crate::wiring::{
     WiringContext, build_factories_from_providers, compute_anonymous_identifiers_with_ctx,
-    resolve_names_with_ctx, validate_attribute_param_ref_types_with_ctx, validate_module_calls,
+    resolve_names_with_ctx, validate_attribute_param_ref_types_with_ctx,
+    validate_module_attribute_param_types, validate_module_calls,
     validate_provider_region_with_ctx, validate_resource_ref_types_with_ctx,
     validate_resources_with_ctx,
 };
@@ -180,6 +181,11 @@ pub fn validate_and_resolve_with_config(
 
     // Validate module call arguments before expansion (needs enriched context for custom type validators)
     validate_module_calls(parsed, base_dir, &enriched_context)?;
+
+    // Validate module attribute parameter ref types before expansion
+    if !skip_resource_validation {
+        validate_module_attribute_param_types(&ctx, parsed, base_dir)?;
+    }
 
     // Resolve module imports and expand module calls
     module_resolver::resolve_modules_with_config(parsed, base_dir, &enriched_context)

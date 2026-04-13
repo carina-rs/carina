@@ -546,6 +546,30 @@ pub fn validate_module_calls(
         .map_err(AppError::Validation)
 }
 
+pub fn validate_module_attribute_param_types(
+    ctx: &WiringContext,
+    parsed: &ParsedFile,
+    base_dir: &Path,
+) -> Result<(), AppError> {
+    for import in &parsed.imports {
+        let module_path = base_dir.join(&import.path);
+        let Some(module_parsed) = module_resolver::load_module(&module_path) else {
+            continue;
+        };
+        if module_parsed.attribute_params.is_empty() {
+            continue;
+        }
+        validation::validate_attribute_param_ref_types(
+            &module_parsed.attribute_params,
+            &module_parsed.resources,
+            ctx.schemas(),
+            &|r| provider_mod::schema_key_for_resource(ctx.factories(), r),
+        )
+        .map_err(AppError::Validation)?;
+    }
+    Ok(())
+}
+
 pub async fn get_provider_with_ctx(
     ctx: &WiringContext,
     parsed: &ParsedFile,
