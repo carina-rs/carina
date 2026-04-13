@@ -664,6 +664,13 @@ pub struct AttributeSchema {
     /// appear in read responses. This is NOT related to sensitive/secret values — it
     /// indicates a CloudFormation `writeOnlyProperties` attribute.
     pub write_only: bool,
+    /// Whether this attribute contributes to anonymous resource identity.
+    /// Identity attributes are included in the hash when computing anonymous resource
+    /// identifiers, alongside create-only attributes. Use this for attributes that
+    /// distinguish resources of the same type that share the same create-only values
+    /// (e.g., Route 53 RecordSet `type` differentiates A vs AAAA records with the
+    /// same name and hosted zone).
+    pub identity: bool,
 }
 
 impl AttributeSchema {
@@ -681,6 +688,7 @@ impl AttributeSchema {
             removable: None,
             block_name: None,
             write_only: false,
+            identity: false,
         }
     }
 
@@ -701,6 +709,11 @@ impl AttributeSchema {
 
     pub fn write_only(mut self) -> Self {
         self.write_only = true;
+        self
+    }
+
+    pub fn identity(mut self) -> Self {
+        self.identity = true;
         self
     }
 
@@ -908,6 +921,15 @@ impl ResourceSchema {
         self.attributes
             .iter()
             .filter(|(_, schema)| schema.create_only)
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
+    /// Returns the names of identity attributes (contribute to anonymous resource hashing)
+    pub fn identity_attributes(&self) -> Vec<&str> {
+        self.attributes
+            .iter()
+            .filter(|(_, schema)| schema.identity)
             .map(|(name, _)| name.as_str())
             .collect()
     }
