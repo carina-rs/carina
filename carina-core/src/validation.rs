@@ -416,6 +416,7 @@ mod tests {
         ProviderContext {
             decryptor: None,
             validators,
+            custom_type_validator: None,
         }
     }
 

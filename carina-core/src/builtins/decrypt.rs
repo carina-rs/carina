@@ -92,6 +92,7 @@ mod tests {
         ProviderContext {
             decryptor: Some(decrypt_fn),
             validators: HashMap::new(),
+            custom_type_validator: None,
         }
     }
 

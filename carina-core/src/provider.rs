@@ -440,6 +440,13 @@ pub trait ProviderFactory: Send + Sync {
     /// using [`provider_config_attribute_types`] before this is called.
     fn validate_config(&self, attributes: &HashMap<String, Value>) -> Result<(), String>;
 
+    /// Validate a value against a provider-defined custom type.
+    /// Returns `Ok(())` if the value is valid or the type is unknown to this provider.
+    /// Returns `Err(message)` if the value is invalid for the given type.
+    fn validate_custom_type(&self, _type_name: &str, _value: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Extract region from config in SDK format (e.g., "ap-northeast-1").
     /// Returns a default region if none is configured.
     fn extract_region(&self, attributes: &HashMap<String, Value>) -> String;

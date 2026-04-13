@@ -10,6 +10,12 @@ use std::collections::HashMap;
 /// Takes a string value and returns `Ok(())` if valid, or `Err(message)` if invalid.
 pub type ValidatorFn = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
+/// Signature for a factory-based custom type validator.
+///
+/// Takes `(type_name, value)` and returns `Ok(())` if valid or unknown,
+/// or `Err(message)` if invalid.
+pub type CustomTypeValidatorFn = Box<dyn Fn(&str, &str) -> Result<(), String> + Send + Sync>;
+
 /// Signature for a decryptor function.
 ///
 /// Takes `(ciphertext, optional_key)` and returns the decrypted plaintext or an error.
@@ -26,6 +32,9 @@ pub struct ProviderContext {
     pub decryptor: Option<DecryptorFn>,
     /// Custom type validators keyed by type name (e.g., "arn", "availability_zone").
     pub validators: HashMap<String, ValidatorFn>,
+    /// Factory-based custom type validator that calls through to provider factories
+    /// (e.g., WASM plugins) for types not covered by `validators`.
+    pub custom_type_validator: Option<CustomTypeValidatorFn>,
 }
 
 impl std::fmt::Debug for ProviderContext {
@@ -33,6 +42,10 @@ impl std::fmt::Debug for ProviderContext {
         f.debug_struct("ProviderContext")
             .field("decryptor", &self.decryptor.as_ref().map(|_| "..."))
             .field("validators", &self.validators.keys().collect::<Vec<_>>())
+            .field(
+                "custom_type_validator",
+                &self.custom_type_validator.as_ref().map(|_| "..."),
+            )
             .finish()
     }
 }

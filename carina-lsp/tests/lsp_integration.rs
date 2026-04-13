@@ -23,6 +23,7 @@ impl TestClient {
             let provider_context = ProviderContext {
                 decryptor: None,
                 validators: HashMap::new(),
+                custom_type_validator: None,
             };
             Backend::new(client, provider_context, None)
         });

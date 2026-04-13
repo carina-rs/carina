@@ -351,6 +351,26 @@ impl WasmBindings {
         }
     }
 
+    async fn call_validate_custom_type(
+        &self,
+        store: &mut Store<HostState>,
+        type_name: &str,
+        value: &str,
+    ) -> wasmtime::Result<Result<(), String>> {
+        match self {
+            WasmBindings::Basic(b) => {
+                b.carina_provider_provider()
+                    .call_validate_custom_type(store, type_name, value)
+                    .await
+            }
+            WasmBindings::Http(b) => {
+                b.carina_provider_provider()
+                    .call_validate_custom_type(store, type_name, value)
+                    .await
+            }
+        }
+    }
+
     async fn call_initialize(
         &self,
         store: &mut Store<HostState>,
@@ -1148,6 +1168,20 @@ impl ProviderFactory for WasmProviderFactory {
                     .call_validate_config(store, &wit_attrs)
                     .await
                     .map_err(|e| format!("Failed to call validate_config(): {e}"))?
+            })
+        })
+    }
+
+    fn validate_custom_type(&self, type_name: &str, value: &str) -> Result<(), String> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let mut guard = self.init_instance.lock().await;
+                let (ref mut store, ref bindings) = *guard;
+                store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
+                bindings
+                    .call_validate_custom_type(store, type_name, value)
+                    .await
+                    .map_err(|e| format!("Failed to call validate_custom_type(): {e}"))?
             })
         })
     }

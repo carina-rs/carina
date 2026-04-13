@@ -89,6 +89,7 @@ async fn main() {
         let provider_context = ProviderContext {
             decryptor: None,
             validators: HashMap::new(),
+            custom_type_validator: None,
         };
 
         // Pass factory builder callback — actual WASM loading happens asynchronously
