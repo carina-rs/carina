@@ -66,7 +66,7 @@ pub(super) fn type_aware_equal(
             }
 
             // Maps: recursive comparison with inner value type
-            (Value::Map(ma), Value::Map(mb), AttributeType::Map(inner)) => {
+            (Value::Map(ma), Value::Map(mb), AttributeType::Map { value: inner, .. }) => {
                 type_aware_maps_equal(ma, mb, |_key| Some(inner.as_ref()), secret_ctx)
             }
 
@@ -237,7 +237,7 @@ fn is_type_default(value: &Value, attr_type: Option<&AttributeType>) -> bool {
         (Value::String(s), Some(AttributeType::String)) if s.is_empty() => true,
         (Value::String(s), Some(AttributeType::StringEnum { .. })) if s.is_empty() => true,
         (Value::List(l), Some(AttributeType::List { .. })) if l.is_empty() => true,
-        (Value::Map(m), Some(AttributeType::Map(_) | AttributeType::Struct { .. }))
+        (Value::Map(m), Some(AttributeType::Map { .. } | AttributeType::Struct { .. }))
             if m.is_empty() =>
         {
             true

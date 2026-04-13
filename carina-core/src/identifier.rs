@@ -1157,7 +1157,7 @@ mod tests {
             .attribute(AttributeSchema::new("domain", AttributeType::String))
             .attribute(AttributeSchema::new(
                 "tags",
-                AttributeType::Map(Box::new(AttributeType::String)),
+                AttributeType::map(AttributeType::String),
             ));
         let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.eip".to_string(), schema)]
             .into_iter()
@@ -2222,7 +2222,7 @@ mod tests {
             )
             .attribute(AttributeSchema::new(
                 "tags",
-                AttributeType::Map(Box::new(AttributeType::String)),
+                AttributeType::map(AttributeType::String),
             ));
         let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.eip".to_string(), schema)]
             .into_iter()

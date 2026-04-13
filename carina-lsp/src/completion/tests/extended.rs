@@ -277,8 +277,7 @@ fn map_completions_delegate_to_inner_type() {
     use carina_core::schema::AttributeType;
 
     let provider = test_provider();
-    let completions =
-        provider.completions_for_type(&AttributeType::Map(Box::new(AttributeType::Bool)), None);
+    let completions = provider.completions_for_type(&AttributeType::map(AttributeType::Bool), None);
 
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(

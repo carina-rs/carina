@@ -109,8 +109,14 @@ pub enum AttributeType {
         inner: Box<AttributeType>,
         ordered: bool,
     },
-    /// Map
-    Map(Box<AttributeType>),
+    /// Map with typed keys and values.
+    /// `key`: type constraint for map keys (e.g., `String` for unconstrained,
+    /// `StringEnum` for condition operators).
+    /// `value`: type of map values.
+    Map {
+        key: Box<AttributeType>,
+        value: Box<AttributeType>,
+    },
     /// Struct (named object with typed fields)
     Struct {
         name: String,
@@ -134,6 +140,19 @@ impl AttributeType {
         AttributeType::List {
             inner: Box::new(inner),
             ordered: false,
+        }
+    }
+
+    /// Create a Map type with unconstrained string keys.
+    pub fn map(value: AttributeType) -> Self {
+        Self::map_with_key(AttributeType::String, value)
+    }
+
+    /// Create a Map type with a typed key constraint.
+    pub fn map_with_key(key: AttributeType, value: AttributeType) -> Self {
+        AttributeType::Map {
+            key: Box::new(key),
+            value: Box::new(value),
         }
     }
 
@@ -332,7 +351,22 @@ impl AttributeType {
                 Ok(())
             }
 
-            (AttributeType::Map(inner), Value::Map(map)) => {
+            (
+                AttributeType::Map {
+                    key: key_type,
+                    value: inner,
+                },
+                Value::Map(map),
+            ) => {
+                // Validate keys against key type
+                for k in map.keys() {
+                    key_type.validate(&Value::String(k.clone())).map_err(|e| {
+                        TypeError::MapKeyError {
+                            key: k.clone(),
+                            inner: Box::new(e),
+                        }
+                    })?;
+                }
                 for (k, v) in map {
                     inner.validate(v).map_err(|e| TypeError::MapValueError {
                         key: k.clone(),
@@ -417,7 +451,7 @@ impl AttributeType {
             AttributeType::StringEnum { name, .. } => name.clone(),
             AttributeType::Custom { name, .. } => name.clone(),
             AttributeType::List { inner, .. } => format!("List<{}>", inner.type_name()),
-            AttributeType::Map(inner) => format!("Map<{}>", inner.type_name()),
+            AttributeType::Map { value: inner, .. } => format!("Map<{}>", inner.type_name()),
             AttributeType::Struct { name, .. } => format!("Struct({})", name),
             AttributeType::Union(types) => {
                 let names: Vec<String> = types.iter().map(|t| t.type_name()).collect();
@@ -489,6 +523,9 @@ pub enum TypeError {
 
     #[error("List item at index {index}: {inner}")]
     ListItemError { index: usize, inner: Box<TypeError> },
+
+    #[error("Map key '{key}': {inner}")]
+    MapKeyError { key: String, inner: Box<TypeError> },
 
     #[error("Map value for key '{key}': {inner}")]
     MapValueError { key: String, inner: Box<TypeError> },
@@ -964,7 +1001,7 @@ fn collect_block_names_from_type(attr_type: &AttributeType, result: &mut HashMap
         AttributeType::List { inner, .. } => {
             collect_block_names_from_type(inner, result);
         }
-        AttributeType::Map(inner) => {
+        AttributeType::Map { value: inner, .. } => {
             collect_block_names_from_type(inner, result);
         }
         AttributeType::Union(types) => {
@@ -3038,7 +3075,7 @@ mod tests {
             .attribute(AttributeSchema::new("bucket_name", AttributeType::String))
             .attribute(AttributeSchema::new(
                 "tags",
-                AttributeType::Map(Box::new(AttributeType::String)),
+                AttributeType::map(AttributeType::String),
             ));
 
         let mut attrs = HashMap::new();

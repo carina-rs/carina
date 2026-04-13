@@ -560,7 +560,7 @@ fn create_plan_filters_non_removable_attribute_removal() {
             .attribute(AttributeSchema::new("region", AttributeType::String).non_removable())
             .attribute(AttributeSchema::new(
                 "tags",
-                AttributeType::Map(Box::new(AttributeType::String)),
+                AttributeType::map(AttributeType::String),
             )),
     );
 

@@ -250,6 +250,8 @@ pub enum AttributeType {
     #[serde(rename = "map")]
     Map {
         inner: Box<AttributeType>,
+        /// Key type constraint for map keys.
+        key: Box<AttributeType>,
     },
     #[serde(rename = "struct")]
     Struct {

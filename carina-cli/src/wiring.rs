@@ -1623,7 +1623,7 @@ mod tests {
         // merge_default_tags checks for the presence of "tags" in the schema.
         let schema = ResourceSchema::new("awscc.s3.bucket").attribute(AttributeSchema::new(
             "tags",
-            AttributeType::Map(Box::new(AttributeType::String)),
+            AttributeType::map(AttributeType::String),
         ));
         let mut schemas: HashMap<String, ResourceSchema> = HashMap::new();
         schemas.insert("awscc.s3.bucket".to_string(), schema);
