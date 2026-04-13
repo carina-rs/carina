@@ -1060,15 +1060,48 @@ fn render_list_of_maps_diff(
         writeln!(out, "{}    {}", attr_prefix, item).unwrap();
     }
     for item in modified {
-        let rendered_fields = render_modified_fields(&item.fields);
-        writeln!(
-            out,
-            "{}  {} {{{}}}",
-            attr_prefix,
-            "~".yellow().bold(),
-            rendered_fields
-        )
-        .unwrap();
+        let has_nested = item
+            .fields
+            .iter()
+            .any(|f| matches!(f, ListOfMapsDiffField::NestedMapChanged { .. }));
+        if has_nested {
+            writeln!(out, "{}  {} {{", attr_prefix, "~".yellow().bold()).unwrap();
+            for field in &item.fields {
+                match field {
+                    ListOfMapsDiffField::Unchanged { key, value } => {
+                        writeln!(out, "{}      {}: {}", attr_prefix, key, value).unwrap();
+                    }
+                    ListOfMapsDiffField::Changed { key, old, new } => {
+                        writeln!(
+                            out,
+                            "{}    {} {}: {} → {}",
+                            attr_prefix,
+                            "~".yellow(),
+                            key,
+                            old.red().strikethrough(),
+                            new.green()
+                        )
+                        .unwrap();
+                    }
+                    ListOfMapsDiffField::NestedMapChanged { key, entries } => {
+                        writeln!(out, "{}      {}:", attr_prefix, key).unwrap();
+                        let nested_prefix = format!("{}      ", attr_prefix);
+                        render_map_diff_entries(out, entries, &nested_prefix);
+                    }
+                }
+            }
+            writeln!(out, "{}    }}", attr_prefix).unwrap();
+        } else {
+            let rendered_fields = render_modified_fields(&item.fields);
+            writeln!(
+                out,
+                "{}  {} {{{}}}",
+                attr_prefix,
+                "~".yellow().bold(),
+                rendered_fields
+            )
+            .unwrap();
+        }
     }
     for item in added {
         writeln!(out, "{}  {} {}", attr_prefix, "+".green().bold(), item).unwrap();
@@ -1100,6 +1133,9 @@ fn render_modified_fields(fields: &[ListOfMapsDiffField]) -> String {
                     old.red().strikethrough(),
                     new.green()
                 ));
+            }
+            ListOfMapsDiffField::NestedMapChanged { key, .. } => {
+                result_parts.push(format!("{}: (nested changes)", key));
             }
         }
     }

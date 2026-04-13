@@ -775,6 +775,18 @@ fn render_list_of_maps_diff(
                     spans.push(Span::raw(" -> "));
                     spans.push(Span::styled(new.clone(), Style::default().fg(Color::Green)));
                 }
+                ListOfMapsDiffField::NestedMapChanged { key, entries } => {
+                    // Flush current spans as a line, then render nested entries
+                    spans.push(Span::raw(format!("{}: ", key)));
+                    lines.push(Line::from(std::mem::take(&mut spans)));
+                    let mut nested_lines = Vec::new();
+                    render_map_diff_entries(&mut nested_lines, entries);
+                    for line in nested_lines {
+                        let mut indented = vec![Span::raw("      ")];
+                        indented.extend(line.spans);
+                        lines.push(Line::from(indented));
+                    }
+                }
             }
         }
         spans.push(Span::raw("}"));

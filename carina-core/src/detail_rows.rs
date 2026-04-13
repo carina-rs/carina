@@ -178,6 +178,11 @@ pub enum ListOfMapsDiffField {
         old: String,
         new: String,
     },
+    /// Field value is a nested map that changed — show recursive key-level diffs
+    NestedMapChanged {
+        key: String,
+        entries: Vec<MapDiffEntryIR>,
+    },
 }
 
 /// A cascading update entry
@@ -865,14 +870,25 @@ fn compute_list_of_maps_diff_parts(
                         .map(|ov| ov.semantically_equal(&new_map[*k]))
                         .unwrap_or(false);
                     if !field_same {
-                        let old_v = old_map
-                            .get(*k)
-                            .map(format_value)
-                            .unwrap_or_else(|| "(none)".to_string());
-                        ListOfMapsDiffField::Changed {
-                            key: k.to_string(),
-                            old: old_v,
-                            new: new_v,
+                        let old_val = old_map.get(*k);
+                        // If both old and new are maps, show recursive diff
+                        if matches!(old_val, Some(Value::Map(_)))
+                            && matches!(&new_map[*k], Value::Map(_))
+                        {
+                            let nested = compute_map_diff_entries(old_val, &new_map[*k]);
+                            ListOfMapsDiffField::NestedMapChanged {
+                                key: k.to_string(),
+                                entries: nested,
+                            }
+                        } else {
+                            let old_v = old_val
+                                .map(format_value)
+                                .unwrap_or_else(|| "(none)".to_string());
+                            ListOfMapsDiffField::Changed {
+                                key: k.to_string(),
+                                old: old_v,
+                                new: new_v,
+                            }
                         }
                     } else {
                         ListOfMapsDiffField::Unchanged {
