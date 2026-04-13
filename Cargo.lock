@@ -947,6 +947,7 @@ name = "carina-provider-resolver"
 version = "0.3.0"
 dependencies = [
  "carina-core",
+ "dirs",
  "flate2",
  "semver",
  "serde",
