@@ -219,6 +219,9 @@ pub struct AttributeSchema {
     /// `None` = auto-detect, `Some(false)` = explicitly non-removable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub removable: Option<bool>,
+    /// Whether this attribute contributes to anonymous resource identity hashing.
+    #[serde(default)]
+    pub identity: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

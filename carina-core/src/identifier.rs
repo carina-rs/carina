@@ -374,6 +374,7 @@ pub fn compute_anonymous_identifiers(
         };
 
         let create_only_attrs = schema.create_only_attributes();
+        let schema_identity_attrs = schema.identity_attributes();
 
         // Collect identity attribute values (e.g., region) from provider config
         let mut identity_values: BTreeMap<String, String> = BTreeMap::new();
@@ -399,6 +400,16 @@ pub fn compute_anonymous_identifiers(
                 // Use the prefix for hashing to produce a stable identifier
                 hash_values.insert(attr_name, format!("Prefix({:?})", prefix));
             } else if let Some(value) = resource.get_attr(attr_name) {
+                hash_values.insert(attr_name, deterministic_value_string(value));
+            }
+        }
+        // Also include schema-level identity attributes in the hash.
+        // These distinguish resources that share create-only values but differ
+        // in other key attributes (e.g., Route 53 RecordSet `type`).
+        for attr_name in &schema_identity_attrs {
+            if !hash_values.contains_key(attr_name)
+                && let Some(value) = resource.get_attr(attr_name)
+            {
                 hash_values.insert(attr_name, deterministic_value_string(value));
             }
         }
@@ -1281,6 +1292,77 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("collision"));
+    }
+
+    #[test]
+    fn test_identity_attribute_prevents_collision() {
+        // Two anonymous resources of the same type with the same create-only attrs
+        // but different identity attrs should NOT collide.
+        // This simulates route53.record_set where `name` is create-only (same)
+        // but `type` is identity (A vs AAAA).
+        let schema = ResourceSchema::new("awscc.route53.record_set")
+            .attribute(AttributeSchema::new("name", AttributeType::String).create_only())
+            .attribute(AttributeSchema::new("hosted_zone_id", AttributeType::String).create_only())
+            .attribute(AttributeSchema::new("type", AttributeType::String).identity())
+            .attribute(AttributeSchema::new("ttl", AttributeType::String))
+            .attribute(AttributeSchema::new(
+                "resource_records",
+                AttributeType::list(AttributeType::String),
+            ));
+        let schemas: HashMap<String, ResourceSchema> =
+            vec![("awscc.route53.record_set".to_string(), schema)]
+                .into_iter()
+                .collect();
+        let providers = vec![ProviderConfig {
+            name: "awscc".to_string(),
+            attributes: HashMap::new(),
+            default_tags: HashMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+        }];
+        let identity_fn = |_: &str| -> Vec<String> { vec![] };
+
+        let mut r1 = Resource::with_provider("awscc", "route53.record_set", "");
+        r1.set_attr(
+            "name".to_string(),
+            Value::String("carina-rs.dev".to_string()),
+        );
+        r1.set_attr(
+            "hosted_zone_id".to_string(),
+            Value::String("Z123".to_string()),
+        );
+        r1.set_attr("type".to_string(), Value::String("A".to_string()));
+
+        let mut r2 = Resource::with_provider("awscc", "route53.record_set", "");
+        r2.set_attr(
+            "name".to_string(),
+            Value::String("carina-rs.dev".to_string()),
+        );
+        r2.set_attr(
+            "hosted_zone_id".to_string(),
+            Value::String("Z123".to_string()),
+        );
+        r2.set_attr("type".to_string(), Value::String("AAAA".to_string()));
+
+        let mut resources = vec![r1, r2];
+        compute_anonymous_identifiers(
+            &mut resources,
+            &providers,
+            &schemas,
+            &schema_key_fn,
+            &identity_fn,
+        )
+        .expect("should not collide when identity attrs differ");
+
+        // Both should have identifiers assigned
+        assert!(!resources[0].id.name.is_empty());
+        assert!(!resources[1].id.name.is_empty());
+        // Identifiers should be different
+        assert_ne!(
+            resources[0].id.name, resources[1].id.name,
+            "different identity attr values should produce different identifiers"
+        );
     }
 
     #[test]

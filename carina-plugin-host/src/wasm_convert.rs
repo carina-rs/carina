@@ -333,6 +333,7 @@ fn proto_attr_schema_to_core(a: &proto::AttributeSchema) -> CoreAttributeSchema 
         removable: a.removable,
         block_name: a.block_name.clone(),
         write_only: a.write_only,
+        identity: a.identity,
     }
 }
 

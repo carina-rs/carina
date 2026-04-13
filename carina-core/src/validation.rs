@@ -798,6 +798,7 @@ let vpc = awscc.ec2.vpc {
                     removable: None,
                     block_name: None,
                     write_only: false,
+                    identity: false,
                 },
             );
         }
