@@ -1171,10 +1171,13 @@ impl Formatter {
     }
 
     fn format_block_attributes(&mut self, node: &CstNode) {
-        // Collect attributes into groups separated by blank lines
+        // Collect attributes into groups separated by blank lines.
+        // Comments are attached to the next attribute (leading_comments map).
         let mut groups: Vec<Vec<&CstNode>> = Vec::new();
         let mut current_group: Vec<&CstNode> = Vec::new();
         let mut inline_comments: std::collections::HashMap<usize, &Trivia> =
+            std::collections::HashMap::new();
+        let mut leading_comments: std::collections::HashMap<usize, Vec<&Trivia>> =
             std::collections::HashMap::new();
         let mut pending_comments: Vec<&Trivia> = Vec::new();
 
@@ -1187,11 +1190,9 @@ impl Formatter {
                         || n.kind == NodeKind::NestedBlock
                         || n.kind == NodeKind::LocalBinding =>
                 {
-                    // Write any pending standalone comments
-                    for comment in pending_comments.drain(..) {
-                        self.write_indent();
-                        self.write_trivia(comment);
-                        self.write_newline();
+                    // Attach pending comments to this attribute
+                    if !pending_comments.is_empty() {
+                        leading_comments.insert(attr_index, std::mem::take(&mut pending_comments));
                     }
                     // Start a new group if there was a blank line
                     if newline_count > 1 && !current_group.is_empty() {
@@ -1203,9 +1204,7 @@ impl Formatter {
                 }
                 CstChild::Trivia(Trivia::LineComment(s)) => {
                     // Check if this is an inline comment (on same line as previous attribute)
-                    // For simplicity, we treat comments after a newline as standalone
                     if attr_index > 0 && !s.is_empty() && newline_count == 0 {
-                        // Store as potential inline comment for previous attribute
                         inline_comments.insert(
                             attr_index - 1,
                             match child {
@@ -1262,6 +1261,14 @@ impl Formatter {
 
             // Format each attribute/nested block/local binding in this group
             for attr in group {
+                // Write leading comments attached to this attribute
+                if let Some(comments) = leading_comments.get(&global_attr_index) {
+                    for comment in comments {
+                        self.write_indent();
+                        self.write_trivia(comment);
+                        self.write_newline();
+                    }
+                }
                 if attr.kind == NodeKind::LocalBinding {
                     self.format_let_binding(attr);
                 } else if attr.kind == NodeKind::NestedBlock {
@@ -2992,6 +2999,36 @@ require   port >= 1 && port <= 65535  , "port must be valid"
         assert!(
             result.contains("'aws:condition'"),
             "Quoted attribute key should be preserved. Got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_comment_stays_above_attribute() {
+        let input = r#"let x = awscc.iam.oidc_provider {
+  url            = 'https://example.com'
+  client_id_list = ['sts.amazonaws.com']
+  # AWS requires this field but does not validate it
+  thumbprint_list = ['ffffffffffffffffffffffffffffffffffffffff']
+}
+"#;
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+
+        // The comment should appear directly before thumbprint_list, not before url
+        let lines: Vec<&str> = result.lines().collect();
+        let comment_line = lines
+            .iter()
+            .position(|l| l.contains("# AWS requires"))
+            .expect("Comment should exist in output");
+        let thumbprint_line = lines
+            .iter()
+            .position(|l| l.contains("thumbprint_list"))
+            .expect("thumbprint_list should exist in output");
+        assert_eq!(
+            comment_line + 1,
+            thumbprint_line,
+            "Comment should be directly above thumbprint_list. Got:\n{}",
             result
         );
     }
