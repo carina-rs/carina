@@ -1156,3 +1156,62 @@ outer =
         labels
     );
 }
+
+#[test]
+fn map_key_completions_from_string_enum_key_type() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    // Create a schema with a Map attribute whose key is StringEnum
+    let condition_keys = vec![
+        "string_equals".to_string(),
+        "string_like".to_string(),
+        "arn_like".to_string(),
+    ];
+    let map_type = AttributeType::map_with_key(
+        AttributeType::StringEnum {
+            name: "ConditionOperator".to_string(),
+            values: condition_keys.clone(),
+            namespace: None,
+            to_dsl: None,
+        },
+        AttributeType::map(AttributeType::String),
+    );
+    let schema =
+        ResourceSchema::new("test.resource").attribute(AttributeSchema::new("condition", map_type));
+
+    let mut schemas = HashMap::new();
+    schemas.insert("test.resource".to_string(), schema);
+
+    let provider = super::super::CompletionProvider::new(Arc::new(schemas), vec![], vec![], vec![]);
+
+    // Simulate being inside `condition = { | }` — attr_path = ["condition"]
+    let completions =
+        provider.struct_field_completions("test.resource", &["condition".to_string()]);
+
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"string_equals"),
+        "Map key completions should include 'string_equals'. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"string_like"),
+        "Map key completions should include 'string_like'. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"arn_like"),
+        "Map key completions should include 'arn_like'. Got: {:?}",
+        labels
+    );
+    assert_eq!(labels.len(), 3, "Should have exactly 3 completions");
+
+    // Verify insert_text includes " = " suffix
+    let first = &completions[0];
+    assert!(
+        first.insert_text.as_deref().unwrap_or("").contains(" = "),
+        "Insert text should include ' = '"
+    );
+}

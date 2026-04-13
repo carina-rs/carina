@@ -393,28 +393,37 @@ impl CompletionProvider {
     /// For a single-element path like ["versioning_configuration"], looks up the attribute directly.
     /// For multi-element paths like ["assume_role_policy_document", "statement"],
     /// walks down the struct hierarchy.
+    /// Resolve the AttributeType at the given attr_path within a resource schema.
+    fn resolve_type_for_path<'a>(
+        &self,
+        schema: &'a ResourceSchema,
+        attr_path: &[String],
+    ) -> Option<&'a AttributeType> {
+        if attr_path.is_empty() {
+            return None;
+        }
+
+        let attr_schema = self.find_attr_schema(schema, &attr_path[0])?;
+        let mut current_type = &attr_schema.attr_type;
+
+        for name in &attr_path[1..] {
+            let fields = self.extract_struct_fields(current_type)?;
+            let field = fields
+                .iter()
+                .find(|f| f.name == *name || f.block_name.as_deref() == Some(name))?;
+            current_type = &field.field_type;
+        }
+
+        Some(current_type)
+    }
+
     fn resolve_struct_fields_for_path<'a>(
         &self,
         schema: &'a ResourceSchema,
         attr_path: &[String],
     ) -> Option<&'a Vec<StructField>> {
-        if attr_path.is_empty() {
-            return None;
-        }
-
-        // Find the top-level attribute
-        let attr_schema = self.find_attr_schema(schema, &attr_path[0])?;
-        let mut fields = self.extract_struct_fields(&attr_schema.attr_type)?;
-
-        // Walk down the remaining path
-        for name in &attr_path[1..] {
-            let field = fields
-                .iter()
-                .find(|f| f.name == *name || f.block_name.as_deref() == Some(name))?;
-            fields = self.extract_struct_fields(&field.field_type)?;
-        }
-
-        Some(fields)
+        let attr_type = self.resolve_type_for_path(schema, attr_path)?;
+        self.extract_struct_fields(attr_type)
     }
 
     fn struct_field_completions(
@@ -428,35 +437,78 @@ impl CompletionProvider {
             arguments: None,
         };
 
-        if let Some(schema) = self.schemas.get(resource_type)
-            && let Some(fields) = self.resolve_struct_fields_for_path(schema, attr_path)
-        {
-            fields
-                .iter()
-                .map(|field| {
-                    let required_marker = if field.required { " (required)" } else { "" };
-                    CompletionItem {
-                        label: field.name.clone(),
-                        kind: Some(CompletionItemKind::FIELD),
-                        detail: field
-                            .description
-                            .as_ref()
-                            .map(|d| format!("{}{}", d, required_marker))
-                            .or_else(|| {
-                                if field.required {
-                                    Some("(required)".to_string())
-                                } else {
-                                    None
-                                }
-                            }),
-                        insert_text: Some(format!("{} = ", field.name)),
-                        command: Some(trigger_suggest.clone()),
-                        ..Default::default()
-                    }
-                })
-                .collect()
+        if let Some(schema) = self.schemas.get(resource_type) {
+            // Try struct field completions first
+            if let Some(fields) = self.resolve_struct_fields_for_path(schema, attr_path) {
+                return fields
+                    .iter()
+                    .map(|field| {
+                        let required_marker = if field.required { " (required)" } else { "" };
+                        CompletionItem {
+                            label: field.name.clone(),
+                            kind: Some(CompletionItemKind::FIELD),
+                            detail: field
+                                .description
+                                .as_ref()
+                                .map(|d| format!("{}{}", d, required_marker))
+                                .or_else(|| {
+                                    if field.required {
+                                        Some("(required)".to_string())
+                                    } else {
+                                        None
+                                    }
+                                }),
+                            insert_text: Some(format!("{} = ", field.name)),
+                            command: Some(trigger_suggest.clone()),
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
+            }
+
+            // Try map key completions: if the attribute type at attr_path is a Map
+            // with a StringEnum key, provide key name completions
+            if let Some(key_type) = self.resolve_map_key_type(schema, attr_path) {
+                return self.map_key_completions_from_type(key_type, &trigger_suggest);
+            }
+        }
+
+        vec![]
+    }
+
+    /// Resolve the Map key type for an attribute path.
+    /// Returns the key AttributeType if the attribute at the path is a Map.
+    fn resolve_map_key_type<'a>(
+        &self,
+        schema: &'a ResourceSchema,
+        attr_path: &[String],
+    ) -> Option<&'a AttributeType> {
+        let attr_type = self.resolve_type_for_path(schema, attr_path)?;
+        if let AttributeType::Map { key, .. } = attr_type {
+            Some(key)
         } else {
-            vec![]
+            None
+        }
+    }
+
+    /// Generate completions from a Map key type (e.g., StringEnum values).
+    fn map_key_completions_from_type(
+        &self,
+        key_type: &AttributeType,
+        trigger_suggest: &Command,
+    ) -> Vec<CompletionItem> {
+        match key_type {
+            AttributeType::StringEnum { values, .. } => values
+                .iter()
+                .map(|v| CompletionItem {
+                    label: v.clone(),
+                    kind: Some(CompletionItemKind::ENUM_MEMBER),
+                    insert_text: Some(format!("{} = ", v)),
+                    command: Some(trigger_suggest.clone()),
+                    ..Default::default()
+                })
+                .collect(),
+            _ => vec![],
         }
     }
 
