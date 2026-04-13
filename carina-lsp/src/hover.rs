@@ -366,16 +366,45 @@ impl HoverProvider {
                 .unwrap_or("No description available"),
         );
 
-        let mut content = format!(
-            "## {}\n\n{}\n\n### Attributes\n\n",
-            resource_name, description
-        );
+        let mut content = format!("## {}\n\n{}\n", resource_name, description);
 
-        for attr in schema.attributes.values() {
-            let required = if attr.required { " **(required)**" } else { "" };
-            let desc =
-                convert_markdown_links_to_plain_text(attr.description.as_deref().unwrap_or(""));
-            content.push_str(&format!("- `{}`: {}{}\n", attr.name, desc, required));
+        // Split attributes into arguments (writable) and attributes (read-only)
+        let mut arguments: Vec<&carina_core::schema::AttributeSchema> = schema
+            .attributes
+            .values()
+            .filter(|a| !a.read_only)
+            .collect();
+        arguments.sort_by_key(|a| &a.name);
+
+        let mut read_only_attrs: Vec<&carina_core::schema::AttributeSchema> =
+            schema.attributes.values().filter(|a| a.read_only).collect();
+        read_only_attrs.sort_by_key(|a| &a.name);
+
+        if !arguments.is_empty() {
+            content.push_str("\n### Arguments\n\n");
+            for attr in &arguments {
+                let required = if attr.required { " **(required)**" } else { "" };
+                let create_only = if attr.create_only {
+                    " _(create-only)_"
+                } else {
+                    ""
+                };
+                let desc =
+                    convert_markdown_links_to_plain_text(attr.description.as_deref().unwrap_or(""));
+                content.push_str(&format!(
+                    "- `{}`: {}{}{}\n",
+                    attr.name, desc, required, create_only
+                ));
+            }
+        }
+
+        if !read_only_attrs.is_empty() {
+            content.push_str("\n### Attributes\n\n");
+            for attr in &read_only_attrs {
+                let desc =
+                    convert_markdown_links_to_plain_text(attr.description.as_deref().unwrap_or(""));
+                content.push_str(&format!("- `{}`: {}\n", attr.name, desc));
+            }
         }
 
         Some(Hover {
