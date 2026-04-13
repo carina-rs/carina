@@ -366,6 +366,17 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
         proto::AttributeType::Union { members } => {
             CoreAttributeType::Union(members.iter().map(proto_attr_type_to_core).collect())
         }
+        proto::AttributeType::Custom {
+            name,
+            base,
+            namespace,
+        } => CoreAttributeType::Custom {
+            name: name.clone(),
+            base: Box::new(proto_attr_type_to_core(base)),
+            validate: |_| Ok(()), // Validation is handled via ProviderContext.validators
+            namespace: namespace.clone(),
+            to_dsl: None,
+        },
     }
 }
 
