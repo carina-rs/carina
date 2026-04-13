@@ -22,8 +22,9 @@ use carina_state::backend::BackendConfig as StateBackendConfig;
 use crate::error::AppError;
 use crate::wiring::{
     WiringContext, build_factories_from_providers, compute_anonymous_identifiers_with_ctx,
-    resolve_names_with_ctx, validate_module_calls, validate_provider_region_with_ctx,
-    validate_resource_ref_types_with_ctx, validate_resources_with_ctx,
+    resolve_names_with_ctx, validate_attribute_param_ref_types_with_ctx, validate_module_calls,
+    validate_provider_region_with_ctx, validate_resource_ref_types_with_ctx,
+    validate_resources_with_ctx,
 };
 
 /// Detect whether the `backend` block in the current configuration has
@@ -196,6 +197,11 @@ pub fn validate_and_resolve_with_config(
             argument_names.insert(rs.binding.clone());
         }
         validate_resource_ref_types_with_ctx(&ctx, &parsed.resources, &argument_names)?;
+        validate_attribute_param_ref_types_with_ctx(
+            &ctx,
+            &parsed.attribute_params,
+            &parsed.resources,
+        )?;
     }
 
     // Compute anonymous identifiers

@@ -193,6 +193,20 @@ pub fn validate_resource_ref_types_with_ctx(
     .map_err(AppError::Validation)
 }
 
+pub fn validate_attribute_param_ref_types_with_ctx(
+    ctx: &WiringContext,
+    attribute_params: &[carina_core::parser::AttributeParameter],
+    resources: &[Resource],
+) -> Result<(), AppError> {
+    validation::validate_attribute_param_ref_types(
+        attribute_params,
+        resources,
+        ctx.schemas(),
+        &|r| provider_mod::schema_key_for_resource(ctx.factories(), r),
+    )
+    .map_err(AppError::Validation)
+}
+
 /// Resolve block name aliases and attribute prefixes in one step.
 pub fn resolve_names_with_ctx(
     ctx: &WiringContext,
