@@ -1477,3 +1477,69 @@ fn no_undefined_resource_for_namespaced_enum_value() {
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn map_key_validation_warns_on_invalid_key() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+    // Build schema: statement.condition has StringEnum keys
+    let condition_type = AttributeType::map_with_key(
+        AttributeType::StringEnum {
+            name: "ConditionOperator".to_string(),
+            values: vec!["string_equals".to_string(), "string_like".to_string()],
+            namespace: None,
+            to_dsl: None,
+        },
+        AttributeType::map(AttributeType::String),
+    );
+    let statement_type = AttributeType::Struct {
+        name: "Statement".to_string(),
+        fields: vec![
+            StructField::new("effect", AttributeType::String),
+            StructField::new("condition", condition_type),
+        ],
+    };
+    let schema = ResourceSchema::new("test.resource").attribute(AttributeSchema::new(
+        "policy",
+        AttributeType::Struct {
+            name: "Policy".to_string(),
+            fields: vec![StructField::new(
+                "statement",
+                AttributeType::list(statement_type),
+            )],
+        },
+    ));
+
+    let mut schemas = HashMap::new();
+    schemas.insert("test.test.resource".to_string(), schema);
+
+    let engine = DiagnosticEngine::new(
+        Arc::new(schemas),
+        vec!["test".to_string()],
+        Arc::new(vec![]),
+    );
+
+    // Invalid condition key "unknown_op"
+    let doc = create_document(
+        r#"test.test.resource {
+  policy = {
+    statement {
+      effect = 'Allow'
+      condition = {
+        unknown_op = { 'key' = 'value' }
+      }
+    }
+  }
+}
+"#,
+    );
+    let diagnostics = engine.analyze(&doc, None);
+    let has_key_error = diagnostics
+        .iter()
+        .any(|d| d.message.contains("Map key") || d.message.contains("unknown_op"));
+    assert!(
+        has_key_error,
+        "Should warn about invalid map key 'unknown_op'. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
