@@ -699,9 +699,30 @@ fn render_map_diff_entries(lines: &mut Vec<Line>, entries: &[MapDiffEntryIR]) {
                     Span::raw("      "),
                     Span::raw(format!("{}:", key)),
                 ]));
-                // Indent nested entries
                 let mut nested_lines = Vec::new();
                 render_map_diff_entries(&mut nested_lines, entries);
+                for line in nested_lines {
+                    let mut indented_spans = vec![Span::raw("    ")];
+                    indented_spans.extend(line.spans);
+                    lines.push(Line::from(indented_spans));
+                }
+            }
+            MapDiffEntryIR::NestedListOfMapsDiff {
+                key,
+                modified,
+                added,
+                removed,
+            } => {
+                let mut nested_lines = Vec::new();
+                render_list_of_maps_diff(
+                    &mut nested_lines,
+                    key,
+                    &[],
+                    modified,
+                    added,
+                    removed,
+                    false,
+                );
                 for line in nested_lines {
                     let mut indented_spans = vec![Span::raw("    ")];
                     indented_spans.extend(line.spans);

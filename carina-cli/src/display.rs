@@ -1033,6 +1033,16 @@ fn render_map_diff_entries(out: &mut String, entries: &[MapDiffEntryIR], attr_pr
                 let nested_prefix = format!("{}    ", attr_prefix);
                 render_map_diff_entries(out, entries, &nested_prefix);
             }
+            MapDiffEntryIR::NestedListOfMapsDiff {
+                key,
+                modified,
+                added,
+                removed,
+            } => {
+                writeln!(out, "{}    {}:", attr_prefix, key).unwrap();
+                let nested_prefix = format!("{}    ", attr_prefix);
+                render_list_of_maps_diff(out, &[], modified, added, removed, &nested_prefix);
+            }
         }
     }
 }

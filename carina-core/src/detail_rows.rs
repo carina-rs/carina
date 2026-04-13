@@ -150,6 +150,14 @@ pub enum MapDiffEntryIR {
         key: String,
         entries: Vec<MapDiffEntryIR>,
     },
+    /// Nested list-of-maps diff: when both old and new values are lists of maps,
+    /// show per-item field-level diffs instead of one-liner.
+    NestedListOfMapsDiff {
+        key: String,
+        modified: Vec<ListOfMapsDiffModified>,
+        added: Vec<String>,
+        removed: Vec<String>,
+    },
 }
 
 /// A modified item in a list-of-maps diff
@@ -691,6 +699,16 @@ fn compute_map_diff_entries(old_value: Option<&Value>, new_value: &Value) -> Vec
                     entries.push(MapDiffEntryIR::NestedMapDiff {
                         key: e.key.clone(),
                         entries: nested,
+                    });
+                } else if is_list_of_maps(&e.new_value) {
+                    // List-of-maps: compute per-item field-level diffs
+                    let (_, modified, added, removed) =
+                        compute_list_of_maps_diff_parts(Some(&e.old_value), &e.new_value);
+                    entries.push(MapDiffEntryIR::NestedListOfMapsDiff {
+                        key: e.key.clone(),
+                        modified,
+                        added,
+                        removed,
                     });
                 } else {
                     entries.push(MapDiffEntryIR::Changed {
