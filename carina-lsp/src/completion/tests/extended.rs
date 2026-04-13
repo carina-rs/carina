@@ -1215,3 +1215,59 @@ fn map_key_completions_from_string_enum_key_type() {
         "Insert text should include ' = '"
     );
 }
+
+#[test]
+fn union_struct_field_completions() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    // principal: Union([Struct { fields: [service, aws, federated] }, String])
+    let principal_type = AttributeType::Union(vec![
+        AttributeType::Struct {
+            name: "Principal".to_string(),
+            fields: vec![
+                StructField::new("service", AttributeType::String),
+                StructField::new("aws", AttributeType::String),
+                StructField::new("federated", AttributeType::String),
+            ],
+        },
+        AttributeType::String,
+    ]);
+
+    let statement_type = AttributeType::Struct {
+        name: "Statement".to_string(),
+        fields: vec![StructField::new("principal", principal_type)],
+    };
+
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::new("statement", statement_type));
+
+    let mut schemas = HashMap::new();
+    schemas.insert("test.resource".to_string(), schema);
+
+    let provider = super::super::CompletionProvider::new(Arc::new(schemas), vec![], vec![], vec![]);
+
+    // Inside principal = { | } — attr_path = ["statement", "principal"]
+    let completions = provider.struct_field_completions(
+        "test.resource",
+        &["statement".to_string(), "principal".to_string()],
+    );
+
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"federated"),
+        "Union(Struct) should suggest 'federated'. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"service"),
+        "Union(Struct) should suggest 'service'. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"aws"),
+        "Union(Struct) should suggest 'aws'. Got: {:?}",
+        labels
+    );
+}

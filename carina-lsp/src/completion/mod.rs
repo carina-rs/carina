@@ -368,6 +368,9 @@ impl CompletionProvider {
                 AttributeType::Struct { fields, .. } => Some(fields),
                 _ => None,
             },
+            AttributeType::Union(members) => {
+                members.iter().find_map(|m| self.extract_struct_fields(m))
+            }
             _ => None,
         }
     }
