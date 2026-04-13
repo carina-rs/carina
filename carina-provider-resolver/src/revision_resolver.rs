@@ -330,7 +330,7 @@ pub fn cache_path_revision(base_dir: &Path, source: &str, sha: &str) -> PathBuf 
         .join(format!("{repo}.wasm"))
 }
 
-fn global_cache_path_revision(source: &str, sha: &str) -> Option<PathBuf> {
+pub(crate) fn global_cache_path_revision(source: &str, sha: &str) -> Option<PathBuf> {
     let repo = source.split('/').next_back().unwrap_or("provider");
     let sha_prefix = &sha[..sha.len().min(12)];
     super::provider_resolver::global_cache_dir().map(|dir| {
