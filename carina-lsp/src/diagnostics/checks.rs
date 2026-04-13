@@ -282,7 +282,7 @@ impl DiagnosticEngine {
         type_expr: &TypeExpr,
         value: &Value,
     ) -> Option<String> {
-        carina_core::validation::validate_type_expr_value(type_expr, value)
+        carina_core::validation::validate_type_expr_value(type_expr, value, &self.provider_context)
     }
 
     /// Find the position of a module call in the document
@@ -483,7 +483,7 @@ impl DiagnosticEngine {
             return None;
         }
 
-        carina_core::validation::validate_type_expr_value(type_expr, value)
+        carina_core::validation::validate_type_expr_value(type_expr, value, &self.provider_context)
     }
 
     /// Find the position of an attributes parameter name in the document.

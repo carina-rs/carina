@@ -166,11 +166,11 @@ pub fn validate_and_resolve_with_config(
     // Validate provider region
     validate_provider_region_with_ctx(&ctx, parsed)?;
 
-    // Validate module call arguments before expansion
-    validate_module_calls(parsed, base_dir)?;
-
     // Enrich provider context with custom type validators from loaded schemas
     let enriched_context = enrich_provider_context(ctx.schemas());
+
+    // Validate module call arguments before expansion (needs enriched context for custom type validators)
+    validate_module_calls(parsed, base_dir, &enriched_context)?;
 
     // Resolve module imports and expand module calls
     module_resolver::resolve_modules_with_config(parsed, base_dir, &enriched_context)
