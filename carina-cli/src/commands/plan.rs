@@ -329,7 +329,7 @@ pub(crate) async fn load_remote_states(
                 bucket,
                 key,
                 region,
-            } => load_remote_state_s3(bucket, key, region, &rs.binding).await?,
+            } => load_remote_state_s3(bucket, key, region.as_deref(), &rs.binding).await?,
         };
 
         let bindings = state_file.build_remote_bindings();
@@ -374,17 +374,16 @@ fn load_remote_state_local(
 async fn load_remote_state_s3(
     bucket: &str,
     key: &str,
-    region: &str,
+    region: Option<&str>,
     binding: &str,
 ) -> Result<StateFile, AppError> {
-    use carina_core::utils::convert_region_value;
-
-    let aws_region = convert_region_value(region);
-
-    let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(aws_config::Region::new(aws_region))
-        .load()
-        .await;
+    let mut config_builder = aws_config::defaults(aws_config::BehaviorVersion::latest());
+    if let Some(region) = region {
+        use carina_core::utils::convert_region_value;
+        let aws_region = convert_region_value(region);
+        config_builder = config_builder.region(aws_config::Region::new(aws_region));
+    }
+    let aws_config = config_builder.load().await;
 
     let client = aws_sdk_s3::Client::new(&aws_config);
 
