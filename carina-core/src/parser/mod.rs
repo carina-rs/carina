@@ -1502,6 +1502,7 @@ fn parse_for_expr(
     ctx: &ParseContext,
     binding_name: &str,
 ) -> Result<(Vec<Resource>, Vec<ModuleCall>), ParseError> {
+    let for_line = pair.as_span().start_pos().line_col().0;
     let mut inner = pair.into_inner();
 
     // Parse the binding pattern
@@ -1563,9 +1564,35 @@ fn parse_for_expr(
             }
         }
         _ => {
+            let iterable_type = match &iterable {
+                Value::String(s) => {
+                    format!("string \"{}\"", if s.len() > 50 { &s[..50] } else { s })
+                }
+                Value::Int(i) => format!("int {}", i),
+                Value::Float(f) => format!("float {}", f),
+                Value::Bool(b) => format!("bool {}", b),
+                Value::ResourceRef { path } => {
+                    format!("unresolved reference {}", path.to_dot_string())
+                }
+                Value::List(_) => "list".to_string(),
+                Value::Map(_) => "map".to_string(),
+                other => format!("{:?}", other),
+            };
+            let binding_type = match &binding {
+                ForBinding::Simple(var) => format!("`for {} in ...`", var),
+                ForBinding::Indexed(idx, val) => format!("`for {}, {} in ...`", idx, val),
+                ForBinding::Map(k, v) => format!("`for {}, {} in ...`", k, v),
+            };
+            let expected = match &binding {
+                ForBinding::Simple(_) | ForBinding::Indexed(_, _) => "list",
+                ForBinding::Map(_, _) => "map",
+            };
             return Err(ParseError::InvalidExpression {
-                line: 0,
-                message: "for expression: binding pattern does not match iterable type".to_string(),
+                line: for_line,
+                message: format!(
+                    "{} — iterable is {} (expected {})",
+                    binding_type, iterable_type, expected
+                ),
             });
         }
     }
