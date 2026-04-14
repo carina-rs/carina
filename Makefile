@@ -116,15 +116,19 @@ plan-fixtures:
 	@echo ""
 	@echo "=== remote_state ==="
 	@$(MAKE) plan-remote-state
+	@echo "---"
+	@$(MAKE) plan-deferred-for
 
 plan-remote-state:
 	cd $(FIXTURES)/remote_state && $(CARINA) plan --refresh=false
+plan-deferred-for:
+	cd $(FIXTURES)/deferred_for && $(CARINA) plan --refresh=false
 plan-exports:
 	cd $(FIXTURES)/exports && $(CARINA) plan --refresh=false
 .PHONY: plan-all-create plan-no-changes plan-no-changes-enum plan-mixed plan-delete plan-compact \
         plan-map-diff plan-enum-display plan-destroy-full plan-destroy-orphans plan-read-only-attrs \
         plan-default-values plan-explicit plan-default-tags \
         plan-state-blocks plan-secret-values plan-moved-with-changes plan-moved-prev-keys plan-moved-pure \
-        plan-remote-state plan-exports \
+        plan-remote-state plan-deferred-for plan-exports \
         plan-map-diff-tui plan-all-create-tui plan-mixed-tui plan-delete-tui \
         plan-moved-with-changes-tui plan-moved-pure-tui plan-fixtures

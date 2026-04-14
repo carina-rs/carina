@@ -60,6 +60,25 @@ pub struct ParseWarning {
     pub message: String,
 }
 
+/// Placeholder text for values that depend on an upstream apply.
+pub const DEFERRED_UPSTREAM_PLACEHOLDER: &str = "(known after upstream apply)";
+
+/// A for-expression whose iterable is unresolved (e.g., remote_state not yet available).
+/// Captures the structural shape of the loop body so the plan can show what
+/// resources *would* be created once the iterable becomes available.
+#[derive(Debug, Clone)]
+pub struct DeferredForExpression {
+    /// Source line number of the `for` keyword.
+    pub line: usize,
+    /// The for-expression header, e.g., `for account_id in orgs.accounts`.
+    pub header: String,
+    /// The resource type the loop body would produce (e.g., `sso.assignment`).
+    pub resource_type: String,
+    /// Attribute template: key → value (concrete values are resolved;
+    /// loop-bound variables remain as `ResourceRef` or placeholder strings).
+    pub attributes: Vec<(String, Value)>,
+}
+
 /// Resource type path for typed references (e.g., aws.vpc, aws.security_group)
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ResourceTypePath {
@@ -391,6 +410,8 @@ pub struct ParsedFile {
     pub structural_bindings: HashSet<String>,
     /// Non-fatal warnings collected during parsing.
     pub warnings: Vec<ParseWarning>,
+    /// For-expressions whose iterables are unresolved; displayed as deferred in plan.
+    pub deferred_for_expressions: Vec<DeferredForExpression>,
 }
 
 impl ParsedFile {
@@ -435,6 +456,8 @@ struct ParseContext<'cfg> {
     remote_states: HashMap<String, RemoteState>,
     /// Non-fatal warnings collected during parsing
     warnings: Vec<ParseWarning>,
+    /// Deferred for-expressions collected during parsing
+    deferred_for_expressions: Vec<DeferredForExpression>,
 }
 
 impl<'cfg> ParseContext<'cfg> {
@@ -449,6 +472,7 @@ impl<'cfg> ParseContext<'cfg> {
             structural_bindings: HashSet::new(),
             remote_states: HashMap::new(),
             warnings: Vec::new(),
+            deferred_for_expressions: Vec::new(),
         }
     }
 
@@ -775,6 +799,7 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
         requires,
         structural_bindings: ctx.structural_bindings,
         warnings: ctx.warnings,
+        deferred_for_expressions: ctx.deferred_for_expressions,
     })
 }
 
@@ -1620,7 +1645,56 @@ fn parse_for_expr(
                 line: for_line,
                 message,
             });
-            // Return empty — the for body produces zero resources
+
+            // Build the for-expression header string
+            let header = match &binding {
+                ForBinding::Simple(var) => {
+                    format!("for {} in {}", var, path.to_dot_string())
+                }
+                ForBinding::Indexed(idx, val) => {
+                    format!("for ({}, {}) in {}", idx, val, path.to_dot_string())
+                }
+                ForBinding::Map(k, v) => {
+                    format!("for {}, {} in {}", k, v, path.to_dot_string())
+                }
+            };
+
+            // Try to parse the body once with placeholder values for the loop
+            // variable(s) to extract the resource type and attribute template.
+            let mut template_ctx = ctx.clone();
+            let placeholder = || Value::String(DEFERRED_UPSTREAM_PLACEHOLDER.to_string());
+            match &binding {
+                ForBinding::Simple(var) => {
+                    template_ctx.set_variable(var.clone(), placeholder());
+                }
+                ForBinding::Indexed(idx, val) => {
+                    template_ctx.set_variable(idx.clone(), placeholder());
+                    template_ctx.set_variable(val.clone(), placeholder());
+                }
+                ForBinding::Map(k, v) => {
+                    template_ctx.set_variable(k.clone(), placeholder());
+                    template_ctx.set_variable(v.clone(), placeholder());
+                }
+            }
+
+            let address = format!("{}[?]", binding_name);
+            if let Ok(ForBodyResult::Resource(resource)) =
+                parse_for_body(body_pair, &template_ctx, &address)
+            {
+                let attrs: Vec<(String, Value)> = resource
+                    .attributes
+                    .iter()
+                    .filter(|(k, _)| !k.starts_with('_'))
+                    .map(|(k, expr)| (k.clone(), expr.0.clone()))
+                    .collect();
+                ctx.deferred_for_expressions.push(DeferredForExpression {
+                    line: for_line,
+                    header,
+                    resource_type: resource.id.resource_type.clone(),
+                    attributes: attrs,
+                });
+            }
+            // Return empty — the for body produces zero concrete resources
         }
         _ => {
             let iterable_type = match &iterable {

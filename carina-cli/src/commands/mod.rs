@@ -334,6 +334,7 @@ mod tests {
             requires: vec![],
             structural_bindings: HashSet::new(),
             warnings: vec![],
+            deferred_for_expressions: vec![],
         }
     }
 

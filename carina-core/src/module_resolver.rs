@@ -195,6 +195,7 @@ impl<'cfg> ModuleResolver<'cfg> {
             requires: vec![],
             structural_bindings: HashSet::new(),
             warnings: vec![],
+            deferred_for_expressions: vec![],
         };
 
         // Read all .crn files in the directory
@@ -227,6 +228,9 @@ impl<'cfg> ModuleResolver<'cfg> {
                 .structural_bindings
                 .extend(parsed.structural_bindings);
             merged.warnings.extend(parsed.warnings);
+            merged
+                .deferred_for_expressions
+                .extend(parsed.deferred_for_expressions);
         }
 
         Ok(merged)
@@ -1248,6 +1252,7 @@ pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
         requires: vec![],
         structural_bindings: HashSet::new(),
         warnings: vec![],
+        deferred_for_expressions: vec![],
     };
 
     for entry in entries.flatten() {
@@ -1271,6 +1276,9 @@ pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
                 .structural_bindings
                 .extend(parsed.structural_bindings);
             merged.warnings.extend(parsed.warnings);
+            merged
+                .deferred_for_expressions
+                .extend(parsed.deferred_for_expressions);
         }
     }
 
@@ -1338,6 +1346,7 @@ pub fn load_module_from_directory(dir: &Path) -> Result<ParsedFile, String> {
         requires: vec![],
         structural_bindings: HashSet::new(),
         warnings: vec![],
+        deferred_for_expressions: vec![],
     };
 
     for entry in entries {
@@ -1366,6 +1375,9 @@ pub fn load_module_from_directory(dir: &Path) -> Result<ParsedFile, String> {
                 .structural_bindings
                 .extend(parsed.structural_bindings);
             merged.warnings.extend(parsed.warnings);
+            merged
+                .deferred_for_expressions
+                .extend(parsed.deferred_for_expressions);
         }
     }
 
@@ -1431,6 +1443,7 @@ mod tests {
             requires: vec![],
             structural_bindings: HashSet::new(),
             warnings: vec![],
+            deferred_for_expressions: vec![],
         }
     }
 
@@ -1566,6 +1579,7 @@ mod tests {
             requires: vec![],
             structural_bindings: HashSet::new(),
             warnings: vec![],
+            deferred_for_expressions: vec![],
         }
     }
 
@@ -1692,6 +1706,7 @@ mod tests {
             requires: vec![],
             structural_bindings: HashSet::new(),
             warnings: vec![],
+            deferred_for_expressions: vec![],
         }
     }
 
@@ -2041,6 +2056,7 @@ mod tests {
             requires: vec![],
             structural_bindings: HashSet::new(),
             warnings: vec![],
+            deferred_for_expressions: vec![],
         }
     }
 
@@ -2327,6 +2343,7 @@ mod tests {
             requires: vec![],
             structural_bindings: HashSet::new(),
             warnings: vec![],
+            deferred_for_expressions: vec![],
         }
     }
 
@@ -2498,6 +2515,7 @@ mod tests {
             requires: vec![],
             structural_bindings: HashSet::new(),
             warnings: vec![],
+            deferred_for_expressions: vec![],
         };
 
         let resolver = {
@@ -2562,6 +2580,7 @@ mod tests {
             requires: vec![],
             structural_bindings: HashSet::new(),
             warnings: vec![],
+            deferred_for_expressions: vec![],
         };
 
         let resolver = {
@@ -2654,6 +2673,7 @@ mod tests {
             }],
             structural_bindings: HashSet::new(),
             warnings: vec![],
+            deferred_for_expressions: vec![],
         };
 
         let resolver = {
@@ -2722,6 +2742,7 @@ mod tests {
             }],
             structural_bindings: HashSet::new(),
             warnings: vec![],
+            deferred_for_expressions: vec![],
         };
 
         let resolver = {
@@ -2787,6 +2808,7 @@ mod tests {
             }],
             structural_bindings: HashSet::new(),
             warnings: vec![],
+            deferred_for_expressions: vec![],
         };
 
         let resolver = {
@@ -2878,6 +2900,7 @@ mod tests {
             }],
             structural_bindings: HashSet::new(),
             warnings: vec![],
+            deferred_for_expressions: vec![],
         };
 
         let resolver = {

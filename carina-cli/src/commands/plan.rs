@@ -285,6 +285,7 @@ pub async fn run_plan(
             Some(wiring.schemas()),
             &ctx.moved_origins,
             &resolved_exports,
+            &parsed.deferred_for_expressions,
         );
     }
 

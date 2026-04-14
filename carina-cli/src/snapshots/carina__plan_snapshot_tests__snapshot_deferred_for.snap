@@ -1,0 +1,16 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  ? for account_id in orgs.accounts (line 13)
+      expands to sso.assignment resources (count known after upstream apply)
+      instance_arn: 'arn:aws:sso:::instance/ssoins-12345'
+      principal_id: 'group-abc-123'
+      principal_type: 'GROUP'
+      target_id: (known after upstream apply)
+      target_type: 'AWS_ACCOUNT'
+
+
+Plan: 0 to add, 0 to change, 0 to destroy, 1 deferred.

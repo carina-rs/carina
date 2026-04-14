@@ -53,6 +53,7 @@ pub fn load_configuration_with_config(
             requires: vec![],
             structural_bindings: HashSet::new(),
             warnings: vec![],
+            deferred_for_expressions: vec![],
         };
         let mut merged = empty_parsed();
         let mut unresolved_merged = empty_parsed();
@@ -98,6 +99,9 @@ pub fn load_configuration_with_config(
                         .structural_bindings
                         .extend(unresolved.structural_bindings);
                     unresolved_merged.warnings.extend(unresolved.warnings);
+                    unresolved_merged
+                        .deferred_for_expressions
+                        .extend(unresolved.deferred_for_expressions);
 
                     // Merge resolved
                     merged.providers.extend(parsed.providers);
@@ -116,6 +120,9 @@ pub fn load_configuration_with_config(
                         .structural_bindings
                         .extend(parsed.structural_bindings);
                     merged.warnings.extend(parsed.warnings);
+                    merged
+                        .deferred_for_expressions
+                        .extend(parsed.deferred_for_expressions);
                     // Merge backend (only one allowed)
                     if let Some(backend) = parsed.backend {
                         if merged.backend.is_some() {

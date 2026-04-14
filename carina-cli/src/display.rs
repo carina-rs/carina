@@ -11,6 +11,7 @@ use carina_core::diff_helpers::compute_map_diff;
 #[cfg(test)]
 use carina_core::effect::CascadingUpdate;
 use carina_core::effect::Effect;
+use carina_core::parser::DEFERRED_UPSTREAM_PLACEHOLDER;
 use carina_core::plan::Plan;
 #[cfg(test)]
 use carina_core::plan_tree::shorten_attr_name;
@@ -49,6 +50,33 @@ fn format_compact_name(
     }
 }
 
+/// Format a value in a deferred for-expression template.
+/// Placeholder strings are shown dimmed; resolved values are shown normally.
+fn format_deferred_value(value: &Value) -> String {
+    match value {
+        Value::String(s) if s == DEFERRED_UPSTREAM_PLACEHOLDER => {
+            format!("{}", s.dimmed())
+        }
+        Value::String(s) => format!("'{}'", s),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::ResourceRef { path } => path.to_dot_string().to_string(),
+        Value::List(items) => {
+            let formatted: Vec<String> = items.iter().map(format_deferred_value).collect();
+            format!("[{}]", formatted.join(", "))
+        }
+        Value::Map(map) => {
+            let formatted: Vec<String> = map
+                .iter()
+                .map(|(k, v)| format!("{} = {}", k, format_deferred_value(v)))
+                .collect();
+            format!("{{{}}}", formatted.join(", "))
+        }
+        _ => format!("{}", DEFERRED_UPSTREAM_PLACEHOLDER.dimmed()),
+    }
+}
+
 /// Format an export value for plan display.
 fn format_export_value(value: &Value) -> String {
     match value {
@@ -79,6 +107,7 @@ pub fn print_plan(
     schemas: Option<&HashMap<String, ResourceSchema>>,
     moved_origins: &HashMap<ResourceId, ResourceId>,
     export_params: &[carina_core::parser::ExportParameter],
+    deferred_for_expressions: &[carina_core::parser::DeferredForExpression],
 ) {
     print!(
         "{}",
@@ -88,7 +117,8 @@ pub fn print_plan(
             delete_attributes,
             schemas,
             moved_origins,
-            export_params
+            export_params,
+            deferred_for_expressions,
         )
     );
 }
@@ -104,10 +134,11 @@ pub fn format_plan(
     schemas: Option<&HashMap<String, ResourceSchema>>,
     moved_origins: &HashMap<ResourceId, ResourceId>,
     export_params: &[carina_core::parser::ExportParameter],
+    deferred_for_expressions: &[carina_core::parser::DeferredForExpression],
 ) -> String {
     let mut out = String::new();
 
-    if plan.is_empty() {
+    if plan.is_empty() && deferred_for_expressions.is_empty() {
         writeln!(
             out,
             "{}",
@@ -132,6 +163,11 @@ pub fn format_plan(
         schemas,
         moved_origins,
     ));
+
+    // Show deferred for-expressions
+    for deferred in deferred_for_expressions {
+        out.push_str(&format_deferred_for_expression(deferred));
+    }
 
     // Show exports if any
     if !export_params.is_empty() {
@@ -188,9 +224,47 @@ pub fn format_plan(
     if summary.moved > 0 {
         parts.push(format!("{} to move", summary.moved.to_string().yellow()));
     }
+    if !deferred_for_expressions.is_empty() {
+        parts.push(format!(
+            "{} deferred",
+            deferred_for_expressions.len().to_string().cyan()
+        ));
+    }
     writeln!(out, "Plan: {}.", parts.join(", ")).unwrap();
     writeln!(out).unwrap();
 
+    out
+}
+
+/// Format a single deferred for-expression for plan display.
+fn format_deferred_for_expression(deferred: &carina_core::parser::DeferredForExpression) -> String {
+    let mut out = String::new();
+    writeln!(
+        out,
+        "  {} {} (line {})",
+        "?".cyan(),
+        deferred.header,
+        deferred.line,
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "      {}",
+        format!(
+            "expands to {} resources (count known after upstream apply)",
+            deferred.resource_type
+        )
+        .dimmed()
+    )
+    .unwrap();
+    // Sort attributes for deterministic output
+    let mut attrs: Vec<_> = deferred.attributes.iter().collect();
+    attrs.sort_by_key(|(k, _)| k.clone());
+    for (key, value) in &attrs {
+        let formatted = format_deferred_value(value);
+        writeln!(out, "      {}: {}", key.dimmed(), formatted).unwrap();
+    }
+    writeln!(out).unwrap();
     out
 }
 
@@ -1670,6 +1744,7 @@ mod tests {
             None,
             &HashMap::new(),
             &[],
+            &[],
         );
     }
 
@@ -1690,6 +1765,7 @@ mod tests {
             &HashMap::new(),
             None,
             &HashMap::new(),
+            &[],
             &[],
         );
     }
@@ -2213,6 +2289,7 @@ mod tests {
             None,
             &HashMap::new(),
             &[],
+            &[],
         );
     }
 
@@ -2240,6 +2317,7 @@ mod tests {
             &HashMap::new(),
             None,
             &HashMap::new(),
+            &[],
             &[],
         );
     }
@@ -2391,6 +2469,7 @@ mod tests {
             &HashMap::new(),
             None,
             &HashMap::new(),
+            &[],
             &[],
         );
     }
