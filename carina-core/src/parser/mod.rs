@@ -67,6 +67,8 @@ pub const DEFERRED_UPSTREAM_PLACEHOLDER: &str = "(known after upstream apply)";
 /// A for-expression whose iterable is unresolved (e.g., remote_state not yet available).
 /// Captures the structural shape of the loop body so the plan can show what
 /// resources *would* be created once the iterable becomes available.
+/// Also stores enough information to expand the loop later when the iterable
+/// is loaded from remote_state.
 #[derive(Debug, Clone)]
 pub struct DeferredForExpression {
     /// Source file name (stamped by config_loader after parsing).
@@ -80,6 +82,15 @@ pub struct DeferredForExpression {
     /// Attribute template: key → value (concrete values are resolved;
     /// loop-bound variables remain as `ResourceRef` or placeholder strings).
     pub attributes: Vec<(String, Value)>,
+    /// The binding address prefix for generated resources (e.g., `_for0`).
+    pub binding_name: String,
+    /// The iterable access path segments (e.g., `["orgs", "accounts"]`).
+    pub iterable_binding: String,
+    pub iterable_attr: String,
+    /// Loop variable name (used for substitution during expansion).
+    pub loop_var: String,
+    /// Template resource for expansion (the for body parsed with placeholders).
+    pub template_resource: Resource,
 }
 
 /// Resource type path for typed references (e.g., aws.vpc, aws.security_group)
@@ -440,6 +451,101 @@ impl ParsedFile {
             };
             eprintln!("  ⚠ {}: {}", location, w.message);
         }
+    }
+
+    /// Expand deferred for-expressions using loaded remote_state bindings.
+    ///
+    /// For each deferred for-expression whose iterable can now be resolved
+    /// from `remote_bindings`, expand the template into concrete resources
+    /// and add them to `self.resources`. Resolved entries are removed from
+    /// `deferred_for_expressions`; unresolved ones remain (with their
+    /// warning preserved).
+    pub fn expand_deferred_for_expressions(
+        &mut self,
+        remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    ) {
+        let mut expanded_resources = Vec::new();
+        let mut resolved_indices = Vec::new();
+
+        for (idx, deferred) in self.deferred_for_expressions.iter().enumerate() {
+            // Look up the iterable value in remote_bindings
+            let iterable = remote_bindings
+                .get(&deferred.iterable_binding)
+                .and_then(|attrs| attrs.get(&deferred.iterable_attr));
+
+            let Some(iterable_value) = iterable else {
+                continue;
+            };
+
+            match iterable_value {
+                Value::List(items) => {
+                    for (i, item) in items.iter().enumerate() {
+                        let address = format!("{}[{}]", deferred.binding_name, i);
+                        let mut resource = deferred.template_resource.clone();
+                        resource.id.name = address.clone();
+                        resource.binding = Some(address);
+                        // Substitute the placeholder in all attributes
+                        for (_key, expr) in resource.attributes.iter_mut() {
+                            substitute_placeholder(&mut expr.0, &deferred.loop_var, item);
+                        }
+                        expanded_resources.push(resource);
+                    }
+                    resolved_indices.push(idx);
+                }
+                Value::Map(map) => {
+                    let mut keys: Vec<&String> = map.keys().collect();
+                    keys.sort();
+                    for key in keys {
+                        let val = &map[key];
+                        let address = format!("{}[\"{}\"]", deferred.binding_name, key);
+                        let mut resource = deferred.template_resource.clone();
+                        resource.id.name = address.clone();
+                        resource.binding = Some(address);
+                        for (_key, expr) in resource.attributes.iter_mut() {
+                            substitute_placeholder(&mut expr.0, &deferred.loop_var, val);
+                        }
+                        expanded_resources.push(resource);
+                    }
+                    resolved_indices.push(idx);
+                }
+                _ => {
+                    // Iterable is not a list or map — leave deferred
+                }
+            }
+        }
+
+        // Remove resolved deferred entries (reverse order to preserve indices)
+        for idx in resolved_indices.into_iter().rev() {
+            // Also remove the corresponding warning
+            let deferred = &self.deferred_for_expressions[idx];
+            self.warnings
+                .retain(|w| w.line != deferred.line || w.file != deferred.file);
+            self.deferred_for_expressions.remove(idx);
+        }
+
+        self.resources.extend(expanded_resources);
+    }
+}
+
+/// Substitute placeholder values in a Value tree.
+/// Replaces `Value::String(DEFERRED_UPSTREAM_PLACEHOLDER)` with the actual value,
+/// matching the loop variable name.
+fn substitute_placeholder(value: &mut Value, _loop_var: &str, replacement: &Value) {
+    match value {
+        Value::String(s) if s == DEFERRED_UPSTREAM_PLACEHOLDER => {
+            *value = replacement.clone();
+        }
+        Value::List(items) => {
+            for item in items.iter_mut() {
+                substitute_placeholder(item, _loop_var, replacement);
+            }
+        }
+        Value::Map(map) => {
+            for v in map.values_mut() {
+                substitute_placeholder(v, _loop_var, replacement);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1695,12 +1801,22 @@ fn parse_for_expr(
                     .filter(|(k, _)| !k.starts_with('_'))
                     .map(|(k, expr)| (k.clone(), expr.0.clone()))
                     .collect();
+                let loop_var = match &binding {
+                    ForBinding::Simple(var) => var.clone(),
+                    ForBinding::Indexed(_, val) => val.clone(),
+                    ForBinding::Map(_, v) => v.clone(),
+                };
                 ctx.deferred_for_expressions.push(DeferredForExpression {
                     file: None,
                     line: for_line,
                     header,
                     resource_type: resource.id.resource_type.clone(),
                     attributes: attrs,
+                    binding_name: binding_name.to_string(),
+                    iterable_binding: path.binding().to_string(),
+                    iterable_attr: path.attribute().to_string(),
+                    loop_var,
+                    template_resource: *resource,
                 });
             }
             // Return empty — the for body produces zero concrete resources
@@ -10104,5 +10220,110 @@ awscc.ec2.vpc {
             "should NOT mention remote_state for local bindings, got: {}",
             w.message
         );
+    }
+
+    #[test]
+    fn expand_deferred_for_with_remote_bindings() {
+        // Parse a for-expression that references a remote_state list.
+        // Initially deferred (no remote values available at parse time).
+        // Then expand with remote_bindings and verify concrete resources are created.
+        let input = r#"
+            let orgs = remote_state {
+                path = "../organizations/carina.state.json"
+            }
+
+            for account_id in orgs.accounts {
+                awscc.sso.assignment {
+                    instance_arn = 'arn:aws:sso:::instance/ssoins-12345'
+                    target_id = account_id
+                    target_type = 'AWS_ACCOUNT'
+                }
+            }
+        "#;
+
+        let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(parsed.deferred_for_expressions.len(), 1);
+        assert_eq!(parsed.resources.len(), 0, "no resources before expansion");
+
+        // Simulate loading remote_state with actual values
+        let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let mut orgs_attrs = HashMap::new();
+        orgs_attrs.insert(
+            "accounts".to_string(),
+            Value::List(vec![
+                Value::String("111111111111".to_string()),
+                Value::String("222222222222".to_string()),
+            ]),
+        );
+        remote_bindings.insert("orgs".to_string(), orgs_attrs);
+
+        // Expand deferred for-expressions
+        parsed.expand_deferred_for_expressions(&remote_bindings);
+
+        // Deferred should be resolved
+        assert_eq!(
+            parsed.deferred_for_expressions.len(),
+            0,
+            "deferred should be empty after expansion"
+        );
+        // Warning should be removed
+        assert!(
+            parsed.warnings.is_empty(),
+            "warning should be removed after expansion, got: {:?}",
+            parsed.warnings
+        );
+        // Two concrete resources should be generated
+        assert_eq!(
+            parsed.resources.len(),
+            2,
+            "should have 2 expanded resources"
+        );
+
+        // Verify the expanded resources have substituted values
+        let r0 = &parsed.resources[0];
+        assert_eq!(r0.id.resource_type, "sso.assignment");
+        let target_id_0 = r0.get_attr("target_id");
+        assert_eq!(
+            target_id_0,
+            Some(&Value::String("111111111111".to_string())),
+            "target_id should be substituted with actual account ID"
+        );
+
+        let r1 = &parsed.resources[1];
+        let target_id_1 = r1.get_attr("target_id");
+        assert_eq!(
+            target_id_1,
+            Some(&Value::String("222222222222".to_string())),
+        );
+    }
+
+    #[test]
+    fn expand_deferred_for_no_remote_data_stays_deferred() {
+        let input = r#"
+            let orgs = remote_state {
+                path = "../organizations/carina.state.json"
+            }
+
+            for account_id in orgs.accounts {
+                awscc.sso.assignment {
+                    target_id = account_id
+                }
+            }
+        "#;
+
+        let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(parsed.deferred_for_expressions.len(), 1);
+
+        // Empty remote_bindings — upstream hasn't been applied yet
+        let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        parsed.expand_deferred_for_expressions(&remote_bindings);
+
+        // Should remain deferred
+        assert_eq!(
+            parsed.deferred_for_expressions.len(),
+            1,
+            "should stay deferred when remote data not available"
+        );
+        assert_eq!(parsed.resources.len(), 0);
     }
 }

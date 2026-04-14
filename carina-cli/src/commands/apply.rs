@@ -827,7 +827,6 @@ pub async fn run_apply(
 ) -> Result<(), AppError> {
     let loaded = load_configuration_with_config(path, provider_context)?;
     let mut parsed = loaded.parsed;
-    parsed.print_warnings();
     let backend_file = loaded.backend_file;
 
     let base_dir = get_base_dir(path);
@@ -1089,6 +1088,12 @@ async fn run_apply_locked(
     // Remote state bindings are loaded up front so data source refs that
     // reference `remote_state` blocks can be resolved during refresh (#1683).
     let remote_bindings = super::plan::load_remote_states(&parsed.remote_states, base_dir).await?;
+
+    // Expand deferred for-expressions now that remote values are available
+    parsed.expand_deferred_for_expressions(&remote_bindings);
+
+    // Print warnings after expansion (resolved ones are removed)
+    parsed.print_warnings();
 
     // Build state-file-derived maps up front so anonymous → let-bound
     // rename transfer (#1685) can run between refresh phases 1 and 2.
