@@ -378,6 +378,15 @@ pub fn check_unused_bindings(parsed: &ParsedFile) -> Vec<String> {
     for export_param in &parsed.export_params {
         if let Some(value) = &export_param.value {
             collect_resource_refs(value, &mut referenced);
+            // Cross-file: when exports.crn is parsed without the binding context,
+            // "vpc.vpc_id" becomes String("vpc.vpc_id") instead of ResourceRef.
+            // Extract the binding name from such dot-notation strings.
+            collect_dot_notation_refs(value, &mut referenced);
+        }
+    }
+    for attr_param in &parsed.attribute_params {
+        if let Some(value) = &attr_param.value {
+            collect_dot_notation_refs(value, &mut referenced);
         }
     }
 
@@ -407,6 +416,37 @@ fn collect_resource_refs(value: &Value, refs: &mut HashSet<String>) {
         Value::Map(map) => {
             for v in map.values() {
                 collect_resource_refs(v, refs);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Extract binding names from dot-notation string values (e.g., "vpc.vpc_id" → "vpc").
+///
+/// When files are parsed independently, cross-file references like `vpc.vpc_id`
+/// become `String("vpc.vpc_id")` instead of `ResourceRef`. This function extracts
+/// the first component as a potential binding name.
+fn collect_dot_notation_refs(value: &Value, refs: &mut HashSet<String>) {
+    match value {
+        Value::String(s) if s.contains('.') && !s.contains(' ') && !s.starts_with('/') => {
+            if let Some(binding) = s.split('.').next()
+                && !binding.is_empty()
+                && binding
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                refs.insert(binding.to_string());
+            }
+        }
+        Value::List(items) => {
+            for item in items {
+                collect_dot_notation_refs(item, refs);
+            }
+        }
+        Value::Map(map) => {
+            for v in map.values() {
+                collect_dot_notation_refs(v, refs);
             }
         }
         _ => {}
