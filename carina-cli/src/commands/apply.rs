@@ -1079,9 +1079,6 @@ async fn run_apply_locked(
     }
     apply_name_overrides(&mut parsed.resources, &state_file);
 
-    // Sort resources by dependencies
-    let sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
-
     // Select appropriate Provider based on configuration
     let provider = get_provider_with_ctx(ctx, parsed, base_dir).await;
 
@@ -1089,11 +1086,16 @@ async fn run_apply_locked(
     // reference `remote_state` blocks can be resolved during refresh (#1683).
     let remote_bindings = super::plan::load_remote_states(&parsed.remote_states, base_dir).await?;
 
-    // Expand deferred for-expressions now that remote values are available
+    // Expand deferred for-expressions now that remote values are available.
+    // Must happen BEFORE sort_resources_by_dependencies so expanded resources
+    // are included in the sorted set used for planning (#1844).
     parsed.expand_deferred_for_expressions(&remote_bindings);
 
     // Print warnings after expansion (resolved ones are removed)
     parsed.print_warnings();
+
+    // Sort resources by dependencies (after expansion so expanded resources are included)
+    let sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
 
     // Build state-file-derived maps up front so anonymous → let-bound
     // rename transfer (#1685) can run between refresh phases 1 and 2.
