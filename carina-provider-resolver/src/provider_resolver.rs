@@ -572,9 +572,63 @@ pub fn resolve_all(
 
     for config in providers {
         let source = match &config.source {
-            Some(s) if !s.starts_with("file://") => s.as_str(),
+            Some(s) => s.as_str(),
             _ => continue,
         };
+
+        // Handle file:// sources: copy into .carina/providers/
+        if let Some(file_path) = source.strip_prefix("file://") {
+            let src_path = PathBuf::from(file_path);
+            if !src_path.exists() {
+                return Err(format!(
+                    "Provider '{}': file source not found: {}",
+                    config.name, file_path
+                ));
+            }
+            let file_name = src_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("provider");
+            let dest = base_dir
+                .join(".carina")
+                .join("providers")
+                .join("file")
+                .join(file_name)
+                .join(
+                    src_path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("provider.wasm"),
+                );
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create provider directory: {e}"))?;
+            }
+            // Remove existing file before hard-linking (hard_link fails if dest exists)
+            let _ = fs::remove_file(&dest);
+            fs::hard_link(&src_path, &dest)
+                .map_err(|e| format!("Failed to link file:// provider: {e}"))?;
+            let sha = sha256_file(&dest)
+                .map_err(|e| format!("Failed to compute SHA256 for file:// provider: {e}"))?;
+
+            // Update or add lock entry
+            if let Some(entry) = lock_file.provider.iter_mut().find(|e| e.source == source) {
+                entry.sha256 = sha;
+            } else {
+                lock_file.provider.push(LockEntry {
+                    name: config.name.clone(),
+                    source: source.to_string(),
+                    version: "file".to_string(),
+                    constraint: None,
+                    revision: None,
+                    resolved_sha: None,
+                    sha256: sha,
+                });
+            }
+
+            resolved.insert(config.name.clone(), dest);
+            continue;
+        }
 
         let binary_path = if let Some(revision) = &config.revision {
             let (path, _sha) = crate::revision_resolver::resolve_provider_by_revision(
@@ -847,5 +901,53 @@ sha256 = "abc123"
 "#;
         let lock: LockFile = toml::from_str(toml_str).unwrap();
         assert!(lock.provider[0].constraint.is_none());
+    }
+
+    #[test]
+    fn resolve_all_copies_file_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create a fake WASM file
+        let wasm_path = tmp.path().join("my-provider.wasm");
+        fs::write(&wasm_path, b"fake wasm content").unwrap();
+
+        let source = format!("file://{}", wasm_path.display());
+        let providers = vec![ProviderConfig {
+            name: "test".to_string(),
+            source: Some(source.clone()),
+            version: None,
+            revision: None,
+            attributes: std::collections::HashMap::new(),
+            default_tags: std::collections::HashMap::new(),
+        }];
+
+        let result = resolve_all(tmp.path(), &providers, false).unwrap();
+        assert!(result.contains_key("test"));
+
+        // Verify copied to .carina/providers/file/
+        let dest = result.get("test").unwrap();
+        assert!(dest.exists());
+        assert!(dest.starts_with(tmp.path().join(".carina/providers/file")));
+
+        // Verify lock file created
+        let lock = LockFile::load(&tmp.path().join("carina-providers.lock")).unwrap();
+        let entry = lock.find_by_source(&source).unwrap();
+        assert_eq!(entry.version, "file");
+        assert!(!entry.sha256.is_empty());
+    }
+
+    #[test]
+    fn resolve_all_errors_on_missing_file_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let providers = vec![ProviderConfig {
+            name: "test".to_string(),
+            source: Some("file:///nonexistent/path.wasm".to_string()),
+            version: None,
+            revision: None,
+            attributes: std::collections::HashMap::new(),
+            default_tags: std::collections::HashMap::new(),
+        }];
+
+        let err = resolve_all(tmp.path(), &providers, false).unwrap_err();
+        assert!(err.contains("not found"));
     }
 }
