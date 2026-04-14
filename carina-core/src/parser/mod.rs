@@ -339,7 +339,7 @@ pub enum RemoteStateBackend {
     S3 {
         bucket: String,
         key: String,
-        region: String,
+        region: Option<String>,
     },
 }
 
@@ -2839,7 +2839,7 @@ fn parse_remote_state_block(
             RemoteStateBackend::Local { path }
         }
         Some("s3") => {
-            // S3 backend: requires "bucket", "key", "region"
+            // S3 backend: requires "bucket", "key"; "region" is optional
             let valid_keys: &[&str] = &["bucket", "key", "region"];
             for key in attrs.keys() {
                 if !valid_keys.contains(&key.as_str()) {
@@ -2864,12 +2864,7 @@ fn parse_remote_state_block(
                     line: 0,
                     message: "remote_state \"s3\" block requires a 'key' attribute".to_string(),
                 })?;
-            let region = attrs
-                .remove("region")
-                .ok_or_else(|| ParseError::InvalidExpression {
-                    line: 0,
-                    message: "remote_state \"s3\" block requires a 'region' attribute".to_string(),
-                })?;
+            let region = attrs.remove("region");
             RemoteStateBackend::S3 {
                 bucket,
                 key,
@@ -9147,7 +9142,7 @@ arguments {
             } => {
                 assert_eq!(bucket, "carina-state");
                 assert_eq!(key, "network/carina.state.json");
-                assert_eq!(region, "ap-northeast-1");
+                assert_eq!(region, &Some("ap-northeast-1".to_string()));
             }
             other => panic!("Expected S3 backend, got: {:?}", other),
         }
@@ -9221,7 +9216,7 @@ arguments {
     }
 
     #[test]
-    fn parse_remote_state_s3_missing_region() {
+    fn parse_remote_state_s3_region_optional() {
         let input = r#"
             let network = remote_state "s3" {
                 bucket = "carina-state"
@@ -9229,14 +9224,14 @@ arguments {
             }
         "#;
 
-        let result = parse(input, &ProviderContext::default());
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("region"),
-            "Error should mention 'region', got: {}",
-            err
-        );
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(parsed.remote_states.len(), 1);
+        match &parsed.remote_states[0].backend {
+            RemoteStateBackend::S3 { region, .. } => {
+                assert!(region.is_none(), "region should be None when omitted");
+            }
+            _ => panic!("Expected S3 backend"),
+        }
     }
 
     #[test]
