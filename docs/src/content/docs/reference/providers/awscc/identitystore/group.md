@@ -36,7 +36,7 @@ The globally unique identifier for the identity store.
 
 ### `group_id`
 
-- **Type:** SecurityGroupId
+- **Type:** String(pattern, len: 1..=47)
 
 The unique identifier for a group in the identity store.
 

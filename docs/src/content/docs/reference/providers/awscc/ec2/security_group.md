@@ -135,7 +135,7 @@ Shorthand formats: `tcp` or `IpProtocol.tcp`
 
 ### `group_id`
 
-- **Type:** SecurityGroupId
+- **Type:** String
 
 The group ID of the specified security group.
 

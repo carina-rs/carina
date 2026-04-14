@@ -12,7 +12,7 @@ Resource Type Definition for AWS:IdentityStore::GroupMembership
 
 ### `group_id`
 
-- **Type:** SecurityGroupId
+- **Type:** String(pattern, len: 1..=47)
 - **Required:** Yes
 - **Create-only:** Yes
 
