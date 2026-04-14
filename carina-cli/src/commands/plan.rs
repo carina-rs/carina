@@ -277,6 +277,7 @@ pub async fn run_plan(
             &delete_attributes,
             Some(wiring.schemas()),
             &ctx.moved_origins,
+            &parsed.export_params,
         );
     }
 
