@@ -32,17 +32,11 @@ use crate::wiring::{
 /// changed since the last run, by comparing against `carina-backend.lock`
 /// under `base_dir`.
 ///
-/// - If no lock exists yet, the current config is written as the new lock.
+/// - If no lock exists, returns an error asking user to run `carina init`.
 /// - If the lock matches, nothing happens.
 /// - If the lock differs and `reconfigure` is `false`, returns an error
 ///   explaining the change and asking the user to re-run with `--reconfigure`.
 /// - If `reconfigure` is `true`, overwrites the lock with the new config.
-///
-/// When no `backend` block is configured, the implicit local backend is
-/// still recorded in the lock. This makes it possible to detect the
-/// local → remote transition (user adds a backend block after having
-/// run carina against local state) — otherwise the lock would be silently
-/// created with the new remote config and the local state abandoned.
 pub fn check_backend_lock(
     base_dir: &Path,
     backend_config: Option<&BackendConfig>,
@@ -77,9 +71,10 @@ pub fn check_backend_lock(
             }
         }
         Some(_) => Ok(()),
-        // No lock file yet — don't create one here. The lock is created
-        // when state is first written (apply/destroy), not on plan/validate.
-        None => Ok(()),
+        // No lock file — user must run `carina init` first
+        None => Err(AppError::Config(
+            "Backend lock file not found. Run 'carina init' to initialize the project.".to_string(),
+        )),
     }
 }
 
@@ -234,13 +229,12 @@ mod tests {
     }
 
     #[test]
-    fn check_backend_lock_does_not_create_lock_on_first_run() {
+    fn check_backend_lock_errors_when_lock_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let config = s3_backend_config("my-bucket", "us-east-1");
-        let result = check_backend_lock(tmp.path(), Some(&config), false);
-        assert!(result.is_ok());
-        // Lock should NOT be created by check — only by ensure_backend_lock
-        assert!(!tmp.path().join("carina-backend.lock").exists());
+        let err = check_backend_lock(tmp.path(), Some(&config), false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("carina init"));
     }
 
     #[test]
@@ -289,11 +283,11 @@ mod tests {
     }
 
     #[test]
-    fn check_backend_lock_no_lock_no_backend_does_not_create_file() {
+    fn check_backend_lock_errors_when_lock_missing_no_backend() {
         let tmp = tempfile::tempdir().unwrap();
-        let result = check_backend_lock(tmp.path(), None, false);
-        assert!(result.is_ok());
-        assert!(!tmp.path().join("carina-backend.lock").exists());
+        let err = check_backend_lock(tmp.path(), None, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("carina init"));
     }
 
     #[test]

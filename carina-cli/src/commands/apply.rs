@@ -991,9 +991,6 @@ pub async fn run_apply(
         op_result?;
     }
 
-    // Create backend lock after state is successfully written
-    crate::commands::ensure_backend_lock(base_dir, parsed.backend.as_ref())?;
-
     Ok(())
 }
 
@@ -1453,7 +1450,6 @@ pub async fn run_apply_from_plan(
 
     let source_path = std::path::PathBuf::from(&plan_file.source_path);
     let base_dir = get_base_dir(&source_path);
-    let backend_config_for_lock = plan_file.backend_config.clone();
     let op_result = crate::signal::run_with_ctrl_c(run_apply_from_plan_locked(
         plan_file,
         auto_approve,
@@ -1478,9 +1474,6 @@ pub async fn run_apply_from_plan(
     } else {
         op_result?;
     }
-
-    // Create backend lock after state is successfully written
-    crate::commands::ensure_backend_lock(base_dir, backend_config_for_lock.as_ref())?;
 
     Ok(())
 }
