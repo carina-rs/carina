@@ -364,7 +364,7 @@ pub(crate) fn resolve_export_values_for_display(
 }
 
 /// Resolve a single export value, handling both ResourceRef and dot-notation strings.
-fn resolve_export_value(
+pub(crate) fn resolve_export_value(
     value: &Value,
     binding_map: &HashMap<String, HashMap<String, Value>>,
 ) -> Value {
