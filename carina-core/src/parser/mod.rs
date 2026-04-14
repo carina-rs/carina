@@ -1261,7 +1261,9 @@ fn detect_structural_rhs(pair: &pest::iterators::Pair<Rule>) -> bool {
         let inner = pair.clone().into_inner().next()?;
         match inner.as_rule() {
             Rule::if_expr | Rule::for_expr | Rule::read_resource_expr => Some(inner.as_rule()),
-            Rule::pipe_expr | Rule::compose_expr | Rule::expression => find_inner_rule(&inner),
+            Rule::pipe_expr | Rule::compose_expr | Rule::coalesce_expr | Rule::expression => {
+                find_inner_rule(&inner)
+            }
             Rule::primary => {
                 let primary_inner = inner.into_inner().next()?;
                 match primary_inner.as_rule() {
@@ -1283,8 +1285,9 @@ fn parse_expression_with_resource_or_module(
     ctx: &ParseContext,
     binding_name: &str,
 ) -> Result<LetBindingRhs, ParseError> {
-    let inner = first_inner(pair, "expression", "expression with resource or module")?;
-    parse_pipe_expr_with_resource_or_module(inner, ctx, binding_name)
+    let coalesce = first_inner(pair, "expression", "expression with resource or module")?;
+    let pipe = first_inner(coalesce, "pipe expression", "coalesce expression")?;
+    parse_pipe_expr_with_resource_or_module(pipe, ctx, binding_name)
 }
 
 fn parse_pipe_expr_with_resource_or_module(
@@ -1562,6 +1565,15 @@ fn parse_for_expr(
                 let result = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
                 collect(result, &mut resources, &mut module_calls);
             }
+        }
+        // Unresolved reference (e.g., missing upstream export) — tolerate with warning
+        (_, Value::ResourceRef { path }) => {
+            eprintln!(
+                "  ⚠ for expression at line {}: {} is not yet available (known after apply)",
+                for_line,
+                path.to_dot_string()
+            );
+            // Return empty — the for body produces zero resources
         }
         _ => {
             let iterable_type = match &iterable {
@@ -3198,7 +3210,27 @@ fn parse_expression(
     ctx: &ParseContext,
 ) -> Result<Value, ParseError> {
     let inner = first_inner(pair, "expression body", "expression")?;
-    parse_pipe_expr(inner, ctx)
+    parse_coalesce_expr(inner, ctx)
+}
+
+fn parse_coalesce_expr(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+) -> Result<Value, ParseError> {
+    let mut inner = pair.into_inner();
+    let first = next_pair(&mut inner, "pipe expression", "coalesce expression")?;
+    let value = parse_pipe_expr(first, ctx)?;
+
+    // If there's a ?? right-hand side, check if left is an unresolved reference
+    if let Some(rhs_pair) = inner.next() {
+        let default = parse_pipe_expr(rhs_pair, ctx)?;
+        match &value {
+            Value::ResourceRef { .. } => Ok(default),
+            _ => Ok(value),
+        }
+    } else {
+        Ok(value)
+    }
 }
 
 fn parse_compose_expr(
@@ -9744,5 +9776,57 @@ exports {
         assert_eq!(parsed.export_params[0].name, "vpc_id");
         assert!(parsed.export_params[0].type_expr.is_some());
         assert_eq!(parsed.export_params[1].name, "cidr");
+    }
+
+    #[test]
+    fn coalesce_operator_returns_default_for_unresolved_ref() {
+        let input = r#"
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.vpc {
+  cidr_block = '10.0.0.0/16'
+}
+
+awscc.ec2.subnet {
+  cidr_block = vpc.missing_attr ?? '10.0.1.0/24'
+}
+"#;
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        // vpc.missing_attr is a ResourceRef (unresolved at parse time), so ?? returns default
+        let subnet = parsed
+            .resources
+            .iter()
+            .find(|r| r.id.resource_type == "ec2.subnet")
+            .unwrap();
+        let cidr = subnet.get_attr("cidr_block");
+        // At parse time, vpc.missing_attr is still a ResourceRef (not resolved), so ?? kicks in
+        // Actually, resource refs remain as ResourceRef until resolution, so the left side IS a ResourceRef
+        assert_eq!(
+            cidr,
+            Some(&Value::String("10.0.1.0/24".to_string())),
+            "?? should return default when left is an unresolved ResourceRef"
+        );
+    }
+
+    #[test]
+    fn coalesce_operator_returns_left_when_resolved() {
+        let input = r#"
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.ec2.vpc {
+  cidr_block = '10.1.0.0/16' ?? '10.0.0.0/16'
+}
+"#;
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        let cidr = parsed.resources[0].get_attr("cidr_block");
+        assert_eq!(
+            cidr,
+            Some(&Value::String("10.1.0.0/16".to_string())),
+            "?? should return left when it's resolved"
+        );
     }
 }
