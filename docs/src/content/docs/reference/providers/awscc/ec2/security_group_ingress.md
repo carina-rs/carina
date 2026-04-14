@@ -65,7 +65,7 @@ The start of port range for the TCP and UDP protocols, or an ICMP/ICMPv6 type nu
 
 ### `group_id`
 
-- **Type:** SecurityGroupId
+- **Type:** String
 - **Required:** No
 - **Create-only:** Yes
 

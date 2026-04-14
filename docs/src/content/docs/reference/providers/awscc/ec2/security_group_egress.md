@@ -83,7 +83,7 @@ If the protocol is TCP or UDP, this is the start of the port range. If the proto
 
 ### `group_id`
 
-- **Type:** SecurityGroupId
+- **Type:** String
 - **Required:** Yes
 - **Create-only:** Yes
 
