@@ -675,6 +675,7 @@ fn test_find_state_bucket_resource_matching_type() {
         remote_states: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
+        warnings: vec![],
     };
 
     // Matching resource type
@@ -1960,6 +1961,7 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
         remote_states: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
+        warnings: vec![],
     };
 
     // MockProvider returns not_found for both resources (simulates external deletion)

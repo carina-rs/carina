@@ -333,6 +333,7 @@ mod tests {
             remote_states: vec![],
             requires: vec![],
             structural_bindings: HashSet::new(),
+            warnings: vec![],
         }
     }
 

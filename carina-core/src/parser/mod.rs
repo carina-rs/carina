@@ -53,6 +53,13 @@ pub enum ParseError {
     UserFunctionError(String),
 }
 
+/// A structured warning emitted during parsing (non-fatal).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParseWarning {
+    pub line: usize,
+    pub message: String,
+}
+
 /// Resource type path for typed references (e.g., aws.vpc, aws.security_group)
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ResourceTypePath {
@@ -343,6 +350,16 @@ pub enum RemoteStateBackend {
     },
 }
 
+impl RemoteStateBackend {
+    /// Human-readable location string (file path or S3 URI).
+    pub fn location(&self) -> String {
+        match self {
+            RemoteStateBackend::Local { path } => path.clone(),
+            RemoteStateBackend::S3 { bucket, key, .. } => format!("s3://{}/{}", bucket, key),
+        }
+    }
+}
+
 /// Parse result
 #[derive(Debug, Clone)]
 pub struct ParsedFile {
@@ -372,6 +389,8 @@ pub struct ParsedFile {
     /// Binding names that are structurally required (if/for/read expressions)
     /// and should not trigger unused-binding warnings.
     pub structural_bindings: HashSet<String>,
+    /// Non-fatal warnings collected during parsing.
+    pub warnings: Vec<ParseWarning>,
 }
 
 impl ParsedFile {
@@ -405,6 +424,10 @@ struct ParseContext<'cfg> {
     config: &'cfg ProviderContext,
     /// Binding names from structurally-required expressions (if/for/read)
     structural_bindings: HashSet<String>,
+    /// Remote state bindings (binding_name -> RemoteState)
+    remote_states: HashMap<String, RemoteState>,
+    /// Non-fatal warnings collected during parsing
+    warnings: Vec<ParseWarning>,
 }
 
 impl<'cfg> ParseContext<'cfg> {
@@ -417,6 +440,8 @@ impl<'cfg> ParseContext<'cfg> {
             evaluating_functions: Vec::new(),
             config,
             structural_bindings: HashSet::new(),
+            remote_states: HashMap::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -599,7 +624,7 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
                                 let binding_name = format!("_for{}", anon_for_counter);
                                 anon_for_counter += 1;
                                 let (expanded_resources, expanded_module_calls) =
-                                    parse_for_expr(stmt, &ctx, &binding_name)?;
+                                    parse_for_expr(stmt, &mut ctx, &binding_name)?;
                                 resources.extend(expanded_resources);
                                 module_calls.extend(expanded_module_calls);
                             }
@@ -612,7 +637,7 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
                                     expanded_module_calls,
                                     _import,
                                     _remote_state,
-                                ) = parse_if_expr(stmt, &ctx, &binding_name)?;
+                                ) = parse_if_expr(stmt, &mut ctx, &binding_name)?;
                                 resources.extend(expanded_resources);
                                 module_calls.extend(expanded_module_calls);
                             }
@@ -646,7 +671,7 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
                                     maybe_import,
                                     maybe_remote_state,
                                     is_structural,
-                                ) = parse_let_binding_extended(stmt, &ctx)?;
+                                ) = parse_let_binding_extended(stmt, &mut ctx)?;
                                 if is_structural {
                                     ctx.structural_bindings.insert(name.clone());
                                 }
@@ -696,6 +721,7 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
                                         let placeholder = Resource::new("_remote_state", &name);
                                         ctx.set_resource_binding(name.clone(), placeholder);
                                     }
+                                    ctx.remote_states.insert(rs.binding.clone(), rs.clone());
                                     remote_states.push(rs);
                                 }
                             }
@@ -741,6 +767,7 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
         remote_states,
         requires,
         structural_bindings: ctx.structural_bindings,
+        warnings: ctx.warnings,
     })
 }
 
@@ -1217,7 +1244,7 @@ type LetBindingRhs = (
 #[allow(clippy::type_complexity)]
 fn parse_let_binding_extended(
     pair: pest::iterators::Pair<Rule>,
-    ctx: &ParseContext,
+    ctx: &mut ParseContext,
 ) -> Result<
     (
         String,
@@ -1282,7 +1309,7 @@ fn detect_structural_rhs(pair: &pest::iterators::Pair<Rule>) -> bool {
 /// Parse expression with potential resource, module call, import, or remote_state
 fn parse_expression_with_resource_or_module(
     pair: pest::iterators::Pair<Rule>,
-    ctx: &ParseContext,
+    ctx: &mut ParseContext,
     binding_name: &str,
 ) -> Result<LetBindingRhs, ParseError> {
     let coalesce = first_inner(pair, "expression", "expression with resource or module")?;
@@ -1292,7 +1319,7 @@ fn parse_expression_with_resource_or_module(
 
 fn parse_pipe_expr_with_resource_or_module(
     pair: pest::iterators::Pair<Rule>,
-    ctx: &ParseContext,
+    ctx: &mut ParseContext,
     binding_name: &str,
 ) -> Result<LetBindingRhs, ParseError> {
     let mut inner = pair.into_inner();
@@ -1422,7 +1449,7 @@ fn parse_pipe_expr_with_resource_or_module(
 
 fn parse_primary_with_resource_or_module(
     pair: pest::iterators::Pair<Rule>,
-    ctx: &ParseContext,
+    ctx: &mut ParseContext,
     binding_name: &str,
 ) -> Result<LetBindingRhs, ParseError> {
     let inner = first_inner(pair, "value", "primary expression")?;
@@ -1502,7 +1529,7 @@ enum ForBodyResult {
 /// a binding name like `binding[0]` or `binding["key"]`.
 fn parse_for_expr(
     pair: pest::iterators::Pair<Rule>,
-    ctx: &ParseContext,
+    ctx: &mut ParseContext,
     binding_name: &str,
 ) -> Result<(Vec<Resource>, Vec<ModuleCall>), ParseError> {
     let for_line = pair.as_span().start_pos().line_col().0;
@@ -1568,11 +1595,25 @@ fn parse_for_expr(
         }
         // Unresolved reference (e.g., missing upstream export) — tolerate with warning
         (_, Value::ResourceRef { path }) => {
-            eprintln!(
-                "  ⚠ for expression at line {}: {} is not yet available (known after apply)",
-                for_line,
-                path.to_dot_string()
-            );
+            let remote_binding = path.binding();
+            let message = if let Some(rs) = ctx.remote_states.get(remote_binding) {
+                format!(
+                    "`{}` is not yet in the upstream state (remote_state '{}' → {}).\n    Apply that directory first, then re-plan.",
+                    path.to_dot_string(),
+                    remote_binding,
+                    rs.backend.location(),
+                )
+            } else {
+                format!(
+                    "`{}` is not yet available (known after apply)",
+                    path.to_dot_string()
+                )
+            };
+            eprintln!("  ⚠ for expression at line {}: {}", for_line, message);
+            ctx.warnings.push(ParseWarning {
+                line: for_line,
+                message,
+            });
             // Return empty — the for body produces zero resources
         }
         _ => {
@@ -1768,7 +1809,7 @@ enum IfBodyResult {
 /// The condition must evaluate to a static Bool value at parse time.
 fn parse_if_expr(
     pair: pest::iterators::Pair<Rule>,
-    ctx: &ParseContext,
+    ctx: &mut ParseContext,
     binding_name: &str,
 ) -> Result<LetBindingRhs, ParseError> {
     let mut inner = pair.into_inner();
@@ -9863,6 +9904,116 @@ awscc.ec2.vpc {
             cidr,
             Some(&Value::String("10.1.0.0/16".to_string())),
             "?? should return left when it's resolved"
+        );
+    }
+
+    #[test]
+    fn for_unresolved_remote_state_local_warning() {
+        // When a for-expression iterates over an unresolved remote_state (local backend),
+        // the warning should mention the upstream directory rather than generic "known after apply".
+        let input = r#"
+            let orgs = remote_state {
+                path = "../organizations/carina.state.json"
+            }
+
+            for name, account in orgs.accounts {
+                awscc.ec2.vpc {
+                    name = name
+                    cidr_block = '10.0.0.0/16'
+                }
+            }
+        "#;
+
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(parsed.warnings.len(), 1);
+        let w = &parsed.warnings[0];
+        assert!(
+            w.message.contains("remote_state 'orgs'"),
+            "warning should mention remote_state binding name, got: {}",
+            w.message
+        );
+        assert!(
+            w.message.contains("../organizations/carina.state.json"),
+            "warning should mention the upstream path, got: {}",
+            w.message
+        );
+        assert!(
+            w.message.contains("Apply that directory first"),
+            "warning should suggest applying upstream, got: {}",
+            w.message
+        );
+        // Should NOT contain the ambiguous "known after apply"
+        assert!(
+            !w.message.contains("known after apply"),
+            "warning should NOT use ambiguous 'known after apply', got: {}",
+            w.message
+        );
+    }
+
+    #[test]
+    fn for_unresolved_remote_state_s3_warning() {
+        // When a for-expression iterates over an unresolved remote_state (S3 backend),
+        // the warning should show the S3 path.
+        let input = r#"
+            let orgs = remote_state "s3" {
+                bucket = "carina-rs-state"
+                key = "management/organizations/carina.state.json"
+            }
+
+            for name, account in orgs.accounts {
+                awscc.ec2.vpc {
+                    name = name
+                    cidr_block = '10.0.0.0/16'
+                }
+            }
+        "#;
+
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(parsed.warnings.len(), 1);
+        let w = &parsed.warnings[0];
+        assert!(
+            w.message
+                .contains("s3://carina-rs-state/management/organizations/carina.state.json"),
+            "warning should show S3 URI, got: {}",
+            w.message
+        );
+        assert!(
+            w.message.contains("remote_state 'orgs'"),
+            "warning should mention binding name, got: {}",
+            w.message
+        );
+    }
+
+    #[test]
+    fn for_unresolved_non_remote_state_warning() {
+        // When a for-expression has an unresolved ref that is NOT a remote_state,
+        // it should use the generic "known after apply" message.
+        let input = r#"
+            let config = awscc.ec2.vpc {
+                name = "base"
+                cidr_block = '10.0.0.0/16'
+            }
+
+            for name, item in config.items {
+                awscc.ec2.subnet {
+                    name = name
+                    cidr_block = '10.0.1.0/24'
+                }
+            }
+        "#;
+
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(parsed.warnings.len(), 1);
+        let w = &parsed.warnings[0];
+        assert!(
+            w.message.contains("known after apply"),
+            "non-remote_state unresolved ref should use generic message, got: {}",
+            w.message
+        );
+        assert!(
+            !w.message.contains("remote_state"),
+            "should NOT mention remote_state for local bindings, got: {}",
+            w.message
         );
     }
 }
