@@ -187,6 +187,7 @@ impl<'cfg> ModuleResolver<'cfg> {
             module_calls: vec![],
             arguments: vec![],
             attribute_params: vec![],
+            export_params: vec![],
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
@@ -217,6 +218,7 @@ impl<'cfg> ModuleResolver<'cfg> {
             merged.module_calls.extend(parsed.module_calls);
             merged.arguments.extend(parsed.arguments);
             merged.attribute_params.extend(parsed.attribute_params);
+            merged.export_params.extend(parsed.export_params);
             merged.user_functions.extend(parsed.user_functions);
             merged.remote_states.extend(parsed.remote_states);
             merged.requires.extend(parsed.requires);
@@ -1236,6 +1238,7 @@ pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
         module_calls: vec![],
         arguments: vec![],
         attribute_params: vec![],
+        export_params: vec![],
         backend: None,
         state_blocks: vec![],
         user_functions: HashMap::new(),
@@ -1257,6 +1260,7 @@ pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
             merged.module_calls.extend(parsed.module_calls);
             merged.arguments.extend(parsed.arguments);
             merged.attribute_params.extend(parsed.attribute_params);
+            merged.export_params.extend(parsed.export_params);
             merged.user_functions.extend(parsed.user_functions);
             merged.remote_states.extend(parsed.remote_states);
             merged.requires.extend(parsed.requires);
@@ -1322,6 +1326,7 @@ pub fn load_module_from_directory(dir: &Path) -> Result<ParsedFile, String> {
         module_calls: vec![],
         arguments: vec![],
         attribute_params: vec![],
+        export_params: vec![],
         backend: None,
         state_blocks: vec![],
         user_functions: HashMap::new(),
@@ -1348,6 +1353,7 @@ pub fn load_module_from_directory(dir: &Path) -> Result<ParsedFile, String> {
             merged.module_calls.extend(parsed.module_calls);
             merged.arguments.extend(parsed.arguments);
             merged.attribute_params.extend(parsed.attribute_params);
+            merged.export_params.extend(parsed.export_params);
             merged.user_functions.extend(parsed.user_functions);
             merged.remote_states.extend(parsed.remote_states);
             merged.requires.extend(parsed.requires);
@@ -1411,6 +1417,7 @@ mod tests {
                 },
             ],
             attribute_params: vec![],
+            export_params: vec![],
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
@@ -1544,6 +1551,7 @@ mod tests {
                 validations: Vec::new(),
             }],
             attribute_params: vec![],
+            export_params: vec![],
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
@@ -1668,6 +1676,7 @@ mod tests {
                     vec![],
                 )),
             }],
+            export_params: vec![],
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
@@ -2015,6 +2024,7 @@ mod tests {
                 },
             ],
             attribute_params: vec![],
+            export_params: vec![],
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
@@ -2299,6 +2309,7 @@ mod tests {
                 }],
             }],
             attribute_params: vec![],
+            export_params: vec![],
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
@@ -2468,6 +2479,7 @@ mod tests {
                 }],
             }],
             attribute_params: vec![],
+            export_params: vec![],
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
@@ -2530,6 +2542,7 @@ mod tests {
                 }],
             }],
             attribute_params: vec![],
+            export_params: vec![],
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
@@ -2607,6 +2620,7 @@ mod tests {
                 },
             ],
             attribute_params: vec![],
+            export_params: vec![],
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
@@ -2677,6 +2691,7 @@ mod tests {
                 },
             ],
             attribute_params: vec![],
+            export_params: vec![],
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
@@ -2738,6 +2753,7 @@ mod tests {
                 validations: Vec::new(),
             }],
             attribute_params: vec![],
+            export_params: vec![],
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
@@ -2830,6 +2846,7 @@ mod tests {
                 },
             ],
             attribute_params: vec![],
+            export_params: vec![],
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),

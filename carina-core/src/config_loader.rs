@@ -45,6 +45,7 @@ pub fn load_configuration_with_config(
             module_calls: vec![],
             arguments: vec![],
             attribute_params: vec![],
+            export_params: vec![],
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
@@ -81,6 +82,9 @@ pub fn load_configuration_with_config(
                         .attribute_params
                         .extend(unresolved.attribute_params);
                     unresolved_merged
+                        .export_params
+                        .extend(unresolved.export_params);
+                    unresolved_merged
                         .state_blocks
                         .extend(unresolved.state_blocks);
                     unresolved_merged
@@ -101,6 +105,7 @@ pub fn load_configuration_with_config(
                     merged.module_calls.extend(parsed.module_calls);
                     merged.arguments.extend(parsed.arguments);
                     merged.attribute_params.extend(parsed.attribute_params);
+                    merged.export_params.extend(parsed.export_params);
                     merged.state_blocks.extend(parsed.state_blocks);
                     merged.user_functions.extend(parsed.user_functions);
                     merged.remote_states.extend(parsed.remote_states);
