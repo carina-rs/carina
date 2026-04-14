@@ -326,6 +326,8 @@ pub(crate) fn resolve_export_values_for_display(
     resources: &[Resource],
     current_states: &HashMap<ResourceId, State>,
 ) -> Vec<carina_core::parser::ExportParameter> {
+    use carina_core::resolver::resolve_ref_value;
+
     // Build binding map from resources + current state
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
     for resource in resources {
@@ -351,7 +353,7 @@ pub(crate) fn resolve_export_values_for_display(
             let resolved_value = param
                 .value
                 .as_ref()
-                .map(|v| resolve_export_value(v, &binding_map));
+                .map(|v| resolve_ref_value(v, &binding_map).unwrap_or_else(|_| v.clone()));
             carina_core::parser::ExportParameter {
                 name: param.name.clone(),
                 type_expr: param.type_expr.clone(),
@@ -359,46 +361,6 @@ pub(crate) fn resolve_export_values_for_display(
             }
         })
         .collect()
-}
-
-/// Resolve a single export value, handling both ResourceRef and dot-notation strings.
-fn resolve_export_value(
-    value: &Value,
-    binding_map: &HashMap<String, HashMap<String, Value>>,
-) -> Value {
-    use carina_core::resolver::resolve_ref_value;
-
-    match value {
-        Value::ResourceRef { .. } => {
-            resolve_ref_value(value, binding_map).unwrap_or_else(|_| value.clone())
-        }
-        // Cross-file: "binding.attr" parsed as String instead of ResourceRef
-        Value::String(s) if s.contains('.') && !s.contains(' ') => {
-            let parts: Vec<&str> = s.splitn(2, '.').collect();
-            if parts.len() == 2
-                && let Some(attrs) = binding_map.get(parts[0])
-                && let Some(resolved) = attrs.get(parts[1])
-            {
-                return resolved.clone();
-            }
-            value.clone()
-        }
-        Value::List(items) => {
-            let resolved: Vec<Value> = items
-                .iter()
-                .map(|item| resolve_export_value(item, binding_map))
-                .collect();
-            Value::List(resolved)
-        }
-        Value::Map(map) => {
-            let resolved: HashMap<String, Value> = map
-                .iter()
-                .map(|(k, v)| (k.clone(), resolve_export_value(v, binding_map)))
-                .collect();
-            Value::Map(resolved)
-        }
-        _ => value.clone(),
-    }
 }
 
 pub(crate) async fn load_remote_states(
