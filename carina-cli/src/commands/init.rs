@@ -15,18 +15,18 @@ pub fn run_init(path: &Path, upgrade: bool) -> Result<(), String> {
     let loaded = load_configuration_with_config(&path_buf, &provider_context)
         .map_err(|e| format!("Failed to load configuration: {e}"))?;
 
-    let github_providers: Vec<_> = loaded
+    let sourced_providers: Vec<_> = loaded
         .parsed
         .providers
         .iter()
-        .filter(|p| p.source.as_ref().is_some_and(|s| !s.starts_with("file://")))
+        .filter(|p| p.source.is_some())
         .collect();
 
-    if !github_providers.is_empty() {
+    if !sourced_providers.is_empty() {
         let action = if upgrade { "Upgrading" } else { "Resolving" };
         println!(
             "{}",
-            format!("{} {} provider(s)...", action, github_providers.len()).cyan()
+            format!("{} {} provider(s)...", action, sourced_providers.len()).cyan()
         );
 
         let resolved =
