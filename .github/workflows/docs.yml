@@ -36,3 +36,4 @@ jobs:
           publish_branch: main
           publish_dir: ./docs/dist
           personal_token: ${{ secrets.DOCS_DEPLOY_TOKEN }}
+          cname: carina-rs.dev
