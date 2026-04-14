@@ -375,6 +375,11 @@ pub fn check_unused_bindings(parsed: &ParsedFile) -> Vec<String> {
             collect_resource_refs(value, &mut referenced);
         }
     }
+    for export_param in &parsed.export_params {
+        if let Some(value) = &export_param.value {
+            collect_resource_refs(value, &mut referenced);
+        }
+    }
 
     // Return unused binding names, skipping structurally-required bindings
     // (if/for/read expressions) and for-generated indexed bindings (e.g., vpcs[0])
@@ -635,6 +640,29 @@ mod tests {
             });
 
         assert!(check_unused_bindings(&parsed).is_empty());
+    }
+
+    #[test]
+    fn binding_referenced_in_exports_not_warned() {
+        let mut parsed = empty_parsed();
+
+        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc").with_binding("vpc");
+        parsed.resources.push(vpc);
+
+        parsed.export_params.push(crate::parser::ExportParameter {
+            name: "vpc_id".to_string(),
+            type_expr: Some(TypeExpr::String),
+            value: Some(Value::resource_ref(
+                "vpc".to_string(),
+                "vpc_id".to_string(),
+                vec![],
+            )),
+        });
+
+        assert!(
+            check_unused_bindings(&parsed).is_empty(),
+            "binding referenced in exports should not be warned"
+        );
     }
 
     #[test]
