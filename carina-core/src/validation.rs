@@ -369,14 +369,46 @@ pub fn check_unused_bindings(parsed: &ParsedFile) -> Vec<String> {
         }
     }
 
+    // Count resources per (provider, resource_type) to detect collision risk.
+    // A binding whose removal would leave multiple anonymous resources of the
+    // same type must be kept to avoid identifier collisions.
+    let mut type_counts: HashMap<(&str, &str), usize> = HashMap::new();
+    for resource in &parsed.resources {
+        *type_counts
+            .entry((&resource.id.provider, &resource.id.resource_type))
+            .or_insert(0) += 1;
+    }
+
     // Return unused binding names, skipping structurally-required bindings
     // (if/for/read expressions) and for-generated indexed bindings (e.g., vpcs[0])
     defined_bindings
         .into_iter()
         .filter(|binding| {
-            !referenced.contains(binding)
-                && !parsed.structural_bindings.contains(binding)
-                && !binding.contains('[')
+            if referenced.contains(binding)
+                || parsed.structural_bindings.contains(binding)
+                || binding.contains('[')
+            {
+                return false;
+            }
+            // Suppress warning if there are multiple resources of the same type —
+            // removing the binding would risk anonymous identifier collision.
+            if let Some(resource) = parsed
+                .resources
+                .iter()
+                .find(|r| r.binding.as_deref() == Some(binding.as_str()))
+            {
+                let count = type_counts
+                    .get(&(
+                        resource.id.provider.as_str(),
+                        resource.id.resource_type.as_str(),
+                    ))
+                    .copied()
+                    .unwrap_or(0);
+                if count > 1 {
+                    return false;
+                }
+            }
+            true
         })
         .collect()
 }
@@ -777,6 +809,56 @@ let vpc = awscc.ec2.vpc {
             vec!["vpc"],
             "genuinely unused binding should still be warned"
         );
+    }
+
+    #[test]
+    fn unused_binding_suppressed_when_collision_would_occur() {
+        // Two record_sets of the same type — removing let would cause collision
+        let input = r#"
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let apex_a = awscc.route53.record_set {
+  name = "carina-rs.dev"
+  type = "A"
+}
+
+let apex_aaaa = awscc.route53.record_set {
+  name = "carina-rs.dev"
+  type = "AAAA"
+}
+"#;
+        let parsed = crate::parser::parse(input, &ProviderContext::default()).unwrap();
+        let unused = check_unused_bindings(&parsed);
+        assert!(
+            unused.is_empty(),
+            "should not warn about unused bindings when removing them would cause collision, got: {:?}",
+            unused
+        );
+    }
+
+    #[test]
+    fn unused_binding_still_warns_for_single_resource_of_type() {
+        // Only one resource of this type — safe to make anonymous
+        let input = r#"
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+}
+
+let subnet = awscc.ec2.subnet {
+  vpc_id = vpc.vpc_id
+  cidr_block = "10.0.1.0/24"
+}
+"#;
+        let parsed = crate::parser::parse(input, &ProviderContext::default()).unwrap();
+        let unused = check_unused_bindings(&parsed);
+        // subnet is unused and is the only resource of its type — should warn
+        assert_eq!(unused, vec!["subnet"]);
     }
 
     /// Helper to create a simple ResourceSchema with given attributes.
