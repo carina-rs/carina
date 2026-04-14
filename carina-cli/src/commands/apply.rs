@@ -1365,18 +1365,13 @@ async fn run_apply_locked(
         .map(|(from, to)| (to.clone(), from.clone()))
         .collect();
 
-    let resolved_exports = crate::commands::plan::resolve_export_values_for_display(
-        &parsed.export_params,
-        &sorted_resources,
-        &current_states,
-    );
     print_plan(
         &plan,
         DetailLevel::Full,
         &delete_attributes,
         Some(ctx.schemas()),
         &moved_origins,
-        &resolved_exports,
+        &parsed.export_params,
     );
 
     // Confirmation prompt

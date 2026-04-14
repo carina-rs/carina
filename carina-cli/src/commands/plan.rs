@@ -271,19 +271,13 @@ pub async fn run_plan(
         carina_tui::run(&ctx.plan, wiring.schemas())
             .map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
     } else {
-        // Resolve export values for display
-        let resolved_exports = resolve_export_values_for_display(
-            &parsed.export_params,
-            &ctx.sorted_resources,
-            &ctx.current_states,
-        );
         print_plan(
             &ctx.plan,
             detail,
             &delete_attributes,
             Some(wiring.schemas()),
             &ctx.moved_origins,
-            &resolved_exports,
+            &parsed.export_params,
         );
     }
 
@@ -320,49 +314,6 @@ pub async fn run_plan(
 /// map of resource bindings to their attributes. The result maps each remote_state
 /// binding name to a `HashMap<String, Value>` where keys are resource binding names
 /// and values are `Value::Map` of that resource's attributes.
-/// Resolve export value expressions for plan display.
-pub(crate) fn resolve_export_values_for_display(
-    export_params: &[carina_core::parser::ExportParameter],
-    resources: &[Resource],
-    current_states: &HashMap<ResourceId, State>,
-) -> Vec<carina_core::parser::ExportParameter> {
-    use carina_core::resolver::resolve_ref_value;
-
-    // Build binding map from resources + current state
-    let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
-    for resource in resources {
-        if let Some(ref binding_name) = resource.binding {
-            let mut attrs: HashMap<String, Value> =
-                carina_core::resource::Expr::resolve_map(&resource.attributes);
-            if let Some(state) = current_states.get(&resource.id)
-                && state.exists
-            {
-                for (k, v) in &state.attributes {
-                    if !attrs.contains_key(k) {
-                        attrs.insert(k.clone(), v.clone());
-                    }
-                }
-            }
-            binding_map.insert(binding_name.clone(), attrs);
-        }
-    }
-
-    export_params
-        .iter()
-        .map(|param| {
-            let resolved_value = param
-                .value
-                .as_ref()
-                .map(|v| resolve_ref_value(v, &binding_map).unwrap_or_else(|_| v.clone()));
-            carina_core::parser::ExportParameter {
-                name: param.name.clone(),
-                type_expr: param.type_expr.clone(),
-                value: resolved_value,
-            }
-        })
-        .collect()
-}
-
 pub(crate) async fn load_remote_states(
     remote_states: &[RemoteState],
     base_dir: &Path,
