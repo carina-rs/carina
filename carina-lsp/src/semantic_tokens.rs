@@ -342,6 +342,8 @@ impl SemanticTokensProvider {
             }
         } else if trimmed.starts_with("attributes ") || trimmed == "attributes{" {
             tokens.push((indent, 10, 0)); // KEYWORD: attributes
+        } else if trimmed.starts_with("exports ") || trimmed == "exports{" {
+            tokens.push((indent, 7, 0)); // KEYWORD: exports
         } else if trimmed.starts_with("arguments ") || trimmed == "arguments{" {
             tokens.push((indent, 9, 0)); // KEYWORD: arguments
         } else if trimmed.starts_with("import ") || trimmed == "import{" {
@@ -397,6 +399,8 @@ impl SemanticTokensProvider {
             && !trimmed.starts_with("let ")
             && !trimmed.starts_with("attributes ")
             && !trimmed.starts_with("attributes{")
+            && !trimmed.starts_with("exports ")
+            && !trimmed.starts_with("exports{")
             && !trimmed.starts_with("arguments ")
             && !trimmed.starts_with("arguments{")
             && !trimmed.starts_with("import ")
