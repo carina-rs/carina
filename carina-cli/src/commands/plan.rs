@@ -108,7 +108,6 @@ pub async fn run_plan(
     provider_context: &ProviderContext,
 ) -> Result<bool, AppError> {
     let mut parsed = load_configuration_with_config(path, provider_context)?.parsed;
-    parsed.print_warnings();
 
     let base_dir = get_base_dir(path);
     validate_and_resolve_with_config(&mut parsed, base_dir, false)?;
@@ -225,6 +224,12 @@ pub async fn run_plan(
 
     // Load remote state data sources
     let remote_bindings = load_remote_states(&parsed.remote_states, base_dir).await?;
+
+    // Expand deferred for-expressions now that remote values are available
+    parsed.expand_deferred_for_expressions(&remote_bindings);
+
+    // Print warnings after expansion (resolved deferred for-expressions have their warnings removed)
+    parsed.print_warnings();
 
     let ctx = create_plan_from_parsed_with_remote(
         &parsed,
