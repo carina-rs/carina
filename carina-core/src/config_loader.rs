@@ -65,6 +65,15 @@ pub fn load_configuration_with_config(
                 .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
             match parser::parse(&content, config) {
                 Ok(mut parsed) => {
+                    // Stamp source file name onto warnings and deferred for-expressions
+                    let file_name = file.file_name().map(|n| n.to_string_lossy().into_owned());
+                    for w in &mut parsed.warnings {
+                        w.file = file_name.clone();
+                    }
+                    for d in &mut parsed.deferred_for_expressions {
+                        d.file = file_name.clone();
+                    }
+
                     let unresolved = parsed.clone();
                     if let Err(e) = parser::resolve_resource_refs_with_config(&mut parsed, config) {
                         parse_errors.push(format!("{}: {}", file.display(), e));
