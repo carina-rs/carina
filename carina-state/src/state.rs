@@ -24,6 +24,9 @@ pub struct StateFile {
     pub carina_version: String,
     /// All managed resources and their current state
     pub resources: Vec<ResourceState>,
+    /// Published exports for remote_state consumers
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub exports: HashMap<String, serde_json::Value>,
 }
 
 impl StateFile {
@@ -31,7 +34,8 @@ impl StateFile {
     /// v2: Added identifier field to ResourceState
     /// v3: Added binding and dependency_bindings fields to ResourceState
     /// v4: Instance path addressing (dot notation instead of underscore prefix)
-    pub const CURRENT_VERSION: u32 = 4;
+    /// v5: Added exports field for remote_state output
+    pub const CURRENT_VERSION: u32 = 5;
 
     /// Create a new empty state file
     pub fn new() -> Self {
@@ -41,6 +45,7 @@ impl StateFile {
             lineage: uuid::Uuid::new_v4().to_string(),
             carina_version: env!("CARGO_PKG_VERSION").to_string(),
             resources: Vec::new(),
+            exports: HashMap::new(),
         }
     }
 
@@ -52,6 +57,7 @@ impl StateFile {
             lineage,
             carina_version: env!("CARGO_PKG_VERSION").to_string(),
             resources: Vec::new(),
+            exports: HashMap::new(),
         }
     }
 
@@ -257,18 +263,11 @@ impl StateFile {
     /// This is used by `remote_state` blocks to expose another project's state
     /// as a nested map: `remote_binding.resource_binding.attribute`.
     pub fn build_remote_bindings(&self) -> HashMap<String, Value> {
-        let mut result = HashMap::new();
-        for rs in &self.resources {
-            if let Some(ref binding) = rs.binding {
-                let attrs: HashMap<String, Value> = rs
-                    .attributes
-                    .iter()
-                    .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
-                    .collect();
-                result.insert(binding.clone(), Value::Map(attrs));
-            }
-        }
-        result
+        // Return only exports — no fallback to let bindings
+        self.exports
+            .iter()
+            .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
+            .collect()
     }
 
     /// Remove a resource from the state
@@ -1048,9 +1047,9 @@ mod tests {
     }
 
     #[test]
-    fn test_state_file_version_is_v4() {
+    fn test_state_file_version_is_v5() {
         let state = StateFile::new();
-        assert_eq!(state.version, 4);
+        assert_eq!(state.version, 5);
     }
 
     #[test]
@@ -1522,6 +1521,56 @@ mod tests {
             secret_stored.starts_with(SECRET_PREFIX),
             "Expected secret hash in list value, got: {}",
             secret_stored
+        );
+    }
+
+    #[test]
+    fn build_remote_bindings_returns_exports() {
+        let mut state = StateFile::new();
+        state.exports.insert(
+            "account_id".to_string(),
+            serde_json::Value::String("123456789012".to_string()),
+        );
+        let bindings = state.build_remote_bindings();
+        assert_eq!(
+            bindings.get("account_id"),
+            Some(&Value::String("123456789012".to_string()))
+        );
+    }
+
+    #[test]
+    fn build_remote_bindings_empty_when_no_exports() {
+        let state = StateFile::new();
+        let bindings = state.build_remote_bindings();
+        assert!(bindings.is_empty());
+    }
+
+    #[test]
+    fn build_remote_bindings_ignores_resource_bindings() {
+        let mut state = StateFile::new();
+        // Add a resource with a binding — should NOT appear in remote bindings
+        state.resources.push(ResourceState {
+            resource_type: "ec2.vpc".to_string(),
+            name: "vpc_123".to_string(),
+            provider: "awscc".to_string(),
+            identifier: Some("vpc-123".to_string()),
+            attributes: HashMap::from([(
+                "vpc_id".to_string(),
+                serde_json::Value::String("vpc-123".to_string()),
+            )]),
+            protected: false,
+            lifecycle: carina_core::resource::LifecycleConfig::default(),
+            prefixes: HashMap::new(),
+            name_overrides: HashMap::new(),
+            desired_keys: vec![],
+            binding: Some("vpc".to_string()),
+            dependency_bindings: vec![],
+            write_only_attributes: vec![],
+        });
+        let bindings = state.build_remote_bindings();
+        assert!(
+            bindings.is_empty(),
+            "resource bindings should not be exposed"
         );
     }
 }
