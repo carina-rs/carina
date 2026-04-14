@@ -4,7 +4,7 @@ expression: output
 ---
 Execution Plan:
 
-  ? for account_id in orgs.accounts (line 13)
+  ? for account_id in orgs.accounts
       expands to sso.assignment resources (count known after upstream apply)
       instance_arn: 'arn:aws:sso:::instance/ssoins-12345'
       principal_id: 'group-abc-123'

@@ -239,14 +239,7 @@ pub fn format_plan(
 /// Format a single deferred for-expression for plan display.
 fn format_deferred_for_expression(deferred: &carina_core::parser::DeferredForExpression) -> String {
     let mut out = String::new();
-    writeln!(
-        out,
-        "  {} {} (line {})",
-        "?".cyan(),
-        deferred.header,
-        deferred.line,
-    )
-    .unwrap();
+    writeln!(out, "  {} {}", "?".cyan(), deferred.header).unwrap();
     writeln!(
         out,
         "      {}",
