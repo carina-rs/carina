@@ -462,6 +462,32 @@ pub fn find_installed_provider(
         .as_deref()
         .ok_or_else(|| format!("Provider '{}' has no source", config.name))?;
 
+    // For file:// sources, look in .carina/providers/file/
+    if let Some(file_path) = source.strip_prefix("file://") {
+        let src = std::path::Path::new(file_path);
+        let file_name = src
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("provider");
+        let dest = base_dir
+            .join(".carina")
+            .join("providers")
+            .join("file")
+            .join(file_name)
+            .join(
+                src.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("provider.wasm"),
+            );
+        if dest.exists() {
+            return Ok(dest);
+        }
+        return Err(format!(
+            "not installed. Run `carina init` in {}",
+            base_dir.display()
+        ));
+    }
+
     let lock_path = base_dir.join("carina-providers.lock");
     let lock_file = LockFile::load(&lock_path).unwrap_or_default();
 
