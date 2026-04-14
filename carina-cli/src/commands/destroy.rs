@@ -118,9 +118,6 @@ pub async fn run_destroy(
         op_result?;
     }
 
-    // Create backend lock after state is successfully written
-    crate::commands::ensure_backend_lock(base_dir, parsed.backend.as_ref())?;
-
     Ok(())
 }
 

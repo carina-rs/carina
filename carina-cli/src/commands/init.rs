@@ -22,31 +22,31 @@ pub fn run_init(path: &Path, upgrade: bool) -> Result<(), String> {
         .filter(|p| p.source.as_ref().is_some_and(|s| !s.starts_with("file://")))
         .collect();
 
-    if github_providers.is_empty() {
+    if !github_providers.is_empty() {
+        let action = if upgrade { "Upgrading" } else { "Resolving" };
         println!(
             "{}",
-            "No providers with remote source found. Nothing to do.".cyan()
+            format!("{} {} provider(s)...", action, github_providers.len()).cyan()
         );
-        return Ok(());
+
+        let resolved =
+            carina_provider_resolver::resolve_all(base_dir, &loaded.parsed.providers, upgrade)?;
+
+        println!(
+            "{}",
+            format!(
+                "{} provider(s) installed in .carina/providers/",
+                resolved.len()
+            )
+            .green()
+        );
     }
 
-    let action = if upgrade { "Upgrading" } else { "Resolving" };
-    println!(
-        "{}",
-        format!("{} {} provider(s)...", action, github_providers.len()).cyan()
-    );
+    // Create backend lock so apply/destroy can detect backend config changes
+    crate::commands::ensure_backend_lock(base_dir, loaded.parsed.backend.as_ref())
+        .map_err(|e| format!("Failed to create backend lock: {e}"))?;
 
-    let resolved =
-        carina_provider_resolver::resolve_all(base_dir, &loaded.parsed.providers, upgrade)?;
-
-    println!(
-        "{}",
-        format!(
-            "Done. {} provider(s) installed in .carina/providers/",
-            resolved.len()
-        )
-        .green()
-    );
+    println!("{}", "Initialized successfully.".green());
 
     Ok(())
 }
