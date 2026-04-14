@@ -895,7 +895,7 @@ fn diff_display_update_resource(
 /// 3. Writes it to the configured remote backend
 /// 4. Reads it back to verify the write
 /// 5. Prompts to delete the local file (unless `--auto-approve`)
-/// 6. Updates `.carina/backend-lock.json` with the new remote config
+/// 6. Updates `carina-backend.lock` with the new remote config
 async fn run_state_migrate(
     path: &PathBuf,
     auto_approve: bool,

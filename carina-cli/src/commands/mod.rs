@@ -29,7 +29,7 @@ use crate::wiring::{
 };
 
 /// Detect whether the `backend` block in the current configuration has
-/// changed since the last run, by comparing against `.carina/backend-lock.json`
+/// changed since the last run, by comparing against `carina-backend.lock`
 /// under `base_dir`.
 ///
 /// - If no lock exists yet, the current config is written as the new lock.
@@ -240,7 +240,7 @@ mod tests {
         let result = check_backend_lock(tmp.path(), Some(&config), false);
         assert!(result.is_ok());
         // Lock should NOT be created by check — only by ensure_backend_lock
-        assert!(!tmp.path().join(".carina/backend-lock.json").exists());
+        assert!(!tmp.path().join("carina-backend.lock").exists());
     }
 
     #[test]
@@ -248,7 +248,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config = s3_backend_config("my-bucket", "us-east-1");
         ensure_backend_lock(tmp.path(), Some(&config)).unwrap();
-        assert!(tmp.path().join(".carina/backend-lock.json").exists());
+        assert!(tmp.path().join("carina-backend.lock").exists());
     }
 
     #[test]
@@ -293,7 +293,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let result = check_backend_lock(tmp.path(), None, false);
         assert!(result.is_ok());
-        assert!(!tmp.path().join(".carina/backend-lock.json").exists());
+        assert!(!tmp.path().join("carina-backend.lock").exists());
     }
 
     #[test]

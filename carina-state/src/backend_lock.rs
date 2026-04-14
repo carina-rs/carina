@@ -1,7 +1,7 @@
 //! Local backend-configuration lock file for change detection.
 //!
 //! Carina stores a hash of the current `backend` block in a local file
-//! (`.carina/backend-lock.json`) next to the user's `.crn` files. Before
+//! (`carina-backend.lock`) at the project root. Before
 //! each plan/apply, the stored hash is compared against the current
 //! configuration — a mismatch indicates that the backend has been
 //! reconfigured (for example, the bucket or key was changed), and Carina
@@ -18,11 +18,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::backend::{BackendConfig, BackendError, BackendResult};
 
-/// Name of the lock directory, relative to the configuration root.
-pub const LOCK_DIR: &str = ".carina";
+/// Name of the lock file at the project root.
+pub const LOCK_FILE: &str = "carina-backend.lock";
 
-/// Name of the lock file, relative to `LOCK_DIR`.
-pub const LOCK_FILE: &str = "backend-lock.json";
+/// Legacy lock path components (for migration from `.carina/backend-lock.json`).
+const LEGACY_LOCK_DIR: &str = ".carina";
+const LEGACY_LOCK_FILE: &str = "backend-lock.json";
 
 /// Snapshot of the backend configuration that was last used for a given
 /// configuration root. Persisted to disk as JSON.
@@ -63,19 +64,33 @@ impl BackendLock {
         }
     }
 
-    /// Path to the lock file under `base_dir`.
+    /// Path to the lock file under `base_dir` (project root).
     pub fn lock_path(base_dir: &Path) -> PathBuf {
-        base_dir.join(LOCK_DIR).join(LOCK_FILE)
+        base_dir.join(LOCK_FILE)
+    }
+
+    /// Legacy lock path (`.carina/backend-lock.json`).
+    fn legacy_lock_path(base_dir: &Path) -> PathBuf {
+        base_dir.join(LEGACY_LOCK_DIR).join(LEGACY_LOCK_FILE)
     }
 
     /// Load an existing lock from `base_dir`, returning `None` if no
-    /// lock file exists yet.
+    /// lock file exists yet. Falls back to the legacy path for migration.
     pub fn load(base_dir: &Path) -> BackendResult<Option<Self>> {
         let path = Self::lock_path(base_dir);
-        if !path.exists() {
-            return Ok(None);
+        if path.exists() {
+            return Self::load_from(&path);
         }
-        let contents = std::fs::read_to_string(&path)
+        // Migration: try legacy path
+        let legacy = Self::legacy_lock_path(base_dir);
+        if legacy.exists() {
+            return Self::load_from(&legacy);
+        }
+        Ok(None)
+    }
+
+    fn load_from(path: &Path) -> BackendResult<Option<Self>> {
+        let contents = std::fs::read_to_string(path)
             .map_err(|e| BackendError::Io(format!("Failed to read {}: {}", path.display(), e)))?;
         let lock: Self = serde_json::from_str(&contents).map_err(|e| {
             BackendError::Serialization(format!(
@@ -87,14 +102,9 @@ impl BackendLock {
         Ok(Some(lock))
     }
 
-    /// Persist this lock snapshot under `base_dir`, creating the
-    /// `.carina` directory if it does not yet exist.
+    /// Persist this lock snapshot at the project root.
     pub fn save(&self, base_dir: &Path) -> BackendResult<()> {
-        let lock_dir = base_dir.join(LOCK_DIR);
-        std::fs::create_dir_all(&lock_dir).map_err(|e| {
-            BackendError::Io(format!("Failed to create {}: {}", lock_dir.display(), e))
-        })?;
-        let path = lock_dir.join(LOCK_FILE);
+        let path = Self::lock_path(base_dir);
         let contents = serde_json::to_string_pretty(self)
             .map_err(|e| BackendError::Serialization(e.to_string()))?;
         std::fs::write(&path, contents)
@@ -185,6 +195,49 @@ mod tests {
     fn load_returns_none_when_lock_missing() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(BackendLock::load(tmp.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn lock_saves_to_project_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock = BackendLock::from_config(&make_config("b", "us-east-1"));
+        lock.save(tmp.path()).unwrap();
+        // Should be at root, not in .carina/
+        assert!(tmp.path().join("carina-backend.lock").exists());
+        assert!(!tmp.path().join(".carina/backend-lock.json").exists());
+    }
+
+    #[test]
+    fn load_migrates_from_legacy_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock = BackendLock::from_config(&make_config("b", "us-east-1"));
+        // Write to legacy path
+        let legacy_dir = tmp.path().join(".carina");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let contents = serde_json::to_string_pretty(&lock).unwrap();
+        std::fs::write(legacy_dir.join("backend-lock.json"), contents).unwrap();
+        // Load should find it
+        let loaded = BackendLock::load(tmp.path()).unwrap().unwrap();
+        assert_eq!(lock, loaded);
+    }
+
+    #[test]
+    fn new_path_takes_precedence_over_legacy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_lock = BackendLock::from_config(&make_config("old-bucket", "us-east-1"));
+        let new_lock = BackendLock::from_config(&make_config("new-bucket", "us-east-1"));
+        // Write old to legacy, new to root
+        let legacy_dir = tmp.path().join(".carina");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(
+            legacy_dir.join("backend-lock.json"),
+            serde_json::to_string_pretty(&old_lock).unwrap(),
+        )
+        .unwrap();
+        new_lock.save(tmp.path()).unwrap();
+        // Should load the new one
+        let loaded = BackendLock::load(tmp.path()).unwrap().unwrap();
+        assert_eq!(loaded, new_lock);
     }
 
     #[test]
