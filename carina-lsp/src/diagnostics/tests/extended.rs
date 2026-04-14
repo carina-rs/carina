@@ -1543,3 +1543,71 @@ fn map_key_validation_warns_on_invalid_key() {
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn string_based_custom_types_are_compatible() {
+    // Regression test for #1822: when both the source and sink are String-based
+    // Custom types (e.g., AwsAccountId → TargetId), the LSP should not flag a
+    // type mismatch, matching the CLI's behavior (#1795).
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    fn validate_account_id(v: &carina_core::resource::Value) -> Result<(), String> {
+        match v {
+            carina_core::resource::Value::String(s) if s.len() == 12 => Ok(()),
+            _ => Err("expected 12-digit account ID".to_string()),
+        }
+    }
+
+    fn validate_target_id(v: &carina_core::resource::Value) -> Result<(), String> {
+        match v {
+            carina_core::resource::Value::String(_) => Ok(()),
+            _ => Err("expected string".to_string()),
+        }
+    }
+
+    // Source resource: has an AwsAccountId attribute
+    let source_schema = ResourceSchema::new("sts.caller_identity").attribute(AttributeSchema::new(
+        "account_id",
+        AttributeType::Custom {
+            name: "AwsAccountId".to_string(),
+            base: Box::new(AttributeType::String),
+            validate: validate_account_id,
+            namespace: Some("aws".to_string()),
+            to_dsl: None,
+        },
+    ));
+
+    // Target resource: has a TargetId attribute (also String-based Custom)
+    let target_schema = ResourceSchema::new("sso.assignment").attribute(AttributeSchema::new(
+        "target_id",
+        AttributeType::Custom {
+            name: "TargetId".to_string(),
+            base: Box::new(AttributeType::String),
+            validate: validate_target_id,
+            namespace: Some("awscc".to_string()),
+            to_dsl: None,
+        },
+    ));
+
+    let mut schemas = HashMap::new();
+    schemas.insert("aws.sts.caller_identity".to_string(), source_schema);
+    schemas.insert("awscc.sso.assignment".to_string(), target_schema);
+    let engine = custom_engine(schemas);
+
+    let doc = create_document(
+        r#"let caller = read aws.sts.caller_identity {}
+
+awscc.sso.assignment {
+target_id = caller.account_id
+}"#,
+    );
+    let diagnostics = engine.analyze(&doc, None);
+    let type_mismatch = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Type mismatch"));
+    assert!(
+        type_mismatch.is_none(),
+        "String-based Custom types should be compatible (AwsAccountId → TargetId). Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
