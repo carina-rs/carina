@@ -406,6 +406,13 @@ impl ParsedFile {
                 && matches!(r.get_attr(attr_name), Some(Value::String(n)) if n == attr_value)
         })
     }
+
+    /// Print all collected warnings to stderr.
+    pub fn print_warnings(&self) {
+        for w in &self.warnings {
+            eprintln!("  ⚠ for expression at line {}: {}", w.line, w.message);
+        }
+    }
 }
 
 /// Parse context (variable scope)
@@ -1609,7 +1616,6 @@ fn parse_for_expr(
                     path.to_dot_string()
                 )
             };
-            eprintln!("  ⚠ for expression at line {}: {}", for_line, message);
             ctx.warnings.push(ParseWarning {
                 line: for_line,
                 message,
