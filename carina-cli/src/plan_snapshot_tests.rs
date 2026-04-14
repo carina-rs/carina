@@ -241,6 +241,7 @@ fn snapshot_all_create() {
         &HashMap::new(),
         Some(&schemas),
         &HashMap::new(),
+        &[],
     ));
     insta::assert_snapshot!(output);
 }
@@ -254,6 +255,7 @@ fn snapshot_no_changes() {
         &HashMap::new(),
         None,
         &HashMap::new(),
+        &[],
     ));
     insta::assert_snapshot!(output);
 }
@@ -267,6 +269,7 @@ fn snapshot_mixed_operations() {
         &HashMap::new(),
         Some(&schemas),
         &HashMap::new(),
+        &[],
     ));
     insta::assert_snapshot!(output);
 }
@@ -295,6 +298,7 @@ fn snapshot_delete_orphan() {
         &delete_attributes,
         Some(&schemas),
         &HashMap::new(),
+        &[],
     ));
     insta::assert_snapshot!(output);
 }
@@ -308,6 +312,7 @@ fn snapshot_compact() {
         &HashMap::new(),
         None,
         &HashMap::new(),
+        &[],
     ));
     insta::assert_snapshot!(output);
 }
@@ -321,6 +326,7 @@ fn snapshot_map_key_diff() {
         &HashMap::new(),
         Some(&schemas),
         &HashMap::new(),
+        &[],
     ));
     insta::assert_snapshot!(output);
 }
@@ -334,6 +340,7 @@ fn snapshot_enum_display() {
         &HashMap::new(),
         Some(&schemas),
         &HashMap::new(),
+        &[],
     ));
     insta::assert_snapshot!(output);
 }
@@ -347,6 +354,7 @@ fn snapshot_no_changes_enum() {
         &HashMap::new(),
         None,
         &HashMap::new(),
+        &[],
     ));
     insta::assert_snapshot!(output);
 }
@@ -396,6 +404,7 @@ fn snapshot_default_values() {
         &HashMap::new(),
         Some(&schemas),
         &HashMap::new(),
+        &[],
     ));
     insta::assert_snapshot!(output);
 }
@@ -409,6 +418,7 @@ fn snapshot_read_only_attrs() {
         &HashMap::new(),
         Some(&schemas),
         &HashMap::new(),
+        &[],
     ));
     insta::assert_snapshot!(output);
 }
@@ -422,6 +432,7 @@ fn snapshot_explicit() {
         &HashMap::new(),
         Some(&schemas),
         &HashMap::new(),
+        &[],
     ));
     insta::assert_snapshot!(output);
 }
@@ -435,6 +446,7 @@ fn snapshot_default_tags() {
         &HashMap::new(),
         Some(&schemas),
         &HashMap::new(),
+        &[],
     ));
     insta::assert_snapshot!(output);
 }
@@ -448,6 +460,7 @@ fn snapshot_state_blocks() {
         &HashMap::new(),
         Some(&schemas),
         &HashMap::new(),
+        &[],
     ));
     insta::assert_snapshot!(output);
 }
@@ -476,6 +489,7 @@ fn snapshot_secret_values() {
         &delete_attributes,
         Some(&schemas),
         &HashMap::new(),
+        &[],
     ));
     insta::assert_snapshot!(output);
 }
@@ -489,6 +503,7 @@ fn snapshot_moved_with_changes() {
         &HashMap::new(),
         Some(&schemas),
         &moved_origins,
+        &[],
     ));
     insta::assert_snapshot!(output);
 }
@@ -516,6 +531,7 @@ fn snapshot_moved_prev_keys() {
         &HashMap::new(),
         Some(&schemas),
         &moved_origins,
+        &[],
     ));
     insta::assert_snapshot!(output);
 }
@@ -549,6 +565,7 @@ fn snapshot_moved_pure() {
         &HashMap::new(),
         Some(&schemas),
         &moved_origins,
+        &[],
     ));
     insta::assert_snapshot!(output);
 }
@@ -626,6 +643,44 @@ fn plan_snapshot_remote_state() {
         &HashMap::new(),
         Some(&schemas),
         &moved_origins,
+        &[],
+    );
+    insta::assert_snapshot!(strip_ansi(&output));
+}
+
+#[test]
+fn plan_snapshot_exports() {
+    use carina_core::parser::{ExportParameter, TypeExpr};
+    use carina_core::resource::Value;
+
+    let (plan, schemas, moved_origins) = build_plan_from_fixture("exports");
+    let exports = vec![
+        ExportParameter {
+            name: "vpc_id".to_string(),
+            type_expr: Some(TypeExpr::String),
+            value: Some(Value::resource_ref(
+                "vpc".to_string(),
+                "vpc_id".to_string(),
+                vec![],
+            )),
+        },
+        ExportParameter {
+            name: "cidr".to_string(),
+            type_expr: None,
+            value: Some(Value::resource_ref(
+                "vpc".to_string(),
+                "cidr_block".to_string(),
+                vec![],
+            )),
+        },
+    ];
+    let output = format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &moved_origins,
+        &exports,
     );
     insta::assert_snapshot!(strip_ansi(&output));
 }
@@ -639,6 +694,7 @@ fn snapshot_nested_map_diff() {
         &HashMap::new(),
         Some(&schemas),
         &HashMap::new(),
+        &[],
     ));
     insta::assert_snapshot!(output);
 }

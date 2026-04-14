@@ -1371,6 +1371,7 @@ async fn run_apply_locked(
         &delete_attributes,
         Some(ctx.schemas()),
         &moved_origins,
+        &parsed.export_params,
     );
 
     // Confirmation prompt
@@ -1672,6 +1673,7 @@ async fn run_apply_from_plan_locked(
         &delete_attributes,
         None,
         &HashMap::new(),
+        &[],
     );
 
     // Confirmation prompt

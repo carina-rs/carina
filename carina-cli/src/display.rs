@@ -49,16 +49,47 @@ fn format_compact_name(
     }
 }
 
+/// Format an export value for plan display.
+fn format_export_value(value: &Value) -> String {
+    match value {
+        Value::String(s) => format!("'{}'", s),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::ResourceRef { path } => path.to_dot_string().to_string(),
+        Value::List(items) => {
+            let formatted: Vec<String> = items.iter().map(format_export_value).collect();
+            format!("[{}]", formatted.join(", "))
+        }
+        Value::Map(map) => {
+            let formatted: Vec<String> = map
+                .iter()
+                .map(|(k, v)| format!("{} = {}", k, format_export_value(v)))
+                .collect();
+            format!("{{{}}}", formatted.join(", "))
+        }
+        _ => "(known after apply)".to_string(),
+    }
+}
+
 pub fn print_plan(
     plan: &Plan,
     detail: DetailLevel,
     delete_attributes: &HashMap<ResourceId, HashMap<String, Value>>,
     schemas: Option<&HashMap<String, ResourceSchema>>,
     moved_origins: &HashMap<ResourceId, ResourceId>,
+    export_params: &[carina_core::parser::ExportParameter],
 ) {
     print!(
         "{}",
-        format_plan(plan, detail, delete_attributes, schemas, moved_origins)
+        format_plan(
+            plan,
+            detail,
+            delete_attributes,
+            schemas,
+            moved_origins,
+            export_params
+        )
     );
 }
 
@@ -72,6 +103,7 @@ pub fn format_plan(
     delete_attributes: &HashMap<ResourceId, HashMap<String, Value>>,
     schemas: Option<&HashMap<String, ResourceSchema>>,
     moved_origins: &HashMap<ResourceId, ResourceId>,
+    export_params: &[carina_core::parser::ExportParameter],
 ) -> String {
     let mut out = String::new();
 
@@ -100,6 +132,34 @@ pub fn format_plan(
         schemas,
         moved_origins,
     ));
+
+    // Show exports if any
+    if !export_params.is_empty() {
+        writeln!(out).unwrap();
+        writeln!(out, "{}", "Exports:".cyan().bold()).unwrap();
+        writeln!(out).unwrap();
+        for param in export_params {
+            let type_str = param
+                .type_expr
+                .as_ref()
+                .map(|t| format!(": {}", t))
+                .unwrap_or_default();
+            let value_str = param
+                .value
+                .as_ref()
+                .map(format_export_value)
+                .unwrap_or_else(|| "(unknown)".to_string());
+            writeln!(
+                out,
+                "  {} {}{} = {}",
+                "+".green(),
+                param.name,
+                type_str.dimmed(),
+                value_str
+            )
+            .unwrap();
+        }
+    }
 
     writeln!(out).unwrap();
     let summary = plan.summary();
@@ -1609,6 +1669,7 @@ mod tests {
             &HashMap::new(),
             None,
             &HashMap::new(),
+            &[],
         );
     }
 
@@ -1629,6 +1690,7 @@ mod tests {
             &HashMap::new(),
             None,
             &HashMap::new(),
+            &[],
         );
     }
 
@@ -2150,6 +2212,7 @@ mod tests {
             &HashMap::new(),
             None,
             &HashMap::new(),
+            &[],
         );
     }
 
@@ -2177,6 +2240,7 @@ mod tests {
             &HashMap::new(),
             None,
             &HashMap::new(),
+            &[],
         );
     }
 
@@ -2327,6 +2391,7 @@ mod tests {
             &HashMap::new(),
             None,
             &HashMap::new(),
+            &[],
         );
     }
 
