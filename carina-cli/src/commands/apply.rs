@@ -466,6 +466,7 @@ pub struct FinalizeApplyInput<'a> {
     pub backend: &'a dyn StateBackend,
     pub lock: Option<&'a LockInfo>,
     pub schemas: &'a HashMap<String, ResourceSchema>,
+    pub export_params: &'a [carina_core::parser::ExportParameter],
 }
 
 /// Save state after apply. Does NOT release the lock -- caller is responsible.
@@ -488,6 +489,12 @@ pub async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), AppErro
         schemas: input.schemas,
     })?;
 
+    // Resolve exports and persist to state
+    if !input.export_params.is_empty() {
+        let exports = resolve_exports(input.export_params, input.sorted_resources, &state);
+        state.exports = exports;
+    }
+
     if let Some(lock) = input.lock {
         save_state_locked(input.backend, lock, &mut state).await?;
     } else {
@@ -496,6 +503,74 @@ pub async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), AppErro
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
 
     Ok(())
+}
+
+/// Resolve export expressions using the binding map built from applied state.
+fn resolve_exports(
+    export_params: &[carina_core::parser::ExportParameter],
+    _resources: &[Resource],
+    state: &StateFile,
+) -> HashMap<String, serde_json::Value> {
+    use carina_core::resource::Value;
+
+    // Build binding map from state (binding name → attributes)
+    let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+    for rs in &state.resources {
+        if let Some(ref binding) = rs.binding {
+            let attrs: HashMap<String, Value> = rs
+                .attributes
+                .iter()
+                .filter_map(|(k, v)| {
+                    carina_core::value::json_to_dsl_value(v).map(|val| (k.clone(), val))
+                })
+                .collect();
+            binding_map.insert(binding.clone(), attrs);
+        }
+    }
+
+    let mut exports = HashMap::new();
+    for param in export_params {
+        if let Some(ref value) = param.value {
+            match carina_core::resolver::resolve_ref_value(value, &binding_map) {
+                Ok(resolved) => {
+                    if let Some(json) = dsl_value_to_json(&resolved) {
+                        exports.insert(param.name.clone(), json);
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  Warning: failed to resolve export '{}': {}",
+                        param.name, e
+                    );
+                }
+            }
+        }
+    }
+    exports
+}
+
+/// Convert a DSL Value to a serde_json::Value for state persistence.
+fn dsl_value_to_json(value: &carina_core::resource::Value) -> Option<serde_json::Value> {
+    use carina_core::resource::Value;
+    match value {
+        Value::String(s) => Some(serde_json::Value::String(s.clone())),
+        Value::Bool(b) => Some(serde_json::Value::Bool(*b)),
+        Value::Int(i) => Some(serde_json::Value::Number((*i).into())),
+        Value::Float(f) => serde_json::Number::from_f64(*f).map(serde_json::Value::Number),
+        Value::List(items) => {
+            let json_items: Vec<serde_json::Value> =
+                items.iter().filter_map(dsl_value_to_json).collect();
+            Some(serde_json::Value::Array(json_items))
+        }
+        Value::Map(map) => {
+            let json_map: serde_json::Map<String, serde_json::Value> = map
+                .iter()
+                .filter_map(|(k, v)| dsl_value_to_json(v).map(|jv| (k.clone(), jv)))
+                .collect();
+            Some(serde_json::Value::Object(json_map))
+        }
+        _ => None, // ResourceRef, Null, etc. — skip
+    }
 }
 
 /// Renew the lock and write state with lock validation.
@@ -1357,6 +1432,7 @@ async fn run_apply_locked(
         backend,
         lock,
         schemas,
+        export_params: &parsed.export_params,
     })
     .await?;
 
@@ -1679,6 +1755,7 @@ async fn run_apply_from_plan_locked(
         backend,
         lock,
         schemas: ctx.schemas(),
+        export_params: &[],
     })
     .await?;
 

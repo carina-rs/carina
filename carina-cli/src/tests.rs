@@ -1376,6 +1376,7 @@ async fn lock_released_on_write_state_failure() {
         backend: &backend,
         lock: Some(&lock),
         schemas: &HashMap::new(),
+        export_params: &[],
     })
     .await;
 
@@ -1508,6 +1509,7 @@ async fn finalize_apply_uses_write_state_locked() {
         backend: &backend,
         lock: Some(&lock),
         schemas: &HashMap::new(),
+        export_params: &[],
     })
     .await;
 
@@ -2037,6 +2039,7 @@ async fn finalize_apply_without_lock_uses_write_state() {
         backend: &backend,
         lock: None, // No lock
         schemas: &HashMap::new(),
+        export_params: &[],
     })
     .await;
 
