@@ -96,16 +96,11 @@ pub fn build_factories_from_providers(
             None => continue,
         };
 
-        let binary_path = if let Some(path) = source.strip_prefix("file://") {
-            std::path::PathBuf::from(path)
-        } else if source.starts_with("github.com/") {
-            match carina_provider_resolver::resolve_single_config(base_dir, config) {
+        let binary_path = if source.starts_with("file://") || source.starts_with("github.com/") {
+            match carina_provider_resolver::find_installed_provider(base_dir, config) {
                 Ok(path) => path,
                 Err(e) => {
-                    let reason = format!(
-                        "Failed to resolve provider '{}' from '{}': {}",
-                        config.name, source, e
-                    );
+                    let reason = format!("Provider '{}' {}", config.name, e);
                     eprintln!("{}", reason.red());
                     load_errors.insert(config.name.clone(), reason);
                     continue;
@@ -650,10 +645,9 @@ async fn load_source_provider(
     config: &ProviderConfig,
     base_dir: &Path,
 ) -> Result<(Box<dyn ProviderFactory>, Box<dyn Provider>, String), String> {
-    let binary_path = if let Some(path) = source.strip_prefix("file://") {
-        std::path::PathBuf::from(path)
-    } else if source.starts_with("github.com/") {
-        carina_provider_resolver::resolve_single_config(base_dir, config)?
+    let binary_path = if source.starts_with("file://") || source.starts_with("github.com/") {
+        carina_provider_resolver::find_installed_provider(base_dir, config)
+            .map_err(|e| format!("Provider '{}' {}", config.name, e))?
     } else {
         return Err(format!(
             "Unsupported source format: {source}. Use file:// for local binaries or github.com/owner/repo for remote."
