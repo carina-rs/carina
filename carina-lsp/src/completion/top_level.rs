@@ -90,6 +90,14 @@ impl CompletionProvider {
                 ..Default::default()
             },
             CompletionItem {
+                label: "exports".to_string(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                insert_text: Some("exports {\n    ${1:name}: ${2:type} = ${3:value}\n}".to_string()),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                detail: Some("Publish values for remote_state consumers".to_string()),
+                ..Default::default()
+            },
+            CompletionItem {
                 label: "fn".to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
                 insert_text: Some("fn ${1:name}(${2:params}) {\n    ${3:body}\n}".to_string()),
