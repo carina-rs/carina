@@ -56,6 +56,7 @@ pub enum ParseError {
 /// A structured warning emitted during parsing (non-fatal).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseWarning {
+    pub file: Option<String>,
     pub line: usize,
     pub message: String,
 }
@@ -68,6 +69,8 @@ pub const DEFERRED_UPSTREAM_PLACEHOLDER: &str = "(known after upstream apply)";
 /// resources *would* be created once the iterable becomes available.
 #[derive(Debug, Clone)]
 pub struct DeferredForExpression {
+    /// Source file name (stamped by config_loader after parsing).
+    pub file: Option<String>,
     /// Source line number of the `for` keyword.
     pub line: usize,
     /// The for-expression header, e.g., `for account_id in orgs.accounts`.
@@ -431,7 +434,11 @@ impl ParsedFile {
     /// Print all collected warnings to stderr.
     pub fn print_warnings(&self) {
         for w in &self.warnings {
-            eprintln!("  ⚠ for expression at line {}: {}", w.line, w.message);
+            let location = match &w.file {
+                Some(f) => format!("{}:{}", f, w.line),
+                None => format!("line {}", w.line),
+            };
+            eprintln!("  ⚠ {}: {}", location, w.message);
         }
     }
 }
@@ -1642,6 +1649,7 @@ fn parse_for_expr(
                 )
             };
             ctx.warnings.push(ParseWarning {
+                file: None,
                 line: for_line,
                 message,
             });
@@ -1688,6 +1696,7 @@ fn parse_for_expr(
                     .map(|(k, expr)| (k.clone(), expr.0.clone()))
                     .collect();
                 ctx.deferred_for_expressions.push(DeferredForExpression {
+                    file: None,
                     line: for_line,
                     header,
                     resource_type: resource.id.resource_type.clone(),
