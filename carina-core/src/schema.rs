@@ -480,6 +480,13 @@ impl AttributeType {
             _ => self.type_name() == name,
         }
     }
+
+    /// Check if this type is a String-based Custom type.
+    /// Used for cross-schema type compatibility: all String-based Custom types
+    /// are considered compatible with each other.
+    pub fn is_string_based_custom(&self) -> bool {
+        matches!(self, AttributeType::Custom { base, .. } if matches!(**base, AttributeType::String))
+    }
 }
 
 impl fmt::Display for AttributeType {

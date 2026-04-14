@@ -141,11 +141,18 @@ pub fn validate_resource_ref_types(
             // - Union type accepts any member type name -> OK
             // - Same type -> OK
             // - Either is "String" -> OK (String is the base type for Custom types)
+            // - Both are String-based Custom types -> OK (different length/pattern constraints
+            //   for the same logical identifier, or semantic type assigned to generic pattern)
             // - Different Custom types -> Error
             if attr_schema.attr_type.accepts_type_name(&ref_type_name) {
                 continue;
             }
             if expected_type_name == "String" || ref_type_name == "String" {
+                continue;
+            }
+            if attr_schema.attr_type.is_string_based_custom()
+                && ref_attr_schema.attr_type.is_string_based_custom()
+            {
                 continue;
             }
 
