@@ -174,7 +174,10 @@ identifier = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 namespaced_id = @{ identifier ~ ("." ~ (identifier | ASCII_DIGIT+))+ }
 
 // Expression
-expression = { pipe_expr }
+expression = { coalesce_expr }
+
+// Null coalescing: expr ?? default (returns left if resolved, right if unresolved reference)
+coalesce_expr = { pipe_expr ~ ("??" ~ pipe_expr)? }
 
 // Pipe operator: value |> func |> func
 pipe_expr = { compose_expr ~ ("|>" ~ function_call)* }
