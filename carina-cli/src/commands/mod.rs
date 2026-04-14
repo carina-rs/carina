@@ -326,6 +326,7 @@ mod tests {
             module_calls: vec![],
             arguments: vec![],
             attribute_params: vec![],
+            export_params: vec![],
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),

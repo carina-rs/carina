@@ -470,6 +470,7 @@ mod tests {
             module_calls: Vec::new(),
             arguments: Vec::new(),
             attribute_params: Vec::new(),
+            export_params: vec![],
             backend: None,
             state_blocks: Vec::new(),
             user_functions: HashMap::new(),

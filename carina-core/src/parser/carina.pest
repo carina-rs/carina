@@ -3,7 +3,7 @@
 // Entry point
 file = { SOI ~ statement* ~ EOI }
 
-statement = { backend_block | provider_block | arguments_block | attributes_block | import_state_block | removed_block | moved_block | require_statement | if_expr | for_expr | fn_def | let_binding | module_call | anonymous_resource }
+statement = { backend_block | provider_block | arguments_block | attributes_block | exports_block | import_state_block | removed_block | moved_block | require_statement | if_expr | for_expr | fn_def | let_binding | module_call | anonymous_resource }
 
 // Require statement: require <validate_expr>, "error message"
 require_statement = { "require" ~ validate_expr ~ "," ~ string }
@@ -75,6 +75,16 @@ attributes_block = {
 
 // Attributes parameter: name: type = expr, or name = expr (type optional)
 attributes_param = {
+    identifier ~ ":" ~ type_expr ~ "=" ~ expression
+  | identifier ~ "=" ~ expression
+}
+
+exports_block = {
+    "exports" ~ "{" ~ exports_param* ~ "}"
+}
+
+// Exports parameter: name: type = expr, or name = expr (type optional)
+exports_param = {
     identifier ~ ":" ~ type_expr ~ "=" ~ expression
   | identifier ~ "=" ~ expression
 }

@@ -215,6 +215,15 @@ pub struct AttributeParameter {
     pub value: Option<Value>,
 }
 
+/// An export parameter in an `exports { }` block.
+/// Publishes a named value for `remote_state` consumers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportParameter {
+    pub name: String,
+    pub type_expr: Option<TypeExpr>,
+    pub value: Option<Value>,
+}
+
 /// State manipulation block (import, removed, moved)
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum StateBlock {
@@ -348,6 +357,8 @@ pub struct ParsedFile {
     pub arguments: Vec<ArgumentParameter>,
     /// Top-level attribute parameters (directory-based module style)
     pub attribute_params: Vec<AttributeParameter>,
+    /// Top-level export parameters (published to remote_state consumers)
+    pub export_params: Vec<ExportParameter>,
     /// Backend configuration for state storage
     pub backend: Option<BackendConfig>,
     /// State manipulation blocks (import, removed, moved)
@@ -525,6 +536,7 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
     let mut module_calls = Vec::new();
     let mut arguments = Vec::new();
     let mut attribute_params = Vec::new();
+    let mut export_params = Vec::new();
     let mut backend = None;
     let mut state_blocks = Vec::new();
     let mut remote_states = Vec::new();
@@ -566,6 +578,10 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
                             Rule::attributes_block => {
                                 let parsed_attribute_params = parse_attributes_block(stmt, &ctx)?;
                                 attribute_params.extend(parsed_attribute_params);
+                            }
+                            Rule::exports_block => {
+                                let parsed_export_params = parse_exports_block(stmt, &ctx)?;
+                                export_params.extend(parsed_export_params);
                             }
                             Rule::import_state_block => {
                                 state_blocks.push(parse_import_state_block(stmt)?);
@@ -718,6 +734,7 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
         module_calls,
         arguments,
         attribute_params,
+        export_params,
         backend,
         state_blocks,
         user_functions: ctx.user_functions,
@@ -1035,6 +1052,41 @@ fn parse_attributes_block(
     }
 
     Ok(attribute_params)
+}
+
+fn parse_exports_block(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+) -> Result<Vec<ExportParameter>, ParseError> {
+    let mut export_params = Vec::new();
+
+    for param in pair.into_inner() {
+        if param.as_rule() == Rule::exports_param {
+            let mut param_inner = param.into_inner();
+            let name = next_pair(&mut param_inner, "parameter name", "exports block")?
+                .as_str()
+                .to_string();
+
+            let next = next_pair(&mut param_inner, "type or expression", "exports parameter")?;
+            let (type_expr, value) = if next.as_rule() == Rule::type_expr {
+                let type_expr = Some(parse_type_expr(next)?);
+                let expr = next_pair(&mut param_inner, "value expression", "exports parameter")?;
+                let value = Some(parse_expression(expr, ctx)?);
+                (type_expr, value)
+            } else {
+                let value = Some(parse_expression(next, ctx)?);
+                (None, value)
+            };
+
+            export_params.push(ExportParameter {
+                name,
+                type_expr,
+                value,
+            });
+        }
+    }
+
+    Ok(export_params)
 }
 
 /// Parse type expression
@@ -9620,5 +9672,50 @@ EOF
         } else {
             panic!("Could not navigate to condition key");
         }
+    }
+
+    #[test]
+    fn parse_exports_block_basic() {
+        let input = r#"
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.vpc {
+  cidr_block = '10.0.0.0/16'
+}
+
+exports {
+  vpc_id = vpc.vpc_id
+}
+"#;
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(parsed.export_params.len(), 1);
+        assert_eq!(parsed.export_params[0].name, "vpc_id");
+        assert!(parsed.export_params[0].type_expr.is_none());
+        assert!(parsed.export_params[0].value.is_some());
+    }
+
+    #[test]
+    fn parse_exports_block_with_type() {
+        let input = r#"
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.vpc {
+  cidr_block = '10.0.0.0/16'
+}
+
+exports {
+  vpc_id: string = vpc.vpc_id
+  cidr: string = vpc.cidr_block
+}
+"#;
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(parsed.export_params.len(), 2);
+        assert_eq!(parsed.export_params[0].name, "vpc_id");
+        assert!(parsed.export_params[0].type_expr.is_some());
+        assert_eq!(parsed.export_params[1].name, "cidr");
     }
 }
