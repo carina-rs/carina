@@ -18,10 +18,10 @@ Resources are defined using the `awscc.<service>.<resource_type>` syntax:
 
 ```crn
 let vpc = awscc.ec2.vpc {
-  name       = "my-vpc"
-  cidr_block = "10.0.0.0/16"
+  name       = 'my-vpc'
+  cidr_block = '10.0.0.0/16'
   tags = {
-    Environment = "production"
+    Environment = 'production'
   }
 }
 ```
@@ -30,10 +30,10 @@ Named resources (using `let`) can be referenced by other resources:
 
 ```crn
 let subnet = awscc.ec2.subnet {
-  name              = "my-subnet"
+  name              = 'my-subnet'
   vpc_id            = vpc.vpc_id
-  cidr_block        = "10.0.1.0/24"
-  availability_zone = "ap-northeast-1a"
+  cidr_block        = '10.0.1.0/24'
+  availability_zone = 'ap-northeast-1a'
 }
 ```
 
