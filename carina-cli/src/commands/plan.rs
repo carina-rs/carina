@@ -108,6 +108,7 @@ pub async fn run_plan(
     provider_context: &ProviderContext,
 ) -> Result<bool, AppError> {
     let mut parsed = load_configuration_with_config(path, provider_context)?.parsed;
+    parsed.print_warnings();
 
     let base_dir = get_base_dir(path);
     validate_and_resolve_with_config(&mut parsed, base_dir, false)?;

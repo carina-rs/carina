@@ -522,6 +522,7 @@ mod tests {
             remote_states: Vec::new(),
             requires: Vec::new(),
             structural_bindings: HashSet::new(),
+            warnings: Vec::new(),
         }
     }
 

@@ -52,6 +52,7 @@ pub fn load_configuration_with_config(
             remote_states: vec![],
             requires: vec![],
             structural_bindings: HashSet::new(),
+            warnings: vec![],
         };
         let mut merged = empty_parsed();
         let mut unresolved_merged = empty_parsed();
@@ -96,6 +97,7 @@ pub fn load_configuration_with_config(
                     unresolved_merged
                         .structural_bindings
                         .extend(unresolved.structural_bindings);
+                    unresolved_merged.warnings.extend(unresolved.warnings);
 
                     // Merge resolved
                     merged.providers.extend(parsed.providers);
@@ -113,6 +115,7 @@ pub fn load_configuration_with_config(
                     merged
                         .structural_bindings
                         .extend(parsed.structural_bindings);
+                    merged.warnings.extend(parsed.warnings);
                     // Merge backend (only one allowed)
                     if let Some(backend) = parsed.backend {
                         if merged.backend.is_some() {
@@ -135,6 +138,14 @@ pub fn load_configuration_with_config(
         if !parse_errors.is_empty() {
             return Err(parse_errors.join("\n"));
         }
+
+        // Upgrade cross-file warnings: a for-expression in one file may reference
+        // a remote_state defined in another file.  During per-file parsing the
+        // remote_state is unknown, so the warning falls back to the generic
+        // "(known after apply)".  Now that all files are merged we can detect
+        // these and rewrite to an upstream-aware message.
+        upgrade_cross_file_warnings(&mut merged, &unresolved_merged);
+
         Ok(LoadedConfig {
             parsed: merged,
             unresolved_parsed: unresolved_merged,
@@ -142,6 +153,47 @@ pub fn load_configuration_with_config(
         })
     } else {
         Err(format!("Path not found: {}", path.display()))
+    }
+}
+
+/// Upgrade generic "(known after apply)" warnings to upstream-aware messages
+/// when the binding matches a remote_state found in a different file.
+fn upgrade_cross_file_warnings(merged: &mut ParsedFile, unresolved: &ParsedFile) {
+    let suffix = " is not yet available (known after apply)";
+    for warning in &mut merged.warnings {
+        if !warning.message.ends_with(suffix) {
+            continue;
+        }
+        // Extract binding name: message is "`orgs.accounts` is not yet available ..."
+        let path_str = match warning
+            .message
+            .strip_prefix('`')
+            .and_then(|s| s.split('`').next())
+        {
+            Some(p) => p,
+            None => continue,
+        };
+        let binding_name = match path_str.split('.').next() {
+            Some(b) => b,
+            None => continue,
+        };
+        // Check against merged remote_states (includes all files)
+        let remote_states = merged
+            .remote_states
+            .iter()
+            .chain(unresolved.remote_states.iter());
+        if let Some(rs) = remote_states
+            .into_iter()
+            .find(|r| r.binding == binding_name)
+        {
+            let new_msg = format!(
+                "`{}` is not yet in the upstream state (remote_state '{}' → {}).\n    Apply that directory first, then re-plan.",
+                path_str,
+                binding_name,
+                rs.backend.location(),
+            );
+            warning.message = new_msg;
+        }
     }
 }
 

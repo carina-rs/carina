@@ -834,6 +834,7 @@ pub async fn run_apply(
 ) -> Result<(), AppError> {
     let loaded = load_configuration_with_config(path, provider_context)?;
     let mut parsed = loaded.parsed;
+    parsed.print_warnings();
     let backend_file = loaded.backend_file;
 
     let base_dir = get_base_dir(path);
