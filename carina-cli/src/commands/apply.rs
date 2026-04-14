@@ -531,18 +531,11 @@ fn resolve_exports(
     let mut exports = HashMap::new();
     for param in export_params {
         if let Some(ref value) = param.value {
-            match carina_core::resolver::resolve_ref_value(value, &binding_map) {
-                Ok(resolved) => {
-                    if let Some(json) = dsl_value_to_json(&resolved) {
-                        exports.insert(param.name.clone(), json);
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "  Warning: failed to resolve export '{}': {}",
-                        param.name, e
-                    );
-                }
+            // Resolve both ResourceRef and cross-file dot-notation strings
+            // (e.g., "registry_prod.account_id" parsed from a different .crn file).
+            let resolved = crate::commands::plan::resolve_export_value(value, &binding_map);
+            if let Some(json) = dsl_value_to_json(&resolved) {
+                exports.insert(param.name.clone(), json);
             }
         }
     }
@@ -2232,5 +2225,54 @@ mod tests {
     fn format_duration_zero() {
         let d = Duration::from_secs(0);
         assert_eq!(format_duration(d), "0.0s");
+    }
+
+    #[test]
+    fn resolve_exports_resolves_cross_file_dot_notation_strings() {
+        use carina_core::parser::ExportParameter;
+        use carina_core::resource::Value;
+        use carina_state::StateFile;
+
+        // Build a state file with a resource that has a binding and attributes
+        let state = {
+            let json = serde_json::json!({
+                "version": 5,
+                "serial": 1,
+                "lineage": "test",
+                "carina_version": "0.4.0",
+                "resources": [
+                    {
+                        "resource_type": "organizations.account",
+                        "name": "registry-prod",
+                        "identifier": "459524413166",
+                        "provider": "awscc",
+                        "binding": "registry_prod",
+                        "attributes": {
+                            "account_id": "459524413166",
+                            "account_name": "registry-prod"
+                        }
+                    }
+                ]
+            });
+            serde_json::from_value::<StateFile>(json).unwrap()
+        };
+
+        // Export param references registry_prod.account_id as a dot-notation string
+        // (this is how cross-file references are parsed: exports.crn doesn't see
+        // the let binding in main.crn, so the parser emits a plain string)
+        let export_params = vec![ExportParameter {
+            name: "account_id".to_string(),
+            type_expr: None,
+            value: Some(Value::String("registry_prod.account_id".to_string())),
+        }];
+
+        let exports = resolve_exports(&export_params, &[], &state);
+
+        assert_eq!(
+            exports.get("account_id"),
+            Some(&serde_json::Value::String("459524413166".to_string())),
+            "resolve_exports should resolve dot-notation strings to actual values. Got: {:?}",
+            exports
+        );
     }
 }
