@@ -523,6 +523,7 @@ mod tests {
             requires: Vec::new(),
             structural_bindings: HashSet::new(),
             warnings: Vec::new(),
+            deferred_for_expressions: Vec::new(),
         }
     }
 

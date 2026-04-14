@@ -1378,6 +1378,7 @@ async fn run_apply_locked(
         Some(ctx.schemas()),
         &moved_origins,
         &resolved_exports,
+        &parsed.deferred_for_expressions,
     );
 
     // Confirmation prompt
@@ -1679,6 +1680,7 @@ async fn run_apply_from_plan_locked(
         &delete_attributes,
         None,
         &HashMap::new(),
+        &[],
         &[],
     );
 

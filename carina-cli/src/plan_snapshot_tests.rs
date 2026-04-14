@@ -242,6 +242,7 @@ fn snapshot_all_create() {
         Some(&schemas),
         &HashMap::new(),
         &[],
+        &[],
     ));
     insta::assert_snapshot!(output);
 }
@@ -256,6 +257,7 @@ fn snapshot_no_changes() {
         None,
         &HashMap::new(),
         &[],
+        &[],
     ));
     insta::assert_snapshot!(output);
 }
@@ -269,6 +271,7 @@ fn snapshot_mixed_operations() {
         &HashMap::new(),
         Some(&schemas),
         &HashMap::new(),
+        &[],
         &[],
     ));
     insta::assert_snapshot!(output);
@@ -299,6 +302,7 @@ fn snapshot_delete_orphan() {
         Some(&schemas),
         &HashMap::new(),
         &[],
+        &[],
     ));
     insta::assert_snapshot!(output);
 }
@@ -312,6 +316,7 @@ fn snapshot_compact() {
         &HashMap::new(),
         None,
         &HashMap::new(),
+        &[],
         &[],
     ));
     insta::assert_snapshot!(output);
@@ -327,6 +332,7 @@ fn snapshot_map_key_diff() {
         Some(&schemas),
         &HashMap::new(),
         &[],
+        &[],
     ));
     insta::assert_snapshot!(output);
 }
@@ -341,6 +347,7 @@ fn snapshot_enum_display() {
         Some(&schemas),
         &HashMap::new(),
         &[],
+        &[],
     ));
     insta::assert_snapshot!(output);
 }
@@ -354,6 +361,7 @@ fn snapshot_no_changes_enum() {
         &HashMap::new(),
         None,
         &HashMap::new(),
+        &[],
         &[],
     ));
     insta::assert_snapshot!(output);
@@ -405,6 +413,7 @@ fn snapshot_default_values() {
         Some(&schemas),
         &HashMap::new(),
         &[],
+        &[],
     ));
     insta::assert_snapshot!(output);
 }
@@ -418,6 +427,7 @@ fn snapshot_read_only_attrs() {
         &HashMap::new(),
         Some(&schemas),
         &HashMap::new(),
+        &[],
         &[],
     ));
     insta::assert_snapshot!(output);
@@ -433,6 +443,7 @@ fn snapshot_explicit() {
         Some(&schemas),
         &HashMap::new(),
         &[],
+        &[],
     ));
     insta::assert_snapshot!(output);
 }
@@ -447,6 +458,7 @@ fn snapshot_default_tags() {
         Some(&schemas),
         &HashMap::new(),
         &[],
+        &[],
     ));
     insta::assert_snapshot!(output);
 }
@@ -460,6 +472,7 @@ fn snapshot_state_blocks() {
         &HashMap::new(),
         Some(&schemas),
         &HashMap::new(),
+        &[],
         &[],
     ));
     insta::assert_snapshot!(output);
@@ -490,6 +503,7 @@ fn snapshot_secret_values() {
         Some(&schemas),
         &HashMap::new(),
         &[],
+        &[],
     ));
     insta::assert_snapshot!(output);
 }
@@ -503,6 +517,7 @@ fn snapshot_moved_with_changes() {
         &HashMap::new(),
         Some(&schemas),
         &moved_origins,
+        &[],
         &[],
     ));
     insta::assert_snapshot!(output);
@@ -531,6 +546,7 @@ fn snapshot_moved_prev_keys() {
         &HashMap::new(),
         Some(&schemas),
         &moved_origins,
+        &[],
         &[],
     ));
     insta::assert_snapshot!(output);
@@ -565,6 +581,7 @@ fn snapshot_moved_pure() {
         &HashMap::new(),
         Some(&schemas),
         &moved_origins,
+        &[],
         &[],
     ));
     insta::assert_snapshot!(output);
@@ -644,6 +661,7 @@ fn plan_snapshot_remote_state() {
         Some(&schemas),
         &moved_origins,
         &[],
+        &[],
     );
     insta::assert_snapshot!(strip_ansi(&output));
 }
@@ -681,6 +699,7 @@ fn plan_snapshot_exports() {
         Some(&schemas),
         &moved_origins,
         &exports,
+        &[],
     );
     insta::assert_snapshot!(strip_ansi(&output));
 }
@@ -695,6 +714,40 @@ fn snapshot_nested_map_diff() {
         Some(&schemas),
         &HashMap::new(),
         &[],
+        &[],
+    ));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_deferred_for() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let fixture_path = PathBuf::from(format!(
+        "{}/tests/fixtures/plan_display/deferred_for",
+        manifest_dir
+    ));
+
+    // Parse — the remote_state has no backing file, so the for-expression is deferred
+    let loaded = load_configuration(&fixture_path).unwrap();
+    let mut parsed = loaded.parsed;
+    let base_dir = get_base_dir(&fixture_path);
+    validate_and_resolve(&mut parsed, base_dir, true).unwrap();
+
+    // The plan should be empty (no concrete effects) but deferred_for_expressions non-empty
+    let plan = carina_core::plan::Plan::new();
+    assert!(
+        !parsed.deferred_for_expressions.is_empty(),
+        "expected at least one deferred for-expression"
+    );
+
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        None,
+        &HashMap::new(),
+        &[],
+        &parsed.deferred_for_expressions,
     ));
     insta::assert_snapshot!(output);
 }
