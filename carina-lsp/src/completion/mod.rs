@@ -182,7 +182,9 @@ impl CompletionProvider {
                     module_name = None;
                 }
             } else if brace_depth == 0
-                && (trimmed.starts_with("arguments") || trimmed.starts_with("attributes"))
+                && (trimmed.starts_with("arguments")
+                    || trimmed.starts_with("attributes")
+                    || trimmed.starts_with("exports"))
                 && trimmed.ends_with('{')
             {
                 in_args_or_attrs_block = true;
@@ -195,6 +197,7 @@ impl CompletionProvider {
                 && !trimmed.starts_with("provider ")
                 && !trimmed.starts_with("arguments ")
                 && !trimmed.starts_with("attributes ")
+                && !trimmed.starts_with("exports ")
                 && !trimmed.starts_with('#')
             {
                 // This is a module call: "module_name {"
