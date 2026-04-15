@@ -12,7 +12,7 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::document::Document;
 use crate::position;
-use carina_core::parser::ParseError;
+use carina_core::parser::{ParseError, ParsedFile};
 use carina_core::provider::ProviderFactory;
 use carina_core::resource::Value;
 use carina_core::schema::ResourceSchema;
@@ -103,7 +103,12 @@ impl DiagnosticEngine {
         self
     }
 
-    pub fn analyze(&self, doc: &Document, base_path: Option<&Path>) -> Vec<Diagnostic> {
+    pub fn analyze(
+        &self,
+        doc: &Document,
+        base_path: Option<&Path>,
+        dir_parsed: Option<&ParsedFile>,
+    ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
         let text = doc.text();
 
@@ -118,8 +123,12 @@ impl DiagnosticEngine {
         // Check for undefined resource references in the raw text
         diagnostics.extend(self.check_undefined_references(&text, &defined_bindings));
 
+        // Use directory-scoped ParsedFile if available, fall back to single-file parse.
+        // Directory-scoped parsing has all cross-file bindings resolved.
+        let parsed_ref = dir_parsed.or(doc.parsed());
+
         // Semantic analysis on parsed file
-        if let Some(parsed) = doc.parsed() {
+        if let Some(parsed) = parsed_ref {
             // Check provider in module
             diagnostics.extend(self.check_provider_in_module(doc, parsed));
 

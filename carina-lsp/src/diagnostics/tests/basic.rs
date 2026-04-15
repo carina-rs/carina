@@ -18,7 +18,7 @@ security_group_ingress {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let unknown_field_diag = diagnostics
         .iter()
@@ -48,7 +48,7 @@ security_group_ingress {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let type_mismatch = diagnostics.iter().find(|d| {
         (d.message.contains("Type mismatch") && d.message.contains("Int"))
@@ -80,7 +80,7 @@ ipv4_ipam_pool_id = vpc.vpc_id
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let type_mismatch = diagnostics
         .iter()
@@ -112,7 +112,7 @@ cidr_block = "10.0.1.0/24"
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let type_mismatch = diagnostics
         .iter()
@@ -151,7 +151,7 @@ security_group_ingress {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let bad_field_diag = diagnostics
         .iter()
@@ -192,7 +192,7 @@ private_dns_name_options_on_launch {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let block_diag = diagnostics
         .iter()
@@ -235,7 +235,7 @@ private_dns_name_options_on_launch {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     // Both blocks should get errors
     let block_count = diagnostics
@@ -271,7 +271,7 @@ security_group_ingress = [{
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let lint_diag = diagnostics
         .iter()
@@ -306,7 +306,7 @@ security_group_ingress {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let lint_diag = diagnostics
         .iter()
@@ -332,7 +332,7 @@ group_description = "Test security group"
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let lint_diag = diagnostics
         .iter()
@@ -356,7 +356,7 @@ region = aws.Region.ap_northeast_1
 aws.sts.caller_identity {}"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let data_source_diag = diagnostics
         .iter()
@@ -379,7 +379,7 @@ region = aws.Region.ap_northeast_1
 let identity = read aws.sts.caller_identity {}"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let data_source_diag = diagnostics
         .iter()
@@ -404,7 +404,7 @@ name = "my-bucket"
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let data_source_diag = diagnostics
         .iter()
@@ -431,8 +431,8 @@ name = "my-bucket"
     let engine = test_engine();
     let engine_rev = test_engine_reversed();
 
-    let diags_normal = engine.analyze(&doc, None);
-    let diags_reversed = engine_rev.analyze(&doc, None);
+    let diags_normal = engine.analyze(&doc, None, None);
+    let diags_reversed = engine_rev.analyze(&doc, None, None);
 
     let messages_normal: Vec<_> = diags_normal.iter().map(|d| &d.message).collect();
     let messages_reversed: Vec<_> = diags_reversed.iter().map(|d| &d.message).collect();
@@ -461,8 +461,8 @@ cidr_block = "10.0.0.0/16"
     let engine = test_engine();
     let engine_rev = test_engine_reversed();
 
-    let diags_normal = engine.analyze(&doc, None);
-    let diags_reversed = engine_rev.analyze(&doc, None);
+    let diags_normal = engine.analyze(&doc, None, None);
+    let diags_reversed = engine_rev.analyze(&doc, None, None);
 
     let messages_normal: Vec<_> = diags_normal.iter().map(|d| &d.message).collect();
     let messages_reversed: Vec<_> = diags_reversed.iter().map(|d| &d.message).collect();
@@ -493,8 +493,8 @@ name = "test-bucket"
 }"#,
     );
 
-    let diags_normal = engine.analyze(&doc, None);
-    let diags_reversed = engine_rev.analyze(&doc, None);
+    let diags_normal = engine.analyze(&doc, None, None);
+    let diags_reversed = engine_rev.analyze(&doc, None, None);
 
     let messages_normal: Vec<_> = diags_normal.iter().map(|d| &d.message).collect();
     let messages_reversed: Vec<_> = diags_reversed.iter().map(|d| &d.message).collect();
@@ -523,7 +523,7 @@ let igw_attachment = awscc.ec2.vpc_gateway_attachment {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
     let dup_diag = diagnostics.iter().find(|d| {
         d.message
             .contains("Duplicate attribute 'internet_gateway_id'")
@@ -556,7 +556,7 @@ let vpc = awscc.ec2.vpc {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
     let dup_diag = diagnostics
         .iter()
         .find(|d| d.message.contains("Duplicate attribute"));
