@@ -8,7 +8,7 @@ use crate::document::Document;
 use crate::position;
 use carina_core::builtins;
 use carina_core::parser::{ArgumentParameter, ParsedFile, TypeExpr};
-use carina_core::resource::Value;
+use carina_core::resource::{Resource, Value};
 use carina_core::schema::{ResourceSchema, suggest_similar_name};
 
 use super::{DiagnosticEngine, carina_diagnostic};
@@ -659,7 +659,35 @@ impl DiagnosticEngine {
             }
         }
 
+        // Schema-level ref type checking for ResourceRef values in exports
+        let schema_key_fn = |r: &Resource| format!("{}.{}", r.id.provider, r.id.resource_type);
+        if let Err(ref_errors) = carina_core::validation::validate_export_param_ref_types(
+            &parsed.export_params,
+            &parsed.resources,
+            &self.schemas,
+            &schema_key_fn,
+        ) {
+            for error_msg in ref_errors.split('\n') {
+                if let Some((line, col)) = self.find_ref_error_position(doc, error_msg) {
+                    diagnostics.push(carina_diagnostic(
+                        line,
+                        col,
+                        col + 1,
+                        DiagnosticSeverity::WARNING,
+                        error_msg.to_string(),
+                    ));
+                }
+            }
+        }
+
         diagnostics
+    }
+
+    /// Find the position of a ref type error in exports by extracting the param name.
+    fn find_ref_error_position(&self, doc: &Document, error_msg: &str) -> Option<(u32, u32)> {
+        // Error format: "export 'NAME': type mismatch ..."
+        let name = error_msg.strip_prefix("export '")?.split('\'').next()?;
+        self.find_exports_param_position(doc, name)
     }
 
     /// Find the position of an exports parameter name in the document.
