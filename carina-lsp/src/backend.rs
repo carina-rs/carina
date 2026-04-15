@@ -191,12 +191,20 @@ impl Backend {
                 .ok()
                 .and_then(|p| p.parent().map(|p| p.to_path_buf()));
 
+            // Parse all .crn files in the directory for cross-file reference resolution
+            let dir_parsed = base_path.as_ref().and_then(|dir| {
+                carina_core::config_loader::parse_directory(dir, &self.provider_context).ok()
+            });
+
             let providers = self.providers.read().await;
             let state = base_path
                 .as_ref()
                 .map(|p| providers.state_for_path(p))
                 .unwrap_or(&providers.empty);
-            let diagnostics = state.diagnostic_engine.analyze(&doc, base_path.as_deref());
+            let diagnostics =
+                state
+                    .diagnostic_engine
+                    .analyze(&doc, base_path.as_deref(), dir_parsed.as_ref());
             drop(providers);
 
             self.client

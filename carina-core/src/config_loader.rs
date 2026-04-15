@@ -213,6 +213,83 @@ fn upgrade_cross_file_warnings(merged: &mut ParsedFile, unresolved: &ParsedFile)
     }
 }
 
+/// Parse all `.crn` files in a directory and return a merged `ParsedFile`.
+///
+/// This is the canonical directory-scope parse: each file is parsed
+/// individually, results are merged, and cross-file references are
+/// resolved against the combined binding map. Both CLI and LSP should
+/// use this to ensure consistent results.
+///
+/// Returns `None` for `export_params` values that are cross-file string
+/// references (e.g. `"registry_prod.account_id"`) resolved to `ResourceRef`.
+pub fn parse_directory(dir: &Path, config: &ProviderContext) -> Result<ParsedFile, String> {
+    let dir_buf = dir.to_path_buf();
+    let files = find_crn_files_in_dir(&dir_buf)?;
+    if files.is_empty() {
+        return Err(format!("No .crn files found in {}", dir.display()));
+    }
+
+    let mut merged = ParsedFile::default();
+    let mut parse_errors = Vec::new();
+
+    for file in &files {
+        let content = fs::read_to_string(file)
+            .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
+        match parser::parse(&content, config) {
+            Ok(mut parsed) => {
+                let file_name = file.file_name().map(|n| n.to_string_lossy().into_owned());
+                for w in &mut parsed.warnings {
+                    w.file = file_name.clone();
+                }
+                for d in &mut parsed.deferred_for_expressions {
+                    d.file = file_name.clone();
+                }
+                merge_parsed_file(&mut merged, parsed);
+            }
+            Err(e) => {
+                parse_errors.push(format!("{}: {}", file.display(), e));
+            }
+        }
+    }
+
+    if !parse_errors.is_empty() {
+        return Err(parse_errors.join("\n"));
+    }
+
+    // Resolve cross-file references on the merged result
+    if let Err(e) = parser::resolve_resource_refs_with_config(&mut merged, config) {
+        return Err(e.to_string());
+    }
+
+    Ok(merged)
+}
+
+/// Merge fields from `source` into `target`.
+fn merge_parsed_file(target: &mut ParsedFile, source: ParsedFile) {
+    target.providers.extend(source.providers);
+    target.resources.extend(source.resources);
+    target.variables.extend(source.variables);
+    target.imports.extend(source.imports);
+    target.module_calls.extend(source.module_calls);
+    target.arguments.extend(source.arguments);
+    target.attribute_params.extend(source.attribute_params);
+    target.export_params.extend(source.export_params);
+    target.state_blocks.extend(source.state_blocks);
+    target.user_functions.extend(source.user_functions);
+    target.remote_states.extend(source.remote_states);
+    target.requires.extend(source.requires);
+    target
+        .structural_bindings
+        .extend(source.structural_bindings);
+    target.warnings.extend(source.warnings);
+    target
+        .deferred_for_expressions
+        .extend(source.deferred_for_expressions);
+    if let Some(backend) = source.backend {
+        target.backend = Some(backend);
+    }
+}
+
 /// Get base directory for module resolution.
 ///
 /// Since paths are now always directories, this returns the path as-is.

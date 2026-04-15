@@ -394,7 +394,7 @@ impl RemoteStateBackend {
 }
 
 /// Parse result
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ParsedFile {
     pub providers: Vec<ProviderConfig>,
     pub resources: Vec<Resource>,

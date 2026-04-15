@@ -17,7 +17,7 @@ operating_region {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let unknown = diagnostics
         .iter()
@@ -43,7 +43,7 @@ outer {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let unknown = diagnostics
         .iter()
@@ -68,7 +68,7 @@ outer {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let mismatch = diagnostics
         .iter()
@@ -95,7 +95,7 @@ outer {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     // Filter to only struct-related diagnostics (ignore unknown attribute warnings from test schema)
     let struct_diags: Vec<_> = diagnostics
@@ -124,7 +124,7 @@ instance_tenancy = awscc.ec2.vpc.InstanceTenancy.invalid_value
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let enum_diag = diagnostics
         .iter()
@@ -150,7 +150,7 @@ instance_tenancy = awscc.ec2.vpc.InstanceTenancy.default
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let enum_diag = diagnostics
         .iter()
@@ -182,7 +182,7 @@ security_group_ingress {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let enum_diag = diagnostics
         .iter()
@@ -213,7 +213,7 @@ security_group_ingress {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let enum_diag = diagnostics
         .iter()
@@ -245,7 +245,7 @@ security_group_ingress {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let port_diag = diagnostics
         .iter()
@@ -287,7 +287,7 @@ protocols = ["tcp", "invalid_protocol"]
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let item_diag = diagnostics
         .iter()
@@ -320,7 +320,7 @@ operating_regions = [{
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let mixed_error = diagnostics.iter().find(|d| {
         d.message.contains("operating_region")
@@ -368,7 +368,7 @@ mode = "invalid_mode"
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let type_error = diagnostics
         .iter()
@@ -414,7 +414,7 @@ mode = "active"
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let type_error = diagnostics
         .iter()
@@ -460,7 +460,7 @@ mode = 42
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let type_error = diagnostics
         .iter()
@@ -485,7 +485,7 @@ attributes {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let undefined_diag = diagnostics
         .iter()
@@ -514,7 +514,7 @@ attributes {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let undefined_diag = diagnostics
         .iter()
@@ -539,7 +539,7 @@ attributes {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let type_diag = diagnostics
         .iter()
@@ -571,7 +571,7 @@ attributes {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let type_diag = diagnostics
         .iter()
@@ -599,7 +599,7 @@ config = {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let unknown = diagnostics
         .iter()
@@ -650,7 +650,7 @@ attributes {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let type_diag = diagnostics
         .iter()
@@ -682,7 +682,7 @@ cidr_block = "10.0.1.0/24"
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let undefined_diag = diagnostics
         .iter()
@@ -714,7 +714,7 @@ cidr_block = "10.0.1.0/24"
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let undefined_diag = diagnostics
         .iter()
@@ -743,7 +743,7 @@ awscc.ec2.vpc {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let provider_diag = diagnostics.iter().find(|d| {
         d.message
@@ -771,7 +771,7 @@ awscc.ec2.vpc {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let provider_diag = diagnostics.iter().find(|d| {
         d.message
@@ -797,7 +797,7 @@ awscc.ec2.vpc {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
     let func_diag = diagnostics
         .iter()
         .find(|d| d.message.contains("Unknown function 'not_a_function'"));
@@ -824,7 +824,7 @@ awscc.ec2.vpc {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
     let func_diag = diagnostics
         .iter()
         .find(|d| d.message.contains("Unknown function"));
@@ -858,7 +858,7 @@ awscc.ec2.route {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let typo_diag = diagnostics.iter().find(|d| {
         d.message
@@ -889,7 +889,7 @@ awscc.ec2.vpc_gateway_attachment {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let ref_diag = diagnostics
         .iter()
@@ -913,7 +913,7 @@ let name = join("-", parts)
 "#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let pipe_diag = diagnostics
         .iter()
@@ -1058,7 +1058,7 @@ let name = parts |> join("-")
 "#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let pipe_diag = diagnostics
         .iter()
@@ -1083,7 +1083,7 @@ attributes {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let type_diag = diagnostics
         .iter()
@@ -1108,7 +1108,7 @@ attributes {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let type_diag = diagnostics
         .iter()
@@ -1133,7 +1133,7 @@ attributes {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let type_diag = diagnostics
         .iter()
@@ -1158,7 +1158,7 @@ attributes {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let type_diag = diagnostics
         .iter()
@@ -1238,7 +1238,7 @@ test.target {
 union_attr = src.my_id
 }"#,
     );
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
     let union_mismatch = diagnostics
         .iter()
         .find(|d| d.message.contains("Type mismatch") && d.message.contains("MyId"));
@@ -1258,7 +1258,7 @@ test.target {
 enum_attr = src.my_id
 }"#,
     );
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
     let enum_mismatch = diagnostics
         .iter()
         .find(|d| d.message.contains("Type mismatch") && d.message.contains("MyId"));
@@ -1278,7 +1278,7 @@ test.target {
 custom_attr = src.my_id
 }"#,
     );
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
     let custom_mismatch = diagnostics
         .iter()
         .find(|d| d.message.contains("Type mismatch") && d.message.contains("custom_attr"));
@@ -1298,7 +1298,7 @@ test.target {
 union_attr = src.name
 }"#,
     );
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
     let string_mismatch = diagnostics
         .iter()
         .find(|d| d.message.contains("Type mismatch") && d.message.contains("union_attr"));
@@ -1322,7 +1322,7 @@ attributes {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let type_diag = diagnostics
         .iter()
@@ -1367,7 +1367,7 @@ fn resource_validation_failed_with_attribute_points_to_attribute_line() {
         "mock.test.resource {\n  name = 'test'\n  tags = {\n    key = 'Project'\n    value = 'carina'\n  }\n}",
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
     let tags_diag = diagnostics
         .iter()
         .find(|d| d.message.contains("tags key/value error"));
@@ -1402,7 +1402,7 @@ fn warning_when_provider_loaded_but_schema_missing() {
 "#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let unknown_type = diagnostics
         .iter()
@@ -1438,7 +1438,7 @@ fn error_when_provider_not_loaded_at_all() {
 "#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let unknown_type = diagnostics
         .iter()
@@ -1466,7 +1466,7 @@ fn no_undefined_resource_for_namespaced_enum_value() {
 "#,
     );
 
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
 
     let undefined = diagnostics
         .iter()
@@ -1533,7 +1533,7 @@ fn map_key_validation_warns_on_invalid_key() {
 }
 "#,
     );
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
     let has_key_error = diagnostics
         .iter()
         .any(|d| d.message.contains("Map key") || d.message.contains("unknown_op"));
@@ -1601,7 +1601,7 @@ awscc.sso.assignment {
 target_id = caller.account_id
 }"#,
     );
-    let diagnostics = engine.analyze(&doc, None);
+    let diagnostics = engine.analyze(&doc, None, None);
     let type_mismatch = diagnostics
         .iter()
         .find(|d| d.message.contains("Type mismatch"));
