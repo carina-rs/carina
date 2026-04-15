@@ -636,6 +636,64 @@ impl DiagnosticEngine {
         None
     }
 
+    /// Validate export parameter values against their type annotations.
+    pub(super) fn check_exports_blocks(
+        &self,
+        doc: &Document,
+        parsed: &ParsedFile,
+    ) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
+
+        for param in &parsed.export_params {
+            if let (Some(type_expr), Some(value)) = (&param.type_expr, &param.value)
+                && let Some(type_error) = self.validate_attributes_type(type_expr, value)
+                && let Some((line, col)) = self.find_exports_param_position(doc, &param.name)
+            {
+                diagnostics.push(carina_diagnostic(
+                    line,
+                    col,
+                    col + param.name.len() as u32,
+                    DiagnosticSeverity::WARNING,
+                    type_error,
+                ));
+            }
+        }
+
+        diagnostics
+    }
+
+    /// Find the position of an exports parameter name in the document.
+    fn find_exports_param_position(&self, doc: &Document, param_name: &str) -> Option<(u32, u32)> {
+        let text = doc.text();
+        let mut in_exports_block = false;
+
+        for (line_idx, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+
+            if trimmed.starts_with("exports") && trimmed.contains('{') {
+                in_exports_block = true;
+                continue;
+            }
+
+            if in_exports_block {
+                if trimmed == "}" {
+                    in_exports_block = false;
+                    continue;
+                }
+
+                if trimmed.starts_with(param_name)
+                    && trimmed[param_name.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c == ':' || c == ' ')
+                {
+                    return Some((line_idx as u32, position::leading_whitespace_chars(line)));
+                }
+            }
+        }
+        None
+    }
+
     /// Check for undefined resource references in attribute values
     pub(super) fn check_undefined_references(
         &self,
