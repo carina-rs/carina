@@ -1238,17 +1238,16 @@ impl ProviderFactory for WasmProviderFactory {
     fn create_normalizer(
         &self,
         attributes: &HashMap<String, Value>,
-    ) -> BoxFuture<'_, Option<Box<dyn ProviderNormalizer>>> {
+    ) -> BoxFuture<'_, Box<dyn ProviderNormalizer>> {
         let attrs = attributes.clone();
         Box::pin(async move {
             match self.get_or_create_shared_instance(&attrs).await {
                 Ok(instance) => {
-                    Some(Box::new(WasmProviderNormalizer { instance })
-                        as Box<dyn ProviderNormalizer>)
+                    Box::new(WasmProviderNormalizer { instance }) as Box<dyn ProviderNormalizer>
                 }
                 Err(e) => {
                     log::error!("Failed to create WASM normalizer instance: {e}");
-                    None
+                    Box::new(carina_core::provider::NoopNormalizer) as Box<dyn ProviderNormalizer>
                 }
             }
         })

@@ -1278,29 +1278,14 @@ async fn run_apply_locked(
     // Resolve references and enum identifiers, then create initial plan for display
     let mut resources_for_plan = sorted_resources.clone();
     resolve_refs_with_state_and_remote(&mut resources_for_plan, &current_states, &remote_bindings)?;
-    provider.normalize_desired(&mut resources_for_plan);
 
-    // Normalize state enum values to match the DSL format produced by normalize_desired.
-    // Must match the plan path in wiring.rs to ensure plan/apply produce the same diffs.
-    provider.normalize_state(&mut current_states);
-
-    // Merge default_tags from provider configs into resources that support tags.
-    // Done after normalize_desired so enum values in tags are already resolved.
-    // Must match the plan path in wiring.rs to ensure plan/apply produce the same diffs.
-    for provider_config in &parsed.providers {
-        if !provider_config.default_tags.is_empty() {
-            provider.merge_default_tags(
-                &mut resources_for_plan,
-                &provider_config.default_tags,
-                ctx.schemas(),
-            );
-        }
-    }
-
-    // Resolve enum aliases (e.g., "all" -> "-1") in both desired resources
-    // and current states so the plan shows canonical AWS values.
-    crate::wiring::resolve_enum_aliases_with_ctx(ctx, &mut resources_for_plan);
-    crate::wiring::resolve_enum_aliases_in_states(ctx, &mut current_states);
+    // Run the normalization pipeline (same as plan path in wiring.rs).
+    let preprocessor = crate::wiring::PlanPreprocessor::new(&provider, ctx);
+    preprocessor.prepare(
+        &mut resources_for_plan,
+        &mut current_states,
+        &parsed.providers,
+    );
 
     let lifecycles = state_file
         .as_ref()
