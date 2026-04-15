@@ -894,6 +894,7 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
         &mut resources,
         &mut attribute_params,
         &mut module_calls,
+        &mut export_params,
     );
 
     Ok(ParsedFile {
@@ -4031,6 +4032,7 @@ fn resolve_forward_references(
     resources: &mut [Resource],
     attribute_params: &mut [AttributeParameter],
     module_calls: &mut [ModuleCall],
+    export_params: &mut [ExportParameter],
 ) {
     for resource in resources.iter_mut() {
         let keys: Vec<String> = resource.attributes.keys().cloned().collect();
@@ -4053,6 +4055,11 @@ fn resolve_forward_references(
                 let resolved = resolve_forward_ref_in_value(value, resource_bindings);
                 call.arguments.insert(key, resolved);
             }
+        }
+    }
+    for export_param in export_params.iter_mut() {
+        if let Some(value) = export_param.value.take() {
+            export_param.value = Some(resolve_forward_ref_in_value(value, resource_bindings));
         }
     }
 }
@@ -4180,6 +4187,21 @@ pub fn resolve_resource_refs_with_config(
         }
 
         resource.attributes = resolved_attrs;
+    }
+
+    // Resolve cross-file forward references in export_params.
+    // During per-file parsing, "binding.attribute" strings from sibling files
+    // remain as Value::String. Convert them to ResourceRef now that the full
+    // binding map is available.
+    let resource_bindings: HashMap<String, Resource> = parsed
+        .resources
+        .iter()
+        .filter_map(|r| r.binding.as_ref().map(|b| (b.clone(), r.clone())))
+        .collect();
+    for export_param in &mut parsed.export_params {
+        if let Some(value) = export_param.value.take() {
+            export_param.value = Some(resolve_forward_ref_in_value(value, &resource_bindings));
+        }
     }
 
     Ok(())
