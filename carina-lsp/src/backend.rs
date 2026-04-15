@@ -159,8 +159,6 @@ pub struct Backend {
     provider_context: Arc<ProviderContext>,
     workspace_root: tokio::sync::OnceCell<Option<PathBuf>>,
     factory_builder: Option<FactoryBuilder>,
-    /// Cached directory-scoped ParsedFile per directory. Invalidated on save/open/close.
-    dir_parse_cache: DashMap<PathBuf, carina_core::parser::ParsedFile>,
 }
 
 impl Backend {
@@ -178,7 +176,6 @@ impl Backend {
             provider_context,
             workspace_root: tokio::sync::OnceCell::new(),
             factory_builder,
-            dir_parse_cache: DashMap::new(),
         }
     }
 
@@ -187,12 +184,42 @@ impl Backend {
         self.workspace_root.get().and_then(|opt| opt.as_ref())
     }
 
-    /// Refresh the directory parse cache for the given directory.
-    fn refresh_dir_parse_cache(&self, dir: &Path) {
-        if let Ok(parsed) = carina_core::config_loader::parse_directory(dir, &self.provider_context)
-        {
-            self.dir_parse_cache.insert(dir.to_path_buf(), parsed);
+    /// Scan sibling .crn files for `let binding = provider.service.type {` patterns.
+    /// Returns a map of binding_name → "provider.service.type" (schema key).
+    fn scan_sibling_bindings(dir: &Path, current_uri: &Url) -> HashMap<String, String> {
+        let mut bindings = HashMap::new();
+        let current_path = current_uri.to_file_path().ok();
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return bindings,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "crn")
+                && current_path.as_ref() != Some(&path)
+                && let Ok(content) = std::fs::read_to_string(&path)
+            {
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if let Some(rest) = trimmed.strip_prefix("let ")
+                        && let Some(eq_pos) = rest.find('=')
+                    {
+                        let binding = rest[..eq_pos].trim();
+                        let after_eq = rest[eq_pos + 1..].trim();
+                        // Strip "read " prefix if present
+                        let type_part = after_eq.strip_prefix("read ").unwrap_or(after_eq);
+                        // Extract "provider.service.type" before "{"
+                        if let Some(brace) = type_part.find('{') {
+                            let resource_type = type_part[..brace].trim();
+                            if resource_type.contains('.') {
+                                bindings.insert(binding.to_string(), resource_type.to_string());
+                            }
+                        }
+                    }
+                }
+            }
         }
+        bindings
     }
 
     async fn update_diagnostics(&self, uri: Url) {
@@ -202,10 +229,11 @@ impl Backend {
                 .ok()
                 .and_then(|p| p.parent().map(|p| p.to_path_buf()));
 
-            // Use cached directory parse for cross-file reference resolution
-            let dir_parsed = base_path
+            // Scan sibling files for binding→resource_type mapping
+            let sibling_bindings = base_path
                 .as_ref()
-                .and_then(|dir| self.dir_parse_cache.get(dir).map(|r| r.clone()));
+                .map(|dir| Self::scan_sibling_bindings(dir, &uri))
+                .unwrap_or_default();
 
             let providers = self.providers.read().await;
             let state = base_path
@@ -215,7 +243,7 @@ impl Backend {
             let diagnostics =
                 state
                     .diagnostic_engine
-                    .analyze(&doc, base_path.as_deref(), dir_parsed.as_ref());
+                    .analyze(&doc, base_path.as_deref(), &sibling_bindings);
             drop(providers);
 
             self.client
@@ -326,13 +354,8 @@ impl LanguageServer for Backend {
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Options(
-                    TextDocumentSyncOptions {
-                        open_close: Some(true),
-                        change: Some(TextDocumentSyncKind::FULL),
-                        save: Some(TextDocumentSyncSaveOptions::Supported(true)),
-                        ..Default::default()
-                    },
+                text_document_sync: Some(TextDocumentSyncCapability::Kind(
+                    TextDocumentSyncKind::FULL,
                 )),
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![
@@ -410,62 +433,39 @@ impl LanguageServer for Backend {
             Arc::clone(&self.provider_context),
         );
         self.documents.insert(uri.clone(), doc);
-        // Refresh directory parse cache on open
-        if let Some(dir) = uri
-            .to_file_path()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        {
-            self.refresh_dir_parse_cache(&dir);
-        }
         self.update_diagnostics(uri).await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri.clone();
+        let version = params.text_document.version;
         if let Some(mut doc) = self.documents.get_mut(&uri) {
+            // Skip stale changes (older version than current)
+            if version <= doc.version() {
+                return;
+            }
             for change in params.content_changes {
                 doc.apply_change(change);
             }
-        }
-        self.update_diagnostics(uri).await;
-    }
-
-    async fn did_save(&self, params: DidSaveTextDocumentParams) {
-        let uri = params.text_document.uri;
-        if let Some(dir) = uri
-            .to_file_path()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        {
-            self.refresh_dir_parse_cache(&dir);
+            doc.set_version(version);
         }
         self.update_diagnostics(uri).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        let uri = &params.text_document.uri;
-        if let Some(dir) = uri
-            .to_file_path()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        {
-            self.refresh_dir_parse_cache(&dir);
-        }
-        self.documents.remove(uri);
+        self.documents.remove(&params.text_document.uri);
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        // Only reload schemas when provider binaries or lock files change.
+        // .crn file saves should NOT trigger schema reload — it blocks the
+        // providers write lock and makes completions/diagnostics unresponsive.
         let should_reload = params.changes.iter().any(|c| {
             let uri = c.uri.as_str();
-            uri.ends_with(".crn")
-                || uri.ends_with(".wasm")
-                || uri.ends_with("carina-providers.lock")
+            uri.ends_with(".wasm") || uri.ends_with("carina-providers.lock")
         });
 
         if should_reload {
-            // Invalidate all directory parse caches when .crn files change externally
-            self.dir_parse_cache.clear();
             self.load_schemas().await;
         }
     }

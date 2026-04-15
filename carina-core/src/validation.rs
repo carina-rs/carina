@@ -344,7 +344,7 @@ fn collect_ref_type_errors(
 }
 
 /// Check if a TypeExpr is compatible with an AttributeType from a schema.
-fn is_type_expr_compatible_with_schema(
+pub fn is_type_expr_compatible_with_schema(
     type_expr: &crate::parser::TypeExpr,
     attr_type: &AttributeType,
 ) -> bool {

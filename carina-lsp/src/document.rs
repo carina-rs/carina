@@ -10,6 +10,7 @@ pub struct Document {
     parsed: Option<ParsedFile>,
     parse_error: Option<ParseError>,
     provider_context: Arc<ProviderContext>,
+    version: i32,
 }
 
 impl Document {
@@ -19,9 +20,18 @@ impl Document {
             parsed: None,
             parse_error: None,
             provider_context,
+            version: 0,
         };
         doc.reparse();
         doc
+    }
+
+    pub fn version(&self) -> i32 {
+        self.version
+    }
+
+    pub fn set_version(&mut self, version: i32) {
+        self.version = version;
     }
 
     pub fn apply_change(&mut self, change: TextDocumentContentChangeEvent) {

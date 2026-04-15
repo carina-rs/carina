@@ -12,7 +12,7 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::document::Document;
 use crate::position;
-use carina_core::parser::{ParseError, ParsedFile};
+use carina_core::parser::ParseError;
 use carina_core::provider::ProviderFactory;
 use carina_core::resource::Value;
 use carina_core::schema::ResourceSchema;
@@ -107,7 +107,7 @@ impl DiagnosticEngine {
         &self,
         doc: &Document,
         base_path: Option<&Path>,
-        dir_parsed: Option<&ParsedFile>,
+        sibling_bindings: &HashMap<String, String>,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
         let text = doc.text();
@@ -121,23 +121,10 @@ impl DiagnosticEngine {
         }
 
         // Check for undefined resource references in the raw text
-        // Use dir_parsed bindings to avoid false positives for cross-file refs
-        let all_bindings = if let Some(dp) = dir_parsed {
-            let mut b = defined_bindings.clone();
-            for r in &dp.resources {
-                if let Some(ref name) = r.binding {
-                    b.insert(name.clone());
-                }
-            }
-            b
-        } else {
-            defined_bindings.clone()
-        };
-        diagnostics.extend(self.check_undefined_references(&text, &all_bindings));
+        let undef_diags = self.check_undefined_references(&text, &defined_bindings);
+        diagnostics.extend(undef_diags);
 
-        // Use current file's ParsedFile for diagnostics (not dir_parsed) so
-        // checks only process items from this file. dir_parsed is used only
-        // for cross-file context (bindings, ref type checking).
+        // Semantic analysis on parsed file
         if let Some(parsed) = doc.parsed() {
             // Check provider in module
             diagnostics.extend(self.check_provider_in_module(doc, parsed));
@@ -609,9 +596,8 @@ impl DiagnosticEngine {
             // Check attributes blocks
             diagnostics.extend(self.check_attributes_blocks(doc, parsed));
 
-            // Check exports blocks — use dir_parsed resources for cross-file ref type checking
-            let all_resources = dir_parsed.map(|dp| &dp.resources[..]);
-            diagnostics.extend(self.check_exports_blocks(doc, parsed, all_resources));
+            // Check exports blocks
+            diagnostics.extend(self.check_exports_blocks(doc, parsed, None, sibling_bindings));
 
             // Check for unused let bindings
             diagnostics.extend(self.check_unused_bindings(doc, parsed));
