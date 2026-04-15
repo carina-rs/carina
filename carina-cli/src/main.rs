@@ -143,6 +143,24 @@ enum Commands {
         #[arg(long)]
         reconfigure: bool,
     },
+    /// Show export values from the state
+    Export {
+        /// Path to directory containing .crn files
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Name of a specific export to display
+        #[arg()]
+        name: Option<String>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Output raw value without key or quotes (requires a specific export name)
+        #[arg(long)]
+        raw: bool,
+    },
     /// Format .crn files
     Fmt {
         /// Path to directory containing .crn files
@@ -375,6 +393,21 @@ async fn main() {
                 &provider_context,
             )
             .await
+        }
+        Commands::Export {
+            path,
+            name,
+            json,
+            raw,
+        } => {
+            let format = if raw {
+                commands::export::OutputFormat::Raw
+            } else if json {
+                commands::export::OutputFormat::Json
+            } else {
+                commands::export::OutputFormat::Human
+            };
+            commands::export::run_export(&path, name, format, &provider_context).await
         }
         Commands::Fmt {
             path,
