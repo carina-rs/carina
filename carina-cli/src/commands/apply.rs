@@ -506,7 +506,7 @@ pub async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), AppErro
 }
 
 /// Resolve export expressions using the binding map built from applied state.
-fn resolve_exports(
+pub(crate) fn resolve_exports(
     export_params: &[carina_core::parser::ExportParameter],
     _resources: &[Resource],
     state: &StateFile,
