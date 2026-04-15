@@ -159,6 +159,8 @@ pub struct Backend {
     provider_context: Arc<ProviderContext>,
     workspace_root: tokio::sync::OnceCell<Option<PathBuf>>,
     factory_builder: Option<FactoryBuilder>,
+    /// Cached directory-scoped ParsedFile per directory. Invalidated on save/open/close.
+    dir_parse_cache: DashMap<PathBuf, carina_core::parser::ParsedFile>,
 }
 
 impl Backend {
@@ -176,12 +178,21 @@ impl Backend {
             provider_context,
             workspace_root: tokio::sync::OnceCell::new(),
             factory_builder,
+            dir_parse_cache: DashMap::new(),
         }
     }
 
     /// Returns the workspace root path, if available.
     pub fn workspace_root(&self) -> Option<&PathBuf> {
         self.workspace_root.get().and_then(|opt| opt.as_ref())
+    }
+
+    /// Refresh the directory parse cache for the given directory.
+    fn refresh_dir_parse_cache(&self, dir: &Path) {
+        if let Ok(parsed) = carina_core::config_loader::parse_directory(dir, &self.provider_context)
+        {
+            self.dir_parse_cache.insert(dir.to_path_buf(), parsed);
+        }
     }
 
     async fn update_diagnostics(&self, uri: Url) {
@@ -191,10 +202,10 @@ impl Backend {
                 .ok()
                 .and_then(|p| p.parent().map(|p| p.to_path_buf()));
 
-            // Parse all .crn files in the directory for cross-file reference resolution
-            let dir_parsed = base_path.as_ref().and_then(|dir| {
-                carina_core::config_loader::parse_directory(dir, &self.provider_context).ok()
-            });
+            // Use cached directory parse for cross-file reference resolution
+            let dir_parsed = base_path
+                .as_ref()
+                .and_then(|dir| self.dir_parse_cache.get(dir).map(|r| r.clone()));
 
             let providers = self.providers.read().await;
             let state = base_path
@@ -315,8 +326,13 @@ impl LanguageServer for Backend {
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::FULL,
+                text_document_sync: Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        open_close: Some(true),
+                        change: Some(TextDocumentSyncKind::FULL),
+                        save: Some(TextDocumentSyncSaveOptions::Supported(true)),
+                        ..Default::default()
+                    },
                 )),
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![
@@ -394,6 +410,14 @@ impl LanguageServer for Backend {
             Arc::clone(&self.provider_context),
         );
         self.documents.insert(uri.clone(), doc);
+        // Refresh directory parse cache on open
+        if let Some(dir) = uri
+            .to_file_path()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        {
+            self.refresh_dir_parse_cache(&dir);
+        }
         self.update_diagnostics(uri).await;
     }
 
@@ -407,8 +431,28 @@ impl LanguageServer for Backend {
         self.update_diagnostics(uri).await;
     }
 
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        let uri = params.text_document.uri;
+        if let Some(dir) = uri
+            .to_file_path()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        {
+            self.refresh_dir_parse_cache(&dir);
+        }
+        self.update_diagnostics(uri).await;
+    }
+
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        self.documents.remove(&params.text_document.uri);
+        let uri = &params.text_document.uri;
+        if let Some(dir) = uri
+            .to_file_path()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        {
+            self.refresh_dir_parse_cache(&dir);
+        }
+        self.documents.remove(uri);
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
@@ -420,6 +464,8 @@ impl LanguageServer for Backend {
         });
 
         if should_reload {
+            // Invalidate all directory parse caches when .crn files change externally
+            self.dir_parse_cache.clear();
             self.load_schemas().await;
         }
     }
