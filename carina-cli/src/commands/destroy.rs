@@ -1047,6 +1047,10 @@ mod tests {
             })
         }
 
+        fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+            self.read(&resource.id, None)
+        }
+
         fn create(&self, _resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
             Box::pin(async { unreachable!() })
         }
