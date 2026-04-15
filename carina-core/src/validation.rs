@@ -356,10 +356,19 @@ pub fn is_type_expr_compatible_with_schema(
         TypeExpr::Int => matches!(attr_type, AttributeType::Int),
         TypeExpr::Float => matches!(attr_type, AttributeType::Float),
         TypeExpr::Simple(name) => {
-            let ref_type_snake = crate::parser::pascal_to_snake(&attr_type.type_name());
-            // String-typed schema attributes are compatible with any Simple type
-            // (the value-level validator handles the rest)
-            is_string_compatible_type(attr_type) || &ref_type_snake == name
+            // Walk the base chain: if any type in the chain matches, it's compatible.
+            // e.g., Simple("arn") accepts KmsKeyArn (chain: KmsKeyArn → Arn ✓)
+            let mut current = attr_type;
+            loop {
+                let type_snake = crate::parser::pascal_to_snake(&current.type_name());
+                if type_snake == *name {
+                    return true;
+                }
+                match current {
+                    AttributeType::Custom { base, .. } => current = base,
+                    _ => return false,
+                }
+            }
         }
         TypeExpr::List(inner) => match attr_type {
             AttributeType::List {
@@ -1775,5 +1784,117 @@ let vpc = awscc.ec2.vpc {
         let err = result.unwrap_err();
         assert!(err.contains("export 'flag'"), "err={err}");
         assert!(err.contains("expected bool"), "err={err}");
+    }
+
+    #[test]
+    fn type_compat_subtype_accepted() {
+        // arn accepts KmsKeyArn (subtype via base chain: KmsKeyArn → Arn)
+        let kms_key_arn = AttributeType::Custom {
+            name: "KmsKeyArn".to_string(),
+            base: Box::new(AttributeType::Custom {
+                name: "Arn".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: |_| Ok(()),
+                namespace: None,
+                to_dsl: None,
+            }),
+            validate: |_| Ok(()),
+            namespace: None,
+            to_dsl: None,
+        };
+        assert!(is_type_expr_compatible_with_schema(
+            &TypeExpr::Simple("arn".to_string()),
+            &kms_key_arn,
+        ));
+    }
+
+    #[test]
+    fn type_compat_sibling_rejected() {
+        // kms_key_arn rejects IamRoleArn (sibling: IamRoleArn → Arn, not KmsKeyArn)
+        let iam_role_arn = AttributeType::Custom {
+            name: "IamRoleArn".to_string(),
+            base: Box::new(AttributeType::Custom {
+                name: "Arn".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: |_| Ok(()),
+                namespace: None,
+                to_dsl: None,
+            }),
+            validate: |_| Ok(()),
+            namespace: None,
+            to_dsl: None,
+        };
+        assert!(!is_type_expr_compatible_with_schema(
+            &TypeExpr::Simple("kms_key_arn".to_string()),
+            &iam_role_arn,
+        ));
+    }
+
+    #[test]
+    fn type_compat_resource_id_subtype() {
+        // aws_resource_id accepts VpcId (subtype)
+        let vpc_id = AttributeType::Custom {
+            name: "VpcId".to_string(),
+            base: Box::new(AttributeType::Custom {
+                name: "AwsResourceId".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: |_| Ok(()),
+                namespace: None,
+                to_dsl: None,
+            }),
+            validate: |_| Ok(()),
+            namespace: None,
+            to_dsl: None,
+        };
+        assert!(is_type_expr_compatible_with_schema(
+            &TypeExpr::Simple("aws_resource_id".to_string()),
+            &vpc_id,
+        ));
+    }
+
+    #[test]
+    fn type_compat_resource_id_siblings_rejected() {
+        // vpc_id rejects SubnetId (sibling)
+        let subnet_id = AttributeType::Custom {
+            name: "SubnetId".to_string(),
+            base: Box::new(AttributeType::Custom {
+                name: "AwsResourceId".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: |_| Ok(()),
+                namespace: None,
+                to_dsl: None,
+            }),
+            validate: |_| Ok(()),
+            namespace: None,
+            to_dsl: None,
+        };
+        assert!(!is_type_expr_compatible_with_schema(
+            &TypeExpr::Simple("vpc_id".to_string()),
+            &subnet_id,
+        ));
+    }
+
+    #[test]
+    fn type_compat_exact_match() {
+        let arn = AttributeType::Custom {
+            name: "Arn".to_string(),
+            base: Box::new(AttributeType::String),
+            validate: |_| Ok(()),
+            namespace: None,
+            to_dsl: None,
+        };
+        assert!(is_type_expr_compatible_with_schema(
+            &TypeExpr::Simple("arn".to_string()),
+            &arn,
+        ));
+    }
+
+    #[test]
+    fn type_compat_plain_string_rejected_for_simple() {
+        // Simple("aws_account_id") rejects plain String
+        assert!(!is_type_expr_compatible_with_schema(
+            &TypeExpr::Simple("aws_account_id".to_string()),
+            &AttributeType::String,
+        ));
     }
 }
