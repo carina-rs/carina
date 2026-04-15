@@ -206,6 +206,11 @@ pub fn validate_and_resolve_with_config(
         )?;
     }
 
+    // Validate export values against their type annotations
+    if !skip_resource_validation {
+        carina_core::validation::validate_export_params(&parsed.export_params, &enriched_context)?;
+    }
+
     // Compute anonymous identifiers
     compute_anonymous_identifiers_with_ctx(&ctx, &mut parsed.resources, &parsed.providers)?;
 

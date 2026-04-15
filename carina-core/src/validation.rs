@@ -335,6 +335,31 @@ pub fn validate_module_calls(
     }
 }
 
+/// Validate export parameter values against their declared type annotations.
+///
+/// For each export with both a `type_expr` and a `value`, validates the value
+/// using `validate_type_expr_value`. Accumulates all errors.
+pub fn validate_export_params(
+    export_params: &[crate::parser::ExportParameter],
+    config: &ProviderContext,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+
+    for param in export_params {
+        if let (Some(type_expr), Some(value)) = (&param.type_expr, &param.value)
+            && let Some(error) = validate_type_expr_value(type_expr, value, config)
+        {
+            errors.push(format!("export '{}': {}", param.name, error));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
 /// Check for unused `let` bindings and return the unused binding names.
 ///
 /// A binding is unused if its name never appears as a `ResourceRef.binding_name`
@@ -1528,5 +1553,91 @@ let vpc = awscc.ec2.vpc {
             result.is_ok(),
             "Should accept IamRoleArn assigned to iam_role_arn"
         );
+    }
+
+    #[test]
+    fn validate_export_params_rejects_invalid_custom_type() {
+        use crate::parser::ExportParameter;
+
+        let config = context_with_iam_policy_arn_validator();
+        let exports = vec![ExportParameter {
+            name: "policy".to_string(),
+            type_expr: Some(TypeExpr::Simple("iam_policy_arn".to_string())),
+            value: Some(Value::String("not-an-arn".to_string())),
+        }];
+        let result = validate_export_params(&exports, &config);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("export 'policy'"), "err={err}");
+        assert!(err.contains("invalid IAM policy ARN"), "err={err}");
+    }
+
+    #[test]
+    fn validate_export_params_rejects_invalid_list_element() {
+        use crate::parser::ExportParameter;
+
+        let config = context_with_iam_policy_arn_validator();
+        let exports = vec![ExportParameter {
+            name: "policies".to_string(),
+            type_expr: Some(TypeExpr::List(Box::new(TypeExpr::Simple(
+                "iam_policy_arn".to_string(),
+            )))),
+            value: Some(Value::List(vec![
+                Value::String("arn:aws:iam::123456789012:policy/valid".to_string()),
+                Value::String("garbage".to_string()),
+            ])),
+        }];
+        let result = validate_export_params(&exports, &config);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("export 'policies'"), "err={err}");
+        assert!(err.contains("Element 1"), "err={err}");
+    }
+
+    #[test]
+    fn validate_export_params_accepts_valid_values() {
+        use crate::parser::ExportParameter;
+
+        let config = context_with_iam_policy_arn_validator();
+        let exports = vec![ExportParameter {
+            name: "policy".to_string(),
+            type_expr: Some(TypeExpr::Simple("iam_policy_arn".to_string())),
+            value: Some(Value::String(
+                "arn:aws:iam::123456789012:policy/admin".to_string(),
+            )),
+        }];
+        let result = validate_export_params(&exports, &config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_export_params_skips_no_type_annotation() {
+        use crate::parser::ExportParameter;
+
+        let config = ProviderContext::default();
+        let exports = vec![ExportParameter {
+            name: "raw".to_string(),
+            type_expr: None,
+            value: Some(Value::String("anything".to_string())),
+        }];
+        let result = validate_export_params(&exports, &config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_export_params_rejects_type_mismatch() {
+        use crate::parser::ExportParameter;
+
+        let config = ProviderContext::default();
+        let exports = vec![ExportParameter {
+            name: "flag".to_string(),
+            type_expr: Some(TypeExpr::Bool),
+            value: Some(Value::String("not-a-bool".to_string())),
+        }];
+        let result = validate_export_params(&exports, &config);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("export 'flag'"), "err={err}");
+        assert!(err.contains("expected bool"), "err={err}");
     }
 }
