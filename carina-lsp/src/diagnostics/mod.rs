@@ -121,14 +121,24 @@ impl DiagnosticEngine {
         }
 
         // Check for undefined resource references in the raw text
-        diagnostics.extend(self.check_undefined_references(&text, &defined_bindings));
+        // Use dir_parsed bindings to avoid false positives for cross-file refs
+        let all_bindings = if let Some(dp) = dir_parsed {
+            let mut b = defined_bindings.clone();
+            for r in &dp.resources {
+                if let Some(ref name) = r.binding {
+                    b.insert(name.clone());
+                }
+            }
+            b
+        } else {
+            defined_bindings.clone()
+        };
+        diagnostics.extend(self.check_undefined_references(&text, &all_bindings));
 
-        // Use directory-scoped ParsedFile if available, fall back to single-file parse.
-        // Directory-scoped parsing has all cross-file bindings resolved.
-        let parsed_ref = dir_parsed.or(doc.parsed());
-
-        // Semantic analysis on parsed file
-        if let Some(parsed) = parsed_ref {
+        // Use current file's ParsedFile for diagnostics (not dir_parsed) so
+        // checks only process items from this file. dir_parsed is used only
+        // for cross-file context (bindings, ref type checking).
+        if let Some(parsed) = doc.parsed() {
             // Check provider in module
             diagnostics.extend(self.check_provider_in_module(doc, parsed));
 
@@ -599,8 +609,9 @@ impl DiagnosticEngine {
             // Check attributes blocks
             diagnostics.extend(self.check_attributes_blocks(doc, parsed));
 
-            // Check exports blocks
-            diagnostics.extend(self.check_exports_blocks(doc, parsed));
+            // Check exports blocks — use dir_parsed resources for cross-file ref type checking
+            let all_resources = dir_parsed.map(|dp| &dp.resources[..]);
+            diagnostics.extend(self.check_exports_blocks(doc, parsed, all_resources));
 
             // Check for unused let bindings
             diagnostics.extend(self.check_unused_bindings(doc, parsed));
