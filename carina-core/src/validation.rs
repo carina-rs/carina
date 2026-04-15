@@ -243,6 +243,142 @@ pub fn validate_attribute_param_ref_types(
     }
 }
 
+/// Validate export parameter values that are ResourceRef against their declared
+/// TypeExpr by looking up the referenced attribute's schema type.
+///
+/// This catches mismatches like `exports { x: list(bool) = [vpc.vpc_id] }` where
+/// `vpc_id` is a string attribute but the export declares `bool`.
+pub fn validate_export_param_ref_types(
+    export_params: &[crate::parser::ExportParameter],
+    resources: &[Resource],
+    schemas: &HashMap<String, ResourceSchema>,
+    schema_key_fn: &dyn Fn(&Resource) -> String,
+) -> Result<(), String> {
+    let mut binding_map: HashMap<String, &Resource> = HashMap::new();
+    for resource in resources {
+        if let Some(ref binding_name) = resource.binding {
+            binding_map.insert(binding_name.clone(), resource);
+        }
+    }
+
+    let mut errors = Vec::new();
+
+    for param in export_params {
+        let Some(ref type_expr) = param.type_expr else {
+            continue;
+        };
+        let Some(ref value) = param.value else {
+            continue;
+        };
+
+        collect_ref_type_errors(
+            type_expr,
+            value,
+            &param.name,
+            &binding_map,
+            schemas,
+            schema_key_fn,
+            &mut errors,
+        );
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
+/// Recursively check ResourceRef values in a value tree against their declared TypeExpr.
+fn collect_ref_type_errors(
+    type_expr: &crate::parser::TypeExpr,
+    value: &Value,
+    param_name: &str,
+    binding_map: &HashMap<String, &Resource>,
+    schemas: &HashMap<String, ResourceSchema>,
+    schema_key_fn: &dyn Fn(&Resource) -> String,
+    errors: &mut Vec<String>,
+) {
+    use crate::parser::TypeExpr;
+
+    match (type_expr, value) {
+        (_, Value::ResourceRef { path }) => {
+            let ref_binding = path.binding();
+            let ref_attr = path.attribute();
+
+            let Some(ref_resource) = binding_map.get(ref_binding) else {
+                return;
+            };
+            let ref_schema_key = schema_key_fn(ref_resource);
+            let Some(ref_schema) = schemas.get(&ref_schema_key) else {
+                return;
+            };
+            let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr) else {
+                return;
+            };
+
+            let ref_type = &ref_attr_schema.attr_type;
+            if !is_type_expr_compatible_with_schema(type_expr, ref_type) {
+                let ref_type_name = ref_type.type_name();
+                errors.push(format!(
+                    "export '{}': type mismatch for '{}.{}': expected {}, got {}",
+                    param_name, ref_binding, ref_attr, type_expr, ref_type_name,
+                ));
+            }
+        }
+        (TypeExpr::List(inner), Value::List(items)) => {
+            for item in items {
+                collect_ref_type_errors(
+                    inner,
+                    item,
+                    param_name,
+                    binding_map,
+                    schemas,
+                    schema_key_fn,
+                    errors,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Check if a TypeExpr is compatible with an AttributeType from a schema.
+fn is_type_expr_compatible_with_schema(
+    type_expr: &crate::parser::TypeExpr,
+    attr_type: &AttributeType,
+) -> bool {
+    use crate::parser::TypeExpr;
+
+    match type_expr {
+        TypeExpr::String => is_string_compatible_type(attr_type),
+        TypeExpr::Bool => matches!(attr_type, AttributeType::Bool),
+        TypeExpr::Int => matches!(attr_type, AttributeType::Int),
+        TypeExpr::Float => matches!(attr_type, AttributeType::Float),
+        TypeExpr::Simple(name) => {
+            let ref_type_snake = crate::parser::pascal_to_snake(&attr_type.type_name());
+            // String-typed schema attributes are compatible with any Simple type
+            // (the value-level validator handles the rest)
+            is_string_compatible_type(attr_type) || &ref_type_snake == name
+        }
+        TypeExpr::List(inner) => match attr_type {
+            AttributeType::List {
+                inner: schema_inner,
+                ..
+            } => is_type_expr_compatible_with_schema(inner, schema_inner),
+            _ => false,
+        },
+        TypeExpr::Map(inner) => match attr_type {
+            AttributeType::Map {
+                value: schema_inner,
+                ..
+            } => is_type_expr_compatible_with_schema(inner, schema_inner),
+            _ => false,
+        },
+        _ => true, // Ref, SchemaType — conservatively accept
+    }
+}
+
 /// Check if an AttributeType is string-compatible (can accept a string value).
 pub fn is_string_compatible_type(attr_type: &AttributeType) -> bool {
     match attr_type {

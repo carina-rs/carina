@@ -209,6 +209,14 @@ pub fn validate_and_resolve_with_config(
     // Validate export values against their type annotations
     if !skip_resource_validation {
         carina_core::validation::validate_export_params(&parsed.export_params, &enriched_context)?;
+        carina_core::validation::validate_export_param_ref_types(
+            &parsed.export_params,
+            &parsed.resources,
+            ctx.schemas(),
+            &|r: &carina_core::resource::Resource| {
+                carina_core::provider::schema_key_for_resource(ctx.factories(), r)
+            },
+        )?;
     }
 
     // Compute anonymous identifiers
