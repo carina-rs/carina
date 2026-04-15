@@ -10042,6 +10042,47 @@ exports {
     }
 
     #[test]
+    fn parse_exports_block_list_round_trips_through_formatter() {
+        let input = r#"
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.vpc {
+  cidr_block = '10.0.0.0/16'
+}
+
+exports {
+  vpc_ids: list(string) = [
+    vpc.vpc_id,
+  ]
+}
+"#;
+
+        let original = parse(input, &ProviderContext::default()).unwrap();
+        let formatted =
+            crate::formatter::format(input, &crate::formatter::FormatConfig::default()).unwrap();
+        let reparsed = parse(&formatted, &ProviderContext::default()).unwrap();
+
+        assert_eq!(
+            formatted,
+            r#"provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.vpc {
+  cidr_block = '10.0.0.0/16'
+}
+
+exports {
+  vpc_ids: list(string) = [vpc.vpc_id]
+}
+"#
+        );
+        assert_eq!(original.export_params, reparsed.export_params);
+    }
+
+    #[test]
     fn coalesce_operator_returns_default_for_unresolved_ref() {
         let input = r#"
 provider awscc {

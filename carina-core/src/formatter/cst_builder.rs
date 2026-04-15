@@ -76,6 +76,9 @@ impl<'a> CstBuilder<'a> {
             Rule::attributes_block => Some(CstChild::Node(
                 self.build_node(NodeKind::AttributesBlock, pair),
             )),
+            Rule::exports_block => Some(CstChild::Node(
+                self.build_node(NodeKind::ExportsBlock, pair),
+            )),
             Rule::arguments_param => Some(CstChild::Node(
                 self.build_node(NodeKind::ArgumentsParam, pair),
             )),
@@ -120,6 +123,9 @@ impl<'a> CstBuilder<'a> {
             )),
             Rule::attributes_param => Some(CstChild::Node(
                 self.build_node(NodeKind::AttributesParam, pair),
+            )),
+            Rule::exports_param => Some(CstChild::Node(
+                self.build_node(NodeKind::ExportsParam, pair),
             )),
             Rule::type_expr => Some(CstChild::Node(self.build_node(NodeKind::TypeExpr, pair))),
             Rule::type_primitive => {
@@ -252,6 +258,7 @@ impl<'a> CstBuilder<'a> {
             Rule::kw_attributes => {
                 Some(CstChild::Token(Token::new("attributes".to_string(), span)))
             }
+            Rule::kw_exports => Some(CstChild::Token(Token::new("exports".to_string(), span))),
             Rule::kw_list => Some(CstChild::Token(Token::new("list".to_string(), span))),
             Rule::kw_map => Some(CstChild::Token(Token::new("map".to_string(), span))),
             Rule::kw_for => Some(CstChild::Token(Token::new("for".to_string(), span))),
@@ -302,6 +309,7 @@ impl<'a> CstBuilder<'a> {
             Rule::block_content => None,
             Rule::arguments_block_content => None,
             Rule::attributes_block_content => None,
+            Rule::exports_block_content => None,
             Rule::validation_block_content => None,
             Rule::validation_block_attr => None,
 

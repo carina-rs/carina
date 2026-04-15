@@ -13,6 +13,20 @@ use carina_core::schema::{ResourceSchema, suggest_similar_name};
 
 use super::{DiagnosticEngine, carina_diagnostic};
 
+/// Check if a string looks like an unresolved cross-file reference ("binding.attribute").
+fn is_dot_notation_ref(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    parts.len() == 2
+        && !s.contains(' ')
+        && !s.starts_with('/')
+        && parts[0]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && parts[1]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 impl DiagnosticEngine {
     /// Check that provider blocks are not defined inside modules.
     pub(super) fn check_provider_in_module(
@@ -455,7 +469,8 @@ impl DiagnosticEngine {
 
                 // Type validation (only when explicit type annotation is present)
                 if let Some(ref type_expr) = attr_param.type_expr
-                    && let Some(type_error) = self.validate_attributes_type(type_expr, value)
+                    && let Some(type_error) =
+                        self.validate_attributes_type(type_expr, value, &HashMap::new())
                     && let Some((line, col)) =
                         self.find_attributes_param_position(doc, &attr_param.name)
                 {
@@ -543,13 +558,79 @@ impl DiagnosticEngine {
     ///
     /// Skips ResourceRef values (type is resolved at runtime), then delegates all
     /// validation to `carina_core::validation::validate_type_expr_value`.
-    fn validate_attributes_type(&self, type_expr: &TypeExpr, value: &Value) -> Option<String> {
+    fn validate_attributes_type(
+        &self,
+        type_expr: &TypeExpr,
+        value: &Value,
+        sibling_bindings: &HashMap<String, String>,
+    ) -> Option<String> {
         // ResourceRef is always allowed (type is resolved at runtime)
         if matches!(value, Value::ResourceRef { .. }) {
             return None;
         }
 
-        carina_core::validation::validate_type_expr_value(type_expr, value, &self.provider_context)
+        self.validate_type_with_ref_awareness(type_expr, value, sibling_bindings)
+    }
+
+    /// Type-check a value against a TypeExpr, resolving cross-file references
+    /// against sibling bindings and schemas for proper type checking.
+    fn validate_type_with_ref_awareness(
+        &self,
+        type_expr: &TypeExpr,
+        value: &Value,
+        sibling_bindings: &HashMap<String, String>,
+    ) -> Option<String> {
+        match (type_expr, value) {
+            // Cross-file ref: look up schema type via sibling bindings
+            (_, Value::String(s)) if is_dot_notation_ref(s) => {
+                let parts: Vec<&str> = s.split('.').collect();
+                let binding = parts[0];
+                let attr = parts[1];
+
+                // Look up resource type from sibling bindings
+                if let Some(resource_type) = sibling_bindings.get(binding) {
+                    // Look up attribute schema type
+                    if let Some(schema) = self.schemas.get(resource_type)
+                        && let Some(attr_schema) = schema.attributes.get(attr)
+                    {
+                        let ref_type = &attr_schema.attr_type;
+                        if !carina_core::validation::is_type_expr_compatible_with_schema(
+                            type_expr, ref_type,
+                        ) {
+                            return Some(format!(
+                                "type mismatch: expected {}, got {} (from {}.{})",
+                                type_expr,
+                                ref_type.type_name(),
+                                binding,
+                                attr
+                            ));
+                        }
+                        return None;
+                    }
+                }
+                // Can't resolve: skip (will be validated by CLI)
+                None
+            }
+            // List: recurse into elements
+            (TypeExpr::List(inner), Value::List(items)) => {
+                for (i, item) in items.iter().enumerate() {
+                    if let Some(e) =
+                        self.validate_type_with_ref_awareness(inner, item, sibling_bindings)
+                    {
+                        return Some(format!("Element {}: {}", i, e));
+                    }
+                }
+                None
+            }
+            // ResourceRef: skip (resolved at runtime)
+            (_, Value::ResourceRef { .. }) => None,
+            // Everything else: normal validation
+            _ => carina_core::validation::validate_type_expr_value(
+                type_expr,
+                value,
+                &self.provider_context,
+            ),
+        }
     }
 
     /// Find the position of an attributes parameter name in the document.
@@ -645,12 +726,14 @@ impl DiagnosticEngine {
         doc: &Document,
         parsed: &ParsedFile,
         all_resources: Option<&[Resource]>,
+        sibling_bindings: &HashMap<String, String>,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
         for param in &parsed.export_params {
             if let (Some(type_expr), Some(value)) = (&param.type_expr, &param.value)
-                && let Some(type_error) = self.validate_attributes_type(type_expr, value)
+                && let Some(type_error) =
+                    self.validate_attributes_type(type_expr, value, sibling_bindings)
                 && let Some((line, col)) = self.find_exports_param_position(doc, &param.name)
             {
                 diagnostics.push(carina_diagnostic(
@@ -659,6 +742,22 @@ impl DiagnosticEngine {
                     col + param.name.len() as u32,
                     DiagnosticSeverity::WARNING,
                     type_error,
+                ));
+            }
+        }
+
+        // Check for unknown type names in type annotations
+        for param in &parsed.export_params {
+            if let Some(type_expr) = &param.type_expr
+                && let Some(error) = self.check_unknown_type_names(type_expr)
+                && let Some((line, col)) = self.find_exports_param_position(doc, &param.name)
+            {
+                diagnostics.push(carina_diagnostic(
+                    line,
+                    col,
+                    col + param.name.len() as u32,
+                    DiagnosticSeverity::WARNING,
+                    error,
                 ));
             }
         }
@@ -725,6 +824,25 @@ impl DiagnosticEngine {
             }
         }
         None
+    }
+
+    /// Check if a TypeExpr contains unknown type names.
+    fn check_unknown_type_names(&self, type_expr: &TypeExpr) -> Option<String> {
+        match type_expr {
+            TypeExpr::Simple(name) => {
+                let builtin = ["ipv4_cidr", "ipv4_address", "ipv6_cidr", "ipv6_address"];
+                if builtin.contains(&name.as_str()) {
+                    return None;
+                }
+                if self.provider_context.validators.contains_key(name) {
+                    return None;
+                }
+                Some(format!("Unknown type '{name}'."))
+            }
+            TypeExpr::List(inner) => self.check_unknown_type_names(inner),
+            TypeExpr::Map(inner) => self.check_unknown_type_names(inner),
+            _ => None,
+        }
     }
 
     /// Check for undefined resource references in attribute values

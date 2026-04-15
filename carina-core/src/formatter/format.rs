@@ -150,6 +150,7 @@ impl Formatter {
             NodeKind::ProviderBlock => self.format_provider_block(node),
             NodeKind::ArgumentsBlock => self.format_arguments_block(node),
             NodeKind::AttributesBlock => self.format_attributes_block(node),
+            NodeKind::ExportsBlock => self.format_attributes_block(node), // same format as attributes
             NodeKind::LetBinding => self.format_let_binding(node),
             NodeKind::LocalBinding => self.format_let_binding(node),
             NodeKind::ModuleCall => self.format_module_call(node),
@@ -177,6 +178,7 @@ impl Formatter {
             NodeKind::ArgumentsParamBlock => self.format_arguments_param_block(node),
             NodeKind::ArgumentsParamAttr => self.format_arguments_param_attr(node, 0),
             NodeKind::AttributesParam => self.format_attributes_param(node, 0),
+            NodeKind::ExportsParam => self.format_attributes_param(node, 0), // same format as attributes
             NodeKind::PipeExpr => self.format_pipe_expr(node),
             NodeKind::ComposeExpr => self.format_compose_expr(node),
             NodeKind::FunctionCall => self.format_function_call(node),
@@ -401,8 +403,12 @@ impl Formatter {
     }
 
     fn format_attributes_block(&mut self, node: &CstNode) {
+        let keyword = match node.kind {
+            NodeKind::ExportsBlock => "exports",
+            _ => "attributes",
+        };
         self.write_indent();
-        self.write("attributes {");
+        self.write(&format!("{keyword} {{"));
         self.write_newline();
         self.current_indent += 1;
 
@@ -459,7 +465,7 @@ impl Formatter {
             .iter()
             .filter_map(|child| {
                 if let CstChild::Node(n) = child
-                    && n.kind == NodeKind::AttributesParam
+                    && (n.kind == NodeKind::AttributesParam || n.kind == NodeKind::ExportsParam)
                 {
                     return Some(n);
                 }

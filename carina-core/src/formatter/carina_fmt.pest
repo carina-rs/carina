@@ -11,7 +11,7 @@ ws = @{ (" " | "\t")+ }
 newline = @{ NEWLINE }
 comment = @{ "#" ~ (!NEWLINE ~ ANY)* }
 
-statement = { backend_block | provider_block | arguments_block | attributes_block | import_state_block | removed_block | moved_block | require_statement | if_expr | for_expr | fn_def | let_binding | module_call | anonymous_resource }
+statement = { backend_block | provider_block | arguments_block | attributes_block | exports_block | import_state_block | removed_block | moved_block | require_statement | if_expr | for_expr | fn_def | let_binding | module_call | anonymous_resource }
 
 // Require statement: require <validate_expr>, "error message"
 require_statement = {
@@ -108,6 +108,19 @@ attributes_block_content = _{ trivia | attributes_param }
 
 // Attributes parameter: name: type = value, or name = value (type optional)
 attributes_param = {
+    identifier ~ trivia* ~ colon ~ trivia* ~ type_expr ~ trivia* ~ equals ~ trivia* ~ expression
+  | identifier ~ trivia* ~ equals ~ trivia* ~ expression
+}
+
+// Exports block: exports { name: type = value }
+exports_block = {
+    kw_exports ~ trivia* ~ open_brace ~ exports_block_content* ~ close_brace
+}
+
+exports_block_content = _{ trivia | exports_param }
+
+// Exports parameter: name: type = value, or name = value (type optional)
+exports_param = {
     identifier ~ trivia* ~ colon ~ trivia* ~ type_expr ~ trivia* ~ equals ~ trivia* ~ expression
   | identifier ~ trivia* ~ equals ~ trivia* ~ expression
 }
@@ -327,6 +340,7 @@ kw_import = { "import" }
 kw_let = { "let" }
 kw_arguments = { "arguments" }
 kw_attributes = { "attributes" }
+kw_exports = { "exports" }
 kw_list = { "list" }
 kw_map = { "map" }
 kw_for = { "for" }
