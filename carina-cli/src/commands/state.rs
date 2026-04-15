@@ -744,6 +744,11 @@ pub(crate) async fn run_state_refresh_locked(
         )?;
     }
 
+    // Re-resolve exports using refreshed state
+    if !parsed.export_params.is_empty() {
+        state.exports = crate::commands::apply::resolve_exports(&parsed.export_params, &[], &state);
+    }
+
     // Save state (with or without lock validation)
     if let Some(lock) = lock {
         crate::commands::apply::save_state_locked(backend, lock, &mut state).await?;
