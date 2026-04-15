@@ -637,10 +637,14 @@ impl DiagnosticEngine {
     }
 
     /// Validate export parameter values against their type annotations.
+    ///
+    /// `all_resources` provides cross-file resources for schema-level ref type
+    /// checking. If None, falls back to the current file's resources.
     pub(super) fn check_exports_blocks(
         &self,
         doc: &Document,
         parsed: &ParsedFile,
+        all_resources: Option<&[Resource]>,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
@@ -660,10 +664,11 @@ impl DiagnosticEngine {
         }
 
         // Schema-level ref type checking for ResourceRef values in exports
+        let resources = all_resources.unwrap_or(&parsed.resources);
         let schema_key_fn = |r: &Resource| format!("{}.{}", r.id.provider, r.id.resource_type);
         if let Err(ref_errors) = carina_core::validation::validate_export_param_ref_types(
             &parsed.export_params,
-            &parsed.resources,
+            resources,
             &self.schemas,
             &schema_key_fn,
         ) {
