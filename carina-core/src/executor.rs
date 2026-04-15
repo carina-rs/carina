@@ -2514,6 +2514,10 @@ mod tests {
             Box::pin(async move { result })
         }
 
+        fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+            self.read(&resource.id, None)
+        }
+
         fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
             let id_str = resource.id.to_string();
             self.call_log
@@ -3296,6 +3300,13 @@ mod tests {
                 Box::pin(async { Err(ProviderError::new("not implemented")) })
             }
 
+            fn read_data_source(
+                &self,
+                _resource: &Resource,
+            ) -> BoxFuture<'_, ProviderResult<State>> {
+                Box::pin(async { Err(ProviderError::new("not implemented")) })
+            }
+
             fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
                 let id = resource.id.clone();
                 let name = resource.id.name.clone();
@@ -3727,6 +3738,10 @@ mod tests {
                     is_timeout: false,
                 })
             })
+        }
+
+        fn read_data_source(&self, _resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+            Box::pin(async { Err(ProviderError::new("not implemented")) })
         }
 
         fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {

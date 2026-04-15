@@ -208,15 +208,12 @@ async fn test_wasm_mock_provider_normalizer() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
     // Regression test for carina-rs/carina#1677: the plugin boundary must
-    // route `read_data_source` through to the guest's override so
-    // providers can see user-supplied input attributes. Without the WIT
-    // plumbing in place, the host's trait-default implementation runs
-    // instead and rejects any resource with non-`_` attributes.
+    // route `read_data_source` through to the guest's implementation so
+    // providers can see user-supplied input attributes.
     //
-    // The mock provider's `read_data_source` override echoes input
-    // attributes back into state plus a sentinel
-    // `__mock_read_data_source__` flag. If that flag shows up, the
-    // override ran — meaning the WASM bridge forwarded the call.
+    // The mock provider's `read_data_source` echoes input attributes back
+    // into state plus a sentinel `__mock_read_data_source__` flag. If
+    // that flag shows up, the WASM bridge forwarded the call correctly.
     let path = skip_if_no_wasm!();
     let factory = WasmProviderFactory::new(path)
         .await

@@ -66,6 +66,10 @@ impl Provider for TestProvider {
         Box::pin(async move { result.map_err(ProviderError::new) })
     }
 
+    fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+        self.read(&resource.id, None)
+    }
+
     fn create(&self, _resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
         Box::pin(async { Err(ProviderError::new("unexpected create")) })
     }
@@ -1560,6 +1564,10 @@ impl Provider for RecordingProvider {
         Box::pin(async move { Ok(State::not_found(id)) })
     }
 
+    fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+        self.read(&resource.id, None)
+    }
+
     fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
         // Return a state with a new identifier to simulate resource creation
         let mut attrs = resource.attributes.clone();
@@ -1617,6 +1625,10 @@ impl Provider for RenameFailProvider {
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id = id.clone();
         Box::pin(async move { Ok(State::not_found(id)) })
+    }
+
+    fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+        self.read(&resource.id, None)
     }
 
     fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {

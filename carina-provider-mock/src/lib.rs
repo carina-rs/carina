@@ -74,6 +74,10 @@ impl Provider for MockProvider {
         })
     }
 
+    fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+        self.read(&resource.id, None)
+    }
+
     fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
         let resource = resource.clone();
         Box::pin(async move {
