@@ -379,6 +379,48 @@ pub fn compute_anonymous_identifiers_with_ctx(
     .map_err(AppError::Config)
 }
 
+/// Encapsulates the plan-time normalization pipeline.
+///
+/// Ensures the correct ordering of normalization steps that must run
+/// between reference resolution and plan creation:
+///
+/// 1. `normalize_desired` — resolve DSL enum identifiers
+/// 2. `normalize_state` — convert raw API values to match DSL format
+/// 3. `merge_default_tags` — add provider-level default tags (must run after normalize_desired)
+/// 4. `resolve_enum_aliases` — convert to canonical AWS values in both resources and states
+pub struct PlanPreprocessor<'a> {
+    normalizer: &'a dyn ProviderNormalizer,
+    ctx: &'a WiringContext,
+}
+
+impl<'a> PlanPreprocessor<'a> {
+    pub fn new(normalizer: &'a dyn ProviderNormalizer, ctx: &'a WiringContext) -> Self {
+        Self { normalizer, ctx }
+    }
+
+    /// Run the full normalization pipeline on desired resources and current states.
+    ///
+    /// Call after `resolve_refs_with_state_and_remote()` and before `create_plan()`.
+    pub fn prepare(
+        &self,
+        resources: &mut [Resource],
+        current_states: &mut HashMap<ResourceId, State>,
+        provider_configs: &[ProviderConfig],
+    ) {
+        self.normalizer.normalize_desired(resources);
+        self.normalizer.normalize_state(current_states);
+        let schemas = self.ctx.schemas();
+        for config in provider_configs {
+            if !config.default_tags.is_empty() {
+                self.normalizer
+                    .merge_default_tags(resources, &config.default_tags, schemas);
+            }
+        }
+        resolve_enum_aliases_with_ctx(self.ctx, resources);
+        resolve_enum_aliases_in_states(self.ctx, current_states);
+    }
+}
+
 /// Run provider-specific normalization on desired resources.
 ///
 /// Creates normalizers from all registered provider factories and applies
@@ -393,9 +435,7 @@ pub fn normalize_desired_with_ctx(ctx: &WiringContext, resources: &mut [Resource
     let mut router = ProviderRouter::new();
     for factory in ctx.factories() {
         let attrs = HashMap::new();
-        if let Some(normalizer) = rt.block_on(factory.create_normalizer(&attrs)) {
-            router.add_normalizer(normalizer);
-        }
+        router.add_normalizer(rt.block_on(factory.create_normalizer(&attrs)));
     }
     router.normalize_desired(resources);
 }
@@ -417,9 +457,7 @@ pub fn normalize_state_with_ctx(
     let mut router = ProviderRouter::new();
     for factory in ctx.factories() {
         let attrs = HashMap::new();
-        if let Some(normalizer) = rt.block_on(factory.create_normalizer(&attrs)) {
-            router.add_normalizer(normalizer);
-        }
+        router.add_normalizer(rt.block_on(factory.create_normalizer(&attrs)));
     }
     router.normalize_state(current_states);
 }
@@ -588,9 +626,7 @@ pub async fn get_provider_with_ctx(
             );
             let provider = factory.create_provider(&provider_config.attributes).await;
             router.add_provider(provider_config.name.clone(), provider);
-            if let Some(ext) = factory.create_normalizer(&provider_config.attributes).await {
-                router.add_normalizer(ext);
-            }
+            router.add_normalizer(factory.create_normalizer(&provider_config.attributes).await);
         } else if !provider_config.name.is_empty() {
             eprintln!(
                 "{}",
@@ -627,9 +663,7 @@ async fn try_add_source_provider(
                 format!("Using {} (region: {}, source: {})", name, region, source).cyan()
             );
             router.add_provider(name, provider);
-            if let Some(normalizer) = factory.create_normalizer(&config.attributes).await {
-                router.add_normalizer(normalizer);
-            }
+            router.add_normalizer(factory.create_normalizer(&config.attributes).await);
         }
         Err(e) => {
             eprintln!(
@@ -699,9 +733,7 @@ pub async fn create_providers_from_configs(
             );
             let provider = factory.create_provider(&config.attributes).await;
             router.add_provider(config.name.clone(), provider);
-            if let Some(ext) = factory.create_normalizer(&config.attributes).await {
-                router.add_normalizer(ext);
-            }
+            router.add_normalizer(factory.create_normalizer(&config.attributes).await);
         }
     }
 
@@ -983,29 +1015,11 @@ pub async fn create_plan_from_parsed_with_remote(
     // Resolve ResourceRef values and enum identifiers using AWS state
     let mut resources = sorted_resources.clone();
     resolve_refs_with_state_and_remote(&mut resources, &current_states, remote_bindings)?;
-    provider.normalize_desired(&mut resources);
 
-    // Normalize state enum values to match the DSL format produced by normalize_desired.
-    // Without this, raw AWS values (e.g., "ap-northeast-1a") in state would diff against
-    // normalized desired values (e.g., "awscc.ec2.subnet.AvailabilityZone.ap_northeast_1a").
-    provider.normalize_state(&mut current_states);
-
-    // Merge default_tags from provider configs into resources that support tags.
-    // Done after normalize_desired so enum values in tags are already resolved.
-    for provider_config in &parsed.providers {
-        if !provider_config.default_tags.is_empty() {
-            provider.merge_default_tags(
-                &mut resources,
-                &provider_config.default_tags,
-                ctx.schemas(),
-            );
-        }
-    }
-
-    // Resolve enum aliases (e.g., "all" -> "-1") in both desired resources
-    // and current states so the differ sees canonical AWS values.
-    resolve_enum_aliases_with_ctx(&ctx, &mut resources);
-    resolve_enum_aliases_in_states(&ctx, &mut current_states);
+    // Run the normalization pipeline: normalize_desired → normalize_state →
+    // merge_default_tags → resolve_enum_aliases (order matters).
+    let preprocessor = PlanPreprocessor::new(&provider, &ctx);
+    preprocessor.prepare(&mut resources, &mut current_states, &parsed.providers);
 
     // Build lifecycles map from state file for orphaned resource deletion
     let lifecycles = state_file
@@ -1681,9 +1695,7 @@ mod tests {
         let mut router = ProviderRouter::new();
         for factory in ctx.factories() {
             let attrs = HashMap::new();
-            if let Some(normalizer) = rt.block_on(factory.create_normalizer(&attrs)) {
-                router.add_normalizer(normalizer);
-            }
+            router.add_normalizer(rt.block_on(factory.create_normalizer(&attrs)));
         }
         let mut resources_with = vec![resource];
         router.merge_default_tags(&mut resources_with, &default_tags, &schemas);

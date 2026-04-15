@@ -193,6 +193,11 @@ pub trait ProviderNormalizer: Send + Sync {
     }
 }
 
+/// A no-op normalizer for providers that don't need plan-time normalization.
+#[derive(Debug, Clone, Copy)]
+pub struct NoopNormalizer;
+impl ProviderNormalizer for NoopNormalizer {}
+
 /// Shared implementation for merging default tags into resources.
 ///
 /// For each resource matching `provider_name` whose schema includes a `tags` attribute:
@@ -433,16 +438,15 @@ pub trait ProviderFactory: Send + Sync {
         attributes: &HashMap<String, Value>,
     ) -> BoxFuture<'_, Box<dyn Provider>>;
 
-    /// Create a schema extension instance from configuration attributes.
+    /// Create a normalizer instance from configuration attributes.
     ///
-    /// Returns `None` if this provider has no schema extensions (the default).
-    /// Providers that need plan-time normalization or state hydration should
-    /// override this method.
+    /// Returns a [`NoopNormalizer`] by default. Providers that need
+    /// plan-time normalization or state hydration should override this.
     fn create_normalizer(
         &self,
         _attributes: &HashMap<String, Value>,
-    ) -> BoxFuture<'_, Option<Box<dyn ProviderNormalizer>>> {
-        Box::pin(async { None })
+    ) -> BoxFuture<'_, Box<dyn ProviderNormalizer>> {
+        Box::pin(async { Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer> })
     }
 
     /// Get all resource schemas for this provider.

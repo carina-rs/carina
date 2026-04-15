@@ -141,9 +141,7 @@ fn build_plan_and_states_from_fixture(
         let mut router = ProviderRouter::new();
         for factory in wiring.factories() {
             let attrs = HashMap::new();
-            if let Some(normalizer) = rt.block_on(factory.create_normalizer(&attrs)) {
-                router.add_normalizer(normalizer);
-            }
+            router.add_normalizer(rt.block_on(factory.create_normalizer(&attrs)));
         }
         for provider_config in &parsed.providers {
             if !provider_config.default_tags.is_empty() {

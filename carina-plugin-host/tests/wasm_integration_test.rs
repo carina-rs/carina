@@ -177,10 +177,7 @@ async fn test_wasm_mock_provider_normalizer() {
     let factory = WasmProviderFactory::new(path)
         .await
         .expect("Failed to load WASM provider");
-    let normalizer = factory
-        .create_normalizer(&HashMap::new())
-        .await
-        .expect("create_normalizer should return Some");
+    let normalizer = factory.create_normalizer(&HashMap::new()).await;
 
     // normalize_desired: mock provider returns resources unchanged
     let mut resources = vec![{
