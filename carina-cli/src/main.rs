@@ -145,10 +145,6 @@ enum Commands {
     },
     /// Show export values from the state
     Export {
-        /// Path to directory containing .crn files
-        #[arg(default_value = ".")]
-        path: PathBuf,
-
         /// Name of a specific export to display
         #[arg()]
         name: Option<String>,
@@ -394,12 +390,7 @@ async fn main() {
             )
             .await
         }
-        Commands::Export {
-            path,
-            name,
-            json,
-            raw,
-        } => {
+        Commands::Export { name, json, raw } => {
             let format = if raw {
                 commands::export::OutputFormat::Raw
             } else if json {
@@ -407,6 +398,7 @@ async fn main() {
             } else {
                 commands::export::OutputFormat::Human
             };
+            let path = PathBuf::from(".");
             commands::export::run_export(&path, name, format, &provider_context).await
         }
         Commands::Fmt {
