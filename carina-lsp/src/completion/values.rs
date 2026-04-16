@@ -1,5 +1,7 @@
 //! Attribute, value, and type-specific completions.
 
+use std::path::Path;
+
 use tower_lsp::lsp_types::{
     Command, CompletionItem, CompletionItemKind, InsertTextFormat, Position, Range, TextEdit,
 };
@@ -8,6 +10,11 @@ use carina_core::builtins;
 use carina_core::schema::AttributeType;
 
 use super::CompletionProvider;
+
+/// How far up the directory tree to walk when suggesting upstream_state sources.
+const UPSTREAM_SOURCE_MAX_UP: usize = 6;
+/// Safety cap on the number of suggestions returned.
+const UPSTREAM_SOURCE_MAX_ITEMS: usize = 100;
 
 /// Context when the user has typed `binding_name.` after `=`.
 struct BindingDotContext {
@@ -463,6 +470,57 @@ impl CompletionProvider {
         }]
     }
 
+    /// Suggest sibling (and uncle/grand-uncle) directories that look like carina
+    /// projects, for use as the `source` attribute of an `upstream_state` block.
+    pub(super) fn upstream_state_source_completions(
+        &self,
+        partial_path: &str,
+        base_path: Option<&Path>,
+    ) -> Vec<CompletionItem> {
+        let Some(base) = base_path else {
+            return vec![];
+        };
+        let base_abs = canonical_or_self(base);
+
+        // Skip the directory that is the current project itself; everything else
+        // we emit at most once, preferring the nearest ancestor encoding.
+        let mut seen_targets: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+        seen_targets.insert(base_abs.clone());
+        let mut suggestions: Vec<String> = Vec::new();
+
+        let mut current = base_abs;
+        for depth in 1..=UPSTREAM_SOURCE_MAX_UP {
+            let Some(parent) = current.parent().map(Path::to_path_buf) else {
+                break;
+            };
+            find_carina_projects_under(&parent, depth, &mut seen_targets, &mut suggestions);
+            if suggestions.len() >= UPSTREAM_SOURCE_MAX_ITEMS {
+                suggestions.truncate(UPSTREAM_SOURCE_MAX_ITEMS);
+                break;
+            }
+            current = parent;
+        }
+
+        // Truncated by ancestor discovery order (nearest first), then sorted for display.
+        suggestions.sort();
+
+        suggestions
+            .into_iter()
+            .filter(|p| partial_path.is_empty() || p.starts_with(partial_path))
+            .map(|p| {
+                let quoted = format!("'{}'", p);
+                CompletionItem {
+                    label: quoted.clone(),
+                    kind: Some(CompletionItemKind::FOLDER),
+                    detail: Some("Carina project".to_string()),
+                    insert_text: Some(quoted),
+                    ..Default::default()
+                }
+            })
+            .collect()
+    }
+
     pub(super) fn generic_value_completions(&self) -> Vec<CompletionItem> {
         let mut completions = vec![
             CompletionItem {
@@ -777,4 +835,86 @@ impl CompletionProvider {
                 .collect(),
         }
     }
+}
+
+/// Scan `ancestor` for directories that look like carina projects.
+///
+/// At `up_depth == 1` (the direct parent of `base`), only the immediate
+/// children are considered. From `up_depth >= 2` the scan also descends one
+/// more level, so patterns like `../../modules/web` are reachable even when
+/// the `modules` dir itself is not a project. The descent is deliberately
+/// capped at grandchildren to keep the search bounded at every ancestor.
+///
+/// `seen` holds the canonical paths already emitted at a nearer ancestor (and
+/// the base itself); entries already in `seen` are skipped so a sibling never
+/// reappears via a longer ancestor route.
+fn find_carina_projects_under(
+    ancestor: &Path,
+    up_depth: usize,
+    seen: &mut std::collections::HashSet<std::path::PathBuf>,
+    out: &mut Vec<String>,
+) {
+    let Ok(entries) = std::fs::read_dir(ancestor) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let child = entry.path();
+        let Some(child_name) = visible_dir_name(&child) else {
+            continue;
+        };
+        let child_abs = canonical_or_self(&child);
+        if dir_has_crn_file(&child) {
+            if seen.insert(child_abs) {
+                out.push(join_relative(up_depth, &[&child_name]));
+            }
+            continue;
+        }
+        if up_depth < 2 {
+            continue;
+        }
+        let Ok(grandchildren) = std::fs::read_dir(&child) else {
+            continue;
+        };
+        for grand in grandchildren.flatten() {
+            let grand_path = grand.path();
+            let Some(grand_name) = visible_dir_name(&grand_path) else {
+                continue;
+            };
+            let grand_abs = canonical_or_self(&grand_path);
+            if dir_has_crn_file(&grand_path) && seen.insert(grand_abs) {
+                out.push(join_relative(up_depth, &[&child_name, &grand_name]));
+            }
+        }
+    }
+}
+
+/// `Some(name)` if `path` is a directory with a non-hidden name, else `None`.
+fn visible_dir_name(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    if name.starts_with('.') || !path.is_dir() {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+fn canonical_or_self(p: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+fn dir_has_crn_file(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|e| e.path().extension().is_some_and(|ext| ext == "crn"))
+}
+
+fn join_relative(up_depth: usize, parts: &[&str]) -> String {
+    let mut s = String::new();
+    for _ in 0..up_depth {
+        s.push_str("../");
+    }
+    s.push_str(&parts.join("/"));
+    s
 }

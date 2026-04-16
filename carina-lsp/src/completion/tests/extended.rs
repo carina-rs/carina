@@ -1199,3 +1199,122 @@ fn arn_completion_uses_single_quotes() {
     let provider = test_provider();
     assert_all_wrapped(&provider.arn_completions(), '\'', "ARN");
 }
+
+#[test]
+fn upstream_state_source_suggests_sibling_carina_projects() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+
+    // Layout:
+    //   root/envs/prod/     (current file here)   <- base_path
+    //   root/envs/staging/  has a .crn  -> should be suggested as '../staging'
+    //   root/envs/prod/sub/ has no .crn -> excluded (not a carina project)
+    //   root/modules/web/   has a .crn  -> should be suggested as '../../modules/web'
+    //   root/unrelated/     has no .crn -> excluded
+    fs::create_dir_all(root.join("envs/prod")).unwrap();
+    fs::create_dir_all(root.join("envs/staging")).unwrap();
+    fs::create_dir_all(root.join("envs/prod/sub")).unwrap();
+    fs::create_dir_all(root.join("modules/web")).unwrap();
+    fs::create_dir_all(root.join("unrelated")).unwrap();
+    fs::write(root.join("envs/prod/main.crn"), "").unwrap();
+    fs::write(root.join("envs/staging/main.crn"), "").unwrap();
+    fs::write(root.join("modules/web/main.crn"), "").unwrap();
+
+    let provider = test_provider();
+    let source = "let orgs = upstream_state {\n    source = '";
+    let doc = create_document(source);
+    let position = Position {
+        line: 1,
+        character: 14,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&root.join("envs/prod")));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"'../staging'"),
+        "Expected sibling '../staging' suggestion. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"'../../modules/web'"),
+        "Expected uncle '../../modules/web' suggestion. Got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.iter().any(|l| l.contains("unrelated")),
+        "Should skip directories without .crn files. Got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.iter().any(|l| l.contains("'../prod'")),
+        "Should not suggest the current project itself. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn upstream_state_source_outside_block_produces_nothing() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join("envs/prod")).unwrap();
+    fs::create_dir_all(root.join("envs/staging")).unwrap();
+    fs::write(root.join("envs/staging/main.crn"), "").unwrap();
+
+    let provider = test_provider();
+    // source attribute at top level (not inside upstream_state) should not trigger
+    // this new completion.
+    let doc = create_document("source = '");
+    let position = Position {
+        line: 0,
+        character: 10,
+    };
+    let completions = provider.complete(&doc, position, Some(&root.join("envs/prod")));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        !labels.iter().any(|l| l == &"'../staging'"),
+        "Outside upstream_state block, source = '...' should not trigger this completion. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn upstream_state_source_matches_partial_prefix() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join("envs/prod")).unwrap();
+    fs::create_dir_all(root.join("envs/staging")).unwrap();
+    fs::create_dir_all(root.join("envs/orgs")).unwrap();
+    fs::write(root.join("envs/staging/main.crn"), "").unwrap();
+    fs::write(root.join("envs/orgs/main.crn"), "").unwrap();
+
+    let provider = test_provider();
+    let source = "let orgs = upstream_state {\n    source = '../or";
+    let doc = create_document(source);
+    let position = Position {
+        line: 1,
+        character: 19,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&root.join("envs/prod")));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"'../orgs'"),
+        "Should match sibling starting with 'or'. Got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.contains(&"'../staging'"),
+        "Should not include sibling that doesn't match the typed prefix. Got: {:?}",
+        labels
+    );
+}
