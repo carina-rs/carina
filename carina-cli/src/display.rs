@@ -100,13 +100,94 @@ fn format_export_value(value: &Value) -> String {
     }
 }
 
+/// Format a `serde_json::Value` for export display (old values stored in state).
+fn format_json_export_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => format!("'{}'", s),
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Array(items) => {
+            let formatted: Vec<String> = items.iter().map(format_json_export_value).collect();
+            format!("[{}]", formatted.join(", "))
+        }
+        serde_json::Value::Object(map) => {
+            let formatted: Vec<String> = map
+                .iter()
+                .map(|(k, v)| format!("{} = {}", k, format_json_export_value(v)))
+                .collect();
+            format!("{{{}}}", formatted.join(", "))
+        }
+    }
+}
+
+/// Format a single export change entry (add/modify/remove) as a displayable line.
+fn format_export_change(change: &crate::commands::plan::ExportChange) -> String {
+    use crate::commands::plan::ExportChange;
+    let mut out = String::new();
+    match change {
+        ExportChange::Added {
+            name,
+            type_expr,
+            new_value,
+        } => {
+            let type_str = type_expr
+                .as_ref()
+                .map(|t| format!(": {}", t))
+                .unwrap_or_default();
+            writeln!(
+                out,
+                "  {} {}{} = {}",
+                "+".green(),
+                name,
+                type_str.dimmed(),
+                format_export_value(new_value)
+            )
+            .unwrap();
+        }
+        ExportChange::Modified {
+            name,
+            type_expr,
+            old_json,
+            new_value,
+        } => {
+            let type_str = type_expr
+                .as_ref()
+                .map(|t| format!(": {}", t))
+                .unwrap_or_default();
+            writeln!(
+                out,
+                "  {} {}{} = {} {} {}",
+                "~".yellow(),
+                name,
+                type_str.dimmed(),
+                format_json_export_value(old_json),
+                "→".dimmed(),
+                format_export_value(new_value)
+            )
+            .unwrap();
+        }
+        ExportChange::Removed { name, old_json } => {
+            writeln!(
+                out,
+                "  {} {} = {}",
+                "-".red(),
+                name,
+                format_json_export_value(old_json)
+            )
+            .unwrap();
+        }
+    }
+    out
+}
+
 pub fn print_plan(
     plan: &Plan,
     detail: DetailLevel,
     delete_attributes: &HashMap<ResourceId, HashMap<String, Value>>,
     schemas: Option<&HashMap<String, ResourceSchema>>,
     moved_origins: &HashMap<ResourceId, ResourceId>,
-    export_params: &[carina_core::parser::ExportParameter],
+    export_changes: &[crate::commands::plan::ExportChange],
     deferred_for_expressions: &[carina_core::parser::DeferredForExpression],
 ) {
     print!(
@@ -117,7 +198,7 @@ pub fn print_plan(
             delete_attributes,
             schemas,
             moved_origins,
-            export_params,
+            export_changes,
             deferred_for_expressions,
         )
     );
@@ -133,12 +214,12 @@ pub fn format_plan(
     delete_attributes: &HashMap<ResourceId, HashMap<String, Value>>,
     schemas: Option<&HashMap<String, ResourceSchema>>,
     moved_origins: &HashMap<ResourceId, ResourceId>,
-    export_params: &[carina_core::parser::ExportParameter],
+    export_changes: &[crate::commands::plan::ExportChange],
     deferred_for_expressions: &[carina_core::parser::DeferredForExpression],
 ) -> String {
     let mut out = String::new();
 
-    if plan.is_empty() && deferred_for_expressions.is_empty() {
+    if plan.is_empty() && deferred_for_expressions.is_empty() && export_changes.is_empty() {
         writeln!(
             out,
             "{}",
@@ -169,31 +250,13 @@ pub fn format_plan(
         out.push_str(&format_deferred_for_expression(deferred));
     }
 
-    // Show exports if any
-    if !export_params.is_empty() {
+    // Show export changes if any
+    if !export_changes.is_empty() {
         writeln!(out).unwrap();
         writeln!(out, "{}", "Exports:".cyan().bold()).unwrap();
         writeln!(out).unwrap();
-        for param in export_params {
-            let type_str = param
-                .type_expr
-                .as_ref()
-                .map(|t| format!(": {}", t))
-                .unwrap_or_default();
-            let value_str = param
-                .value
-                .as_ref()
-                .map(format_export_value)
-                .unwrap_or_else(|| "(unknown)".to_string());
-            writeln!(
-                out,
-                "  {} {}{} = {}",
-                "+".green(),
-                param.name,
-                type_str.dimmed(),
-                value_str
-            )
-            .unwrap();
+        for change in export_changes {
+            out.push_str(&format_export_change(change));
         }
     }
 
@@ -228,6 +291,12 @@ pub fn format_plan(
         parts.push(format!(
             "{} deferred",
             deferred_for_expressions.len().to_string().cyan()
+        ));
+    }
+    if !export_changes.is_empty() {
+        parts.push(format!(
+            "{} export change(s)",
+            export_changes.len().to_string().cyan()
         ));
     }
     writeln!(out, "Plan: {}.", parts.join(", ")).unwrap();

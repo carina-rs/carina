@@ -543,7 +543,7 @@ pub(crate) fn resolve_exports(
 }
 
 /// Convert a DSL Value to a serde_json::Value for state persistence.
-fn dsl_value_to_json(value: &carina_core::resource::Value) -> Option<serde_json::Value> {
+pub(crate) fn dsl_value_to_json(value: &carina_core::resource::Value) -> Option<serde_json::Value> {
     use carina_core::resource::Value;
     match value {
         Value::String(s) => Some(serde_json::Value::String(s.clone())),
@@ -1356,13 +1356,19 @@ async fn run_apply_locked(
         &sorted_resources,
         &current_states,
     );
+    let current_exports = state_file
+        .as_ref()
+        .map(|s| s.exports.clone())
+        .unwrap_or_default();
+    let export_changes =
+        crate::commands::plan::compute_export_diffs(&resolved_exports, &current_exports);
     print_plan(
         &plan,
         DetailLevel::Full,
         &delete_attributes,
         Some(ctx.schemas()),
         &moved_origins,
-        &resolved_exports,
+        &export_changes,
         &parsed.deferred_for_expressions,
     );
 

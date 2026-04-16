@@ -283,13 +283,18 @@ pub async fn run_plan(
             &ctx.sorted_resources,
             &ctx.current_states,
         );
+        let current_exports = state_file
+            .as_ref()
+            .map(|s| s.exports.clone())
+            .unwrap_or_default();
+        let export_changes = compute_export_diffs(&resolved_exports, &current_exports);
         print_plan(
             &ctx.plan,
             detail,
             &delete_attributes,
             Some(wiring.schemas()),
             &ctx.moved_origins,
-            &resolved_exports,
+            &export_changes,
             &parsed.deferred_for_expressions,
         );
     }
@@ -408,6 +413,86 @@ pub(crate) fn resolve_export_value(
     }
 }
 
+/// Represents a change to an export value between current state and desired.
+pub enum ExportChange {
+    Added {
+        name: String,
+        type_expr: Option<carina_core::parser::TypeExpr>,
+        new_value: Value,
+    },
+    Modified {
+        name: String,
+        type_expr: Option<carina_core::parser::TypeExpr>,
+        old_json: serde_json::Value,
+        new_value: Value,
+    },
+    Removed {
+        name: String,
+        old_json: serde_json::Value,
+    },
+}
+
+impl ExportChange {
+    pub fn name(&self) -> &str {
+        match self {
+            ExportChange::Added { name, .. }
+            | ExportChange::Modified { name, .. }
+            | ExportChange::Removed { name, .. } => name,
+        }
+    }
+}
+
+/// Compute the set of export changes by comparing desired (resolved) exports
+/// against current state-recorded exports.
+///
+/// `resolved_params` contains the desired export values resolved against
+/// current resource states. `current_exports` is the JSON-serialized map
+/// from `StateFile.exports`.
+pub fn compute_export_diffs(
+    resolved_params: &[carina_core::parser::ExportParameter],
+    current_exports: &HashMap<String, serde_json::Value>,
+) -> Vec<ExportChange> {
+    let mut changes = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for param in resolved_params {
+        seen.insert(param.name.clone());
+        let Some(ref value) = param.value else {
+            continue;
+        };
+        let new_json = crate::commands::apply::dsl_value_to_json(value);
+        match (current_exports.get(&param.name), new_json) {
+            (None, _) => changes.push(ExportChange::Added {
+                name: param.name.clone(),
+                type_expr: param.type_expr.clone(),
+                new_value: value.clone(),
+            }),
+            (Some(old), Some(new)) if old == &new => {
+                // unchanged — skip
+            }
+            (Some(old), _) => changes.push(ExportChange::Modified {
+                name: param.name.clone(),
+                type_expr: param.type_expr.clone(),
+                old_json: old.clone(),
+                new_value: value.clone(),
+            }),
+        }
+    }
+
+    // Removed: exports in state but not in desired params
+    for (name, old) in current_exports {
+        if !seen.contains(name) {
+            changes.push(ExportChange::Removed {
+                name: name.clone(),
+                old_json: old.clone(),
+            });
+        }
+    }
+
+    changes.sort_by(|a, b| a.name().cmp(b.name()));
+    changes
+}
+
 pub(crate) async fn load_remote_states(
     remote_states: &[RemoteState],
     base_dir: &Path,
@@ -509,4 +594,72 @@ async fn load_remote_state_s3(
             bucket, key, binding, e
         ))
     })
+}
+
+#[cfg(test)]
+mod export_diff_tests {
+    use super::*;
+    use carina_core::parser::ExportParameter;
+
+    fn param(name: &str, value: Value) -> ExportParameter {
+        ExportParameter {
+            name: name.to_string(),
+            type_expr: None,
+            value: Some(value),
+        }
+    }
+
+    #[test]
+    fn compute_export_diffs_added_when_state_empty() {
+        let params = vec![param("count", Value::Int(42))];
+        let current = HashMap::new();
+        let changes = compute_export_diffs(&params, &current);
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(changes[0], ExportChange::Added { .. }));
+    }
+
+    #[test]
+    fn compute_export_diffs_modified_when_value_differs() {
+        let params = vec![param("count", Value::Int(42))];
+        let mut current = HashMap::new();
+        current.insert("count".to_string(), serde_json::json!(7));
+        let changes = compute_export_diffs(&params, &current);
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(changes[0], ExportChange::Modified { .. }));
+    }
+
+    #[test]
+    fn compute_export_diffs_unchanged_when_value_matches() {
+        let params = vec![param("count", Value::Int(42))];
+        let mut current = HashMap::new();
+        current.insert("count".to_string(), serde_json::json!(42));
+        let changes = compute_export_diffs(&params, &current);
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn compute_export_diffs_removed_when_param_missing() {
+        let params = vec![];
+        let mut current = HashMap::new();
+        current.insert("stale".to_string(), serde_json::json!("old"));
+        let changes = compute_export_diffs(&params, &current);
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(changes[0], ExportChange::Removed { .. }));
+    }
+
+    #[test]
+    fn compute_export_diffs_mixed_sorted_by_name() {
+        let params = vec![
+            param("added", Value::Int(1)),
+            param("modified", Value::Int(2)),
+        ];
+        let mut current = HashMap::new();
+        current.insert("modified".to_string(), serde_json::json!(99));
+        current.insert("removed".to_string(), serde_json::json!("old"));
+        let changes = compute_export_diffs(&params, &current);
+        assert_eq!(changes.len(), 3);
+        assert_eq!(changes[0].name(), "added");
+        assert_eq!(changes[1].name(), "modified");
+        assert_eq!(changes[2].name(), "removed");
+    }
 }
