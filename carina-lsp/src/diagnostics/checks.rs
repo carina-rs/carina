@@ -393,18 +393,14 @@ impl DiagnosticEngine {
         binding_name: &str,
     ) -> Option<(u32, u32)> {
         for (line_idx, line) in text.lines().enumerate() {
-            let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("let ")
-                && let Some(eq_pos) = rest.find('=')
+            if let Some((name, _)) = crate::let_parse::parse_let_header(line)
+                && name == binding_name
             {
-                let name = rest[..eq_pos].trim();
-                if name == binding_name {
-                    // Find the column of the binding name in the original line
-                    let let_byte_pos = line.find("let ").unwrap();
-                    let let_char_pos = position::byte_offset_to_char_offset(line, let_byte_pos);
-                    let name_col = let_char_pos + 4; // "let " is 4 chars
-                    return Some((line_idx as u32, name_col));
-                }
+                // Find the column of the binding name in the original line
+                let let_byte_pos = line.find("let ").unwrap();
+                let let_char_pos = position::byte_offset_to_char_offset(line, let_byte_pos);
+                let name_col = let_char_pos + 4; // "let " is 4 chars
+                return Some((line_idx as u32, name_col));
             }
         }
         None
@@ -414,18 +410,8 @@ impl DiagnosticEngine {
     pub(super) fn extract_resource_bindings(&self, text: &str) -> HashSet<String> {
         let mut bindings = HashSet::new();
         for line in text.lines() {
-            let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("let ")
-                && let Some(eq_pos) = rest.find('=')
-            {
-                let binding_name = rest[..eq_pos].trim();
-                if !binding_name.is_empty()
-                    && binding_name
-                        .chars()
-                        .all(|c| c.is_alphanumeric() || c == '_')
-                {
-                    bindings.insert(binding_name.to_string());
-                }
+            if let Some((name, _)) = crate::let_parse::parse_let_header(line) {
+                bindings.insert(name.to_string());
             }
         }
         bindings
