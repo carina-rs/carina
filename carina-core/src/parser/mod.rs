@@ -570,8 +570,10 @@ fn substitute_placeholder(v: &mut Value, key: Option<&str>, value: &Value) {
         Value::String(s) if s == DEFERRED_UPSTREAM_PLACEHOLDER => {
             *v = value.clone();
         }
-        Value::String(s) if key.is_some() && s == DEFERRED_UPSTREAM_KEY_PLACEHOLDER => {
-            *v = Value::String(key.unwrap().to_string());
+        Value::String(s) if s == DEFERRED_UPSTREAM_KEY_PLACEHOLDER => {
+            if let Some(k) = key {
+                *v = Value::String(k.to_string());
+            }
         }
         Value::List(items) => {
             for item in items.iter_mut() {
@@ -10572,6 +10574,52 @@ awscc.ec2.vpc {
         assert_eq!(
             dev.get_attr("target_id"),
             Some(&Value::String("222222222222".to_string()))
+        );
+    }
+
+    #[test]
+    fn expand_deferred_for_simple_binding_with_map_iterable_warns() {
+        // Simple binding but upstream resolves to a map — mismatch should warn
+        // and leave deferred.
+        let input = r#"
+            let orgs = remote_state {
+                path = "../organizations/carina.state.json"
+            }
+
+            for account_id in orgs.accounts {
+                awscc.sso.assignment {
+                    target_id = account_id
+                }
+            }
+        "#;
+
+        let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+
+        let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let mut accounts = HashMap::new();
+        accounts.insert(
+            "prod".to_string(),
+            Value::String("111111111111".to_string()),
+        );
+        let mut orgs_attrs = HashMap::new();
+        orgs_attrs.insert("accounts".to_string(), Value::Map(accounts));
+        remote_bindings.insert("orgs".to_string(), orgs_attrs);
+
+        parsed.expand_deferred_for_expressions(&remote_bindings);
+
+        assert_eq!(
+            parsed.resources.len(),
+            0,
+            "simple binding with map iterable should not silently expand"
+        );
+        assert_eq!(parsed.deferred_for_expressions.len(), 1);
+        assert!(
+            parsed
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("expected list")),
+            "should warn about list vs map shape mismatch, got: {:?}",
+            parsed.warnings
         );
     }
 
