@@ -10607,4 +10607,20 @@ awscc.ec2.vpc {
             "error should mention the unknown attribute and binding: {msg}",
         );
     }
+
+    #[test]
+    fn upstream_state_duplicate_binding_is_error() {
+        let input = r#"
+            upstream_state "orgs" { source = "../a" }
+            upstream_state "orgs" { source = "../b" }
+        "#;
+        let err = parse(input, &ProviderContext::default())
+            .expect_err("duplicate upstream_state binding must be a parse error");
+        match &err {
+            ParseError::DuplicateBinding { name, .. } => {
+                assert_eq!(name, "orgs");
+            }
+            other => panic!("Expected DuplicateBinding error, got: {other}"),
+        }
+    }
 }
