@@ -28,8 +28,24 @@
     "keywords": {
       "patterns": [
         {
+          "name": "storage.type.carina",
+          "match": "\\b(let|fn)\\b"
+        },
+        {
+          "name": "keyword.declaration.carina",
+          "match": "\\b(provider|backend|upstream_state|exports|attributes|arguments|validation|moved|removed)\\b"
+        },
+        {
           "name": "keyword.control.carina",
-          "match": "\\b(provider|let)\\b"
+          "match": "\\b(for|in|if|else)\\b"
+        },
+        {
+          "name": "keyword.other.carina",
+          "match": "\\b(import|require|read)\\b"
+        },
+        {
+          "name": "constant.language.null.carina",
+          "match": "\\bnull\\b"
         }
       ]
     },
