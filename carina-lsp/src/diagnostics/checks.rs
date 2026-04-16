@@ -622,6 +622,17 @@ impl DiagnosticEngine {
                 }
                 None
             }
+            // Map: recurse into values
+            (TypeExpr::Map(inner), Value::Map(map)) => {
+                for (key, val) in map {
+                    if let Some(e) =
+                        self.validate_type_with_ref_awareness(inner, val, sibling_bindings)
+                    {
+                        return Some(format!("Key '{}': {}", key, e));
+                    }
+                }
+                None
+            }
             // ResourceRef: skip (resolved at runtime)
             (_, Value::ResourceRef { .. }) => None,
             // Everything else: normal validation
