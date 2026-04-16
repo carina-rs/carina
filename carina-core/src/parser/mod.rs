@@ -66,6 +66,10 @@ pub const DEFERRED_UPSTREAM_PLACEHOLDER: &str = "(known after upstream apply)";
 /// Placeholder reserved for map-binding key variables. Distinct from the
 /// value-var placeholder so expansion can substitute each correctly.
 pub(crate) const DEFERRED_UPSTREAM_KEY_PLACEHOLDER: &str = "(known after upstream apply: key)";
+/// Placeholder reserved for indexed-binding index variables — distinct from
+/// key and value placeholders so `for (i, x) in list` expansion can
+/// substitute `i` with the integer index.
+pub(crate) const DEFERRED_UPSTREAM_INDEX_PLACEHOLDER: &str = "(known after upstream apply: index)";
 
 /// A for-expression whose iterable is unresolved (e.g., remote_state not yet available).
 /// Captures the structural shape of the loop body so the plan can show what
@@ -489,16 +493,29 @@ impl ParsedFile {
             };
 
             match (&deferred.binding, iterable_value) {
-                // Simple/Indexed bindings expand over lists
-                (ForBinding::Simple(_), Value::List(items))
-                | (ForBinding::Indexed(_, _), Value::List(items)) => {
+                // Simple binding: only the value var is bound
+                (ForBinding::Simple(_), Value::List(items)) => {
                     for (i, item) in items.iter().enumerate() {
                         let address = format!("{}[{}]", deferred.binding_name, i);
                         let mut resource = deferred.template_resource.clone();
                         resource.id.name = address.clone();
                         resource.binding = Some(address);
                         for (_k, expr) in resource.attributes.iter_mut() {
-                            substitute_placeholder(&mut expr.0, None, item);
+                            substitute_placeholder(&mut expr.0, None, None, item);
+                        }
+                        expanded_resources.push(resource);
+                    }
+                    resolved_indices.push(idx);
+                }
+                // Indexed binding: both index and value vars are bound
+                (ForBinding::Indexed(_, _), Value::List(items)) => {
+                    for (i, item) in items.iter().enumerate() {
+                        let address = format!("{}[{}]", deferred.binding_name, i);
+                        let mut resource = deferred.template_resource.clone();
+                        resource.id.name = address.clone();
+                        resource.binding = Some(address);
+                        for (_k, expr) in resource.attributes.iter_mut() {
+                            substitute_placeholder(&mut expr.0, Some(i as i64), None, item);
                         }
                         expanded_resources.push(resource);
                     }
@@ -515,7 +532,7 @@ impl ParsedFile {
                         resource.id.name = address.clone();
                         resource.binding = Some(address);
                         for (_k, expr) in resource.attributes.iter_mut() {
-                            substitute_placeholder(&mut expr.0, Some(key), val);
+                            substitute_placeholder(&mut expr.0, None, Some(key), val);
                         }
                         expanded_resources.push(resource);
                     }
@@ -578,12 +595,14 @@ impl ParsedFile {
 
 /// Substitute deferred-for-expression placeholders in a Value tree.
 ///
-/// Replaces `DEFERRED_UPSTREAM_PLACEHOLDER` with `value`. If `key` is
-/// supplied (map-binding expansion), also replaces
+/// Replaces `DEFERRED_UPSTREAM_PLACEHOLDER` with `value`. If `index` is
+/// supplied (indexed-binding expansion), replaces
+/// `DEFERRED_UPSTREAM_INDEX_PLACEHOLDER` with the integer index. If `key`
+/// is supplied (map-binding expansion), replaces
 /// `DEFERRED_UPSTREAM_KEY_PLACEHOLDER` with the key string. Recurses into
 /// all compound Value variants so placeholders nested inside
 /// interpolations / function calls / secrets are reached.
-fn substitute_placeholder(v: &mut Value, key: Option<&str>, value: &Value) {
+fn substitute_placeholder(v: &mut Value, index: Option<i64>, key: Option<&str>, value: &Value) {
     match v {
         Value::String(s) if s == DEFERRED_UPSTREAM_PLACEHOLDER => {
             *v = value.clone();
@@ -593,30 +612,35 @@ fn substitute_placeholder(v: &mut Value, key: Option<&str>, value: &Value) {
                 *v = Value::String(k.to_string());
             }
         }
+        Value::String(s) if s == DEFERRED_UPSTREAM_INDEX_PLACEHOLDER => {
+            if let Some(i) = index {
+                *v = Value::Int(i);
+            }
+        }
         Value::List(items) => {
             for item in items.iter_mut() {
-                substitute_placeholder(item, key, value);
+                substitute_placeholder(item, index, key, value);
             }
         }
         Value::Map(map) => {
             for val in map.values_mut() {
-                substitute_placeholder(val, key, value);
+                substitute_placeholder(val, index, key, value);
             }
         }
         Value::FunctionCall { args, .. } => {
             for arg in args.iter_mut() {
-                substitute_placeholder(arg, key, value);
+                substitute_placeholder(arg, index, key, value);
             }
         }
         Value::Interpolation(parts) => {
             for part in parts.iter_mut() {
                 if let crate::resource::InterpolationPart::Expr(inner) = part {
-                    substitute_placeholder(inner, key, value);
+                    substitute_placeholder(inner, index, key, value);
                 }
             }
         }
         Value::Secret(inner) => {
-            substitute_placeholder(inner, key, value);
+            substitute_placeholder(inner, index, key, value);
         }
         _ => {}
     }
@@ -1884,7 +1908,10 @@ fn parse_for_expr(
                     template_ctx.set_variable(var.clone(), placeholder());
                 }
                 ForBinding::Indexed(idx, val) => {
-                    template_ctx.set_variable(idx.clone(), placeholder());
+                    template_ctx.set_variable(
+                        idx.clone(),
+                        Value::String(DEFERRED_UPSTREAM_INDEX_PLACEHOLDER.to_string()),
+                    );
                     template_ctx.set_variable(val.clone(), placeholder());
                 }
                 ForBinding::Map(k, v) => {
@@ -10607,6 +10634,60 @@ awscc.ec2.vpc {
         assert_eq!(
             dev.get_attr("target_id"),
             Some(&Value::String("222222222222".to_string()))
+        );
+    }
+
+    #[test]
+    fn expand_deferred_for_indexed_binding_substitutes_index_and_value() {
+        // Indexed binding `for (i, x) in list` must substitute BOTH the index
+        // and value variables. Prior to the fix both vars shared the same
+        // placeholder, causing the index to receive the item value.
+        let input = r#"
+            let orgs = remote_state {
+                path = "../organizations/carina.state.json"
+            }
+
+            for (i, account_id) in orgs.accounts {
+                awscc.sso.assignment {
+                    target_id = account_id
+                    position = i
+                }
+            }
+        "#;
+
+        let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(parsed.deferred_for_expressions.len(), 1);
+
+        let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let mut orgs_attrs = HashMap::new();
+        orgs_attrs.insert(
+            "accounts".to_string(),
+            Value::List(vec![
+                Value::String("111111111111".to_string()),
+                Value::String("222222222222".to_string()),
+            ]),
+        );
+        remote_bindings.insert("orgs".to_string(), orgs_attrs);
+
+        parsed.expand_deferred_for_expressions(&remote_bindings);
+
+        assert_eq!(parsed.resources.len(), 2);
+        assert_eq!(
+            parsed.resources[0].get_attr("target_id"),
+            Some(&Value::String("111111111111".to_string()))
+        );
+        assert_eq!(
+            parsed.resources[0].get_attr("position"),
+            Some(&Value::Int(0)),
+            "index should be 0, not the item value"
+        );
+        assert_eq!(
+            parsed.resources[1].get_attr("target_id"),
+            Some(&Value::String("222222222222".to_string()))
+        );
+        assert_eq!(
+            parsed.resources[1].get_attr("position"),
+            Some(&Value::Int(1))
         );
     }
 
