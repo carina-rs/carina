@@ -1908,6 +1908,50 @@ fn exports_type_warning_multiline_vs_oneline() {
 }
 
 #[test]
+fn exports_map_type_warning_for_cross_file_ref() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use std::collections::HashMap;
+
+    // Schema: registry_prod.account_id is String — incompatible with map(bool)
+    let schema = ResourceSchema::new("awscc.organizations.account")
+        .attribute(AttributeSchema::new("account_id", AttributeType::String));
+    let schemas: HashMap<String, ResourceSchema> = vec![(schema.resource_type.clone(), schema)]
+        .into_iter()
+        .collect();
+    let engine = custom_engine(schemas);
+
+    let doc = create_document(
+        r#"exports {
+  accounts: map(bool) = {
+    prod = registry_prod.account_id
+    dev  = registry_dev.account_id
+  }
+}"#,
+    );
+
+    let mut sibling_bindings = HashMap::new();
+    sibling_bindings.insert(
+        "registry_prod".to_string(),
+        "awscc.organizations.account".to_string(),
+    );
+    sibling_bindings.insert(
+        "registry_dev".to_string(),
+        "awscc.organizations.account".to_string(),
+    );
+
+    let diagnostics = engine.analyze(&doc, None, &sibling_bindings, &HashSet::new());
+
+    let type_warning = diagnostics
+        .iter()
+        .find(|d| d.message.contains("type mismatch") || d.message.contains("expected"));
+    assert!(
+        type_warning.is_some(),
+        "Should warn about map(bool) vs String account_id. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn no_undefined_resource_for_sibling_binding_in_exports() {
     let engine = DiagnosticEngine::new(
         Arc::new(HashMap::new()),
