@@ -491,7 +491,7 @@ pub async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), AppErro
 
     // Resolve exports and persist to state
     if !input.export_params.is_empty() {
-        let exports = resolve_exports(input.export_params, input.sorted_resources, &state);
+        let exports = resolve_exports(input.export_params, &state);
         state.exports = exports;
     }
 
@@ -508,7 +508,6 @@ pub async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), AppErro
 /// Resolve export expressions using the binding map built from applied state.
 pub(crate) fn resolve_exports(
     export_params: &[carina_core::parser::ExportParameter],
-    _resources: &[Resource],
     state: &StateFile,
 ) -> HashMap<String, serde_json::Value> {
     use carina_core::resource::Value;
@@ -594,6 +593,30 @@ pub async fn save_state_unlocked(
 ) -> Result<(), AppError> {
     state.increment_serial();
     backend.write_state(state).await.map_err(AppError::Backend)
+}
+
+/// Persist export changes when the resource plan is empty.
+///
+/// Used when `plan.is_empty()` short-circuits apply: resources don't need
+/// any work, but exports may have changed. Rebuild the exports from the
+/// current state + desired `export_params` and write the state.
+pub(crate) async fn persist_exports_only(
+    backend: &dyn StateBackend,
+    lock: Option<&LockInfo>,
+    state_file: Option<StateFile>,
+    export_params: &[carina_core::parser::ExportParameter],
+) -> Result<(), AppError> {
+    let mut state = state_file.unwrap_or_default();
+    let exports = resolve_exports(export_params, &state);
+    state.exports = exports;
+    if let Some(lk) = lock {
+        save_state_locked(backend, lk, &mut state).await?;
+    } else {
+        save_state_unlocked(backend, &mut state).await?;
+    }
+    println!("  {} State saved (serial: {})", "✓".green(), state.serial);
+    println!("  {} Exports updated", "✓".green());
+    Ok(())
 }
 
 pub struct ApplyStateSave<'a> {
@@ -1327,7 +1350,35 @@ async fn run_apply_locked(
     }
 
     if plan.is_empty() {
-        println!("{}", "No changes needed.".green());
+        // Even when no resources need changes, exports may have changed.
+        // Persist them before returning so state stays in sync with config.
+        let resolved_exports = crate::commands::plan::resolve_export_values_for_display(
+            &parsed.export_params,
+            &sorted_resources,
+            &current_states,
+        );
+        let empty_exports = HashMap::new();
+        let current_exports = state_file
+            .as_ref()
+            .map(|s| &s.exports)
+            .unwrap_or(&empty_exports);
+        let export_changes =
+            crate::commands::plan::compute_export_diffs(&resolved_exports, current_exports);
+
+        if export_changes.is_empty() {
+            println!("{}", "No changes needed.".green());
+            return Ok(());
+        }
+
+        println!(
+            "{}",
+            format!(
+                "Persisting {} export change(s) to state.",
+                export_changes.len()
+            )
+            .cyan()
+        );
+        persist_exports_only(backend, lock, state_file, &parsed.export_params).await?;
         return Ok(());
     }
 
@@ -2264,7 +2315,7 @@ mod tests {
             value: Some(Value::String("registry_prod.account_id".to_string())),
         }];
 
-        let exports = resolve_exports(&export_params, &[], &state);
+        let exports = resolve_exports(&export_params, &state);
 
         assert_eq!(
             exports.get("account_id"),
