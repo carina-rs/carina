@@ -666,28 +666,21 @@ fn plan_snapshot_remote_state() {
 
 #[test]
 fn plan_snapshot_exports() {
-    use carina_core::parser::{ExportParameter, TypeExpr};
+    use crate::commands::plan::ExportChange;
+    use carina_core::parser::TypeExpr;
     use carina_core::resource::Value;
 
     let (plan, schemas, moved_origins) = build_plan_from_fixture("exports");
-    let exports = vec![
-        ExportParameter {
+    let export_changes = vec![
+        ExportChange::Added {
             name: "vpc_id".to_string(),
             type_expr: Some(TypeExpr::String),
-            value: Some(Value::resource_ref(
-                "vpc".to_string(),
-                "vpc_id".to_string(),
-                vec![],
-            )),
+            new_value: Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         },
-        ExportParameter {
+        ExportChange::Added {
             name: "cidr".to_string(),
             type_expr: None,
-            value: Some(Value::resource_ref(
-                "vpc".to_string(),
-                "cidr_block".to_string(),
-                vec![],
-            )),
+            new_value: Value::resource_ref("vpc".to_string(), "cidr_block".to_string(), vec![]),
         },
     ];
     let output = format_plan(
@@ -696,7 +689,43 @@ fn plan_snapshot_exports() {
         &HashMap::new(),
         Some(&schemas),
         &moved_origins,
-        &exports,
+        &export_changes,
+        &[],
+    );
+    insta::assert_snapshot!(strip_ansi(&output));
+}
+
+#[test]
+fn plan_snapshot_export_changes_mixed() {
+    use crate::commands::plan::ExportChange;
+    use carina_core::parser::TypeExpr;
+    use carina_core::resource::Value;
+
+    let (plan, schemas, moved_origins) = build_plan_from_fixture("no_changes");
+    let export_changes = vec![
+        ExportChange::Added {
+            name: "new_export".to_string(),
+            type_expr: Some(TypeExpr::String),
+            new_value: Value::String("hello".to_string()),
+        },
+        ExportChange::Modified {
+            name: "changed".to_string(),
+            type_expr: Some(TypeExpr::Int),
+            old_json: serde_json::json!(42),
+            new_value: Value::Int(100),
+        },
+        ExportChange::Removed {
+            name: "obsolete".to_string(),
+            old_json: serde_json::json!("gone"),
+        },
+    ];
+    let output = format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &moved_origins,
+        &export_changes,
         &[],
     );
     insta::assert_snapshot!(strip_ansi(&output));
