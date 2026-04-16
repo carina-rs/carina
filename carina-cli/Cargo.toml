@@ -11,6 +11,10 @@ homepage.workspace = true
 name = "carina"
 path = "src/main.rs"
 
+[[example]]
+name = "plan-fixture"
+path = "examples/plan-fixture.rs"
+
 [dependencies]
 carina-core = { path = "../carina-core" }
 carina-plugin-host = { path = "../carina-plugin-host" }

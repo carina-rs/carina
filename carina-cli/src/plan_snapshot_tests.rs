@@ -7,22 +7,13 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use carina_core::config_loader::{get_base_dir, load_configuration};
-use carina_core::deps::sort_resources_by_dependencies;
-use carina_core::differ::{cascade_dependent_updates, create_plan};
-use carina_core::resolver::resolve_refs_with_state_and_remote;
-use carina_core::resource::{ResourceId, State, Value};
+use carina_core::config_loader::load_configuration;
+use carina_core::resource::{ResourceId, State};
 use carina_core::schema::ResourceSchema;
-use carina_state::{StateFile, check_and_migrate};
 
 use crate::DetailLevel;
-use crate::commands::validate_and_resolve;
 use crate::display::{format_destroy_plan, format_plan};
-use crate::wiring::{
-    WiringContext, normalize_desired_with_ctx, normalize_state_with_ctx,
-    reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
-    resolve_enum_aliases_in_states, resolve_enum_aliases_with_ctx,
-};
+use crate::fixture_plan::build_plan_from_fixture_name;
 
 /// Strip ANSI escape codes from a string for snapshot readability.
 fn strip_ansi(s: &str) -> String {
@@ -38,8 +29,8 @@ fn build_plan_from_fixture(
     HashMap<String, ResourceSchema>,
     HashMap<ResourceId, ResourceId>,
 ) {
-    let (plan, _, schemas, moved_origins) = build_plan_and_states_from_fixture(fixture_dir);
-    (plan, schemas, moved_origins)
+    let fp = build_plan_from_fixture_name(fixture_dir);
+    (fp.plan, fp.schemas, fp.moved_origins)
 }
 
 #[allow(clippy::type_complexity)]
@@ -51,181 +42,8 @@ fn build_plan_and_states_from_fixture(
     HashMap<String, ResourceSchema>,
     HashMap<ResourceId, ResourceId>,
 ) {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let fixture_path = PathBuf::from(format!(
-        "{}/tests/fixtures/plan_display/{}",
-        manifest_dir, fixture_dir
-    ));
-    let state_path = PathBuf::from(format!(
-        "{}/tests/fixtures/plan_display/{}/carina.state.json",
-        manifest_dir, fixture_dir
-    ));
-
-    // Parse configuration
-    let mut parsed = load_configuration(&fixture_path).unwrap().parsed;
-    let base_dir = get_base_dir(&fixture_path);
-    validate_and_resolve(&mut parsed, base_dir, true).unwrap();
-
-    // Load state file if present
-    let state_file: Option<StateFile> = if state_path.exists() {
-        let json = std::fs::read_to_string(&state_path).unwrap();
-        Some(serde_json::from_str(&json).unwrap())
-    } else {
-        None
-    };
-
-    // Reconcile identifiers with state (same as plan command)
-    let wiring = WiringContext::new(vec![]);
-    reconcile_prefixed_names(&mut parsed.resources, &state_file);
-    if let Some(sf) = state_file.as_ref() {
-        reconcile_anonymous_identifiers_with_ctx(&wiring, &mut parsed.resources, sf);
-    }
-
-    // Sort resources by dependency order
-    let sorted_resources = sort_resources_by_dependencies(&parsed.resources).unwrap();
-
-    // Build current states (--refresh=false path)
-    let mut current_states: HashMap<ResourceId, State> = HashMap::new();
-    if let Some(sf) = state_file.as_ref() {
-        for resource in &sorted_resources {
-            let state = sf.build_state_for_resource(resource);
-            current_states.insert(resource.id.clone(), state);
-        }
-
-        // Include orphaned resources
-        let desired_ids: HashSet<ResourceId> =
-            sorted_resources.iter().map(|r| r.id.clone()).collect();
-        for (id, state) in sf.build_orphan_states(&desired_ids) {
-            current_states.entry(id).or_insert(state);
-        }
-    } else {
-        for resource in &sorted_resources {
-            current_states.insert(resource.id.clone(), State::not_found(resource.id.clone()));
-        }
-    }
-
-    let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
-    for us in &parsed.upstream_states {
-        let dir = if us.source.is_absolute() {
-            us.source.clone()
-        } else {
-            base_dir.join(&us.source)
-        };
-        let state_path = dir.join(carina_state::LocalBackend::DEFAULT_STATE_FILE);
-        if let Ok(content) = std::fs::read_to_string(&state_path)
-            && let Ok(sf) = check_and_migrate(&content)
-        {
-            remote_bindings.insert(us.binding.clone(), sf.build_remote_bindings());
-        }
-    }
-
-    // Resolve ResourceRef values using state and remote bindings
-    let mut resources = sorted_resources.clone();
-    resolve_refs_with_state_and_remote(&mut resources, &current_states, &remote_bindings)
-        .expect("Failed to resolve refs with state");
-
-    // Normalize desired resources (resolve enum identifiers)
-    normalize_desired_with_ctx(&wiring, &mut resources);
-
-    // Normalize state enum values to match DSL format
-    normalize_state_with_ctx(&wiring, &mut current_states);
-
-    // Merge default_tags from provider configs into resources that support tags
-    {
-        use carina_core::provider::{ProviderNormalizer, ProviderRouter};
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("failed to build tokio runtime for merge_default_tags");
-        let mut router = ProviderRouter::new();
-        for factory in wiring.factories() {
-            let attrs = HashMap::new();
-            router.add_normalizer(rt.block_on(factory.create_normalizer(&attrs)));
-        }
-        for provider_config in &parsed.providers {
-            if !provider_config.default_tags.is_empty() {
-                router.merge_default_tags(
-                    &mut resources,
-                    &provider_config.default_tags,
-                    wiring.schemas(),
-                );
-            }
-        }
-    }
-
-    // Resolve enum aliases (e.g., "all" -> "-1") in both desired and current states
-    resolve_enum_aliases_with_ctx(&wiring, &mut resources);
-    resolve_enum_aliases_in_states(&wiring, &mut current_states);
-
-    // Build plan
-    let lifecycles = state_file
-        .as_ref()
-        .map(|sf| sf.build_lifecycles())
-        .unwrap_or_default();
-
-    let mut saved_attrs = state_file
-        .as_ref()
-        .map(|sf| sf.build_saved_attrs())
-        .unwrap_or_default();
-
-    let mut prev_desired_keys = state_file
-        .as_ref()
-        .map(|sf| sf.build_desired_keys())
-        .unwrap_or_default();
-
-    let orphan_dependencies = if let Some(sf) = state_file.as_ref() {
-        let desired_ids: HashSet<ResourceId> =
-            sorted_resources.iter().map(|r| r.id.clone()).collect();
-        sf.build_orphan_dependencies(&desired_ids)
-    } else {
-        HashMap::new()
-    };
-
-    // Pre-process moved blocks: transfer state, prev_desired_keys, and saved_attrs
-    let moved_pairs = crate::wiring::materialize_moved_states(
-        &mut current_states,
-        &mut prev_desired_keys,
-        &mut saved_attrs,
-        &parsed.state_blocks,
-        &state_file,
-    );
-
-    let mut plan = create_plan(
-        &resources,
-        &current_states,
-        &lifecycles,
-        wiring.schemas(),
-        &saved_attrs,
-        &prev_desired_keys,
-        &orphan_dependencies,
-    );
-
-    cascade_dependent_updates(
-        &mut plan,
-        &sorted_resources,
-        &current_states,
-        wiring.schemas(),
-    );
-
-    // Add state block effects (import/removed/moved)
-    crate::wiring::add_state_block_effects(
-        &mut plan,
-        &parsed.state_blocks,
-        &state_file,
-        &moved_pairs,
-        wiring.schemas(),
-    );
-
-    let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
-        .iter()
-        .map(|(from, to)| (to.clone(), from.clone()))
-        .collect();
-
-    (
-        plan,
-        current_states,
-        wiring.schemas().clone(),
-        moved_origins,
-    )
+    let fp = build_plan_from_fixture_name(fixture_dir);
+    (fp.plan, fp.current_states, fp.schemas, fp.moved_origins)
 }
 
 #[test]
@@ -746,33 +564,20 @@ fn snapshot_nested_map_diff() {
 
 #[test]
 fn snapshot_deferred_for() {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let fixture_path = PathBuf::from(format!(
-        "{}/tests/fixtures/plan_display/deferred_for",
-        manifest_dir
-    ));
-
-    // Parse — the upstream_state has no backing file, so the for-expression is deferred
-    let loaded = load_configuration(&fixture_path).unwrap();
-    let mut parsed = loaded.parsed;
-    let base_dir = get_base_dir(&fixture_path);
-    validate_and_resolve(&mut parsed, base_dir, true).unwrap();
-
-    // The plan should be empty (no concrete effects) but deferred_for_expressions non-empty
-    let plan = carina_core::plan::Plan::new();
+    let fp = build_plan_from_fixture_name("deferred_for");
     assert!(
-        !parsed.deferred_for_expressions.is_empty(),
+        !fp.deferred_for_expressions.is_empty(),
         "expected at least one deferred for-expression"
     );
 
     let output = strip_ansi(&format_plan(
-        &plan,
+        &fp.plan,
         DetailLevel::Full,
         &HashMap::new(),
         None,
         &HashMap::new(),
         &[],
-        &parsed.deferred_for_expressions,
+        &fp.deferred_for_expressions,
     ));
     insta::assert_snapshot!(output);
 }

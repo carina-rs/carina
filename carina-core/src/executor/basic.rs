@@ -71,7 +71,7 @@ pub(super) async fn refresh_pending_states(
     observer.on_event(&ExecutionEvent::RefreshStarted);
 
     let mut refreshes: Vec<_> = pending_refreshes.iter().collect();
-    refreshes.sort_by(|(left_id, _), (right_id, _)| left_id.to_string().cmp(&right_id.to_string()));
+    refreshes.sort_by_key(|(left_id, _)| left_id.to_string());
     let mut failed_refreshes = std::collections::HashSet::new();
 
     for (id, identifier) in refreshes {

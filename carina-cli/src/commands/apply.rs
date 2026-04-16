@@ -381,7 +381,7 @@ pub async fn refresh_pending_states(
     println!("{}", "Refreshing uncertain resource states...".cyan());
 
     let mut refreshes: Vec<_> = pending_refreshes.iter().collect();
-    refreshes.sort_by(|(left_id, _), (right_id, _)| left_id.to_string().cmp(&right_id.to_string()));
+    refreshes.sort_by_key(|(left_id, _)| left_id.to_string());
     let mut failed_refreshes = HashSet::new();
 
     for (id, identifier) in refreshes {
