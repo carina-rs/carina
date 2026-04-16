@@ -63,6 +63,9 @@ pub struct ParseWarning {
 
 /// Placeholder text for values that depend on an upstream apply.
 pub const DEFERRED_UPSTREAM_PLACEHOLDER: &str = "(known after upstream apply)";
+/// Placeholder reserved for map-binding key variables. Distinct from the
+/// value-var placeholder so expansion can substitute each correctly.
+pub const DEFERRED_UPSTREAM_KEY_PLACEHOLDER: &str = "(known after upstream apply: key)";
 
 /// A for-expression whose iterable is unresolved (e.g., remote_state not yet available).
 /// Captures the structural shape of the loop body so the plan can show what
@@ -87,8 +90,10 @@ pub struct DeferredForExpression {
     /// The iterable access path segments (e.g., `["orgs", "accounts"]`).
     pub iterable_binding: String,
     pub iterable_attr: String,
-    /// Loop variable name (used for substitution during expansion).
-    pub loop_var: String,
+    /// Binding pattern — records the kind (Simple/Indexed/Map) so the expansion
+    /// can verify the resolved iterable's shape matches and substitute the
+    /// correct variable(s).
+    pub binding: ForBinding,
     /// Template resource for expansion (the for body parsed with placeholders).
     pub template_resource: Resource,
 }
@@ -466,6 +471,7 @@ impl ParsedFile {
     ) {
         let mut expanded_resources = Vec::new();
         let mut resolved_indices = Vec::new();
+        let mut new_warnings: Vec<ParseWarning> = Vec::new();
 
         for (idx, deferred) in self.deferred_for_expressions.iter().enumerate() {
             // Look up the iterable value in remote_bindings
@@ -477,8 +483,10 @@ impl ParsedFile {
                 continue;
             };
 
-            match iterable_value {
-                Value::List(items) => {
+            match (&deferred.binding, iterable_value) {
+                // Simple/Indexed bindings expand over lists
+                (ForBinding::Simple(_), Value::List(items))
+                | (ForBinding::Indexed(_, _), Value::List(items)) => {
                     for (i, item) in items.iter().enumerate() {
                         let address = format!("{}[{}]", deferred.binding_name, i);
                         let mut resource = deferred.template_resource.clone();
@@ -486,13 +494,14 @@ impl ParsedFile {
                         resource.binding = Some(address);
                         // Substitute the placeholder in all attributes
                         for (_key, expr) in resource.attributes.iter_mut() {
-                            substitute_placeholder(&mut expr.0, &deferred.loop_var, item);
+                            substitute_placeholder(&mut expr.0, item);
                         }
                         expanded_resources.push(resource);
                     }
                     resolved_indices.push(idx);
                 }
-                Value::Map(map) => {
+                // Map binding expands over maps, substituting both key and value vars
+                (ForBinding::Map(_, _), Value::Map(map)) => {
                     let mut keys: Vec<&String> = map.keys().collect();
                     keys.sort();
                     for key in keys {
@@ -501,12 +510,34 @@ impl ParsedFile {
                         let mut resource = deferred.template_resource.clone();
                         resource.id.name = address.clone();
                         resource.binding = Some(address);
-                        for (_key, expr) in resource.attributes.iter_mut() {
-                            substitute_placeholder(&mut expr.0, &deferred.loop_var, val);
-                        }
+                        substitute_for_map_entry(&mut resource, key, val);
                         expanded_resources.push(resource);
                     }
                     resolved_indices.push(idx);
+                }
+                // Shape mismatch: emit warning and leave deferred
+                (ForBinding::Map(_, _), Value::List(_)) => {
+                    new_warnings.push(ParseWarning {
+                        file: deferred.file.clone(),
+                        line: deferred.line,
+                        message: format!(
+                            "for binding expected map iterable but `{}.{}` resolved to a list. \
+                             Fix either the upstream export shape or the downstream binding.",
+                            deferred.iterable_binding, deferred.iterable_attr,
+                        ),
+                    });
+                }
+                (ForBinding::Simple(_), Value::Map(_))
+                | (ForBinding::Indexed(_, _), Value::Map(_)) => {
+                    new_warnings.push(ParseWarning {
+                        file: deferred.file.clone(),
+                        line: deferred.line,
+                        message: format!(
+                            "for binding expected list iterable but `{}.{}` resolved to a map. \
+                             Fix either the upstream export shape or the downstream binding.",
+                            deferred.iterable_binding, deferred.iterable_attr,
+                        ),
+                    });
                 }
                 _ => {
                     // Iterable is not a list or map — leave deferred
@@ -524,28 +555,59 @@ impl ParsedFile {
         }
 
         self.resources.extend(expanded_resources);
+        self.warnings.extend(new_warnings);
     }
 }
 
 /// Substitute placeholder values in a Value tree.
 /// Replaces `Value::String(DEFERRED_UPSTREAM_PLACEHOLDER)` with the actual value,
 /// matching the loop variable name.
-fn substitute_placeholder(value: &mut Value, _loop_var: &str, replacement: &Value) {
+fn substitute_placeholder(value: &mut Value, replacement: &Value) {
     match value {
         Value::String(s) if s == DEFERRED_UPSTREAM_PLACEHOLDER => {
             *value = replacement.clone();
         }
         Value::List(items) => {
             for item in items.iter_mut() {
-                substitute_placeholder(item, _loop_var, replacement);
+                substitute_placeholder(item, replacement);
             }
         }
         Value::Map(map) => {
             for v in map.values_mut() {
-                substitute_placeholder(v, _loop_var, replacement);
+                substitute_placeholder(v, replacement);
             }
         }
         _ => {}
+    }
+}
+
+/// Substitute key and value placeholders for a map-binding entry.
+/// Replaces `DEFERRED_UPSTREAM_KEY_PLACEHOLDER` with the key string and
+/// `DEFERRED_UPSTREAM_PLACEHOLDER` with the value.
+fn substitute_for_map_entry(resource: &mut Resource, key: &str, value: &Value) {
+    fn recurse(v: &mut Value, key: &str, replacement: &Value) {
+        match v {
+            Value::String(s) if s == DEFERRED_UPSTREAM_KEY_PLACEHOLDER => {
+                *v = Value::String(key.to_string());
+            }
+            Value::String(s) if s == DEFERRED_UPSTREAM_PLACEHOLDER => {
+                *v = replacement.clone();
+            }
+            Value::List(items) => {
+                for item in items.iter_mut() {
+                    recurse(item, key, replacement);
+                }
+            }
+            Value::Map(map) => {
+                for val in map.values_mut() {
+                    recurse(val, key, replacement);
+                }
+            }
+            _ => {}
+        }
+    }
+    for (_, expr) in resource.attributes.iter_mut() {
+        recurse(&mut expr.0, key, value);
     }
 }
 
@@ -1649,7 +1711,8 @@ fn parse_primary_with_resource_or_module(
 }
 
 /// Binding pattern for a for expression
-enum ForBinding {
+#[derive(Debug, Clone)]
+pub enum ForBinding {
     /// Simple: `for x in ...`
     Simple(String),
     /// Indexed: `for (i, x) in ...`
@@ -1814,7 +1877,10 @@ fn parse_for_expr(
                     template_ctx.set_variable(val.clone(), placeholder());
                 }
                 ForBinding::Map(k, v) => {
-                    template_ctx.set_variable(k.clone(), placeholder());
+                    template_ctx.set_variable(
+                        k.clone(),
+                        Value::String(DEFERRED_UPSTREAM_KEY_PLACEHOLDER.to_string()),
+                    );
                     template_ctx.set_variable(v.clone(), placeholder());
                 }
             }
@@ -1829,11 +1895,6 @@ fn parse_for_expr(
                     .filter(|(k, _)| !k.starts_with('_'))
                     .map(|(k, expr)| (k.clone(), expr.0.clone()))
                     .collect();
-                let loop_var = match &binding {
-                    ForBinding::Simple(var) => var.clone(),
-                    ForBinding::Indexed(_, val) => val.clone(),
-                    ForBinding::Map(_, v) => v.clone(),
-                };
                 ctx.deferred_for_expressions.push(DeferredForExpression {
                     file: None,
                     line: for_line,
@@ -1847,7 +1908,7 @@ fn parse_for_expr(
                     binding_name: binding_name.to_string(),
                     iterable_binding: path.binding().to_string(),
                     iterable_attr: path.attribute().to_string(),
-                    loop_var,
+                    binding: binding.clone(),
                     template_resource: *resource,
                 });
             }
@@ -10481,5 +10542,112 @@ awscc.ec2.vpc {
             "should stay deferred when remote data not available"
         );
         assert_eq!(parsed.resources.len(), 0);
+    }
+
+    #[test]
+    fn expand_deferred_for_map_binding_substitutes_key_and_value() {
+        // Map binding `for k, v in orgs.accounts` should expand each entry with
+        // both the key and value variables available.
+        let input = r#"
+            let orgs = remote_state {
+                path = "../organizations/carina.state.json"
+            }
+
+            for name, account_id in orgs.accounts {
+                awscc.sso.assignment {
+                    target_id = account_id
+                    target_name = name
+                }
+            }
+        "#;
+
+        let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(parsed.deferred_for_expressions.len(), 1);
+
+        let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let mut accounts = HashMap::new();
+        accounts.insert(
+            "prod".to_string(),
+            Value::String("111111111111".to_string()),
+        );
+        accounts.insert("dev".to_string(), Value::String("222222222222".to_string()));
+        let mut orgs_attrs = HashMap::new();
+        orgs_attrs.insert("accounts".to_string(), Value::Map(accounts));
+        remote_bindings.insert("orgs".to_string(), orgs_attrs);
+
+        parsed.expand_deferred_for_expressions(&remote_bindings);
+
+        assert_eq!(parsed.deferred_for_expressions.len(), 0);
+        assert_eq!(parsed.resources.len(), 2);
+
+        // Verify both key and value are substituted.
+        let mut by_name: HashMap<String, &Resource> = HashMap::new();
+        for r in &parsed.resources {
+            if let Some(Value::String(s)) = r.get_attr("target_name") {
+                by_name.insert(s.clone(), r);
+            }
+        }
+        let prod = by_name.get("prod").expect("prod entry");
+        assert_eq!(
+            prod.get_attr("target_id"),
+            Some(&Value::String("111111111111".to_string()))
+        );
+        let dev = by_name.get("dev").expect("dev entry");
+        assert_eq!(
+            dev.get_attr("target_id"),
+            Some(&Value::String("222222222222".to_string()))
+        );
+    }
+
+    #[test]
+    fn expand_deferred_for_map_binding_with_list_iterable_warns() {
+        // Map binding but upstream resolves to a list — mismatch should produce
+        // a warning and leave the for-expression deferred (do not silently expand).
+        let input = r#"
+            let orgs = remote_state {
+                path = "../organizations/carina.state.json"
+            }
+
+            for name, account_id in orgs.accounts {
+                awscc.sso.assignment {
+                    target_id = account_id
+                }
+            }
+        "#;
+
+        let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+
+        let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let mut orgs_attrs = HashMap::new();
+        orgs_attrs.insert(
+            "accounts".to_string(),
+            Value::List(vec![
+                Value::String("111111111111".to_string()),
+                Value::String("222222222222".to_string()),
+            ]),
+        );
+        remote_bindings.insert("orgs".to_string(), orgs_attrs);
+
+        parsed.expand_deferred_for_expressions(&remote_bindings);
+
+        // Mismatch: should NOT expand silently with numeric indices
+        assert_eq!(
+            parsed.resources.len(),
+            0,
+            "map binding with list iterable should not silently expand"
+        );
+        assert_eq!(
+            parsed.deferred_for_expressions.len(),
+            1,
+            "should remain deferred on shape mismatch"
+        );
+        assert!(
+            parsed
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("expected map") || w.message.contains("shape")),
+            "should warn about shape mismatch, got: {:?}",
+            parsed.warnings
+        );
     }
 }
