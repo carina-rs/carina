@@ -487,6 +487,29 @@ impl AttributeType {
     pub fn is_string_based_custom(&self) -> bool {
         matches!(self, AttributeType::Custom { base, .. } if matches!(**base, AttributeType::String))
     }
+
+    /// Check if two attribute types are compatible for ResourceRef assignment.
+    ///
+    /// Compatibility rules:
+    /// - Union type accepts any member type name
+    /// - Same type name is always compatible
+    /// - Either side being `String` is compatible (String is the base for Custom types)
+    /// - Both sides being String-based Custom types are compatible
+    pub fn is_compatible_with(&self, other: &AttributeType) -> bool {
+        let self_name = self.type_name();
+        let other_name = other.type_name();
+
+        if self.accepts_type_name(&other_name) || other.accepts_type_name(&self_name) {
+            return true;
+        }
+        if self_name == "String" || other_name == "String" {
+            return true;
+        }
+        if self.is_string_based_custom() && other.is_string_based_custom() {
+            return true;
+        }
+        false
+    }
 }
 
 impl fmt::Display for AttributeType {
@@ -3219,5 +3242,56 @@ mod tests {
         attrs.insert("_binding".to_string(), Value::String("b".to_string()));
 
         assert!(schema.validate(&attrs).is_ok());
+    }
+
+    fn make_custom(name: &str, base: AttributeType) -> AttributeType {
+        AttributeType::Custom {
+            name: name.to_string(),
+            base: Box::new(base),
+            validate: |_| Ok(()),
+            namespace: None,
+            to_dsl: None,
+        }
+    }
+
+    #[test]
+    fn is_compatible_with_same_type() {
+        assert!(AttributeType::String.is_compatible_with(&AttributeType::String));
+        assert!(AttributeType::Int.is_compatible_with(&AttributeType::Int));
+    }
+
+    #[test]
+    fn is_compatible_with_different_base_types() {
+        assert!(!AttributeType::Bool.is_compatible_with(&AttributeType::Int));
+        assert!(!AttributeType::Int.is_compatible_with(&AttributeType::Bool));
+    }
+
+    #[test]
+    fn is_compatible_with_string_and_custom() {
+        let custom = make_custom("VpcId", AttributeType::String);
+        assert!(AttributeType::String.is_compatible_with(&custom));
+        assert!(custom.is_compatible_with(&AttributeType::String));
+    }
+
+    #[test]
+    fn is_compatible_with_two_string_based_customs() {
+        let vpc_id = make_custom("VpcId", AttributeType::String);
+        let subnet_id = make_custom("SubnetId", AttributeType::String);
+        assert!(vpc_id.is_compatible_with(&subnet_id));
+    }
+
+    #[test]
+    fn is_compatible_with_union_accepts_member() {
+        let vpc_id = make_custom("VpcId", AttributeType::String);
+        let union = AttributeType::Union(vec![vpc_id, AttributeType::String]);
+        let other_vpc_id = make_custom("VpcId", AttributeType::String);
+        assert!(union.is_compatible_with(&other_vpc_id));
+    }
+
+    #[test]
+    fn is_compatible_with_int_custom_rejects_string_custom() {
+        let int_custom = make_custom("Port", AttributeType::Int);
+        let string_custom = make_custom("VpcId", AttributeType::String);
+        assert!(!int_custom.is_compatible_with(&string_custom));
     }
 }
