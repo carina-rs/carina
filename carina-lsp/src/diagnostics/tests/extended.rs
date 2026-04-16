@@ -1886,3 +1886,43 @@ fn exports_type_warning_multiline_vs_oneline() {
         diag_literal.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn no_undefined_resource_for_sibling_binding_in_exports() {
+    let engine = DiagnosticEngine::new(
+        Arc::new(HashMap::new()),
+        vec!["awscc".to_string()],
+        Arc::new(vec![]),
+    );
+    let doc = create_document(
+        r#"exports {
+  accounts: map(aws_account_id) = {
+    prod = registry_prod.account_id
+    dev = registry_dev.account_id
+  }
+}
+"#,
+    );
+
+    // registry_prod and registry_dev are defined in sibling files
+    let mut sibling_bindings = HashMap::new();
+    sibling_bindings.insert(
+        "registry_prod".to_string(),
+        "awscc.organizations.account".to_string(),
+    );
+    sibling_bindings.insert(
+        "registry_dev".to_string(),
+        "awscc.organizations.account".to_string(),
+    );
+
+    let diagnostics = engine.analyze(&doc, None, &sibling_bindings);
+
+    let undefined = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Undefined resource"));
+    assert!(
+        undefined.is_none(),
+        "Sibling binding refs should not be flagged as undefined. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}

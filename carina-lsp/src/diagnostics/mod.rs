@@ -121,7 +121,12 @@ impl DiagnosticEngine {
         }
 
         // Check for undefined resource references in the raw text
-        let undef_diags = self.check_undefined_references(&text, &defined_bindings);
+        // Include sibling file bindings to avoid false positives for cross-file refs
+        let mut all_bindings = defined_bindings.clone();
+        for name in sibling_bindings.keys() {
+            all_bindings.insert(name.clone());
+        }
+        let undef_diags = self.check_undefined_references(&text, &all_bindings);
         diagnostics.extend(undef_diags);
 
         // Semantic analysis on parsed file
