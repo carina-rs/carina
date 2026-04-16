@@ -106,7 +106,12 @@ fn build_plan_and_states_from_fixture(
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     for us in &parsed.upstream_states {
-        let state_path = crate::commands::plan::upstream_state_file_path(us, base_dir);
+        let dir = if us.source.is_absolute() {
+            us.source.clone()
+        } else {
+            base_dir.join(&us.source)
+        };
+        let state_path = dir.join(carina_state::LocalBackend::DEFAULT_STATE_FILE);
         if let Ok(content) = std::fs::read_to_string(&state_path)
             && let Ok(sf) = check_and_migrate(&content)
         {

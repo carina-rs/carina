@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -14,8 +14,8 @@ use carina_core::value::{
     redact_secrets_in_plan, redact_secrets_in_resource, redact_secrets_in_state,
 };
 use carina_state::{
-    BackendConfig as StateBackendConfig, StateBackend, StateFile, check_and_migrate,
-    create_backend, create_local_backend,
+    BackendConfig as StateBackendConfig, LocalBackend, StateBackend, StateFile, create_backend,
+    create_local_backend, resolve_backend,
 };
 
 use super::validate_and_resolve_with_config;
@@ -490,49 +490,232 @@ pub fn compute_export_diffs(
     changes
 }
 
-/// Resolve the state-file path for an `upstream_state` block. The `source`
-/// is treated as a directory (absolute or relative to `base_dir`) whose
-/// default local state file is read.
-pub(crate) fn upstream_state_file_path(us: &UpstreamState, base_dir: &Path) -> PathBuf {
-    let dir = if us.source.is_absolute() {
-        us.source.clone()
-    } else {
-        base_dir.join(&us.source)
-    };
-    dir.join(carina_state::LocalBackend::DEFAULT_STATE_FILE)
-}
-
-pub(crate) async fn load_upstream_state_bindings(
+/// Resolve and read each upstream's published exports by parsing its source
+/// directory, deriving its backend, and pulling the state through that backend.
+///
+/// `cycle_guard` holds canonicalized absolute paths of directories currently
+/// being resolved. An upstream whose source canonicalizes to a path already in
+/// the guard is a cycle (A → B → A) and produces an error naming the path.
+pub(crate) async fn load_upstream_states(
     upstream_states: &[UpstreamState],
     base_dir: &Path,
+    provider_context: &ProviderContext,
+    cycle_guard: &mut HashSet<PathBuf>,
 ) -> Result<HashMap<String, HashMap<String, Value>>, AppError> {
     let mut result = HashMap::new();
 
     for us in upstream_states {
-        let state_path = upstream_state_file_path(us, base_dir);
-
-        let content = fs::read_to_string(&state_path).map_err(|e| {
+        let source_abs = base_dir.join(&us.source).canonicalize().map_err(|e| {
             AppError::Config(format!(
-                "Failed to read upstream state file '{}' for upstream_state '{}': {}",
-                state_path.display(),
+                "upstream_state '{}': cannot resolve source '{}': {}",
                 us.binding,
+                us.source.display(),
                 e
             ))
         })?;
 
-        let state_file = check_and_migrate(&content).map_err(|e| {
-            AppError::Config(format!(
-                "Failed to parse upstream state file '{}' for upstream_state '{}': {}",
-                state_path.display(),
+        if !cycle_guard.insert(source_abs.clone()) {
+            return Err(AppError::Config(format!(
+                "upstream_state '{}': cycle detected at {}",
                 us.binding,
-                e
-            ))
-        })?;
+                source_abs.display()
+            )));
+        }
 
-        result.insert(us.binding.clone(), state_file.build_remote_bindings());
+        let load_result =
+            load_upstream_bindings_at(us, &source_abs, provider_context, cycle_guard).await;
+        cycle_guard.remove(&source_abs);
+        let bindings = load_result?;
+        result.insert(us.binding.clone(), bindings);
     }
 
     Ok(result)
+}
+
+async fn load_upstream_bindings_at(
+    us: &UpstreamState,
+    source_abs: &Path,
+    provider_context: &ProviderContext,
+    cycle_guard: &mut HashSet<PathBuf>,
+) -> Result<HashMap<String, Value>, AppError> {
+    let loaded = load_configuration_with_config(&source_abs.to_path_buf(), provider_context)
+        .map_err(|e| AppError::Config(format!("upstream_state '{}': {}", us.binding, e)))?;
+
+    // Walk the upstream's own upstream_state blocks so cycles are detected
+    // even when the chain is longer than one hop. The returned bindings are
+    // discarded; the downstream only needs this upstream's own exports.
+    Box::pin(load_upstream_states(
+        &loaded.parsed.upstream_states,
+        source_abs,
+        provider_context,
+        cycle_guard,
+    ))
+    .await?;
+
+    let backend: Box<dyn StateBackend> = match loaded.parsed.backend.as_ref() {
+        // Anchor local-backend state paths at the upstream's source directory
+        // so `path = "foo.json"` resolves relative to the upstream, not the
+        // downstream process's CWD.
+        Some(config) if config.backend_type == "local" => {
+            let state_path = StateBackendConfig::from(config)
+                .get_string("path")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(LocalBackend::DEFAULT_STATE_FILE));
+            let anchored = if state_path.is_absolute() {
+                state_path
+            } else {
+                source_abs.join(state_path)
+            };
+            Box::new(LocalBackend::with_path(anchored))
+        }
+        Some(config) => resolve_backend(Some(config))
+            .await
+            .map_err(AppError::Backend)?,
+        None => Box::new(LocalBackend::with_path(
+            source_abs.join(LocalBackend::DEFAULT_STATE_FILE),
+        )),
+    };
+
+    let state_file = backend
+        .read_state()
+        .await
+        .map_err(AppError::Backend)?
+        .ok_or_else(|| {
+            AppError::Config(format!(
+                "upstream_state '{}': no state found at {}",
+                us.binding,
+                source_abs.display()
+            ))
+        })?;
+
+    Ok(state_file.build_remote_bindings())
+}
+
+/// Thin wrapper preserved for call sites that haven't yet been threaded with
+/// a cycle guard. Task 5 (#1911) removes this in favor of direct calls to
+/// `load_upstream_states`.
+pub(crate) async fn load_upstream_state_bindings(
+    upstream_states: &[UpstreamState],
+    base_dir: &Path,
+) -> Result<HashMap<String, HashMap<String, Value>>, AppError> {
+    let mut cycle_guard = HashSet::new();
+    if let Ok(abs) = base_dir.canonicalize() {
+        cycle_guard.insert(abs);
+    }
+    load_upstream_states(
+        upstream_states,
+        base_dir,
+        &ProviderContext::default(),
+        &mut cycle_guard,
+    )
+    .await
+}
+
+#[cfg(test)]
+mod load_upstream_states_tests {
+    use super::*;
+    use std::fs;
+
+    fn write_state(dir: &Path, exports: &[(&str, serde_json::Value)]) {
+        let mut state = StateFile::new();
+        for (k, v) in exports {
+            state.exports.insert(k.to_string(), v.clone());
+        }
+        fs::write(
+            dir.join(carina_state::LocalBackend::DEFAULT_STATE_FILE),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_upstream_states_reads_exports_from_source_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("main.crn"),
+            r#"backend local { path = "carina.state.json" }"#,
+        )
+        .unwrap();
+        write_state(dir.path(), &[("account_id", serde_json::json!("123"))]);
+
+        let upstream_states = vec![UpstreamState {
+            binding: "orgs".to_string(),
+            source: dir.path().to_path_buf(),
+        }];
+
+        let base_dir = dir.path().parent().unwrap();
+        let result = load_upstream_states(
+            &upstream_states,
+            base_dir,
+            &ProviderContext::default(),
+            &mut HashSet::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result["orgs"]["account_id"],
+            Value::String("123".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn load_upstream_states_errors_on_cycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_a = tmp.path().join("a");
+        let dir_b = tmp.path().join("b");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+        fs::write(
+            dir_a.join("main.crn"),
+            r#"upstream_state "b" { source = "../b" }"#,
+        )
+        .unwrap();
+        fs::write(
+            dir_b.join("main.crn"),
+            r#"upstream_state "a" { source = "../a" }"#,
+        )
+        .unwrap();
+
+        let upstream_states = vec![UpstreamState {
+            binding: "b".to_string(),
+            source: PathBuf::from("../b"),
+        }];
+
+        let mut guard = HashSet::new();
+        guard.insert(dir_a.canonicalize().unwrap());
+
+        let err = load_upstream_states(
+            &upstream_states,
+            &dir_a,
+            &ProviderContext::default(),
+            &mut guard,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("cycle"), "got: {}", err);
+    }
+
+    #[tokio::test]
+    async fn load_upstream_states_errors_when_source_missing() {
+        let upstream_states = vec![UpstreamState {
+            binding: "orgs".to_string(),
+            source: PathBuf::from("/nonexistent/carina/upstream/path"),
+        }];
+        let err = load_upstream_states(
+            &upstream_states,
+            Path::new("/"),
+            &ProviderContext::default(),
+            &mut HashSet::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("orgs"),
+            "error should name the binding: {}",
+            err
+        );
+    }
 }
 
 #[cfg(test)]
