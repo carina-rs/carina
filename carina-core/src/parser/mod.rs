@@ -765,10 +765,11 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
                                 requires.push(parse_require_statement(stmt)?);
                             }
                             Rule::for_expr => {
-                                let binding_name = format!("_for{}", anon_for_counter);
+                                let iterable_name =
+                                    extract_for_iterable_name(&stmt, anon_for_counter);
                                 anon_for_counter += 1;
                                 let (expanded_resources, expanded_module_calls) =
-                                    parse_for_expr(stmt, &mut ctx, &binding_name)?;
+                                    parse_for_expr(stmt, &mut ctx, &iterable_name)?;
                                 resources.extend(expanded_resources);
                                 module_calls.extend(expanded_module_calls);
                             }
@@ -1668,6 +1669,32 @@ enum ForBodyResult {
 /// `for x in list { resource_expr }` expands to resources with addresses like
 /// `binding[0]`, `binding[1]`, etc.
 ///
+/// Extract a binding name from a for-expression's iterable.
+///
+/// For `for x in orgs.accounts { ... }`, returns `_accounts`.
+/// For non-variable iterables (lists, function calls), falls back to `_for{N}`.
+fn extract_for_iterable_name(pair: &pest::iterators::Pair<Rule>, counter: usize) -> String {
+    let fallback = format!("_for{}", counter);
+    let mut inner = pair.clone().into_inner();
+    // Skip for_binding, take for_iterable
+    let iterable_pair = inner.nth(1);
+    let Some(iterable) = iterable_pair else {
+        return fallback;
+    };
+    // Only extract name from variable_ref iterables
+    let first_child = iterable.into_inner().next();
+    let Some(child) = first_child else {
+        return fallback;
+    };
+    if child.as_rule() != Rule::variable_ref {
+        return fallback;
+    }
+    // Take the last segment of the dotted path (e.g., "accounts" from "orgs.accounts")
+    let text = child.as_str().trim();
+    let last_segment = text.rsplit('.').next().unwrap_or(text);
+    format!("_{}", last_segment)
+}
+
 /// `for k, v in map { resource_expr }` expands to resources with addresses like
 /// `binding["key1"]`, `binding["key2"]`, etc.
 ///
@@ -7807,6 +7834,68 @@ aws.s3.bucket {
         assert_eq!(names[1], "_for0[1]");
         assert_eq!(names[2], "_for1[0]");
         assert_eq!(names[3], "_for1[1]");
+    }
+
+    #[test]
+    fn parse_top_level_for_uses_iterable_name_as_binding() {
+        let input = r#"
+            let azs = ["ap-northeast-1a", "ap-northeast-1c"]
+            for az in azs {
+                awscc.ec2.subnet {
+                    availability_zone = az
+                }
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(result.resources.len(), 2);
+
+        let names: Vec<&str> = result
+            .resources
+            .iter()
+            .map(|r| r.id.name.as_str())
+            .collect();
+        assert_eq!(names[0], "_azs[0]");
+        assert_eq!(names[1], "_azs[1]");
+    }
+
+    #[test]
+    fn parse_top_level_for_uses_last_segment_of_dotted_iterable() {
+        let input = r#"
+            let orgs = remote_state {
+                path = '../orgs/carina.state.json'
+            }
+            for acct in orgs.accounts {
+                awscc.sso.assignment {
+                    target_id = acct
+                }
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        // Deferred (remote_state not resolved), so no concrete resources
+        // but the deferred_for_expressions should use _accounts
+        assert_eq!(result.deferred_for_expressions[0].binding_name, "_accounts");
+    }
+
+    #[test]
+    fn parse_top_level_for_literal_list_uses_counter_fallback() {
+        let input = r#"
+            for az in ["a", "b"] {
+                awscc.ec2.subnet {
+                    availability_zone = az
+                }
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        let names: Vec<&str> = result
+            .resources
+            .iter()
+            .map(|r| r.id.name.as_str())
+            .collect();
+        assert_eq!(names[0], "_for0[0]");
+        assert_eq!(names[1], "_for0[1]");
     }
 
     #[test]
