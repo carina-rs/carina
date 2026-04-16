@@ -596,6 +596,34 @@ pub async fn save_state_unlocked(
     backend.write_state(state).await.map_err(AppError::Backend)
 }
 
+/// Persist export changes when the resource plan is empty.
+///
+/// Used when `plan.is_empty()` short-circuits apply: resources don't need
+/// any work, but exports may have changed. Rebuild the exports from the
+/// current state + desired `export_params` and write the state.
+pub(crate) async fn persist_exports_only(
+    backend: &dyn StateBackend,
+    lock: Option<&LockInfo>,
+    state_file: Option<StateFile>,
+    export_params: &[carina_core::parser::ExportParameter],
+    sorted_resources: &[Resource],
+) -> Result<(), AppError> {
+    let mut state = state_file.unwrap_or_default();
+    let exports = resolve_exports(export_params, sorted_resources, &state);
+    state.exports = exports;
+    if let Some(lk) = lock {
+        save_state_locked(backend, lk, &mut state).await?;
+    } else {
+        save_state_unlocked(backend, &mut state).await?;
+    }
+    println!(
+        "  {} State saved (serial: {}), exports updated.",
+        "✓".green(),
+        state.serial
+    );
+    Ok(())
+}
+
 pub struct ApplyStateSave<'a> {
     pub state_file: Option<StateFile>,
     pub sorted_resources: &'a [Resource],
@@ -1327,7 +1355,41 @@ async fn run_apply_locked(
     }
 
     if plan.is_empty() {
-        println!("{}", "No changes needed.".green());
+        // Even when no resources need changes, exports may have changed.
+        // Persist them before returning so state stays in sync with config.
+        let resolved_exports = crate::commands::plan::resolve_export_values_for_display(
+            &parsed.export_params,
+            &sorted_resources,
+            &current_states,
+        );
+        let current_exports = state_file
+            .as_ref()
+            .map(|s| s.exports.clone())
+            .unwrap_or_default();
+        let export_changes =
+            crate::commands::plan::compute_export_diffs(&resolved_exports, &current_exports);
+
+        if export_changes.is_empty() {
+            println!("{}", "No changes needed.".green());
+            return Ok(());
+        }
+
+        println!(
+            "{}",
+            format!(
+                "Persisting {} export change(s) to state.",
+                export_changes.len()
+            )
+            .cyan()
+        );
+        persist_exports_only(
+            backend,
+            lock,
+            state_file,
+            &parsed.export_params,
+            &sorted_resources,
+        )
+        .await?;
         return Ok(());
     }
 

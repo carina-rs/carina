@@ -2632,3 +2632,93 @@ fn plan_file_serialization_redacts_secrets() {
     // Non-secret values should still be present
     assert!(json.contains("my-db"));
 }
+
+/// Backend that captures the state written to it.
+struct CapturingBackend {
+    captured: Arc<Mutex<Option<StateFile>>>,
+}
+
+#[async_trait::async_trait]
+impl StateBackend for CapturingBackend {
+    async fn read_state(&self) -> carina_state::BackendResult<Option<StateFile>> {
+        Ok(Some(StateFile::new()))
+    }
+    async fn write_state(&self, state: &StateFile) -> carina_state::BackendResult<()> {
+        *self.captured.lock().unwrap() = Some(state.clone());
+        Ok(())
+    }
+    async fn acquire_lock(&self, operation: &str) -> carina_state::BackendResult<LockInfo> {
+        Ok(LockInfo::new(operation))
+    }
+    async fn release_lock(&self, _lock: &LockInfo) -> carina_state::BackendResult<()> {
+        Ok(())
+    }
+    async fn renew_lock(&self, lock: &LockInfo) -> carina_state::BackendResult<LockInfo> {
+        Ok(lock.renewed())
+    }
+    async fn write_state_locked(
+        &self,
+        state: &carina_state::StateFile,
+        _lock: &LockInfo,
+    ) -> carina_state::BackendResult<()> {
+        self.write_state(state).await
+    }
+    async fn force_unlock(&self, _lock_id: &str) -> carina_state::BackendResult<()> {
+        Ok(())
+    }
+    async fn init(&self) -> carina_state::BackendResult<()> {
+        Ok(())
+    }
+    async fn bucket_exists(&self) -> carina_state::BackendResult<bool> {
+        Ok(true)
+    }
+    async fn create_bucket(&self) -> carina_state::BackendResult<()> {
+        Ok(())
+    }
+    fn resource_type(&self) -> Option<&str> {
+        None
+    }
+    fn provider_name(&self) -> Option<&str> {
+        None
+    }
+    fn resource_definition(&self, _bucket_name: &str) -> Option<String> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn persist_exports_only_writes_state_with_new_exports() {
+    use carina_core::parser::ExportParameter;
+    use carina_core::resource::Value;
+
+    let captured = Arc::new(Mutex::new(None));
+    let backend = CapturingBackend {
+        captured: captured.clone(),
+    };
+    let lock = LockInfo::new("apply");
+
+    let export_params = vec![ExportParameter {
+        name: "account_id".to_string(),
+        type_expr: None,
+        value: Some(Value::String("123456789012".to_string())),
+    }];
+
+    let result = crate::commands::apply::persist_exports_only(
+        &backend,
+        Some(&lock),
+        Some(StateFile::new()),
+        &export_params,
+        &[],
+    )
+    .await;
+
+    assert!(result.is_ok(), "persist_exports_only failed: {:?}", result);
+
+    let written = captured.lock().unwrap();
+    let state = written.as_ref().expect("state should be written");
+    assert_eq!(state.exports.len(), 1);
+    assert_eq!(
+        state.exports.get("account_id"),
+        Some(&serde_json::json!("123456789012"))
+    );
+}
