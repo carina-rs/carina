@@ -21,8 +21,8 @@ check_rust_files() {
 
     local find_args=("$dir" -name '*.rs' -type f)
 
-    # Exclude test-only files: *_tests.rs and files under tests/ directories
-    find_args+=(-not -name '*_tests.rs' -not -path '*/tests/*')
+    # Exclude test-only files: *_tests.rs, tests.rs, and files under tests/ directories
+    find_args+=(-not -name '*_tests.rs' -not -name 'tests.rs' -not -path '*/tests/*')
 
     # Build -not -name args for excluded files
     if [ -n "$exclude_files" ]; then
