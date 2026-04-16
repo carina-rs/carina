@@ -77,7 +77,7 @@ pub struct DeferredForExpression {
     pub line: usize,
     /// The for-expression header, e.g., `for account_id in orgs.accounts`.
     pub header: String,
-    /// The resource type the loop body would produce (e.g., `sso.assignment`).
+    /// The provider-qualified resource type the loop body would produce (e.g., `awscc.sso.assignment`).
     pub resource_type: String,
     /// Attribute template: key → value (concrete values are resolved;
     /// loop-bound variables remain as `ResourceRef` or placeholder strings).
@@ -1811,7 +1811,11 @@ fn parse_for_expr(
                     file: None,
                     line: for_line,
                     header,
-                    resource_type: resource.id.resource_type.clone(),
+                    resource_type: if resource.id.provider.is_empty() {
+                        resource.id.resource_type.clone()
+                    } else {
+                        format!("{}.{}", resource.id.provider, resource.id.resource_type)
+                    },
                     attributes: attrs,
                     binding_name: binding_name.to_string(),
                     iterable_binding: path.binding().to_string(),
