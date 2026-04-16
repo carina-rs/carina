@@ -177,12 +177,12 @@ fn list_string_enum_completions() {
 
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
-        labels.contains(&"\"tcp\""),
+        labels.contains(&"'tcp'"),
         "Should offer tcp as completion for List(StringEnum). Got: {:?}",
         labels
     );
     assert!(
-        labels.contains(&"\"udp\""),
+        labels.contains(&"'udp'"),
         "Should offer udp as completion for List(StringEnum). Got: {:?}",
         labels
     );
@@ -229,12 +229,12 @@ fn union_completions_include_member_types() {
 
     // Should have StringEnum completions
     assert!(
-        labels.contains(&"\"active\""),
+        labels.contains(&"'active'"),
         "Should offer 'active' from StringEnum member. Got: {:?}",
         labels
     );
     assert!(
-        labels.contains(&"\"passive\""),
+        labels.contains(&"'passive'"),
         "Should offer 'passive' from StringEnum member. Got: {:?}",
         labels
     );
@@ -1180,4 +1180,22 @@ fn read_snippet_on_fresh_line_includes_let() {
         "On fresh line read snippet should still include `let ... = read ...`. Got: {:?}",
         snippet
     );
+}
+
+#[test]
+fn ipv4_cidr_completions_use_single_quotes() {
+    let provider = test_provider();
+    assert_all_wrapped(&provider.cidr_completions(), '\'', "CIDR");
+}
+
+#[test]
+fn ipv6_cidr_completions_use_single_quotes() {
+    let provider = test_provider();
+    assert_all_wrapped(&provider.ipv6_cidr_completions(), '\'', "IPv6 CIDR");
+}
+
+#[test]
+fn arn_completion_uses_single_quotes() {
+    let provider = test_provider();
+    assert_all_wrapped(&provider.arn_completions(), '\'', "ARN");
 }

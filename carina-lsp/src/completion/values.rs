@@ -543,10 +543,10 @@ impl CompletionProvider {
         cidrs
             .into_iter()
             .map(|(cidr, description)| CompletionItem {
-                label: format!("\"{}\"", cidr),
+                label: format!("'{}'", cidr),
                 kind: Some(CompletionItemKind::VALUE),
                 detail: Some(description.to_string()),
-                insert_text: Some(format!("\"{}\"", cidr)),
+                insert_text: Some(format!("'{}'", cidr)),
                 ..Default::default()
             })
             .collect()
@@ -564,10 +564,10 @@ impl CompletionProvider {
         cidrs
             .into_iter()
             .map(|(cidr, description)| CompletionItem {
-                label: format!("\"{}\"", cidr),
+                label: format!("'{}'", cidr),
                 kind: Some(CompletionItemKind::VALUE),
                 detail: Some(description.to_string()),
-                insert_text: Some(format!("\"{}\"", cidr)),
+                insert_text: Some(format!("'{}'", cidr)),
                 ..Default::default()
             })
             .collect()
@@ -575,10 +575,10 @@ impl CompletionProvider {
 
     pub(super) fn arn_completions(&self) -> Vec<CompletionItem> {
         vec![CompletionItem {
-            label: "\"arn:aws:...\"".to_string(),
+            label: "'arn:aws:...'".to_string(),
             kind: Some(CompletionItemKind::VALUE),
             insert_text: Some(
-                "\"arn:aws:${1:service}:${2:region}:${3:account}:${4:resource}\"".to_string(),
+                "'arn:aws:${1:service}:${2:region}:${3:account}:${4:resource}'".to_string(),
             ),
             insert_text_format: Some(InsertTextFormat::SNIPPET),
             detail: Some("ARN format: arn:partition:service:region:account:resource".to_string()),
@@ -769,9 +769,9 @@ impl CompletionProvider {
             None => values
                 .iter()
                 .map(|value| CompletionItem {
-                    label: format!("\"{}\"", value),
+                    label: format!("'{}'", value),
                     kind: Some(CompletionItemKind::ENUM_MEMBER),
-                    insert_text: Some(format!("\"{}\"", value)),
+                    insert_text: Some(format!("'{}'", value)),
                     ..Default::default()
                 })
                 .collect(),
