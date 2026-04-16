@@ -2687,6 +2687,35 @@ impl StateBackend for CapturingBackend {
 }
 
 #[tokio::test]
+async fn persist_exports_only_clears_state_exports_when_params_empty() {
+    let captured = Arc::new(Mutex::new(None));
+    let backend = CapturingBackend {
+        captured: captured.clone(),
+    };
+    let lock = LockInfo::new("apply");
+
+    // Pre-existing state with stale exports
+    let mut state_in = StateFile::new();
+    state_in
+        .exports
+        .insert("old".to_string(), serde_json::json!("stale"));
+
+    let result =
+        crate::commands::apply::persist_exports_only(&backend, Some(&lock), Some(state_in), &[])
+            .await;
+
+    assert!(result.is_ok(), "persist_exports_only failed: {:?}", result);
+
+    let written = captured.lock().unwrap();
+    let state = written.as_ref().expect("state should be written");
+    assert!(
+        state.exports.is_empty(),
+        "stale exports should be cleared when export_params is empty, got: {:?}",
+        state.exports
+    );
+}
+
+#[tokio::test]
 async fn persist_exports_only_writes_state_with_new_exports() {
     use carina_core::parser::ExportParameter;
     use carina_core::resource::Value;
