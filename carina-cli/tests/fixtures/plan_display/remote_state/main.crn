@@ -1,11 +1,11 @@
-# Test remote_state: reference another project's state
+# Test upstream_state: reference another project's state
 
 provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let network = remote_state {
-  path = 'network.state.json'
+upstream_state "network" {
+  source = "./network"
 }
 
 awscc.ec2.security_group {

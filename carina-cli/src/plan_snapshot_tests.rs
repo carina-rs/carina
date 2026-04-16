@@ -104,20 +104,13 @@ fn build_plan_and_states_from_fixture(
         }
     }
 
-    // Load remote state files if any
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
-    for rs in &parsed.remote_states {
-        if let carina_core::parser::RemoteStateBackend::Local { ref path } = rs.backend {
-            let remote_path = if std::path::Path::new(path).is_absolute() {
-                std::path::PathBuf::from(path)
-            } else {
-                base_dir.join(path)
-            };
-            if let Ok(content) = std::fs::read_to_string(&remote_path)
-                && let Ok(sf) = check_and_migrate(&content)
-            {
-                remote_bindings.insert(rs.binding.clone(), sf.build_remote_bindings());
-            }
+    for us in &parsed.upstream_states {
+        let state_path = crate::commands::plan::upstream_state_file_path(us, base_dir);
+        if let Ok(content) = std::fs::read_to_string(&state_path)
+            && let Ok(sf) = check_and_migrate(&content)
+        {
+            remote_bindings.insert(us.binding.clone(), sf.build_remote_bindings());
         }
     }
 
