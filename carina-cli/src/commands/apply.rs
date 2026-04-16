@@ -1440,7 +1440,9 @@ async fn run_apply_locked(
         let interrupt = async {
             let _ = tokio::signal::ctrl_c().await;
         };
-        let input = crate::signal::read_line_with_interrupt(stdin, interrupt).await?;
+        let read_result = crate::signal::read_line_with_interrupt(stdin, interrupt).await;
+        emit_newline_on_interrupt(&mut std::io::stdout(), &read_result);
+        let input = read_result?;
 
         if input.trim() != "yes" {
             println!();
@@ -1744,7 +1746,9 @@ async fn run_apply_from_plan_locked(
         let interrupt = async {
             let _ = tokio::signal::ctrl_c().await;
         };
-        let input = crate::signal::read_line_with_interrupt(stdin, interrupt).await?;
+        let read_result = crate::signal::read_line_with_interrupt(stdin, interrupt).await;
+        emit_newline_on_interrupt(&mut std::io::stdout(), &read_result);
+        let input = read_result?;
 
         if input.trim() != "yes" {
             println!();
@@ -1834,6 +1838,16 @@ async fn run_apply_from_plan_locked(
             "Apply failed. {}.",
             parts.join(", ")
         )))
+    }
+}
+
+// The confirmation prompt's "Enter a value: " has no trailing newline, and on
+// Ctrl+C the inner interrupt future fires before the outer run_with_ctrl_c
+// handler — so nothing else emits a newline before the lock-release message.
+fn emit_newline_on_interrupt<W: std::io::Write>(writer: &mut W, result: &Result<String, AppError>) {
+    if matches!(result, Err(AppError::Interrupted)) {
+        let _ = writeln!(writer);
+        let _ = writer.flush();
     }
 }
 
@@ -2325,5 +2339,29 @@ mod tests {
             "resolve_exports should resolve dot-notation strings to actual values. Got: {:?}",
             exports
         );
+    }
+
+    #[test]
+    fn emit_newline_on_interrupt_writes_newline_when_interrupted() {
+        let mut buf: Vec<u8> = Vec::new();
+        let result: Result<String, AppError> = Err(AppError::Interrupted);
+        emit_newline_on_interrupt(&mut buf, &result);
+        assert_eq!(buf, b"\n");
+    }
+
+    #[test]
+    fn emit_newline_on_interrupt_writes_nothing_on_ok() {
+        let mut buf: Vec<u8> = Vec::new();
+        let result: Result<String, AppError> = Ok("yes".to_string());
+        emit_newline_on_interrupt(&mut buf, &result);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn emit_newline_on_interrupt_writes_nothing_on_other_error() {
+        let mut buf: Vec<u8> = Vec::new();
+        let result: Result<String, AppError> = Err(AppError::Config("boom".to_string()));
+        emit_newline_on_interrupt(&mut buf, &result);
+        assert!(buf.is_empty());
     }
 }
