@@ -220,7 +220,7 @@ pub async fn run_plan(
         );
     }
 
-    let remote_bindings = load_remote_states(&parsed.upstream_states, base_dir).await?;
+    let remote_bindings = load_upstream_state_bindings(&parsed.upstream_states, base_dir).await?;
 
     // Expand deferred for-expressions now that remote values are available
     parsed.expand_deferred_for_expressions(&remote_bindings);
@@ -502,7 +502,7 @@ pub(crate) fn upstream_state_file_path(us: &UpstreamState, base_dir: &Path) -> P
     dir.join(carina_state::LocalBackend::DEFAULT_STATE_FILE)
 }
 
-pub(crate) async fn load_remote_states(
+pub(crate) async fn load_upstream_state_bindings(
     upstream_states: &[UpstreamState],
     base_dir: &Path,
 ) -> Result<HashMap<String, HashMap<String, Value>>, AppError> {

@@ -1108,7 +1108,7 @@ async fn run_apply_locked(
     // Upstream state bindings are loaded up front so refs that target
     // `upstream_state` blocks can be resolved during refresh (#1683).
     let remote_bindings =
-        super::plan::load_remote_states(&parsed.upstream_states, base_dir).await?;
+        super::plan::load_upstream_state_bindings(&parsed.upstream_states, base_dir).await?;
 
     // Expand deferred for-expressions now that remote values are available.
     // Must happen BEFORE sort_resources_by_dependencies so expanded resources
