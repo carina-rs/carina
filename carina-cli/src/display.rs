@@ -244,7 +244,7 @@ fn format_deferred_for_expression(deferred: &carina_core::parser::DeferredForExp
         out,
         "      {}",
         format!(
-            "expands to {} resources (count known after upstream apply)",
+            "expands to one {} per element (count known after upstream apply)",
             deferred.resource_type
         )
         .dimmed()
