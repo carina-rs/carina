@@ -110,6 +110,14 @@ pub fn find_pipe_preferred_direct_calls(source: &str) -> Vec<PipePreferredWarnin
                     continue;
                 }
 
+                // Skip if this is a type annotation position: `name: map(...)`
+                // A ':' followed only by whitespace before the function name means
+                // we're in a type position, not a function call.
+                let before_trimmed = before.trim_end();
+                if before_trimmed.ends_with(':') {
+                    continue;
+                }
+
                 warnings.push(PipePreferredWarning {
                     name: func_name.to_string(),
                     line: line_idx + 1,
@@ -753,6 +761,33 @@ let e = replace("old", "new", str)
             results.is_empty(),
             "Should not match when function name is part of a longer identifier"
         );
+    }
+
+    #[test]
+    fn test_pipe_preferred_type_annotation_no_warning() {
+        // `map(aws_account_id)` in a type position is a type annotation, not a
+        // function call. Should not trigger pipe-form warning.
+        let source = r#"exports {
+  accounts: map(aws_account_id) = {
+    prod = x.y
+  }
+}"#;
+        let results = find_pipe_preferred_direct_calls(source);
+        assert!(
+            results.is_empty(),
+            "map() in type annotation position should not trigger pipe warning. Got: {:?}",
+            results
+        );
+    }
+
+    #[test]
+    fn test_pipe_preferred_type_annotation_list_no_warning() {
+        let source = r#"attributes {
+  items: list(string) = ["a", "b"]
+}"#;
+        let results = find_pipe_preferred_direct_calls(source);
+        // `list` is not in PIPE_PREFERRED_FUNCTIONS, but ensure no regression
+        assert!(results.is_empty());
     }
 
     #[test]
