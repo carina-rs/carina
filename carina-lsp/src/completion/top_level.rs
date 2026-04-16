@@ -149,7 +149,7 @@ impl CompletionProvider {
                 label: "upstream_state".to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
                 insert_text: Some(
-                    "upstream_state \"${1:binding}\" {\n    source = \"${2:../other-project}\"\n}"
+                    "let ${1:binding} = upstream_state {\n    source = \"${2:../other-project}\"\n}"
                         .to_string(),
                 ),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),

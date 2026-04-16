@@ -835,7 +835,7 @@ fn top_level_completion_suggests_upstream_state() {
 fn upstream_state_block_completes_source_attribute() {
     let provider = test_provider();
     let doc = create_document(
-        r#"upstream_state "orgs" {
+        r#"let orgs = upstream_state {
 
 }"#,
     );

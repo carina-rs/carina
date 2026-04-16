@@ -370,7 +370,7 @@ pub struct BackendConfig {
     pub attributes: HashMap<String, Value>,
 }
 
-/// Upstream state reference: `upstream_state "<binding>" { source = "<dir>" }`.
+/// Upstream state reference: `let <binding> = upstream_state { source = "<dir>" }`.
 ///
 /// Declares a read-only reference to another Carina configuration's state.
 /// The `source` path is resolved against the enclosing `.crn` file's
@@ -787,7 +787,7 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
     let mut export_params = Vec::new();
     let mut backend = None;
     let mut state_blocks = Vec::new();
-    let mut upstream_states = Vec::new();
+    let mut upstream_states: Vec<UpstreamState> = Vec::new();
     let mut requires = Vec::new();
     let mut anon_for_counter = 0usize;
     let mut anon_if_counter = 0usize;
@@ -843,25 +843,6 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
                             Rule::require_statement => {
                                 requires.push(parse_require_statement(stmt)?);
                             }
-                            Rule::upstream_state_block => {
-                                let (line, _) = stmt.as_span().start_pos().line_col();
-                                let us = parse_upstream_state_block(stmt)?;
-                                if ctx.upstream_states.contains_key(&us.binding)
-                                    || ctx.variables.contains_key(&us.binding)
-                                    || ctx.resource_bindings.contains_key(&us.binding)
-                                {
-                                    return Err(ParseError::DuplicateBinding {
-                                        name: us.binding,
-                                        line,
-                                    });
-                                }
-                                // Register the binding so `<binding>.<attr>` references
-                                // resolve as ResourceRef rather than being rejected.
-                                let placeholder = Resource::new("_upstream_state", &us.binding);
-                                ctx.set_resource_binding(us.binding.clone(), placeholder);
-                                ctx.upstream_states.insert(us.binding.clone(), us.clone());
-                                upstream_states.push(us);
-                            }
                             Rule::for_expr => {
                                 let iterable_name =
                                     extract_for_iterable_name(&stmt, anon_for_counter);
@@ -913,13 +894,16 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
                                     ctx.structural_bindings.insert(name.clone());
                                 }
                                 let is_discard = name == "_";
+                                let is_upstream_state = ctx.upstream_states.contains_key(&name);
                                 if !is_discard {
                                     if ctx.variables.contains_key(&name)
                                         || ctx.resource_bindings.contains_key(&name)
                                     {
                                         return Err(ParseError::DuplicateBinding { name, line });
                                     }
-                                    ctx.set_variable(name.clone(), value);
+                                    if !is_upstream_state {
+                                        ctx.set_variable(name.clone(), value);
+                                    }
                                 }
                                 if !expanded_resources.is_empty() {
                                     if !is_discard {
@@ -945,6 +929,11 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
                                         let placeholder = Resource::new("_module_binding", &name);
                                         ctx.set_resource_binding(name.clone(), placeholder);
                                     }
+                                }
+                                if is_upstream_state && !is_discard {
+                                    let placeholder = Resource::new("_upstream_state", &name);
+                                    ctx.set_resource_binding(name.clone(), placeholder);
+                                    upstream_states.push(ctx.upstream_states[&name].clone());
                                 }
                                 if let Some(import) = maybe_import {
                                     ctx.imported_modules
@@ -1437,7 +1426,7 @@ fn parse_module_call(
     if module_name == "remote_state" {
         return Err(ParseError::InvalidExpression {
             line: span.start_pos().line_col().0,
-            message: "`remote_state` has been replaced by the top-level `upstream_state \"<binding>\" { source = \"...\" }` block".to_string(),
+            message: "`remote_state` has been replaced by `let <binding> = upstream_state { source = \"...\" }`".to_string(),
         });
     }
 
@@ -1514,22 +1503,26 @@ fn parse_let_binding_extended(
     ))
 }
 
-/// Detect if an expression pair's innermost primary is an if/for/read expression.
+/// Detect if an expression pair's innermost primary is an if/for/read/upstream_state expression.
 fn detect_structural_rhs(pair: &pest::iterators::Pair<Rule>) -> bool {
     // Walk into expression -> pipe_expr -> compose_expr -> primary -> inner
     fn find_inner_rule(pair: &pest::iterators::Pair<Rule>) -> Option<Rule> {
         let inner = pair.clone().into_inner().next()?;
         match inner.as_rule() {
-            Rule::if_expr | Rule::for_expr | Rule::read_resource_expr => Some(inner.as_rule()),
+            Rule::if_expr
+            | Rule::for_expr
+            | Rule::read_resource_expr
+            | Rule::upstream_state_expr => Some(inner.as_rule()),
             Rule::pipe_expr | Rule::compose_expr | Rule::coalesce_expr | Rule::expression => {
                 find_inner_rule(&inner)
             }
             Rule::primary => {
                 let primary_inner = inner.into_inner().next()?;
                 match primary_inner.as_rule() {
-                    Rule::if_expr | Rule::for_expr | Rule::read_resource_expr => {
-                        Some(primary_inner.as_rule())
-                    }
+                    Rule::if_expr
+                    | Rule::for_expr
+                    | Rule::read_resource_expr
+                    | Rule::upstream_state_expr => Some(primary_inner.as_rule()),
                     _ => None,
                 }
             }
@@ -1686,6 +1679,19 @@ fn parse_primary_with_resource_or_module(
             let resource = parse_read_resource_expr(inner, ctx, binding_name)?;
             let ref_value = Value::String(format!("${{{}}}", binding_name));
             Ok((ref_value, vec![resource], vec![], None))
+        }
+        Rule::upstream_state_expr => {
+            let (line, _) = inner.as_span().start_pos().line_col();
+            let us = parse_upstream_state_expr(inner, binding_name)?;
+            if ctx.upstream_states.contains_key(&us.binding) {
+                return Err(ParseError::DuplicateBinding {
+                    name: us.binding,
+                    line,
+                });
+            }
+            ctx.upstream_states.insert(us.binding.clone(), us);
+            let ref_value = Value::String(format!("${{{}}}", binding_name));
+            Ok((ref_value, vec![], vec![], None))
         }
         Rule::resource_expr => {
             let resource = parse_resource_expr(inner, ctx, binding_name)?;
@@ -3144,14 +3150,16 @@ fn parse_backend_block(
     })
 }
 
-/// Parse an `upstream_state "<binding>" { source = "<dir>" }` block.
-fn parse_upstream_state_block(
+/// Parse an `upstream_state { source = "<dir>" }` expression.
+///
+/// The binding name comes from the enclosing `let` binding, so it's passed in
+/// rather than extracted from the expression itself.
+fn parse_upstream_state_expr(
     pair: pest::iterators::Pair<Rule>,
+    binding_name: &str,
 ) -> Result<UpstreamState, ParseError> {
     let (block_line, _) = pair.as_span().start_pos().line_col();
-    let mut inner = pair.into_inner();
-    let binding_pair = next_pair(&mut inner, "binding name", "upstream_state block")?;
-    let binding = extract_string_from_string_pair(binding_pair)?;
+    let inner = pair.into_inner();
 
     let mut source: Option<String> = None;
     for attr_pair in inner {
@@ -3160,10 +3168,18 @@ fn parse_upstream_state_block(
         }
         let (attr_line, _) = attr_pair.as_span().start_pos().line_col();
         let mut attr_inner = attr_pair.into_inner();
-        let key = next_pair(&mut attr_inner, "attribute name", "upstream_state block")?
-            .as_str()
-            .to_string();
-        let value_pair = next_pair(&mut attr_inner, "attribute value", "upstream_state block")?;
+        let key = next_pair(
+            &mut attr_inner,
+            "attribute name",
+            "upstream_state expression",
+        )?
+        .as_str()
+        .to_string();
+        let value_pair = next_pair(
+            &mut attr_inner,
+            "attribute value",
+            "upstream_state expression",
+        )?;
         match key.as_str() {
             "source" => {
                 let value_text = value_pair.as_str().to_string();
@@ -3171,8 +3187,8 @@ fn parse_upstream_state_block(
                     ParseError::InvalidExpression {
                         line: attr_line,
                         message: format!(
-                            "upstream_state \"{}\": 'source' must be a string literal, got: {}",
-                            binding, value_text
+                            "upstream_state '{}': 'source' must be a string literal, got: {}",
+                            binding_name, value_text
                         ),
                     }
                 })?);
@@ -3181,8 +3197,8 @@ fn parse_upstream_state_block(
                 return Err(ParseError::InvalidExpression {
                     line: attr_line,
                     message: format!(
-                        "unknown attribute '{}' in upstream_state \"{}\" block",
-                        other, binding
+                        "unknown attribute '{}' in upstream_state '{}' expression",
+                        other, binding_name
                     ),
                 });
             }
@@ -3192,44 +3208,15 @@ fn parse_upstream_state_block(
     let source = source.ok_or_else(|| ParseError::InvalidExpression {
         line: block_line,
         message: format!(
-            "upstream_state \"{}\" requires a 'source' attribute",
-            binding
+            "upstream_state '{}' requires a 'source' attribute",
+            binding_name
         ),
     })?;
 
     Ok(UpstreamState {
-        binding,
+        binding: binding_name.to_string(),
         source: std::path::PathBuf::from(source),
     })
-}
-
-/// Extract a string value directly from a Rule::string pair
-fn extract_string_from_string_pair(
-    pair: pest::iterators::Pair<Rule>,
-) -> Result<String, ParseError> {
-    // string = single_quoted_string | double_quoted_string
-    let inner_pair = pair.into_inner().next().unwrap();
-
-    if inner_pair.as_rule() == Rule::single_quoted_string {
-        return Ok(inner_pair
-            .into_inner()
-            .next()
-            .map(|p| unescape_single_quoted(p.as_str()))
-            .unwrap_or_default());
-    }
-
-    // Double-quoted string
-    let mut result = String::new();
-    for inner in inner_pair.into_inner() {
-        if inner.as_rule() == Rule::string_part {
-            for part in inner.into_inner() {
-                if part.as_rule() == Rule::string_literal {
-                    result.push_str(part.as_str());
-                }
-            }
-        }
-    }
-    Ok(result)
 }
 
 /// Extract a string value from a pair (expression -> pipe_expr -> primary -> string)
@@ -7899,7 +7886,7 @@ aws.s3.bucket {
     #[test]
     fn parse_top_level_for_uses_last_segment_of_dotted_iterable() {
         let input = r#"
-            upstream_state "orgs" {
+            let orgs = upstream_state {
                 source = "../orgs"
             }
             for acct in orgs.accounts {
@@ -9439,7 +9426,7 @@ arguments {
         // After parsing upstream_state, the binding should be registered so that
         // `network.vpc.vpc_id` is parsed as a ResourceRef.
         let input = r#"
-            upstream_state "network" {
+            let network = upstream_state {
                 source = "../network"
             }
 
@@ -10084,7 +10071,7 @@ awscc.ec2.vpc {
         // When a for-expression iterates over an unresolved upstream_state,
         // the warning should mention the upstream directory rather than generic "known after apply".
         let input = r#"
-            upstream_state "orgs" {
+            let orgs = upstream_state {
                 source = "../organizations"
             }
 
@@ -10161,7 +10148,7 @@ awscc.ec2.vpc {
         // Initially deferred (no remote values available at parse time).
         // Then expand with remote_bindings and verify concrete resources are created.
         let input = r#"
-            upstream_state "orgs" {
+            let orgs = upstream_state {
                 source = "../organizations"
             }
 
@@ -10233,7 +10220,7 @@ awscc.ec2.vpc {
     #[test]
     fn expand_deferred_for_no_remote_data_stays_deferred() {
         let input = r#"
-            upstream_state "orgs" {
+            let orgs = upstream_state {
                 source = "../organizations"
             }
 
@@ -10265,7 +10252,7 @@ awscc.ec2.vpc {
         // Map binding `for k, v in orgs.accounts` should expand each entry with
         // both the key and value variables available.
         let input = r#"
-            upstream_state "orgs" {
+            let orgs = upstream_state {
                 source = "../organizations"
             }
 
@@ -10321,7 +10308,7 @@ awscc.ec2.vpc {
         // and value variables. Prior to the fix both vars shared the same
         // placeholder, causing the index to receive the item value.
         let input = r#"
-            upstream_state "orgs" {
+            let orgs = upstream_state {
                 source = "../organizations"
             }
 
@@ -10375,7 +10362,7 @@ awscc.ec2.vpc {
         // Placeholder substitution must recurse into Value::Interpolation parts,
         // otherwise the rendered resource ships the raw placeholder string.
         let input = r#"
-            upstream_state "orgs" {
+            let orgs = upstream_state {
                 source = "../organizations"
             }
 
@@ -10435,7 +10422,7 @@ awscc.ec2.vpc {
         // Simple binding but upstream resolves to a map — mismatch should warn
         // and leave deferred.
         let input = r#"
-            upstream_state "orgs" {
+            let orgs = upstream_state {
                 source = "../organizations"
             }
 
@@ -10481,7 +10468,7 @@ awscc.ec2.vpc {
         // Map binding but upstream resolves to a list — mismatch should produce
         // a warning and leave the for-expression deferred (do not silently expand).
         let input = r#"
-            upstream_state "orgs" {
+            let orgs = upstream_state {
                 source = "../organizations"
             }
 
@@ -10540,9 +10527,9 @@ awscc.ec2.vpc {
     }
 
     #[test]
-    fn parses_upstream_state_block_with_source() {
+    fn parses_upstream_state_expr_with_source() {
         let input = r#"
-            upstream_state "orgs" {
+            let orgs = upstream_state {
                 source = "../organizations"
             }
         "#;
@@ -10551,6 +10538,23 @@ awscc.ec2.vpc {
         let us = &parsed.upstream_states[0];
         assert_eq!(us.binding, "orgs");
         assert_eq!(us.source, std::path::PathBuf::from("../organizations"));
+    }
+
+    #[test]
+    fn old_top_level_upstream_state_syntax_is_rejected() {
+        // The pre-#1926 form `upstream_state "name" { ... }` was a top-level
+        // statement; with the let-binding form it should no longer parse.
+        let input = r#"
+            upstream_state "orgs" {
+                source = "../organizations"
+            }
+        "#;
+        let result = parse(input, &ProviderContext::default());
+        assert!(
+            result.is_err(),
+            "old top-level upstream_state syntax must be rejected, got: {:?}",
+            result.ok().map(|p| p.upstream_states)
+        );
     }
 
     #[test]
@@ -10569,7 +10573,7 @@ awscc.ec2.vpc {
 
     #[test]
     fn upstream_state_missing_source_is_error() {
-        let input = r#"upstream_state "orgs" { }"#;
+        let input = r#"let orgs = upstream_state { }"#;
         let err = parse(input, &ProviderContext::default())
             .expect_err("missing source must be a parse error");
         let msg = err.to_string();
@@ -10581,7 +10585,7 @@ awscc.ec2.vpc {
 
     #[test]
     fn upstream_state_source_must_be_string() {
-        let input = r#"upstream_state "orgs" { source = 42 }"#;
+        let input = r#"let orgs = upstream_state { source = 42 }"#;
         let err = parse(input, &ProviderContext::default())
             .expect_err("non-string source must be a parse error");
         let msg = err.to_string();
@@ -10594,7 +10598,7 @@ awscc.ec2.vpc {
     #[test]
     fn upstream_state_unknown_attribute_is_error() {
         let input = r#"
-            upstream_state "orgs" {
+            let orgs = upstream_state {
                 source = "../foo"
                 backend = "s3"
             }
@@ -10611,8 +10615,8 @@ awscc.ec2.vpc {
     #[test]
     fn upstream_state_duplicate_binding_is_error() {
         let input = r#"
-            upstream_state "orgs" { source = "../a" }
-            upstream_state "orgs" { source = "../b" }
+            let orgs = upstream_state { source = "../a" }
+            let orgs = upstream_state { source = "../b" }
         "#;
         let err = parse(input, &ProviderContext::default())
             .expect_err("duplicate upstream_state binding must be a parse error");

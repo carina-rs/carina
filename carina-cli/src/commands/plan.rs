@@ -665,12 +665,12 @@ mod load_upstream_states_tests {
         fs::create_dir_all(&dir_b).unwrap();
         fs::write(
             dir_a.join("main.crn"),
-            r#"upstream_state "b" { source = "../b" }"#,
+            r#"let b = upstream_state { source = "../b" }"#,
         )
         .unwrap();
         fs::write(
             dir_b.join("main.crn"),
-            r#"upstream_state "a" { source = "../a" }"#,
+            r#"let a = upstream_state { source = "../a" }"#,
         )
         .unwrap();
 
@@ -747,7 +747,7 @@ mod run_plan_upstream_state_tests {
         fs::write(
             dir_b.join("main.crn"),
             r#"
-                upstream_state "a" { source = "../a" }
+                let a = upstream_state { source = "../a" }
                 exports { region = a.region }
             "#,
         )
