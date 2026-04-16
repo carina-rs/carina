@@ -130,7 +130,7 @@ This removes the resource from Carina's state but leaves the actual cloud resour
 To read outputs from another Carina project's state, use `upstream_state`:
 
 ```crn
-upstream_state "network" {
+let network = upstream_state {
   source = "../network"
 }
 
@@ -144,7 +144,7 @@ awscc.ec2.security_group {
 }
 ```
 
-The `upstream_state` block points at an upstream project's directory. Carina loads that directory's configuration, resolves its backend, reads its state, and exposes the upstream's `exports` through the declared binding. In this example, `network.vpc_id` references the `vpc_id` value published by the `../network` project's `exports` block.
+The `upstream_state` expression points at an upstream project's directory. Carina loads that directory's configuration, resolves its backend, reads its state, and exposes the upstream's `exports` through the `let`-bound name. In this example, `network.vpc_id` references the `vpc_id` value published by the `../network` project's `exports` block.
 
 `source` is required and resolved relative to the enclosing `.crn` file's directory. The upstream directory must contain a valid Carina configuration (a `main.crn` or flat `*.crn` files) with an `exports` block that publishes the values consumers need.
 

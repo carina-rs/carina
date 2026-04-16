@@ -265,7 +265,7 @@ removed {
 Reference values exported by another Carina project:
 
 ```crn
-upstream_state "network" {
+let network = upstream_state {
   source = "../network"
 }
 

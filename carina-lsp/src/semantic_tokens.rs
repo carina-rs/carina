@@ -313,6 +313,14 @@ impl SemanticTokensProvider {
                     let read_start = let_start + 4 + read_pos + 2; // position of "read"
                     tokens.push((read_start as u32, 4, 0)); // KEYWORD: read
                 }
+                // Check for "upstream_state" keyword after "let name = upstream_state ..."
+                if let Some(us_pos) = after_let.find("= upstream_state") {
+                    let after_kw = after_let[us_pos + 16..].chars().next();
+                    if after_kw.is_none_or(|c| c.is_whitespace() || c == '{') {
+                        let us_start = let_start + 4 + us_pos + 2; // position of "upstream_state"
+                        tokens.push((us_start as u32, 14, 0)); // KEYWORD: upstream_state
+                    }
+                }
                 // Check for "import" keyword after "let name = import ..."
                 if let Some(import_pos) = after_let.find("= import ") {
                     let import_start = let_start + 4 + import_pos + 2; // position of "import"
@@ -335,8 +343,6 @@ impl SemanticTokensProvider {
                     tokens.push((if_start as u32, 2, 0)); // KEYWORD: if
                 }
             }
-        } else if trimmed.starts_with("upstream_state ") {
-            tokens.push((indent, 14, 0)); // KEYWORD: upstream_state
         } else if trimmed.starts_with("attributes ") || trimmed == "attributes{" {
             tokens.push((indent, 10, 0)); // KEYWORD: attributes
         } else if trimmed.starts_with("exports ") || trimmed == "exports{" {
@@ -394,7 +400,6 @@ impl SemanticTokensProvider {
         if !trimmed.starts_with("provider ")
             && !trimmed.starts_with("backend ")
             && !trimmed.starts_with("let ")
-            && !trimmed.starts_with("upstream_state ")
             && !trimmed.starts_with("attributes ")
             && !trimmed.starts_with("attributes{")
             && !trimmed.starts_with("exports ")
@@ -1324,14 +1329,14 @@ mod tests {
     #[test]
     fn upstream_state_keyword_is_highlighted() {
         let provider = SemanticTokensProvider::new(&[]);
-        let tokens = provider.tokenize_line(r#"upstream_state "orgs" {"#, 0);
-        // "upstream_state" should be KEYWORD at position 0 with length 14
+        let tokens = provider.tokenize_line(r#"let orgs = upstream_state {"#, 0);
+        // "upstream_state" appears at column 11 with length 14
         let keyword_token = tokens
             .iter()
-            .find(|(start, len, typ)| *start == 0 && *len == 14 && *typ == 0);
+            .find(|(start, len, typ)| *start == 11 && *len == 14 && *typ == 0);
         assert!(
             keyword_token.is_some(),
-            "Expected KEYWORD token for 'upstream_state'. Got: {:?}",
+            "Expected KEYWORD token for 'upstream_state' in `let name = upstream_state {{`. Got: {:?}",
             tokens
         );
     }

@@ -191,10 +191,7 @@ impl CompletionProvider {
                 in_args_or_attrs_block = true;
                 resource_type.clear();
                 module_name = None;
-            } else if brace_depth == 0
-                && trimmed.starts_with("upstream_state ")
-                && trimmed.ends_with('{')
-            {
+            } else if brace_depth == 0 && is_let_upstream_state_line(trimmed) {
                 in_upstream_state_block = true;
                 resource_type.clear();
                 module_name = None;
@@ -206,7 +203,6 @@ impl CompletionProvider {
                 && !trimmed.starts_with("arguments ")
                 && !trimmed.starts_with("attributes ")
                 && !trimmed.starts_with("exports ")
-                && !trimmed.starts_with("upstream_state ")
                 && !trimmed.starts_with('#')
             {
                 // This is a module call: "module_name {"
@@ -585,4 +581,27 @@ enum CompletionContext {
         partial_path: String,
     },
     None,
+}
+
+/// Detect a `let <binding> = upstream_state {` opening line, where `<binding>`
+/// is a bare identifier. Used to enter the upstream_state block context.
+fn is_let_upstream_state_line(trimmed: &str) -> bool {
+    let Some(rest) = trimmed.strip_prefix("let ") else {
+        return false;
+    };
+    let Some(eq_pos) = rest.find('=') else {
+        return false;
+    };
+    let binding = rest[..eq_pos].trim();
+    if binding.is_empty() || !binding.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return false;
+    }
+    let after_eq = rest[eq_pos + 1..].trim_start();
+    let Some(rest) = after_eq.strip_prefix("upstream_state") else {
+        return false;
+    };
+    // Must be followed by whitespace or `{` to ensure it's the keyword, not a
+    // longer identifier like `upstream_states`.
+    let next = rest.trim_start();
+    next.starts_with('{') || next.is_empty()
 }

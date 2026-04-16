@@ -4,7 +4,7 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-upstream_state "orgs" {
+let orgs = upstream_state {
   source = "../organizations"
 }
 
