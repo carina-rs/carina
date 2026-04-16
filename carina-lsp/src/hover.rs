@@ -149,8 +149,11 @@ impl HoverProvider {
             }
         }
 
-        // Check for built-in function hover
-        if let Some(hover) = self.builtin_function_hover(&word) {
+        // Check for built-in function hover, but skip when the word is a type
+        // constructor (`map`, `list`) appearing in a type annotation position.
+        if !is_in_type_annotation_position(doc, position, &word)
+            && let Some(hover) = self.builtin_function_hover(&word)
+        {
             return Some(hover);
         }
 
@@ -650,6 +653,40 @@ impl HoverProvider {
     }
 }
 
+/// Determine whether a word at `position` is in a type annotation position.
+///
+/// Returns true for `map` / `list` appearing immediately after `:` on the
+/// same line, e.g., `accounts: map(...)` or `items: list(...)`.
+/// In these cases the word is a type constructor, not a function call,
+/// and builtin-function hover should be suppressed.
+fn is_in_type_annotation_position(doc: &Document, position: Position, word: &str) -> bool {
+    if word != "map" && word != "list" {
+        return false;
+    }
+    let line_str = match doc.line_at(position.line) {
+        Some(l) => l,
+        None => return false,
+    };
+    let col = position.character as usize;
+    let chars: Vec<char> = line_str.chars().collect();
+    if col > chars.len() {
+        return false;
+    }
+    // Walk back from the cursor to find the start of the word
+    let mut start = col;
+    while start > 0 {
+        let prev = chars[start - 1];
+        if prev.is_alphanumeric() || prev == '_' {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    // Check what's before the word (trimmed of whitespace)
+    let before: String = chars[..start].iter().collect();
+    before.trim_end().ends_with(':')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1096,6 +1133,39 @@ awscc.ec2.vpc_gateway_attachment {
             content.contains("string"),
             "Should show type, got:\n{}",
             content
+        );
+    }
+
+    #[test]
+    fn test_no_builtin_hover_for_map_in_type_annotation() {
+        let provider = HoverProvider::new(Arc::new(HashMap::new()), vec![]);
+        // Line 1 (0-indexed): "  accounts: map(aws_account_id) = {"
+        // Position on "map" → should NOT show function hover
+        let doc = Document::new(
+            "exports {\n  accounts: map(aws_account_id) = {}\n}".to_string(),
+            Arc::new(ProviderContext::default()),
+        );
+        // Column 14 is inside "map" on line 1
+        let hover = provider.hover(&doc, Position::new(1, 14));
+        assert!(
+            hover.is_none(),
+            "map() in type annotation should not trigger builtin function hover, got: {:?}",
+            hover
+        );
+    }
+
+    #[test]
+    fn test_builtin_hover_for_map_in_function_call() {
+        let provider = HoverProvider::new(Arc::new(HashMap::new()), vec![]);
+        // Normal function call (no preceding ':') — should show hover
+        let doc = Document::new(
+            "let x = map(\".id\", items)".to_string(),
+            Arc::new(ProviderContext::default()),
+        );
+        let hover = provider.hover(&doc, Position::new(0, 10));
+        assert!(
+            hover.is_some(),
+            "map() in function call position should show builtin function hover"
         );
     }
 }
