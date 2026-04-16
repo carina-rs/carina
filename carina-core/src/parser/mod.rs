@@ -65,7 +65,7 @@ pub struct ParseWarning {
 pub const DEFERRED_UPSTREAM_PLACEHOLDER: &str = "(known after upstream apply)";
 /// Placeholder reserved for map-binding key variables. Distinct from the
 /// value-var placeholder so expansion can substitute each correctly.
-pub const DEFERRED_UPSTREAM_KEY_PLACEHOLDER: &str = "(known after upstream apply: key)";
+pub(crate) const DEFERRED_UPSTREAM_KEY_PLACEHOLDER: &str = "(known after upstream apply: key)";
 
 /// A for-expression whose iterable is unresolved (e.g., remote_state not yet available).
 /// Captures the structural shape of the loop body so the plan can show what
@@ -492,9 +492,8 @@ impl ParsedFile {
                         let mut resource = deferred.template_resource.clone();
                         resource.id.name = address.clone();
                         resource.binding = Some(address);
-                        // Substitute the placeholder in all attributes
-                        for (_key, expr) in resource.attributes.iter_mut() {
-                            substitute_placeholder(&mut expr.0, item);
+                        for (_k, expr) in resource.attributes.iter_mut() {
+                            substitute_placeholder(&mut expr.0, None, item);
                         }
                         expanded_resources.push(resource);
                     }
@@ -510,7 +509,9 @@ impl ParsedFile {
                         let mut resource = deferred.template_resource.clone();
                         resource.id.name = address.clone();
                         resource.binding = Some(address);
-                        substitute_for_map_entry(&mut resource, key, val);
+                        for (_k, expr) in resource.attributes.iter_mut() {
+                            substitute_placeholder(&mut expr.0, Some(key), val);
+                        }
                         expanded_resources.push(resource);
                     }
                     resolved_indices.push(idx);
@@ -559,55 +560,30 @@ impl ParsedFile {
     }
 }
 
-/// Substitute placeholder values in a Value tree.
-/// Replaces `Value::String(DEFERRED_UPSTREAM_PLACEHOLDER)` with the actual value,
-/// matching the loop variable name.
-fn substitute_placeholder(value: &mut Value, replacement: &Value) {
-    match value {
+/// Substitute deferred-for-expression placeholders in a Value tree.
+///
+/// Replaces `DEFERRED_UPSTREAM_PLACEHOLDER` with `value`. If `key` is
+/// supplied (map-binding expansion), also replaces
+/// `DEFERRED_UPSTREAM_KEY_PLACEHOLDER` with the key string.
+fn substitute_placeholder(v: &mut Value, key: Option<&str>, value: &Value) {
+    match v {
         Value::String(s) if s == DEFERRED_UPSTREAM_PLACEHOLDER => {
-            *value = replacement.clone();
+            *v = value.clone();
+        }
+        Value::String(s) if key.is_some() && s == DEFERRED_UPSTREAM_KEY_PLACEHOLDER => {
+            *v = Value::String(key.unwrap().to_string());
         }
         Value::List(items) => {
             for item in items.iter_mut() {
-                substitute_placeholder(item, replacement);
+                substitute_placeholder(item, key, value);
             }
         }
         Value::Map(map) => {
-            for v in map.values_mut() {
-                substitute_placeholder(v, replacement);
+            for val in map.values_mut() {
+                substitute_placeholder(val, key, value);
             }
         }
         _ => {}
-    }
-}
-
-/// Substitute key and value placeholders for a map-binding entry.
-/// Replaces `DEFERRED_UPSTREAM_KEY_PLACEHOLDER` with the key string and
-/// `DEFERRED_UPSTREAM_PLACEHOLDER` with the value.
-fn substitute_for_map_entry(resource: &mut Resource, key: &str, value: &Value) {
-    fn recurse(v: &mut Value, key: &str, replacement: &Value) {
-        match v {
-            Value::String(s) if s == DEFERRED_UPSTREAM_KEY_PLACEHOLDER => {
-                *v = Value::String(key.to_string());
-            }
-            Value::String(s) if s == DEFERRED_UPSTREAM_PLACEHOLDER => {
-                *v = replacement.clone();
-            }
-            Value::List(items) => {
-                for item in items.iter_mut() {
-                    recurse(item, key, replacement);
-                }
-            }
-            Value::Map(map) => {
-                for val in map.values_mut() {
-                    recurse(val, key, replacement);
-                }
-            }
-            _ => {}
-        }
-    }
-    for (_, expr) in resource.attributes.iter_mut() {
-        recurse(&mut expr.0, key, value);
     }
 }
 
@@ -1711,7 +1687,7 @@ fn parse_primary_with_resource_or_module(
 }
 
 /// Binding pattern for a for expression
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ForBinding {
     /// Simple: `for x in ...`
     Simple(String),
