@@ -648,8 +648,8 @@ fn no_unused_let_bindings_in_fixtures() {
 }
 
 #[test]
-fn plan_snapshot_remote_state() {
-    let (plan, schemas, moved_origins) = build_plan_from_fixture("remote_state");
+fn plan_snapshot_upstream_state() {
+    let (plan, schemas, moved_origins) = build_plan_from_fixture("upstream_state");
     let output = format_plan(
         &plan,
         DetailLevel::Full,
@@ -752,7 +752,7 @@ fn snapshot_deferred_for() {
         manifest_dir
     ));
 
-    // Parse — the remote_state has no backing file, so the for-expression is deferred
+    // Parse — the upstream_state has no backing file, so the for-expression is deferred
     let loaded = load_configuration(&fixture_path).unwrap();
     let mut parsed = loaded.parsed;
     let base_dir = get_base_dir(&fixture_path);
