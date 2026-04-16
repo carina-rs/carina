@@ -690,7 +690,7 @@ mod tests {
             backend: None,
             state_blocks: Vec::new(),
             user_functions: HashMap::new(),
-            remote_states: Vec::new(),
+            upstream_states: Vec::new(),
             requires: Vec::new(),
             structural_bindings: HashSet::new(),
             warnings: Vec::new(),
