@@ -17,8 +17,8 @@ use crate::resource::{Expr, InterpolationPart, Resource, ResourceId, State, Valu
 /// metadata on each resource. This preserves dependency information that would
 /// otherwise be lost when ResourceRef values are replaced with plain strings.
 ///
-/// `remote_bindings` provides external bindings from remote state data sources.
-/// Each entry maps a remote_state binding name to a map of resource binding names
+/// `remote_bindings` provides external bindings from upstream state data sources.
+/// Each entry maps an upstream_state binding name to a map of resource binding names
 /// to their attributes. For example, `network -> { vpc -> { vpc_id -> "vpc-123" } }`.
 pub fn resolve_refs_with_state(
     resources: &mut [Resource],
@@ -27,7 +27,7 @@ pub fn resolve_refs_with_state(
     resolve_refs_with_state_and_remote(resources, current_states, &HashMap::new())
 }
 
-/// Resolve all ResourceRef values in resources using current state and remote state bindings.
+/// Resolve all ResourceRef values in resources using current state and upstream state bindings.
 pub fn resolve_refs_with_state_and_remote(
     resources: &mut [Resource],
     current_states: &HashMap<ResourceId, State>,
@@ -67,8 +67,8 @@ pub fn resolve_refs_with_state_and_remote(
         }
     }
 
-    // Inject remote state bindings.
-    // Each remote_state binding (e.g., "network") maps to a Map value containing
+    // Inject upstream state bindings.
+    // Each upstream_state binding (e.g., "network") maps to a Map value containing
     // resource bindings as nested maps (e.g., { "vpc" -> Map { "vpc_id" -> "vpc-123" } }).
     for (remote_binding, remote_attrs) in remote_bindings {
         binding_map.insert(remote_binding.clone(), remote_attrs.clone());
@@ -641,9 +641,9 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_remote_state_binding() {
-        // Simulate a resource that references a remote_state binding:
-        // network.vpc.vpc_id where network is a remote_state
+    fn test_resolve_upstream_state_binding() {
+        // Simulate a resource that references an upstream_state binding:
+        // network.vpc.vpc_id where network is an upstream_state
         let mut resources = vec![make_resource(
             "web-sg",
             None,
@@ -682,8 +682,8 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_remote_state_unresolved_keeps_ref() {
-        // If the remote state doesn't have the referenced resource, the ref stays as-is
+    fn test_resolve_upstream_state_unresolved_keeps_ref() {
+        // If the upstream state doesn't have the referenced resource, the ref stays as-is
         let mut resources = vec![make_resource(
             "web-sg",
             None,
