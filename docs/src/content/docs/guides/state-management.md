@@ -1,6 +1,6 @@
 ---
 title: "State Management"
-description: "Learn how Carina tracks infrastructure state, configure an S3 backend, import existing resources, move and remove state entries, and reference remote state."
+description: "Learn how Carina tracks infrastructure state, configure an S3 backend, import existing resources, move and remove state entries, and reference upstream state."
 ---
 
 Carina uses a state file to track which resources it manages and their current attributes. This guide covers how to configure state storage, manipulate state entries, and share state between projects.
@@ -125,18 +125,18 @@ removed {
 
 This removes the resource from Carina's state but leaves the actual cloud resource untouched. This is useful when transferring ownership of a resource to another tool or project.
 
-## Referencing remote state
+## Referencing upstream state
 
-To read outputs from another Carina project's state, use `remote_state`:
+To read outputs from another Carina project's state, use `upstream_state`:
 
 ```crn
-let network = remote_state {
-  path = 'network.state.json'
+upstream_state "network" {
+  source = "../network"
 }
 
 awscc.ec2.security_group {
   group_description = 'Web security group'
-  vpc_id            = network.vpc.vpc_id
+  vpc_id            = network.vpc_id
 
   tags = {
     Name = 'web-sg'
@@ -144,17 +144,9 @@ awscc.ec2.security_group {
 }
 ```
 
-The `remote_state` block loads another project's state file and makes its resource attributes available through the binding. In this example, `network.vpc.vpc_id` references the `vpc_id` attribute of the `vpc` resource from the network project's state.
+The `upstream_state` block points at an upstream project's directory. Carina loads that directory's configuration, resolves its backend, reads its state, and exposes the upstream's `exports` through the declared binding. In this example, `network.vpc_id` references the `vpc_id` value published by the `../network` project's `exports` block.
 
-You can also specify the backend type explicitly:
-
-```crn
-let network = remote_state 's3' {
-  bucket = 'carina-state'
-  key    = 'network/carina.state.json'
-  region = 'ap-northeast-1'
-}
-```
+`source` is required and resolved relative to the enclosing `.crn` file's directory. The upstream directory must contain a valid Carina configuration (a `main.crn` or flat `*.crn` files) with an `exports` block that publishes the values consumers need.
 
 ## State CLI commands
 
