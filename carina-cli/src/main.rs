@@ -1,48 +1,23 @@
-mod commands;
-mod display;
-mod error;
-mod signal;
-mod wiring;
-
 use std::path::PathBuf;
 
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{CompleteEnv, Shell, generate};
 use colored::Colorize;
 
 use base64::Engine;
-use commands::apply::{run_apply, run_apply_from_plan};
-use commands::destroy::run_destroy;
-use commands::docs;
-use commands::fmt::run_fmt;
-use commands::lint::run_lint;
-use commands::module::{ModuleCommands, run_module_command};
-use commands::plan::run_plan;
-use commands::skills;
-use commands::state::{StateCommands, run_force_unlock, run_state_command};
-use commands::validate::run_validate;
-
-/// Controls how much detail is shown in plan output (CLI-facing enum with clap support).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum DetailLevel {
-    /// Show all attributes: user-specified, defaults, read-only, and unchanged (dimmed)
-    Full,
-    /// Show only attributes explicitly specified in .crn file
-    Explicit,
-    /// Show resource names only (no attributes)
-    None,
-}
-
-impl DetailLevel {
-    /// Convert to the core `DetailLevel` enum used by `build_detail_rows`.
-    pub fn to_core(self) -> carina_core::detail_rows::DetailLevel {
-        match self {
-            DetailLevel::Full => carina_core::detail_rows::DetailLevel::Full,
-            DetailLevel::Explicit => carina_core::detail_rows::DetailLevel::Explicit,
-            DetailLevel::None => carina_core::detail_rows::DetailLevel::NamesOnly,
-        }
-    }
-}
+use carina_cli::DetailLevel;
+use carina_cli::commands;
+use carina_cli::commands::apply::{run_apply, run_apply_from_plan};
+use carina_cli::commands::destroy::run_destroy;
+use carina_cli::commands::docs;
+use carina_cli::commands::fmt::run_fmt;
+use carina_cli::commands::lint::run_lint;
+use carina_cli::commands::module::{ModuleCommands, run_module_command};
+use carina_cli::commands::plan::run_plan;
+use carina_cli::commands::skills;
+use carina_cli::commands::state::{StateCommands, run_force_unlock, run_state_command};
+use carina_cli::commands::validate::run_validate;
+use carina_cli::error;
 
 #[derive(Parser)]
 #[command(name = "carina")]
@@ -484,14 +459,6 @@ fn format_error_lines(msg: &str) -> String {
 
 #[cfg(test)]
 mod cli_version_tests;
-#[cfg(test)]
-mod module_info_snapshot_tests;
-#[cfg(test)]
-mod module_list_tests;
-#[cfg(test)]
-mod plan_snapshot_tests;
-#[cfg(test)]
-mod tests;
 
 #[cfg(test)]
 mod error_format_tests {

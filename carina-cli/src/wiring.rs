@@ -427,7 +427,6 @@ impl<'a> PlanPreprocessor<'a> {
 /// `normalize_desired()` to the resources. This resolves enum identifiers
 /// (e.g., bare enum identifiers -> namespaced enum strings) without requiring
 /// actual provider instances or network access.
-#[cfg(test)]
 pub fn normalize_desired_with_ctx(ctx: &WiringContext, resources: &mut [Resource]) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -446,7 +445,6 @@ pub fn normalize_desired_with_ctx(ctx: &WiringContext, resources: &mut [Resource
 /// `normalize_state()` to the current states. This converts raw AWS enum
 /// values (e.g., `"ap-northeast-1a"`) to the same DSL format that
 /// `normalize_desired` produces, preventing false diffs.
-#[cfg(test)]
 pub fn normalize_state_with_ctx(
     ctx: &WiringContext,
     current_states: &mut HashMap<ResourceId, State>,
