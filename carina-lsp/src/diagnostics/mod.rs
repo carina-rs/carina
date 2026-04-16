@@ -757,21 +757,14 @@ fn check_resource_ref_type_mismatch(
 ) -> Option<String> {
     let ref_schema = binding_schema_map.get(ref_binding)?;
     let ref_attr_schema = ref_schema.attributes.get(ref_attr)?;
-    let ref_type_name = ref_attr_schema.attr_type.type_name();
 
-    let expected_type_name = expected_type.type_name();
-    if expected_type.accepts_type_name(&ref_type_name)
-        || expected_type_name == "String"
-        || ref_type_name == "String"
-        || (expected_type.is_string_based_custom()
-            && ref_attr_schema.attr_type.is_string_based_custom())
-    {
+    if expected_type.is_compatible_with(&ref_attr_schema.attr_type) {
         None
     } else {
         Some(format!(
             "Type mismatch: expected {}, got {} (from {}.{})",
             expected_type.type_name(),
-            ref_type_name,
+            ref_attr_schema.attr_type.type_name(),
             ref_binding,
             ref_attr
         ))
