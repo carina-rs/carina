@@ -2708,7 +2708,6 @@ async fn persist_exports_only_writes_state_with_new_exports() {
         Some(&lock),
         Some(StateFile::new()),
         &export_params,
-        &[],
     )
     .await;
 

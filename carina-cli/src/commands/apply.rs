@@ -491,7 +491,7 @@ pub async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), AppErro
 
     // Resolve exports and persist to state
     if !input.export_params.is_empty() {
-        let exports = resolve_exports(input.export_params, input.sorted_resources, &state);
+        let exports = resolve_exports(input.export_params, &state);
         state.exports = exports;
     }
 
@@ -508,7 +508,6 @@ pub async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), AppErro
 /// Resolve export expressions using the binding map built from applied state.
 pub(crate) fn resolve_exports(
     export_params: &[carina_core::parser::ExportParameter],
-    _resources: &[Resource],
     state: &StateFile,
 ) -> HashMap<String, serde_json::Value> {
     use carina_core::resource::Value;
@@ -606,21 +605,17 @@ pub(crate) async fn persist_exports_only(
     lock: Option<&LockInfo>,
     state_file: Option<StateFile>,
     export_params: &[carina_core::parser::ExportParameter],
-    sorted_resources: &[Resource],
 ) -> Result<(), AppError> {
     let mut state = state_file.unwrap_or_default();
-    let exports = resolve_exports(export_params, sorted_resources, &state);
+    let exports = resolve_exports(export_params, &state);
     state.exports = exports;
     if let Some(lk) = lock {
         save_state_locked(backend, lk, &mut state).await?;
     } else {
         save_state_unlocked(backend, &mut state).await?;
     }
-    println!(
-        "  {} State saved (serial: {}), exports updated.",
-        "✓".green(),
-        state.serial
-    );
+    println!("  {} State saved (serial: {})", "✓".green(), state.serial);
+    println!("  {} Exports updated", "✓".green());
     Ok(())
 }
 
@@ -1362,12 +1357,13 @@ async fn run_apply_locked(
             &sorted_resources,
             &current_states,
         );
+        let empty_exports = HashMap::new();
         let current_exports = state_file
             .as_ref()
-            .map(|s| s.exports.clone())
-            .unwrap_or_default();
+            .map(|s| &s.exports)
+            .unwrap_or(&empty_exports);
         let export_changes =
-            crate::commands::plan::compute_export_diffs(&resolved_exports, &current_exports);
+            crate::commands::plan::compute_export_diffs(&resolved_exports, current_exports);
 
         if export_changes.is_empty() {
             println!("{}", "No changes needed.".green());
@@ -1382,14 +1378,7 @@ async fn run_apply_locked(
             )
             .cyan()
         );
-        persist_exports_only(
-            backend,
-            lock,
-            state_file,
-            &parsed.export_params,
-            &sorted_resources,
-        )
-        .await?;
+        persist_exports_only(backend, lock, state_file, &parsed.export_params).await?;
         return Ok(());
     }
 
@@ -2326,7 +2315,7 @@ mod tests {
             value: Some(Value::String("registry_prod.account_id".to_string())),
         }];
 
-        let exports = resolve_exports(&export_params, &[], &state);
+        let exports = resolve_exports(&export_params, &state);
 
         assert_eq!(
             exports.get("account_id"),
