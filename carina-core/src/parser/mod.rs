@@ -471,6 +471,11 @@ impl ParsedFile {
     ) {
         let mut expanded_resources = Vec::new();
         let mut resolved_indices = Vec::new();
+        // Indices where the iterable resolved but had the wrong shape. These
+        // entries stay deferred (user must fix), but their parse-time "not yet
+        // available" warning is replaced by the more specific shape-mismatch
+        // warning collected in `new_warnings`.
+        let mut mismatched_indices: Vec<usize> = Vec::new();
         let mut new_warnings: Vec<ParseWarning> = Vec::new();
 
         for (idx, deferred) in self.deferred_for_expressions.iter().enumerate() {
@@ -516,8 +521,10 @@ impl ParsedFile {
                     }
                     resolved_indices.push(idx);
                 }
-                // Shape mismatch: emit warning and leave deferred
+                // Shape mismatch: replace the original "not yet available" warning
+                // with a specific shape-mismatch warning, leave entry deferred.
                 (ForBinding::Map(_, _), Value::List(_)) => {
+                    mismatched_indices.push(idx);
                     new_warnings.push(ParseWarning {
                         file: deferred.file.clone(),
                         line: deferred.line,
@@ -530,6 +537,7 @@ impl ParsedFile {
                 }
                 (ForBinding::Simple(_), Value::Map(_))
                 | (ForBinding::Indexed(_, _), Value::Map(_)) => {
+                    mismatched_indices.push(idx);
                     new_warnings.push(ParseWarning {
                         file: deferred.file.clone(),
                         line: deferred.line,
@@ -544,6 +552,14 @@ impl ParsedFile {
                     // Iterable is not a list or map — leave deferred
                 }
             }
+        }
+
+        // Remove parse-time warnings for mismatched entries (the new
+        // shape-mismatch warning replaces the generic "not yet available" one).
+        for idx in &mismatched_indices {
+            let deferred = &self.deferred_for_expressions[*idx];
+            self.warnings
+                .retain(|w| w.line != deferred.line || w.file != deferred.file);
         }
 
         // Remove resolved deferred entries (reverse order to preserve indices)
@@ -10671,6 +10687,17 @@ awscc.ec2.vpc {
                 .iter()
                 .any(|w| w.message.contains("expected map") || w.message.contains("shape")),
             "should warn about shape mismatch, got: {:?}",
+            parsed.warnings
+        );
+        // The parse-time "not yet available" warning should be replaced by the
+        // more specific shape-mismatch warning (not kept alongside).
+        assert!(
+            !parsed
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("not yet available")
+                    || w.message.contains("not yet in the upstream state")),
+            "parse-time warning should be replaced, got: {:?}",
             parsed.warnings
         );
     }
