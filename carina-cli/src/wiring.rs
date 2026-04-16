@@ -745,10 +745,10 @@ pub async fn create_providers_from_configs(
     router
 }
 
-/// Create a plan from parsed configuration (without remote state bindings).
+/// Create a plan from parsed configuration (without upstream state bindings).
 ///
-/// This is a convenience wrapper around `create_plan_from_parsed_with_remote`
-/// for callers that don't use remote_state data sources.
+/// This is a convenience wrapper around `create_plan_from_parsed_with_upstream`
+/// for callers that don't use upstream_state blocks.
 #[allow(dead_code)]
 pub async fn create_plan_from_parsed(
     parsed: &ParsedFile,
@@ -756,11 +756,11 @@ pub async fn create_plan_from_parsed(
     refresh: bool,
     base_dir: &Path,
 ) -> Result<PlanContext, AppError> {
-    create_plan_from_parsed_with_remote(parsed, state_file, refresh, &HashMap::new(), base_dir)
+    create_plan_from_parsed_with_upstream(parsed, state_file, refresh, &HashMap::new(), base_dir)
         .await
 }
 
-pub async fn create_plan_from_parsed_with_remote(
+pub async fn create_plan_from_parsed_with_upstream(
     parsed: &ParsedFile,
     state_file: &Option<StateFile>,
     refresh: bool,

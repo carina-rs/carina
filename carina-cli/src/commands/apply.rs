@@ -1063,6 +1063,7 @@ pub async fn run_apply(
         backend.as_ref(),
         lock_info.as_ref(),
         base_dir,
+        provider_context,
     ))
     .await;
 
@@ -1092,6 +1093,7 @@ async fn run_apply_locked(
     backend: &dyn StateBackend,
     lock: Option<&LockInfo>,
     base_dir: &std::path::Path,
+    provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
     // Read current state from backend
     let state_file = backend.read_state().await.map_err(AppError::Backend)?;
@@ -1107,8 +1109,14 @@ async fn run_apply_locked(
 
     // Upstream state bindings are loaded up front so refs that target
     // `upstream_state` blocks can be resolved during refresh (#1683).
-    let remote_bindings =
-        super::plan::load_upstream_state_bindings(&parsed.upstream_states, base_dir).await?;
+    let mut cycle_guard = super::plan::seed_cycle_guard(base_dir);
+    let remote_bindings = super::plan::load_upstream_states(
+        &parsed.upstream_states,
+        base_dir,
+        provider_context,
+        &mut cycle_guard,
+    )
+    .await?;
 
     // Expand deferred for-expressions now that remote values are available.
     // Must happen BEFORE sort_resources_by_dependencies so expanded resources
