@@ -24,7 +24,7 @@ use crate::commands::apply::apply_name_overrides;
 use crate::display::print_plan;
 use crate::error::AppError;
 use crate::wiring::{
-    WiringContext, build_factories_from_providers, create_plan_from_parsed_with_remote,
+    WiringContext, build_factories_from_providers, create_plan_from_parsed_with_upstream,
     reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
 };
 
@@ -220,7 +220,14 @@ pub async fn run_plan(
         );
     }
 
-    let remote_bindings = load_upstream_state_bindings(&parsed.upstream_states, base_dir).await?;
+    let mut cycle_guard = seed_cycle_guard(base_dir);
+    let remote_bindings = load_upstream_states(
+        &parsed.upstream_states,
+        base_dir,
+        provider_context,
+        &mut cycle_guard,
+    )
+    .await?;
 
     // Expand deferred for-expressions now that remote values are available
     parsed.expand_deferred_for_expressions(&remote_bindings);
@@ -228,7 +235,7 @@ pub async fn run_plan(
     // Print warnings after expansion (resolved deferred for-expressions have their warnings removed)
     parsed.print_warnings();
 
-    let ctx = create_plan_from_parsed_with_remote(
+    let ctx = create_plan_from_parsed_with_upstream(
         &parsed,
         &state_file,
         refresh,
@@ -490,6 +497,16 @@ pub fn compute_export_diffs(
     changes
 }
 
+/// Seed a cycle guard with the caller's own base directory so that a chain
+/// ending back at the root is detected as a cycle.
+pub(crate) fn seed_cycle_guard(base_dir: &Path) -> HashSet<PathBuf> {
+    let mut guard = HashSet::new();
+    if let Ok(abs) = base_dir.canonicalize() {
+        guard.insert(abs);
+    }
+    guard
+}
+
 /// Resolve and read each upstream's published exports by parsing its source
 /// directory, deriving its backend, and pulling the state through that backend.
 ///
@@ -589,26 +606,6 @@ async fn load_upstream_bindings_at(
         })?;
 
     Ok(state_file.build_remote_bindings())
-}
-
-/// Thin wrapper preserved for call sites that haven't yet been threaded with
-/// a cycle guard. Task 5 (#1911) removes this in favor of direct calls to
-/// `load_upstream_states`.
-pub(crate) async fn load_upstream_state_bindings(
-    upstream_states: &[UpstreamState],
-    base_dir: &Path,
-) -> Result<HashMap<String, HashMap<String, Value>>, AppError> {
-    let mut cycle_guard = HashSet::new();
-    if let Ok(abs) = base_dir.canonicalize() {
-        cycle_guard.insert(abs);
-    }
-    load_upstream_states(
-        upstream_states,
-        base_dir,
-        &ProviderContext::default(),
-        &mut cycle_guard,
-    )
-    .await
 }
 
 #[cfg(test)]
@@ -714,6 +711,84 @@ mod load_upstream_states_tests {
             err.to_string().contains("orgs"),
             "error should name the binding: {}",
             err
+        );
+    }
+}
+
+#[cfg(test)]
+mod run_plan_upstream_state_tests {
+    use super::*;
+    use std::fs;
+
+    #[tokio::test]
+    async fn run_plan_resolves_upstream_state_exports() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_a = tmp.path().join("a");
+        let dir_b = tmp.path().join("b");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        fs::write(
+            dir_a.join("main.crn"),
+            r#"backend local { path = "carina.state.json" }"#,
+        )
+        .unwrap();
+
+        let mut state_a = StateFile::new();
+        state_a
+            .exports
+            .insert("region".to_string(), serde_json::json!("ap-northeast-1"));
+        fs::write(
+            dir_a.join("carina.state.json"),
+            serde_json::to_string(&state_a).unwrap(),
+        )
+        .unwrap();
+
+        fs::write(
+            dir_b.join("main.crn"),
+            r#"
+                upstream_state "a" { source = "../a" }
+                exports { region = a.region }
+            "#,
+        )
+        .unwrap();
+
+        crate::commands::ensure_backend_lock(&dir_b, None).unwrap();
+
+        run_plan(
+            &dir_b,
+            None,
+            DetailLevel::None,
+            false,
+            false,
+            true,
+            false,
+            &ProviderContext::default(),
+        )
+        .await
+        .expect("run_plan should succeed");
+
+        // `run_plan` returns only `has_changes`; reload the downstream via
+        // the same loader path to verify the upstream binding value is
+        // reachable to downstream references.
+        let parsed = carina_core::config_loader::load_configuration_with_config(
+            &dir_b,
+            &ProviderContext::default(),
+        )
+        .expect("load config")
+        .parsed;
+        let mut guard = seed_cycle_guard(&dir_b);
+        let bindings = load_upstream_states(
+            &parsed.upstream_states,
+            &dir_b,
+            &ProviderContext::default(),
+            &mut guard,
+        )
+        .await
+        .expect("upstream bindings");
+        assert_eq!(
+            bindings["a"]["region"],
+            Value::String("ap-northeast-1".to_string())
         );
     }
 }
