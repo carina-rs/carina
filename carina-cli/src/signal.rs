@@ -7,6 +7,7 @@
 use std::future::Future;
 
 use colored::Colorize;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 use crate::error::AppError;
 
@@ -47,6 +48,76 @@ where
             });
 
             Err(AppError::Interrupted)
+        }
+    }
+}
+
+/// Read a single line from `reader`, cancellable by `interrupt`.
+///
+/// Returns the line with any trailing `\n` or `\r\n` stripped, or
+/// `Err(AppError::Interrupted)` if `interrupt` fires first.
+pub async fn read_line_with_interrupt<R, F>(reader: R, interrupt: F) -> Result<String, AppError>
+where
+    R: AsyncBufRead + Unpin,
+    F: Future<Output = ()>,
+{
+    tokio::pin!(reader);
+    let mut buf = String::new();
+    tokio::select! {
+        result = reader.read_line(&mut buf) => {
+            result.map_err(|e| AppError::Config(e.to_string()))?;
+            if buf.ends_with('\n') {
+                buf.pop();
+                if buf.ends_with('\r') {
+                    buf.pop();
+                }
+            }
+            Ok(buf)
+        }
+        _ = interrupt => Err(AppError::Interrupted),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn read_line_returns_input_before_interrupt() {
+        let input = &b"yes\n"[..];
+        let interrupt = std::future::pending::<()>();
+        let line = read_line_with_interrupt(input, interrupt).await.unwrap();
+        assert_eq!(line, "yes");
+    }
+
+    #[tokio::test]
+    async fn read_line_strips_crlf() {
+        let input = &b"no\r\n"[..];
+        let interrupt = std::future::pending::<()>();
+        let line = read_line_with_interrupt(input, interrupt).await.unwrap();
+        assert_eq!(line, "no");
+    }
+
+    #[tokio::test]
+    async fn read_line_returns_interrupted_when_signal_fires_first() {
+        // Simulates a user who hasn't pressed Enter at the confirmation prompt.
+        let reader = tokio::io::BufReader::new(NeverReady);
+        let interrupt = async {};
+        let err = read_line_with_interrupt(reader, interrupt)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Interrupted));
+    }
+
+    struct NeverReady;
+
+    impl tokio::io::AsyncRead for NeverReady {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
         }
     }
 }
