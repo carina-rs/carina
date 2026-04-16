@@ -3166,7 +3166,16 @@ fn parse_upstream_state_block(
         let value_pair = next_pair(&mut attr_inner, "attribute value", "upstream_state block")?;
         match key.as_str() {
             "source" => {
-                source = Some(extract_string_from_pair(value_pair)?);
+                let value_text = value_pair.as_str().to_string();
+                source = Some(extract_string_from_pair(value_pair).map_err(|_| {
+                    ParseError::InvalidExpression {
+                        line: attr_line,
+                        message: format!(
+                            "upstream_state \"{}\": 'source' must be a string literal, got: {}",
+                            binding, value_text
+                        ),
+                    }
+                })?);
             }
             other => {
                 return Err(ParseError::InvalidExpression {
@@ -10555,6 +10564,47 @@ awscc.ec2.vpc {
         assert!(
             msg.contains("remote_state") && msg.contains("upstream_state"),
             "error should guide users to upstream_state, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn upstream_state_missing_source_is_error() {
+        let input = r#"upstream_state "orgs" { }"#;
+        let err = parse(input, &ProviderContext::default())
+            .expect_err("missing source must be a parse error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("upstream_state") && msg.contains("source") && msg.contains("orgs"),
+            "error should mention upstream_state, binding, and source: {msg}",
+        );
+    }
+
+    #[test]
+    fn upstream_state_source_must_be_string() {
+        let input = r#"upstream_state "orgs" { source = 42 }"#;
+        let err = parse(input, &ProviderContext::default())
+            .expect_err("non-string source must be a parse error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("source") && msg.contains("orgs"),
+            "error should mention source and binding: {msg}",
+        );
+    }
+
+    #[test]
+    fn upstream_state_unknown_attribute_is_error() {
+        let input = r#"
+            upstream_state "orgs" {
+                source = "../foo"
+                backend = "s3"
+            }
+        "#;
+        let err = parse(input, &ProviderContext::default())
+            .expect_err("unknown attribute must be a parse error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("backend") && msg.contains("orgs"),
+            "error should mention the unknown attribute and binding: {msg}",
         );
     }
 }
