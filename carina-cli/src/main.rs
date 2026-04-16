@@ -349,7 +349,7 @@ async fn main() {
                 }
             }
             Err(e) => {
-                eprintln!("{} {}", "Error:".red().bold(), e);
+                eprint!("{}", format_error_lines(&e.to_string()));
                 std::process::exit(1);
             }
         }
@@ -468,11 +468,18 @@ async fn main() {
                 std::process::exit(130);
             }
             _ => {
-                eprintln!("{} {}", "Error:".red().bold(), e);
+                eprint!("{}", format_error_lines(&e.to_string()));
                 std::process::exit(1);
             }
         }
     }
+}
+
+fn format_error_lines(msg: &str) -> String {
+    let prefix = "Error:".red().bold().to_string();
+    msg.lines()
+        .map(|line| format!("{} {}\n", prefix, line))
+        .collect()
 }
 
 #[cfg(test)]
@@ -485,3 +492,22 @@ mod module_list_tests;
 mod plan_snapshot_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod error_format_tests {
+    use super::*;
+
+    #[test]
+    fn single_line_error_has_prefix() {
+        colored::control::set_override(false);
+        let result = format_error_lines("something went wrong");
+        assert_eq!(result, "Error: something went wrong\n");
+    }
+
+    #[test]
+    fn multi_line_error_each_line_has_prefix() {
+        colored::control::set_override(false);
+        let result = format_error_lines("first error\nsecond error");
+        assert_eq!(result, "Error: first error\nError: second error\n");
+    }
+}
