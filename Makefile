@@ -114,13 +114,13 @@ plan-fixtures:
 	@echo "=== moved_pure ==="
 	@$(MAKE) plan-moved-pure
 	@echo ""
-	@echo "=== remote_state ==="
-	@$(MAKE) plan-remote-state
+	@echo "=== upstream_state ==="
+	@$(MAKE) plan-upstream-state
 	@echo "---"
 	@$(MAKE) plan-deferred-for
 
-plan-remote-state:
-	cd $(FIXTURES)/remote_state && $(CARINA) plan --refresh=false
+plan-upstream-state:
+	cd $(FIXTURES)/upstream_state && $(CARINA) plan --refresh=false
 plan-deferred-for:
 	cd $(FIXTURES)/deferred_for && $(CARINA) plan --refresh=false
 plan-exports:
@@ -129,6 +129,6 @@ plan-exports:
         plan-map-diff plan-enum-display plan-destroy-full plan-destroy-orphans plan-read-only-attrs \
         plan-default-values plan-explicit plan-default-tags \
         plan-state-blocks plan-secret-values plan-moved-with-changes plan-moved-prev-keys plan-moved-pure \
-        plan-remote-state plan-deferred-for plan-exports \
+        plan-upstream-state plan-deferred-for plan-exports \
         plan-map-diff-tui plan-all-create-tui plan-mixed-tui plan-delete-tui \
         plan-moved-with-changes-tui plan-moved-pure-tui plan-fixtures
