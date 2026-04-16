@@ -185,13 +185,11 @@ fn split_top_level(s: &str) -> Vec<&str> {
             b'"' => in_quote = !in_quote,
             b'[' | b'{' if !in_quote => depth += 1,
             b']' | b'}' if !in_quote => depth -= 1,
-            b',' if !in_quote && depth == 0 => {
-                if i + 1 < bytes.len() && bytes[i + 1] == b' ' {
-                    parts.push(&s[start..i]);
-                    start = i + 2;
-                    i += 2;
-                    continue;
-                }
+            b',' if !in_quote && depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b' ' => {
+                parts.push(&s[start..i]);
+                start = i + 2;
+                i += 2;
+                continue;
             }
             _ => {}
         }
