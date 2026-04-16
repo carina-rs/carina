@@ -1436,10 +1436,11 @@ async fn run_apply_locked(
         print!("\n  Enter a value: ");
         std::io::Write::flush(&mut std::io::stdout()).map_err(|e| e.to_string())?;
 
-        let mut input = String::new();
-        std::io::stdin()
-            .read_line(&mut input)
-            .map_err(|e| e.to_string())?;
+        let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+        let interrupt = async {
+            let _ = tokio::signal::ctrl_c().await;
+        };
+        let input = crate::signal::read_line_with_interrupt(stdin, interrupt).await?;
 
         if input.trim() != "yes" {
             println!();
@@ -1739,10 +1740,11 @@ async fn run_apply_from_plan_locked(
         print!("\n  Enter a value: ");
         std::io::Write::flush(&mut std::io::stdout()).map_err(|e| e.to_string())?;
 
-        let mut input = String::new();
-        std::io::stdin()
-            .read_line(&mut input)
-            .map_err(|e| e.to_string())?;
+        let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+        let interrupt = async {
+            let _ = tokio::signal::ctrl_c().await;
+        };
+        let input = crate::signal::read_line_with_interrupt(stdin, interrupt).await?;
 
         if input.trim() != "yes" {
             println!();
