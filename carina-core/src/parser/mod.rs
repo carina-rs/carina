@@ -580,7 +580,9 @@ impl ParsedFile {
 ///
 /// Replaces `DEFERRED_UPSTREAM_PLACEHOLDER` with `value`. If `key` is
 /// supplied (map-binding expansion), also replaces
-/// `DEFERRED_UPSTREAM_KEY_PLACEHOLDER` with the key string.
+/// `DEFERRED_UPSTREAM_KEY_PLACEHOLDER` with the key string. Recurses into
+/// all compound Value variants so placeholders nested inside
+/// interpolations / function calls / secrets are reached.
 fn substitute_placeholder(v: &mut Value, key: Option<&str>, value: &Value) {
     match v {
         Value::String(s) if s == DEFERRED_UPSTREAM_PLACEHOLDER => {
@@ -600,6 +602,21 @@ fn substitute_placeholder(v: &mut Value, key: Option<&str>, value: &Value) {
             for val in map.values_mut() {
                 substitute_placeholder(val, key, value);
             }
+        }
+        Value::FunctionCall { args, .. } => {
+            for arg in args.iter_mut() {
+                substitute_placeholder(arg, key, value);
+            }
+        }
+        Value::Interpolation(parts) => {
+            for part in parts.iter_mut() {
+                if let crate::resource::InterpolationPart::Expr(inner) = part {
+                    substitute_placeholder(inner, key, value);
+                }
+            }
+        }
+        Value::Secret(inner) => {
+            substitute_placeholder(inner, key, value);
         }
         _ => {}
     }
@@ -10590,6 +10607,67 @@ awscc.ec2.vpc {
         assert_eq!(
             dev.get_attr("target_id"),
             Some(&Value::String("222222222222".to_string()))
+        );
+    }
+
+    #[test]
+    fn expand_deferred_for_substitutes_placeholder_inside_interpolation() {
+        // The loop var may appear inside a string interpolation like "acct-${id}".
+        // Placeholder substitution must recurse into Value::Interpolation parts,
+        // otherwise the rendered resource ships the raw placeholder string.
+        let input = r#"
+            let orgs = remote_state {
+                path = "../organizations/carina.state.json"
+            }
+
+            for account_id in orgs.accounts {
+                awscc.sso.assignment {
+                    target_id = account_id
+                    label = "acct-${account_id}"
+                }
+            }
+        "#;
+
+        let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(parsed.deferred_for_expressions.len(), 1);
+
+        let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let mut orgs_attrs = HashMap::new();
+        orgs_attrs.insert(
+            "accounts".to_string(),
+            Value::List(vec![Value::String("111111111111".to_string())]),
+        );
+        remote_bindings.insert("orgs".to_string(), orgs_attrs);
+
+        parsed.expand_deferred_for_expressions(&remote_bindings);
+        assert_eq!(parsed.resources.len(), 1);
+
+        // label must have the placeholder substituted in the interpolation.
+        let label = parsed.resources[0].get_attr("label");
+        let rendered = match label {
+            Some(Value::Interpolation(parts)) => {
+                let mut s = String::new();
+                for p in parts {
+                    match p {
+                        crate::resource::InterpolationPart::Literal(lit) => s.push_str(lit),
+                        crate::resource::InterpolationPart::Expr(Value::String(v)) => s.push_str(v),
+                        _ => s.push_str("<expr>"),
+                    }
+                }
+                s
+            }
+            Some(Value::String(s)) => s.clone(),
+            other => panic!("unexpected label shape: {:?}", other),
+        };
+        assert!(
+            rendered.contains("111111111111"),
+            "interpolation should contain substituted account id, got: {}",
+            rendered
+        );
+        assert!(
+            !rendered.contains(DEFERRED_UPSTREAM_PLACEHOLDER),
+            "placeholder must not leak into rendered label, got: {}",
+            rendered
         );
     }
 
