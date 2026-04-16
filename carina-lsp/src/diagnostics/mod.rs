@@ -4,7 +4,7 @@ mod validation;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -108,6 +108,7 @@ impl DiagnosticEngine {
         doc: &Document,
         base_path: Option<&Path>,
         sibling_bindings: &HashMap<String, String>,
+        sibling_referenced: &HashSet<String>,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
         let text = doc.text();
@@ -121,7 +122,12 @@ impl DiagnosticEngine {
         }
 
         // Check for undefined resource references in the raw text
-        let undef_diags = self.check_undefined_references(&text, &defined_bindings);
+        // Include sibling file bindings to avoid false positives for cross-file refs
+        let mut all_bindings = defined_bindings.clone();
+        for name in sibling_bindings.keys() {
+            all_bindings.insert(name.clone());
+        }
+        let undef_diags = self.check_undefined_references(&text, &all_bindings);
         diagnostics.extend(undef_diags);
 
         // Semantic analysis on parsed file
@@ -599,8 +605,13 @@ impl DiagnosticEngine {
             // Check exports blocks
             diagnostics.extend(self.check_exports_blocks(doc, parsed, None, sibling_bindings));
 
-            // Check for unused let bindings
-            diagnostics.extend(self.check_unused_bindings(doc, parsed));
+            // Check for unused let bindings (exclude bindings referenced by sibling files)
+            let unused_diags = self.check_unused_bindings(doc, parsed);
+            diagnostics.extend(unused_diags.into_iter().filter(|d| {
+                !sibling_referenced
+                    .iter()
+                    .any(|name| d.message.contains(&format!("'{}'", name)))
+            }));
 
             // Check for unknown attributes on resource references (typo detection)
             diagnostics.extend(self.check_resource_ref_attributes(
