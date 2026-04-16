@@ -94,7 +94,7 @@ impl CompletionProvider {
                 kind: Some(CompletionItemKind::KEYWORD),
                 insert_text: Some("exports {\n    ${1:name}: ${2:type} = ${3:value}\n}".to_string()),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
-                detail: Some("Publish values for remote_state consumers".to_string()),
+                detail: Some("Publish values for upstream_state consumers".to_string()),
                 ..Default::default()
             },
             CompletionItem {
@@ -146,11 +146,14 @@ impl CompletionProvider {
                 ..Default::default()
             },
             CompletionItem {
-                label: "remote_state".to_string(),
+                label: "upstream_state".to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
-                insert_text: Some("let ${1:name} = remote_state {\n    path = \"${2:../other-project/carina.state.json}\"\n}".to_string()),
+                insert_text: Some(
+                    "upstream_state \"${1:binding}\" {\n    source = \"${2:../other-project}\"\n}"
+                        .to_string(),
+                ),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
-                detail: Some("Reference another project's state".to_string()),
+                detail: Some("Reference another project's exported state".to_string()),
                 ..Default::default()
             },
             CompletionItem {

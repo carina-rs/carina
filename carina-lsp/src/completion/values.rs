@@ -1,8 +1,5 @@
 //! Attribute, value, and type-specific completions.
 
-use std::collections::HashMap;
-use std::path::Path;
-
 use tower_lsp::lsp_types::{
     Command, CompletionItem, CompletionItemKind, InsertTextFormat, Position, Range, TextEdit,
 };
@@ -16,21 +13,6 @@ use super::CompletionProvider;
 struct BindingDotContext {
     binding_name: String,
     resource_type: String,
-}
-
-/// Context when the user has typed `remote_binding.` or `remote_binding.resource.` after `=`.
-enum RemoteStateDotContext {
-    /// After `remote_binding.` — complete with resource binding names
-    FirstSegment {
-        binding_name: String,
-        state_path: String,
-    },
-    /// After `remote_binding.resource.` — complete with attribute names
-    SecondSegment {
-        binding_name: String,
-        resource_binding: String,
-        state_path: String,
-    },
 }
 
 fn type_completion_item(label: String, detail: String, range: Range) -> CompletionItem {
@@ -106,7 +88,6 @@ impl CompletionProvider {
         text: &str,
         current_binding: Option<&str>,
         position: Position,
-        base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
 
@@ -115,12 +96,6 @@ impl CompletionProvider {
         // from the start of "igw" to the cursor, so accepting a completion like
         // "igw.internet_gateway_id" replaces "igw." instead of being appended.
         let ref_edit_range = self.compute_value_prefix_range(text, position);
-
-        // Check if the user has typed "remote_binding." or "remote_binding.resource."
-        // after "=" — if so, show remote state completions.
-        if let Some(remote_ctx) = self.detect_remote_state_dot_context(text, position) {
-            return self.remote_state_completions(&remote_ctx, ref_edit_range, base_path);
-        }
 
         // Check if the user has typed "binding." after "=" — if so, show only
         // that binding's resource attributes, not built-in functions or generic completions.
@@ -316,276 +291,6 @@ impl CompletionProvider {
         completions
     }
 
-    /// Extract remote_state binding names and their paths from text.
-    /// Parses lines like `let network = remote_state { path = "..." }` or multi-line variants.
-    fn extract_remote_state_bindings(&self, text: &str) -> Vec<(String, String)> {
-        let mut bindings = Vec::new();
-        let mut current_binding: Option<String> = None;
-        let mut in_remote_state_block = false;
-        let mut brace_depth = 0;
-
-        for line in text.lines() {
-            let trimmed = line.trim();
-
-            // Detect "let name = remote_state {"
-            if let Some(rest) = trimmed.strip_prefix("let ")
-                && let Some(eq_pos) = rest.find('=')
-            {
-                let name = rest[..eq_pos].trim();
-                let after_eq = rest[eq_pos + 1..].trim();
-                if let Some(after_rs) = after_eq.strip_prefix("remote_state")
-                    && (after_rs.is_empty()
-                        || after_rs.starts_with(char::is_whitespace)
-                        || after_rs.starts_with('{')
-                        || after_rs.starts_with('"'))
-                {
-                    // Skip optional backend name string (e.g., "s3")
-                    let after_rs = after_rs.trim();
-                    let after_backend = if let Some(stripped) = after_rs.strip_prefix('"') {
-                        // Skip past the closing quote of the backend name
-                        if let Some(end_quote) = stripped.find('"') {
-                            stripped[end_quote + 1..].trim()
-                        } else {
-                            after_rs
-                        }
-                    } else {
-                        after_rs
-                    };
-                    if let Some(after_brace) = after_backend.strip_prefix('{') {
-                        current_binding = Some(name.to_string());
-                        in_remote_state_block = true;
-                        brace_depth = 1;
-
-                        // Check if path is on the same line
-                        let inside_block = after_brace.trim();
-                        if let Some(path) = Self::extract_path_from_line(inside_block) {
-                            bindings.push((name.to_string(), path));
-                            current_binding = None;
-                            in_remote_state_block = false;
-                            brace_depth = 0;
-                        }
-                        continue;
-                    }
-                }
-            }
-
-            if in_remote_state_block {
-                // Track braces
-                for c in trimmed.chars() {
-                    if c == '{' {
-                        brace_depth += 1;
-                    } else if c == '}' {
-                        brace_depth -= 1;
-                        if brace_depth == 0 {
-                            in_remote_state_block = false;
-                            current_binding = None;
-                            break;
-                        }
-                    }
-                }
-
-                // Look for path = "..."
-                if let Some(ref binding_name) = current_binding
-                    && let Some(path) = Self::extract_path_from_line(trimmed)
-                {
-                    bindings.push((binding_name.clone(), path));
-                }
-            }
-        }
-
-        bindings
-    }
-
-    /// Extract path value from a line containing `path = "..."`.
-    fn extract_path_from_line(line: &str) -> Option<String> {
-        let trimmed = line.trim();
-        let rest = trimmed.strip_prefix("path")?.trim();
-        let rest = rest.strip_prefix('=')?.trim();
-        let rest = rest.strip_prefix('"')?;
-        let end = rest.find('"')?;
-        Some(rest[..end].to_string())
-    }
-
-    /// Detect if the user has typed `remote_binding.` or `remote_binding.resource.` after `=`.
-    fn detect_remote_state_dot_context(
-        &self,
-        text: &str,
-        position: Position,
-    ) -> Option<RemoteStateDotContext> {
-        let lines: Vec<&str> = text.lines().collect();
-        let line_idx = position.line as usize;
-        if line_idx >= lines.len() {
-            return None;
-        }
-
-        let col = position.character as usize;
-        let prefix: String = lines[line_idx].chars().take(col).collect();
-
-        // Extract the value part after "="
-        let after_eq = prefix.rsplit('=').next()?.trim();
-
-        // Must contain at least one dot
-        let first_dot = after_eq.find('.')?;
-        let candidate_binding = &after_eq[..first_dot];
-
-        // Validate binding name
-        if candidate_binding.is_empty()
-            || !candidate_binding
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '_')
-        {
-            return None;
-        }
-
-        // Check if this binding is a remote_state binding
-        let remote_bindings = self.extract_remote_state_bindings(text);
-        let state_path = remote_bindings
-            .iter()
-            .find(|(name, _)| name == candidate_binding)?
-            .1
-            .clone();
-
-        let after_first_dot = &after_eq[first_dot + 1..];
-
-        // Check for second dot: "remote_binding.resource."
-        if let Some(second_dot) = after_first_dot.find('.') {
-            let resource_binding = &after_first_dot[..second_dot];
-            if !resource_binding.is_empty()
-                && resource_binding
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || c == '_')
-            {
-                return Some(RemoteStateDotContext::SecondSegment {
-                    binding_name: candidate_binding.to_string(),
-                    resource_binding: resource_binding.to_string(),
-                    state_path,
-                });
-            }
-        }
-
-        // First dot only: "remote_binding."
-        Some(RemoteStateDotContext::FirstSegment {
-            binding_name: candidate_binding.to_string(),
-            state_path,
-        })
-    }
-
-    /// Load a remote state file and return its resource bindings.
-    /// Returns None if the file cannot be read or parsed.
-    fn load_remote_state_bindings(
-        &self,
-        state_path: &str,
-        base_path: Option<&Path>,
-    ) -> Option<HashMap<String, HashMap<String, String>>> {
-        let path = if Path::new(state_path).is_absolute() {
-            std::path::PathBuf::from(state_path)
-        } else {
-            base_path?.join(state_path)
-        };
-
-        let content = std::fs::read_to_string(&path).ok()?;
-        let state_file = carina_state::check_and_migrate(&content).ok()?;
-
-        // Build a map of binding_name -> { attr_name -> attr_display_value }
-        let mut result = HashMap::new();
-        for rs in &state_file.resources {
-            if let Some(ref binding) = rs.binding {
-                let attrs: HashMap<String, String> = rs
-                    .attributes
-                    .keys()
-                    .map(|k| (k.clone(), format!("{}.{}", rs.resource_type, k)))
-                    .collect();
-                result.insert(binding.clone(), attrs);
-            }
-        }
-
-        Some(result)
-    }
-
-    /// Provide completions for remote state bindings.
-    fn remote_state_completions(
-        &self,
-        ctx: &RemoteStateDotContext,
-        edit_range: Range,
-        base_path: Option<&Path>,
-    ) -> Vec<CompletionItem> {
-        match ctx {
-            RemoteStateDotContext::FirstSegment {
-                binding_name,
-                state_path,
-            } => {
-                let Some(remote_bindings) = self.load_remote_state_bindings(state_path, base_path)
-                else {
-                    return vec![];
-                };
-
-                remote_bindings
-                    .keys()
-                    .map(|resource_binding| {
-                        let full_ref = format!("{}.{}", binding_name, resource_binding);
-                        CompletionItem {
-                            label: full_ref.clone(),
-                            kind: Some(CompletionItemKind::MODULE),
-                            detail: Some(format!(
-                                "Remote state resource binding '{}'",
-                                resource_binding
-                            )),
-                            text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(
-                                TextEdit {
-                                    range: edit_range,
-                                    new_text: full_ref,
-                                },
-                            )),
-                            command: Some(Command {
-                                title: "Trigger Suggest".to_string(),
-                                command: "editor.action.triggerSuggest".to_string(),
-                                arguments: None,
-                            }),
-                            ..Default::default()
-                        }
-                    })
-                    .collect()
-            }
-            RemoteStateDotContext::SecondSegment {
-                binding_name,
-                resource_binding,
-                state_path,
-            } => {
-                let Some(remote_bindings) = self.load_remote_state_bindings(state_path, base_path)
-                else {
-                    return vec![];
-                };
-
-                let Some(attrs) = remote_bindings.get(resource_binding) else {
-                    return vec![];
-                };
-
-                attrs
-                    .keys()
-                    .map(|attr_name| {
-                        let full_ref =
-                            format!("{}.{}.{}", binding_name, resource_binding, attr_name);
-                        CompletionItem {
-                            label: full_ref.clone(),
-                            kind: Some(CompletionItemKind::FIELD),
-                            detail: Some(format!(
-                                "Attribute '{}' from remote resource '{}'",
-                                attr_name, resource_binding
-                            )),
-                            text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(
-                                TextEdit {
-                                    range: edit_range,
-                                    new_text: full_ref,
-                                },
-                            )),
-                            ..Default::default()
-                        }
-                    })
-                    .collect()
-            }
-        }
-    }
-
     /// Compute a text edit range covering the value prefix the user has already typed
     /// after the `=` sign. This allows resource reference completions like `igw.internet_gateway_id`
     /// to replace the already-typed prefix (e.g., `igw.`) instead of being appended after it.
@@ -745,6 +450,17 @@ impl CompletionProvider {
                 ..Default::default()
             },
         ]
+    }
+
+    pub(super) fn upstream_state_block_completions(&self) -> Vec<CompletionItem> {
+        vec![CompletionItem {
+            label: "source".to_string(),
+            kind: Some(CompletionItemKind::PROPERTY),
+            detail: Some("Path to the upstream project directory".to_string()),
+            insert_text: Some("source = \"$0\"".to_string()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            ..Default::default()
+        }]
     }
 
     pub(super) fn generic_value_completions(&self) -> Vec<CompletionItem> {

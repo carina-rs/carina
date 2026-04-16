@@ -59,6 +59,7 @@ impl CompletionProvider {
             CompletionContext::InsideResourceBlock { resource_type } => {
                 self.attribute_completions_for_type(&resource_type)
             }
+            CompletionContext::InsideUpstreamStateBlock => self.upstream_state_block_completions(),
             CompletionContext::InsideModuleCall { module_name } => {
                 self.module_parameter_completions(&module_name, &text, base_path)
             }
@@ -72,7 +73,6 @@ impl CompletionProvider {
                 &text,
                 current_binding.as_deref(),
                 position,
-                base_path,
             ),
             CompletionContext::InsideStructBlock {
                 resource_type,
@@ -146,6 +146,7 @@ impl CompletionProvider {
         let mut module_name: Option<String> = None;
         let mut provider_block_name: Option<String> = None;
         let mut in_args_or_attrs_block = false;
+        let mut in_upstream_state_block = false;
         // Track nested block names at each depth level (index 0 = depth 1, etc.)
         let mut nested_block_names: Vec<String> = Vec::new();
 
@@ -191,6 +192,13 @@ impl CompletionProvider {
                 resource_type.clear();
                 module_name = None;
             } else if brace_depth == 0
+                && trimmed.starts_with("upstream_state ")
+                && trimmed.ends_with('{')
+            {
+                in_upstream_state_block = true;
+                resource_type.clear();
+                module_name = None;
+            } else if brace_depth == 0
                 && trimmed.ends_with('{')
                 && !trimmed.starts_with("let ")
                 && !self.starts_with_provider_prefix(trimmed)
@@ -198,6 +206,7 @@ impl CompletionProvider {
                 && !trimmed.starts_with("arguments ")
                 && !trimmed.starts_with("attributes ")
                 && !trimmed.starts_with("exports ")
+                && !trimmed.starts_with("upstream_state ")
                 && !trimmed.starts_with('#')
             {
                 // This is a module call: "module_name {"
@@ -238,6 +247,7 @@ impl CompletionProvider {
                         module_name = None;
                         provider_block_name = None;
                         in_args_or_attrs_block = false;
+                        in_upstream_state_block = false;
                         nested_block_names.clear();
                     } else {
                         // Truncate to current depth
@@ -325,6 +335,9 @@ impl CompletionProvider {
 
         // Inside module call block
         if brace_depth > 0 {
+            if in_upstream_state_block {
+                return CompletionContext::InsideUpstreamStateBlock;
+            }
             if let Some(name) = module_name {
                 return CompletionContext::InsideModuleCall { module_name: name };
             }
@@ -543,6 +556,7 @@ enum CompletionContext {
     InsideResourceBlock {
         resource_type: String,
     },
+    InsideUpstreamStateBlock,
     InsideModuleCall {
         module_name: String,
     },
