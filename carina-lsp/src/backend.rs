@@ -186,12 +186,22 @@ impl Backend {
 
     /// Scan sibling .crn files for `let binding = provider.service.type {` patterns.
     /// Returns a map of binding_name → "provider.service.type" (schema key).
-    fn scan_sibling_bindings(dir: &Path, current_uri: &Url) -> HashMap<String, String> {
+    /// Scan sibling .crn files for let bindings and references.
+    ///
+    /// Returns:
+    /// - `bindings`: binding_name → resource_type for let bindings in sibling files
+    /// - `referenced`: binding names from the current file that are referenced by sibling files
+    fn scan_sibling_context(
+        dir: &Path,
+        current_uri: &Url,
+        current_bindings: &std::collections::HashSet<String>,
+    ) -> (HashMap<String, String>, std::collections::HashSet<String>) {
         let mut bindings = HashMap::new();
+        let mut referenced = std::collections::HashSet::new();
         let current_path = current_uri.to_file_path().ok();
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
-            Err(_) => return bindings,
+            Err(_) => return (bindings, referenced),
         };
         for entry in entries.flatten() {
             let path = entry.path();
@@ -216,10 +226,21 @@ impl Backend {
                             }
                         }
                     }
+
+                    // Check if this line references any binding from the current file
+                    // Look for "binding_name." patterns after "="
+                    if let Some(eq_pos) = trimmed.find('=') {
+                        let after_eq = trimmed[eq_pos + 1..].trim();
+                        for name in current_bindings.iter() {
+                            if after_eq.starts_with(&format!("{}.", name)) {
+                                referenced.insert(name.clone());
+                            }
+                        }
+                    }
                 }
             }
         }
-        bindings
+        (bindings, referenced)
     }
 
     async fn update_diagnostics(&self, uri: Url) {
@@ -229,10 +250,29 @@ impl Backend {
                 .ok()
                 .and_then(|p| p.parent().map(|p| p.to_path_buf()));
 
-            // Scan sibling files for binding→resource_type mapping
-            let sibling_bindings = base_path
+            // Extract current file's bindings for cross-file reference scanning
+            let current_bindings: std::collections::HashSet<String> = {
+                let text = doc.text();
+                let mut bindings = std::collections::HashSet::new();
+                for line in text.lines() {
+                    let trimmed = line.trim();
+                    if let Some(rest) = trimmed.strip_prefix("let ")
+                        && let Some(eq_pos) = rest.find('=')
+                    {
+                        let name = rest[..eq_pos].trim();
+                        if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                        {
+                            bindings.insert(name.to_string());
+                        }
+                    }
+                }
+                bindings
+            };
+
+            // Scan sibling files for bindings and references to this file's bindings
+            let (sibling_bindings, sibling_referenced) = base_path
                 .as_ref()
-                .map(|dir| Self::scan_sibling_bindings(dir, &uri))
+                .map(|dir| Self::scan_sibling_context(dir, &uri, &current_bindings))
                 .unwrap_or_default();
 
             let providers = self.providers.read().await;
@@ -240,10 +280,12 @@ impl Backend {
                 .as_ref()
                 .map(|p| providers.state_for_path(p))
                 .unwrap_or(&providers.empty);
-            let diagnostics =
-                state
-                    .diagnostic_engine
-                    .analyze(&doc, base_path.as_deref(), &sibling_bindings);
+            let diagnostics = state.diagnostic_engine.analyze(
+                &doc,
+                base_path.as_deref(),
+                &sibling_bindings,
+                &sibling_referenced,
+            );
             drop(providers);
 
             self.client

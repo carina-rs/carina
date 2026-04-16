@@ -4,7 +4,7 @@ mod validation;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -108,6 +108,7 @@ impl DiagnosticEngine {
         doc: &Document,
         base_path: Option<&Path>,
         sibling_bindings: &HashMap<String, String>,
+        sibling_referenced: &HashSet<String>,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
         let text = doc.text();
@@ -604,8 +605,13 @@ impl DiagnosticEngine {
             // Check exports blocks
             diagnostics.extend(self.check_exports_blocks(doc, parsed, None, sibling_bindings));
 
-            // Check for unused let bindings
-            diagnostics.extend(self.check_unused_bindings(doc, parsed));
+            // Check for unused let bindings (exclude bindings referenced by sibling files)
+            let unused_diags = self.check_unused_bindings(doc, parsed);
+            diagnostics.extend(unused_diags.into_iter().filter(|d| {
+                !sibling_referenced
+                    .iter()
+                    .any(|name| d.message.contains(&format!("'{}'", name)))
+            }));
 
             // Check for unknown attributes on resource references (typo detection)
             diagnostics.extend(self.check_resource_ref_attributes(
