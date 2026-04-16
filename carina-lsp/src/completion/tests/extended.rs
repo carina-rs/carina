@@ -1060,3 +1060,124 @@ fn union_struct_field_completions() {
         labels
     );
 }
+
+#[test]
+fn upstream_state_snippet_on_fresh_line_includes_let() {
+    let provider = test_provider();
+    let completions = provider.top_level_completions(
+        Position {
+            line: 0,
+            character: 0,
+        },
+        "",
+        None,
+    );
+    let item = find_completion(&completions, "upstream_state");
+    let snippet = item.insert_text.as_deref().unwrap_or("");
+    assert!(
+        snippet.starts_with("let "),
+        "On fresh line upstream_state should still insert full 'let ... = upstream_state {{...}}'. Got: {:?}",
+        snippet
+    );
+}
+
+#[test]
+fn upstream_state_snippet_after_let_binding_omits_let() {
+    // Bug #1930: typing `let orgs = u` then picking `upstream_state` produced
+    // `let orgs = let binding = upstream_state {...}`. The snippet must drop
+    // its leading `let ${1:binding} = ` when the line already has `let <name> =`.
+    let provider = test_provider();
+    let text = "let orgs = u";
+    let completions = provider.top_level_completions(
+        Position {
+            line: 0,
+            character: text.len() as u32,
+        },
+        text,
+        None,
+    );
+    let item = find_completion(&completions, "upstream_state");
+    let snippet = item.insert_text.as_deref().unwrap_or("");
+    assert!(
+        !snippet.contains("let "),
+        "After existing `let <name> =`, upstream_state snippet must not re-emit `let `. Got: {:?}",
+        snippet
+    );
+    assert!(
+        snippet.starts_with("upstream_state"),
+        "Snippet should start directly with `upstream_state`. Got: {:?}",
+        snippet
+    );
+}
+
+#[test]
+fn read_snippet_after_let_binding_omits_let() {
+    let provider = test_provider();
+    let text = "let b = r";
+    let completions = provider.top_level_completions(
+        Position {
+            line: 0,
+            character: text.len() as u32,
+        },
+        text,
+        None,
+    );
+    let item = find_completion(&completions, "read");
+    let snippet = item.insert_text.as_deref().unwrap_or("");
+    assert!(
+        !snippet.contains("let "),
+        "After existing `let <name> =`, read snippet must not re-emit `let `. Got: {:?}",
+        snippet
+    );
+    assert!(
+        snippet.starts_with("read "),
+        "Snippet should start directly with `read `. Got: {:?}",
+        snippet
+    );
+}
+
+#[test]
+fn let_import_snippet_after_let_binding_omits_let() {
+    let provider = test_provider();
+    let text = "let m = i";
+    let completions = provider.top_level_completions(
+        Position {
+            line: 0,
+            character: text.len() as u32,
+        },
+        text,
+        None,
+    );
+    let item = find_completion(&completions, "let import");
+    let snippet = item.insert_text.as_deref().unwrap_or("");
+    assert!(
+        !snippet.contains("let "),
+        "After existing `let <name> =`, `let import` snippet must not re-emit `let `. Got: {:?}",
+        snippet
+    );
+    assert!(
+        snippet.starts_with("import "),
+        "Snippet should start directly with `import `. Got: {:?}",
+        snippet
+    );
+}
+
+#[test]
+fn read_snippet_on_fresh_line_includes_let() {
+    let provider = test_provider();
+    let completions = provider.top_level_completions(
+        Position {
+            line: 0,
+            character: 0,
+        },
+        "",
+        None,
+    );
+    let item = find_completion(&completions, "read");
+    let snippet = item.insert_text.as_deref().unwrap_or("");
+    assert!(
+        snippet.starts_with("let "),
+        "On fresh line read snippet should still include `let ... = read ...`. Got: {:?}",
+        snippet
+    );
+}

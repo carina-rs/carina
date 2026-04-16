@@ -13,6 +13,16 @@ pub(super) fn create_document(content: &str) -> Document {
     Document::new(content.to_string(), Arc::new(ProviderContext::default()))
 }
 
+pub(super) fn find_completion<'a>(
+    completions: &'a [CompletionItem],
+    label: &str,
+) -> &'a CompletionItem {
+    completions
+        .iter()
+        .find(|c| c.label == label)
+        .unwrap_or_else(|| panic!("completion '{}' not found", label))
+}
+
 pub(super) fn test_provider() -> CompletionProvider {
     let factories: Vec<Box<dyn ProviderFactory>> = vec![];
     let schemas = Arc::new(carina_core::provider::collect_schemas(&factories));
