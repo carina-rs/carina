@@ -993,7 +993,9 @@ versioning_status =
     );
     // Should NOT have quoted string format
     assert!(
-        !completions.iter().any(|c| c.label == "\"Enabled\""),
+        !completions
+            .iter()
+            .any(|c| c.label == "\"Enabled\"" || c.label == "'Enabled'"),
         "Should not show quoted string format"
     );
 }

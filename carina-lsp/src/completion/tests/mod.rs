@@ -23,6 +23,24 @@ pub(super) fn find_completion<'a>(
         .unwrap_or_else(|| panic!("completion '{}' not found", label))
 }
 
+/// Assert that every item's label and insert_text are wrapped with `quote`.
+pub(super) fn assert_all_wrapped(items: &[CompletionItem], quote: char, kind: &str) {
+    assert!(!items.is_empty(), "Expected at least one {kind} completion");
+    for item in items {
+        assert!(
+            item.label.starts_with(quote) && item.label.ends_with(quote),
+            "{kind} completion label must be wrapped with `{quote}`. Got: {:?}",
+            item.label
+        );
+        let text = item.insert_text.as_deref().unwrap_or("");
+        assert!(
+            text.starts_with(quote) && text.ends_with(quote),
+            "{kind} completion insert_text must be wrapped with `{quote}`. Got: {:?}",
+            text
+        );
+    }
+}
+
 pub(super) fn test_provider() -> CompletionProvider {
     let factories: Vec<Box<dyn ProviderFactory>> = vec![];
     let schemas = Arc::new(carina_core::provider::collect_schemas(&factories));
