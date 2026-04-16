@@ -48,6 +48,26 @@ impl CompletionProvider {
             end: position,
         };
 
+        // Avoid emitting a duplicate `let` when the line already has `let <name> =`.
+        let after_let_binding =
+            line_idx < lines.len() && is_after_let_binding(lines[line_idx], prefix_start as usize);
+
+        let read_snippet = if after_let_binding {
+            "read ${1:aws.s3.bucket} {\n    name = \"${2:existing-resource}\"\n}"
+        } else {
+            "let ${1:name} = read ${2:aws.s3.bucket} {\n    name = \"${3:existing-resource}\"\n}"
+        };
+        let let_import_snippet = if after_let_binding {
+            "import \"${1:./modules/name}\""
+        } else {
+            "let ${1:module_name} = import \"${2:./modules/name}\""
+        };
+        let upstream_state_snippet = if after_let_binding {
+            "upstream_state {\n    source = \"${1:../other-project}\"\n}"
+        } else {
+            "let ${1:binding} = upstream_state {\n    source = \"${2:../other-project}\"\n}"
+        };
+
         let mut completions = vec![
             CompletionItem {
                 label: "provider".to_string(),
@@ -68,7 +88,7 @@ impl CompletionProvider {
             CompletionItem {
                 label: "read".to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
-                insert_text: Some("let ${1:name} = read ${2:aws.s3.bucket} {\n    name = \"${3:existing-resource}\"\n}".to_string()),
+                insert_text: Some(read_snippet.to_string()),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Read existing resource (data source)".to_string()),
                 ..Default::default()
@@ -108,7 +128,7 @@ impl CompletionProvider {
             CompletionItem {
                 label: "let import".to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
-                insert_text: Some("let ${1:module_name} = import \"${2:./modules/name}\"".to_string()),
+                insert_text: Some(let_import_snippet.to_string()),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Import a module".to_string()),
                 ..Default::default()
@@ -148,10 +168,7 @@ impl CompletionProvider {
             CompletionItem {
                 label: "upstream_state".to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
-                insert_text: Some(
-                    "let ${1:binding} = upstream_state {\n    source = \"${2:../other-project}\"\n}"
-                        .to_string(),
-                ),
+                insert_text: Some(upstream_state_snippet.to_string()),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Reference another project's exported state".to_string()),
                 ..Default::default()
@@ -518,5 +535,43 @@ impl CompletionProvider {
 
         completions.sort_by(|a, b| a.label.cmp(&b.label));
         completions
+    }
+}
+
+/// Return true when `line[..prefix_start]` already forms a `let <name> =` binding header.
+/// `prefix_start` is a char offset, converted to a byte offset for slicing.
+fn is_after_let_binding(line: &str, prefix_start: usize) -> bool {
+    let byte_end = line
+        .char_indices()
+        .nth(prefix_start)
+        .map(|(i, _)| i)
+        .unwrap_or(line.len());
+    let trimmed = line[..byte_end].trim_start();
+    let Some(rest) = trimmed.strip_prefix("let ") else {
+        return false;
+    };
+    let Some(eq_pos) = rest.find('=') else {
+        return false;
+    };
+    let name = rest[..eq_pos].trim();
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::is_after_let_binding;
+
+    #[test]
+    fn detects_after_let_binding() {
+        assert!(is_after_let_binding("let orgs = u", 11));
+        assert!(is_after_let_binding("let orgs =u", 10));
+        assert!(is_after_let_binding("  let x = ", 10));
+    }
+
+    #[test]
+    fn rejects_plain_top_level() {
+        assert!(!is_after_let_binding("u", 1));
+        assert!(!is_after_let_binding("let ", 4));
+        assert!(!is_after_let_binding("let orgs", 8));
     }
 }
