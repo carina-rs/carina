@@ -91,6 +91,9 @@ impl CompletionProvider {
             CompletionContext::InsideImportPath { partial_path } => {
                 self.import_path_completions(&partial_path, base_path)
             }
+            CompletionContext::InsideUpstreamStateSource { partial_path } => {
+                self.upstream_state_source_completions(&partial_path, base_path)
+            }
             CompletionContext::None => vec![],
         }
     }
@@ -311,6 +314,16 @@ impl CompletionProvider {
             }
             return CompletionContext::InsideProviderBlock {
                 provider_name: pname.clone(),
+            };
+        }
+
+        // Check if cursor is inside `source = '...'` within an upstream_state block
+        if in_upstream_state_block
+            && brace_depth > 0
+            && let Some(partial) = extract_upstream_source_partial(&prefix)
+        {
+            return CompletionContext::InsideUpstreamStateSource {
+                partial_path: partial,
             };
         }
 
@@ -580,6 +593,9 @@ enum CompletionContext {
     InsideImportPath {
         partial_path: String,
     },
+    InsideUpstreamStateSource {
+        partial_path: String,
+    },
     None,
 }
 
@@ -604,4 +620,17 @@ fn is_let_upstream_state_line(trimmed: &str) -> bool {
     // longer identifier like `upstream_states`.
     let next = rest.trim_start();
     next.starts_with('{') || next.is_empty()
+}
+
+/// If `prefix` ends with `source = '<partial>` (unclosed single quote), return
+/// `<partial>`. Otherwise return `None`.
+fn extract_upstream_source_partial(prefix: &str) -> Option<String> {
+    let trimmed = prefix.trim_start();
+    let rest = trimmed.strip_prefix("source")?;
+    let rest = rest.trim_start().strip_prefix('=')?.trim_start();
+    let rest = rest.strip_prefix('\'')?;
+    if rest.contains('\'') {
+        return None;
+    }
+    Some(rest.to_string())
 }
