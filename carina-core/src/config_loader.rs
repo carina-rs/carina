@@ -49,7 +49,7 @@ pub fn load_configuration_with_config(
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
-            remote_states: vec![],
+            upstream_states: vec![],
             requires: vec![],
             structural_bindings: HashSet::new(),
             warnings: vec![],
@@ -102,8 +102,8 @@ pub fn load_configuration_with_config(
                         .user_functions
                         .extend(unresolved.user_functions);
                     unresolved_merged
-                        .remote_states
-                        .extend(unresolved.remote_states);
+                        .upstream_states
+                        .extend(unresolved.upstream_states);
                     unresolved_merged
                         .structural_bindings
                         .extend(unresolved.structural_bindings);
@@ -123,7 +123,7 @@ pub fn load_configuration_with_config(
                     merged.export_params.extend(parsed.export_params);
                     merged.state_blocks.extend(parsed.state_blocks);
                     merged.user_functions.extend(parsed.user_functions);
-                    merged.remote_states.extend(parsed.remote_states);
+                    merged.upstream_states.extend(parsed.upstream_states);
                     merged.requires.extend(parsed.requires);
                     merged
                         .structural_bindings
@@ -165,8 +165,8 @@ pub fn load_configuration_with_config(
         }
 
         // Upgrade cross-file warnings: a for-expression in one file may reference
-        // a remote_state defined in another file.  During per-file parsing the
-        // remote_state is unknown, so the warning falls back to the generic
+        // an upstream_state defined in another file.  During per-file parsing the
+        // upstream_state is unknown, so the warning falls back to the generic
         // "(known after apply)".  Now that all files are merged we can detect
         // these and rewrite to an upstream-aware message.
         upgrade_cross_file_warnings(&mut merged, &unresolved_merged);
@@ -182,7 +182,7 @@ pub fn load_configuration_with_config(
 }
 
 /// Upgrade generic "(known after apply)" warnings to upstream-aware messages
-/// when the binding matches a remote_state found in a different file.
+/// when the binding matches an upstream_state found in a different file.
 fn upgrade_cross_file_warnings(merged: &mut ParsedFile, unresolved: &ParsedFile) {
     let suffix = " is not yet available (known after apply)";
     for warning in &mut merged.warnings {
@@ -202,20 +202,20 @@ fn upgrade_cross_file_warnings(merged: &mut ParsedFile, unresolved: &ParsedFile)
             Some(b) => b,
             None => continue,
         };
-        // Check against merged remote_states (includes all files)
-        let remote_states = merged
-            .remote_states
+        // Check against merged upstream_states (includes all files)
+        let upstream_states = merged
+            .upstream_states
             .iter()
-            .chain(unresolved.remote_states.iter());
-        if let Some(rs) = remote_states
+            .chain(unresolved.upstream_states.iter());
+        if let Some(us) = upstream_states
             .into_iter()
-            .find(|r| r.binding == binding_name)
+            .find(|u| u.binding == binding_name)
         {
             let new_msg = format!(
-                "`{}` is not yet in the upstream state (remote_state '{}' → {}).\n    Apply that directory first, then re-plan.",
+                "`{}` is not yet in the upstream state (upstream_state '{}' → {}).\n    Apply that directory first, then re-plan.",
                 path_str,
                 binding_name,
-                rs.backend.location(),
+                us.source.display(),
             );
             warning.message = new_msg;
         }
@@ -285,7 +285,7 @@ fn merge_parsed_file(target: &mut ParsedFile, source: ParsedFile) {
     target.export_params.extend(source.export_params);
     target.state_blocks.extend(source.state_blocks);
     target.user_functions.extend(source.user_functions);
-    target.remote_states.extend(source.remote_states);
+    target.upstream_states.extend(source.upstream_states);
     target.requires.extend(source.requires);
     target
         .structural_bindings

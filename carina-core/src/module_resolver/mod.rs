@@ -198,7 +198,7 @@ impl<'cfg> ModuleResolver<'cfg> {
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
-            remote_states: vec![],
+            upstream_states: vec![],
             requires: vec![],
             structural_bindings: HashSet::new(),
             warnings: vec![],
@@ -229,7 +229,7 @@ impl<'cfg> ModuleResolver<'cfg> {
             merged.attribute_params.extend(parsed.attribute_params);
             merged.export_params.extend(parsed.export_params);
             merged.user_functions.extend(parsed.user_functions);
-            merged.remote_states.extend(parsed.remote_states);
+            merged.upstream_states.extend(parsed.upstream_states);
             merged.requires.extend(parsed.requires);
             merged
                 .structural_bindings
@@ -818,7 +818,7 @@ pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
         backend: None,
         state_blocks: vec![],
         user_functions: HashMap::new(),
-        remote_states: vec![],
+        upstream_states: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
         warnings: vec![],
@@ -840,7 +840,7 @@ pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
             merged.attribute_params.extend(parsed.attribute_params);
             merged.export_params.extend(parsed.export_params);
             merged.user_functions.extend(parsed.user_functions);
-            merged.remote_states.extend(parsed.remote_states);
+            merged.upstream_states.extend(parsed.upstream_states);
             merged.requires.extend(parsed.requires);
             merged
                 .structural_bindings
@@ -912,7 +912,7 @@ pub fn load_module_from_directory(dir: &Path) -> Result<ParsedFile, String> {
         backend: None,
         state_blocks: vec![],
         user_functions: HashMap::new(),
-        remote_states: vec![],
+        upstream_states: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
         warnings: vec![],
@@ -939,7 +939,7 @@ pub fn load_module_from_directory(dir: &Path) -> Result<ParsedFile, String> {
             merged.attribute_params.extend(parsed.attribute_params);
             merged.export_params.extend(parsed.export_params);
             merged.user_functions.extend(parsed.user_functions);
-            merged.remote_states.extend(parsed.remote_states);
+            merged.upstream_states.extend(parsed.upstream_states);
             merged.requires.extend(parsed.requires);
             merged
                 .structural_bindings
@@ -1009,7 +1009,7 @@ mod tests {
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
-            remote_states: vec![],
+            upstream_states: vec![],
             requires: vec![],
             structural_bindings: HashSet::new(),
             warnings: vec![],
@@ -1145,7 +1145,7 @@ mod tests {
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
-            remote_states: vec![],
+            upstream_states: vec![],
             requires: vec![],
             structural_bindings: HashSet::new(),
             warnings: vec![],
@@ -1272,7 +1272,7 @@ mod tests {
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
-            remote_states: vec![],
+            upstream_states: vec![],
             requires: vec![],
             structural_bindings: HashSet::new(),
             warnings: vec![],
@@ -1622,7 +1622,7 @@ mod tests {
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
-            remote_states: vec![],
+            upstream_states: vec![],
             requires: vec![],
             structural_bindings: HashSet::new(),
             warnings: vec![],
@@ -1909,7 +1909,7 @@ mod tests {
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
-            remote_states: vec![],
+            upstream_states: vec![],
             requires: vec![],
             structural_bindings: HashSet::new(),
             warnings: vec![],
@@ -2081,7 +2081,7 @@ mod tests {
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
-            remote_states: vec![],
+            upstream_states: vec![],
             requires: vec![],
             structural_bindings: HashSet::new(),
             warnings: vec![],
@@ -2146,7 +2146,7 @@ mod tests {
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
-            remote_states: vec![],
+            upstream_states: vec![],
             requires: vec![],
             structural_bindings: HashSet::new(),
             warnings: vec![],
@@ -2226,7 +2226,7 @@ mod tests {
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
-            remote_states: vec![],
+            upstream_states: vec![],
             requires: vec![RequireBlock {
                 // !enable_https || cert_arn != null
                 condition: ValidateExpr::Or(
@@ -2299,7 +2299,7 @@ mod tests {
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
-            remote_states: vec![],
+            upstream_states: vec![],
             requires: vec![RequireBlock {
                 // !enable_https || has_cert
                 condition: ValidateExpr::Or(
@@ -2363,7 +2363,7 @@ mod tests {
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
-            remote_states: vec![],
+            upstream_states: vec![],
             requires: vec![RequireBlock {
                 // len(subnet_ids) >= 2
                 condition: ValidateExpr::Compare {
@@ -2458,7 +2458,7 @@ mod tests {
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
-            remote_states: vec![],
+            upstream_states: vec![],
             requires: vec![RequireBlock {
                 // min_size <= max_size
                 condition: ValidateExpr::Compare {

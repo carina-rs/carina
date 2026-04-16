@@ -1,11 +1,11 @@
-# Test deferred for-expression: remote_state iterable not yet available
+# Test deferred for-expression: upstream_state iterable not yet available
 
 provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let orgs = remote_state {
-  path = '../organizations/carina.state.json'
+upstream_state "orgs" {
+  source = "../organizations"
 }
 
 let sso_instance_arn = 'arn:aws:sso:::instance/ssoins-12345'

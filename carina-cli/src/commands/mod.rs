@@ -194,9 +194,9 @@ pub fn validate_and_resolve_with_config(
         validate_resources_with_ctx(&ctx, &parsed.resources)?;
         let mut argument_names: HashSet<String> =
             parsed.arguments.iter().map(|a| a.name.clone()).collect();
-        // Remote state bindings are resolved at plan time, skip type validation
-        for rs in &parsed.remote_states {
-            argument_names.insert(rs.binding.clone());
+        // Upstream state bindings are resolved at plan time, skip type validation
+        for us in &parsed.upstream_states {
+            argument_names.insert(us.binding.clone());
         }
         validate_resource_ref_types_with_ctx(&ctx, &parsed.resources, &argument_names)?;
         validate_attribute_param_ref_types_with_ctx(
@@ -344,7 +344,7 @@ mod tests {
             backend: None,
             state_blocks: vec![],
             user_functions: HashMap::new(),
-            remote_states: vec![],
+            upstream_states: vec![],
             requires: vec![],
             structural_bindings: HashSet::new(),
             warnings: vec![],
