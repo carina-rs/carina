@@ -1370,6 +1370,24 @@ async fn run_apply_locked(
             return Ok(());
         }
 
+        print_plan(
+            &plan,
+            DetailLevel::Full,
+            &HashMap::new(),
+            Some(ctx.schemas()),
+            &HashMap::new(),
+            &export_changes,
+            &parsed.deferred_for_expressions,
+        );
+
+        let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+        let interrupt = async {
+            let _ = tokio::signal::ctrl_c().await;
+        };
+        if confirm_apply(stdin, interrupt, auto_approve).await? == ApplyConfirmation::Cancelled {
+            return Ok(());
+        }
+
         println!(
             "{}",
             format!(
@@ -1423,33 +1441,12 @@ async fn run_apply_locked(
         &parsed.deferred_for_expressions,
     );
 
-    // Confirmation prompt
-    if !auto_approve {
-        println!(
-            "{}",
-            "Do you want to perform these actions?".yellow().bold()
-        );
-        println!(
-            "  {}",
-            "Carina will perform the actions described above. Type 'yes' to confirm.".yellow()
-        );
-        print!("\n  Enter a value: ");
-        std::io::Write::flush(&mut std::io::stdout()).map_err(|e| e.to_string())?;
-
-        let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-        let interrupt = async {
-            let _ = tokio::signal::ctrl_c().await;
-        };
-        let read_result = crate::signal::read_line_with_interrupt(stdin, interrupt).await;
-        emit_newline_on_interrupt(&mut std::io::stdout(), &read_result);
-        let input = read_result?;
-
-        if input.trim() != "yes" {
-            println!();
-            println!("{}", "Apply cancelled.".yellow());
-            return Ok(());
-        }
-        println!();
+    let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+    let interrupt = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    if confirm_apply(stdin, interrupt, auto_approve).await? == ApplyConfirmation::Cancelled {
+        return Ok(());
     }
 
     println!("{}", "Applying changes...".cyan().bold());
@@ -1729,33 +1726,12 @@ async fn run_apply_from_plan_locked(
         &[],
     );
 
-    // Confirmation prompt
-    if !auto_approve {
-        println!(
-            "{}",
-            "Do you want to perform these actions?".yellow().bold()
-        );
-        println!(
-            "  {}",
-            "Carina will perform the actions described above. Type 'yes' to confirm.".yellow()
-        );
-        print!("\n  Enter a value: ");
-        std::io::Write::flush(&mut std::io::stdout()).map_err(|e| e.to_string())?;
-
-        let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-        let interrupt = async {
-            let _ = tokio::signal::ctrl_c().await;
-        };
-        let read_result = crate::signal::read_line_with_interrupt(stdin, interrupt).await;
-        emit_newline_on_interrupt(&mut std::io::stdout(), &read_result);
-        let input = read_result?;
-
-        if input.trim() != "yes" {
-            println!();
-            println!("{}", "Apply cancelled.".yellow());
-            return Ok(());
-        }
-        println!();
+    let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+    let interrupt = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    if confirm_apply(stdin, interrupt, auto_approve).await? == ApplyConfirmation::Cancelled {
+        return Ok(());
     }
 
     // Build initial binding map for reference resolution
@@ -1848,6 +1824,52 @@ fn emit_newline_on_interrupt<W: std::io::Write>(writer: &mut W, result: &Result<
     if matches!(result, Err(AppError::Interrupted)) {
         let _ = writeln!(writer);
         let _ = writer.flush();
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ApplyConfirmation {
+    Confirmed,
+    Cancelled,
+}
+
+/// Prompt the user to confirm an apply. Shared between the resource-change and
+/// export-only paths so both use identical wording and behavior.
+pub(crate) async fn confirm_apply<R, F>(
+    reader: R,
+    interrupt: F,
+    auto_approve: bool,
+) -> Result<ApplyConfirmation, AppError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    F: std::future::Future<Output = ()>,
+{
+    if auto_approve {
+        return Ok(ApplyConfirmation::Confirmed);
+    }
+
+    println!(
+        "{}",
+        "Do you want to perform these actions?".yellow().bold()
+    );
+    println!(
+        "  {}",
+        "Carina will perform the actions described above. Type 'yes' to confirm.".yellow()
+    );
+    print!("\n  Enter a value: ");
+    std::io::Write::flush(&mut std::io::stdout()).map_err(|e| e.to_string())?;
+
+    let read_result = crate::signal::read_line_with_interrupt(reader, interrupt).await;
+    emit_newline_on_interrupt(&mut std::io::stdout(), &read_result);
+    let input = read_result?;
+
+    if input.trim() != "yes" {
+        println!();
+        println!("{}", "Apply cancelled.".yellow());
+        Ok(ApplyConfirmation::Cancelled)
+    } else {
+        println!();
+        Ok(ApplyConfirmation::Confirmed)
     }
 }
 
@@ -2363,5 +2385,57 @@ mod tests {
         let result: Result<String, AppError> = Err(AppError::Config("boom".to_string()));
         emit_newline_on_interrupt(&mut buf, &result);
         assert!(buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn confirm_apply_returns_confirmed_on_yes() {
+        let input = &b"yes\n"[..];
+        let interrupt = std::future::pending::<()>();
+        let outcome = confirm_apply(input, interrupt, false).await.unwrap();
+        assert_eq!(outcome, ApplyConfirmation::Confirmed);
+    }
+
+    #[tokio::test]
+    async fn confirm_apply_returns_cancelled_on_no() {
+        let input = &b"no\n"[..];
+        let interrupt = std::future::pending::<()>();
+        let outcome = confirm_apply(input, interrupt, false).await.unwrap();
+        assert_eq!(outcome, ApplyConfirmation::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn confirm_apply_returns_cancelled_on_empty_input() {
+        let input = &b"\n"[..];
+        let interrupt = std::future::pending::<()>();
+        let outcome = confirm_apply(input, interrupt, false).await.unwrap();
+        assert_eq!(outcome, ApplyConfirmation::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn confirm_apply_auto_approve_skips_read() {
+        // Reader would hang forever; auto_approve must short-circuit without reading.
+        let input = tokio::io::BufReader::new(tokio::io::empty());
+        let interrupt = std::future::pending::<()>();
+        let outcome = confirm_apply(input, interrupt, true).await.unwrap();
+        assert_eq!(outcome, ApplyConfirmation::Confirmed);
+    }
+
+    #[tokio::test]
+    async fn confirm_apply_propagates_interrupt() {
+        // A reader that never resolves, to force the interrupt path.
+        struct NeverReady;
+        impl tokio::io::AsyncRead for NeverReady {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Pending
+            }
+        }
+        let reader = tokio::io::BufReader::new(NeverReady);
+        let interrupt = async {};
+        let err = confirm_apply(reader, interrupt, false).await.unwrap_err();
+        assert!(matches!(err, AppError::Interrupted));
     }
 }
