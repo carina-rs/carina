@@ -327,6 +327,19 @@ fn collect_ref_type_errors(
                 );
             }
         }
+        (TypeExpr::Map(inner), Value::Map(map)) => {
+            for value in map.values() {
+                collect_ref_type_errors(
+                    inner,
+                    value,
+                    param_name,
+                    binding_map,
+                    schemas,
+                    schema_key_fn,
+                    errors,
+                );
+            }
+        }
         _ => {}
     }
 }
@@ -1884,5 +1897,103 @@ let vpc = awscc.ec2.vpc {
             &TypeExpr::Simple("aws_account_id".to_string()),
             &AttributeType::String,
         ));
+    }
+
+    #[test]
+    fn validate_export_param_ref_types_map_accepts_compatible_types() {
+        use crate::parser::ExportParameter;
+
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "organizations.account".to_string(),
+            make_schema(
+                "organizations.account",
+                vec![("account_id", AttributeType::String)],
+            ),
+        );
+
+        let registry_prod = Resource::with_provider("awscc", "organizations.account", "prod")
+            .with_binding("registry_prod")
+            .with_attribute("account_id", Value::String("111".to_string()));
+
+        let mut map_value = HashMap::new();
+        map_value.insert(
+            "prod".to_string(),
+            Value::resource_ref(
+                "registry_prod".to_string(),
+                "account_id".to_string(),
+                vec![],
+            ),
+        );
+
+        let exports = vec![ExportParameter {
+            name: "accounts".to_string(),
+            // declared as map(string), and values are String-typed — should pass
+            type_expr: Some(TypeExpr::Map(Box::new(TypeExpr::String))),
+            value: Some(Value::Map(map_value)),
+        }];
+
+        let result = validate_export_param_ref_types(
+            &exports,
+            &[registry_prod],
+            &schemas,
+            &test_schema_key_fn,
+        );
+        assert!(
+            result.is_ok(),
+            "map(string) = {{ prod = registry_prod.account_id (String) }} should pass, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn validate_export_param_ref_types_map_rejects_type_mismatch() {
+        use crate::parser::ExportParameter;
+
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "organizations.account".to_string(),
+            make_schema(
+                "organizations.account",
+                vec![("account_id", AttributeType::String)],
+            ),
+        );
+
+        let registry_prod = Resource::with_provider("awscc", "organizations.account", "prod")
+            .with_binding("registry_prod")
+            .with_attribute("account_id", Value::String("111".to_string()));
+
+        let mut map_value = HashMap::new();
+        map_value.insert(
+            "prod".to_string(),
+            Value::resource_ref(
+                "registry_prod".to_string(),
+                "account_id".to_string(),
+                vec![],
+            ),
+        );
+
+        let exports = vec![ExportParameter {
+            name: "accounts".to_string(),
+            // declared as map(bool) — values should be rejected as they are strings
+            type_expr: Some(TypeExpr::Map(Box::new(TypeExpr::Bool))),
+            value: Some(Value::Map(map_value)),
+        }];
+
+        let result = validate_export_param_ref_types(
+            &exports,
+            &[registry_prod],
+            &schemas,
+            &test_schema_key_fn,
+        );
+        assert!(
+            result.is_err(),
+            "map(bool) = {{ prod = registry_prod.account_id }} (String) should be flagged as type mismatch"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("accounts") && err.contains("type mismatch"),
+            "error should mention the export name and type mismatch, got: {err}"
+        );
     }
 }
