@@ -10,12 +10,13 @@ missing=0
 
 for dir in "$FIXTURES_DIR"/*/; do
     name="$(basename "$dir")"
-    if ! grep -q "$FIXTURES_DIR/$name\b\|/\$name " "$MAKEFILE" 2>/dev/null; then
-        # Check if the directory name appears in any FIXTURES-relative path in the Makefile
-        if ! grep -q "/$name " "$MAKEFILE" 2>/dev/null && ! grep -q "/$name && " "$MAKEFILE" 2>/dev/null; then
-            echo "MISSING: fixture directory '$name' has no corresponding Makefile target"
-            missing=$((missing + 1))
-        fi
+    # Match `$(PLAN_FIXTURE) <name>` (current invocation format) or legacy
+    # path-based invocations like `.../$name ` or `.../$name && `.
+    if ! grep -qE "\\\$\\(PLAN_FIXTURE\\) $name(\$|[[:space:]])" "$MAKEFILE" 2>/dev/null \
+        && ! grep -q "/$name " "$MAKEFILE" 2>/dev/null \
+        && ! grep -q "/$name && " "$MAKEFILE" 2>/dev/null; then
+        echo "MISSING: fixture directory '$name' has no corresponding Makefile target"
+        missing=$((missing + 1))
     fi
 done
 
