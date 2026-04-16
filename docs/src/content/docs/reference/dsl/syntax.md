@@ -260,29 +260,21 @@ removed {
 }
 ```
 
-## Remote State
+## Upstream State
 
-Reference resources managed by another Carina project:
+Reference values exported by another Carina project:
 
 ```crn
-let network = remote_state {
-  path = 'network.state.json'
+upstream_state "network" {
+  source = "../network"
 }
 
 awscc.ec2.security_group {
-  vpc_id = network.vpc.vpc_id
+  vpc_id = network.vpc_id
 }
 ```
 
-Remote state with an S3 backend:
-
-```crn
-let network = remote_state 's3' {
-  bucket = 'my-state-bucket'
-  key    = 'network/carina.state.json'
-  region = 'ap-northeast-1'
-}
-```
+`source` is required and points at the upstream project's directory. The path is resolved relative to the enclosing `.crn` file's directory. Carina loads the upstream's configuration, resolves its backend, reads its state, and exposes the values published by its `exports` block through the declared binding.
 
 ## Comments
 

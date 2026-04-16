@@ -144,12 +144,9 @@ let vpc = awscc.ec2.vpc {
 
 # Module import binding
 let network = import './modules/network'
-
-# Remote state binding
-let shared = remote_state {
-  path = 'shared.state.json'
-}
 ```
+
+Upstream state is declared at the top level with the `upstream_state` block rather than through `let`. See [Upstream State](/reference/dsl/syntax/#upstream-state) for details.
 
 Use `let _ =` (the discard pattern) when you need to evaluate an expression but do not need to reference the result. See [Syntax: Discard Pattern](/reference/dsl/syntax/#discard-pattern) for details.
 
