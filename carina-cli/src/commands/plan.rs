@@ -677,55 +677,22 @@ fn check_ref_against_upstream(
     location: &str,
     errors: &mut Vec<String>,
 ) {
-    match value {
-        Value::ResourceRef { path } => {
-            let binding = path.binding();
-            let field = path.attribute();
-            let Some(exports) = remote_bindings.get(binding) else {
-                return;
-            };
-            if !exports.contains_key(field) {
-                let known: Vec<&str> = exports.keys().map(String::as_str).collect();
-                let suggestion = carina_core::schema::suggest_similar_name(field, &known)
-                    .map(|s| format!(" Did you mean `{}`?", s))
-                    .unwrap_or_default();
-                errors.push(format!(
-                    "{location}: upstream_state `{binding}` does not export `{field}`.{suggestion}"
-                ));
-            }
+    value.visit_refs(&mut |path| {
+        let binding = path.binding();
+        let field = path.attribute();
+        let Some(exports) = remote_bindings.get(binding) else {
+            return;
+        };
+        if !exports.contains_key(field) {
+            let known: Vec<&str> = exports.keys().map(String::as_str).collect();
+            let suggestion = carina_core::schema::suggest_similar_name(field, &known)
+                .map(|s| format!(" Did you mean `{}`?", s))
+                .unwrap_or_default();
+            errors.push(format!(
+                "{location}: upstream_state `{binding}` does not export `{field}`.{suggestion}"
+            ));
         }
-        Value::List(items) => {
-            for v in items {
-                check_ref_against_upstream(v, remote_bindings, location, errors);
-            }
-        }
-        Value::Map(map) => {
-            for v in map.values() {
-                check_ref_against_upstream(v, remote_bindings, location, errors);
-            }
-        }
-        Value::Interpolation(parts) => {
-            for part in parts {
-                if let carina_core::resource::InterpolationPart::Expr(v) = part {
-                    check_ref_against_upstream(v, remote_bindings, location, errors);
-                }
-            }
-        }
-        Value::FunctionCall { args, .. } => {
-            for arg in args {
-                check_ref_against_upstream(arg, remote_bindings, location, errors);
-            }
-        }
-        Value::Secret(inner) => {
-            check_ref_against_upstream(inner, remote_bindings, location, errors);
-        }
-        Value::Closure { captured_args, .. } => {
-            for arg in captured_args {
-                check_ref_against_upstream(arg, remote_bindings, location, errors);
-            }
-        }
-        Value::String(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_) => {}
-    }
+    });
 }
 
 #[cfg(test)]
