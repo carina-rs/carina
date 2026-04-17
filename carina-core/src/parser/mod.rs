@@ -983,7 +983,6 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
         &attribute_params,
         &module_calls,
         &export_params,
-        &ctx.deferred_for_expressions,
     )?;
 
     Ok(ParsedFile {
@@ -4110,13 +4109,17 @@ fn collect_known_bindings<'ctx>(
 }
 
 /// Reject references whose root identifier is not declared anywhere in scope.
+///
+/// Note: deferred for-expression iterables are not checked here. They may name
+/// bindings declared in sibling files (e.g. an `upstream_state` in `backend.crn`
+/// iterated from `main.crn`) that only become visible after directory-wide
+/// merging. That check runs in `check_deferred_for_iterables` instead.
 fn check_undefined_bindings(
     known: &std::collections::HashSet<&str>,
     resources: &[Resource],
     attribute_params: &[AttributeParameter],
     module_calls: &[ModuleCall],
     export_params: &[ExportParameter],
-    deferred_for_expressions: &[DeferredForExpression],
 ) -> Result<(), ParseError> {
     for resource in resources {
         for expr in resource.attributes.values() {
@@ -4136,14 +4139,6 @@ fn check_undefined_bindings(
     for export in export_params {
         if let Some(value) = &export.value {
             check_undefined_in_value(known, value)?;
-        }
-    }
-    for deferred in deferred_for_expressions {
-        if !known.contains(deferred.iterable_binding.as_str()) {
-            return Err(ParseError::UndefinedIdentifier {
-                name: deferred.iterable_binding.clone(),
-                line: deferred.line,
-            });
         }
     }
     Ok(())
@@ -4353,6 +4348,38 @@ pub fn resolve_resource_refs_with_config(
         }
     }
 
+    Ok(())
+}
+
+/// Verify that every deferred for-expression iterable names a declared binding.
+///
+/// This must run on a fully merged `ParsedFile` (directory-wide), not on a
+/// single-file parse — iterables commonly reference `upstream_state` or `let`
+/// bindings declared in sibling files that only become visible after merging.
+pub(crate) fn check_deferred_for_iterables(parsed: &ParsedFile) -> Result<(), ParseError> {
+    let mut known: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    known.extend(parsed.resources.iter().filter_map(|r| r.binding.as_deref()));
+    known.extend(parsed.arguments.iter().map(|a| a.name.as_str()));
+    known.extend(
+        parsed
+            .module_calls
+            .iter()
+            .filter_map(|c| c.binding_name.as_deref()),
+    );
+    known.extend(parsed.upstream_states.iter().map(|u| u.binding.as_str()));
+    known.extend(parsed.imports.iter().map(|i| i.alias.as_str()));
+    known.extend(parsed.user_functions.keys().map(String::as_str));
+    known.extend(parsed.variables.keys().map(String::as_str));
+    known.extend(parsed.structural_bindings.iter().map(String::as_str));
+
+    for deferred in &parsed.deferred_for_expressions {
+        if !known.contains(deferred.iterable_binding.as_str()) {
+            return Err(ParseError::UndefinedIdentifier {
+                name: deferred.iterable_binding.clone(),
+                line: deferred.line,
+            });
+        }
+    }
     Ok(())
 }
 
@@ -10736,7 +10763,13 @@ awscc.ec2.vpc {
                 }
             }
         "#;
-        let err = parse(input, &ProviderContext::default())
+        // Iterable-binding validation runs in `check_deferred_for_iterables`
+        // on the merged directory-level `ParsedFile`, so that cross-file
+        // `upstream_state` bindings in sibling files aren't rejected during
+        // per-file parsing.
+        let parsed = parse(input, &ProviderContext::default())
+            .expect("single-file parse must not reject cross-file iterables");
+        let err = check_deferred_for_iterables(&parsed)
             .expect_err("undefined `orgs` must be a hard error");
         match err {
             ParseError::UndefinedIdentifier { name, .. } => {
