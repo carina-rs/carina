@@ -1318,3 +1318,87 @@ fn upstream_state_source_matches_partial_prefix() {
         labels
     );
 }
+
+// Regression tests for #1947: top-level snippets must use single quotes.
+// The old snippets used double quotes, which meant the upstream_state
+// directory completion path (which only looks for `source = '...'`) never
+// fired on a freshly inserted snippet.
+
+fn top_level_snippet(text: &str, label: &str) -> String {
+    let provider = test_provider();
+    let completions = provider.top_level_completions(
+        Position {
+            line: 0,
+            character: text.len() as u32,
+        },
+        text,
+        None,
+    );
+    find_completion(&completions, label)
+        .insert_text
+        .clone()
+        .unwrap_or_default()
+}
+
+#[test]
+fn top_level_snippets_use_single_quotes() {
+    let cases = [
+        ("", "upstream_state"),
+        ("let orgs = u", "upstream_state"),
+        ("", "let import"),
+        ("let m = i", "let import"),
+        ("", "import"),
+        ("", "removed"),
+        ("", "moved"),
+    ];
+    for (context, label) in cases {
+        let snippet = top_level_snippet(context, label);
+        assert!(
+            !snippet.contains('"'),
+            "{label} snippet (context={context:?}) must not contain double quotes. Got: {snippet:?}"
+        );
+    }
+}
+
+#[test]
+fn upstream_state_snippet_quotes_source_value() {
+    for context in ["", "let orgs = u"] {
+        let snippet = top_level_snippet(context, "upstream_state");
+        assert!(
+            snippet.contains("source = '"),
+            "upstream_state snippet (context={context:?}) must wrap `source` value in single quotes. Got: {snippet:?}"
+        );
+    }
+}
+
+#[test]
+fn upstream_state_source_suggestions_work_with_double_quotes() {
+    // #1947 (2): existing files may contain `source = "..."`. The directory
+    // completion should fire regardless of quote style.
+    use std::fs;
+    use tempfile::tempdir;
+
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join("envs/prod")).unwrap();
+    fs::create_dir_all(root.join("envs/staging")).unwrap();
+    fs::write(root.join("envs/prod/main.crn"), "").unwrap();
+    fs::write(root.join("envs/staging/main.crn"), "").unwrap();
+
+    let provider = test_provider();
+    let source = "let orgs = upstream_state {\n    source = \"";
+    let doc = create_document(source);
+    let position = Position {
+        line: 1,
+        character: 14,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&root.join("envs/prod")));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"'../staging'"),
+        "Double-quoted source = \"... should still offer directory suggestions. Got: {:?}",
+        labels
+    );
+}
