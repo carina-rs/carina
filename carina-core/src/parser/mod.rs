@@ -40,6 +40,11 @@ pub enum ParseError {
     #[error("Duplicate binding at line {line}: {name}")]
     DuplicateBinding { name: String, line: usize },
 
+    #[error(
+        "Undefined identifier `{name}`: no `let`, `upstream_state`, `read`, module import, or function binding with that name is in scope"
+    )]
+    UndefinedIdentifier { name: String, line: usize },
+
     #[error("Module not found: {0}")]
     ModuleNotFound(String),
 
@@ -968,6 +973,18 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
         &mut module_calls,
         &mut export_params,
     );
+
+    // Third pass: every remaining ResourceRef must point at a declared binding.
+    // Anything else is a typo or a stale reference to something the user removed.
+    let known_bindings = collect_known_bindings(&ctx);
+    check_undefined_bindings(
+        &known_bindings,
+        &resources,
+        &attribute_params,
+        &module_calls,
+        &export_params,
+        &ctx.deferred_for_expressions,
+    )?;
 
     Ok(ParsedFile {
         providers,
@@ -4074,6 +4091,116 @@ fn unescape_single_quoted(s: &str) -> String {
         }
     }
     result
+}
+
+/// Collect every identifier that is a valid binding source in the fully parsed
+/// context. Anything not in this set that appears as the root of a dotted
+/// reference is a typo / missing binding.
+fn collect_known_bindings<'ctx>(
+    ctx: &'ctx ParseContext<'_>,
+) -> std::collections::HashSet<&'ctx str> {
+    let mut set: std::collections::HashSet<&'ctx str> = std::collections::HashSet::new();
+    set.extend(ctx.resource_bindings.keys().map(String::as_str));
+    set.extend(ctx.upstream_states.keys().map(String::as_str));
+    set.extend(ctx.imported_modules.keys().map(String::as_str));
+    set.extend(ctx.user_functions.keys().map(String::as_str));
+    set.extend(ctx.structural_bindings.iter().map(String::as_str));
+    set.extend(ctx.variables.keys().map(String::as_str));
+    set
+}
+
+/// Reject references whose root identifier is not declared anywhere in scope.
+fn check_undefined_bindings(
+    known: &std::collections::HashSet<&str>,
+    resources: &[Resource],
+    attribute_params: &[AttributeParameter],
+    module_calls: &[ModuleCall],
+    export_params: &[ExportParameter],
+    deferred_for_expressions: &[DeferredForExpression],
+) -> Result<(), ParseError> {
+    for resource in resources {
+        for expr in resource.attributes.values() {
+            check_undefined_in_value(known, &expr.0)?;
+        }
+    }
+    for attr in attribute_params {
+        if let Some(value) = &attr.value {
+            check_undefined_in_value(known, value)?;
+        }
+    }
+    for call in module_calls {
+        for v in call.arguments.values() {
+            check_undefined_in_value(known, v)?;
+        }
+    }
+    for export in export_params {
+        if let Some(value) = &export.value {
+            check_undefined_in_value(known, value)?;
+        }
+    }
+    for deferred in deferred_for_expressions {
+        if !known.contains(deferred.iterable_binding.as_str()) {
+            return Err(ParseError::UndefinedIdentifier {
+                name: deferred.iterable_binding.clone(),
+                line: deferred.line,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn check_undefined_in_value(
+    known: &std::collections::HashSet<&str>,
+    value: &Value,
+) -> Result<(), ParseError> {
+    match value {
+        Value::ResourceRef { path } => {
+            let root = path.binding();
+            let root_ident = root.split(['[', ']']).next().unwrap_or(root);
+            if !known.contains(root_ident) {
+                return Err(ParseError::UndefinedIdentifier {
+                    name: root_ident.to_string(),
+                    line: 0,
+                });
+            }
+            Ok(())
+        }
+        Value::List(items) => {
+            for v in items {
+                check_undefined_in_value(known, v)?;
+            }
+            Ok(())
+        }
+        Value::Map(map) => {
+            for v in map.values() {
+                check_undefined_in_value(known, v)?;
+            }
+            Ok(())
+        }
+        Value::Interpolation(parts) => {
+            for part in parts {
+                if let crate::resource::InterpolationPart::Expr(v) = part {
+                    check_undefined_in_value(known, v)?;
+                }
+            }
+            Ok(())
+        }
+        Value::FunctionCall { args, .. } => {
+            for arg in args {
+                check_undefined_in_value(known, arg)?;
+            }
+            Ok(())
+        }
+        Value::Secret(inner) => check_undefined_in_value(known, inner),
+        Value::Closure { captured_args, .. } => {
+            for arg in captured_args {
+                check_undefined_in_value(known, arg)?;
+            }
+            Ok(())
+        }
+        // Leaves: exhaustive on purpose so a new Value variant forces a review here.
+        Value::String(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_) => Ok(()),
+    }
 }
 
 /// Resolve forward references after the full binding set is known.
@@ -10626,5 +10753,93 @@ awscc.ec2.vpc {
             }
             other => panic!("Expected DuplicateBinding error, got: {other}"),
         }
+    }
+
+    // A dotted reference `orgs.accounts` is only valid when `orgs` is declared
+    // somewhere in scope (`let`, `upstream_state`, `read`, module import,
+    // function, or for/if structural binding). Referring to a name that isn't
+    // bound anywhere must be a hard error, not a deferred warning.
+
+    #[test]
+    fn undefined_identifier_in_for_iterable_is_error() {
+        let input = r#"
+            for name, account_id in orgs.accounts {
+                aws.s3_bucket {
+                    name = name
+                }
+            }
+        "#;
+        let err = parse(input, &ProviderContext::default())
+            .expect_err("undefined `orgs` must be a hard error");
+        match err {
+            ParseError::UndefinedIdentifier { name, .. } => {
+                assert_eq!(name, "orgs");
+            }
+            other => panic!("Expected UndefinedIdentifier, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn forward_reference_to_later_let_is_allowed() {
+        // `foo.id` refers to `let foo = ...` declared after the first resource.
+        // This is a legitimate forward reference that the second-pass resolver
+        // handles.
+        let input = r#"
+            let bucket = aws.s3_bucket {
+                name = foo.id
+            }
+            let foo = aws.s3_bucket {
+                name = "foo-bucket"
+            }
+        "#;
+        let result = parse(input, &ProviderContext::default());
+        assert!(
+            result.is_ok(),
+            "Forward reference to later `let` must still parse: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn backward_reference_to_resource_attr_is_allowed() {
+        // `bucket.id` — `bucket` is defined; `id` is populated after apply.
+        // This is the legitimate "known after apply" case.
+        let input = r#"
+            let bucket = aws.s3_bucket {
+                name = "my-bucket"
+            }
+            aws.s3_bucket_policy {
+                name = "policy"
+                bucket_name = bucket.id
+            }
+        "#;
+        let result = parse(input, &ProviderContext::default());
+        assert!(
+            result.is_ok(),
+            "Reference to declared binding's attribute must parse: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn reference_to_upstream_state_binding_is_allowed() {
+        // `orgs` IS declared via upstream_state. The field (`accounts`) may
+        // not yet be loaded — that stays as a deferred warning, not an error.
+        let input = r#"
+            let orgs = upstream_state {
+                source = "../organizations"
+            }
+            for name, account_id in orgs.accounts {
+                aws.s3_bucket {
+                    name = name
+                }
+            }
+        "#;
+        let result = parse(input, &ProviderContext::default());
+        assert!(
+            result.is_ok(),
+            "Reference to upstream_state binding must parse: {:?}",
+            result.err()
+        );
     }
 }
