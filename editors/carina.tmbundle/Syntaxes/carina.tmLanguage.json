@@ -53,7 +53,7 @@
       "patterns": [
         {
           "name": "support.class.carina",
-          "match": "(aws|gcp|azure)\\.[a-z][a-z0-9_]*\\.[a-z][a-z0-9_]*"
+          "match": "(aws|awscc|gcp|azure)\\.[a-z][a-z0-9_]*\\.[a-z][a-z0-9_]*"
         }
       ]
     },
