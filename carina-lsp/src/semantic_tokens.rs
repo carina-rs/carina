@@ -1,9 +1,14 @@
 use crate::position;
 use tower_lsp::lsp_types::{SemanticToken, SemanticTokenType, SemanticTokensLegend};
 
-/// Token types supported by this language server
+/// Token types supported by this language server.
+///
+/// DSL keywords and boolean literals are deliberately NOT emitted here; the
+/// TextMate grammar handles them via dedicated scopes so themes can style
+/// each category independently (#1948). The `KEYWORD` entry stays in the
+/// legend only to keep the indices of later entries stable.
 pub const TOKEN_TYPES: &[SemanticTokenType] = &[
-    SemanticTokenType::KEYWORD,  // 0: provider, let, fn
+    SemanticTokenType::KEYWORD,  // 0: (unused — kept for index stability)
     SemanticTokenType::TYPE,     // 1: aws.s3.bucket, aws.ec2.vpc, aws.Region.*
     SemanticTokenType::VARIABLE, // 2: variable names
     SemanticTokenType::PROPERTY, // 3: attribute names (name, region, etc.)
@@ -264,134 +269,64 @@ impl SemanticTokensProvider {
             return tokens;
         }
 
-        // Keywords at start of line
-        // Note: keywords like "provider", "backend", "let" and their arguments
-        // are ASCII-only, so byte positions == char positions in this section.
-        if trimmed.starts_with("provider ") {
-            tokens.push((indent, 8, 0)); // KEYWORD: provider
-            if let Some(name_start) = line.find("provider ") {
-                let after_provider = &line[name_start + 9..];
-                let leading_spaces = after_provider.len() - after_provider.trim_start().len();
-                let after_provider_trimmed = after_provider.trim_start();
-                if let Some(name_end) = after_provider_trimmed.find([' ', '{']) {
-                    let name = &after_provider_trimmed[..name_end];
-                    if !name.is_empty() {
-                        let name_pos = name_start + 9 + leading_spaces;
-                        tokens.push((name_pos as u32, name.len() as u32, 1)); // TYPE
-                    }
+        // DSL keywords (let, fn, provider, for, if, etc.) are intentionally NOT
+        // emitted as semantic tokens: the TextMate grammar paints them via
+        // dedicated scopes (`storage.type.carina`, `keyword.control.carina`,
+        // etc.) and a blanket `KEYWORD` semantic token would override that.
+        // See #1948. We still emit the *name* that follows a declaration
+        // keyword (provider/backend/let/fn) so those names get typed/variable/
+        // function highlighting from the semantic layer.
+        if trimmed.starts_with("provider ")
+            && let Some(name_start) = line.find("provider ")
+        {
+            let after = &line[name_start + 9..];
+            let leading_spaces = after.len() - after.trim_start().len();
+            let after_trimmed = after.trim_start();
+            if let Some(name_end) = after_trimmed.find([' ', '{']) {
+                let name = &after_trimmed[..name_end];
+                if !name.is_empty() {
+                    let name_pos = name_start + 9 + leading_spaces;
+                    tokens.push((name_pos as u32, name.len() as u32, 1)); // TYPE
                 }
             }
-        } else if trimmed.starts_with("backend ") {
-            tokens.push((indent, 7, 0)); // KEYWORD: backend
-            if let Some(name_start) = line.find("backend ") {
-                let after_backend = &line[name_start + 8..];
-                let leading_spaces = after_backend.len() - after_backend.trim_start().len();
-                let after_backend_trimmed = after_backend.trim_start();
-                if let Some(name_end) = after_backend_trimmed.find([' ', '{']) {
-                    let name = &after_backend_trimmed[..name_end];
-                    if !name.is_empty() {
-                        let name_pos = name_start + 8 + leading_spaces;
-                        tokens.push((name_pos as u32, name.len() as u32, 1)); // TYPE
-                    }
+        } else if trimmed.starts_with("backend ")
+            && let Some(name_start) = line.find("backend ")
+        {
+            let after = &line[name_start + 8..];
+            let leading_spaces = after.len() - after.trim_start().len();
+            let after_trimmed = after.trim_start();
+            if let Some(name_end) = after_trimmed.find([' ', '{']) {
+                let name = &after_trimmed[..name_end];
+                if !name.is_empty() {
+                    let name_pos = name_start + 8 + leading_spaces;
+                    tokens.push((name_pos as u32, name.len() as u32, 1)); // TYPE
                 }
             }
-        } else if trimmed.starts_with("let ") {
-            tokens.push((indent, 3, 0)); // KEYWORD: let
-            if let Some(let_start) = line.find("let ") {
-                let after_let = &line[let_start + 4..];
-                let leading_spaces = after_let.len() - after_let.trim_start().len();
-                let after_let_trimmed = after_let.trim_start();
-                if let Some(name_end) = after_let_trimmed.find([' ', '=']) {
-                    let name = &after_let_trimmed[..name_end];
-                    if !name.is_empty() {
-                        let name_start = let_start + 4 + leading_spaces;
-                        tokens.push((name_start as u32, name.len() as u32, 2)); // VARIABLE
-                    }
-                }
-                // Check for "read" keyword after "let name = read ..."
-                if let Some(read_pos) = after_let.find("= read ") {
-                    let read_start = let_start + 4 + read_pos + 2; // position of "read"
-                    tokens.push((read_start as u32, 4, 0)); // KEYWORD: read
-                }
-                // Check for "upstream_state" keyword after "let name = upstream_state ..."
-                if let Some(us_pos) = after_let.find("= upstream_state") {
-                    let after_kw = after_let[us_pos + 16..].chars().next();
-                    if after_kw.is_none_or(|c| c.is_whitespace() || c == '{') {
-                        let us_start = let_start + 4 + us_pos + 2; // position of "upstream_state"
-                        tokens.push((us_start as u32, 14, 0)); // KEYWORD: upstream_state
-                    }
-                }
-                // Check for "import" keyword after "let name = import ..."
-                if let Some(import_pos) = after_let.find("= import ") {
-                    let import_start = let_start + 4 + import_pos + 2; // position of "import"
-                    tokens.push((import_start as u32, 6, 0)); // KEYWORD: import
-                }
-                // Check for "for" keyword after "let name = for ..."
-                if let Some(for_pos) = after_let.find("= for ") {
-                    let for_start = let_start + 4 + for_pos + 2; // position of "for"
-                    tokens.push((for_start as u32, 3, 0)); // KEYWORD: for
-                    // Check for "in" keyword on the same line
-                    let after_for = &line[for_start + 3..];
-                    if let Some(in_pos) = after_for.find(" in ") {
-                        let in_start = for_start + 3 + in_pos + 1;
-                        tokens.push((in_start as u32, 2, 0)); // KEYWORD: in
-                    }
-                }
-                // Check for "if" keyword after "let name = if ..."
-                if let Some(if_pos) = after_let.find("= if ") {
-                    let if_start = let_start + 4 + if_pos + 2; // position of "if"
-                    tokens.push((if_start as u32, 2, 0)); // KEYWORD: if
+        } else if trimmed.starts_with("let ")
+            && let Some(let_start) = line.find("let ")
+        {
+            let after_let = &line[let_start + 4..];
+            let leading_spaces = after_let.len() - after_let.trim_start().len();
+            let after_let_trimmed = after_let.trim_start();
+            if let Some(name_end) = after_let_trimmed.find([' ', '=']) {
+                let name = &after_let_trimmed[..name_end];
+                if !name.is_empty() {
+                    let name_start = let_start + 4 + leading_spaces;
+                    tokens.push((name_start as u32, name.len() as u32, 2)); // VARIABLE
                 }
             }
-        } else if trimmed.starts_with("attributes ") || trimmed == "attributes{" {
-            tokens.push((indent, 10, 0)); // KEYWORD: attributes
-        } else if trimmed.starts_with("exports ") || trimmed == "exports{" {
-            tokens.push((indent, 7, 0)); // KEYWORD: exports
-        } else if trimmed.starts_with("arguments ") || trimmed == "arguments{" {
-            tokens.push((indent, 9, 0)); // KEYWORD: arguments
-        } else if trimmed.starts_with("import ") || trimmed == "import{" {
-            tokens.push((indent, 6, 0)); // KEYWORD: import
-        } else if trimmed.starts_with("removed ") || trimmed == "removed{" {
-            tokens.push((indent, 7, 0)); // KEYWORD: removed
-        } else if trimmed.starts_with("moved ") || trimmed == "moved{" {
-            tokens.push((indent, 5, 0)); // KEYWORD: moved
-        } else if trimmed.starts_with("fn ") {
-            tokens.push((indent, 2, 0)); // KEYWORD: fn
-            // Highlight the function name after "fn "
-            if let Some(fn_start) = line.find("fn ") {
-                let after_fn = &line[fn_start + 3..];
-                let leading_spaces = after_fn.len() - after_fn.trim_start().len();
-                let after_fn_trimmed = after_fn.trim_start();
-                if let Some(name_end) = after_fn_trimmed.find(['(', ' ']) {
-                    let name = &after_fn_trimmed[..name_end];
-                    if !name.is_empty() {
-                        let name_pos = fn_start + 3 + leading_spaces;
-                        tokens.push((name_pos as u32, name.len() as u32, 8)); // FUNCTION
-                    }
+        } else if trimmed.starts_with("fn ")
+            && let Some(fn_start) = line.find("fn ")
+        {
+            let after_fn = &line[fn_start + 3..];
+            let leading_spaces = after_fn.len() - after_fn.trim_start().len();
+            let after_fn_trimmed = after_fn.trim_start();
+            if let Some(name_end) = after_fn_trimmed.find(['(', ' ']) {
+                let name = &after_fn_trimmed[..name_end];
+                if !name.is_empty() {
+                    let name_pos = fn_start + 3 + leading_spaces;
+                    tokens.push((name_pos as u32, name.len() as u32, 8)); // FUNCTION
                 }
-            }
-        } else if trimmed.starts_with("for ") {
-            tokens.push((indent, 3, 0)); // KEYWORD: for
-            // Check for "in" keyword on the same line
-            if let Some(in_pos) = trimmed.find(" in ") {
-                let in_start = indent as usize + in_pos + 1;
-                tokens.push((in_start as u32, 2, 0)); // KEYWORD: in
-            }
-        } else if trimmed.starts_with("if ") {
-            tokens.push((indent, 2, 0)); // KEYWORD: if
-        } else if trimmed.starts_with("require ") {
-            tokens.push((indent, 7, 0)); // KEYWORD: require
-        }
-
-        // "else" keyword can appear after "}" on a line like "} else {"
-        if let Some(else_pos) = line.find("else") {
-            // Verify it's the keyword by checking surrounding characters are not identifier chars
-            let is_ident_char = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-            let before_ok = else_pos == 0 || !is_ident_char(line.as_bytes()[else_pos - 1]);
-            let after_ok =
-                else_pos + 4 >= line.len() || !is_ident_char(line.as_bytes()[else_pos + 4]);
-            if before_ok && after_ok {
-                tokens.push((else_pos as u32, 4, 0)); // KEYWORD: else
             }
         }
 
@@ -518,9 +453,9 @@ impl SemanticTokensProvider {
             }
         }
 
-        // Boolean literals
-        self.find_and_add_pattern(line, "true", 0, &mut tokens);
-        self.find_and_add_pattern(line, "false", 0, &mut tokens);
+        // Booleans are left to the TextMate grammar
+        // (`constant.language.boolean.carina`) to avoid a blanket KEYWORD
+        // semantic token overriding it.
 
         // Sort by position and deduplicate
         tokens.sort_by_key(|(start, _, _)| *start);
@@ -881,65 +816,11 @@ mod tests {
     }
 
     #[test]
-    fn test_import_keyword_highlighted() {
-        let provider = SemanticTokensProvider::new(&[]);
-        let tokens = provider.tokenize_line("let web = import \"./modules/web.crn\"", 0);
-        let import_token = tokens.iter().find(|(_, len, typ)| *typ == 0 && *len == 6);
-        assert!(
-            import_token.is_some(),
-            "Should highlight 'import' as KEYWORD. Got: {:?}",
-            tokens
-        );
-        let (_, len, _) = import_token.unwrap();
-        assert_eq!(*len, 6, "import keyword length should be 6");
-    }
-
-    #[test]
-    fn test_attributes_keyword_highlighted() {
-        let provider = SemanticTokensProvider::new(&[]);
-        let tokens = provider.tokenize_line("attributes {", 0);
-        let keyword_token = tokens
-            .iter()
-            .find(|(start, _, typ)| *start == 0 && *typ == 0);
-        assert!(
-            keyword_token.is_some(),
-            "Should highlight 'attributes' as KEYWORD. Got: {:?}",
-            tokens
-        );
-        let (_, len, _) = keyword_token.unwrap();
-        assert_eq!(*len, 10, "attributes keyword length should be 10");
-    }
-
-    #[test]
-    fn test_arguments_keyword_highlighted() {
-        let provider = SemanticTokensProvider::new(&[]);
-        let tokens = provider.tokenize_line("arguments {", 0);
-        let keyword_token = tokens
-            .iter()
-            .find(|(start, _, typ)| *start == 0 && *typ == 0);
-        assert!(
-            keyword_token.is_some(),
-            "Should highlight 'arguments' as KEYWORD. Got: {:?}",
-            tokens
-        );
-        let (_, len, _) = keyword_token.unwrap();
-        assert_eq!(*len, 9, "arguments keyword length should be 9");
-    }
-
-    #[test]
     fn test_import_let_binding_variable_highlighted() {
         let provider = SemanticTokensProvider::new(&[]);
         let tokens = provider.tokenize_line("let web = import \"./modules/web.crn\"", 0);
-        // "let" should be KEYWORD
-        let let_token = tokens
-            .iter()
-            .find(|(start, len, typ)| *start == 0 && *len == 3 && *typ == 0);
-        assert!(
-            let_token.is_some(),
-            "Should highlight 'let' as KEYWORD. Got: {:?}",
-            tokens
-        );
-        // "web" should be VARIABLE
+        // The module alias `web` is still emitted as VARIABLE even though `let`
+        // itself is handled by the TextMate grammar (see #1948).
         let var_token = tokens.iter().find(|(_, _, typ)| *typ == 2);
         assert!(
             var_token.is_some(),
@@ -1214,104 +1095,6 @@ mod tests {
     }
 
     #[test]
-    fn test_top_level_for_keyword_highlighted() {
-        let provider = SemanticTokensProvider::new(&[]);
-        let tokens = provider.tokenize_line(r#"for az in ["a", "b"] {"#, 0);
-        // "for" should be KEYWORD at position 0
-        let for_token = tokens
-            .iter()
-            .find(|(start, len, typ)| *start == 0 && *len == 3 && *typ == 0);
-        assert!(
-            for_token.is_some(),
-            "Expected KEYWORD token for top-level 'for'. Got: {:?}",
-            tokens
-        );
-        // "in" should be KEYWORD
-        let in_token = tokens.iter().find(|(_, len, typ)| *len == 2 && *typ == 0);
-        assert!(
-            in_token.is_some(),
-            "Expected KEYWORD token for 'in' in top-level for. Got: {:?}",
-            tokens
-        );
-    }
-
-    #[test]
-    fn test_top_level_if_keyword_highlighted() {
-        let provider = SemanticTokensProvider::new(&[]);
-        let tokens = provider.tokenize_line("if some_condition {", 0);
-        // "if" should be KEYWORD at position 0
-        let if_token = tokens
-            .iter()
-            .find(|(start, len, typ)| *start == 0 && *len == 2 && *typ == 0);
-        assert!(
-            if_token.is_some(),
-            "Expected KEYWORD token for top-level 'if'. Got: {:?}",
-            tokens
-        );
-    }
-
-    #[test]
-    fn test_indented_top_level_for_keyword_highlighted() {
-        let provider = SemanticTokensProvider::new(&[]);
-        let tokens = provider.tokenize_line(r#"    for az in ["a", "b"] {"#, 0);
-        // "for" should be KEYWORD at position 4
-        let for_token = tokens
-            .iter()
-            .find(|(start, len, typ)| *start == 4 && *len == 3 && *typ == 0);
-        assert!(
-            for_token.is_some(),
-            "Expected KEYWORD token for indented top-level 'for'. Got: {:?}",
-            tokens
-        );
-    }
-
-    #[test]
-    fn test_indented_top_level_if_keyword_highlighted() {
-        let provider = SemanticTokensProvider::new(&[]);
-        let tokens = provider.tokenize_line("    if some_condition {", 0);
-        // "if" should be KEYWORD at position 4
-        let if_token = tokens
-            .iter()
-            .find(|(start, len, typ)| *start == 4 && *len == 2 && *typ == 0);
-        assert!(
-            if_token.is_some(),
-            "Expected KEYWORD token for indented top-level 'if'. Got: {:?}",
-            tokens
-        );
-    }
-
-    #[test]
-    fn test_for_in_keywords_highlighted() {
-        let provider = SemanticTokensProvider::new(&[]);
-        let tokens = provider.tokenize_line(r#"let subnets = for az in ["a", "b"] {"#, 0);
-        // "let" should be KEYWORD
-        let let_token = tokens
-            .iter()
-            .find(|(start, len, typ)| *start == 0 && *len == 3 && *typ == 0);
-        assert!(
-            let_token.is_some(),
-            "Expected KEYWORD token for 'let'. Got: {:?}",
-            tokens
-        );
-        // "for" should be KEYWORD (at position 14: "let subnets = for")
-        let for_token = tokens
-            .iter()
-            .find(|(start, len, typ)| *start == 14 && *len == 3 && *typ == 0);
-        assert!(
-            for_token.is_some(),
-            "Expected KEYWORD token for 'for'. Got: {:?}",
-            tokens
-        );
-        // "in" should be KEYWORD
-        let in_token = tokens.iter().find(|(_, len, typ)| *len == 2 && *typ == 0);
-        assert!(
-            in_token.is_some(),
-            "Expected KEYWORD token for 'in'. Got: {:?}",
-            tokens
-        );
-    }
-
-    #[test]
     fn test_heredoc_highlighted_as_string() {
         let provider = SemanticTokensProvider::new(&[]);
         let input = "policy = <<EOT\n{\"Version\": \"2012-10-17\"}\nEOT";
@@ -1327,21 +1110,6 @@ mod tests {
     }
 
     #[test]
-    fn upstream_state_keyword_is_highlighted() {
-        let provider = SemanticTokensProvider::new(&[]);
-        let tokens = provider.tokenize_line(r#"let orgs = upstream_state {"#, 0);
-        // "upstream_state" appears at column 11 with length 14
-        let keyword_token = tokens
-            .iter()
-            .find(|(start, len, typ)| *start == 11 && *len == 14 && *typ == 0);
-        assert!(
-            keyword_token.is_some(),
-            "Expected KEYWORD token for 'upstream_state' in `let name = upstream_state {{`. Got: {:?}",
-            tokens
-        );
-    }
-
-    #[test]
     fn test_find_heredoc_marker() {
         use carina_core::heredoc::find_heredoc_marker;
         assert_eq!(
@@ -1351,5 +1119,78 @@ mod tests {
         assert_eq!(find_heredoc_marker("x = <<-EOF"), Some("EOF".to_string()));
         assert_eq!(find_heredoc_marker("x = \"<<EOT\""), None);
         assert_eq!(find_heredoc_marker("x = 123"), None);
+    }
+
+    // Issue #1948 — the LSP stopped emitting semantic-token `KEYWORD`s for DSL
+    // keywords so the TextMate split from #1934 (`storage.type.carina`,
+    // `keyword.declaration.carina`, `keyword.control.carina`, etc.) can drive
+    // the coloring without being overridden by a blanket `keyword` token.
+
+    #[test]
+    fn keywords_do_not_emit_keyword_semantic_token() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let sources = [
+            "let x = aws.s3_bucket { name = \"b\" }",
+            "fn greet(name) { name }",
+            "provider aws { region = aws.Region.ap_northeast_1 }",
+            "backend s3 { bucket = \"b\" }",
+            "let orgs = upstream_state { source = \"../o\" }",
+            "attributes { a: string = \"x\" }",
+            "arguments { a: string }",
+            "exports { a: string = \"x\" }",
+            "import { to = aws.s3_bucket \"x\" }",
+            "moved { from = aws.s3_bucket \"a\" to = aws.s3_bucket \"b\" }",
+            "removed { from = aws.s3_bucket \"x\" }",
+            "for az in [\"a\", \"b\"] { aws.s3_bucket { name = az } }",
+            "if cond { aws.s3_bucket { name = \"x\" } }",
+            "} else { aws.s3_bucket { name = \"y\" } }",
+            "require !empty(name), \"must be set\"",
+            "let r = read aws.s3_bucket { name = \"x\" }",
+            "let m = import \"./modules/web\"",
+            r#"let subnets = for az in ["a", "b"] { aws.s3_bucket { name = az } }"#,
+            "let x = if cond { aws.s3_bucket { name = \"y\" } }",
+        ];
+        for src in sources {
+            let tokens = provider.tokenize(src);
+            let keyword_tokens: Vec<_> = tokens.iter().filter(|t| t.token_type == 0).collect();
+            assert!(
+                keyword_tokens.is_empty(),
+                "Expected no KEYWORD semantic tokens for {src:?}. Got: {tokens:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn booleans_do_not_emit_keyword_semantic_token() {
+        // `true` / `false` also fell under token_type 0 before this change.
+        // They stay colored by TextMate's `constant.language.boolean.carina`.
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize("enabled = true");
+        let keyword_tokens: Vec<_> = tokens.iter().filter(|t| t.token_type == 0).collect();
+        assert!(
+            keyword_tokens.is_empty(),
+            "true/false should not emit KEYWORD tokens. Got: {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn non_keyword_semantic_tokens_still_emitted() {
+        // Defensive: make sure we didn't delete too much. TYPE, VARIABLE,
+        // PROPERTY, STRING, NUMBER, OPERATOR, FUNCTION should all still appear.
+        let provider = SemanticTokensProvider::new(&[]);
+        let src = r#"let bucket = aws.s3_bucket {
+    name = "b"
+    count = 3
+}
+"#;
+        let tokens = provider.tokenize(src);
+        let kinds: std::collections::HashSet<u32> = tokens.iter().map(|t| t.token_type).collect();
+        // 1 TYPE, 2 VARIABLE, 3 PROPERTY, 4 STRING, 5 NUMBER, 6 OPERATOR
+        for expected in [1u32, 2, 3, 4, 5, 6] {
+            assert!(
+                kinds.contains(&expected),
+                "Expected token_type {expected} in output. Got kinds: {kinds:?}"
+            );
+        }
     }
 }
