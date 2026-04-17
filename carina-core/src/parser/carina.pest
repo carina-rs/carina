@@ -216,11 +216,14 @@ for_expr = {
     "for" ~ for_binding ~ "in" ~ for_iterable ~ "{" ~ for_body ~ "}"
 }
 
-// For binding: simple (x), indexed ((i, x)), or map (k, v)
+// For binding: simple (x), indexed ((i, x)), or map (k, v).
+// `_` is accepted in any position as a discard pattern (same semantics as
+// `let _ = ...`): the binding is not registered and is exempt from the
+// unused-binding warning.
 for_binding = { for_indexed_binding | for_map_binding | for_simple_binding }
-for_simple_binding = { identifier }
-for_indexed_binding = { "(" ~ identifier ~ "," ~ identifier ~ ")" }
-for_map_binding = { identifier ~ "," ~ identifier }
+for_simple_binding = { discard_pattern | identifier }
+for_indexed_binding = { "(" ~ (discard_pattern | identifier) ~ "," ~ (discard_pattern | identifier) ~ ")" }
+for_map_binding = { (discard_pattern | identifier) ~ "," ~ (discard_pattern | identifier) }
 
 // For iterable: restricted to simple expressions to avoid ambiguity with body block
 for_iterable = { function_call | list | variable_ref | "(" ~ expression ~ ")" }
