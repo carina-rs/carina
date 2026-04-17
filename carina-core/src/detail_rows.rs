@@ -938,12 +938,13 @@ fn is_both_maps(old_value: Option<&Value>, new_value: &Value) -> bool {
 
 /// Check whether a Value references the given binding name.
 fn value_references_binding(value: &Value, binding: &str) -> bool {
-    match value {
-        Value::ResourceRef { path } => path.binding() == binding,
-        Value::List(items) => items.iter().any(|v| value_references_binding(v, binding)),
-        Value::Map(map) => map.values().any(|v| value_references_binding(v, binding)),
-        _ => false,
-    }
+    let mut found = false;
+    value.visit_refs(&mut |path| {
+        if path.binding() == binding {
+            found = true;
+        }
+    });
+    found
 }
 
 #[cfg(test)]
@@ -1164,5 +1165,45 @@ mod tests {
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None);
         assert_eq!(rows.len(), 1);
         assert!(matches!(&rows[0], DetailRow::ReplaceChanged { key, .. } if key == "cidr_block"));
+    }
+
+    /// The pre-#1971 hand-rolled walker only descended into `List` and `Map`,
+    /// so a ResourceRef nested inside `Interpolation` / `FunctionCall` /
+    /// `Secret` / `Closure` would fail to mark the attribute as referencing
+    /// the binding. Guard against regressing that after migrating to
+    /// `Value::visit_refs`.
+    #[test]
+    fn value_references_binding_covers_non_container_variants() {
+        use crate::resource::InterpolationPart;
+
+        let refs_vpc = Value::resource_ref("vpc", "id", vec![]);
+
+        let interpolation = Value::Interpolation(vec![
+            InterpolationPart::Literal("vpc-".to_string()),
+            InterpolationPart::Expr(refs_vpc.clone()),
+        ]);
+        assert!(value_references_binding(&interpolation, "vpc"));
+
+        let function_call = Value::FunctionCall {
+            name: "join".to_string(),
+            args: vec![Value::String(",".to_string()), refs_vpc.clone()],
+        };
+        assert!(value_references_binding(&function_call, "vpc"));
+
+        let secret = Value::Secret(Box::new(refs_vpc.clone()));
+        assert!(value_references_binding(&secret, "vpc"));
+
+        let closure = Value::Closure {
+            name: "map".to_string(),
+            captured_args: vec![refs_vpc],
+            remaining_arity: 1,
+        };
+        assert!(value_references_binding(&closure, "vpc"));
+
+        // Still false when the binding is genuinely absent.
+        assert!(!value_references_binding(
+            &Value::String("plain".to_string()),
+            "vpc"
+        ));
     }
 }
