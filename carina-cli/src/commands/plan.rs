@@ -232,6 +232,10 @@ pub async fn run_plan(
     // Expand deferred for-expressions now that remote values are available
     parsed.expand_deferred_for_expressions(&remote_bindings);
 
+    // Now that the upstream exports are known, any reference to a field that
+    // isn't in them is a typo, not a deferred value.
+    validate_upstream_state_field_references(&parsed, &remote_bindings)?;
+
     // Print warnings after expansion (resolved deferred for-expressions have their warnings removed)
     parsed.print_warnings();
 
@@ -608,6 +612,122 @@ async fn load_upstream_bindings_at(
     Ok(state_file.build_remote_bindings())
 }
 
+/// Reject field references against `upstream_state` bindings whose target is
+/// absent from the upstream's `exports`. The `validate` subcommand can't do
+/// this (no upstream I/O), but once `plan` / `apply` have loaded
+/// `remote_bindings` the check becomes a straightforward map lookup.
+pub(crate) fn validate_upstream_state_field_references(
+    parsed: &carina_core::parser::ParsedFile,
+    remote_bindings: &HashMap<String, HashMap<String, Value>>,
+) -> Result<(), AppError> {
+    let mut errors: Vec<String> = Vec::new();
+
+    for resource in &parsed.resources {
+        for (attr_name, expr) in resource.attributes.iter() {
+            check_ref_against_upstream(
+                expr.as_value(),
+                remote_bindings,
+                &format!("{} attribute `{}`", resource.id, attr_name),
+                &mut errors,
+            );
+        }
+    }
+    for attr in &parsed.attribute_params {
+        if let Some(value) = &attr.value {
+            check_ref_against_upstream(
+                value,
+                remote_bindings,
+                &format!("attributes.{}", attr.name),
+                &mut errors,
+            );
+        }
+    }
+    for export in &parsed.export_params {
+        if let Some(value) = &export.value {
+            check_ref_against_upstream(
+                value,
+                remote_bindings,
+                &format!("exports.{}", export.name),
+                &mut errors,
+            );
+        }
+    }
+    for call in &parsed.module_calls {
+        let caller = call.binding_name.as_deref().unwrap_or(&call.module_name);
+        for (arg_name, v) in call.arguments.iter() {
+            check_ref_against_upstream(
+                v,
+                remote_bindings,
+                &format!("module `{}` argument `{}`", caller, arg_name),
+                &mut errors,
+            );
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::Validation(errors.join("\n")))
+    }
+}
+
+fn check_ref_against_upstream(
+    value: &Value,
+    remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    location: &str,
+    errors: &mut Vec<String>,
+) {
+    match value {
+        Value::ResourceRef { path } => {
+            let binding = path.binding();
+            let field = path.attribute();
+            let Some(exports) = remote_bindings.get(binding) else {
+                return;
+            };
+            if !exports.contains_key(field) {
+                let known: Vec<&str> = exports.keys().map(String::as_str).collect();
+                let suggestion = carina_core::schema::suggest_similar_name(field, &known)
+                    .map(|s| format!(" Did you mean `{}`?", s))
+                    .unwrap_or_default();
+                errors.push(format!(
+                    "{location}: upstream_state `{binding}` does not export `{field}`.{suggestion}"
+                ));
+            }
+        }
+        Value::List(items) => {
+            for v in items {
+                check_ref_against_upstream(v, remote_bindings, location, errors);
+            }
+        }
+        Value::Map(map) => {
+            for v in map.values() {
+                check_ref_against_upstream(v, remote_bindings, location, errors);
+            }
+        }
+        Value::Interpolation(parts) => {
+            for part in parts {
+                if let carina_core::resource::InterpolationPart::Expr(v) = part {
+                    check_ref_against_upstream(v, remote_bindings, location, errors);
+                }
+            }
+        }
+        Value::FunctionCall { args, .. } => {
+            for arg in args {
+                check_ref_against_upstream(arg, remote_bindings, location, errors);
+            }
+        }
+        Value::Secret(inner) => {
+            check_ref_against_upstream(inner, remote_bindings, location, errors);
+        }
+        Value::Closure { captured_args, .. } => {
+            for arg in captured_args {
+                check_ref_against_upstream(arg, remote_bindings, location, errors);
+            }
+        }
+        Value::String(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_) => {}
+    }
+}
+
 #[cfg(test)]
 mod load_upstream_states_tests {
     use super::*;
@@ -858,5 +978,95 @@ mod export_diff_tests {
         assert_eq!(changes[0].name(), "added");
         assert_eq!(changes[1].name(), "modified");
         assert_eq!(changes[2].name(), "removed");
+    }
+}
+
+#[cfg(test)]
+mod upstream_state_field_tests {
+    use super::*;
+    use carina_core::parser::parse;
+
+    fn remote_bindings_with(
+        binding: &str,
+        fields: &[(&str, Value)],
+    ) -> HashMap<String, HashMap<String, Value>> {
+        let inner: HashMap<String, Value> = fields
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect();
+        let mut outer = HashMap::new();
+        outer.insert(binding.to_string(), inner);
+        outer
+    }
+
+    #[test]
+    fn reference_to_missing_upstream_field_is_error() {
+        let src = r#"
+            let orgs = upstream_state { source = "../organizations" }
+            aws.s3_bucket {
+                name = orgs.account
+            }
+        "#;
+        let parsed = parse(src, &ProviderContext::default()).unwrap();
+        let bindings =
+            remote_bindings_with("orgs", &[("accounts", Value::String("a".to_string()))]);
+        let err = validate_upstream_state_field_references(&parsed, &bindings)
+            .expect_err("orgs.account must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("orgs"), "error should name the binding: {msg}");
+        assert!(
+            msg.contains("account"),
+            "error should name the field: {msg}"
+        );
+        assert!(
+            msg.contains("Did you mean `accounts`"),
+            "should suggest `accounts`: {msg}"
+        );
+    }
+
+    #[test]
+    fn reference_to_existing_upstream_field_is_ok() {
+        let src = r#"
+            let orgs = upstream_state { source = "../organizations" }
+            aws.s3_bucket {
+                name = orgs.accounts
+            }
+        "#;
+        let parsed = parse(src, &ProviderContext::default()).unwrap();
+        let bindings =
+            remote_bindings_with("orgs", &[("accounts", Value::String("a".to_string()))]);
+        assert!(validate_upstream_state_field_references(&parsed, &bindings).is_ok());
+    }
+
+    #[test]
+    fn missing_upstream_field_inside_interpolation_is_caught() {
+        let src = r#"
+            let orgs = upstream_state { source = "../organizations" }
+            aws.s3_bucket {
+                name = "prefix-${orgs.account}-suffix"
+            }
+        "#;
+        let parsed = parse(src, &ProviderContext::default()).unwrap();
+        let bindings =
+            remote_bindings_with("orgs", &[("accounts", Value::String("a".to_string()))]);
+        let err = validate_upstream_state_field_references(&parsed, &bindings)
+            .expect_err("missing field inside interpolation must be caught");
+        assert!(err.to_string().contains("`account`"));
+    }
+
+    #[test]
+    fn reference_to_non_upstream_binding_is_not_checked() {
+        // `bucket.id` points at a resource binding, not an upstream_state binding,
+        // so this pass leaves it alone (validate_resource_ref_types handles that case).
+        let src = r#"
+            let bucket = aws.s3_bucket { name = "b" }
+            aws.s3_bucket_policy {
+                name = "p"
+                bucket_name = bucket.id
+            }
+        "#;
+        let parsed = parse(src, &ProviderContext::default()).unwrap();
+        let bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        assert!(validate_upstream_state_field_references(&parsed, &bindings).is_ok());
     }
 }

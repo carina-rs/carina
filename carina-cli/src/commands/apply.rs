@@ -1123,6 +1123,10 @@ async fn run_apply_locked(
     // are included in the sorted set used for planning (#1844).
     parsed.expand_deferred_for_expressions(&remote_bindings);
 
+    // Now that the upstream exports are known, any reference to a field that
+    // isn't in them is a typo, not a deferred value.
+    super::plan::validate_upstream_state_field_references(parsed, &remote_bindings)?;
+
     // Print warnings after expansion (resolved ones are removed)
     parsed.print_warnings();
 
