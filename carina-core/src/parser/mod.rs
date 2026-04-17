@@ -985,6 +985,19 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
         &export_params,
     )?;
 
+    // Fourth pass: emit "validate does not inspect" warnings for simple
+    // attribute references to upstream_state bindings. Dedupe per binding
+    // and skip bindings that already got a for-iterable warning (which
+    // carries richer context about deferred expansion).
+    warn_unverified_upstream_state_refs(
+        &upstream_states,
+        &resources,
+        &attribute_params,
+        &module_calls,
+        &export_params,
+        &mut ctx.warnings,
+    );
+
     Ok(ParsedFile {
         providers,
         resources,
@@ -4163,6 +4176,131 @@ fn check_undefined_in_value(
         return Err(ParseError::UndefinedIdentifier { name, line: 0 });
     }
     Ok(())
+}
+
+/// Walk a `Value` looking for `Value::String("binding.attr")` forms that
+/// survived cross-file resolution without being converted to `ResourceRef`.
+/// The callback receives the binding name (portion before the first `.`).
+fn visit_string_refs(value: &Value, record: &mut impl FnMut(&str)) {
+    match value {
+        Value::String(s) => {
+            if let Some((binding, rest)) = s.split_once('.')
+                && !rest.is_empty()
+                && is_identifier(binding)
+            {
+                record(binding);
+            }
+        }
+        Value::List(items) => {
+            for item in items {
+                visit_string_refs(item, record);
+            }
+        }
+        Value::Map(map) => {
+            for v in map.values() {
+                visit_string_refs(v, record);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Walk every `Value` collected during parsing and emit a warning for each
+/// `upstream_state` binding that is referenced but not already covered by a
+/// for-iterable warning.
+///
+/// Dedup key is the binding name — many attribute references to the same
+/// upstream_state collapse into a single warning, since the point is to flag
+/// that validate does not inspect that upstream, not to repeat per-reference.
+pub(crate) fn warn_unverified_upstream_state_refs(
+    upstream_states: &[UpstreamState],
+    resources: &[Resource],
+    attribute_params: &[AttributeParameter],
+    module_calls: &[ModuleCall],
+    export_params: &[ExportParameter],
+    warnings: &mut Vec<ParseWarning>,
+) {
+    if upstream_states.is_empty() {
+        return;
+    }
+
+    let by_name: HashMap<&str, &UpstreamState> = upstream_states
+        .iter()
+        .map(|u| (u.binding.as_str(), u))
+        .collect();
+
+    // Bindings that already got a warning (for-iterable or simple-ref from an
+    // earlier pass) — skip them to avoid duplicates.
+    let already_warned: HashSet<String> = warnings
+        .iter()
+        .filter_map(|w| {
+            w.message
+                .split("upstream_state '")
+                .nth(1)
+                .and_then(|s| s.split('\'').next())
+                .map(String::from)
+        })
+        .collect();
+
+    let mut referenced: HashSet<String> = HashSet::new();
+    let mut record = |binding: &str| {
+        if by_name.contains_key(binding) && !already_warned.contains(binding) {
+            referenced.insert(binding.to_string());
+        }
+    };
+    let mut visit = |v: &Value| {
+        v.visit_refs(&mut |path| record(path.binding()));
+        // Cross-file references that never got resolved to ResourceRef remain
+        // as Value::String("binding.attr"). Detect those too so cross-file
+        // attribute refs surface warnings during directory-scope parsing.
+        visit_string_refs(v, &mut record);
+    };
+
+    for r in resources {
+        for expr in r.attributes.values() {
+            visit(expr.as_value());
+        }
+    }
+    for ap in attribute_params {
+        if let Some(v) = &ap.value {
+            visit(v);
+        }
+    }
+    for ep in export_params {
+        if let Some(v) = &ep.value {
+            visit(v);
+        }
+    }
+    for mc in module_calls {
+        for v in mc.arguments.values() {
+            visit(v);
+        }
+    }
+
+    // Emit in a deterministic order (binding name) so output is stable.
+    let mut names: Vec<&String> = referenced.iter().collect();
+    names.sort();
+    for name in names {
+        let us = by_name[name.as_str()];
+        warnings.push(ParseWarning {
+            file: None,
+            line: 0,
+            message: format!(
+                "upstream_state '{}' ({}) is referenced but validate does not inspect it — attribute existence and types are not verified.",
+                name,
+                us.source.display(),
+            ),
+        });
+    }
 }
 
 /// Resolve forward references after the full binding set is known.
@@ -10240,6 +10378,185 @@ awscc.ec2.vpc {
             !w.message.contains("known after apply"),
             "warning should NOT use ambiguous 'known after apply', got: {}",
             w.message
+        );
+    }
+
+    #[test]
+    fn simple_ref_to_upstream_state_emits_warning() {
+        // A simple attribute reference to an upstream_state binding (not a
+        // for-iterable) should emit the same "validate does not inspect"
+        // warning — validate never reads the upstream state, so the
+        // referenced attribute's existence and type cannot be verified.
+        let input = r#"
+            let network = upstream_state {
+                source = "../network"
+            }
+
+            awscc.ec2.security_group {
+                group_description = "Web SG"
+                vpc_id = network.vpc_id
+            }
+        "#;
+
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(
+            parsed.warnings.len(),
+            1,
+            "expected 1 warning, got: {:?}",
+            parsed.warnings
+        );
+        let w = &parsed.warnings[0];
+        assert!(
+            w.message.contains("upstream_state 'network'"),
+            "warning should mention binding name, got: {}",
+            w.message
+        );
+        assert!(
+            w.message.contains("../network"),
+            "warning should mention upstream source, got: {}",
+            w.message
+        );
+        assert!(
+            w.message.contains("validate does not inspect"),
+            "warning should explain validate does not inspect, got: {}",
+            w.message
+        );
+    }
+
+    #[test]
+    fn multiple_refs_to_same_upstream_state_emit_single_warning() {
+        // Multiple attribute references to the same upstream_state binding
+        // should produce only one warning — the point is to flag that the
+        // upstream is unverified, not to repeat per-attribute.
+        let input = r#"
+            let network = upstream_state {
+                source = "../network"
+            }
+
+            awscc.ec2.security_group {
+                group_description = "Web SG"
+                vpc_id = network.vpc_id
+            }
+
+            awscc.ec2.subnet {
+                vpc_id = network.vpc_id
+                cidr_block = network.subnet_cidr
+            }
+        "#;
+
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(
+            parsed.warnings.len(),
+            1,
+            "expected 1 dedup'd warning, got: {:?}",
+            parsed.warnings
+        );
+        assert!(
+            parsed.warnings[0]
+                .message
+                .contains("upstream_state 'network'"),
+            "warning should name the binding, got: {}",
+            parsed.warnings[0].message
+        );
+    }
+
+    #[test]
+    fn for_iterable_and_simple_ref_on_same_upstream_state_emit_single_warning() {
+        // When a file has both a for-iterable using upstream_state and a
+        // simple attribute ref to the same binding, only the for-iterable
+        // warning should fire — it carries extra context about deferred
+        // expansion and supersedes the attribute-ref warning.
+        let input = r#"
+            let orgs = upstream_state {
+                source = "../organizations"
+            }
+
+            for name, account in orgs.accounts {
+                awscc.ec2.vpc {
+                    name = name
+                    cidr_block = '10.0.0.0/16'
+                }
+            }
+
+            awscc.iam.role {
+                role_name = orgs.admin_role
+            }
+        "#;
+
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(
+            parsed.warnings.len(),
+            1,
+            "for-iterable warning should suppress the attribute-ref warning, got: {:?}",
+            parsed.warnings
+        );
+    }
+
+    #[test]
+    fn declared_but_unreferenced_upstream_state_emits_no_warning() {
+        // Declaring an upstream_state without referencing any of its attributes
+        // should stay silent — nothing to flag.
+        let input = r#"
+            let network = upstream_state {
+                source = "../network"
+            }
+
+            awscc.ec2.vpc {
+                cidr_block = '10.0.0.0/16'
+            }
+        "#;
+
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(
+            parsed.warnings.len(),
+            0,
+            "unreferenced upstream_state should produce no warning, got: {:?}",
+            parsed.warnings
+        );
+    }
+
+    #[test]
+    fn refs_to_different_upstream_states_emit_separate_warnings() {
+        // Dedup is per-binding: two distinct upstream_state bindings should
+        // each get their own warning.
+        let input = r#"
+            let network = upstream_state {
+                source = "../network"
+            }
+
+            let orgs = upstream_state {
+                source = "../organizations"
+            }
+
+            awscc.ec2.security_group {
+                group_description = "sg"
+                vpc_id = network.vpc_id
+                role_name = orgs.admin_role
+            }
+        "#;
+
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(
+            parsed.warnings.len(),
+            2,
+            "expected one warning per upstream_state binding, got: {:?}",
+            parsed.warnings
+        );
+        let bindings: Vec<String> = parsed
+            .warnings
+            .iter()
+            .filter_map(|w| {
+                w.message
+                    .split("upstream_state '")
+                    .nth(1)
+                    .and_then(|s| s.split('\'').next())
+                    .map(String::from)
+            })
+            .collect();
+        assert!(
+            bindings.contains(&"network".to_string()) && bindings.contains(&"orgs".to_string()),
+            "warnings should cover both bindings, got: {:?}",
+            parsed.warnings
         );
     }
 

@@ -175,6 +175,26 @@ pub fn load_configuration_with_config(
         // these and rewrite to an upstream-aware message.
         upgrade_cross_file_warnings(&mut merged, &unresolved_merged);
 
+        // Emit "validate does not inspect" warnings for simple attribute
+        // references to upstream_state bindings declared in sibling files.
+        // Per-file parsing only sees its own upstream_states; this catches
+        // the cross-file case. Dedupe against warnings already present so
+        // we don't double-count same-file references.
+        let merged_upstream_states: Vec<parser::UpstreamState> = merged
+            .upstream_states
+            .iter()
+            .chain(unresolved_merged.upstream_states.iter())
+            .cloned()
+            .collect();
+        parser::warn_unverified_upstream_state_refs(
+            &merged_upstream_states,
+            &merged.resources,
+            &merged.attribute_params,
+            &merged.module_calls,
+            &merged.export_params,
+            &mut merged.warnings,
+        );
+
         Ok(LoadedConfig {
             parsed: merged,
             unresolved_parsed: unresolved_merged,
@@ -892,6 +912,61 @@ let orgs = upstream_state {
             !warning.message.contains("known after apply"),
             "cross-file warning should be upgraded past generic 'known after apply', got: {}",
             warning.message
+        );
+    }
+
+    #[test]
+    fn cross_file_simple_ref_to_upstream_state_emits_warning() {
+        // When a resource in one file references an upstream_state declared in
+        // another file via a simple attribute reference, the merged config must
+        // still surface the "validate does not inspect" warning — one warning
+        // per binding.
+        let dir = create_temp_dir("cross_file_simple_ref_upstream");
+        fs::write(
+            dir.join("backend.crn"),
+            r#"backend local { path = 'carina.state.json' }
+
+let network = upstream_state {
+  source = '../network'
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("main.crn"),
+            r#"awscc.ec2.security_group {
+  group_description = 'Web SG'
+  vpc_id = network.vpc_id
+}
+"#,
+        )
+        .unwrap();
+
+        let result = load_configuration(&dir);
+        let loaded = result.expect("load should succeed");
+        cleanup(&dir);
+
+        let matching: Vec<_> = loaded
+            .parsed
+            .warnings
+            .iter()
+            .filter(|w| w.message.contains("upstream_state 'network'"))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "expected exactly one warning for cross-file simple ref, got: {:?}",
+            loaded.parsed.warnings
+        );
+        assert!(
+            matching[0].message.contains("../network"),
+            "warning should name the upstream source, got: {}",
+            matching[0].message
+        );
+        assert!(
+            matching[0].message.contains("validate does not inspect"),
+            "warning should explain validate does not inspect, got: {}",
+            matching[0].message
         );
     }
 
