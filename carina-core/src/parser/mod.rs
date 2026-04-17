@@ -4153,54 +4153,21 @@ fn check_undefined_in_value(
     known: &std::collections::HashSet<&str>,
     value: &Value,
 ) -> Result<(), ParseError> {
-    match value {
-        Value::ResourceRef { path } => {
-            let root = path.binding();
-            let root_ident = root.split(['[', ']']).next().unwrap_or(root);
-            if !known.contains(root_ident) {
-                return Err(ParseError::UndefinedIdentifier {
-                    name: root_ident.to_string(),
-                    line: 0,
-                });
-            }
-            Ok(())
+    let mut undefined: Option<String> = None;
+    value.visit_refs(&mut |path| {
+        if undefined.is_some() {
+            return;
         }
-        Value::List(items) => {
-            for v in items {
-                check_undefined_in_value(known, v)?;
-            }
-            Ok(())
+        let root = path.binding();
+        let root_ident = root.split(['[', ']']).next().unwrap_or(root);
+        if !known.contains(root_ident) {
+            undefined = Some(root_ident.to_string());
         }
-        Value::Map(map) => {
-            for v in map.values() {
-                check_undefined_in_value(known, v)?;
-            }
-            Ok(())
-        }
-        Value::Interpolation(parts) => {
-            for part in parts {
-                if let crate::resource::InterpolationPart::Expr(v) = part {
-                    check_undefined_in_value(known, v)?;
-                }
-            }
-            Ok(())
-        }
-        Value::FunctionCall { args, .. } => {
-            for arg in args {
-                check_undefined_in_value(known, arg)?;
-            }
-            Ok(())
-        }
-        Value::Secret(inner) => check_undefined_in_value(known, inner),
-        Value::Closure { captured_args, .. } => {
-            for arg in captured_args {
-                check_undefined_in_value(known, arg)?;
-            }
-            Ok(())
-        }
-        // Leaves: exhaustive on purpose so a new Value variant forces a review here.
-        Value::String(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_) => Ok(()),
+    });
+    if let Some(name) = undefined {
+        return Err(ParseError::UndefinedIdentifier { name, line: 0 });
     }
+    Ok(())
 }
 
 /// Resolve forward references after the full binding set is known.

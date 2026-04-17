@@ -283,6 +283,42 @@ impl Value {
             _ => None,
         }
     }
+
+    /// Recursively walk this value, invoking `f` on each `ResourceRef`'s `AccessPath`.
+    pub fn visit_refs(&self, f: &mut impl FnMut(&AccessPath)) {
+        match self {
+            Value::ResourceRef { path } => f(path),
+            Value::List(items) => {
+                for v in items {
+                    v.visit_refs(f);
+                }
+            }
+            Value::Map(map) => {
+                for v in map.values() {
+                    v.visit_refs(f);
+                }
+            }
+            Value::Interpolation(parts) => {
+                for part in parts {
+                    if let InterpolationPart::Expr(v) = part {
+                        v.visit_refs(f);
+                    }
+                }
+            }
+            Value::FunctionCall { args, .. } => {
+                for arg in args {
+                    arg.visit_refs(f);
+                }
+            }
+            Value::Secret(inner) => inner.visit_refs(f),
+            Value::Closure { captured_args, .. } => {
+                for arg in captured_args {
+                    arg.visit_refs(f);
+                }
+            }
+            Value::String(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_) => {}
+        }
+    }
 }
 
 impl Expr {
@@ -1744,5 +1780,52 @@ mod tests {
             remaining_arity: 1,
         };
         assert!(contains_resource_ref(&closure));
+    }
+
+    #[test]
+    fn visit_refs_collects_from_all_nested_variants() {
+        let value = Value::List(vec![
+            Value::resource_ref("a", "id", vec![]),
+            Value::Map(HashMap::from([(
+                "k".to_string(),
+                Value::resource_ref("b", "id", vec![]),
+            )])),
+            Value::Interpolation(vec![
+                InterpolationPart::Literal("x".to_string()),
+                InterpolationPart::Expr(Value::resource_ref("c", "id", vec![])),
+            ]),
+            Value::FunctionCall {
+                name: "join".to_string(),
+                args: vec![Value::resource_ref("d", "id", vec![])],
+            },
+            Value::Secret(Box::new(Value::resource_ref("e", "id", vec![]))),
+            Value::Closure {
+                name: "fn".to_string(),
+                captured_args: vec![Value::resource_ref("f", "id", vec![])],
+                remaining_arity: 1,
+            },
+            Value::String("plain".to_string()),
+        ]);
+
+        let mut collected: Vec<String> = Vec::new();
+        value.visit_refs(&mut |path| {
+            collected.push(path.binding().to_string());
+        });
+        collected.sort();
+        assert_eq!(collected, vec!["a", "b", "c", "d", "e", "f"]);
+    }
+
+    #[test]
+    fn visit_refs_on_leaf_variants_calls_nothing() {
+        for v in [
+            Value::String("s".into()),
+            Value::Int(1),
+            Value::Float(1.0),
+            Value::Bool(true),
+        ] {
+            let mut count = 0;
+            v.visit_refs(&mut |_| count += 1);
+            assert_eq!(count, 0);
+        }
     }
 }
