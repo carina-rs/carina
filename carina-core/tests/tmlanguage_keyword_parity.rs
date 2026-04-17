@@ -1,6 +1,9 @@
-//! Drift-detection tests: assert that every `KEYWORDS` entry appears in each
-//! `carina.tmLanguage.json` under its expected scope, and that the grammar
-//! lists nothing beyond `KEYWORDS`.
+//! Drift-detection tests for the two TextMate grammar files.
+//!
+//! - Per-file: every `KEYWORDS` entry appears under its expected scope, and
+//!   nothing extra is listed.
+//! - Cross-file: the vscode and tmbundle grammars are byte-identical, so an
+//!   edit to one without the other is caught immediately.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -104,4 +107,28 @@ fn vscode_grammar_matches_keywords() {
 #[test]
 fn tmbundle_grammar_matches_keywords() {
     assert_grammar_matches(TMBUNDLE_GRAMMAR);
+}
+
+#[test]
+fn vscode_and_tmbundle_grammars_are_byte_identical() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let vscode = fs::read(manifest_dir.join(VSCODE_GRAMMAR))
+        .unwrap_or_else(|e| panic!("failed to read {VSCODE_GRAMMAR}: {e}"));
+    let tmbundle = fs::read(manifest_dir.join(TMBUNDLE_GRAMMAR))
+        .unwrap_or_else(|e| panic!("failed to read {TMBUNDLE_GRAMMAR}: {e}"));
+    if vscode != tmbundle {
+        let first_diff = vscode
+            .iter()
+            .zip(tmbundle.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(vscode.len().min(tmbundle.len()));
+        panic!(
+            "`{VSCODE_GRAMMAR}` ({vscode_len} bytes) and `{TMBUNDLE_GRAMMAR}` \
+             ({tmbundle_len} bytes) must stay byte-identical. First difference at \
+             byte offset {first_diff}. Edit both files together; the keyword \
+             parity tests above only inspect the keyword bucket.",
+            vscode_len = vscode.len(),
+            tmbundle_len = tmbundle.len(),
+        );
+    }
 }
