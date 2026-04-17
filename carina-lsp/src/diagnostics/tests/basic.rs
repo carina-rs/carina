@@ -627,3 +627,89 @@ fn carina_diagnostic_helper_with_multiline_range() {
     assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
     assert_eq!(diag.source, Some("carina".to_string()));
 }
+
+#[test]
+fn unused_for_binding_emits_lsp_diagnostic() {
+    // A for-loop binding never referenced in the body should surface as an
+    // LSP diagnostic — not only a CLI warning — so editor users see it too.
+    let engine = test_engine();
+    let doc = create_document(
+        r#"let things = { a = 1, b = 2 }
+
+for name, account_id in things {
+  awscc.ec2.vpc {
+    cidr_block = account_id
+  }
+}
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+
+    let unused = diagnostics
+        .iter()
+        .find(|d| d.message.contains("for-loop binding 'name'"));
+    assert!(
+        unused.is_some(),
+        "expected LSP diagnostic for unused for-loop binding 'name', got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    let d = unused.unwrap();
+    assert_eq!(d.source, Some("carina".to_string()));
+    // Diagnostic should sit on the `for` line (1-indexed line 3 in source = 0-indexed 2)
+    assert_eq!(d.range.start.line, 2);
+}
+
+#[test]
+fn used_for_binding_no_lsp_diagnostic() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"let things = { a = 1, b = 2 }
+
+for key, value in things {
+  awscc.ec2.vpc {
+    name = key
+    cidr_block = value
+  }
+}
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|d| d.message.contains("for-loop binding")),
+        "used for-loop bindings should not produce diagnostics, got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn upstream_state_warning_not_in_lsp() {
+    // upstream_state "validate does not inspect" is a CLI-time informational
+    // note, not an editor-surface problem. Do NOT emit as LSP diagnostic.
+    let engine = test_engine();
+    let doc = create_document(
+        r#"let network = upstream_state {
+  source = "../network"
+}
+
+awscc.ec2.security_group {
+  group_description = "Web SG"
+  vpc_id = network.vpc_id
+}
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|d| d.message.contains("validate does not inspect")),
+        "upstream_state informational warning must stay CLI-only, got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}

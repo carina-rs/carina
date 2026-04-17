@@ -1768,6 +1768,42 @@ pub enum ForBinding {
     Map(String, String),
 }
 
+impl ForBinding {
+    /// Every binding name introduced by this pattern, in declaration order.
+    pub fn names(&self) -> Vec<&str> {
+        match self {
+            ForBinding::Simple(a) => vec![a.as_str()],
+            ForBinding::Indexed(a, b) | ForBinding::Map(a, b) => vec![a.as_str(), b.as_str()],
+        }
+    }
+}
+
+/// Whether `name` appears in `text` as a whole identifier (not a substring
+/// of a longer identifier). An identifier is bounded by anything that is
+/// not ASCII alphanumeric or `_`.
+fn identifier_appears_in(text: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    let name_bytes = name.as_bytes();
+    let is_id_char = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+
+    let mut i = 0;
+    while i + name_bytes.len() <= bytes.len() {
+        if &bytes[i..i + name_bytes.len()] == name_bytes {
+            let before_ok = i == 0 || !is_id_char(bytes[i - 1]);
+            let after_idx = i + name_bytes.len();
+            let after_ok = after_idx == bytes.len() || !is_id_char(bytes[after_idx]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Result of parsing a for expression body: either a resource or a module call
 enum ForBodyResult {
     Resource(Box<Resource>),
@@ -1829,6 +1865,25 @@ fn parse_for_expr(
     // Parse the body (we'll re-parse it for each iteration)
     let body_pair = next_pair(&mut inner, "body", "for expression")?;
 
+    // Warn on loop variables never referenced in the body. `_` is a discard
+    // marker and is skipped. The check is a scan over the body's raw text
+    // for the binding name as a whole identifier — good enough because the
+    // grammar already guarantees identifiers appear at token boundaries.
+    let body_text = body_pair.as_str();
+    for var in binding.names() {
+        if var == "_" || identifier_appears_in(body_text, var) {
+            continue;
+        }
+        ctx.warnings.push(ParseWarning {
+            file: None,
+            line: for_line,
+            message: format!(
+                "for-loop binding '{}' is unused. Rename to '_' to suppress this warning.",
+                var
+            ),
+        });
+    }
+
     let mut resources = Vec::new();
     let mut module_calls = Vec::new();
 
@@ -1841,13 +1896,20 @@ fn parse_for_expr(
         }
     };
 
+    // Helper: only register non-discard bindings so `_` is never addressable.
+    let bind = |c: &mut ParseContext, name: &str, v: Value| {
+        if name != "_" {
+            c.set_variable(name.to_string(), v);
+        }
+    };
+
     // Expand based on iterable type
     match (&binding, &iterable) {
         (ForBinding::Simple(var), Value::List(items)) => {
             for (i, item) in items.iter().enumerate() {
                 let address = format!("{}[{}]", binding_name, i);
                 let mut iter_ctx = ctx.clone();
-                iter_ctx.set_variable(var.clone(), item.clone());
+                bind(&mut iter_ctx, var, item.clone());
                 let result = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
                 collect(result, &mut resources, &mut module_calls);
             }
@@ -1856,8 +1918,8 @@ fn parse_for_expr(
             for (i, item) in items.iter().enumerate() {
                 let address = format!("{}[{}]", binding_name, i);
                 let mut iter_ctx = ctx.clone();
-                iter_ctx.set_variable(idx_var.clone(), Value::Int(i as i64));
-                iter_ctx.set_variable(val_var.clone(), item.clone());
+                bind(&mut iter_ctx, idx_var, Value::Int(i as i64));
+                bind(&mut iter_ctx, val_var, item.clone());
                 let result = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
                 collect(result, &mut resources, &mut module_calls);
             }
@@ -1870,8 +1932,8 @@ fn parse_for_expr(
                 let val = &map[key];
                 let address = format!("{}[\"{}\"]", binding_name, key);
                 let mut iter_ctx = ctx.clone();
-                iter_ctx.set_variable(key_var.clone(), Value::String(key.clone()));
-                iter_ctx.set_variable(val_var.clone(), val.clone());
+                bind(&mut iter_ctx, key_var, Value::String(key.clone()));
+                bind(&mut iter_ctx, val_var, val.clone());
                 let result = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
                 collect(result, &mut resources, &mut module_calls);
             }
@@ -1915,23 +1977,30 @@ fn parse_for_expr(
             // variable(s) to extract the resource type and attribute template.
             let mut template_ctx = ctx.clone();
             let placeholder = || Value::String(DEFERRED_UPSTREAM_PLACEHOLDER.to_string());
+            let bind = |c: &mut ParseContext, name: &str, v: Value| {
+                if name != "_" {
+                    c.set_variable(name.to_string(), v);
+                }
+            };
             match &binding {
                 ForBinding::Simple(var) => {
-                    template_ctx.set_variable(var.clone(), placeholder());
+                    bind(&mut template_ctx, var, placeholder());
                 }
                 ForBinding::Indexed(idx, val) => {
-                    template_ctx.set_variable(
-                        idx.clone(),
+                    bind(
+                        &mut template_ctx,
+                        idx,
                         Value::String(DEFERRED_UPSTREAM_INDEX_PLACEHOLDER.to_string()),
                     );
-                    template_ctx.set_variable(val.clone(), placeholder());
+                    bind(&mut template_ctx, val, placeholder());
                 }
                 ForBinding::Map(k, v) => {
-                    template_ctx.set_variable(
-                        k.clone(),
+                    bind(
+                        &mut template_ctx,
+                        k,
                         Value::String(DEFERRED_UPSTREAM_KEY_PLACEHOLDER.to_string()),
                     );
-                    template_ctx.set_variable(v.clone(), placeholder());
+                    bind(&mut template_ctx, v, placeholder());
                 }
             }
 
@@ -2001,7 +2070,13 @@ fn parse_for_expr(
     Ok((resources, module_calls))
 }
 
-/// Parse a for binding pattern
+/// Parse a for binding pattern.
+///
+/// Each position accepts either an `identifier` or a `discard_pattern`
+/// (`_`). The text of the matched pair — either the identifier name or
+/// the literal `_` — is stored as the binding name. A `_` marker is not
+/// added to the parse-time scope and is exempt from the unused-binding
+/// warning; downstream code checks for `name == "_"` to enforce that.
 fn parse_for_binding(pair: pest::iterators::Pair<Rule>) -> Result<ForBinding, ParseError> {
     let inner = first_inner(pair, "binding pattern", "for binding")?;
     match inner.as_rule() {
@@ -10336,7 +10411,7 @@ awscc.ec2.vpc {
                 source = "../organizations"
             }
 
-            for name, account in orgs.accounts {
+            for name, _ in orgs.accounts {
                 awscc.ec2.vpc {
                     name = name
                     cidr_block = '10.0.0.0/16'
@@ -10345,13 +10420,11 @@ awscc.ec2.vpc {
         "#;
 
         let parsed = parse(input, &ProviderContext::default()).unwrap();
-        assert_eq!(parsed.warnings.len(), 1);
-        let w = &parsed.warnings[0];
-        assert!(
-            w.message.contains("upstream_state 'orgs'"),
-            "warning should mention upstream_state binding name, got: {}",
-            w.message
-        );
+        let w = parsed
+            .warnings
+            .iter()
+            .find(|w| w.message.contains("upstream_state 'orgs'"))
+            .expect("expected upstream_state warning");
         assert!(
             w.message.contains("../organizations"),
             "warning should mention the upstream source, got: {}",
@@ -10471,7 +10544,7 @@ awscc.ec2.vpc {
                 source = "../organizations"
             }
 
-            for name, account in orgs.accounts {
+            for name, _ in orgs.accounts {
                 awscc.ec2.vpc {
                     name = name
                     cidr_block = '10.0.0.0/16'
@@ -10570,7 +10643,7 @@ awscc.ec2.vpc {
                 cidr_block = '10.0.0.0/16'
             }
 
-            for name, item in config.items {
+            for name, _ in config.items {
                 awscc.ec2.subnet {
                     name = name
                     cidr_block = '10.0.1.0/24'
@@ -11148,6 +11221,198 @@ awscc.ec2.vpc {
             result.is_ok(),
             "Reference to declared binding's attribute must parse: {:?}",
             result.err()
+        );
+    }
+
+    #[test]
+    fn for_discard_pattern_simple_parses() {
+        // `for _ in xs` should parse — the loop variable is intentionally unused.
+        let input = r#"
+            for _ in [1, 2, 3] {
+                awscc.ec2.vpc {
+                    cidr_block = '10.0.0.0/16'
+                }
+            }
+        "#;
+        let result = parse(input, &ProviderContext::default());
+        assert!(
+            result.is_ok(),
+            "discard in simple for-binding must parse: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn for_discard_pattern_map_key_parses() {
+        // `for _, v in m` — discard the map key, use only the value.
+        let input = r#"
+            let things = { a = 1, b = 2 }
+            for _, value in things {
+                awscc.ec2.vpc {
+                    cidr_block = '10.0.0.0/16'
+                }
+            }
+        "#;
+        let result = parse(input, &ProviderContext::default());
+        assert!(
+            result.is_ok(),
+            "discard in map-form key position must parse: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn for_discard_pattern_map_value_parses() {
+        let input = r#"
+            let things = { a = 1, b = 2 }
+            for key, _ in things {
+                awscc.ec2.vpc {
+                    cidr_block = '10.0.0.0/16'
+                }
+            }
+        "#;
+        let result = parse(input, &ProviderContext::default());
+        assert!(
+            result.is_ok(),
+            "discard in map-form value position must parse: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn for_discard_pattern_indexed_parses() {
+        let input = r#"
+            for (_, item) in [1, 2, 3] {
+                awscc.ec2.vpc {
+                    cidr_block = '10.0.0.0/16'
+                }
+            }
+        "#;
+        let result = parse(input, &ProviderContext::default());
+        assert!(
+            result.is_ok(),
+            "discard in indexed-form must parse: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn for_discard_pattern_cannot_be_referenced() {
+        // Using `_` on the RHS should error — it's not a binding, it's a
+        // discard marker. This mirrors `let _ = expr`.
+        let input = r#"
+            for _, v in { a = 1 } {
+                awscc.ec2.vpc {
+                    name = _
+                    cidr_block = '10.0.0.0/16'
+                }
+            }
+        "#;
+        let result = parse(input, &ProviderContext::default());
+        assert!(
+            result.is_err(),
+            "referencing a discard binding should error, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn for_unused_binding_warns_simple() {
+        // Simple-form loop variable never referenced inside the body — warn.
+        let input = r#"
+            for item in [1, 2, 3] {
+                awscc.ec2.vpc {
+                    cidr_block = '10.0.0.0/16'
+                }
+            }
+        "#;
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        let unused: Vec<_> = parsed
+            .warnings
+            .iter()
+            .filter(|w| w.message.contains("unused") && w.message.contains("item"))
+            .collect();
+        assert_eq!(
+            unused.len(),
+            1,
+            "expected one unused-for-binding warning, got: {:?}",
+            parsed.warnings
+        );
+    }
+
+    #[test]
+    fn for_used_binding_no_warning() {
+        // Binding is referenced in body — no warning.
+        let input = r#"
+            for item in [1, 2, 3] {
+                awscc.ec2.vpc {
+                    name = item
+                    cidr_block = '10.0.0.0/16'
+                }
+            }
+        "#;
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        assert!(
+            !parsed
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("unused") && w.message.contains("item")),
+            "expected no unused warning when binding is used, got: {:?}",
+            parsed.warnings
+        );
+    }
+
+    #[test]
+    fn for_unused_map_key_warns_only_key() {
+        // Only the map key is unused — warn for key, not value.
+        let input = r#"
+            let things = { a = 1, b = 2 }
+            for name, account_id in things {
+                awscc.ec2.vpc {
+                    cidr_block = account_id
+                }
+            }
+        "#;
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        let unused: Vec<_> = parsed
+            .warnings
+            .iter()
+            .filter(|w| w.message.contains("unused"))
+            .collect();
+        assert_eq!(
+            unused.len(),
+            1,
+            "expected one warning for unused key, got: {:?}",
+            parsed.warnings
+        );
+        assert!(
+            unused[0].message.contains("name"),
+            "expected warning to mention 'name', got: {}",
+            unused[0].message
+        );
+        assert!(
+            !unused[0].message.contains("account_id"),
+            "warning should not mention used binding, got: {}",
+            unused[0].message
+        );
+    }
+
+    #[test]
+    fn for_discard_binding_no_unused_warning() {
+        // `_` discard should suppress the unused-warning check.
+        let input = r#"
+            let things = { a = 1, b = 2 }
+            for _, account_id in things {
+                awscc.ec2.vpc {
+                    cidr_block = account_id
+                }
+            }
+        "#;
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        assert!(
+            !parsed.warnings.iter().any(|w| w.message.contains("unused")),
+            "discard binding should suppress unused warning, got: {:?}",
+            parsed.warnings
         );
     }
 
