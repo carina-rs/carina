@@ -175,6 +175,21 @@ impl CompletionProvider {
             });
         }
 
+        // Add for-loop binding names in scope at the cursor.
+        // Type inference for loop variables is a follow-up; for now we offer
+        // the bare identifier so the user at least gets autocomplete on the
+        // name itself.
+        let for_bindings = super::top_level::extract_for_binding_names_in_scope(text, position);
+        for name in &for_bindings {
+            completions.push(CompletionItem {
+                label: name.clone(),
+                kind: Some(CompletionItemKind::VARIABLE),
+                detail: Some("for-loop binding".to_string()),
+                insert_text: Some(name.clone()),
+                ..Default::default()
+            });
+        }
+
         // Look up the attribute type from schema
         if let Some(schema) = self.schemas.get(resource_type)
             && let Some(attr_schema) = schema.attributes.get(attr_name)
