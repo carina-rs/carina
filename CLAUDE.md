@@ -168,6 +168,13 @@ When modifying the DSL or resource schemas, also update the LSP:
   - `checks.rs`: Module loading and additional checks
   - Parser errors are automatically detected via `carina-core::parser`
 
+- **TextMate grammars** (editor syntax highlighting):
+  - `editors/vscode/syntaxes/carina.tmLanguage.json` and
+    `editors/carina.tmbundle/Syntaxes/carina.tmLanguage.json` must stay
+    **byte-identical**. Edit both files together; the parity test in
+    `carina-core/tests/tmlanguage_keyword_parity.rs` fails the build
+    otherwise.
+
 **Testing**: When bugs are found or issues are pointed out, write test code to capture the fix. This ensures regressions are caught and documents expected behavior.
 
 ### Resource Type Mapping
