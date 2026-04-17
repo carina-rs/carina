@@ -108,13 +108,21 @@ async fn test_from_file_cached_recovers_from_stale_cache() {
         .expect("initial from_file_cached should succeed");
     assert_eq!(factory.name(), "mock");
 
-    // Find the .cwasm file and corrupt it
+    // Find the .cwasm file before dropping the factory (path only, no access).
     let cwasm_path = std::fs::read_dir(cache_dir.path())
         .expect("read_dir")
         .filter_map(|e| e.ok())
         .find(|e| e.path().extension().is_some_and(|ext| ext == "cwasm"))
         .expect("should find .cwasm file")
         .path();
+
+    // Drop the factory — and therefore its mmap of this file — before
+    // overwriting. On Linux, mutating a file while a file-backed mmap of it
+    // is live results in SIGBUS on any later access to the now-invalid
+    // pages; macOS is more lenient, which is why this test slipped through
+    // locally.
+    drop(factory);
+
     std::fs::write(&cwasm_path, b"not a valid cwasm file")
         .expect("Failed to write stale cache file");
 
