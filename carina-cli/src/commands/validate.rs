@@ -43,7 +43,7 @@ pub fn run_validate(
     let base_dir = get_base_dir(path);
 
     // Surface bad `upstream_state.source` paths before printing warnings —
-    // otherwise the "is not yet in the upstream state" warning implies the
+    // otherwise the "validate does not inspect" warning implies the
     // source is reachable and misdirects the user.
     check_upstream_state_sources(base_dir, &parsed.upstream_states)?;
 

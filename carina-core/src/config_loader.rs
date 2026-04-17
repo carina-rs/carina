@@ -216,7 +216,7 @@ fn upgrade_cross_file_warnings(merged: &mut ParsedFile, unresolved: &ParsedFile)
             .find(|u| u.binding == binding_name)
         {
             let new_msg = format!(
-                "`{}` is not yet in the upstream state (upstream_state '{}' → {}).\n    Apply that directory first, then re-plan.",
+                "`{}` depends on upstream_state '{}' ({}), which validate does not inspect.",
                 path_str,
                 binding_name,
                 us.source.display(),
@@ -821,6 +821,77 @@ let orgs = upstream_state {
             result.is_ok(),
             "expected cross-file upstream_state binding in `for` to resolve, got: {:?}",
             result.err()
+        );
+    }
+
+    #[test]
+    fn cross_file_upstream_state_warning_does_not_assert_absence() {
+        // Regression for #1967: when a for-expression references an upstream_state
+        // declared in a different file, the merged warning must describe the
+        // dependency without claiming the key is absent — validate never reads
+        // the upstream state, so it cannot know.
+        let dir = create_temp_dir("cross_file_upstream_warning_wording");
+        fs::write(
+            dir.join("backend.crn"),
+            r#"backend local { path = 'carina.state.json' }
+
+let orgs = upstream_state {
+  source = '../organizations'
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("main.crn"),
+            r#"for name, account_id in orgs.accounts {
+  aws.s3.bucket {
+    name = name
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let result = load_configuration(&dir);
+        let loaded = result.expect("load should succeed");
+        cleanup(&dir);
+
+        let warning = loaded
+            .parsed
+            .warnings
+            .iter()
+            .find(|w| w.message.contains("orgs.accounts"))
+            .expect("expected a warning for orgs.accounts");
+
+        assert!(
+            warning.message.contains("upstream_state 'orgs'"),
+            "warning should name the upstream_state binding, got: {}",
+            warning.message
+        );
+        assert!(
+            warning.message.contains("../organizations"),
+            "warning should name the upstream source, got: {}",
+            warning.message
+        );
+        assert!(
+            warning.message.contains("validate does not inspect"),
+            "warning should explain that validate does not inspect upstream state, got: {}",
+            warning.message
+        );
+        assert!(
+            !warning.message.contains("not yet in the upstream state"),
+            "warning must not assert the key is absent, got: {}",
+            warning.message
+        );
+        assert!(
+            !warning.message.contains("Apply that directory first"),
+            "warning must not prescribe re-applying upstream, got: {}",
+            warning.message
+        );
+        assert!(
+            !warning.message.contains("known after apply"),
+            "cross-file warning should be upgraded past generic 'known after apply', got: {}",
+            warning.message
         );
     }
 

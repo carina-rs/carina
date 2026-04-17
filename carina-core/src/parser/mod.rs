@@ -1863,12 +1863,12 @@ fn parse_for_expr(
                 collect(result, &mut resources, &mut module_calls);
             }
         }
-        // Unresolved reference (e.g., missing upstream export) — tolerate with warning
+        // Unresolved reference — tolerate with warning; the value resolves at plan time
         (_, Value::ResourceRef { path }) => {
             let remote_binding = path.binding();
             let message = if let Some(us) = ctx.upstream_states.get(remote_binding) {
                 format!(
-                    "`{}` is not yet in the upstream state (upstream_state '{}' → {}).\n    Apply that directory first, then re-plan.",
+                    "`{}` depends on upstream_state '{}' ({}), which validate does not inspect.",
                     path.to_dot_string(),
                     remote_binding,
                     us.source.display(),
@@ -10190,7 +10190,9 @@ awscc.ec2.vpc {
     #[test]
     fn for_unresolved_upstream_state_warning() {
         // When a for-expression iterates over an unresolved upstream_state,
-        // the warning should mention the upstream directory rather than generic "known after apply".
+        // the warning should name the upstream binding and source without
+        // asserting absence or prescribing an action — validate does not
+        // read the upstream state, so it cannot know whether the key exists.
         let input = r#"
             let orgs = upstream_state {
                 source = "../organizations"
@@ -10218,8 +10220,19 @@ awscc.ec2.vpc {
             w.message
         );
         assert!(
-            w.message.contains("Apply that directory first"),
-            "warning should suggest applying upstream, got: {}",
+            w.message.contains("validate does not inspect"),
+            "warning should explain that validate does not inspect upstream state, got: {}",
+            w.message
+        );
+        // Must NOT assert absence — validate never reads the upstream state.
+        assert!(
+            !w.message.contains("not yet in the upstream state"),
+            "warning must not assert the key is absent, got: {}",
+            w.message
+        );
+        assert!(
+            !w.message.contains("Apply that directory first"),
+            "warning must not prescribe re-applying upstream, got: {}",
             w.message
         );
         // Should NOT contain the ambiguous "known after apply"
@@ -10641,7 +10654,7 @@ awscc.ec2.vpc {
                 .warnings
                 .iter()
                 .any(|w| w.message.contains("not yet available")
-                    || w.message.contains("not yet in the upstream state")),
+                    || w.message.contains("validate does not inspect")),
             "parse-time warning should be replaced, got: {:?}",
             parsed.warnings
         );
