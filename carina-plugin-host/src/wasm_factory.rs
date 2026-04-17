@@ -975,6 +975,25 @@ impl WasmProviderFactory {
     }
 
     /// Precompile a .wasm file and save the result to a .cwasm file.
+    ///
+    /// **Mmap safety invariant:** `from_precompiled` loads `.cwasm` via
+    /// `Component::deserialize_file`, which keeps the file memory-mapped for
+    /// the lifetime of the returned `Component`. Any in-place mutation of
+    /// `cwasm_path` — including `std::fs::write(cwasm_path, …)` or
+    /// `OpenOptions::truncate(true)` — while a previous `Component` is still
+    /// alive pulls backing pages out from under the mmap region; subsequent
+    /// access then traps as `SIGBUS` on Linux (macOS is more lenient, so a
+    /// bug slipping through on macOS still blows up in CI).
+    ///
+    /// To honor the invariant, this function writes to a sibling temp file
+    /// and then `rename()`s it onto `cwasm_path`. Rename creates a new inode
+    /// while keeping the old one alive until its last mapping closes, so any
+    /// previously-loaded factories remain valid. Do not "simplify" this to
+    /// a direct `std::fs::write(cwasm_path, …)`.
+    ///
+    /// The tempfile path includes the current process ID so that multiple
+    /// processes racing to precompile the same component don't clobber each
+    /// other's in-progress writes.
     pub fn precompile(wasm_path: &Path, cwasm_path: &Path) -> Result<(), String> {
         let config = build_engine_config();
         let engine = Engine::new(&config).map_err(|e| format!("Engine error: {e}"))?;
@@ -984,8 +1003,8 @@ impl WasmProviderFactory {
             .map_err(|e| format!("Precompile error: {e}"))?;
         if let Some(parent) = cwasm_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("Mkdir error: {e}"))?;
-            // Write to a temp file and atomically rename to avoid race conditions
-            // when multiple processes precompile the same component concurrently.
+            // Tempfile + atomic rename; preserves any live mmap held by a
+            // previously-loaded Component (see doc comment above for why).
             let tmp_path = parent.join(format!(
                 ".{}.tmp.{}",
                 cwasm_path
