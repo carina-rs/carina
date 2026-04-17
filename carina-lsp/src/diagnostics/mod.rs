@@ -12,7 +12,7 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::document::Document;
 use crate::position;
-use carina_core::parser::ParseError;
+use carina_core::parser::{ParseError, ParsedFile};
 use carina_core::provider::ProviderFactory;
 use carina_core::resource::Value;
 use carina_core::schema::ResourceSchema;
@@ -614,6 +614,12 @@ impl DiagnosticEngine {
                     .any(|name| d.message.contains(&format!("'{}'", name)))
             }));
 
+            // Surface unused-for-binding warnings (recorded in parsed.warnings by
+            // the parser) as LSP diagnostics. Other ParseWarnings (e.g. the
+            // upstream_state "validate does not inspect" note) are informational
+            // context meant for CLI output only and are not elevated here.
+            diagnostics.extend(self.check_unused_for_bindings(doc, parsed));
+
             // Check for unknown attributes on resource references (typo detection)
             diagnostics.extend(self.check_resource_ref_attributes(
                 doc,
@@ -685,6 +691,34 @@ impl DiagnosticEngine {
                         "Consider using pipe form for '{}': data |> {}(...)",
                         pw.name, pw.name
                     ),
+                ))
+            })
+            .collect()
+    }
+
+    /// Elevate "for-loop binding '<name>' is unused" parse warnings to LSP
+    /// diagnostics. Other ParseWarnings are intentionally not surfaced here:
+    /// informational notes (e.g. upstream_state "validate does not inspect")
+    /// belong on the CLI, not as editor squiggles.
+    fn check_unused_for_bindings(&self, doc: &Document, parsed: &ParsedFile) -> Vec<Diagnostic> {
+        let prefix = "for-loop binding '";
+        let text = doc.text();
+        parsed
+            .warnings
+            .iter()
+            .filter_map(|w| {
+                let rest = w.message.strip_prefix(prefix)?;
+                let name = rest.split('\'').next()?;
+                let line_idx = w.line.checked_sub(1)?;
+                let line_text = text.lines().nth(line_idx)?;
+                let byte_pos = line_text.find(name)?;
+                let col = position::byte_offset_to_char_offset(line_text, byte_pos);
+                Some(carina_diagnostic(
+                    line_idx as u32,
+                    col,
+                    col + name.chars().count() as u32,
+                    DiagnosticSeverity::WARNING,
+                    w.message.clone(),
                 ))
             })
             .collect()
