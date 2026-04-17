@@ -166,12 +166,8 @@ impl CompletionProvider {
                 resource_type = rt;
                 module_name = None;
                 // Extract binding name from "let binding_name = resource_type {"
-                current_binding = trimmed
-                    .strip_prefix("let ")
-                    .and_then(|rest| rest.find('=').map(|eq| rest[..eq].trim().to_string()))
-                    .filter(|name| {
-                        !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')
-                    });
+                current_binding =
+                    crate::let_parse::parse_let_header(trimmed).map(|(name, _)| name.to_string());
             } else if brace_depth == 0 && trimmed.starts_with("provider ") && trimmed.ends_with('{')
             {
                 // Detect "provider <name> {"
@@ -602,18 +598,10 @@ enum CompletionContext {
 /// Detect a `let <binding> = upstream_state {` opening line, where `<binding>`
 /// is a bare identifier. Used to enter the upstream_state block context.
 fn is_let_upstream_state_line(trimmed: &str) -> bool {
-    let Some(rest) = trimmed.strip_prefix("let ") else {
+    let Some((_, rhs)) = crate::let_parse::parse_let_header(trimmed) else {
         return false;
     };
-    let Some(eq_pos) = rest.find('=') else {
-        return false;
-    };
-    let binding = rest[..eq_pos].trim();
-    if binding.is_empty() || !binding.chars().all(|c| c.is_alphanumeric() || c == '_') {
-        return false;
-    }
-    let after_eq = rest[eq_pos + 1..].trim_start();
-    let Some(rest) = after_eq.strip_prefix("upstream_state") else {
+    let Some(rest) = rhs.strip_prefix("upstream_state") else {
         return false;
     };
     // Must be followed by whitespace or `{` to ensure it's the keyword, not a

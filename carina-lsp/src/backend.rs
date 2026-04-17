@@ -211,11 +211,7 @@ impl Backend {
             {
                 for line in content.lines() {
                     let trimmed = line.trim();
-                    if let Some(rest) = trimmed.strip_prefix("let ")
-                        && let Some(eq_pos) = rest.find('=')
-                    {
-                        let binding = rest[..eq_pos].trim();
-                        let after_eq = rest[eq_pos + 1..].trim();
+                    if let Some((binding, after_eq)) = crate::let_parse::parse_let_header(line) {
                         // Strip "read " prefix if present
                         let type_part = after_eq.strip_prefix("read ").unwrap_or(after_eq);
                         // Extract "provider.service.type" before "{"
@@ -255,15 +251,8 @@ impl Backend {
                 let text = doc.text();
                 let mut bindings = std::collections::HashSet::new();
                 for line in text.lines() {
-                    let trimmed = line.trim();
-                    if let Some(rest) = trimmed.strip_prefix("let ")
-                        && let Some(eq_pos) = rest.find('=')
-                    {
-                        let name = rest[..eq_pos].trim();
-                        if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')
-                        {
-                            bindings.insert(name.to_string());
-                        }
+                    if let Some((name, _)) = crate::let_parse::parse_let_header(line) {
+                        bindings.insert(name.to_string());
                     }
                 }
                 bindings

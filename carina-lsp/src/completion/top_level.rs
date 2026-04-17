@@ -186,24 +186,19 @@ impl CompletionProvider {
         // Generate module binding completions from import statements
         // e.g., "let github = import '...'" → suggest "github" with call scaffold
         for line in lines.iter() {
-            let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("let ")
-                && let Some(eq_pos) = rest.find('=')
+            if let Some((binding, after_eq)) = crate::let_parse::parse_let_header(line)
+                && binding != "_"
+                && after_eq.starts_with("import ")
             {
-                let binding = rest[..eq_pos].trim();
-                let after_eq = rest[eq_pos + 1..].trim();
-                if after_eq.starts_with("import ") && !binding.is_empty() && binding != "_" {
-                    // Try to load module and scaffold arguments
-                    let snippet = self.build_module_call_snippet(binding, after_eq, base_path);
-                    completions.push(CompletionItem {
-                        label: binding.to_string(),
-                        kind: Some(CompletionItemKind::MODULE),
-                        insert_text: Some(snippet),
-                        insert_text_format: Some(InsertTextFormat::SNIPPET),
-                        detail: Some("Module call".to_string()),
-                        ..Default::default()
-                    });
-                }
+                let snippet = self.build_module_call_snippet(binding, after_eq, base_path);
+                completions.push(CompletionItem {
+                    label: binding.to_string(),
+                    kind: Some(CompletionItemKind::MODULE),
+                    insert_text: Some(snippet),
+                    insert_text_format: Some(InsertTextFormat::SNIPPET),
+                    detail: Some("Module call".to_string()),
+                    ..Default::default()
+                });
             }
         }
 
@@ -300,26 +295,9 @@ impl CompletionProvider {
     pub(super) fn extract_resource_bindings(&self, text: &str) -> Vec<(String, String)> {
         let mut bindings = Vec::new();
         for line in text.lines() {
-            let trimmed = line.trim();
-            // Parse: let binding_name = <resource_type> {
-            if let Some(rest) = trimmed.strip_prefix("let ")
-                && let Some(eq_pos) = rest.find('=')
-            {
-                let binding_name = rest[..eq_pos].trim();
-                if !binding_name.is_empty()
-                    && binding_name
-                        .chars()
-                        .all(|c| c.is_alphanumeric() || c == '_')
-                {
-                    // Extract resource type from the part after "="
-                    let after_eq = rest[eq_pos + 1..].trim();
-                    if let Some(resource_type) = self.extract_resource_type(after_eq) {
-                        bindings.push((binding_name.to_string(), resource_type));
-                    } else {
-                        // Fallback: include binding with empty resource type
-                        bindings.push((binding_name.to_string(), String::new()));
-                    }
-                }
+            if let Some((binding_name, after_eq)) = crate::let_parse::parse_let_header(line) {
+                let resource_type = self.extract_resource_type(after_eq).unwrap_or_default();
+                bindings.push((binding_name.to_string(), resource_type));
             }
         }
         bindings
@@ -390,24 +368,16 @@ impl CompletionProvider {
     /// Find the import path for a given module name from let import bindings
     pub(super) fn find_module_import_path(&self, module_name: &str, text: &str) -> Option<String> {
         for line in text.lines() {
-            let trimmed = line.trim();
-            // Parse: let name = import "path"
-            if let Some(rest) = trimmed.strip_prefix("let ") {
-                let rest = rest.trim_start();
-                if let Some(eq_pos) = rest.find('=') {
-                    let alias = rest[..eq_pos].trim();
-                    let after_eq = rest[eq_pos + 1..].trim();
-                    if let Some(import_rest) = after_eq.strip_prefix("import ") {
-                        let import_rest = import_rest.trim();
-                        if let Some(path_start) = import_rest.find('"')
-                            && let Some(path_end) = import_rest[path_start + 1..].find('"')
-                        {
-                            let path = &import_rest[path_start + 1..path_start + 1 + path_end];
-                            if alias == module_name {
-                                return Some(path.to_string());
-                            }
-                        }
-                    }
+            if let Some((alias, after_eq)) = crate::let_parse::parse_let_header(line)
+                && alias == module_name
+                && let Some(import_rest) = after_eq.strip_prefix("import ")
+            {
+                let import_rest = import_rest.trim();
+                if let Some(path_start) = import_rest.find('"')
+                    && let Some(path_end) = import_rest[path_start + 1..].find('"')
+                {
+                    let path = &import_rest[path_start + 1..path_start + 1 + path_end];
+                    return Some(path.to_string());
                 }
             }
         }
@@ -546,15 +516,7 @@ fn is_after_let_binding(line: &str, prefix_start: usize) -> bool {
         .nth(prefix_start)
         .map(|(i, _)| i)
         .unwrap_or(line.len());
-    let trimmed = line[..byte_end].trim_start();
-    let Some(rest) = trimmed.strip_prefix("let ") else {
-        return false;
-    };
-    let Some(eq_pos) = rest.find('=') else {
-        return false;
-    };
-    let name = rest[..eq_pos].trim();
-    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    crate::let_parse::parse_let_header(&line[..byte_end]).is_some()
 }
 
 #[cfg(test)]
