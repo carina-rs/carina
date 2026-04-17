@@ -525,20 +525,20 @@ impl HoverProvider {
     }
 
     fn attribute_hover(&self, word: &str, enclosing_resource: Option<&str>) -> Option<Hover> {
-        // If we know the enclosing resource type, look up only that schema
-        if let Some(resource_type) = enclosing_resource
-            && let Some(schema) = self.schemas.get(resource_type)
-            && let Some(attr) = schema.attributes.get(word)
-        {
-            return self.build_attribute_hover(attr);
+        // When we know the enclosing resource, only its schema is authoritative.
+        // Falling back to a global scan would return a lookalike attribute from
+        // an unrelated schema (nondeterministic via HashMap iteration order) —
+        // see #1988.
+        if let Some(resource_type) = enclosing_resource {
+            return self
+                .schemas
+                .get(resource_type)
+                .and_then(|schema| schema.attributes.get(word))
+                .and_then(|attr| self.build_attribute_hover(attr));
         }
 
-        // Fall back to iterating all schemas
-        for schema in self.schemas.values() {
-            if let Some(attr) = schema.attributes.get(word) {
-                return self.build_attribute_hover(attr);
-            }
-        }
+        // No enclosing-resource context (e.g., bare identifier at top level):
+        // we have nothing to anchor the lookup to, so do not guess.
         None
     }
 
@@ -777,12 +777,15 @@ mod tests {
             desc,
         );
 
+        // The attribute must be hovered inside its enclosing resource block so
+        // the resolver has the schema context to anchor on (see #1988).
         let doc = Document::new(
-            "secondary_allocation_ids".to_string(),
+            "ec2.nat_gateway {\n  secondary_allocation_ids\n}\n".to_string(),
             Arc::new(ProviderContext::default()),
         );
+        // Hover on the attribute name (line 1, inside the identifier).
         let hover = provider
-            .hover(&doc, Position::new(0, 5))
+            .hover(&doc, Position::new(1, 5))
             .expect("Should find hover for attribute");
 
         let content = match &hover.contents {
@@ -921,6 +924,56 @@ awscc.ec2.vpc_gateway_attachment {
             "Hover should NOT show description from a different resource (internet_gateway), \
              but got:\n{}",
             content
+        );
+    }
+
+    #[test]
+    fn test_attribute_hover_unknown_in_enclosing_resource_returns_none() {
+        // Regression for #1988: when a word is NOT an attribute of the
+        // enclosing resource, hover must return None — not fall back to a
+        // lookalike attribute from an unrelated resource schema.
+        let mut schemas = HashMap::new();
+
+        // `account_id` lives on organizations.account only.
+        let account_schema = ResourceSchema::new("awscc.organizations.account").attribute(
+            AttributeSchema::new("account_id", AttributeType::String)
+                .with_description("The unique identifier (ID) of the new account."),
+        );
+        schemas.insert("awscc.organizations.account".to_string(), account_schema);
+
+        // `awscc.sso.assignment` intentionally has NO `account_id`.
+        let assignment_schema = ResourceSchema::new("awscc.sso.assignment").attribute(
+            AttributeSchema::new("target_id", AttributeType::String).with_description("Target id."),
+        );
+        schemas.insert("awscc.sso.assignment".to_string(), assignment_schema);
+
+        let provider = HoverProvider::new(Arc::new(schemas), vec![]);
+
+        // Simulates the repro: a for-loop binding named `account_id` used as
+        // an attribute value inside an sso.assignment block.
+        let doc = Document::new(
+            r#"for _, account_id in orgs.accounts {
+    awscc.sso.assignment {
+        target_id = account_id
+    }
+}
+"#
+            .to_string(),
+            Arc::new(ProviderContext::default()),
+        );
+
+        // Hover on the `account_id` token in `target_id = account_id`
+        // (line 2, char 21 puts the cursor inside "account_id").
+        let hover = provider.hover(&doc, Position::new(2, 25));
+
+        assert!(
+            hover.is_none(),
+            "Hover on a non-attribute identifier must be None; \
+             must not fall back to an unrelated schema. Got: {:?}",
+            hover.map(|h| match h.contents {
+                HoverContents::Markup(m) => m.value,
+                _ => String::new(),
+            })
         );
     }
 
