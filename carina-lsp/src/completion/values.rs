@@ -475,6 +475,7 @@ impl CompletionProvider {
     pub(super) fn upstream_state_source_completions(
         &self,
         partial_path: &str,
+        position: Position,
         base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {
         let Some(base) = base_path else {
@@ -505,20 +506,34 @@ impl CompletionProvider {
         // Truncated by ancestor discovery order (nearest first), then sorted for display.
         suggestions.sort();
 
+        // Replace the typed partial (from just after the opening quote to the
+        // cursor) with the full suggestion. A plain `insert_text` would leave
+        // the client to infer the replacement range via word boundaries, which
+        // splits on `/` and `.` and produces `../../foo` when the user typed
+        // `../or` — an explicit TextEdit avoids that.
+        let partial_chars = partial_path.chars().count() as u32;
+        let range = Range {
+            start: Position {
+                line: position.line,
+                character: position.character.saturating_sub(partial_chars),
+            },
+            end: position,
+        };
+
         suggestions
             .into_iter()
             .filter(|p| partial_path.is_empty() || p.starts_with(partial_path))
             .map(|p| CompletionItem {
-                // Completion fires with the cursor already inside an open
-                // quote (see `extract_upstream_source_partial`), so the
-                // insert text must be the bare path — wrapping it in quotes
-                // would produce nested-quoted output like `'../'../foo''`.
-                // The label keeps quotes for display consistency with how
-                // the value appears in the source.
+                // Label keeps quotes so the popup reads like the source form;
+                // the TextEdit inserts the bare path, since the cursor is
+                // already inside an open quote.
                 label: format!("'{}'", p),
                 kind: Some(CompletionItemKind::FOLDER),
                 detail: Some("Carina project".to_string()),
-                insert_text: Some(p),
+                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                    range,
+                    new_text: p,
+                })),
                 ..Default::default()
             })
             .collect()
