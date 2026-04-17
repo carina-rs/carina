@@ -9,8 +9,14 @@ use carina_plugin_host::WasmProviderFactory;
 
 fn wasm_path() -> Option<PathBuf> {
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-    let path = workspace_root.join("target/wasm32-wasip2/debug/carina_provider_mock.wasm");
-    if path.exists() { Some(path) } else { None }
+    // Cargo uses hyphens in binary names but underscores in library names; check both.
+    for name in &["carina_provider_mock.wasm", "carina-provider-mock.wasm"] {
+        let path = workspace_root.join("target/wasm32-wasip2/debug").join(name);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
 }
 
 macro_rules! skip_if_no_wasm {
@@ -28,12 +34,25 @@ macro_rules! skip_if_no_wasm {
     };
 }
 
+/// Build a `WasmProviderFactory` using a per-test temporary cache directory.
+///
+/// Tests in this binary run in parallel; if they all shared
+/// `WasmProviderFactory::new()`'s default `~/.carina/cache`, concurrent
+/// precompile runs race on the same `.cwasm` path and one test can observe
+/// a partially-written file (`"failed to load code for …"`). Each test gets
+/// its own cache dir via this helper to eliminate that race.
+async fn load_factory(wasm: &std::path::Path) -> (WasmProviderFactory, tempfile::TempDir) {
+    let cache = tempfile::tempdir().expect("Failed to create cache tempdir");
+    let factory = WasmProviderFactory::from_file_cached(wasm, cache.path())
+        .await
+        .expect("Failed to load WASM provider");
+    (factory, cache)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_mock_provider_factory() {
     let path = skip_if_no_wasm!();
-    let factory = WasmProviderFactory::new(path)
-        .await
-        .expect("Failed to load WASM provider");
+    let (factory, _cache) = load_factory(&path).await;
 
     assert_eq!(factory.name(), "mock");
     assert_eq!(factory.display_name(), "Mock Provider (Process)");
@@ -46,9 +65,7 @@ async fn test_wasm_mock_provider_factory() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_mock_provider_create_and_read() {
     let path = skip_if_no_wasm!();
-    let factory = WasmProviderFactory::new(path)
-        .await
-        .expect("Failed to load WASM provider");
+    let (factory, _cache) = load_factory(&path).await;
     let provider = factory.create_provider(&HashMap::new()).await;
 
     assert_eq!(provider.name(), "mock");
@@ -105,9 +122,7 @@ async fn test_wasm_mock_provider_create_and_read() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_mock_provider_update_and_delete() {
     let path = skip_if_no_wasm!();
-    let factory = WasmProviderFactory::new(path)
-        .await
-        .expect("Failed to load WASM provider");
+    let (factory, _cache) = load_factory(&path).await;
     let provider = factory.create_provider(&HashMap::new()).await;
 
     let id = ResourceId::with_provider("mock", "test.resource", "updatable");
@@ -174,9 +189,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_mock_provider_normalizer() {
     let path = skip_if_no_wasm!();
-    let factory = WasmProviderFactory::new(path)
-        .await
-        .expect("Failed to load WASM provider");
+    let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory.create_normalizer(&HashMap::new()).await;
 
     // normalize_desired: mock provider returns resources unchanged
@@ -212,9 +225,7 @@ async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
     // into state plus a sentinel `__mock_read_data_source__` flag. If
     // that flag shows up, the WASM bridge forwarded the call correctly.
     let path = skip_if_no_wasm!();
-    let factory = WasmProviderFactory::new(path)
-        .await
-        .expect("Failed to load WASM provider");
+    let (factory, _cache) = load_factory(&path).await;
     let provider = factory.create_provider(&HashMap::new()).await;
 
     let mut resource = Resource::with_provider("mock", "test.data_source", "example");

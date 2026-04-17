@@ -97,7 +97,13 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
+      # Build the WASM fixture so carina-plugin-host's integration tests run
+      # instead of silently skipping. Without this step a stale or missing
+      # fixture leaves the wasm_integration_test suite as a no-op in CI.
+      - run: cargo build -p carina-provider-mock --target wasm32-wasip2
       - run: cargo test --all-features
 
   binary-build:
