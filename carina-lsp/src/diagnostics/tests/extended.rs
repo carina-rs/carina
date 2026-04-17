@@ -1990,3 +1990,103 @@ fn no_undefined_resource_for_sibling_binding_in_exports() {
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn upstream_state_missing_source_directory_is_flagged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let engine = test_engine();
+    let doc = create_document(
+        r#"let orgs = upstream_state {
+    source = '../nonexistent'
+}
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, Some(&base), &HashMap::new(), &HashSet::new());
+
+    let diag = diagnostics
+        .iter()
+        .find(|d| d.message.contains("upstream_state 'orgs'"));
+    assert!(
+        diag.is_some(),
+        "Expected a diagnostic for missing upstream_state source. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    let diag = diag.unwrap();
+    assert!(
+        diag.message.contains("../nonexistent") && diag.message.contains("does not exist"),
+        "unexpected message: {}",
+        diag.message
+    );
+    // Range should point at the source value on line 1 (0-based).
+    assert_eq!(
+        diag.range.start.line, 1,
+        "diagnostic should point at the `source = ...` line"
+    );
+}
+
+#[test]
+fn upstream_state_source_check_ignores_same_source_in_provider_block() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    let engine = test_engine();
+    // A `provider` block with the same `source = '...'` string as the
+    // `upstream_state` block. The diagnostic must land on the upstream_state
+    // line (line 5 here, 0-based 4), not the provider line.
+    let doc = create_document(
+        r#"provider aws {
+    source = '../nonexistent'
+    region = 'ap-northeast-1'
+}
+let orgs = upstream_state {
+    source = '../nonexistent'
+}
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, Some(&base), &HashMap::new(), &HashSet::new());
+
+    let diag = diagnostics
+        .iter()
+        .find(|d| d.message.contains("upstream_state 'orgs'"));
+    assert!(
+        diag.is_some(),
+        "expected diagnostic for upstream_state source. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        diag.unwrap().range.start.line,
+        5,
+        "diagnostic must point at the upstream_state source line, not the provider's"
+    );
+}
+
+#[test]
+fn upstream_state_existing_source_directory_is_ok() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("project");
+    std::fs::create_dir(&base).unwrap();
+    std::fs::create_dir(tmp.path().join("upstream")).unwrap();
+
+    let engine = test_engine();
+    let doc = create_document(
+        r#"let orgs = upstream_state {
+    source = '../upstream'
+}
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, Some(&base), &HashMap::new(), &HashSet::new());
+
+    let diag = diagnostics
+        .iter()
+        .find(|d| d.message.contains("upstream_state"));
+    assert!(
+        diag.is_none(),
+        "Existing source should not trigger diagnostic. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}

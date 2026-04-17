@@ -144,6 +144,7 @@ impl DiagnosticEngine {
             // Check module calls
             if let Some(base) = base_path {
                 diagnostics.extend(self.check_module_calls(doc, parsed, base));
+                diagnostics.extend(self.check_upstream_state_sources(doc, parsed, base));
             }
             // Build binding_name -> (provider, resource_type) map for ResourceRef type checking
             let mut binding_schema_map: HashMap<String, ResourceSchema> = HashMap::new();
