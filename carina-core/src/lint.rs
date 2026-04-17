@@ -159,27 +159,40 @@ fn is_snake_case(name: &str) -> bool {
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
-/// Extract a binding name from the text after a keyword (`let`, `for`, `import`).
+/// Extract a binding name from the text after `let` or `import`.
 ///
-/// If `stop_at_eq` is true, the name is delimited by whitespace or `=` (for `let`/`import`).
-/// If false, the name is delimited by whitespace only (for `for`).
-/// Returns `None` if the name is empty or starts with `_`.
-fn extract_binding_name(after_keyword: &str, stop_at_eq: bool) -> Option<String> {
+/// The name is delimited by whitespace or `=`. Returns `None` if the name is
+/// empty or starts with `_`. `for` lines use `extract_for_binding_names`
+/// instead because they can carry two names (map form).
+fn extract_binding_name(after_keyword: &str) -> Option<String> {
     let trimmed = after_keyword.trim_start();
-    let name: String = if stop_at_eq {
-        trimmed
-            .chars()
-            .take_while(|c| !c.is_whitespace() && *c != '=')
-            .collect()
-    } else {
-        trimmed.chars().take_while(|c| !c.is_whitespace()).collect()
-    };
+    let name: String = trimmed
+        .chars()
+        .take_while(|c| !c.is_whitespace() && *c != '=')
+        .collect();
 
     if name.is_empty() || name.starts_with('_') {
         return None;
     }
 
     Some(name)
+}
+
+/// Extract binding names from a `for` line.
+///
+/// Handles both forms:
+/// - Single: `for v in xs` → `["v"]`
+/// - Map: `for k, v in m` → `["k", "v"]`
+///
+/// The "header" is the portion before ` in `. Names beginning with `_` are
+/// dropped (discard/unused markers are not subject to the naming check).
+fn extract_for_binding_names(after_for: &str) -> Vec<String> {
+    let header = after_for.split(" in ").next().unwrap_or("");
+    header
+        .split(',')
+        .map(|part| part.trim().to_string())
+        .filter(|part| !part.is_empty() && !part.starts_with('_'))
+        .collect()
 }
 
 /// Find `let` bindings with non-snake_case names in source text.
@@ -197,24 +210,26 @@ pub fn find_non_snake_case_bindings(source: &str) -> Vec<NamingWarning> {
             continue;
         }
 
-        // Extract binding name from `let`, `for`, or `import` patterns
-        let name = if let Some(rest) = trimmed.strip_prefix("let ") {
-            extract_binding_name(rest, true)
+        // Extract binding name(s) from `let`, `for`, or `import` patterns.
+        // `for` may have two names (map-form: `for k, v in m`); every other
+        // form has at most one.
+        let names: Vec<String> = if let Some(rest) = trimmed.strip_prefix("let ") {
+            extract_binding_name(rest).into_iter().collect()
         } else if let Some(rest) = trimmed.strip_prefix("for ") {
-            extract_binding_name(rest, false)
+            extract_for_binding_names(rest)
         } else if let Some(rest) = trimmed.strip_prefix("import ") {
-            extract_binding_name(rest, true)
+            extract_binding_name(rest).into_iter().collect()
         } else {
-            None
+            Vec::new()
         };
 
-        if let Some(name) = name
-            && !is_snake_case(&name)
-        {
-            warnings.push(NamingWarning {
-                name,
-                line: line_idx + 1,
-            });
+        for name in names {
+            if !is_snake_case(&name) {
+                warnings.push(NamingWarning {
+                    name,
+                    line: line_idx + 1,
+                });
+            }
         }
     }
 
@@ -869,6 +884,90 @@ let e = replace("old", "new", str)
         let source = "for item in items {\n    let x = item\n}";
         let results = find_non_snake_case_bindings(source);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_naming_for_map_form_snake_case_no_warning() {
+        // Map-form iteration: `for k, v in m`. Both bindings snake_case — no warning.
+        // Previously the lint took the first whitespace-delimited token ("name,")
+        // and warned because of the trailing comma.
+        let source = "for name, account_id in orgs.accounts {\n    let x = name\n}";
+        let results = find_non_snake_case_bindings(source);
+        assert!(
+            results.is_empty(),
+            "map-form snake_case bindings should not warn, got: {:?}",
+            results
+        );
+    }
+
+    #[test]
+    fn test_naming_for_map_form_pascal_case_warns_both() {
+        // Both map-form bindings should be checked independently.
+        let source = "for K, V in m {\n    let x = K\n}";
+        let results = find_non_snake_case_bindings(source);
+        assert_eq!(
+            results.len(),
+            2,
+            "both map-form bindings should warn, got: {:?}",
+            results
+        );
+        let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"K"), "expected K in {:?}", names);
+        assert!(names.contains(&"V"), "expected V in {:?}", names);
+        // Neither name should carry a comma.
+        assert!(
+            results.iter().all(|r| !r.name.contains(',')),
+            "warning names must not contain commas, got: {:?}",
+            results
+        );
+    }
+
+    #[test]
+    fn test_naming_for_map_form_mixed_warns_only_bad() {
+        // One snake_case + one PascalCase — only the bad one warns.
+        let source = "for key, BadValue in m {\n    let x = key\n}";
+        let results = find_non_snake_case_bindings(source);
+        assert_eq!(results.len(), 1, "only one warning expected: {:?}", results);
+        assert_eq!(results[0].name, "BadValue");
+    }
+
+    #[test]
+    fn test_naming_for_iterable_contains_in_word() {
+        // If the iterable's name contains " in " (as a substring of an
+        // identifier), we still only split on the first occurrence. This
+        // happens to be safe for identifiers because ` in ` — with its
+        // surrounding spaces — cannot appear inside a single identifier.
+        let source = "for v in items_in_group {\n}";
+        let results = find_non_snake_case_bindings(source);
+        assert!(
+            results.is_empty(),
+            "iterable containing 'in' substring should not confuse parser, got: {:?}",
+            results
+        );
+    }
+
+    #[test]
+    fn test_naming_for_map_form_extra_whitespace() {
+        // Extra spaces around the comma should not matter.
+        let source = "for key,   value in m {\n}";
+        let results = find_non_snake_case_bindings(source);
+        assert!(
+            results.is_empty(),
+            "extra whitespace around comma should still yield snake_case names, got: {:?}",
+            results
+        );
+    }
+
+    #[test]
+    fn test_naming_for_map_form_underscore_discard_skipped() {
+        // A `_`-prefixed binding on either side should be skipped.
+        let source = "for _k, v in m {\n    let x = v\n}";
+        let results = find_non_snake_case_bindings(source);
+        assert!(
+            results.is_empty(),
+            "discard binding should be skipped, got: {:?}",
+            results
+        );
     }
 
     #[test]
