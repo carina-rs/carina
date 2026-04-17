@@ -58,14 +58,14 @@ impl CompletionProvider {
             "let ${1:name} = read ${2:aws.s3.bucket} {\n    name = \"${3:existing-resource}\"\n}"
         };
         let let_import_snippet = if after_let_binding {
-            "import \"${1:./modules/name}\""
+            "import '${1:./modules/name}'"
         } else {
-            "let ${1:module_name} = import \"${2:./modules/name}\""
+            "let ${1:module_name} = import '${2:./modules/name}'"
         };
         let upstream_state_snippet = if after_let_binding {
-            "upstream_state {\n    source = \"${1:../other-project}\"\n}"
+            "upstream_state {\n    source = '${1:../other-project}'\n}"
         } else {
-            "let ${1:binding} = upstream_state {\n    source = \"${2:../other-project}\"\n}"
+            "let ${1:binding} = upstream_state {\n    source = '${2:../other-project}'\n}"
         };
 
         let mut completions = vec![
@@ -136,7 +136,7 @@ impl CompletionProvider {
             CompletionItem {
                 label: "import".to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
-                insert_text: Some("import {\n    to = ${1:awscc.ec2.vpc} \"${2:name}\"\n    id = \"${3:resource-id}\"\n}".to_string()),
+                insert_text: Some("import {\n    to = ${1:awscc.ec2.vpc} '${2:name}'\n    id = '${3:resource-id}'\n}".to_string()),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Import existing resource into state".to_string()),
                 ..Default::default()
@@ -144,7 +144,7 @@ impl CompletionProvider {
             CompletionItem {
                 label: "removed".to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
-                insert_text: Some("removed {\n    from = ${1:awscc.ec2.vpc} \"${2:name}\"\n}".to_string()),
+                insert_text: Some("removed {\n    from = ${1:awscc.ec2.vpc} '${2:name}'\n}".to_string()),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Remove resource from state without destroying".to_string()),
                 ..Default::default()
@@ -152,7 +152,7 @@ impl CompletionProvider {
             CompletionItem {
                 label: "moved".to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
-                insert_text: Some("moved {\n    from = ${1:awscc.ec2.vpc} \"${2:old-name}\"\n    to   = ${3:awscc.ec2.vpc} \"${4:new-name}\"\n}".to_string()),
+                insert_text: Some("moved {\n    from = ${1:awscc.ec2.vpc} '${2:old-name}'\n    to   = ${3:awscc.ec2.vpc} '${4:new-name}'\n}".to_string()),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Move/rename resource in state".to_string()),
                 ..Default::default()
@@ -373,8 +373,9 @@ impl CompletionProvider {
                 && let Some(import_rest) = after_eq.strip_prefix("import ")
             {
                 let import_rest = import_rest.trim();
-                if let Some(path_start) = import_rest.find('"')
-                    && let Some(path_end) = import_rest[path_start + 1..].find('"')
+                if let Some(path_start) = import_rest.find(['"', '\''])
+                    && let Some(quote) = import_rest[path_start..].chars().next()
+                    && let Some(path_end) = import_rest[path_start + 1..].find(quote)
                 {
                     let path = &import_rest[path_start + 1..path_start + 1 + path_end];
                     return Some(path.to_string());

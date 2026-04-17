@@ -610,15 +610,63 @@ fn is_let_upstream_state_line(trimmed: &str) -> bool {
     next.starts_with('{') || next.is_empty()
 }
 
-/// If `prefix` ends with `source = '<partial>` (unclosed single quote), return
-/// `<partial>`. Otherwise return `None`.
+/// If `prefix` ends with `source = '<partial>` or `source = "<partial>`
+/// (unclosed quote of either kind), return `<partial>`. Otherwise return
+/// `None`.
 fn extract_upstream_source_partial(prefix: &str) -> Option<String> {
     let trimmed = prefix.trim_start();
     let rest = trimmed.strip_prefix("source")?;
     let rest = rest.trim_start().strip_prefix('=')?.trim_start();
-    let rest = rest.strip_prefix('\'')?;
-    if rest.contains('\'') {
+    let (quote, rest) = if let Some(r) = rest.strip_prefix('\'') {
+        ('\'', r)
+    } else {
+        ('"', rest.strip_prefix('"')?)
+    };
+    if rest.contains(quote) {
         return None;
     }
     Some(rest.to_string())
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::extract_upstream_source_partial;
+
+    #[test]
+    fn single_quote_unclosed_returns_partial() {
+        assert_eq!(
+            extract_upstream_source_partial("source = '"),
+            Some(String::new())
+        );
+        assert_eq!(
+            extract_upstream_source_partial("source = '../ot"),
+            Some("../ot".to_string())
+        );
+    }
+
+    #[test]
+    fn double_quote_unclosed_returns_partial() {
+        assert_eq!(
+            extract_upstream_source_partial("source = \""),
+            Some(String::new())
+        );
+        assert_eq!(
+            extract_upstream_source_partial("source = \"../ot"),
+            Some("../ot".to_string())
+        );
+    }
+
+    #[test]
+    fn closed_quotes_return_none() {
+        assert_eq!(extract_upstream_source_partial("source = '../x'"), None);
+        assert_eq!(extract_upstream_source_partial("source = \"../x\""), None);
+    }
+
+    #[test]
+    fn missing_pieces_return_none() {
+        assert_eq!(extract_upstream_source_partial(""), None);
+        assert_eq!(extract_upstream_source_partial("source"), None);
+        assert_eq!(extract_upstream_source_partial("source ="), None);
+        assert_eq!(extract_upstream_source_partial("source = ../x"), None);
+    }
 }
