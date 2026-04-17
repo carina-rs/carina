@@ -200,3 +200,38 @@ async fn test_new_uses_default_cache() {
         "Cache file should not be rewritten on second call"
     );
 }
+
+/// Regression guard for #1978. `Component::deserialize_file` mmap's the
+/// `.cwasm`. If `precompile` ever starts writing the target path in place
+/// (instead of write-tempfile + atomic rename), a second precompile run on
+/// the same path while an earlier factory's mmap is still live will trap
+/// as SIGBUS on Linux — the same failure mode that broke #1976's test.
+///
+/// This test loads a factory, keeps it alive, overwrites the cache via the
+/// public `precompile` API, loads a second factory from the same path, and
+/// then lets both drop. If the invariant holds the whole sequence is a
+/// no-op from the user's perspective; if someone breaks it, the Linux CI
+/// runner crashes here.
+#[tokio::test(flavor = "multi_thread")]
+async fn precompile_preserves_prior_factory_mmap() {
+    let wasm = skip_if_no_wasm!();
+    let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let cwasm_path = cache_dir.path().join("carina_provider_mock.cwasm");
+
+    WasmProviderFactory::precompile(&wasm, &cwasm_path).expect("initial precompile should succeed");
+    let factory1 = WasmProviderFactory::from_precompiled(&cwasm_path)
+        .await
+        .expect("first from_precompiled should succeed");
+
+    // Overwrite the cache file via the public API while `factory1` still
+    // holds its mmap. A `precompile` implementation that writes in place
+    // would pull backing pages out from under `factory1`'s Component.
+    WasmProviderFactory::precompile(&wasm, &cwasm_path).expect("second precompile should succeed");
+
+    let factory2 = WasmProviderFactory::from_precompiled(&cwasm_path)
+        .await
+        .expect("second from_precompiled should succeed");
+
+    assert_eq!(factory1.name(), "mock");
+    assert_eq!(factory2.name(), "mock");
+}
