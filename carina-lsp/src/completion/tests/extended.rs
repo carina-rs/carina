@@ -1402,3 +1402,52 @@ fn upstream_state_source_suggestions_work_with_double_quotes() {
         labels
     );
 }
+
+fn assert_staging_insert_text_is_bare(source: &str) {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join("envs/prod")).unwrap();
+    fs::create_dir_all(root.join("envs/staging")).unwrap();
+    fs::write(root.join("envs/prod/main.crn"), "").unwrap();
+    fs::write(root.join("envs/staging/main.crn"), "").unwrap();
+
+    let provider = test_provider();
+    let doc = create_document(source);
+    let position = Position {
+        line: 1,
+        character: 14,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&root.join("envs/prod")));
+    let staging = completions
+        .iter()
+        .find(|c| c.label.contains("../staging"))
+        .expect("expected a staging suggestion");
+
+    let insert_text = staging
+        .insert_text
+        .as_deref()
+        .expect("staging suggestion must have insert_text");
+    assert_eq!(
+        insert_text, "../staging",
+        "insert_text must be the bare path, not wrapped in quotes (source: {source:?})"
+    );
+}
+
+#[test]
+fn upstream_state_source_insert_text_has_no_surrounding_quotes_single() {
+    // #1956: the completion triggers with the cursor already inside an open
+    // quote, so `insert_text` must be the bare path — otherwise accepting a
+    // suggestion produces nested quotes like `'../'../staging''`.
+    assert_staging_insert_text_is_bare("let orgs = upstream_state {\n    source = '");
+}
+
+#[test]
+fn upstream_state_source_insert_text_has_no_surrounding_quotes_double() {
+    // Same invariant for `source = "..."`, since both quote styles share the
+    // same completion path.
+    assert_staging_insert_text_is_bare("let orgs = upstream_state {\n    source = \"");
+}

@@ -508,15 +508,18 @@ impl CompletionProvider {
         suggestions
             .into_iter()
             .filter(|p| partial_path.is_empty() || p.starts_with(partial_path))
-            .map(|p| {
-                let quoted = format!("'{}'", p);
-                CompletionItem {
-                    label: quoted.clone(),
-                    kind: Some(CompletionItemKind::FOLDER),
-                    detail: Some("Carina project".to_string()),
-                    insert_text: Some(quoted),
-                    ..Default::default()
-                }
+            .map(|p| CompletionItem {
+                // Completion fires with the cursor already inside an open
+                // quote (see `extract_upstream_source_partial`), so the
+                // insert text must be the bare path — wrapping it in quotes
+                // would produce nested-quoted output like `'../'../foo''`.
+                // The label keeps quotes for display consistency with how
+                // the value appears in the source.
+                label: format!("'{}'", p),
+                kind: Some(CompletionItemKind::FOLDER),
+                detail: Some("Carina project".to_string()),
+                insert_text: Some(p),
+                ..Default::default()
             })
             .collect()
     }
