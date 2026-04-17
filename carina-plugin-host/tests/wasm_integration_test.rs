@@ -9,8 +9,14 @@ use carina_plugin_host::WasmProviderFactory;
 
 fn wasm_path() -> Option<PathBuf> {
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-    let path = workspace_root.join("target/wasm32-wasip2/debug/carina_provider_mock.wasm");
-    if path.exists() { Some(path) } else { None }
+    // Cargo uses hyphens in binary names but underscores in library names; check both.
+    for name in &["carina_provider_mock.wasm", "carina-provider-mock.wasm"] {
+        let path = workspace_root.join("target/wasm32-wasip2/debug").join(name);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
 }
 
 macro_rules! skip_if_no_wasm {
