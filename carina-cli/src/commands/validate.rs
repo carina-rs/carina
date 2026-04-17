@@ -8,7 +8,7 @@ use carina_core::config_loader::{
     find_crn_files_in_dir, get_base_dir, load_configuration_with_config,
 };
 use carina_core::lint::find_duplicate_attrs;
-use carina_core::parser::ProviderContext;
+use carina_core::parser::{ProviderContext, UpstreamState};
 
 use super::validate_and_resolve_with_config;
 use crate::error::AppError;
@@ -39,9 +39,15 @@ pub fn run_validate(
 ) -> Result<(), AppError> {
     let loaded = load_configuration_with_config(path, provider_context)?;
     let mut parsed = loaded.parsed;
-    parsed.print_warnings();
 
     let base_dir = get_base_dir(path);
+
+    // Surface bad `upstream_state.source` paths before printing warnings —
+    // otherwise the "is not yet in the upstream state" warning implies the
+    // source is reachable and misdirects the user.
+    check_upstream_state_sources(base_dir, &parsed.upstream_states)?;
+
+    parsed.print_warnings();
 
     if !json {
         println!("{}", "Validating...".cyan());
@@ -142,6 +148,32 @@ pub fn run_validate(
     Ok(())
 }
 
+/// Verify that every `upstream_state.source` resolves to an existing directory.
+///
+/// Cheaper than plan-time `load_upstream_states` (no canonicalize, no backend
+/// I/O) — this is a lightweight early signal run during `validate`. All
+/// failures are accumulated so the user sees every bad path at once.
+fn check_upstream_state_sources(
+    base_dir: &std::path::Path,
+    upstream_states: &[UpstreamState],
+) -> Result<(), AppError> {
+    let mut errors = Vec::new();
+    for us in upstream_states {
+        if !base_dir.join(&us.source).is_dir() {
+            errors.push(format!(
+                "upstream_state '{}': source '{}' does not exist",
+                us.binding,
+                us.source.display()
+            ));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::Validation(errors.join("\n")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +196,54 @@ mod tests {
         assert_eq!(parsed["resources"].as_array().unwrap().len(), 2);
         // warnings should be omitted when empty
         assert!(parsed.get("warnings").is_none());
+    }
+
+    fn upstream(binding: &str, source: &str) -> UpstreamState {
+        UpstreamState {
+            binding: binding.to_string(),
+            source: std::path::PathBuf::from(source),
+        }
+    }
+
+    #[test]
+    fn check_upstream_state_sources_accepts_existing_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("project");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::create_dir(tmp.path().join("upstream")).unwrap();
+
+        check_upstream_state_sources(&base, &[upstream("orgs", "../upstream")]).unwrap();
+    }
+
+    #[test]
+    fn check_upstream_state_sources_rejects_missing_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("project");
+        std::fs::create_dir(&base).unwrap();
+
+        let err = check_upstream_state_sources(&base, &[upstream("orgs", "../nonexistent")])
+            .expect_err("missing source should error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("upstream_state 'orgs'") && msg.contains("../nonexistent"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_upstream_state_sources_reports_every_missing_binding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("project");
+        std::fs::create_dir(&base).unwrap();
+
+        let err = check_upstream_state_sources(
+            &base,
+            &[upstream("a", "../missing_a"), upstream("b", "../missing_b")],
+        )
+        .expect_err("missing sources should error");
+        let msg = err.to_string();
+        assert!(msg.contains("upstream_state 'a'"), "missing 'a': {msg}");
+        assert!(msg.contains("upstream_state 'b'"), "missing 'b': {msg}");
     }
 
     #[test]
