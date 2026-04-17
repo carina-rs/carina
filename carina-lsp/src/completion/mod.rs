@@ -92,7 +92,7 @@ impl CompletionProvider {
                 self.import_path_completions(&partial_path, base_path)
             }
             CompletionContext::InsideUpstreamStateSource { partial_path } => {
-                self.upstream_state_source_completions(&partial_path, base_path)
+                self.upstream_state_source_completions(&partial_path, position, base_path)
             }
             CompletionContext::None => vec![],
         }

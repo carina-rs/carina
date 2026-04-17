@@ -1,5 +1,5 @@
 use super::*;
-use tower_lsp::lsp_types::InsertTextFormat;
+use tower_lsp::lsp_types::{InsertTextFormat, TextEdit};
 
 #[test]
 #[ignore = "requires provider schemas"]
@@ -1401,4 +1401,71 @@ fn upstream_state_source_suggestions_work_with_double_quotes() {
         "Double-quoted source = \"... should still offer directory suggestions. Got: {:?}",
         labels
     );
+}
+
+/// Run the completion provider on `source` (a 2-line snippet whose second
+/// line contains `source = ...<cursor>`), find the `../staging` suggestion,
+/// and return its `TextEdit`.
+fn staging_text_edit(source: &str) -> TextEdit {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join("envs/prod")).unwrap();
+    fs::create_dir_all(root.join("envs/staging")).unwrap();
+    fs::write(root.join("envs/prod/main.crn"), "").unwrap();
+    fs::write(root.join("envs/staging/main.crn"), "").unwrap();
+
+    let provider = test_provider();
+    let doc = create_document(source);
+    // Place the cursor at the end of the second line (where the user just typed).
+    let last_line = source.lines().next_back().unwrap_or("");
+    let position = Position {
+        line: 1,
+        character: last_line.chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&root.join("envs/prod")));
+    let staging = completions
+        .iter()
+        .find(|c| c.label.contains("../staging"))
+        .unwrap_or_else(|| panic!("expected a staging suggestion for source {source:?}"));
+
+    match staging.text_edit.as_ref() {
+        Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) => edit.clone(),
+        other => panic!("expected text_edit::Edit, got {other:?}"),
+    }
+}
+
+#[test]
+fn upstream_state_source_text_edit_inserts_bare_path_single_quote() {
+    // #1956: the completion triggers with the cursor already inside an open
+    // quote, so the inserted text must be the bare path — otherwise accepting
+    // a suggestion produces nested quotes like `'../'../staging''`.
+    let edit = staging_text_edit("let orgs = upstream_state {\n    source = '");
+    assert_eq!(edit.new_text, "../staging");
+}
+
+#[test]
+fn upstream_state_source_text_edit_inserts_bare_path_double_quote() {
+    let edit = staging_text_edit("let orgs = upstream_state {\n    source = \"");
+    assert_eq!(edit.new_text, "../staging");
+}
+
+#[test]
+fn upstream_state_source_text_edit_range_covers_typed_partial() {
+    // #1956: when the user has typed a partial path (`../st`), the text edit
+    // must replace the whole partial, not just the trailing word. A plain
+    // `insert_text` would let the client infer the range via word boundaries
+    // and split on `/`/`.`, yielding `../../staging` instead of `../staging`.
+    let source = "let orgs = upstream_state {\n    source = '../st";
+    let edit = staging_text_edit(source);
+    assert_eq!(edit.new_text, "../staging");
+    // `    source = '` occupies cols 0..14, so the partial `../st` starts at
+    // col 14 and ends at the cursor at col 19.
+    assert_eq!(edit.range.start.line, 1);
+    assert_eq!(edit.range.start.character, 14);
+    assert_eq!(edit.range.end.line, 1);
+    assert_eq!(edit.range.end.character, 19);
 }
