@@ -1129,6 +1129,91 @@ fn module_call_scaffolding_includes_arguments() {
 }
 
 #[test]
+fn string_enum_completion_inside_for_loop_body() {
+    // Regression for #1974: inside a `for` body, the enclosing resource_type
+    // must still be detected so StringEnum completions fire. Previously the
+    // for's opening `{` tripped the context detector into brace_depth >= 1
+    // before the resource block's `{`, and `extract_resource_type` was only
+    // consulted at brace_depth == 0 — so the resource schema was missed,
+    // falling through to `generic_value_completions` (regions, true/false).
+    let provider = test_provider_with_enum_and_regions();
+    let doc = create_document(
+        r#"let items = [1, 2]
+for item in items {
+  awscc.s3.bucket {
+    versioning_status =
+  }
+}
+"#,
+    );
+    // Cursor after `    versioning_status = ` on line 3 (0-indexed)
+    let position = Position {
+        line: 3,
+        character: 25,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"Enabled"),
+        "StringEnum 'Enabled' must still be offered inside a for body. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"Suspended"),
+        "StringEnum 'Suspended' must still be offered inside a for body. Got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.iter().any(|l| l.starts_with("aws.Region.")),
+        "Region values must not pollute StringEnum completions inside for body. Got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.contains(&"true") && !labels.contains(&"false"),
+        "Boolean values must not pollute StringEnum completions. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn string_enum_completion_inside_nested_for_loop_body() {
+    // Two stacked `for` bodies still have to see through to the resource
+    // type inside. Regression safety net for the for_body_depth tracker.
+    let provider = test_provider_with_enum_and_regions();
+    let doc = create_document(
+        r#"for a in [1] {
+  for b in [2] {
+    awscc.s3.bucket {
+      versioning_status =
+    }
+  }
+}
+"#,
+    );
+    // Cursor on line 3 after `      versioning_status = `
+    let position = Position {
+        line: 3,
+        character: 27,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"Enabled"),
+        "Enum candidate must reach nested for body. Got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.iter().any(|l| l.starts_with("aws.Region.")),
+        "No region pollution in nested for body. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
 fn for_loop_binding_suggested_in_body_value_position() {
     let provider = test_provider_single_attr();
     let doc =

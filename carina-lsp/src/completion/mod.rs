@@ -152,6 +152,12 @@ impl CompletionProvider {
         let mut in_upstream_state_block = false;
         // Track nested block names at each depth level (index 0 = depth 1, etc.)
         let mut nested_block_names: Vec<String> = Vec::new();
+        // Depth-of-for-bodies currently open. A `for ... { <body> }` stacks a
+        // resource_block-free brace level that should be transparent when we
+        // look for enclosing resource types, so a resource declaration at
+        // `brace_depth == for_body_depth` is still a top-level declaration
+        // relative to any enclosing resource.
+        let mut for_body_depth: i32 = 0;
 
         for (i, line) in lines.iter().enumerate() {
             if i > line_idx {
@@ -159,9 +165,17 @@ impl CompletionProvider {
             }
             let trimmed = line.trim();
 
+            // A `for ... in ... {` header opens a pure control-flow brace level,
+            // not a resource block. Track it so resource-type detection below
+            // can see through it.
+            let is_for_header = trimmed.starts_with("for ") && trimmed.ends_with('{');
+
             // Look for resource type declaration: "aws.ec2.vpc {" or "let x = aws.ec2.vpc {"
+            // Accept at depth == 0 (top level) or at depth == for_body_depth
+            // (directly inside a `for` body, which is semantically top-level
+            // for the purpose of resolving the enclosing resource type).
             if let Some(rt) = self.extract_resource_type(line)
-                && brace_depth == 0
+                && brace_depth == for_body_depth
             {
                 resource_type = rt;
                 module_name = None;
@@ -231,10 +245,22 @@ impl CompletionProvider {
                 }
             }
 
+            // Track for-body opens so the opening `{` increments both
+            // brace_depth and for_body_depth. The matching `}` drops
+            // for_body_depth alongside brace_depth.
+            let mut for_brace_pending = is_for_header;
+
             for c in line.chars() {
                 if c == '{' {
                     brace_depth += 1;
+                    if for_brace_pending {
+                        for_body_depth += 1;
+                        for_brace_pending = false;
+                    }
                 } else if c == '}' {
+                    if brace_depth == for_body_depth && for_body_depth > 0 {
+                        for_body_depth -= 1;
+                    }
                     brace_depth -= 1;
                     if brace_depth == 0 {
                         resource_type.clear();
@@ -244,6 +270,13 @@ impl CompletionProvider {
                         in_args_or_attrs_block = false;
                         in_upstream_state_block = false;
                         nested_block_names.clear();
+                    } else if brace_depth == for_body_depth {
+                        // Closed the resource/module block that was inside the
+                        // current for body — forget its type so the next
+                        // resource at this level is detected fresh.
+                        resource_type.clear();
+                        current_binding = None;
+                        module_name = None;
                     } else {
                         // Truncate to current depth
                         let depth_index = (brace_depth - 1) as usize;
