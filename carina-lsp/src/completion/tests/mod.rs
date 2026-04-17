@@ -131,6 +131,17 @@ pub(super) fn test_provider_with_nested_structs() -> CompletionProvider {
     CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![])
 }
 
+/// Minimal provider with a single resource type `test.foo.bar` that has one
+/// `attr` string attribute. Enough to exercise value-position completions
+/// without needing real provider schemas.
+pub(super) fn test_provider_single_attr() -> CompletionProvider {
+    let schema = ResourceSchema::new("test.foo.bar")
+        .attribute(AttributeSchema::new("attr", AttributeType::String));
+    let mut schemas = HashMap::new();
+    schemas.insert("test.foo.bar".to_string(), schema);
+    CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![])
+}
+
 /// Provider with StringEnum that has name but no namespace (simulates WASM provider).
 pub(super) fn test_provider_with_nameless_enum() -> CompletionProvider {
     // Top-level attribute with StringEnum (no namespace)

@@ -1129,6 +1129,79 @@ fn module_call_scaffolding_includes_arguments() {
 }
 
 #[test]
+fn for_loop_binding_suggested_in_body_value_position() {
+    let provider = test_provider_single_attr();
+    let doc =
+        create_document("for name, account_id in items {\n  test.foo.bar {\n    attr = \n  }\n}\n");
+    // Cursor after `    attr = ` on line 2 (0-indexed)
+    let position = Position {
+        line: 2,
+        character: 11,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"name"),
+        "map-form for binding 'name' should be suggested in body. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"account_id"),
+        "map-form for binding 'account_id' should be suggested in body. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn for_loop_binding_not_suggested_outside_body() {
+    let provider = test_provider_single_attr();
+    let doc = create_document(
+        "for item in items {\n  test.foo.bar {\n    attr = x\n  }\n}\ntest.foo.bar {\n  attr = \n}\n",
+    );
+    // Cursor on line 6 after `  attr = ` — outside the for body
+    let position = Position {
+        line: 6,
+        character: 9,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        !labels.contains(&"item"),
+        "for-loop binding should not leak outside its body. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn for_loop_discard_not_suggested() {
+    let provider = test_provider_single_attr();
+    let doc =
+        create_document("for _, account_id in items {\n  test.foo.bar {\n    attr = \n  }\n}\n");
+    let position = Position {
+        line: 2,
+        character: 11,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        !labels.contains(&"_"),
+        "'_' discard marker must not be suggested. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"account_id"),
+        "named binding alongside discard should still be suggested. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
 fn import_path_completion_lists_directories_and_crn_files() {
     let tmp = tempfile::tempdir().unwrap();
     let modules_dir = tmp.path().join("modules");
