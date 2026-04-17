@@ -34,38 +34,9 @@ pub fn get_resource_dependencies(resource: &Resource) -> HashSet<String> {
 
 /// Recursively collect resource reference dependencies from a value
 fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
-    match value {
-        Value::ResourceRef { path } => {
-            deps.insert(path.binding().to_string());
-        }
-        Value::List(items) => {
-            for item in items {
-                collect_dependencies(item, deps);
-            }
-        }
-        Value::Map(map) => {
-            for v in map.values() {
-                collect_dependencies(v, deps);
-            }
-        }
-        Value::Interpolation(parts) => {
-            use crate::resource::InterpolationPart;
-            for part in parts {
-                if let InterpolationPart::Expr(v) = part {
-                    collect_dependencies(v, deps);
-                }
-            }
-        }
-        Value::FunctionCall { args, .. } => {
-            for arg in args {
-                collect_dependencies(arg, deps);
-            }
-        }
-        Value::Secret(inner) => {
-            collect_dependencies(inner, deps);
-        }
-        _ => {}
-    }
+    value.visit_refs(&mut |path| {
+        deps.insert(path.binding().to_string());
+    });
 }
 
 /// Sort resources topologically based on dependencies.
@@ -316,6 +287,31 @@ mod tests {
         assert!(deps.contains("b"));
         assert!(deps.contains("c"));
         assert_eq!(deps.len(), 2);
+    }
+
+    /// Regression: a ResourceRef inside a `Closure`'s captured args must show
+    /// up as a dependency. The prior hand-rolled walk had no `Closure` arm
+    /// and silently dropped these refs, which in turn let the topological
+    /// sort place the dependent resource before its upstream.
+    #[test]
+    fn collect_dependencies_finds_refs_inside_closure() {
+        let mut resource = Resource::new("test", "a");
+        resource.binding = Some("a".to_string());
+        resource.set_attr(
+            "fn".to_string(),
+            Value::Closure {
+                name: "map".to_string(),
+                captured_args: vec![Value::resource_ref("upstream", "id", vec![])],
+                remaining_arity: 1,
+            },
+        );
+
+        let deps = get_resource_dependencies(&resource);
+        assert!(
+            deps.contains("upstream"),
+            "Expected deps to include 'upstream' from Closure captured_args. Got: {:?}",
+            deps
+        );
     }
 
     /// Regression test for #1078: when resolve_refs_with_state partially resolves

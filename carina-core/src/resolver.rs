@@ -6,7 +6,9 @@
 use std::collections::HashMap;
 
 use crate::deps::get_resource_dependencies;
-use crate::resource::{Expr, InterpolationPart, Resource, ResourceId, State, Value};
+use crate::resource::{
+    Expr, InterpolationPart, Resource, ResourceId, State, Value, contains_resource_ref,
+};
 
 /// Resolve all ResourceRef values in resources using current state.
 ///
@@ -218,23 +220,6 @@ pub fn resolve_ref_value(
             })
         }
         _ => Ok(value.clone()),
-    }
-}
-
-/// Check if a Value contains any ResourceRef (possibly nested)
-fn contains_resource_ref(value: &Value) -> bool {
-    match value {
-        Value::ResourceRef { .. } => true,
-        Value::List(items) => items.iter().any(contains_resource_ref),
-        Value::Map(map) => map.values().any(contains_resource_ref),
-        Value::Interpolation(parts) => parts.iter().any(|p| match p {
-            InterpolationPart::Expr(v) => contains_resource_ref(v),
-            _ => false,
-        }),
-        Value::FunctionCall { args, .. } => args.iter().any(contains_resource_ref),
-        Value::Secret(inner) => contains_resource_ref(inner),
-        Value::Closure { captured_args, .. } => captured_args.iter().any(contains_resource_ref),
-        _ => false,
     }
 }
 

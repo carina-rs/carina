@@ -1142,68 +1142,37 @@ impl DiagnosticEngine {
         binding_schema_map: &HashMap<String, ResourceSchema>,
         diagnostics: &mut Vec<Diagnostic>,
     ) {
-        match value {
-            Value::ResourceRef { path } => {
-                let binding_name = path.binding();
-                let attribute_name = path.attribute();
-                let Some(ref_schema) = binding_schema_map.get(binding_name) else {
-                    return;
-                };
-                if ref_schema.attributes.contains_key(attribute_name) {
-                    return;
-                }
-                // Attribute not found - build "did you mean" suggestion
-                let known_attrs: Vec<&str> =
-                    ref_schema.attributes.keys().map(|s| s.as_str()).collect();
-                let suggestion = suggest_similar_name(attribute_name, &known_attrs)
-                    .map(|s| format!(" Did you mean '{}'?", s))
-                    .unwrap_or_default();
+        value.visit_refs(&mut |path| {
+            let binding_name = path.binding();
+            let attribute_name = path.attribute();
+            let Some(ref_schema) = binding_schema_map.get(binding_name) else {
+                return;
+            };
+            if ref_schema.attributes.contains_key(attribute_name) {
+                return;
+            }
+            // Attribute not found - build "did you mean" suggestion
+            let known_attrs: Vec<&str> = ref_schema.attributes.keys().map(|s| s.as_str()).collect();
+            let suggestion = suggest_similar_name(attribute_name, &known_attrs)
+                .map(|s| format!(" Did you mean '{}'?", s))
+                .unwrap_or_default();
 
-                let ref_text = format!("{}.{}", binding_name, attribute_name);
-                if let Some((line, col)) = self.find_ref_value_position(doc, &ref_text) {
-                    // Highlight just the attribute part (after the dot)
-                    let attr_col = col + binding_name.len() as u32 + 1; // +1 for the dot
-                    diagnostics.push(carina_diagnostic(
-                        line,
-                        attr_col,
-                        attr_col + attribute_name.len() as u32,
-                        DiagnosticSeverity::WARNING,
-                        format!(
-                            "Unknown attribute '{}' on '{}' (type '{}'){}",
-                            attribute_name, binding_name, ref_schema.resource_type, suggestion,
-                        ),
-                    ));
-                }
+            let ref_text = format!("{}.{}", binding_name, attribute_name);
+            if let Some((line, col)) = self.find_ref_value_position(doc, &ref_text) {
+                // Highlight just the attribute part (after the dot)
+                let attr_col = col + binding_name.len() as u32 + 1; // +1 for the dot
+                diagnostics.push(carina_diagnostic(
+                    line,
+                    attr_col,
+                    attr_col + attribute_name.len() as u32,
+                    DiagnosticSeverity::WARNING,
+                    format!(
+                        "Unknown attribute '{}' on '{}' (type '{}'){}",
+                        attribute_name, binding_name, ref_schema.resource_type, suggestion,
+                    ),
+                ));
             }
-            Value::List(items) => {
-                for item in items {
-                    self.collect_ref_attr_diagnostics(doc, item, binding_schema_map, diagnostics);
-                }
-            }
-            Value::Map(map) => {
-                for v in map.values() {
-                    self.collect_ref_attr_diagnostics(doc, v, binding_schema_map, diagnostics);
-                }
-            }
-            Value::Interpolation(parts) => {
-                for part in parts {
-                    if let carina_core::resource::InterpolationPart::Expr(expr) = part {
-                        self.collect_ref_attr_diagnostics(
-                            doc,
-                            expr,
-                            binding_schema_map,
-                            diagnostics,
-                        );
-                    }
-                }
-            }
-            Value::FunctionCall { args, .. } => {
-                for arg in args {
-                    self.collect_ref_attr_diagnostics(doc, arg, binding_schema_map, diagnostics);
-                }
-            }
-            _ => {}
-        }
+        });
     }
 
     /// Find the position of a resource reference value (e.g., "igw.internet_gateway_id") in the document.

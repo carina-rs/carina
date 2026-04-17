@@ -393,19 +393,9 @@ impl std::ops::DerefMut for Expr {
 
 /// Check if a Value contains any ResourceRef (possibly nested)
 pub fn contains_resource_ref(value: &Value) -> bool {
-    match value {
-        Value::ResourceRef { .. } => true,
-        Value::List(items) => items.iter().any(contains_resource_ref),
-        Value::Map(map) => map.values().any(contains_resource_ref),
-        Value::Interpolation(parts) => parts.iter().any(|p| match p {
-            InterpolationPart::Expr(v) => contains_resource_ref(v),
-            _ => false,
-        }),
-        Value::FunctionCall { args, .. } => args.iter().any(contains_resource_ref),
-        Value::Secret(inner) => contains_resource_ref(inner),
-        Value::Closure { captured_args, .. } => captured_args.iter().any(contains_resource_ref),
-        _ => false,
-    }
+    let mut found = false;
+    value.visit_refs(&mut |_| found = true);
+    found
 }
 
 impl Value {
