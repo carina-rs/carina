@@ -13,6 +13,65 @@ use carina_core::schema::{ResourceSchema, suggest_similar_name};
 
 use super::{DiagnosticEngine, carina_diagnostic};
 
+/// Locate the `source = '<expected>'` or `source = "<expected>"` line inside
+/// an `upstream_state { ... }` block whose value equals `expected`. Returns
+/// `(line, start_col, end_col)` in character columns, positioned over the
+/// inner value (quotes excluded).
+///
+/// Restricting to `upstream_state` blocks avoids false matches against
+/// `provider` / `module` blocks that also take a `source` attribute.
+fn find_source_value_position(text: &str, expected: &str) -> Option<(u32, u32, u32)> {
+    let mut in_upstream_state = false;
+    let mut brace_depth: u32 = 0;
+    for (line_idx, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if !in_upstream_state && trimmed.contains("upstream_state") && trimmed.contains('{') {
+            in_upstream_state = true;
+            brace_depth = 1;
+            continue;
+        }
+        if !in_upstream_state {
+            continue;
+        }
+        // Track nested braces so a struct value inside upstream_state doesn't
+        // prematurely close the block.
+        brace_depth += trimmed.matches('{').count() as u32;
+        brace_depth = brace_depth.saturating_sub(trimmed.matches('}').count() as u32);
+        if brace_depth == 0 {
+            in_upstream_state = false;
+            continue;
+        }
+        if !trimmed.starts_with("source") {
+            continue;
+        }
+        let Some((lhs, rhs)) = trimmed.split_once('=') else {
+            continue;
+        };
+        // Skip `source` followed by non-whitespace (e.g. `source_path`).
+        if !lhs.trim_end().eq("source") {
+            continue;
+        }
+        let after_eq = rhs.trim_start();
+        let Some(quote) = after_eq.chars().next().filter(|c| *c == '\'' || *c == '"') else {
+            continue;
+        };
+        let inner = &after_eq[quote.len_utf8()..];
+        let Some(end_byte) = inner.find(quote) else {
+            continue;
+        };
+        if &inner[..end_byte] != expected {
+            continue;
+        }
+        // Columns are character counts from the start of the line up to the
+        // start of `inner` (i.e. just past the opening quote).
+        let prefix_len = line.len() - after_eq.len() + quote.len_utf8();
+        let start_col = line[..prefix_len].chars().count() as u32;
+        let end_col = start_col + inner[..end_byte].chars().count() as u32;
+        return Some((line_idx as u32, start_col, end_col));
+    }
+    None
+}
+
 /// Check if a string looks like an unresolved cross-file reference ("binding.attribute").
 fn is_dot_notation_ref(s: &str) -> bool {
     let parts: Vec<&str> = s.split('.').collect();
@@ -193,6 +252,45 @@ impl DiagnosticEngine {
             }
         }
         None
+    }
+
+    /// Flag `upstream_state { source = ... }` paths that do not resolve to an
+    /// existing directory relative to the project's base path.
+    ///
+    /// Mirrors the CLI-side check in `carina-cli::commands::validate` so editors
+    /// surface typo'd source paths as squiggles instead of waiting until the
+    /// user runs `carina validate` or `carina plan`. Cheap by design — no
+    /// canonicalize, no remote state reads.
+    pub(super) fn check_upstream_state_sources(
+        &self,
+        doc: &Document,
+        parsed: &ParsedFile,
+        base_path: &std::path::Path,
+    ) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
+        let text = doc.text();
+
+        for us in &parsed.upstream_states {
+            if base_path.join(&us.source).is_dir() {
+                continue;
+            }
+            let source_str = us.source.to_string_lossy();
+            let Some((line, col, end_col)) = find_source_value_position(&text, &source_str) else {
+                continue;
+            };
+            diagnostics.push(carina_diagnostic(
+                line,
+                col,
+                end_col,
+                DiagnosticSeverity::ERROR,
+                format!(
+                    "upstream_state '{}': source '{}' does not exist",
+                    us.binding, source_str
+                ),
+            ));
+        }
+
+        diagnostics
     }
 
     /// Check module calls against imported module definitions
