@@ -164,6 +164,10 @@ pub fn load_configuration_with_config(
             return Err(e.to_string());
         }
 
+        if let Err(e) = parser::check_deferred_for_iterables(&merged) {
+            return Err(e.to_string());
+        }
+
         // Upgrade cross-file warnings: a for-expression in one file may reference
         // an upstream_state defined in another file.  During per-file parsing the
         // upstream_state is unknown, so the warning falls back to the generic
@@ -267,6 +271,12 @@ pub fn parse_directory(dir: &Path, config: &ProviderContext) -> Result<ParsedFil
 
     // Resolve cross-file references on the merged result
     if let Err(e) = parser::resolve_resource_refs_with_config(&mut merged, config) {
+        return Err(e.to_string());
+    }
+
+    // Per-file parse deliberately skips this check: the iterable may reference
+    // an `upstream_state` or `let` declared in a sibling file.
+    if let Err(e) = parser::check_deferred_for_iterables(&merged) {
         return Err(e.to_string());
     }
 
@@ -779,5 +789,61 @@ mod tests {
             Ok(_) => panic!("expected error for multiple backends"),
         }
         cleanup(&dir);
+    }
+
+    #[test]
+    fn parse_directory_accepts_cross_file_upstream_state_in_for_expression() {
+        let dir = create_temp_dir("cross_file_upstream_for");
+        fs::write(
+            dir.join("backend.crn"),
+            r#"backend local { path = 'carina.state.json' }
+
+let orgs = upstream_state {
+  source = '../organizations'
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("main.crn"),
+            r#"for name, account_id in orgs.accounts {
+  aws.s3.bucket {
+    name = name
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let result = parse_directory(&dir, &ProviderContext::default());
+        cleanup(&dir);
+        assert!(
+            result.is_ok(),
+            "expected cross-file upstream_state binding in `for` to resolve, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn parse_directory_rejects_undefined_iterable_even_after_merge() {
+        let dir = create_temp_dir("undefined_for_iterable");
+        fs::write(
+            dir.join("main.crn"),
+            r#"for name, account_id in does_not_exist.accounts {
+  aws.s3.bucket {
+    name = name
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let result = parse_directory(&dir, &ProviderContext::default());
+        cleanup(&dir);
+        let err = result.expect_err("undefined iterable should still error after merge");
+        assert!(
+            err.contains("Undefined identifier `does_not_exist`"),
+            "unexpected error: {err}"
+        );
     }
 }
