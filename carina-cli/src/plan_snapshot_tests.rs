@@ -514,32 +514,32 @@ fn plan_snapshot_exports() {
 /// Verifies that a project whose provider/resource/exports blocks are
 /// spread across sibling .crn files produces the same plan as the
 /// single-file `exports` fixture. Guards against regressions where
-/// directory-scoped parsing drops definitions in sibling files.
+/// directory-scoped parsing drops definitions in sibling files: the
+/// `export_changes` fed to `format_plan` are derived from the loaded
+/// `parsed.export_params`, so a dropped `exports.crn` would make the
+/// Exports section disappear from the snapshot.
 #[test]
 fn plan_snapshot_exports_multifile() {
-    use crate::commands::plan::ExportChange;
-    use carina_core::parser::TypeExpr;
-    use carina_core::resource::Value;
+    use crate::commands::plan::compute_export_diffs;
 
-    let (plan, schemas, moved_origins) = build_plan_from_fixture("exports_multifile");
-    let export_changes = vec![
-        ExportChange::Added {
-            name: "vpc_id".to_string(),
-            type_expr: Some(TypeExpr::String),
-            new_value: Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-        },
-        ExportChange::Added {
-            name: "cidr".to_string(),
-            type_expr: None,
-            new_value: Value::resource_ref("vpc".to_string(), "cidr_block".to_string(), vec![]),
-        },
-    ];
+    let fp = build_plan_from_fixture_name("exports_multifile");
+
+    // Assert the multi-file load actually picked up exports.crn before
+    // rendering, so the snapshot claim is backed by parsed state.
+    let exported_names: Vec<&str> = fp.export_params.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(
+        exported_names,
+        vec!["vpc_id", "cidr"],
+        "exports.crn definitions must be merged when loading a multi-file project"
+    );
+
+    let export_changes = compute_export_diffs(&fp.export_params, &HashMap::new());
     let output = format_plan(
-        &plan,
+        &fp.plan,
         DetailLevel::Full,
         &HashMap::new(),
-        Some(&schemas),
-        &moved_origins,
+        Some(&fp.schemas),
+        &fp.moved_origins,
         &export_changes,
         &[],
     );

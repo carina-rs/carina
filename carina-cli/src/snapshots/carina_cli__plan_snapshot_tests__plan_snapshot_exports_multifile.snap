@@ -9,7 +9,7 @@ Execution Plan:
 
 Exports:
 
-  + vpc_id: string = vpc.vpc_id
   + cidr = vpc.cidr_block
+  + vpc_id: string = vpc.vpc_id
 
 Plan: 1 to add, 0 to change, 0 to destroy, 2 export change(s).
