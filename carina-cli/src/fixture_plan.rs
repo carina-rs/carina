@@ -33,6 +33,7 @@ pub struct FixturePlan {
     pub schemas: HashMap<String, ResourceSchema>,
     pub moved_origins: HashMap<ResourceId, ResourceId>,
     pub deferred_for_expressions: Vec<carina_core::parser::DeferredForExpression>,
+    pub export_params: Vec<carina_core::parser::ExportParameter>,
 }
 
 /// Build a plan from a fixture directory name (e.g. "all_create"). Resolves
@@ -203,6 +204,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         schemas: wiring.schemas().clone(),
         moved_origins,
         deferred_for_expressions: parsed.deferred_for_expressions,
+        export_params: parsed.export_params,
     }
 }
 

@@ -124,11 +124,13 @@ plan-deferred-for:
 	$(PLAN_FIXTURE) deferred_for
 plan-exports:
 	$(PLAN_FIXTURE) exports
+plan-exports-multifile:
+	$(PLAN_FIXTURE) exports_multifile
 .PHONY: plan-all-create plan-no-changes plan-no-changes-enum plan-mixed plan-delete plan-compact \
         plan-map-diff plan-enum-display plan-destroy-full plan-destroy-orphans plan-read-only-attrs \
         plan-default-values plan-explicit plan-default-tags \
         plan-state-blocks plan-secret-values plan-moved-with-changes plan-moved-prev-keys plan-moved-pure \
-        plan-upstream-state plan-deferred-for plan-exports \
+        plan-upstream-state plan-deferred-for plan-exports plan-exports-multifile \
         plan-map-diff-tui plan-all-create-tui plan-mixed-tui plan-delete-tui \
         plan-moved-with-changes-tui plan-moved-pure-tui plan-fixtures
 
