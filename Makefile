@@ -131,3 +131,34 @@ plan-exports:
         plan-upstream-state plan-deferred-for plan-exports \
         plan-map-diff-tui plan-all-create-tui plan-mixed-tui plan-delete-tui \
         plan-moved-with-changes-tui plan-moved-pure-tui plan-fixtures
+
+# ---------------------------------------------------------------------------
+# Install
+# ---------------------------------------------------------------------------
+#
+# `cargo install --force` has a rebuild-avoidance quirk where it can reuse a
+# previously-installed artifact when only a dependency crate changed, leaving
+# ~/.cargo/bin with a stale binary even though `cargo install` exits 0.
+#
+# Always rebuild the release binaries explicitly and copy them into
+# $(INSTALL_DIR). Safe to re-run; cheap when nothing changed.
+#
+# Uses `cargo metadata` to resolve the effective target directory, so this
+# works with both the default `target/` and a custom `target-dir` set in
+# .cargo/config.toml.
+
+INSTALL_DIR ?= $(HOME)/.cargo/bin
+CARGO_TARGET_DIR := $(shell cargo metadata --format-version 1 --no-deps | \
+                            sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+
+install: install-cli install-lsp
+install-cli:
+	cargo build -p carina-cli --release
+	install -m 755 "$(CARGO_TARGET_DIR)/release/carina" "$(INSTALL_DIR)/carina"
+	@echo "Installed $(INSTALL_DIR)/carina"
+install-lsp:
+	cargo build -p carina-lsp --release
+	install -m 755 "$(CARGO_TARGET_DIR)/release/carina-lsp" "$(INSTALL_DIR)/carina-lsp"
+	@echo "Installed $(INSTALL_DIR)/carina-lsp"
+
+.PHONY: install install-cli install-lsp

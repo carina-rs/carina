@@ -2090,3 +2090,339 @@ fn upstream_state_existing_source_directory_is_ok() {
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+// =====================================================================
+// upstream_state field-reference diagnostics (#1990)
+// =====================================================================
+
+fn set_up_project_with_upstream(
+    main_crn: &str,
+    upstream_exports_crn: Option<&str>,
+) -> (tempfile::TempDir, std::path::PathBuf, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let upstream = tmp.path().join("organizations");
+    std::fs::create_dir(&upstream).unwrap();
+    if let Some(body) = upstream_exports_crn {
+        std::fs::write(upstream.join("exports.crn"), body).unwrap();
+    }
+    let base = tmp.path().join("downstream");
+    std::fs::create_dir(&base).unwrap();
+    std::fs::write(base.join("main.crn"), main_crn).unwrap();
+    (tmp, base, "main.crn".to_string())
+}
+
+fn analyze_with_buffer(
+    engine: &DiagnosticEngine,
+    base: &std::path::Path,
+    filename: &str,
+    buffer: &str,
+) -> Vec<tower_lsp::lsp_types::Diagnostic> {
+    let doc = create_document(buffer);
+    engine.analyze_with_filename(
+        &doc,
+        Some(filename),
+        Some(base),
+        &HashMap::new(),
+        &HashSet::new(),
+    )
+}
+
+#[test]
+fn upstream_state_unknown_field_in_for_expression_is_flagged() {
+    // The issue's canonical repro.
+    let (_tmp, base, name) = set_up_project_with_upstream(
+        r#"let orgs = upstream_state { source = '../organizations' }
+for name, _ in orgs.account {
+    awscc.ec2.vpc {
+        name = name
+        cidr_block = '10.0.0.0/16'
+    }
+}
+"#,
+        Some(
+            r#"exports { accounts: string = "x" }
+"#,
+        ),
+    );
+
+    let engine = test_engine();
+    let buffer = std::fs::read_to_string(base.join(&name)).unwrap();
+    let diagnostics = analyze_with_buffer(&engine, &base, &name, &buffer);
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("does not export `account`")),
+        "got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn upstream_state_known_field_passes() {
+    let (_tmp, base, name) = set_up_project_with_upstream(
+        r#"let orgs = upstream_state { source = '../organizations' }
+for name, _ in orgs.accounts {
+    awscc.ec2.vpc {
+        name = name
+        cidr_block = '10.0.0.0/16'
+    }
+}
+"#,
+        Some(
+            r#"exports { accounts: string = "x" }
+"#,
+        ),
+    );
+
+    let engine = test_engine();
+    let buffer = std::fs::read_to_string(base.join(&name)).unwrap();
+    let diagnostics = analyze_with_buffer(&engine, &base, &name, &buffer);
+
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|d| d.message.contains("does not export")),
+        "known field should not be flagged, got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn upstream_state_buffer_differs_from_disk_uses_buffer() {
+    // Disk: `orgs.accounts` (correct). Buffer in editor: `orgs.acc` (typo).
+    // Must flag based on the buffer, not disk.
+    let (_tmp, base, name) = set_up_project_with_upstream(
+        r#"let orgs = upstream_state { source = '../organizations' }
+let x = orgs.accounts
+"#,
+        Some(
+            r#"exports { accounts: string = "x" }
+"#,
+        ),
+    );
+
+    let engine = test_engine();
+    let edited = r#"let orgs = upstream_state { source = '../organizations' }
+let x = orgs.acc
+"#;
+    let diagnostics = analyze_with_buffer(&engine, &base, &name, edited);
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("does not export `acc`")),
+        "buffer typo must be flagged against disk exports, got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn upstream_state_buffer_fix_clears_diagnostic() {
+    // Disk: `orgs.account` (typo, would be flagged). Buffer: `orgs.accounts`
+    // (user fixed it). Must NOT flag — reflects the buffer, not disk.
+    let (_tmp, base, name) = set_up_project_with_upstream(
+        r#"let orgs = upstream_state { source = '../organizations' }
+let x = orgs.account
+"#,
+        Some(
+            r#"exports { accounts: string = "x" }
+"#,
+        ),
+    );
+
+    let engine = test_engine();
+    let fixed = r#"let orgs = upstream_state { source = '../organizations' }
+let x = orgs.accounts
+"#;
+    let diagnostics = analyze_with_buffer(&engine, &base, &name, fixed);
+
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|d| d.message.contains("does not export")),
+        "fixed buffer should clear diagnostic even if disk is stale, got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn upstream_state_buffer_retypo_reflags() {
+    // Reproduces the user-reported sequence:
+    //   disk typo → fix in buffer → retype typo in buffer.
+    // Diagnostic must reappear on the second typo.
+    let (_tmp, base, name) = set_up_project_with_upstream(
+        r#"let orgs = upstream_state { source = '../organizations' }
+let x = orgs.accounts
+"#,
+        Some(
+            r#"exports { accounts: string = "x" }
+"#,
+        ),
+    );
+
+    let engine = test_engine();
+
+    // Simulate user editing to a new typo.
+    let retypo = r#"let orgs = upstream_state { source = '../organizations' }
+let x = orgs.acc
+"#;
+    let diagnostics = analyze_with_buffer(&engine, &base, &name, retypo);
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("does not export `acc`")),
+        "retyped typo must reflag, got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn upstream_state_cross_file_declaration_is_checked() {
+    // `let orgs = upstream_state { ... }` lives in `backend.crn`; the
+    // reference lives in `main.crn`. Must still flag.
+    let tmp = tempfile::tempdir().unwrap();
+    let upstream = tmp.path().join("organizations");
+    std::fs::create_dir(&upstream).unwrap();
+    std::fs::write(
+        upstream.join("exports.crn"),
+        r#"exports { accounts: string = "x" }
+"#,
+    )
+    .unwrap();
+    let base = tmp.path().join("downstream");
+    std::fs::create_dir(&base).unwrap();
+    std::fs::write(
+        base.join("backend.crn"),
+        r#"let orgs = upstream_state { source = '../organizations' }
+"#,
+    )
+    .unwrap();
+    let main_src = r#"for name, _ in orgs.account {
+    awscc.ec2.vpc {
+        name = name
+        cidr_block = '10.0.0.0/16'
+    }
+}
+"#;
+    std::fs::write(base.join("main.crn"), main_src).unwrap();
+
+    let engine = test_engine();
+    let diagnostics = analyze_with_buffer(&engine, &base, "main.crn", main_src);
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("does not export `account`")),
+        "cross-file upstream_state ref must be flagged, got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn upstream_state_duplicate_bad_refs_anchor_to_distinct_sites() {
+    // Two for-iterables both misspell the same field. Each diagnostic
+    // must anchor to its own source site, not stack on the first.
+    let (_tmp, base, name) = set_up_project_with_upstream(
+        r#"let orgs = upstream_state {
+    source = '../organizations'
+}
+
+for name, _ in orgs.bad {
+    awscc.ec2.vpc {
+        name = name
+        cidr_block = '10.0.0.0/16'
+    }
+}
+
+for other, _ in orgs.bad {
+    awscc.ec2.subnet {
+        name = other
+        cidr_block = '10.0.1.0/24'
+    }
+}
+"#,
+        Some(
+            r#"exports { accounts: string = "x" }
+"#,
+        ),
+    );
+
+    let engine = test_engine();
+    let buffer = std::fs::read_to_string(base.join(&name)).unwrap();
+    let diagnostics = analyze_with_buffer(&engine, &base, &name, &buffer);
+
+    let bad_ref_diags: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.message.contains("does not export `bad`"))
+        .collect();
+    assert_eq!(
+        bad_ref_diags.len(),
+        2,
+        "expected 2 diagnostics for 2 occurrences, got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    let lines: std::collections::HashSet<u32> =
+        bad_ref_diags.iter().map(|d| d.range.start.line).collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "diagnostics should anchor to distinct lines, got lines: {:?}",
+        bad_ref_diags
+            .iter()
+            .map(|d| d.range.start.line)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn upstream_state_single_line_block_source_diagnostic() {
+    // `let orgs = upstream_state { source = '../x' }` on one line.
+    // `find_source_value_position` must still locate the source value.
+    let tmp = tempfile::tempdir().unwrap();
+    let upstream = tmp.path().join("organizations");
+    std::fs::create_dir(&upstream).unwrap();
+    std::fs::write(upstream.join("main.crn"), "not valid crn {{{").unwrap();
+    let base = tmp.path().join("downstream");
+    std::fs::create_dir(&base).unwrap();
+    let src = "let orgs = upstream_state { source = '../organizations' }\n";
+    std::fs::write(base.join("main.crn"), src).unwrap();
+
+    let engine = test_engine();
+    let diagnostics = analyze_with_buffer(&engine, &base, "main.crn", src);
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("failed to parse source")),
+        "single-line upstream_state block must yield resolve-error diagnostic, got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn upstream_state_broken_upstream_surfaces_resolve_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let upstream = tmp.path().join("organizations");
+    std::fs::create_dir(&upstream).unwrap();
+    std::fs::write(upstream.join("main.crn"), "not valid crn {{{").unwrap();
+    let base = tmp.path().join("downstream");
+    std::fs::create_dir(&base).unwrap();
+    let src = r#"let orgs = upstream_state {
+    source = '../organizations'
+}
+"#;
+    std::fs::write(base.join("main.crn"), src).unwrap();
+
+    let engine = test_engine();
+    let diagnostics = analyze_with_buffer(&engine, &base, "main.crn", src);
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("failed to parse source")),
+        "broken upstream must produce resolve-error diagnostic, got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}

@@ -264,13 +264,19 @@ impl Backend {
                 .map(|dir| Self::scan_sibling_context(dir, &uri, &current_bindings))
                 .unwrap_or_default();
 
+            let current_file_name: Option<String> = uri
+                .to_file_path()
+                .ok()
+                .and_then(|p| p.file_name().and_then(|n| n.to_str().map(String::from)));
+
             let providers = self.providers.read().await;
             let state = base_path
                 .as_ref()
                 .map(|p| providers.state_for_path(p))
                 .unwrap_or(&providers.empty);
-            let diagnostics = state.diagnostic_engine.analyze(
+            let diagnostics = state.diagnostic_engine.analyze_with_filename(
                 &doc,
+                current_file_name.as_deref(),
                 base_path.as_deref(),
                 &sibling_bindings,
                 &sibling_referenced,

@@ -168,33 +168,6 @@ pub fn load_configuration_with_config(
             return Err(e.to_string());
         }
 
-        // Upgrade cross-file warnings: a for-expression in one file may reference
-        // an upstream_state defined in another file.  During per-file parsing the
-        // upstream_state is unknown, so the warning falls back to the generic
-        // "(known after apply)".  Now that all files are merged we can detect
-        // these and rewrite to an upstream-aware message.
-        upgrade_cross_file_warnings(&mut merged, &unresolved_merged);
-
-        // Emit "validate does not inspect" warnings for simple attribute
-        // references to upstream_state bindings declared in sibling files.
-        // Per-file parsing only sees its own upstream_states; this catches
-        // the cross-file case. Dedupe against warnings already present so
-        // we don't double-count same-file references.
-        let merged_upstream_states: Vec<parser::UpstreamState> = merged
-            .upstream_states
-            .iter()
-            .chain(unresolved_merged.upstream_states.iter())
-            .cloned()
-            .collect();
-        parser::warn_unverified_upstream_state_refs(
-            &merged_upstream_states,
-            &merged.resources,
-            &merged.attribute_params,
-            &merged.module_calls,
-            &merged.export_params,
-            &mut merged.warnings,
-        );
-
         Ok(LoadedConfig {
             parsed: merged,
             unresolved_parsed: unresolved_merged,
@@ -202,47 +175,6 @@ pub fn load_configuration_with_config(
         })
     } else {
         Err(format!("Path not found: {}", path.display()))
-    }
-}
-
-/// Upgrade generic "(known after apply)" warnings to upstream-aware messages
-/// when the binding matches an upstream_state found in a different file.
-fn upgrade_cross_file_warnings(merged: &mut ParsedFile, unresolved: &ParsedFile) {
-    let suffix = " is not yet available (known after apply)";
-    for warning in &mut merged.warnings {
-        if !warning.message.ends_with(suffix) {
-            continue;
-        }
-        // Extract binding name: message is "`orgs.accounts` is not yet available ..."
-        let path_str = match warning
-            .message
-            .strip_prefix('`')
-            .and_then(|s| s.split('`').next())
-        {
-            Some(p) => p,
-            None => continue,
-        };
-        let binding_name = match path_str.split('.').next() {
-            Some(b) => b,
-            None => continue,
-        };
-        // Check against merged upstream_states (includes all files)
-        let upstream_states = merged
-            .upstream_states
-            .iter()
-            .chain(unresolved.upstream_states.iter());
-        if let Some(us) = upstream_states
-            .into_iter()
-            .find(|u| u.binding == binding_name)
-        {
-            let new_msg = format!(
-                "`{}` depends on upstream_state '{}' ({}), which validate does not inspect.",
-                path_str,
-                binding_name,
-                us.source.display(),
-            );
-            warning.message = new_msg;
-        }
     }
 }
 
@@ -256,21 +188,52 @@ fn upgrade_cross_file_warnings(merged: &mut ParsedFile, unresolved: &ParsedFile)
 /// Returns `None` for `export_params` values that are cross-file string
 /// references (e.g. `"registry_prod.account_id"`) resolved to `ResourceRef`.
 pub fn parse_directory(dir: &Path, config: &ProviderContext) -> Result<ParsedFile, String> {
+    parse_directory_with_overrides(dir, config, &HashMap::new())
+}
+
+/// Like [`parse_directory`] but takes an `overrides` map from **file name**
+/// (e.g. `"main.crn"`) to source text. Files present in the map are parsed
+/// from the override text; the rest are read from disk.
+///
+/// LSP uses this to analyze the open document's in-memory buffer alongside
+/// the on-disk siblings, so edits show diagnostics before the user saves.
+pub fn parse_directory_with_overrides(
+    dir: &Path,
+    config: &ProviderContext,
+    overrides: &HashMap<String, String>,
+) -> Result<ParsedFile, String> {
     let dir_buf = dir.to_path_buf();
     let files = find_crn_files_in_dir(&dir_buf)?;
-    if files.is_empty() {
+    let mut paths: Vec<(std::path::PathBuf, String)> = files
+        .into_iter()
+        .filter_map(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str().map(|s| (p.clone(), s.to_string())))
+        })
+        .collect();
+    // Also include overrides whose filename isn't on disk yet (e.g. a new
+    // buffer the user hasn't saved). Keep the list de-duplicated by name.
+    for name in overrides.keys() {
+        if !paths.iter().any(|(_, n)| n == name) {
+            paths.push((dir_buf.join(name), name.clone()));
+        }
+    }
+    if paths.is_empty() {
         return Err(format!("No .crn files found in {}", dir.display()));
     }
 
     let mut merged = ParsedFile::default();
     let mut parse_errors = Vec::new();
 
-    for file in &files {
-        let content = fs::read_to_string(file)
-            .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
+    for (file, name) in &paths {
+        let content = match overrides.get(name) {
+            Some(buffer) => buffer.clone(),
+            None => fs::read_to_string(file)
+                .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?,
+        };
         match parser::parse(&content, config) {
             Ok(mut parsed) => {
-                let file_name = file.file_name().map(|n| n.to_string_lossy().into_owned());
+                let file_name = Some(name.clone());
                 for w in &mut parsed.warnings {
                     w.file = file_name.clone();
                 }
@@ -845,18 +808,21 @@ let orgs = upstream_state {
     }
 
     #[test]
-    fn cross_file_upstream_state_warning_does_not_assert_absence() {
-        // Regression for #1967: when a for-expression references an upstream_state
-        // declared in a different file, the merged warning must describe the
-        // dependency without claiming the key is absent — validate never reads
-        // the upstream state, so it cannot know.
-        let dir = create_temp_dir("cross_file_upstream_warning_wording");
+    fn cross_file_upstream_state_refs_emit_no_soft_warning() {
+        // Field validity is checked statically by the `upstream_exports`
+        // module now. Loader- and parser-level "validate does not inspect"
+        // soft warnings are gone across the board.
+        let dir = create_temp_dir("cross_file_upstream_no_warning");
         fs::write(
             dir.join("backend.crn"),
             r#"backend local { path = 'carina.state.json' }
 
 let orgs = upstream_state {
   source = '../organizations'
+}
+
+let network = upstream_state {
+  source = '../network'
 }
 "#,
         )
@@ -868,73 +834,8 @@ let orgs = upstream_state {
     name = name
   }
 }
-"#,
-        )
-        .unwrap();
 
-        let result = load_configuration(&dir);
-        let loaded = result.expect("load should succeed");
-        cleanup(&dir);
-
-        let warning = loaded
-            .parsed
-            .warnings
-            .iter()
-            .find(|w| w.message.contains("orgs.accounts"))
-            .expect("expected a warning for orgs.accounts");
-
-        assert!(
-            warning.message.contains("upstream_state 'orgs'"),
-            "warning should name the upstream_state binding, got: {}",
-            warning.message
-        );
-        assert!(
-            warning.message.contains("../organizations"),
-            "warning should name the upstream source, got: {}",
-            warning.message
-        );
-        assert!(
-            warning.message.contains("validate does not inspect"),
-            "warning should explain that validate does not inspect upstream state, got: {}",
-            warning.message
-        );
-        assert!(
-            !warning.message.contains("not yet in the upstream state"),
-            "warning must not assert the key is absent, got: {}",
-            warning.message
-        );
-        assert!(
-            !warning.message.contains("Apply that directory first"),
-            "warning must not prescribe re-applying upstream, got: {}",
-            warning.message
-        );
-        assert!(
-            !warning.message.contains("known after apply"),
-            "cross-file warning should be upgraded past generic 'known after apply', got: {}",
-            warning.message
-        );
-    }
-
-    #[test]
-    fn cross_file_simple_ref_to_upstream_state_emits_warning() {
-        // When a resource in one file references an upstream_state declared in
-        // another file via a simple attribute reference, the merged config must
-        // still surface the "validate does not inspect" warning — one warning
-        // per binding.
-        let dir = create_temp_dir("cross_file_simple_ref_upstream");
-        fs::write(
-            dir.join("backend.crn"),
-            r#"backend local { path = 'carina.state.json' }
-
-let network = upstream_state {
-  source = '../network'
-}
-"#,
-        )
-        .unwrap();
-        fs::write(
-            dir.join("main.crn"),
-            r#"awscc.ec2.security_group {
+awscc.ec2.security_group {
   group_description = 'Web SG'
   vpc_id = network.vpc_id
 }
@@ -946,27 +847,16 @@ let network = upstream_state {
         let loaded = result.expect("load should succeed");
         cleanup(&dir);
 
-        let matching: Vec<_> = loaded
+        let upstream_warnings: Vec<_> = loaded
             .parsed
             .warnings
             .iter()
-            .filter(|w| w.message.contains("upstream_state 'network'"))
+            .filter(|w| w.message.contains("upstream_state"))
             .collect();
-        assert_eq!(
-            matching.len(),
-            1,
-            "expected exactly one warning for cross-file simple ref, got: {:?}",
-            loaded.parsed.warnings
-        );
         assert!(
-            matching[0].message.contains("../network"),
-            "warning should name the upstream source, got: {}",
-            matching[0].message
-        );
-        assert!(
-            matching[0].message.contains("validate does not inspect"),
-            "warning should explain validate does not inspect, got: {}",
-            matching[0].message
+            upstream_warnings.is_empty(),
+            "loader should emit no soft upstream_state warnings, got: {:?}",
+            upstream_warnings
         );
     }
 

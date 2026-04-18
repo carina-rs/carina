@@ -110,6 +110,21 @@ impl DiagnosticEngine {
         sibling_bindings: &HashMap<String, String>,
         sibling_referenced: &HashSet<String>,
     ) -> Vec<Diagnostic> {
+        self.analyze_with_filename(doc, None, base_path, sibling_bindings, sibling_referenced)
+    }
+
+    /// Like [`analyze`] but lets the caller pass the current document's file
+    /// name (basename, e.g. `"main.crn"`). LSP uses this to feed the open
+    /// buffer into directory-scoped parses that would otherwise only see
+    /// on-disk content — so diagnostics update on keystrokes.
+    pub fn analyze_with_filename(
+        &self,
+        doc: &Document,
+        current_file_name: Option<&str>,
+        base_path: Option<&Path>,
+        sibling_bindings: &HashMap<String, String>,
+        sibling_referenced: &HashSet<String>,
+    ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
         let text = doc.text();
 
@@ -129,6 +144,19 @@ impl DiagnosticEngine {
         }
         let undef_diags = self.check_undefined_references(&text, &all_bindings);
         diagnostics.extend(undef_diags);
+
+        // Upstream_state field-ref check: must run even when the current
+        // document fails to parse on its own (e.g. when the downstream
+        // references a `let` declared in a sibling file). Uses a
+        // directory-scoped parse fed with the current buffer, not just
+        // disk content.
+        if let Some(base) = base_path {
+            diagnostics.extend(self.check_upstream_state_field_references(
+                doc,
+                current_file_name,
+                base,
+            ));
+        }
 
         // Semantic analysis on parsed file
         if let Some(parsed) = doc.parsed() {
