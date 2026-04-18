@@ -184,13 +184,27 @@ impl Backend {
         self.workspace_root.get().and_then(|opt| opt.as_ref())
     }
 
-    /// Scan sibling .crn files for `let binding = provider.service.type {` patterns.
-    /// Returns a map of binding_name → "provider.service.type" (schema key).
-    /// Scan sibling .crn files for let bindings and references.
+    /// Scan sibling `.crn` files in the same directory for `let` bindings
+    /// and references to the current file's bindings.
     ///
-    /// Returns:
-    /// - `bindings`: binding_name → resource_type for let bindings in sibling files
-    /// - `referenced`: binding names from the current file that are referenced by sibling files
+    /// ## Scope
+    ///
+    /// Intentionally **one directory level only** (the parent directory of
+    /// the file being edited). Carina is directory-scoped — each directory
+    /// is its own parse unit. Files in nested subdirectories are separate
+    /// modules or upstream projects with their own binding scopes, so they
+    /// must not leak bindings into this cross-file reference check.
+    /// Dedicated diagnostics
+    /// ([`crate::diagnostics::checks::DiagnosticEngine::check_upstream_state_field_references`])
+    /// handle references that do cross a directory boundary (upstream
+    /// state exports, module call arguments) via
+    /// `parse_directory_with_overrides`.
+    ///
+    /// ## Returns
+    /// - `bindings`: binding_name → resource_type for `let` bindings in the
+    ///   current file's sibling `.crn`s.
+    /// - `referenced`: binding names from the current file that appear to be
+    ///   referenced by those siblings.
     fn scan_sibling_context(
         dir: &Path,
         current_uri: &Url,
