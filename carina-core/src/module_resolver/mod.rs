@@ -659,18 +659,15 @@ pub fn get_parsed_file(path: &Path) -> Result<ParsedFile, ModuleError> {
 
 /// Load a module from a file or directory path.
 ///
-/// For directories, tries `main.crn` first, then falls back to merging all `.crn` files.
-/// Returns `None` if the path cannot be read/parsed, or if the directory contains
-/// no module definitions (no inputs or outputs).
+/// For directories, merges all `.crn` files uniformly. No file name
+/// (including `main.crn`) is privileged: definitions in sibling files
+/// are preserved alongside `main.crn`.
+///
+/// Returns `None` if the path cannot be read/parsed, or if the directory
+/// contains no module definitions (no inputs or outputs).
 pub fn load_module(path: &Path) -> Option<ParsedFile> {
     if path.is_dir() {
-        let main_path = path.join("main.crn");
-        if main_path.exists() {
-            let content = fs::read_to_string(&main_path).ok()?;
-            crate::parser::parse(&content, &ProviderContext::default()).ok()
-        } else {
-            load_directory_module(path)
-        }
+        load_directory_module(path)
     } else {
         let content = fs::read_to_string(path).ok()?;
         crate::parser::parse(&content, &ProviderContext::default()).ok()
@@ -805,7 +802,6 @@ fn check_type_match(
 ///
 /// Returns `None` if no module definitions (arguments/attributes) are found.
 pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
-    let entries = fs::read_dir(dir_path).ok()?;
     let mut merged = ParsedFile {
         providers: vec![],
         resources: vec![],
@@ -825,10 +821,18 @@ pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
         deferred_for_expressions: vec![],
     };
 
-    for entry in entries.flatten() {
+    // Collect and sort .crn entries so the merged vectors are independent of
+    // filesystem iteration order (ext4 vs APFS vs tmpfs differ).
+    let mut crn_files: Vec<_> = fs::read_dir(dir_path)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "crn"))
+        .collect();
+    crn_files.sort_by_key(|e| e.path());
+
+    for entry in crn_files {
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "crn")
-            && let Ok(content) = fs::read_to_string(&path)
+        if let Ok(content) = fs::read_to_string(&path)
             && let Ok(parsed) = crate::parser::parse(&content, &ProviderContext::default())
         {
             merged.providers.extend(parsed.providers);
@@ -2722,5 +2726,75 @@ mod tests {
             "Expected InvalidArgumentType for list with invalid ARN, got {:?}",
             result
         );
+    }
+
+    #[test]
+    fn test_load_module_directory_merges_sibling_files_with_main() {
+        // A directory-based module that splits definitions across main.crn and
+        // sibling files (arguments.crn, exports.crn, resources.crn) must be
+        // parsed as a whole. The previous behavior returned only main.crn's
+        // contents when main.crn existed, silently dropping siblings.
+        let tmp_dir = std::env::temp_dir().join("carina_test_load_module_sibling_merge");
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        fs::write(tmp_dir.join("main.crn"), "# main module file\n").unwrap();
+        fs::write(
+            tmp_dir.join("arguments.crn"),
+            "arguments {\n  env: string\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp_dir.join("exports.crn"),
+            "exports {\n  region = \"ap-northeast-1\"\n}\n",
+        )
+        .unwrap();
+
+        let parsed = load_module(&tmp_dir)
+            .expect("expected module to load because arguments.crn declares an argument");
+
+        assert_eq!(
+            parsed.arguments.len(),
+            1,
+            "arguments declared in arguments.crn must be preserved when main.crn exists"
+        );
+        assert_eq!(parsed.arguments[0].name, "env");
+        assert_eq!(
+            parsed.export_params.len(),
+            1,
+            "exports declared in exports.crn must be preserved when main.crn exists"
+        );
+        assert_eq!(parsed.export_params[0].name, "region");
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_load_module_directory_merge_order_is_deterministic() {
+        // Merged vectors must be ordered by file path so that downstream
+        // first-match-wins lookups (hover, completion, diagnostics) do not
+        // depend on filesystem iteration order.
+        let tmp_dir = std::env::temp_dir().join("carina_test_load_module_merge_order");
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        // Create files out of lexicographic order to make the sort observable.
+        fs::write(tmp_dir.join("z_last.crn"), "arguments {\n  c: string\n}\n").unwrap();
+        fs::write(tmp_dir.join("a_first.crn"), "arguments {\n  a: string\n}\n").unwrap();
+        fs::write(
+            tmp_dir.join("m_middle.crn"),
+            "arguments {\n  b: string\n}\n",
+        )
+        .unwrap();
+
+        let parsed = load_module(&tmp_dir).expect("module should load");
+        let names: Vec<&str> = parsed.arguments.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["a", "b", "c"],
+            "arguments must be merged in sorted filename order"
+        );
+
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 }
