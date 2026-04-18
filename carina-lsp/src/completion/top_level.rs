@@ -475,30 +475,20 @@ impl CompletionProvider {
             }
 
             let path = entry.path();
-            if path.is_dir() {
-                // Directory: suggest as path component
-                if name.starts_with(name_prefix) {
-                    completions.push(CompletionItem {
-                        label: format!("{}/", name),
-                        kind: Some(CompletionItemKind::FOLDER),
-                        insert_text: Some(format!("{}/", name)),
-                        detail: Some("Directory".to_string()),
-                        command: Some(Command {
-                            title: "Trigger Suggest".to_string(),
-                            command: "editor.action.triggerSuggest".to_string(),
-                            arguments: None,
-                        }),
-                        ..Default::default()
-                    });
-                }
-            } else if name.ends_with(".crn") && name.starts_with(name_prefix) {
-                // .crn file: suggest without extension
-                let stem = name.strip_suffix(".crn").unwrap_or(&name);
+            // Modules are directory-scoped, so only directories are valid
+            // import targets; .crn files on their own are rejected by the
+            // resolver (ModuleError::NotADirectory).
+            if path.is_dir() && name.starts_with(name_prefix) {
                 completions.push(CompletionItem {
-                    label: stem.to_string(),
-                    kind: Some(CompletionItemKind::FILE),
-                    insert_text: Some(stem.to_string()),
-                    detail: Some("Carina module".to_string()),
+                    label: format!("{}/", name),
+                    kind: Some(CompletionItemKind::FOLDER),
+                    insert_text: Some(format!("{}/", name)),
+                    detail: Some("Module directory".to_string()),
+                    command: Some(Command {
+                        title: "Trigger Suggest".to_string(),
+                        command: "editor.action.triggerSuggest".to_string(),
+                        arguments: None,
+                    }),
                     ..Default::default()
                 });
             }

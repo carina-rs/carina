@@ -71,6 +71,11 @@ pub enum ModuleError {
 
     #[error("Require constraint failed in module '{module}': {message}")]
     RequireConstraintFailed { module: String, message: String },
+
+    #[error(
+        "Module path '{path}' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory."
+    )]
+    NotADirectory { path: String },
 }
 
 /// Context for module resolution
@@ -106,19 +111,26 @@ impl<'cfg> ModuleResolver<'cfg> {
         }
     }
 
-    /// Load and cache a module from a file or directory path
+    /// Load and cache a module from a directory path.
+    ///
+    /// Modules are directory-scoped: a module is a directory containing one or
+    /// more `.crn` files. Single-file modules are not supported — pass the
+    /// module's directory, not an individual `.crn` file.
     pub fn load_module(&mut self, path: &str) -> Result<ParsedFile, ModuleError> {
         let full_path = self.resolve_path(path);
 
-        // Canonicalize for consistent cycle detection and caching.
-        // For directories, canonicalize directly. For files, try with .crn extension.
-        let canonical = if full_path.exists() {
-            full_path.canonicalize()?
-        } else if full_path.with_extension("crn").exists() {
-            full_path.with_extension("crn").canonicalize()?
-        } else {
-            full_path.clone()
-        };
+        // Distinguish "file exists but isn't a directory" from
+        // "path doesn't exist / permission denied": only the former is the
+        // single-file-module contract violation. Otherwise let canonicalize()
+        // surface the underlying IO error (NotFound, PermissionDenied, ...).
+        let metadata = full_path.metadata()?;
+        if !metadata.is_dir() {
+            return Err(ModuleError::NotADirectory {
+                path: path.to_string(),
+            });
+        }
+
+        let canonical = full_path.canonicalize()?;
 
         // Check for circular import
         if self.resolving.contains(&canonical) {
@@ -133,17 +145,7 @@ impl<'cfg> ModuleResolver<'cfg> {
         // Mark as resolving
         self.resolving.insert(canonical.clone());
 
-        // Load module: directory or single file
-        let load_result = if full_path.is_dir() {
-            self.load_directory_module(&full_path)
-        } else {
-            fs::read_to_string(&full_path)
-                .map_err(ModuleError::from)
-                .and_then(|content| {
-                    crate::parser::parse(&content, self.config).map_err(ModuleError::from)
-                })
-        };
-        let mut parsed = match load_result {
+        let mut parsed = match self.load_directory_module(&full_path) {
             Ok(parsed) => parsed,
             Err(e) => {
                 self.resolving.remove(&canonical);
@@ -164,13 +166,8 @@ impl<'cfg> ModuleResolver<'cfg> {
         }
 
         // Recursively resolve nested module imports within this module.
-        // The module's base directory is used for resolving its relative imports.
-        let module_base_dir = if full_path.is_dir() {
-            full_path.clone()
-        } else {
-            full_path.parent().unwrap_or(&full_path).to_path_buf()
-        };
-        if let Err(e) = self.resolve_nested_modules(&mut parsed, &module_base_dir) {
+        // The module's directory is used for resolving its relative imports.
+        if let Err(e) = self.resolve_nested_modules(&mut parsed, &full_path) {
             self.resolving.remove(&canonical);
             return Err(e);
         }
@@ -657,21 +654,18 @@ pub fn get_parsed_file(path: &Path) -> Result<ParsedFile, ModuleError> {
     Ok(parsed)
 }
 
-/// Load a module from a file or directory path.
+/// Load a module from a directory path.
 ///
-/// For directories, merges all `.crn` files uniformly. No file name
-/// (including `main.crn`) is privileged: definitions in sibling files
-/// are preserved alongside `main.crn`.
+/// Modules are directory-scoped: all `.crn` files in the directory are merged
+/// uniformly, with no file name (including `main.crn`) treated as privileged.
 ///
-/// Returns `None` if the path cannot be read/parsed, or if the directory
+/// Returns `None` if `path` is not a directory, cannot be read/parsed, or
 /// contains no module definitions (no inputs or outputs).
 pub fn load_module(path: &Path) -> Option<ParsedFile> {
-    if path.is_dir() {
-        load_directory_module(path)
-    } else {
-        let content = fs::read_to_string(path).ok()?;
-        crate::parser::parse(&content, &ProviderContext::default()).ok()
+    if !path.is_dir() {
+        return None;
     }
+    load_directory_module(path)
 }
 
 /// Check that a module argument value matches the declared type.
@@ -1818,27 +1812,29 @@ mod tests {
     }
 
     #[test]
-    fn test_load_module_io_error_cleans_resolving_set() {
-        let tmp_dir = std::env::temp_dir().join("carina_test_io_error_cleanup");
+    fn test_load_module_missing_path_cleans_resolving_set() {
+        // Nonexistent import path => descriptive IO error (NotFound), not the
+        // single-file-module contract error. The resolving set must be cleaned
+        // up so a retry does not masquerade as a circular import.
+        let tmp_dir = std::env::temp_dir().join("carina_test_missing_path_cleanup");
         let _ = fs::create_dir_all(&tmp_dir);
 
         let mut resolver = ModuleResolver::new(&tmp_dir);
 
-        // First attempt: load a non-existent file -> IO error
-        let result = resolver.load_module("nonexistent");
-        assert!(result.is_err());
+        let err = resolver
+            .load_module("nonexistent")
+            .expect_err("expected error");
         assert!(
-            matches!(&result.unwrap_err(), ModuleError::Io(_)),
-            "expected IO error on first attempt"
+            matches!(&err, ModuleError::Io(_)),
+            "expected Io error for a nonexistent path, got: {err:?}"
         );
 
-        // Second attempt: should get the same IO error, not a circular import error.
-        // Before the fix, the path stayed in `resolving` and this would return CircularImport.
-        let result = resolver.load_module("nonexistent");
-        assert!(result.is_err());
+        let err = resolver
+            .load_module("nonexistent")
+            .expect_err("expected error");
         assert!(
-            matches!(&result.unwrap_err(), ModuleError::Io(_)),
-            "expected IO error on second attempt, not CircularImport"
+            matches!(&err, ModuleError::Io(_)),
+            "expected Io error on second attempt, not CircularImport, got: {err:?}"
         );
 
         let _ = fs::remove_dir_all(&tmp_dir);
@@ -1846,15 +1842,20 @@ mod tests {
 
     #[test]
     fn test_load_module_parse_error_cleans_resolving_set() {
-        let tmp_dir = std::env::temp_dir().join("carina_test_parse_error_cleanup");
-        let _ = fs::create_dir_all(&tmp_dir);
-        let bad_file = tmp_dir.join("bad_module.crn");
-        fs::write(&bad_file, "this is not valid carina syntax {{{{").unwrap();
+        let tmp_root = std::env::temp_dir().join("carina_test_parse_error_cleanup");
+        let _ = fs::remove_dir_all(&tmp_root);
+        let bad_module_dir = tmp_root.join("bad_module");
+        fs::create_dir_all(&bad_module_dir).unwrap();
+        fs::write(
+            bad_module_dir.join("main.crn"),
+            "this is not valid carina syntax {{{{",
+        )
+        .unwrap();
 
-        let mut resolver = ModuleResolver::new(&tmp_dir);
+        let mut resolver = ModuleResolver::new(&tmp_root);
 
-        // First attempt: parse error (use .crn extension since load_module reads full_path directly)
-        let result = resolver.load_module("bad_module.crn");
+        // First attempt: parse error on a directory module with a bad .crn file.
+        let result = resolver.load_module("bad_module");
         assert!(
             result.is_err(),
             "expected error but got: {:?}",
@@ -1867,7 +1868,8 @@ mod tests {
         );
 
         // Second attempt: should still get parse error, not circular import
-        let result = resolver.load_module("bad_module.crn");
+        // (the resolving set must have been cleaned up).
+        let result = resolver.load_module("bad_module");
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -1875,7 +1877,29 @@ mod tests {
             "expected Parse error on second attempt, not CircularImport, got: {err:?}"
         );
 
-        let _ = fs::remove_dir_all(&tmp_dir);
+        let _ = fs::remove_dir_all(&tmp_root);
+    }
+
+    #[test]
+    fn test_load_module_rejects_file_path() {
+        // Issue #1997: Modules must be directories. A single `.crn` file as a
+        // module target should be rejected with NotADirectory instead of being
+        // parsed as a one-file module.
+        let tmp_root = std::env::temp_dir().join("carina_test_module_rejects_file");
+        let _ = fs::remove_dir_all(&tmp_root);
+        fs::create_dir_all(&tmp_root).unwrap();
+        fs::write(tmp_root.join("single.crn"), "arguments {\n  x: string\n}\n").unwrap();
+
+        let mut resolver = ModuleResolver::new(&tmp_root);
+        let err = resolver
+            .load_module("single.crn")
+            .expect_err("a single .crn file must not be loadable as a module");
+        assert!(
+            matches!(&err, ModuleError::NotADirectory { .. }),
+            "expected NotADirectory, got {err:?}"
+        );
+
+        let _ = fs::remove_dir_all(&tmp_root);
     }
 
     /// Helper to create a module with a validated port argument

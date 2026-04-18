@@ -7,10 +7,10 @@ Modules are reusable units of Carina configuration. A module defines a set of re
 
 ## Module Structure
 
-A module is a `.crn` file (or a directory containing `main.crn`) that declares `arguments` and `attributes` blocks.
+A module is a directory containing one or more `.crn` files that together declare `arguments` and `attributes` blocks. Carina merges every `.crn` file in the directory as peers; there is no privileged filename like `main.crn`.
 
 ```crn
-# modules/network/main.crn
+# modules/network/main.crn  (any filename works — main.crn is just convention)
 
 arguments {
   cidr_block : string
@@ -168,19 +168,31 @@ awscc.ec2.security_group {
 
 ## Directory Modules
 
-A module can be either:
+A module is always a **directory** containing one or more `.crn` files. Every
+`.crn` file in that directory is merged into a single module — no file name
+(including `main.crn`) is treated as privileged, so definitions can be split
+across `arguments.crn`, `exports.crn`, `resources.crn`, etc. as naturally as
+you like.
 
-- **A single file**: `import "./modules/network.crn"` (the `.crn` extension can be omitted)
-- **A directory**: `import "./modules/network"` which loads `./modules/network/main.crn`
+```
+modules/network/
+  main.crn        # optional; just one of the module's .crn files
+  arguments.crn   # merged in as peers
+  exports.crn
+```
 
-Directory modules are useful when a module needs helper files or becomes complex enough to warrant its own directory.
+Single-file imports (`import "./modules/network.crn"`) are **not supported**:
+the loader returns `NotADirectory` for any path that is not a directory.
+If your module is currently a single `.crn` file, move it into a directory of
+its own.
 
 ## Module Resolution
 
-Import paths are resolved relative to the file containing the `import` statement:
+Import paths are resolved relative to the file containing the `import`
+statement and must point at a directory:
 
 ```crn
-# From project/main.crn, imports project/modules/network/main.crn
+# From project/main.crn, imports every .crn file under project/modules/network/
 let network = import './modules/network'
 
 # Relative path from current file
