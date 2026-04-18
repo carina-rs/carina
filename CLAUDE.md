@@ -226,7 +226,7 @@ Enum values use namespaced identifiers like `aws.s3.VersioningStatus.Enabled`.
 ### Module Loading
 
 Directory-based modules (e.g., `modules/web_tier/`) require special handling:
-- CLI: `load_module()` checks `is_dir()` and reads `main.crn` from directory
+- CLI: `load_module()` checks `is_dir()` and merges all `.crn` files in the directory uniformly (no file name is privileged; `main.crn` is a peer of `arguments.crn`, `exports.crn`, etc.)
 - LSP: Module loading in `diagnostics/checks.rs` handles directory modules for proper validation
 
 ## Git Workflow

@@ -659,18 +659,15 @@ pub fn get_parsed_file(path: &Path) -> Result<ParsedFile, ModuleError> {
 
 /// Load a module from a file or directory path.
 ///
-/// For directories, tries `main.crn` first, then falls back to merging all `.crn` files.
-/// Returns `None` if the path cannot be read/parsed, or if the directory contains
-/// no module definitions (no inputs or outputs).
+/// For directories, merges all `.crn` files uniformly. No file name
+/// (including `main.crn`) is privileged: definitions in sibling files
+/// are preserved alongside `main.crn`.
+///
+/// Returns `None` if the path cannot be read/parsed, or if the directory
+/// contains no module definitions (no inputs or outputs).
 pub fn load_module(path: &Path) -> Option<ParsedFile> {
     if path.is_dir() {
-        let main_path = path.join("main.crn");
-        if main_path.exists() {
-            let content = fs::read_to_string(&main_path).ok()?;
-            crate::parser::parse(&content, &ProviderContext::default()).ok()
-        } else {
-            load_directory_module(path)
-        }
+        load_directory_module(path)
     } else {
         let content = fs::read_to_string(path).ok()?;
         crate::parser::parse(&content, &ProviderContext::default()).ok()
@@ -2722,5 +2719,46 @@ mod tests {
             "Expected InvalidArgumentType for list with invalid ARN, got {:?}",
             result
         );
+    }
+
+    #[test]
+    fn test_load_module_directory_merges_sibling_files_with_main() {
+        // A directory-based module that splits definitions across main.crn and
+        // sibling files (arguments.crn, exports.crn, resources.crn) must be
+        // parsed as a whole. The previous behavior returned only main.crn's
+        // contents when main.crn existed, silently dropping siblings.
+        let tmp_dir = std::env::temp_dir().join("carina_test_load_module_sibling_merge");
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        fs::write(tmp_dir.join("main.crn"), "# main module file\n").unwrap();
+        fs::write(
+            tmp_dir.join("arguments.crn"),
+            "arguments {\n  env: string\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp_dir.join("exports.crn"),
+            "exports {\n  region = \"ap-northeast-1\"\n}\n",
+        )
+        .unwrap();
+
+        let parsed = load_module(&tmp_dir)
+            .expect("expected module to load because arguments.crn declares an argument");
+
+        assert_eq!(
+            parsed.arguments.len(),
+            1,
+            "arguments declared in arguments.crn must be preserved when main.crn exists"
+        );
+        assert_eq!(parsed.arguments[0].name, "env");
+        assert_eq!(
+            parsed.export_params.len(),
+            1,
+            "exports declared in exports.crn must be preserved when main.crn exists"
+        );
+        assert_eq!(parsed.export_params[0].name, "region");
+
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 }
