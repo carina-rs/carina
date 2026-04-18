@@ -511,6 +511,41 @@ fn plan_snapshot_exports() {
     insta::assert_snapshot!(strip_ansi(&output));
 }
 
+/// Verifies that a project whose provider/resource/exports blocks are
+/// spread across sibling .crn files produces the same plan as the
+/// single-file `exports` fixture. Guards against regressions where
+/// directory-scoped parsing drops definitions in sibling files.
+#[test]
+fn plan_snapshot_exports_multifile() {
+    use crate::commands::plan::ExportChange;
+    use carina_core::parser::TypeExpr;
+    use carina_core::resource::Value;
+
+    let (plan, schemas, moved_origins) = build_plan_from_fixture("exports_multifile");
+    let export_changes = vec![
+        ExportChange::Added {
+            name: "vpc_id".to_string(),
+            type_expr: Some(TypeExpr::String),
+            new_value: Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
+        },
+        ExportChange::Added {
+            name: "cidr".to_string(),
+            type_expr: None,
+            new_value: Value::resource_ref("vpc".to_string(), "cidr_block".to_string(), vec![]),
+        },
+    ];
+    let output = format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &moved_origins,
+        &export_changes,
+        &[],
+    );
+    insta::assert_snapshot!(strip_ansi(&output));
+}
+
 #[test]
 fn plan_snapshot_export_changes_mixed() {
     use crate::commands::plan::ExportChange;
