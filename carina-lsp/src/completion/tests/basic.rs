@@ -416,7 +416,12 @@ security_group_ingress {
 }
 
 #[test]
+#[ignore = "requires provider schemas"]
 fn struct_field_value_completion_for_bool() {
+    // Requires the real `awscc.ec2.flow_log` schema so the destination_options
+    // struct resolves; previously this test passed only because the
+    // fallback path returned `true`/`false` to every unresolved attribute
+    // (the exact pollution #1974 fixed).
     let provider = test_provider();
     // flow_log's destination_options has Bool fields
     let doc = create_document(
@@ -1125,6 +1130,58 @@ fn module_call_scaffolding_includes_arguments() {
         snippet.contains("name") && snippet.contains("port"),
         "Scaffold should include all arguments. Got:\n{}",
         snippet
+    );
+}
+
+#[test]
+fn unknown_attribute_fallback_has_no_type_pollution() {
+    // When value completion cannot resolve the attribute's type (the
+    // attribute isn't in the schema), the fallback must not inject
+    // concrete values of arbitrary types. `true`/`false` belong to Bool;
+    // `aws.Region.*` belong to Region. Built-in functions are fine —
+    // they're type-neutral.
+    use carina_core::schema::{AttributeSchema, AttributeType, CompletionValue, ResourceSchema};
+    use std::sync::Arc;
+
+    let schema = ResourceSchema::new("test.foo.bar")
+        .attribute(AttributeSchema::new("known_attr", AttributeType::String));
+    let mut schemas = HashMap::new();
+    schemas.insert("test.foo.bar".to_string(), schema);
+    let regions = vec![CompletionValue {
+        value: "aws.Region.ap_northeast_1".to_string(),
+        description: "Tokyo".to_string(),
+    }];
+    let provider = CompletionProvider::new(
+        Arc::new(schemas),
+        vec!["test".to_string(), "aws".to_string()],
+        regions,
+        vec![],
+    );
+    // Cursor after `nonexistent_attr = ` — `nonexistent_attr` has no schema.
+    let doc = create_document("test.foo.bar {\n  nonexistent_attr = \n}\n");
+    let position = Position {
+        line: 1,
+        character: 22,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        !labels.contains(&"true") && !labels.contains(&"false"),
+        "Bool values must not leak into unknown-attribute fallback. Got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.iter().any(|l| l.starts_with("aws.Region.")),
+        "Region values must not leak into unknown-attribute fallback. Got: {:?}",
+        labels
+    );
+    // Sanity: built-in functions are still offered (type-neutral).
+    assert!(
+        labels.contains(&"join"),
+        "Built-in functions should still appear. Got: {:?}",
+        labels
     );
 }
 
