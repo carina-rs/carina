@@ -142,6 +142,40 @@ pub(super) fn test_provider_single_attr() -> CompletionProvider {
     CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![])
 }
 
+/// Like `test_provider_with_nameless_enum` but with a non-empty
+/// `region_completions_data`, so tests can detect region pollution in
+/// type-incompatible completion paths (see #1974).
+pub(super) fn test_provider_with_enum_and_regions() -> CompletionProvider {
+    let status_enum = AttributeType::StringEnum {
+        name: "VersioningStatus".to_string(),
+        values: vec!["Enabled".to_string(), "Suspended".to_string()],
+        namespace: None,
+        to_dsl: None,
+    };
+    let schema = ResourceSchema::new("awscc.s3.bucket")
+        .attribute(AttributeSchema::new("versioning_status", status_enum));
+    let mut schemas = HashMap::new();
+    schemas.insert("awscc.s3.bucket".to_string(), schema);
+
+    let region_completions: Vec<CompletionValue> = vec![
+        CompletionValue {
+            value: "aws.Region.ap_northeast_1".to_string(),
+            description: "Asia Pacific (Tokyo)".to_string(),
+        },
+        CompletionValue {
+            value: "aws.Region.us_east_1".to_string(),
+            description: "US East (N. Virginia)".to_string(),
+        },
+    ];
+
+    CompletionProvider::new(
+        Arc::new(schemas),
+        vec!["awscc".to_string(), "aws".to_string()],
+        region_completions,
+        vec![],
+    )
+}
+
 /// Provider with StringEnum that has name but no namespace (simulates WASM provider).
 pub(super) fn test_provider_with_nameless_enum() -> CompletionProvider {
     // Top-level attribute with StringEnum (no namespace)
