@@ -19,9 +19,15 @@ use carina_cli::commands::state::{StateCommands, run_force_unlock, run_state_com
 use carina_cli::commands::validate::run_validate;
 use carina_cli::error;
 
+/// Version string assembled at build time by `build.rs`. Formatted as
+/// `<pkg> (<git-hash>[-dirty] <build-date>)`, or just `<pkg>` when the
+/// binary is built from a non-git source (e.g. `cargo install` from
+/// crates.io, where `build.rs` has no git context).
+const VERSION: &str = env!("CARINA_VERSION_STRING");
+
 #[derive(Parser)]
 #[command(name = "carina")]
-#[command(version)]
+#[command(version = VERSION)]
 #[command(about = "A functional infrastructure management tool", long_about = None)]
 struct Cli {
     #[command(subcommand)]
