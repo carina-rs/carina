@@ -143,26 +143,11 @@ pub fn run_lint(path: &PathBuf, provider_context: &ProviderContext) -> Result<()
         }
     }
 
-    // Also collect tag keys from module directories
-    for call in &parsed.module_calls {
-        let module_dir = base_dir.join(&call.module_name);
-        if module_dir.is_dir()
-            && let Ok(module_files) = find_crn_files_in_dir(&module_dir)
-        {
-            for mf in module_files {
-                if let Ok(content) = fs::read_to_string(&mf) {
-                    let file_tag_keys = collect_tag_keys(&content);
-                    for entry in &file_tag_keys {
-                        all_tag_keys.push(TagKeyEntry {
-                            key: entry.key.clone(),
-                            style: entry.style,
-                            line: entry.line,
-                        });
-                        tag_key_files.push(mf.clone());
-                    }
-                }
-            }
-        }
+    // Also collect tag keys from every imported module directory so tag-key
+    // style consistency is checked across the whole project (root + modules).
+    for (mf, entry) in collect_tag_keys_from_modules(&parsed, base_dir) {
+        all_tag_keys.push(entry);
+        tag_key_files.push(mf);
     }
 
     // Check for mixed tag key styles across all collected keys
@@ -209,5 +194,125 @@ pub fn run_lint(path: &PathBuf, provider_context: &ProviderContext) -> Result<()
             "Found {} lint warning(s).",
             warnings.len()
         )))
+    }
+}
+
+/// Walk every imported module directory referenced by `parsed.module_calls`
+/// and yield each `.crn` file's tag keys paired with the file path.
+///
+/// Keys off `parsed.imports` (alias → path) rather than `module_calls.module_name`:
+/// the alias need not match the last component of the import path (e.g.
+/// `import net = './modules/network'` uses alias `net` but dir `network`).
+/// Modules are directory-scoped (#1997), so only directory imports that are
+/// actually called from the root config are scanned.
+fn collect_tag_keys_from_modules(
+    parsed: &carina_core::parser::ParsedFile,
+    base_dir: &std::path::Path,
+) -> Vec<(PathBuf, TagKeyEntry)> {
+    let aliases_used: HashSet<&str> = parsed
+        .module_calls
+        .iter()
+        .map(|c| c.module_name.as_str())
+        .collect();
+
+    let mut out = Vec::new();
+    for import in &parsed.imports {
+        if !aliases_used.contains(import.alias.as_str()) {
+            continue;
+        }
+        let module_dir = base_dir.join(&import.path);
+        if !module_dir.is_dir() {
+            continue;
+        }
+        let Ok(module_files) = find_crn_files_in_dir(&module_dir) else {
+            continue;
+        };
+        for mf in module_files {
+            let Ok(content) = fs::read_to_string(&mf) else {
+                continue;
+            };
+            for entry in collect_tag_keys(&content) {
+                out.push((mf.clone(), entry));
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use carina_core::parser::{ImportStatement, ModuleCall, ParsedFile};
+
+    /// Build a minimal ParsedFile with the given imports and module-call aliases.
+    fn parsed_with_imports(imports: Vec<(&str, &str)>, calls: Vec<&str>) -> ParsedFile {
+        ParsedFile {
+            imports: imports
+                .into_iter()
+                .map(|(alias, path)| ImportStatement {
+                    alias: alias.to_string(),
+                    path: path.to_string(),
+                })
+                .collect(),
+            module_calls: calls
+                .into_iter()
+                .map(|name| ModuleCall {
+                    module_name: name.to_string(),
+                    binding_name: None,
+                    arguments: HashMap::new(),
+                })
+                .collect(),
+            ..ParsedFile::default()
+        }
+    }
+
+    #[test]
+    fn collect_tag_keys_from_modules_scans_directory_imports() {
+        // Regression guard for #1997: a module whose import alias differs
+        // from the directory name must still be scanned for tag keys.
+        let tmp = tempfile::tempdir().unwrap();
+        let modules_dir = tmp.path().join("modules").join("network");
+        fs::create_dir_all(&modules_dir).unwrap();
+        fs::write(
+            modules_dir.join("main.crn"),
+            "let vpc = awscc.ec2.vpc {\n  tags = {\n    Name = 'x'\n  }\n}\n",
+        )
+        .unwrap();
+
+        let parsed = parsed_with_imports(
+            vec![("net", "./modules/network")],
+            vec!["net"], // alias differs from last path component
+        );
+
+        let results = collect_tag_keys_from_modules(&parsed, tmp.path());
+        assert!(
+            results.iter().any(|(_, entry)| entry.key == "Name"),
+            "tag key 'Name' must be collected from the module's main.crn; got {:?}",
+            results.iter().map(|(_, e)| &e.key).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn collect_tag_keys_from_modules_skips_unused_imports() {
+        // An imported module that is never called from the root config is
+        // not part of the effective plan — skip it to avoid surfacing tag
+        // inconsistencies in dead code.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("unused");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("main.crn"),
+            "let vpc = awscc.ec2.vpc {\n  tags = {\n    Name = 'x'\n  }\n}\n",
+        )
+        .unwrap();
+
+        let parsed = parsed_with_imports(vec![("unused", "./unused")], vec![]); // no call
+
+        let results = collect_tag_keys_from_modules(&parsed, tmp.path());
+        assert!(
+            results.is_empty(),
+            "tag keys from uncalled imports must not be collected; got {:?}",
+            results.iter().map(|(_, e)| &e.key).collect::<Vec<_>>()
+        );
     }
 }
