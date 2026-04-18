@@ -394,6 +394,49 @@ mod tests {
     }
 
     #[test]
+    fn resolve_merges_exports_across_multiple_crn_files_in_upstream() {
+        // Issue #1997: when the upstream project is multi-file, the resolver
+        // must merge every .crn file's exports — not just read one privileged
+        // file. A downstream that references a field declared in a sibling
+        // of the upstream's exports file must still validate.
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream_dir = tmp.path().join("organizations");
+        fs::create_dir(&upstream_dir).unwrap();
+        // Two sibling files each contributing their own exports block.
+        write_crn(
+            &upstream_dir,
+            "accounts.crn",
+            r#"exports {
+                accounts: string = "x"
+            }"#,
+        );
+        write_crn(
+            &upstream_dir,
+            "region.crn",
+            r#"exports {
+                region: string = "ap-northeast-1"
+            }"#,
+        );
+        let base = tmp.path().join("downstream");
+        fs::create_dir(&base).unwrap();
+
+        let (got, errs) =
+            resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], &ctx());
+        assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
+        let keys = got.get("orgs").expect("resolved");
+        assert!(
+            keys.contains("accounts"),
+            "export from accounts.crn must be merged, got {:?}",
+            keys
+        );
+        assert!(
+            keys.contains("region"),
+            "export from region.crn must be merged, got {:?}",
+            keys
+        );
+    }
+
+    #[test]
     fn resolve_skips_missing_source_directory() {
         // Missing-directory is `check_upstream_state_sources`' job; this
         // resolver stays quiet about it.

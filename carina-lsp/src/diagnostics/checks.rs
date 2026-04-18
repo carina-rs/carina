@@ -376,6 +376,12 @@ impl DiagnosticEngine {
     /// surface typo'd source paths as squiggles instead of waiting until the
     /// user runs `carina validate` or `carina plan`. Cheap by design — no
     /// canonicalize, no remote state reads.
+    ///
+    /// Scope: **directory existence only.** Parsing the upstream's `.crn`
+    /// files (across every sibling file in the upstream directory) and
+    /// checking references against its declared exports is the job of
+    /// [`Self::check_upstream_state_field_references`], which runs a full
+    /// directory-scoped parse via `parse_directory_with_overrides`.
     pub(super) fn check_upstream_state_sources(
         &self,
         doc: &Document,
