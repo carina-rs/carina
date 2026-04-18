@@ -18,10 +18,11 @@ cargo test -p carina-cli
 # Run a single test
 cargo test -p carina-core test_name
 
-# Run CLI commands (path must be a directory, not a file)
+# Run CLI commands (most subcommands take a directory; `fmt` also accepts a single .crn file)
 cargo run -- validate .
 cargo run -- plan .
 cargo run -- apply .
+cargo run -- fmt path/to/file.crn
 
 # With AWS credentials (using aws-vault)
 aws-vault exec <profile> -- cargo run -- plan .

@@ -23,14 +23,16 @@ pub fn run_fmt(
     let ctx = WiringContext::new(vec![]);
     let block_names = collect_all_block_names(ctx.schemas());
 
-    if path.is_file() {
-        return Err(AppError::Config(format!(
-            "expected directory, got file: {}",
-            path.display()
-        )));
-    }
-
-    let files = if recursive {
+    let files = if path.is_file() {
+        if path.extension().is_some_and(|ext| ext == "crn") {
+            vec![path.clone()]
+        } else {
+            return Err(AppError::Config(format!(
+                "expected a .crn file or a directory, got: {}",
+                path.display()
+            )));
+        }
+    } else if recursive {
         find_crn_files_recursive(path)?
     } else {
         find_crn_files_in_dir(path)?
@@ -118,5 +120,60 @@ fn print_diff(file: &Path, original: &str, formatted: &str) {
             ChangeTag::Equal => " ".normal(),
         };
         print!("{}{}", sign, change);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const UNFORMATTED: &str = "provider awscc {\nregion = awscc.Region.ap_northeast_1\n}\n";
+
+    #[test]
+    fn run_fmt_accepts_single_file_path() {
+        // Scope: #1997 — `carina fmt <file.crn>` should not be rejected just
+        // because the path is a file. Users who want to format one file must
+        // not be forced to operate on the parent directory.
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("example.crn");
+        std::fs::write(&file, UNFORMATTED).unwrap();
+
+        run_fmt(&file, false, false, false).expect("formatting a single .crn file must succeed");
+
+        let after = std::fs::read_to_string(&file).unwrap();
+        assert_ne!(
+            after, UNFORMATTED,
+            "the file should have been rewritten to the formatted form"
+        );
+    }
+
+    #[test]
+    fn run_fmt_single_file_check_mode_reports_unformatted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("needs_format.crn");
+        std::fs::write(&file, UNFORMATTED).unwrap();
+
+        let result = run_fmt(&file, true, false, false);
+        assert!(
+            result.is_err(),
+            "check mode must report an unformatted file with an error"
+        );
+
+        // The file must not be rewritten in check mode.
+        let after = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(after, UNFORMATTED, "check mode must not modify the file");
+    }
+
+    #[test]
+    fn run_fmt_rejects_non_crn_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("notes.txt");
+        std::fs::write(&file, "hello\n").unwrap();
+
+        let result = run_fmt(&file, false, false, false);
+        assert!(
+            result.is_err(),
+            "non-.crn files must still be rejected even though files are now accepted"
+        );
     }
 }
