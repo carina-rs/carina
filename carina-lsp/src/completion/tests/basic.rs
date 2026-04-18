@@ -1290,7 +1290,10 @@ fn for_loop_discard_not_suggested() {
 }
 
 #[test]
-fn import_path_completion_lists_directories_and_crn_files() {
+fn import_path_completion_lists_directories_only() {
+    // Modules are directory-scoped (issue #1997). Stray `.crn` files next to
+    // module directories must NOT be suggested as import targets — the
+    // resolver would reject them with NotADirectory.
     let tmp = tempfile::tempdir().unwrap();
     let modules_dir = tmp.path().join("modules");
     std::fs::create_dir_all(&modules_dir).unwrap();
@@ -1312,13 +1315,13 @@ fn import_path_completion_lists_directories_and_crn_files() {
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
-        labels.contains(&"web"),
-        "Should suggest 'web' (.crn file without extension). Got: {:?}",
+        labels.contains(&"shared/"),
+        "Should suggest 'shared/' directory. Got: {:?}",
         labels
     );
     assert!(
-        labels.contains(&"shared/"),
-        "Should suggest 'shared/' directory. Got: {:?}",
+        !labels.contains(&"web"),
+        "Must NOT suggest 'web' for a standalone .crn file. Got: {:?}",
         labels
     );
 }

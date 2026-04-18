@@ -119,7 +119,12 @@ impl<'cfg> ModuleResolver<'cfg> {
     pub fn load_module(&mut self, path: &str) -> Result<ParsedFile, ModuleError> {
         let full_path = self.resolve_path(path);
 
-        if !full_path.is_dir() {
+        // Distinguish "file exists but isn't a directory" from
+        // "path doesn't exist / permission denied": only the former is the
+        // single-file-module contract violation. Otherwise let canonicalize()
+        // surface the underlying IO error (NotFound, PermissionDenied, ...).
+        let metadata = full_path.metadata()?;
+        if !metadata.is_dir() {
             return Err(ModuleError::NotADirectory {
                 path: path.to_string(),
             });
@@ -1808,8 +1813,9 @@ mod tests {
 
     #[test]
     fn test_load_module_missing_path_cleans_resolving_set() {
-        // Nonexistent import path => NotADirectory. The resolving set must be
-        // cleaned up so a retry does not masquerade as a circular import.
+        // Nonexistent import path => descriptive IO error (NotFound), not the
+        // single-file-module contract error. The resolving set must be cleaned
+        // up so a retry does not masquerade as a circular import.
         let tmp_dir = std::env::temp_dir().join("carina_test_missing_path_cleanup");
         let _ = fs::create_dir_all(&tmp_dir);
 
@@ -1819,16 +1825,16 @@ mod tests {
             .load_module("nonexistent")
             .expect_err("expected error");
         assert!(
-            matches!(&err, ModuleError::NotADirectory { .. }),
-            "expected NotADirectory on first attempt, got: {err:?}"
+            matches!(&err, ModuleError::Io(_)),
+            "expected Io error for a nonexistent path, got: {err:?}"
         );
 
         let err = resolver
             .load_module("nonexistent")
             .expect_err("expected error");
         assert!(
-            matches!(&err, ModuleError::NotADirectory { .. }),
-            "expected NotADirectory on second attempt, not CircularImport, got: {err:?}"
+            matches!(&err, ModuleError::Io(_)),
+            "expected Io error on second attempt, not CircularImport, got: {err:?}"
         );
 
         let _ = fs::remove_dir_all(&tmp_dir);
