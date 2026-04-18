@@ -181,60 +181,14 @@ impl<'cfg> ModuleResolver<'cfg> {
         Ok(parsed)
     }
 
-    /// Load all .crn files from a directory and merge them into a single ParsedFile
+    /// Load all .crn files from a directory and merge them into a single ParsedFile.
     fn load_directory_module(&self, dir_path: &Path) -> Result<ParsedFile, ModuleError> {
-        let mut merged = ParsedFile {
-            providers: vec![],
-            resources: vec![],
-            variables: HashMap::new(),
-            imports: vec![],
-            module_calls: vec![],
-            arguments: vec![],
-            attribute_params: vec![],
-            export_params: vec![],
-            backend: None,
-            state_blocks: vec![],
-            user_functions: HashMap::new(),
-            upstream_states: vec![],
-            requires: vec![],
-            structural_bindings: HashSet::new(),
-            warnings: vec![],
-            deferred_for_expressions: vec![],
-        };
+        let mut merged = ParsedFile::default();
 
-        // Read all .crn files in the directory
-        let mut crn_files: Vec<_> = fs::read_dir(dir_path)?
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "crn"))
-            .collect();
-
-        // Sort for consistent ordering
-        crn_files.sort_by_key(|e| e.path());
-
-        for entry in crn_files {
-            let file_path = entry.path();
+        for file_path in sorted_crn_paths_in(dir_path)? {
             let content = fs::read_to_string(&file_path)?;
             let parsed = crate::parser::parse(&content, self.config)?;
-
-            // Merge all fields
-            merged.providers.extend(parsed.providers);
-            merged.resources.extend(parsed.resources);
-            merged.variables.extend(parsed.variables);
-            merged.imports.extend(parsed.imports);
-            merged.module_calls.extend(parsed.module_calls);
-            merged.arguments.extend(parsed.arguments);
-            merged.attribute_params.extend(parsed.attribute_params);
-            merged.export_params.extend(parsed.export_params);
-            merged.user_functions.extend(parsed.user_functions);
-            merged.upstream_states.extend(parsed.upstream_states);
-            merged.requires.extend(parsed.requires);
-            merged
-                .structural_bindings
-                .extend(parsed.structural_bindings);
-            merged.warnings.extend(parsed.warnings);
-            merged
-                .deferred_for_expressions
-                .extend(parsed.deferred_for_expressions);
+            crate::config_loader::merge_parsed_file(&mut merged, parsed);
         }
 
         Ok(merged)
@@ -792,61 +746,34 @@ fn check_type_match(
     }
 }
 
+/// Collect `.crn` file paths directly inside `dir_path`, sorted by path.
+///
+/// Sorting is load-bearing: merged `ParsedFile` vectors inherit this order,
+/// and downstream consumers (LSP first-match-wins lookups, CLI diagnostic
+/// ordering) must not depend on filesystem iteration order, which varies
+/// across ext4/APFS/tmpfs.
+fn sorted_crn_paths_in(dir_path: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut crn_files: Vec<PathBuf> = fs::read_dir(dir_path)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "crn"))
+        .collect();
+    crn_files.sort();
+    Ok(crn_files)
+}
+
 /// Load all `.crn` files from a directory and merge them into a single `ParsedFile`.
 ///
-/// Returns `None` if no module definitions (arguments/attributes) are found.
+/// Returns `None` if the directory cannot be read or contains no module
+/// definitions (no arguments/attributes).
 pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
-    let mut merged = ParsedFile {
-        providers: vec![],
-        resources: vec![],
-        variables: HashMap::new(),
-        imports: vec![],
-        module_calls: vec![],
-        arguments: vec![],
-        attribute_params: vec![],
-        export_params: vec![],
-        backend: None,
-        state_blocks: vec![],
-        user_functions: HashMap::new(),
-        upstream_states: vec![],
-        requires: vec![],
-        structural_bindings: HashSet::new(),
-        warnings: vec![],
-        deferred_for_expressions: vec![],
-    };
+    let mut merged = ParsedFile::default();
 
-    // Collect and sort .crn entries so the merged vectors are independent of
-    // filesystem iteration order (ext4 vs APFS vs tmpfs differ).
-    let mut crn_files: Vec<_> = fs::read_dir(dir_path)
-        .ok()?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "crn"))
-        .collect();
-    crn_files.sort_by_key(|e| e.path());
-
-    for entry in crn_files {
-        let path = entry.path();
+    for path in sorted_crn_paths_in(dir_path).ok()? {
         if let Ok(content) = fs::read_to_string(&path)
             && let Ok(parsed) = crate::parser::parse(&content, &ProviderContext::default())
         {
-            merged.providers.extend(parsed.providers);
-            merged.resources.extend(parsed.resources);
-            merged.variables.extend(parsed.variables);
-            merged.imports.extend(parsed.imports);
-            merged.module_calls.extend(parsed.module_calls);
-            merged.arguments.extend(parsed.arguments);
-            merged.attribute_params.extend(parsed.attribute_params);
-            merged.export_params.extend(parsed.export_params);
-            merged.user_functions.extend(parsed.user_functions);
-            merged.upstream_states.extend(parsed.upstream_states);
-            merged.requires.extend(parsed.requires);
-            merged
-                .structural_bindings
-                .extend(parsed.structural_bindings);
-            merged.warnings.extend(parsed.warnings);
-            merged
-                .deferred_for_expressions
-                .extend(parsed.deferred_for_expressions);
+            crate::config_loader::merge_parsed_file(&mut merged, parsed);
         }
     }
 
@@ -892,61 +819,19 @@ pub fn derive_module_name(path: &Path) -> String {
 
 /// Load a module from a directory by reading all `.crn` files.
 ///
-/// Unlike [`load_directory_module`], this returns a `Result` with descriptive error messages
-/// and does not check for module definitions (inputs/outputs).
+/// Unlike [`load_directory_module`], this returns a `Result` with descriptive
+/// error messages and does not check for module definitions (inputs/outputs).
 pub fn load_module_from_directory(dir: &Path) -> Result<ParsedFile, String> {
-    let entries = fs::read_dir(dir)
+    let paths = sorted_crn_paths_in(dir)
         .map_err(|e| format!("Failed to read directory {}: {}", dir.display(), e))?;
 
-    let mut merged = ParsedFile {
-        providers: vec![],
-        resources: vec![],
-        variables: HashMap::new(),
-        imports: vec![],
-        module_calls: vec![],
-        arguments: vec![],
-        attribute_params: vec![],
-        export_params: vec![],
-        backend: None,
-        state_blocks: vec![],
-        user_functions: HashMap::new(),
-        upstream_states: vec![],
-        requires: vec![],
-        structural_bindings: HashSet::new(),
-        warnings: vec![],
-        deferred_for_expressions: vec![],
-    };
-
-    for entry in entries {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-
-        if path.extension().is_some_and(|ext| ext == "crn") {
-            let content = fs::read_to_string(&path)
-                .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-
-            let parsed = crate::parser::parse(&content, &ProviderContext::default())
-                .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
-
-            merged.providers.extend(parsed.providers);
-            merged.resources.extend(parsed.resources);
-            merged.variables.extend(parsed.variables);
-            merged.imports.extend(parsed.imports);
-            merged.module_calls.extend(parsed.module_calls);
-            merged.arguments.extend(parsed.arguments);
-            merged.attribute_params.extend(parsed.attribute_params);
-            merged.export_params.extend(parsed.export_params);
-            merged.user_functions.extend(parsed.user_functions);
-            merged.upstream_states.extend(parsed.upstream_states);
-            merged.requires.extend(parsed.requires);
-            merged
-                .structural_bindings
-                .extend(parsed.structural_bindings);
-            merged.warnings.extend(parsed.warnings);
-            merged
-                .deferred_for_expressions
-                .extend(parsed.deferred_for_expressions);
-        }
+    let mut merged = ParsedFile::default();
+    for path in paths {
+        let content = fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+        let parsed = crate::parser::parse(&content, &ProviderContext::default())
+            .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
+        crate::config_loader::merge_parsed_file(&mut merged, parsed);
     }
 
     Ok(merged)
