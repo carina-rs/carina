@@ -802,7 +802,6 @@ fn check_type_match(
 ///
 /// Returns `None` if no module definitions (arguments/attributes) are found.
 pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
-    let entries = fs::read_dir(dir_path).ok()?;
     let mut merged = ParsedFile {
         providers: vec![],
         resources: vec![],
@@ -822,10 +821,18 @@ pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
         deferred_for_expressions: vec![],
     };
 
-    for entry in entries.flatten() {
+    // Collect and sort .crn entries so the merged vectors are independent of
+    // filesystem iteration order (ext4 vs APFS vs tmpfs differ).
+    let mut crn_files: Vec<_> = fs::read_dir(dir_path)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "crn"))
+        .collect();
+    crn_files.sort_by_key(|e| e.path());
+
+    for entry in crn_files {
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "crn")
-            && let Ok(content) = fs::read_to_string(&path)
+        if let Ok(content) = fs::read_to_string(&path)
             && let Ok(parsed) = crate::parser::parse(&content, &ProviderContext::default())
         {
             merged.providers.extend(parsed.providers);
@@ -2758,6 +2765,35 @@ mod tests {
             "exports declared in exports.crn must be preserved when main.crn exists"
         );
         assert_eq!(parsed.export_params[0].name, "region");
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_load_module_directory_merge_order_is_deterministic() {
+        // Merged vectors must be ordered by file path so that downstream
+        // first-match-wins lookups (hover, completion, diagnostics) do not
+        // depend on filesystem iteration order.
+        let tmp_dir = std::env::temp_dir().join("carina_test_load_module_merge_order");
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        // Create files out of lexicographic order to make the sort observable.
+        fs::write(tmp_dir.join("z_last.crn"), "arguments {\n  c: string\n}\n").unwrap();
+        fs::write(tmp_dir.join("a_first.crn"), "arguments {\n  a: string\n}\n").unwrap();
+        fs::write(
+            tmp_dir.join("m_middle.crn"),
+            "arguments {\n  b: string\n}\n",
+        )
+        .unwrap();
+
+        let parsed = load_module(&tmp_dir).expect("module should load");
+        let names: Vec<&str> = parsed.arguments.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["a", "b", "c"],
+            "arguments must be merged in sorted filename order"
+        );
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }
