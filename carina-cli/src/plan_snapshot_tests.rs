@@ -401,6 +401,60 @@ fn snapshot_moved_pure() {
     insta::assert_snapshot!(output);
 }
 
+/// Collect unused `let` bindings across every fixture subdirectory of
+/// `fixtures_root`. A fixture is any immediate subdirectory containing at
+/// least one `.crn` file (the file need not be named `main.crn` — sibling
+/// layouts like `resources.crn` + `exports.crn` are covered).
+fn collect_unused_let_bindings_in_fixtures(
+    fixtures_root: &std::path::Path,
+) -> Vec<(String, Vec<String>)> {
+    let mut failures: Vec<(String, Vec<String>)> = Vec::new();
+
+    for entry in std::fs::read_dir(fixtures_root).unwrap() {
+        let entry = entry.unwrap();
+        if !entry.file_type().unwrap().is_dir() {
+            continue;
+        }
+        let fixture_dir = entry.path();
+        let has_crn = std::fs::read_dir(&fixture_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.path().extension().is_some_and(|ext| ext == "crn"));
+        if !has_crn {
+            continue;
+        }
+        let fixture_name = entry.file_name().to_string_lossy().to_string();
+
+        let loaded = load_configuration(&fixture_dir).unwrap();
+        let unused = crate::wiring::check_unused_bindings(&loaded.unresolved_parsed);
+        if unused.is_empty() {
+            continue;
+        }
+        // Moved block targets are structurally required bindings
+        let move_targets: HashSet<String> = loaded
+            .unresolved_parsed
+            .state_blocks
+            .iter()
+            .filter_map(|sb| {
+                if let carina_core::parser::StateBlock::Moved { to, .. } = sb {
+                    Some(to.name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let truly_unused: Vec<String> = unused
+            .into_iter()
+            .filter(|b| !move_targets.contains(b))
+            .collect();
+        if !truly_unused.is_empty() {
+            failures.push((fixture_name, truly_unused));
+        }
+    }
+
+    failures
+}
+
 /// Ensure no fixture .crn file has unused `let` bindings.
 ///
 /// `let` should only be used when a binding is referenced by another resource.
@@ -409,47 +463,9 @@ fn snapshot_moved_pure() {
 #[test]
 fn no_unused_let_bindings_in_fixtures() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let fixtures_dir = format!("{}/tests/fixtures/plan_display", manifest_dir);
+    let fixtures_dir = PathBuf::from(format!("{}/tests/fixtures/plan_display", manifest_dir));
 
-    let mut failures: Vec<(String, Vec<String>)> = Vec::new();
-
-    for entry in std::fs::read_dir(&fixtures_dir).unwrap() {
-        let entry = entry.unwrap();
-        if !entry.file_type().unwrap().is_dir() {
-            continue;
-        }
-        let fixture_name = entry.file_name().to_string_lossy().to_string();
-        let fixture_dir = PathBuf::from(format!("{}/{}", fixtures_dir, fixture_name));
-        let crn_path = fixture_dir.join("main.crn");
-        if !crn_path.exists() {
-            continue;
-        }
-
-        let loaded = load_configuration(&fixture_dir).unwrap();
-        let unused = crate::wiring::check_unused_bindings(&loaded.unresolved_parsed);
-        if !unused.is_empty() {
-            // Moved block targets are structurally required bindings
-            let move_targets: HashSet<String> = loaded
-                .unresolved_parsed
-                .state_blocks
-                .iter()
-                .filter_map(|sb| {
-                    if let carina_core::parser::StateBlock::Moved { to, .. } = sb {
-                        Some(to.name.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            let truly_unused: Vec<String> = unused
-                .into_iter()
-                .filter(|b| !move_targets.contains(b))
-                .collect();
-            if !truly_unused.is_empty() {
-                failures.push((fixture_name, truly_unused));
-            }
-        }
-    }
+    let failures = collect_unused_let_bindings_in_fixtures(&fixtures_dir);
 
     if !failures.is_empty() {
         let msg: Vec<String> = failures
@@ -463,6 +479,38 @@ fn no_unused_let_bindings_in_fixtures() {
             msg.join("\n")
         );
     }
+}
+
+/// Regression test for #1997: before, the walker silently skipped any
+/// fixture directory that did not contain `main.crn`, so unused `let`
+/// bindings in a sibling-only layout (e.g. `resources.crn`) would pass
+/// this check unnoticed. The walker now keys off "directory contains
+/// any .crn file", so such layouts are exercised too.
+#[test]
+fn unused_let_check_covers_fixtures_without_main_crn() {
+    let tmp_root = std::env::temp_dir().join("carina_test_unused_let_sibling_only");
+    let _ = std::fs::remove_dir_all(&tmp_root);
+    let fixture_dir = tmp_root.join("sibling_only");
+    std::fs::create_dir_all(&fixture_dir).unwrap();
+
+    // Deliberately NO main.crn. The only .crn declares an unused let binding.
+    std::fs::write(
+        fixture_dir.join("resources.crn"),
+        "provider awscc {\n  region = awscc.Region.ap_northeast_1\n}\n\n\
+         let orphan = awscc.ec2.vpc {\n  cidr_block = '10.0.0.0/16'\n}\n",
+    )
+    .unwrap();
+
+    let failures = collect_unused_let_bindings_in_fixtures(&tmp_root);
+    assert_eq!(
+        failures.len(),
+        1,
+        "fixtures without main.crn must still be inspected for unused let bindings"
+    );
+    assert_eq!(failures[0].0, "sibling_only");
+    assert_eq!(failures[0].1, vec!["orphan".to_string()]);
+
+    let _ = std::fs::remove_dir_all(&tmp_root);
 }
 
 #[test]
