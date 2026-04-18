@@ -24,6 +24,7 @@ pub mod provider;
 pub mod resolver;
 pub mod resource;
 pub mod schema;
+pub mod upstream_exports;
 pub mod utils;
 pub mod validation;
 pub mod value;

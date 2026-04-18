@@ -222,6 +222,31 @@ pub fn validate_and_resolve_with_config(
     // Compute anonymous identifiers
     compute_anonymous_identifiers_with_ctx(&ctx, &mut parsed.resources, &parsed.providers)?;
 
+    // Reject references to `upstream_state` fields that the upstream's
+    // `exports { }` block does not declare. Gated like the other
+    // validations above so `destroy` / `state` (which pass
+    // `skip_resource_validation = true`) can still run when an upstream
+    // has drifted — those commands are the recovery path for exactly
+    // that situation. No state I/O: we parse the upstream's `.crn`
+    // files directly.
+    if !skip_resource_validation {
+        let (upstream_exports, resolve_errors) =
+            carina_core::upstream_exports::resolve_upstream_exports(
+                base_dir,
+                &parsed.upstream_states,
+                &enriched_context,
+            );
+        let field_errors = carina_core::upstream_exports::check_upstream_state_field_references(
+            parsed,
+            &upstream_exports,
+        );
+        if !resolve_errors.is_empty() || !field_errors.is_empty() {
+            let mut lines: Vec<String> = resolve_errors.iter().map(ToString::to_string).collect();
+            lines.extend(field_errors.iter().map(ToString::to_string));
+            return Err(AppError::Validation(lines.join("\n")));
+        }
+    }
+
     Ok(())
 }
 
@@ -408,6 +433,56 @@ mod tests {
             msg.contains("has no source configured"),
             "Error should tell user to add source. Got: {}",
             msg
+        );
+    }
+
+    #[test]
+    fn upstream_field_check_honors_skip_resource_validation() {
+        // `destroy` and `state` subcommands pass `skip_resource_validation =
+        // true` so they can run on projects whose upstream has drifted.
+        // The static upstream-exports check must respect that gate;
+        // otherwise a broken upstream would block recovery commands.
+        use std::fs;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream_dir = tmp.path().join("organizations");
+        fs::create_dir(&upstream_dir).unwrap();
+        fs::write(
+            upstream_dir.join("exports.crn"),
+            "exports { accounts: string = \"x\" }\n",
+        )
+        .unwrap();
+        let base = tmp.path().join("downstream");
+        fs::create_dir(&base).unwrap();
+        fs::write(
+            base.join("main.crn"),
+            r#"let orgs = upstream_state { source = "../organizations" }
+exports {
+    bad: string = orgs.missing
+}
+"#,
+        )
+        .unwrap();
+
+        let loaded = carina_core::config_loader::load_configuration_with_config(
+            &base,
+            &ProviderContext::default(),
+        )
+        .expect("load");
+        let mut parsed = loaded.parsed;
+
+        // With full validation, the typo is rejected.
+        let err = validate_and_resolve_with_config(&mut parsed.clone(), &base, false)
+            .expect_err("full validation must flag the typo");
+        assert!(err.to_string().contains("does not export `missing`"));
+
+        // With skip_resource_validation=true, recovery commands pass
+        // through despite the typo.
+        let result = validate_and_resolve_with_config(&mut parsed, &base, true);
+        assert!(
+            result.is_ok(),
+            "skip_resource_validation=true must bypass upstream field check, got: {:?}",
+            result.err()
         );
     }
 }

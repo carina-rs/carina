@@ -24,50 +24,79 @@ fn find_source_value_position(text: &str, expected: &str) -> Option<(u32, u32, u
     let mut in_upstream_state = false;
     let mut brace_depth: u32 = 0;
     for (line_idx, line) in text.lines().enumerate() {
-        let trimmed = line.trim_start();
-        if !in_upstream_state && trimmed.contains("upstream_state") && trimmed.contains('{') {
-            in_upstream_state = true;
-            brace_depth = 1;
-            continue;
-        }
-        if !in_upstream_state {
-            continue;
-        }
+        // On the opening line, scan only the segment after the first `{`
+        // so a single-line form
+        //   `let orgs = upstream_state { source = '...' }`
+        // also has its `source` attribute parsed without a separate line.
+        let (scan_from_byte, is_opening_line) =
+            if !in_upstream_state && line.contains("upstream_state") {
+                match line.find('{') {
+                    Some(idx) => {
+                        in_upstream_state = true;
+                        brace_depth = 1;
+                        (idx + 1, true)
+                    }
+                    None => continue,
+                }
+            } else if in_upstream_state {
+                (0, false)
+            } else {
+                continue;
+            };
+
+        let segment = &line[scan_from_byte..];
+
         // Track nested braces so a struct value inside upstream_state doesn't
-        // prematurely close the block.
-        brace_depth += trimmed.matches('{').count() as u32;
-        brace_depth = brace_depth.saturating_sub(trimmed.matches('}').count() as u32);
-        if brace_depth == 0 {
+        // prematurely close the block. On the opening line we've already
+        // counted the `{` that opened it.
+        brace_depth += segment.matches('{').count() as u32;
+        brace_depth = brace_depth.saturating_sub(segment.matches('}').count() as u32);
+        // Drop out of state mode at end of line, but still look for `source`
+        // on this line first.
+        let should_close = brace_depth == 0;
+
+        // `source` can appear after the opening brace on the same line.
+        let trimmed = segment.trim_start();
+        let found = trimmed.starts_with("source")
+            && trimmed
+                .split_once('=')
+                .map(|(lhs, _)| lhs.trim_end() == "source")
+                .unwrap_or(false);
+
+        if found {
+            // trimmed: "source = '../x' ..."
+            let (_, rhs) = trimmed.split_once('=').unwrap();
+            let after_eq = rhs.trim_start();
+            if let Some(quote) = after_eq.chars().next().filter(|c| *c == '\'' || *c == '"') {
+                let inner = &after_eq[quote.len_utf8()..];
+                if let Some(end_byte) = inner.find(quote)
+                    && &inner[..end_byte] == expected
+                {
+                    // Compute columns: prefix up to start of inner string.
+                    let trimmed_offset = segment.len() - trimmed.len();
+                    let rhs_offset = trimmed.len() - rhs.len();
+                    let after_eq_offset = rhs.len() - after_eq.len();
+                    let value_byte_in_line = scan_from_byte
+                        + trimmed_offset
+                        + rhs_offset
+                        + after_eq_offset
+                        + quote.len_utf8();
+                    let start_col = line[..value_byte_in_line].chars().count() as u32;
+                    let end_col = start_col + inner[..end_byte].chars().count() as u32;
+                    return Some((line_idx as u32, start_col, end_col));
+                }
+            }
+        }
+
+        // Close after processing this line, in case `source = '...'` was on
+        // the same line as the closing `}`.
+        if should_close {
             in_upstream_state = false;
-            continue;
         }
-        if !trimmed.starts_with("source") {
-            continue;
-        }
-        let Some((lhs, rhs)) = trimmed.split_once('=') else {
-            continue;
-        };
-        // Skip `source` followed by non-whitespace (e.g. `source_path`).
-        if !lhs.trim_end().eq("source") {
-            continue;
-        }
-        let after_eq = rhs.trim_start();
-        let Some(quote) = after_eq.chars().next().filter(|c| *c == '\'' || *c == '"') else {
-            continue;
-        };
-        let inner = &after_eq[quote.len_utf8()..];
-        let Some(end_byte) = inner.find(quote) else {
-            continue;
-        };
-        if &inner[..end_byte] != expected {
-            continue;
-        }
-        // Columns are character counts from the start of the line up to the
-        // start of `inner` (i.e. just past the opening quote).
-        let prefix_len = line.len() - after_eq.len() + quote.len_utf8();
-        let start_col = line[..prefix_len].chars().count() as u32;
-        let end_col = start_col + inner[..end_byte].chars().count() as u32;
-        return Some((line_idx as u32, start_col, end_col));
+
+        // Silence unused-variable warnings for is_opening_line (reserved for
+        // potential future multi-block tracking).
+        let _ = is_opening_line;
     }
     None
 }
@@ -252,6 +281,92 @@ impl DiagnosticEngine {
             }
         }
         None
+    }
+
+    /// Reject references like `orgs.account` whose field isn't declared by
+    /// the upstream's `exports { }` block.
+    ///
+    /// Uses a directory-scoped parse that overrides the on-disk copy of
+    /// `current_file_name` with the editor's in-memory buffer, so edits
+    /// produce diagnostics before the user saves. Runs even when the
+    /// single-file parse fails — common when a `for` iterates over a
+    /// binding declared in a sibling file.
+    pub(super) fn check_upstream_state_field_references(
+        &self,
+        doc: &Document,
+        current_file_name: Option<&str>,
+        base_path: &std::path::Path,
+    ) -> Vec<Diagnostic> {
+        let mut overrides: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        if let Some(name) = current_file_name {
+            overrides.insert(name.to_string(), doc.text());
+        }
+        let merged = carina_core::config_loader::parse_directory_with_overrides(
+            base_path,
+            &self.provider_context,
+            &overrides,
+        );
+        let Ok(merged) = merged else {
+            return Vec::new();
+        };
+
+        let (exports, resolve_errors) = carina_core::upstream_exports::resolve_upstream_exports(
+            base_path,
+            &merged.upstream_states,
+            &self.provider_context,
+        );
+
+        let mut diagnostics = Vec::new();
+        let text = doc.text();
+
+        // Broken-upstream diagnostics anchor to the `source = ...` line in
+        // the current document (if this file is the one declaring that
+        // upstream_state); otherwise they belong to the sibling.
+        for err in resolve_errors {
+            let source_str = err.source.to_string_lossy();
+            let Some((line, col, end_col)) = find_source_value_position(&text, &source_str) else {
+                continue;
+            };
+            diagnostics.push(carina_diagnostic(
+                line,
+                col,
+                end_col,
+                DiagnosticSeverity::ERROR,
+                err.to_string(),
+            ));
+        }
+
+        // Multiple `UpstreamFieldError`s can share the same `binding.field`
+        // text (e.g. two `let` bindings that both reference `orgs.bad`).
+        // `find_ref_value_position` returns the first occurrence; tracking
+        // how many times we've already consumed each ref text lets us
+        // anchor later diagnostics at subsequent occurrences instead of
+        // stacking them on the first.
+        let field_errors =
+            carina_core::upstream_exports::check_upstream_state_field_references(&merged, &exports);
+        let mut seen_count: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for err in field_errors {
+            let ref_text = format!("{}.{}", err.binding, err.field);
+            let skip = *seen_count.get(&ref_text).unwrap_or(&0);
+            // Only surface errors whose reference appears in the current
+            // document; sibling-file errors are handled when that file is
+            // analyzed.
+            let Some((line, col)) = self.find_ref_value_position_nth(doc, &ref_text, skip) else {
+                continue;
+            };
+            *seen_count.entry(ref_text.clone()).or_insert(0) += 1;
+            let end_col = col + ref_text.chars().count() as u32;
+            diagnostics.push(carina_diagnostic(
+                line,
+                col,
+                end_col,
+                DiagnosticSeverity::ERROR,
+                err.diagnostic_message(),
+            ));
+        }
+        diagnostics
     }
 
     /// Flag `upstream_state { source = ... }` paths that do not resolve to an
@@ -1175,15 +1290,54 @@ impl DiagnosticEngine {
         });
     }
 
-    /// Find the position of a resource reference value (e.g., "igw.internet_gateway_id") in the document.
+    /// Locate the first occurrence of `ref_text` as a standalone identifier
+    /// chain — so `orgs.acc` won't match inside `orgs.accounts`.
     fn find_ref_value_position(&self, doc: &Document, ref_text: &str) -> Option<(u32, u32)> {
+        self.find_ref_value_position_nth(doc, ref_text, 0)
+    }
+
+    /// Locate the `skip + 1`-th identifier-chain occurrence of `ref_text`
+    /// in the document. Used when the core checker emits multiple errors
+    /// with identical `binding.field` strings so each diagnostic lands on
+    /// its own source site instead of stacking on the first.
+    fn find_ref_value_position_nth(
+        &self,
+        doc: &Document,
+        ref_text: &str,
+        skip: usize,
+    ) -> Option<(u32, u32)> {
+        fn is_ident_cont(c: char) -> bool {
+            c.is_ascii_alphanumeric() || c == '_'
+        }
         let text = doc.text();
+        let mut skipped = 0usize;
         for (line_idx, line) in text.lines().enumerate() {
-            if let Some(byte_pos) = line.find(ref_text) {
-                return Some((
-                    line_idx as u32,
-                    position::byte_offset_to_char_offset(line, byte_pos),
-                ));
+            let mut search_from = 0;
+            while let Some(rel) = line[search_from..].find(ref_text) {
+                let byte_pos = search_from + rel;
+                let before_ok = byte_pos == 0
+                    || line[..byte_pos]
+                        .chars()
+                        .next_back()
+                        .map(|c| !is_ident_cont(c))
+                        .unwrap_or(true);
+                let after_idx = byte_pos + ref_text.len();
+                let after_ok = after_idx >= line.len()
+                    || line[after_idx..]
+                        .chars()
+                        .next()
+                        .map(|c| !is_ident_cont(c))
+                        .unwrap_or(true);
+                if before_ok && after_ok {
+                    if skipped == skip {
+                        return Some((
+                            line_idx as u32,
+                            position::byte_offset_to_char_offset(line, byte_pos),
+                        ));
+                    }
+                    skipped += 1;
+                }
+                search_from = byte_pos + ref_text.len();
             }
         }
         None
