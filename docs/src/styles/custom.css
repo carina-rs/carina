@@ -51,6 +51,7 @@
   /* Type families (override Starlight defaults) */
   --sl-font:        'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
   --sl-font-system-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --carina-font-display: 'Space Grotesk', var(--sl-font);
 }
 
 /* Force dark mode only (Carina is dark-only) */

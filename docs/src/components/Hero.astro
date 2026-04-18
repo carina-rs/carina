@@ -119,8 +119,8 @@ const planHtml = `<span class="prompt">$</span> carina plan .
     height: 260px;
     background: radial-gradient(
       ellipse at center,
-      rgba(251, 191, 36, 0.14) 0%,
-      rgba(8, 145, 178, 0.08) 35%,
+      rgba(251, 191, 36, 0.22) 0%,
+      rgba(8, 145, 178, 0.14) 35%,
       transparent 70%
     );
     pointer-events: none;
@@ -153,10 +153,14 @@ const planHtml = `<span class="prompt">$</span> carina plan .
   .hero-tagline {
     position: relative;
     z-index: 1;
+    font-family: var(--carina-font-display, var(--sl-font));
     font-size: clamp(var(--sl-text-base), calc(0.0625rem + 2vw), var(--sl-text-xl));
-    color: var(--sl-color-gray-2);
+    font-weight: 500;
+    letter-spacing: -0.01em;
+    color: #cbd5e1;
     margin: 0.5rem auto 0;
     max-width: 40rem;
+    line-height: 1.5;
   }
 
   .hero-banner {
