@@ -271,7 +271,7 @@ pub fn parse_directory_with_overrides(
 }
 
 /// Merge fields from `source` into `target`.
-fn merge_parsed_file(target: &mut ParsedFile, source: ParsedFile) {
+pub(crate) fn merge_parsed_file(target: &mut ParsedFile, source: ParsedFile) {
     target.providers.extend(source.providers);
     target.resources.extend(source.resources);
     target.variables.extend(source.variables);
