@@ -213,7 +213,8 @@ impl DiagnosticEngine {
                             ));
                         }
                     } else if !provider_loaded {
-                        // Provider not loaded at all
+                        // Provider not downloaded: point at `carina init`,
+                        // not a generic "unknown" message that reads as a typo.
                         if let Some((line, col)) = self.find_resource_type_position(
                             doc,
                             provider,
@@ -229,8 +230,8 @@ impl DiagnosticEngine {
                                 end_col,
                                 DiagnosticSeverity::ERROR,
                                 format!(
-                                    "Unknown resource type: {}.{}",
-                                    provider, resource.id.resource_type
+                                    "Provider '{}' is not downloaded. Run `carina init` to fetch it.",
+                                    provider
                                 ),
                             ));
                         }
