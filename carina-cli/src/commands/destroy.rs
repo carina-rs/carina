@@ -881,10 +881,7 @@ async fn run_destroy_locked(
     // Get or create state file
     let mut state = state_file.unwrap_or_default();
 
-    // Remove destroyed resources from state
-    for id in &destroyed_ids {
-        state.remove_resource(&id.provider, &id.resource_type, &id.name);
-    }
+    apply_destroy_to_state(&mut state, &destroyed_ids);
 
     // Save state (with or without lock validation)
     if let Some(lock) = lock {
@@ -909,6 +906,15 @@ async fn run_destroy_locked(
             success_count, failure_count, skip_count
         )))
     }
+}
+
+/// Apply destroy results to the state file: remove destroyed resources and
+/// clear any exports (since exports reference attributes of destroyed resources).
+fn apply_destroy_to_state(state: &mut carina_state::StateFile, destroyed_ids: &[ResourceId]) {
+    for id in destroyed_ids {
+        state.remove_resource(&id.provider, &id.resource_type, &id.name);
+    }
+    state.exports.clear();
 }
 
 /// Build a minimal `Resource` for an orphaned resource from the state file.
@@ -1099,6 +1105,27 @@ mod tests {
     fn is_retryable_returns_false_for_timeout() {
         let err = ProviderError::new("DependencyViolation: something").timeout();
         assert!(!is_retryable_delete_error(&err));
+    }
+
+    #[test]
+    fn apply_destroy_to_state_removes_resources_and_clears_exports() {
+        // Regression test for #1983: destroy must clear stale exports because
+        // they reference attributes of resources that no longer exist.
+        use carina_state::ResourceState;
+
+        let mut state = carina_state::StateFile::new();
+        state
+            .resources
+            .push(ResourceState::new("ec2.vpc", "main", "awscc"));
+        state
+            .exports
+            .insert("vpc_id".to_string(), serde_json::json!("vpc-12345"));
+
+        let destroyed = vec![ResourceId::with_provider("awscc", "ec2.vpc", "main")];
+        apply_destroy_to_state(&mut state, &destroyed);
+
+        assert!(state.resources.is_empty(), "resource should be removed");
+        assert!(state.exports.is_empty(), "exports should be cleared");
     }
 
     #[tokio::test]
