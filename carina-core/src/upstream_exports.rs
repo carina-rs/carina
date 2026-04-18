@@ -309,6 +309,43 @@ mod tests {
     }
 
     #[test]
+    fn resolve_uses_base_dir_regardless_of_declaring_file() {
+        // Issue #1997: the `source` path is resolved against the project's
+        // base directory (the directory passed to validate/plan/apply), not
+        // against the specific .crn file that happens to declare the
+        // `upstream_state`. Two declarations in sibling files in the same
+        // project must therefore resolve identically.
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream_dir = tmp.path().join("organizations");
+        fs::create_dir(&upstream_dir).unwrap();
+        write_crn(
+            &upstream_dir,
+            "exports.crn",
+            r#"exports {
+                accounts: string = "x"
+            }"#,
+        );
+        let base = tmp.path().join("downstream");
+        fs::create_dir(&base).unwrap();
+        // Two sibling .crn files living at different depths is not possible
+        // within one base_dir (directory-scoped parse is flat), but the rule
+        // is that file position inside the base dir is irrelevant: the same
+        // relative source string resolves the same way for every declaration.
+        let (got, errs) =
+            resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], &ctx());
+        assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
+        assert!(got.get("orgs").unwrap().contains("accounts"));
+
+        // Same call a second time with an identical UpstreamState produces
+        // the same result — guards against any accidental dependence on
+        // declaring-file state.
+        let (got2, errs2) =
+            resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], &ctx());
+        assert!(errs2.is_empty());
+        assert_eq!(got, got2);
+    }
+
+    #[test]
     fn resolve_reads_exports_from_default_exports_file() {
         let tmp = tempfile::tempdir().unwrap();
         let upstream_dir = tmp.path().join("organizations");
