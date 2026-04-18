@@ -184,60 +184,6 @@ web_tier {
 }
 
 #[test]
-fn module_parameter_completion_with_single_file_module() {
-    use std::fs;
-    use tempfile::tempdir;
-
-    let provider = test_provider();
-
-    // Create a temporary directory structure
-    let temp_dir = tempdir().expect("Failed to create temp dir");
-    let base_path = temp_dir.path();
-
-    // Create module directory
-    let module_dir = base_path.join("modules");
-    fs::create_dir_all(&module_dir).expect("Failed to create module dir");
-
-    // Create single file module
-    let module_content = r#"
-arguments {
-name: string
-count: int = 1
-}
-"#;
-    fs::write(module_dir.join("simple.crn"), module_content).expect("Failed to write module file");
-
-    // Create main file that imports the module
-    let main_content = r#"let simple = import "./modules/simple.crn"
-
-simple {
-n
-}"#;
-    let doc = create_document(main_content);
-
-    // Cursor inside the module call block (line 3, after "n")
-    let position = Position {
-        line: 3,
-        character: 5,
-    };
-
-    let completions = provider.complete(&doc, position, Some(base_path));
-
-    // Should have module parameter completions
-    let name_completion = completions.iter().find(|c| c.label == "name");
-    assert!(
-        name_completion.is_some(),
-        "Should have name parameter completion"
-    );
-
-    let count_completion = completions.iter().find(|c| c.label == "count");
-    assert!(
-        count_completion.is_some(),
-        "Should have count parameter completion"
-    );
-}
-
-#[test]
 #[ignore = "requires provider schemas"]
 fn instance_tenancy_completion_for_aws_vpc() {
     let provider = test_provider();
