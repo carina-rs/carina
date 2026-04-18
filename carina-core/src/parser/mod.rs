@@ -382,9 +382,19 @@ pub struct BackendConfig {
 /// Upstream state reference: `let <binding> = upstream_state { source = "<dir>" }`.
 ///
 /// Declares a read-only reference to another Carina configuration's state.
-/// The `source` path is resolved against the enclosing `.crn` file's
-/// directory at plan/apply time; its backend and state file are derived
-/// from the upstream configuration itself.
+///
+/// `source` is a directory path. Carina itself is directory-scoped, so every
+/// sibling `.crn` file in a project (or module) shares the same base
+/// directory; the resolution rule is simply:
+///
+/// - Absolute paths are used as-is.
+/// - Relative paths are resolved against the **enclosing project or module
+///   directory** — the one passed to `carina validate` / `plan` / `apply`,
+///   or the module directory containing the `upstream_state` declaration.
+///
+/// Which specific `.crn` file inside that directory declares the
+/// `upstream_state` does not affect resolution. The upstream's backend and
+/// state file are derived from the upstream configuration itself.
 #[derive(Debug, Clone)]
 pub struct UpstreamState {
     /// The binding name (e.g., "orgs")
