@@ -1499,6 +1499,64 @@ fn no_undefined_resource_for_namespaced_enum_value() {
 }
 
 #[test]
+fn no_undefined_resource_for_declared_but_uninstalled_provider() {
+    // Regression for #2019: when a provider is declared (`provider awscc { ... }`)
+    // in the current document but hasn't been downloaded (installed provider_names
+    // is empty), the provider-namespaced enum reference on its right-hand side
+    // used to be flagged as `Undefined resource: 'awscc'. Define it with 'let
+    // awscc = aws...'` — which is both wrong (awscc is a namespace, not a let
+    // binding) and actively misleading (following the fix breaks valid DSL).
+    let engine = DiagnosticEngine::new(
+        Arc::new(HashMap::new()),
+        vec![], // nothing installed — simulates missing .carina/
+        Arc::new(vec![]),
+    );
+    let doc = create_document(
+        r#"provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+
+    let undefined = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Undefined resource"));
+    assert!(
+        undefined.is_none(),
+        "Declared-but-uninstalled provider name must not be flagged as 'Undefined resource'. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn undefined_resource_still_fires_when_identifier_is_not_a_declared_provider() {
+    // Regression guard for #2019: the fix must not swallow legitimate undefined-
+    // binding diagnostics. When the root identifier is not a declared provider
+    // and not a defined binding, the existing "Undefined resource" message
+    // should still fire.
+    let engine = DiagnosticEngine::new(Arc::new(HashMap::new()), vec![], Arc::new(vec![]));
+    let doc = create_document(
+        r#"provider awscc {
+  region = totally_unknown.some_attr
+}
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+
+    let undefined = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Undefined resource: 'totally_unknown'"));
+    assert!(
+        undefined.is_some(),
+        "A genuinely unknown identifier should still produce the 'Undefined resource' diagnostic. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn map_key_validation_warns_on_invalid_key() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 

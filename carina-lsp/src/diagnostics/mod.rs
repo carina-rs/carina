@@ -142,7 +142,9 @@ impl DiagnosticEngine {
         for name in sibling_bindings.keys() {
             all_bindings.insert(name.clone());
         }
-        let undef_diags = self.check_undefined_references(&text, &all_bindings);
+        let declared_providers = self.extract_declared_provider_names(&text);
+        let undef_diags =
+            self.check_undefined_references(&text, &all_bindings, &declared_providers);
         diagnostics.extend(undef_diags);
 
         // Upstream_state field-ref check: must run even when the current
