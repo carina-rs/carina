@@ -61,6 +61,9 @@ pub enum ParseError {
 /// A structured warning emitted during parsing (non-fatal).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseWarning {
+    /// Full source path of the file this warning originated from
+    /// (stamped by `config_loader` after parsing). `None` at parse time;
+    /// always `Some` once the warning reaches CLI/LSP callers.
     pub file: Option<String>,
     pub line: usize,
     pub message: String,
@@ -83,7 +86,8 @@ pub(crate) const DEFERRED_UPSTREAM_INDEX_PLACEHOLDER: &str = "(known after upstr
 /// is loaded from upstream_state.
 #[derive(Debug, Clone)]
 pub struct DeferredForExpression {
-    /// Source file name (stamped by config_loader after parsing).
+    /// Full source path of the file this deferred expression originated
+    /// from (stamped by `config_loader` after parsing).
     pub file: Option<String>,
     /// Source line number of the `for` keyword.
     pub line: usize,
