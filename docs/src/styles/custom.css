@@ -1,125 +1,113 @@
-/* ============================================
-   Canopus Deep Navy Theme
-   Inspired by Canopus (α Carinae) — warm white-gold star
-   ============================================ */
+/* ============================================================
+   Carina Docs — custom.css (drop-in)
+   Canopus Deep Navy palette + Canopus Gold accent + Cyan secondary
+   Source: Carina Design System
+   ============================================================ */
 
-/* Dark mode (default) */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
+
+/* ---- Tokens --------------------------------------------------- */
 :root {
-  /* Gray scale: Slate palette (hue 215) */
-  --sl-color-white: hsl(0, 0%, 100%);
-  --sl-color-gray-1: hsl(214, 32%, 91%); /* #e2e8f0 Slate 200 */
-  --sl-color-gray-2: hsl(215, 16%, 62%); /* #94a3b8 Slate 400 */
-  --sl-color-gray-3: hsl(215, 14%, 46%); /* #64748b Slate 500 */
-  --sl-color-gray-4: hsl(217, 19%, 35%); /* #475569 Slate 600 */
-  --sl-color-gray-5: hsl(217, 33%, 17%); /* #1e293b Slate 800 */
-  --sl-color-gray-6: hsl(222, 47%, 11%); /* #0f172a Slate 900 */
-  --sl-color-black: hsl(229, 84%, 5%);   /* #020617 Slate 950 */
+  /* Slate grayscale */
+  --slate-100: #f1f5f9;
+  --slate-200: #e2e8f0;
+  --slate-400: #94a3b8;
+  --slate-500: #64748b;
+  --slate-600: #475569;
+  --slate-700: #334155;
+  --slate-800: #1e293b;
+  --slate-900: #0f172a;
+  --slate-950: #020617;
 
+  /* Canopus Gold */
+  --gold-100: #fef9c3;
+  --gold-400: #fbbf24;
+  --gold-low: hsl(32, 60%, 15%);
 
-  /* Accent: Canopus Gold (Amber/Yellow) */
-  --sl-color-accent-low: hsl(32, 60%, 15%);   /* dark amber */
-  --sl-color-accent: hsl(43, 96%, 56%);        /* ~#fbbf24 Yellow 400 */
-  --sl-color-accent-high: hsl(48, 96%, 89%);   /* ~#fef9c3 Yellow 100 */
+  /* Cyan */
+  --cyan-500: #06b6d4;
+  --cyan-600: #0891b2;
+
+  /* Effect colours */
+  --effect-create:  #22c55e;
+  --effect-update:  #fbbf24;
+  --effect-delete:  #ef4444;
+  --effect-replace: #d946ef;
+  --effect-read:    #22d3ee;
+
+  /* ---- Starlight bindings (these names are what Starlight reads) ---- */
+  --sl-color-white:     #ffffff;
+  --sl-color-gray-1:    var(--slate-200);
+  --sl-color-gray-2:    var(--slate-400);
+  --sl-color-gray-3:    var(--slate-500);
+  --sl-color-gray-4:    var(--slate-600);
+  --sl-color-gray-5:    var(--slate-800);
+  --sl-color-gray-6:    var(--slate-900);
+  --sl-color-black:     var(--slate-950);
+  --sl-color-accent-low:  var(--gold-low);
+  --sl-color-accent:      var(--gold-400);
+  --sl-color-accent-high: var(--gold-100);
+
+  /* Type families (override Starlight defaults) */
+  --sl-font:        'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
+  --sl-font-system-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
-/* Force dark mode only */
+/* Force dark mode only (Carina is dark-only) */
 :root[data-theme='light'] {
-  /* Override light mode to use dark mode values */
-  --sl-color-white: hsl(0, 0%, 100%);
-  --sl-color-gray-1: hsl(214, 32%, 91%);
-  --sl-color-gray-2: hsl(215, 16%, 62%);
-  --sl-color-gray-3: hsl(215, 14%, 46%);
-  --sl-color-gray-4: hsl(217, 19%, 35%);
-  --sl-color-gray-5: hsl(217, 33%, 17%);
-  --sl-color-gray-6: hsl(222, 47%, 11%);
-  --sl-color-gray-7: hsl(222, 47%, 11%);
-  --sl-color-black: hsl(229, 84%, 5%);
-  --sl-color-accent-low: hsl(32, 60%, 15%);
-  --sl-color-accent: hsl(43, 96%, 56%);
-  --sl-color-accent-high: hsl(48, 96%, 89%);
+  --sl-color-white:     #ffffff;
+  --sl-color-gray-1:    var(--slate-200);
+  --sl-color-gray-2:    var(--slate-400);
+  --sl-color-gray-3:    var(--slate-500);
+  --sl-color-gray-4:    var(--slate-600);
+  --sl-color-gray-5:    var(--slate-800);
+  --sl-color-gray-6:    var(--slate-900);
+  --sl-color-gray-7:    var(--slate-900);
+  --sl-color-black:     var(--slate-950);
+  --sl-color-accent-low:  var(--gold-low);
+  --sl-color-accent:      var(--gold-400);
+  --sl-color-accent-high: var(--gold-100);
   color-scheme: dark;
 }
 
-/* Code block theme: match hero panels */
+/* ---- Code blocks (Expressive Code) ---------------------------- */
 :root {
-  --astro-code-background: #1e293b;
+  --astro-code-background: var(--slate-800);
   --astro-code-token-keyword: var(--sl-color-accent-high);
 }
-/* Override Expressive Code frame backgrounds and text color (loaded after custom.css, so need !important) */
-.expressive-code .frame pre {
-  background: #1e293b !important;
-}
-.expressive-code .frame .header {
-  background: #162032 !important;
-}
-.expressive-code .frame.is-terminal .header {
-  background: #162032 !important;
-}
-.expressive-code pre {
-  border-color: #334155 !important;
-}
-/* Boost default code foreground for readability against #1e293b */
-.expressive-code .frame pre code {
-  color: #f1f5f9 !important; /* Slate 100 — high contrast on Slate 800 */
-}
-.expressive-code {
-  --ec-codeFg: #f1f5f9 !important;
-}
+.expressive-code .frame pre         { background: var(--slate-800) !important; }
+.expressive-code .frame .header     { background: #162032 !important; }
+.expressive-code .frame.is-terminal .header { background: #162032 !important; }
+.expressive-code pre                { border-color: var(--slate-700) !important; }
+.expressive-code .frame pre code    { color: var(--slate-100) !important; }
+.expressive-code                    { --ec-codeFg: var(--slate-100) !important; }
 
-/* "Soon" badge: improve contrast in sidebar */
+/* ---- Badges --------------------------------------------------- */
 .sl-badge.default {
-  background-color: hsl(217, 19%, 35%); /* Slate 600 */
-  border-color: hsl(215, 14%, 46%);     /* Slate 500 */
-  color: hsl(214, 32%, 91%);            /* Slate 200 */
+  background-color: var(--slate-600);
+  border-color: var(--slate-500);
+  color: var(--slate-200);
 }
 
-/* Hide theme toggle */
-starlight-theme-select {
-  display: none;
-}
+/* ---- Chrome --------------------------------------------------- */
+starlight-theme-select { display: none; }
+.header { background-color: var(--sl-color-black) !important; }
 
-/* Nav bar: match page background */
-.header {
-  background-color: var(--sl-color-black) !important;
-}
-
-/* Provider doc table styling */
-table {
-  width: 100%;
-  font-size: 0.9rem;
-}
-
-/* Enum value tables: Value and DSL Identifier columns */
-table th:first-child,
-table td:first-child {
-  min-width: 120px;
-}
-
-/* Struct field tables: narrower Required column */
-table th:nth-child(3),
-table td:nth-child(3) {
-  min-width: 80px;
-  white-space: nowrap;
-}
-
-/* Table header and stripe rows */
+/* ---- Tables --------------------------------------------------- */
+table { width: 100%; font-size: 0.9rem; }
+table th:first-child, table td:first-child { min-width: 120px; }
+table th:nth-child(3), table td:nth-child(3) { min-width: 80px; white-space: nowrap; }
 table thead th {
   background-color: var(--sl-color-accent-low);
   color: var(--sl-color-white);
 }
-
-/* Restore left padding on first column (Starlight zeroes it by default) */
 .sl-markdown-content :is(th:first-child, td:first-child):not(:where(.not-content *)) {
   padding-inline-start: 1rem;
 }
-table tbody tr:nth-child(even) {
-  background-color: var(--sl-color-gray-6);
-}
-table td, table th {
-  border-color: var(--sl-color-hairline-light);
-}
+table tbody tr:nth-child(even) { background-color: var(--sl-color-gray-6); }
+table td, table th { border-color: var(--sl-color-hairline-light); }
 
-/* Feature cards: consistent cyan accent with left border */
+/* ---- Feature cards (3 px gold left border) -------------------- */
 .card {
   --sl-card-border: var(--sl-color-accent);
   --sl-card-bg: var(--sl-color-accent-low);
@@ -127,75 +115,24 @@ table td, table th {
   border-left: 3px solid var(--sl-color-accent);
   transition: border-color 0.2s ease;
 }
-.card:hover {
-  border-color: var(--sl-color-accent);
-}
-.card .icon {
-  color: var(--sl-color-accent);
-}
-/* Override per-card color rotation to use consistent cyan */
-.card:nth-child(4n + 1) {
-  --sl-card-border: var(--sl-color-accent);
-  --sl-card-bg: var(--sl-color-accent-low);
-}
-.card:nth-child(4n + 3) {
-  --sl-card-border: var(--sl-color-accent);
-  --sl-card-bg: var(--sl-color-accent-low);
-}
-.card:nth-child(4n + 4) {
-  --sl-card-border: var(--sl-color-accent);
-  --sl-card-bg: var(--sl-color-accent-low);
-}
+.card:hover { border-color: var(--sl-color-accent); }
+.card .icon { color: var(--sl-color-accent); }
+.card:nth-child(4n + 1),
+.card:nth-child(4n + 3),
+.card:nth-child(4n + 4),
 .card:nth-child(4n + 5) {
   --sl-card-border: var(--sl-color-accent);
   --sl-card-bg: var(--sl-color-accent-low);
 }
 
-/* "Why Carina?" section */
-.why-carina {
-  text-align: center;
-  padding: 2rem 0;
-  margin-bottom: 1rem;
-}
-.why-carina h2 {
-  font-size: var(--sl-text-2xl);
-  color: var(--sl-color-white);
-  margin-bottom: 1.5rem;
-}
-.why-grid {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  align-items: stretch;
-  gap: 1.5rem;
-  text-align: left;
-}
-.why-item {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  padding: 1.25rem;
-  border: 1px solid var(--sl-color-gray-5);
-  border-radius: 0.5rem;
-  background: var(--sl-color-black);
-}
-.why-icon {
-  font-size: 1.5rem;
-  margin-bottom: 0.5rem;
-}
-.why-item h3 {
-  font-size: var(--sl-text-lg);
-  color: var(--sl-color-white);
-  margin: 0 0 0.5rem;
-}
-.why-item p {
-  flex: 1;
-  font-size: var(--sl-text-sm);
-  color: var(--sl-color-gray-2);
-  margin: 0;
-  line-height: 1.6;
-}
-@media (max-width: 50rem) {
-  .why-grid {
-    grid-template-columns: 1fr;
-  }
-}
+/* ---- "Why Carina?" landing section ---------------------------- */
+.why-carina      { text-align: center; padding: 2rem 0; margin-bottom: 1rem; }
+.why-carina h2   { font-size: var(--sl-text-2xl); color: var(--sl-color-white); margin-bottom: 1.5rem; }
+.why-grid        { display: grid; grid-template-columns: repeat(3, 1fr); align-items: stretch; gap: 1.5rem; text-align: left; }
+.why-item        { display: flex; flex-direction: column; height: 100%; padding: 1.25rem;
+                   border: 1px solid var(--sl-color-gray-5); border-radius: 0.5rem;
+                   background: var(--sl-color-black); }
+.why-icon        { font-size: 1.5rem; margin-bottom: 0.5rem; }
+.why-item h3     { font-size: var(--sl-text-lg); color: var(--sl-color-white); margin: 0 0 0.5rem; }
+.why-item p      { flex: 1; font-size: var(--sl-text-sm); color: var(--sl-color-gray-2); margin: 0; line-height: 1.6; }
+@media (max-width: 50rem) { .why-grid { grid-template-columns: 1fr; } }
