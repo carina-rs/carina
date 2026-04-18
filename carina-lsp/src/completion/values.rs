@@ -227,11 +227,11 @@ impl CompletionProvider {
             return completions;
         }
 
-        // No schema found — include built-in function completions as fallback
+        // No schema found — offer only type-neutral candidates. Built-in
+        // functions are safe (their concrete value types depend on use),
+        // but injecting `true`/`false` or every region would pollute the
+        // list with values that can't possibly fit an unknown attribute.
         completions.extend(self.builtin_function_completions());
-
-        // Fall back to generic value completions
-        completions.extend(self.generic_value_completions());
         completions
     }
 
@@ -554,26 +554,6 @@ impl CompletionProvider {
             .collect()
     }
 
-    pub(super) fn generic_value_completions(&self) -> Vec<CompletionItem> {
-        let mut completions = vec![
-            CompletionItem {
-                label: "true".to_string(),
-                kind: Some(CompletionItemKind::VALUE),
-                detail: Some("Boolean true".to_string()),
-                ..Default::default()
-            },
-            CompletionItem {
-                label: "false".to_string(),
-                kind: Some(CompletionItemKind::VALUE),
-                detail: Some("Boolean false".to_string()),
-                ..Default::default()
-            },
-        ];
-
-        completions.extend(self.region_completions());
-        completions
-    }
-
     /// Provide completions for built-in function names.
     pub(super) fn builtin_function_completions(&self) -> Vec<CompletionItem> {
         builtins::builtin_functions()
@@ -584,19 +564,6 @@ impl CompletionProvider {
                 detail: Some(func.signature.to_string()),
                 insert_text: Some(format!("{}($0)", func.name)),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
-                ..Default::default()
-            })
-            .collect()
-    }
-
-    pub(super) fn region_completions(&self) -> Vec<CompletionItem> {
-        self.region_completions_data
-            .iter()
-            .map(|c| CompletionItem {
-                label: c.value.clone(),
-                kind: Some(CompletionItemKind::ENUM_MEMBER),
-                detail: Some(c.description.clone()),
-                insert_text: Some(c.value.clone()),
                 ..Default::default()
             })
             .collect()
