@@ -65,13 +65,17 @@ pub fn load_configuration_with_config(
                 .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
             match parser::parse(&content, config) {
                 Ok(mut parsed) => {
-                    // Stamp source file name onto warnings and deferred for-expressions
-                    let file_name = file.file_name().map(|n| n.to_string_lossy().into_owned());
+                    // Stamp the full source path onto warnings and deferred
+                    // for-expressions. Bare filenames are ambiguous when a
+                    // project spans multiple `.crn` files (and identically
+                    // named files in sibling directories), and they break
+                    // editor jump-to-location.
+                    let file_path = Some(file.display().to_string());
                     for w in &mut parsed.warnings {
-                        w.file = file_name.clone();
+                        w.file = file_path.clone();
                     }
                     for d in &mut parsed.deferred_for_expressions {
-                        d.file = file_name.clone();
+                        d.file = file_path.clone();
                     }
 
                     let unresolved = parsed.clone();
@@ -233,12 +237,12 @@ pub fn parse_directory_with_overrides(
         };
         match parser::parse(&content, config) {
             Ok(mut parsed) => {
-                let file_name = Some(name.clone());
+                let file_path = Some(file.display().to_string());
                 for w in &mut parsed.warnings {
-                    w.file = file_name.clone();
+                    w.file = file_path.clone();
                 }
                 for d in &mut parsed.deferred_for_expressions {
-                    d.file = file_name.clone();
+                    d.file = file_path.clone();
                 }
                 merge_parsed_file(&mut merged, parsed);
             }
@@ -717,6 +721,47 @@ mod tests {
             ),
             Ok(_) => panic!("expected error for file path"),
         }
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn load_configuration_stamps_full_path_on_warnings() {
+        // Issue #1997: warnings and deferred for-expressions must carry a full
+        // source path, not a bare filename. Bare filenames are ambiguous when a
+        // project spans multiple .crn files and break editor jump-to-location.
+        let dir = create_temp_dir("load_warning_full_path");
+        // A for-loop with an unused binding generates a ParseWarning.
+        let crn_path = dir.join("main.crn");
+        fs::write(
+            &crn_path,
+            r#"provider aws {
+    region = aws.Region.ap_northeast_1
+}
+
+let empty_list = []
+let _ = for unused_var in empty_list {
+    aws.ec2.vpc {
+        cidr_block = "10.0.0.0/16"
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let config = load_configuration(&dir).unwrap();
+        assert!(
+            !config.parsed.warnings.is_empty(),
+            "fixture must produce at least one ParseWarning"
+        );
+        let stamped = config.parsed.warnings[0]
+            .file
+            .as_ref()
+            .expect("warning must have a file path stamped");
+        assert_eq!(
+            stamped,
+            &crn_path.display().to_string(),
+            "warning.file must carry the full source path, not a bare filename",
+        );
         cleanup(&dir);
     }
 
