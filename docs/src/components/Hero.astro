@@ -30,7 +30,10 @@ const planHtml = `<span class="prompt">$</span> carina plan .
 ---
 
 <div class="hero-custom">
+  <div class="hero-horizon horizon-top" aria-hidden="true"></div>
+
   <div class="hero-header">
+    <div class="hero-halo" aria-hidden="true"></div>
     <div class="hero-star"></div>
     <h1 id={PAGE_TITLE_ID} data-page-title>Carina</h1>
     <p class="hero-tagline">A strongly typed infrastructure management tool written in Rust.</p>
@@ -68,35 +71,92 @@ const planHtml = `<span class="prompt">$</span> carina plan .
     <a href="/getting-started/installation/" class="hero-btn primary">Get Started</a>
     <a href="https://github.com/carina-rs/carina" class="hero-btn secondary">GitHub</a>
   </div>
+
+  <div class="hero-horizon horizon-bottom" aria-hidden="true"></div>
 </div>
 
 <style>
   .hero-custom {
     padding: clamp(2rem, 6vw, 4rem) 0 2rem;
     text-align: center;
+    position: relative;
+  }
+
+  /* Brand horizons */
+  .hero-horizon {
+    height: 1px;
+    margin: 0 auto;
+    max-width: 52rem;
+    background: linear-gradient(
+      90deg,
+      transparent 0%,
+      var(--carina-horizon-color, #fbbf24) 50%,
+      transparent 100%
+    );
+    opacity: 0.55;
+  }
+  .horizon-top {
+    --carina-horizon-color: #fbbf24;
+    margin-bottom: clamp(1.5rem, 4vw, 3rem);
+  }
+  .horizon-bottom {
+    --carina-horizon-color: #0891b2;
+    margin-top: clamp(1.5rem, 4vw, 2.5rem);
+  }
+
+  /* Header with halo */
+  .hero-header {
+    position: relative;
+  }
+
+  .hero-halo {
+    position: absolute;
+    top: -40px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 420px;
+    max-width: 80vw;
+    height: 260px;
+    background: radial-gradient(
+      ellipse at center,
+      rgba(251, 191, 36, 0.14) 0%,
+      rgba(8, 145, 178, 0.08) 35%,
+      transparent 70%
+    );
+    pointer-events: none;
+    z-index: 0;
   }
 
   .hero-star {
+    position: relative;
+    z-index: 1;
     width: 10px;
     height: 10px;
     border-radius: 50%;
     background: #fef3c7;
-    box-shadow: 0 0 16px #fde68a, 0 0 40px rgba(253, 230, 138, 0.3);
-    margin: 0 auto 1rem;
+    box-shadow: 0 0 16px #fde68a, 0 0 40px rgba(253, 230, 138, 0.45);
+    margin: 0 auto 0.75rem;
   }
 
   h1 {
+    position: relative;
+    z-index: 1;
+    font-family: var(--carina-font-display, var(--sl-font));
     font-size: clamp(var(--sl-text-4xl), calc(0.25rem + 5vw), var(--sl-text-6xl));
     font-weight: 700;
+    letter-spacing: -0.02em;
     line-height: var(--sl-line-height-headings);
     color: #fbbf24;
     margin: 0;
   }
 
   .hero-tagline {
+    position: relative;
+    z-index: 1;
     font-size: clamp(var(--sl-text-base), calc(0.0625rem + 2vw), var(--sl-text-xl));
     color: var(--sl-color-gray-2);
-    margin: 0.5rem 0 0;
+    margin: 0.5rem auto 0;
+    max-width: 40rem;
   }
 
   .hero-banner {
@@ -162,9 +222,7 @@ const planHtml = `<span class="prompt">$</span> carina plan .
     font-weight: 600;
   }
 
-  .terminal-header {
-    gap: 0.25rem;
-  }
+  .terminal-header { gap: 0.25rem; }
 
   .terminal-dot {
     width: 0.5rem;
@@ -181,9 +239,7 @@ const planHtml = `<span class="prompt">$</span> carina plan .
     margin-left: 0.25rem;
   }
 
-  .panel-body {
-    padding: 0.75rem;
-  }
+  .panel-body { padding: 0.75rem; }
 
   .panel-body pre {
     margin: 0;
@@ -226,16 +282,14 @@ const planHtml = `<span class="prompt">$</span> carina plan .
     font-size: var(--sl-text-sm);
     font-weight: 600;
     text-decoration: none;
-    transition: background-color 0.2s ease;
+    transition: background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease;
   }
 
   .hero-btn.primary {
     background: #d97706;
     color: #fff;
   }
-  .hero-btn.primary:hover {
-    background: #f59e0b;
-  }
+  .hero-btn.primary:hover { background: #f59e0b; }
 
   .hero-btn.secondary {
     border: 1px solid #475569;
@@ -247,9 +301,7 @@ const planHtml = `<span class="prompt">$</span> carina plan .
   }
 
   @media (max-width: 50rem) {
-    .hero-panels {
-      flex-direction: column;
-    }
+    .hero-panels { flex-direction: column; }
+    .hero-halo { height: 180px; top: -20px; }
   }
-
 </style>
