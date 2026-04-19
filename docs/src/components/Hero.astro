@@ -1,17 +1,19 @@
 ---
 const PAGE_TITLE_ID = '_top';
 
-const codeHtml = `<span class="kw">provider</span> <span class="id">aws</span> {
-  <span class="attr">region =</span> <span class="enum">aws.Region.ap_northeast_1</span>
+const codeHtml = `<span class="kw">provider</span> <span class="id">awscc</span> {
+  <span class="attr">source  =</span> <span class="str">'github.com/carina-rs/carina-provider-awscc'</span>
+  <span class="attr">version =</span> <span class="str">'0.4.0'</span>
+  <span class="attr">region  =</span> <span class="enum">awscc.Region.ap_northeast_1</span>
 }
 
 <span class="kw">let</span> <span class="id">vpc</span> = <span class="type">awscc.ec2.vpc</span> {
-  <span class="attr">cidr_block =</span> <span class="str">'10.0.0.0/16'</span>
+  <span class="attr">cidr_block         =</span> <span class="str">'10.0.0.0/16'</span>
   <span class="attr">enable_dns_support =</span> <span class="bool">true</span>
 }
 
 <span class="type">awscc.ec2.subnet</span> {
-  <span class="attr">vpc_id =</span> <span class="id">vpc</span>.vpc_id
+  <span class="attr">vpc_id     =</span> <span class="id">vpc</span>.vpc_id
   <span class="attr">cidr_block =</span> <span class="str">'10.0.1.0/24'</span>
 }`;
 
@@ -19,11 +21,11 @@ const planHtml = `<span class="prompt">$</span> carina plan .
 <span class="muted">Planning...</span>
 
 <span class="add">+</span> <span class="id">awscc.ec2.vpc</span>
-  <span class="attr">cidr_block:</span> <span class="str">'10.0.0.0/16'</span>
+  <span class="attr">cidr_block:</span>         <span class="str">'10.0.0.0/16'</span>
   <span class="attr">enable_dns_support:</span> <span class="bool">true</span>
 
 <span class="add">+</span> <span class="id">awscc.ec2.subnet</span>
-  <span class="attr">vpc_id:</span> <span class="id">vpc</span>.vpc_id
+  <span class="attr">vpc_id:</span>     <span class="id">vpc</span>.vpc_id
   <span class="attr">cidr_block:</span> <span class="str">'10.0.1.0/24'</span>
 
 <span class="plan-summary">Plan: 2 to create, 0 to update, 0 to delete.</span>`;
