@@ -354,11 +354,14 @@ pub fn resolve_provider_by_revision(
     // 1. Resolve revision to SHA
     let sha = if !upgrade
         && let Some(lock_entry) = lock_file.find_by_source(source)
-        && lock_entry.revision.as_deref() == Some(revision)
-        && lock_entry.resolved_sha.is_some()
+        && let super::provider_resolver::LockEntryKind::Revision {
+            revision: locked_revision,
+            resolved_sha,
+        } = &lock_entry.kind
+        && locked_revision == revision
     {
         // Reuse locked SHA if revision matches (skip on upgrade)
-        lock_entry.resolved_sha.clone().unwrap()
+        resolved_sha.clone()
     } else {
         eprintln!(
             "Resolving revision '{}' for provider '{}'...",
@@ -402,10 +405,10 @@ pub fn resolve_provider_by_revision(
         lock_file.upsert(super::provider_resolver::LockEntry {
             name: name.to_string(),
             source: source.to_string(),
-            version: String::new(),
-            constraint: None,
-            revision: Some(revision.to_string()),
-            resolved_sha: Some(sha.clone()),
+            kind: super::provider_resolver::LockEntryKind::Revision {
+                revision: revision.to_string(),
+                resolved_sha: sha.clone(),
+            },
             sha256: hash,
         });
         eprintln!(
@@ -450,10 +453,10 @@ pub fn resolve_provider_by_revision(
     lock_file.upsert(super::provider_resolver::LockEntry {
         name: name.to_string(),
         source: source.to_string(),
-        version: String::new(),
-        constraint: None,
-        revision: Some(revision.to_string()),
-        resolved_sha: Some(sha.clone()),
+        kind: super::provider_resolver::LockEntryKind::Revision {
+            revision: revision.to_string(),
+            resolved_sha: sha.clone(),
+        },
         sha256: hash,
     });
 
