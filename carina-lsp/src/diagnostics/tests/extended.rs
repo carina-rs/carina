@@ -2674,6 +2674,28 @@ fn for_iterable_multiline_header_still_flagged() {
 }
 
 #[test]
+fn lsp_binding_used_only_in_for_body_is_not_flagged_unused() {
+    let provider = test_engine();
+    let source = r#"
+let vpc = test.r.vpc { name = "v" }
+for _, id in orgs.xs {
+  test.r.res { name = vpc.name }
+}
+"#;
+    let doc = create_document(source);
+    let diagnostics = provider.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    // Match "Unused" (LSP check_unused_bindings) and "unused" (parser warnings)
+    // case-insensitively so the assertion fires whichever path flags `vpc`.
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|d| d.message.to_lowercase().contains("unused") && d.message.contains("vpc")),
+        "vpc used in for body, must not be flagged unused, got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn enum_mismatch_inside_for_body_surfaces_as_diagnostic() {
     let provider = test_engine_with_enum_attr();
     let source = r#"
