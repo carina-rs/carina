@@ -180,6 +180,11 @@ pub struct ResourceSchema {
     pub operation_config: Option<OperationConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub validators: Vec<ValidatorType>,
+    /// Declarative "exactly one of" groups. Each inner vec is a group of
+    /// attribute names where exactly one must be specified. Survives
+    /// serialization across the WASM plugin boundary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclusive_required: Vec<Vec<String>>,
 }
 
 /// Per-resource operational configuration for timeouts and retries.

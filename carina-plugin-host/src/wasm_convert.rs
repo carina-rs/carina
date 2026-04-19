@@ -278,6 +278,7 @@ fn proto_schema_to_core(s: &proto::ResourceSchema) -> CoreResourceSchema {
                 create_max_retries: c.create_max_retries,
             }
         }),
+        exclusive_required: s.exclusive_required.clone(),
     }
 }
 
@@ -878,6 +879,7 @@ mod tests {
             force_replace: false,
             operation_config: None,
             validators: vec![proto::ValidatorType::TagsKeyValueCheck],
+            exclusive_required: vec![],
         };
         let core_schema = proto_schema_to_core(&proto_schema);
         assert!(core_schema.validator.is_some());
@@ -894,9 +896,72 @@ mod tests {
             force_replace: false,
             operation_config: None,
             validators: vec![],
+            exclusive_required: vec![],
         };
         let core_schema = proto_schema_to_core(&proto_schema);
         assert!(core_schema.validator.is_none());
+    }
+
+    #[test]
+    fn test_exclusive_required_roundtrips_through_proto() {
+        // Declarative exclusive_required must survive the proto boundary so
+        // WASM providers can express `oneOf` constraints as data.
+        let proto_schema = proto::ResourceSchema {
+            resource_type: "awscc.ec2.vpc".to_string(),
+            attributes: HashMap::new(),
+            description: None,
+            data_source: false,
+            name_attribute: None,
+            force_replace: false,
+            operation_config: None,
+            validators: vec![],
+            exclusive_required: vec![vec![
+                "cidr_block".to_string(),
+                "ipv4_ipam_pool_id".to_string(),
+            ]],
+        };
+        let core_schema = proto_schema_to_core(&proto_schema);
+        assert_eq!(
+            core_schema.exclusive_required,
+            vec![vec![
+                "cidr_block".to_string(),
+                "ipv4_ipam_pool_id".to_string(),
+            ]]
+        );
+
+        // And the resulting core schema rejects empty attributes.
+        let err = core_schema.validate(&HashMap::new()).unwrap_err();
+        assert!(
+            err.iter().any(|e| e
+                .to_string()
+                .contains("Exactly one of [cidr_block, ipv4_ipam_pool_id]")),
+            "expected missing-group error, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_exclusive_required_survives_json_roundtrip() {
+        // The plugin host receives schemas as JSON. Confirm the new field
+        // is preserved through full JSON round-trip (guest -> host).
+        let proto_schema = proto::ResourceSchema {
+            resource_type: "awscc.ec2.vpc".to_string(),
+            attributes: HashMap::new(),
+            description: None,
+            data_source: false,
+            name_attribute: None,
+            force_replace: false,
+            operation_config: None,
+            validators: vec![],
+            exclusive_required: vec![vec!["a".to_string(), "b".to_string()]],
+        };
+        let json = serde_json::to_string(&vec![proto_schema]).unwrap();
+        let schemas = json_to_schemas(&json);
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(
+            schemas[0].exclusive_required,
+            vec![vec!["a".to_string(), "b".to_string()]]
+        );
     }
 
     #[test]
@@ -910,6 +975,7 @@ mod tests {
             force_replace: false,
             operation_config: None,
             validators: vec![proto::ValidatorType::TagsKeyValueCheck],
+            exclusive_required: vec![],
         };
         let core_schema = proto_schema_to_core(&proto_schema);
         let validator = core_schema.validator.unwrap();
