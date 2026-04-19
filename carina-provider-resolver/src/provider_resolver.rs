@@ -801,8 +801,26 @@ pub fn check_lock_mismatch(
                     &format!("version constraint = '{}'", constraint.raw),
                 ));
             }
-            // No constraint, no revision in .crn — accept whatever is locked.
-            (None, None, _) => {}
+            // No constraint and no revision in .crn: the user didn't pin
+            // anything explicitly. That implies version mode (latest tag).
+            // Any pre-existing lock entry must also be version mode — a
+            // revision-mode entry was written under a `.crn` that had
+            // `revision = '...'` and is now gone, which is still a mismatch.
+            (None, None, LockEntryKind::Version { .. }) => {}
+            (
+                None,
+                None,
+                LockEntryKind::Revision {
+                    revision: locked_rev,
+                    ..
+                },
+            ) => {
+                return Err(mismatch_error(
+                    &config.name,
+                    &format!("revision = '{locked_rev}'"),
+                    "(no revision, no version constraint — version mode)",
+                ));
+            }
             // .crn has both revision and version (parser should reject this);
             // treat as accept and let the resolver surface its own error.
             (Some(_), Some(_), _) => {}
@@ -1595,6 +1613,22 @@ sha256 = "abc"
         let cfg = provider_config(SRC, None);
 
         assert!(check_lock_mismatch(&[cfg], &lock, LockMode::Normal).is_ok());
+    }
+
+    /// .crn without revision but lock in revision mode is a mismatch — the
+    /// user dropped `revision = '...'` from their config and `.crn` now
+    /// implies version mode, but the lock still pins a git revision.
+    #[test]
+    fn check_mismatch_detects_revision_dropped_from_crn() {
+        let mut lock = LockFile::default();
+        lock.upsert(revision_entry(SRC, "main", "abc123"));
+        let cfg = provider_config(SRC, None); // no revision, no version
+
+        let err = check_lock_mismatch(&[cfg], &lock, LockMode::Normal)
+            .expect_err(".crn lost its revision but lock still has one — must error");
+        assert!(err.contains("awscc"), "{err}");
+        assert!(err.contains("main"), "{err}");
+        assert!(err.contains("--upgrade"), "{err}");
     }
 
     /// End-to-end: `resolve_all` in Normal mode with a stale lock errors
