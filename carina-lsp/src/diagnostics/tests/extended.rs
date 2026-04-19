@@ -2724,3 +2724,50 @@ for _, id in orgs.xs {
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn for_body_diagnostic_anchors_inside_for_not_at_prior_sibling() {
+    // Regression for #2078. The same attribute name (`mode`) appears both at
+    // top level (valid) and inside a `for` body (invalid). The diagnostic
+    // must anchor on the for-body line, not the earlier top-level line that
+    // happens to share the attribute name.
+    let provider = test_engine_with_enum_attr();
+    // Line layout (0-indexed):
+    //   0: (empty)
+    //   1: test.r.mode_holder {
+    //   2:   mode = "fast"           <- valid
+    //   3: }
+    //   4:
+    //   5: for _, id in orgs.xs {
+    //   6:   test.r.mode_holder {
+    //   7:     mode = "aaaa"         <- INVALID, should anchor here
+    //   8:   }
+    //   9: }
+    let source = r#"
+test.r.mode_holder {
+  mode = "fast"
+}
+
+for _, id in orgs.xs {
+  test.r.mode_holder {
+    mode = "aaaa"
+  }
+}
+"#;
+    let doc = create_document(source);
+    let diagnostics = provider.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let bad = diagnostics
+        .iter()
+        .find(|d| d.message.contains("aaaa"))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected enum-mismatch diagnostic for 'aaaa', got: {:?}",
+                diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(
+        bad.range.start.line, 7,
+        "diagnostic must anchor on the for-body line (0-indexed 7), got: line {} with range {:?}",
+        bad.range.start.line, bad.range
+    );
+}
