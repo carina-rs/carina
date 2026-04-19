@@ -95,7 +95,7 @@ impl CompletionProvider {
                 self.upstream_state_source_completions(&partial_path, position, base_path)
             }
             CompletionContext::ForIterable { partial } => {
-                self.for_iterable_completions(&text, position, &partial)
+                self.for_iterable_completions(&text, position, &partial, base_path)
             }
             CompletionContext::None => vec![],
         }

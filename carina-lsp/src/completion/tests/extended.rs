@@ -1544,6 +1544,37 @@ fn for_binding_declaration_position_does_not_suggest_bindings() {
 }
 
 #[test]
+fn for_iterable_offers_binding_declared_in_sibling_file() {
+    // `let orgs = upstream_state { ... }` commonly lives in a sibling
+    // `backend.crn` while the `for _ in orgs.accounts` sits in `main.crn`.
+    // Completion must surface bindings from the whole directory, not just
+    // the current buffer.
+    let provider = test_provider();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    std::fs::write(
+        base.join("backend.crn"),
+        "let orgs = upstream_state { source = '../organizations' }\n",
+    )
+    .unwrap();
+    let main = "for _, account_id in or";
+    std::fs::write(base.join("main.crn"), main).unwrap();
+    let doc = create_document(main);
+    let position = Position {
+        line: 0,
+        character: main.chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(base));
+
+    assert!(
+        completions.iter().any(|c| c.label == "orgs"),
+        "expected `orgs` from sibling backend.crn, got: {:?}",
+        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn for_iterable_fires_immediately_after_in_without_trailing_space() {
     // User types `for name, _ in` and invokes completion before adding a
     // space — the cursor is right after the `n` of `in` and the rest of
