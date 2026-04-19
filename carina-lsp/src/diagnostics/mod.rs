@@ -189,9 +189,13 @@ impl DiagnosticEngine {
 
             // Check resource types — include for-body template resources so
             // attribute/type/enum validation fires inside `for` loops too.
-            for (_ctx, resource) in parsed.iter_all_resources() {
+            for (ctx, resource) in parsed.iter_all_resources() {
                 let provider = &resource.id.provider;
                 let full_resource_type = format!("{}.{}", provider, resource.id.resource_type);
+                // Source-range hint for attribute position lookups. Without
+                // this, a `for`-body diagnostic like `mode = "aaa"` would
+                // anchor on the first top-level `mode =` in the file.
+                let scope = resource_source_range(doc, ctx, provider, &resource.id.resource_type);
 
                 if !self.schemas.contains_key(&full_resource_type) {
                     let provider_loaded = self.provider_names.contains(&provider.to_string());
@@ -312,7 +316,8 @@ impl DiagnosticEngine {
                             && canon != attr_name
                             && resource.attributes.contains_key(canon)
                         {
-                            if let Some((line, col)) = self.find_attribute_position(doc, attr_name)
+                            if let Some((line, col)) =
+                                self.find_attribute_position(doc, attr_name, scope)
                             {
                                 diagnostics.push(carina_diagnostic(
                                     line,
@@ -330,7 +335,8 @@ impl DiagnosticEngine {
 
                         // Check for unknown attributes
                         if !schema.attributes.contains_key(canonical_name) {
-                            if let Some((line, col)) = self.find_attribute_position(doc, attr_name)
+                            if let Some((line, col)) =
+                                self.find_attribute_position(doc, attr_name, scope)
                             {
                                 // Check if there's a similar attribute (e.g., vpc -> vpc_id)
                                 let suggestion =
@@ -524,7 +530,7 @@ impl DiagnosticEngine {
 
                             if let Some(message) = type_error
                                 && let Some((line, col)) =
-                                    self.find_attribute_position(doc, attr_name)
+                                    self.find_attribute_position(doc, attr_name, scope)
                             {
                                 diagnostics.push(carina_diagnostic(
                                     line,
@@ -586,7 +592,7 @@ impl DiagnosticEngine {
                                     ..
                                 } = &error
                                 {
-                                    self.find_attribute_position(doc, attr)
+                                    self.find_attribute_position(doc, attr, scope)
                                 } else {
                                     None
                                 };
@@ -805,10 +811,31 @@ impl DiagnosticEngine {
         None
     }
 
-    fn find_attribute_position(&self, doc: &Document, attr_name: &str) -> Option<(u32, u32)> {
+    /// Find the source position of an attribute assignment (`attr_name = ...`).
+    ///
+    /// `scope` optionally restricts the search to a half-open line range
+    /// `[start, end)` (both 0-indexed). Without a scope, the first matching
+    /// line anywhere in the document wins — which produces wrong anchors
+    /// when the same attribute name appears in multiple resource blocks.
+    /// Callers walking resources should pass the resource's source range
+    /// (see `resource_source_range`).
+    fn find_attribute_position(
+        &self,
+        doc: &Document,
+        attr_name: &str,
+        scope: Option<(u32, u32)>,
+    ) -> Option<(u32, u32)> {
         let text = doc.text();
+        let (start, end) = scope.unwrap_or((0, u32::MAX));
 
         for (line_idx, line) in text.lines().enumerate() {
+            let line_idx = line_idx as u32;
+            if line_idx < start {
+                continue;
+            }
+            if line_idx >= end {
+                break;
+            }
             let trimmed = line.trim_start();
             // Must start with attr_name followed by whitespace or '='
             if !trimmed.starts_with(attr_name) {
@@ -819,10 +846,96 @@ impl DiagnosticEngine {
                 continue;
             }
             // Calculate column position (account for leading whitespace)
-            return Some((line_idx as u32, position::leading_whitespace_chars(line)));
+            return Some((line_idx, position::leading_whitespace_chars(line)));
         }
         None
     }
+}
+
+/// Derive the source line range (0-indexed, half-open) of a resource block.
+///
+/// - For `Deferred(for_expr)` the scope starts at the `for` line and ends
+///   at the closing brace of the for expression.
+/// - For `Direct` we locate the `provider.resource_type` token and scan
+///   forward from there.
+///
+/// Returns `None` when the block can't be located (e.g., during partial
+/// parses). Callers that fall back to `None` get document-wide search —
+/// the historic behavior — which is still correct when there's no
+/// ambiguity.
+fn resource_source_range(
+    doc: &Document,
+    ctx: carina_core::parser::ResourceContext<'_>,
+    provider: &str,
+    resource_type: &str,
+) -> Option<(u32, u32)> {
+    use carina_core::parser::ResourceContext;
+    let text = doc.text();
+    let lines: Vec<&str> = text.lines().collect();
+
+    let start = match ctx {
+        // `DeferredForExpression.line` is 1-indexed (pest line_col). Convert to 0-indexed.
+        ResourceContext::Deferred(d) => d.line.saturating_sub(1) as u32,
+        ResourceContext::Direct => {
+            let pattern = format!("{}.{}", provider, resource_type);
+            let (idx, _) = lines
+                .iter()
+                .enumerate()
+                .find(|(_, l)| l.contains(pattern.as_str()))?;
+            idx as u32
+        }
+    };
+
+    // Scan forward from `start`, tracking brace balance. The block ends when
+    // the balance returns to zero after we've seen at least one `{`.
+    let mut balance: i32 = 0;
+    let mut seen_open = false;
+    for (idx, line) in lines.iter().enumerate().skip(start as usize) {
+        // Skip comments (`#` or `//`) by trimming from the first marker.
+        let stripped = strip_line_comment(line);
+        for ch in stripped.chars() {
+            match ch {
+                '{' => {
+                    balance += 1;
+                    seen_open = true;
+                }
+                '}' => {
+                    balance -= 1;
+                    if seen_open && balance == 0 {
+                        return Some((start, idx as u32 + 1));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // Unterminated: treat as extending to end of file.
+    Some((start, lines.len() as u32))
+}
+
+fn strip_line_comment(line: &str) -> &str {
+    // Conservative: only strip `#` or `//` outside of strings. For source
+    // ranges we only need brace-balance accuracy, so missing a comment
+    // inside a string is acceptable — strings in .crn don't normally
+    // contain unbalanced braces.
+    let mut in_string = false;
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' || b == b'\'' {
+            in_string = !in_string;
+        } else if !in_string {
+            if b == b'#' {
+                return &line[..i];
+            }
+            if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                return &line[..i];
+            }
+        }
+        i += 1;
+    }
+    line
 }
 
 /// Check whether a ResourceRef value is type-compatible with the expected attribute type.
