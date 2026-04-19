@@ -634,42 +634,15 @@ fn should_reload_providers(changes: &[FileEvent]) -> bool {
 fn should_reload_for_event(event: &FileEvent) -> bool {
     let uri = event.uri.as_str();
 
-    // A provider binary or its lock file changing — including deletion, so the
-    // LSP notices `.carina/` being wiped — is always a reload trigger.
-    if uri.ends_with(".wasm") || uri.ends_with("carina-providers.lock") {
-        return true;
-    }
-
-    // `.crn` saves are cheap per-file but full-workspace reload is not, so
-    // only trigger when the file currently has a `provider` block — or the
-    // file was deleted (the block is gone, but a state that depended on it
-    // may still be loaded).
-    if uri.ends_with(".crn") {
-        if event.typ == FileChangeType::DELETED {
-            return true;
-        }
-        if let Ok(path) = event.uri.to_file_path()
-            && let Ok(content) = std::fs::read_to_string(&path)
-        {
-            return content_declares_provider(&content);
-        }
-    }
-
-    false
-}
-
-/// Cheap textual scan for a `provider NAME {` block. Good enough to gate a
-/// workspace-wide schema reload; false positives (a literal `provider` token
-/// inside a comment or string) are tolerable because the worst case is an
-/// extra reload, not a wrong answer.
-fn content_declares_provider(content: &str) -> bool {
-    content.lines().any(|line| {
-        let trimmed = line.trim_start();
-        let Some(rest) = trimmed.strip_prefix("provider") else {
-            return false;
-        };
-        matches!(rest.chars().next(), Some(c) if c.is_ascii_whitespace())
-    })
+    // A provider binary, its lock file, or any `.crn` file changing — create,
+    // change, or delete — triggers a reload. Gating `.crn` changes on "file
+    // currently declares a provider block" misses the removal case: editing a
+    // file to delete its `provider NAME {}` block silently keeps the stale
+    // factory live, because the post-save content no longer matches.
+    // `didChangeWatchedFiles` fires on save / delete (not on `did_change`
+    // keystrokes), so an unconditional reload cost is bounded and matches the
+    // existing wasm / lock-file behavior.
+    uri.ends_with(".wasm") || uri.ends_with("carina-providers.lock") || uri.ends_with(".crn")
 }
 
 #[cfg(test)]
@@ -716,40 +689,39 @@ mod tests {
     }
 
     #[test]
-    fn reload_when_crn_file_declares_provider() {
+    fn reload_for_any_crn_change_including_removed_provider_block() {
+        // Covers three scenarios in one:
+        // - .crn that declares a provider block (adding `source = ...`)
+        // - .crn whose previously-declared provider block was deleted on save
+        //   (reviewer-spotted regression: gating on current content misses it)
+        // - .crn that never declared a provider (`main.crn` edits).
+        // All three must reload: we can't reliably detect the middle case
+        // from the post-save content alone, and the reload cost is bounded
+        // since `didChangeWatchedFiles` fires on save, not per-keystroke.
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("providers.crn");
-        std::fs::write(
-            &path,
-            "provider awscc {\n  source = 'github.com/carina-rs/carina-provider-awscc'\n}\n",
-        )
-        .unwrap();
-
-        assert!(should_reload_providers(&[file_event(
-            &path,
-            FileChangeType::CHANGED
-        )]));
+        for (name, content) in [
+            (
+                "with_block.crn",
+                "provider awscc {\n  source = 'github.com/carina-rs/carina-provider-awscc'\n}\n",
+            ),
+            ("block_removed.crn", "# provider block removed\n"),
+            ("main.crn", "awscc.s3.bucket { bucket_name = 'ex' }\n"),
+        ] {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, content).unwrap();
+            for typ in [FileChangeType::CREATED, FileChangeType::CHANGED] {
+                assert!(
+                    should_reload_providers(&[file_event(&path, typ)]),
+                    "{name} {typ:?} must trigger reload"
+                );
+            }
+        }
     }
 
     #[test]
-    fn no_reload_when_crn_file_has_no_provider_block() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("main.crn");
-        std::fs::write(&path, "awscc.s3.bucket {\n  bucket_name = 'example'\n}\n").unwrap();
-
-        assert!(!should_reload_providers(&[file_event(
-            &path,
-            FileChangeType::CHANGED
-        )]));
-    }
-
-    #[test]
-    fn reload_when_crn_file_is_deleted_even_without_content() {
+    fn reload_when_crn_file_is_deleted() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("gone.crn");
-        // Deliberately do NOT create the file — a delete event has no content
-        // to inspect, but the previously-loaded provider state may still be
-        // live, so we reload unconditionally.
         assert!(should_reload_providers(&[file_event(
             &path,
             FileChangeType::DELETED
@@ -757,19 +729,14 @@ mod tests {
     }
 
     #[test]
-    fn content_declares_provider_recognizes_leading_whitespace() {
-        assert!(content_declares_provider("provider awscc {"));
-        assert!(content_declares_provider("  provider aws {"));
-        assert!(content_declares_provider("\tprovider awscc {"));
-    }
-
-    #[test]
-    fn content_declares_provider_rejects_non_provider_lines() {
-        assert!(!content_declares_provider(
-            "providers.crn is the convention"
-        ));
-        assert!(!content_declares_provider("provider_name = 'awscc'"));
-        assert!(!content_declares_provider("# nothing here"));
-        assert!(!content_declares_provider("awscc.s3.bucket { }"));
+    fn no_reload_for_unrelated_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["README.md", "Cargo.toml", "notes.txt"] {
+            let path = tmp.path().join(name);
+            assert!(
+                !should_reload_providers(&[file_event(&path, FileChangeType::CHANGED)]),
+                "{name} should not trigger reload"
+            );
+        }
     }
 }
