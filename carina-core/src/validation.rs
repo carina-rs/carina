@@ -66,22 +66,24 @@ pub fn validate_resources(
 /// For example, if `ipv4_ipam_pool_id` expects `IpamPoolId` type,
 /// a reference like `vpc.vpc_id` (which is `AwsResourceId`) should be an error.
 pub fn validate_resource_ref_types(
-    resources: &[Resource],
+    parsed: &ParsedFile,
     schemas: &HashMap<String, ResourceSchema>,
     schema_key_fn: &dyn Fn(&Resource) -> String,
     argument_names: &HashSet<String>,
 ) -> Result<(), String> {
     let mut all_errors = Vec::new();
 
-    // Build binding_name -> resource map
+    // Build binding_name -> resource map from direct resources only.
+    // For-body template resources never carry a `binding`, so skipping
+    // them here keeps the map correct for lookup.
     let mut binding_map: HashMap<String, &Resource> = HashMap::new();
-    for resource in resources {
+    for resource in &parsed.resources {
         if let Some(ref binding_name) = resource.binding {
             binding_map.insert(binding_name.clone(), resource);
         }
     }
 
-    for resource in resources {
+    for (_ctx, resource) in parsed.iter_all_resources() {
         let schema_key = schema_key_fn(resource);
 
         let Some(schema) = schemas.get(&schema_key) else {
@@ -1107,8 +1109,10 @@ let vpc = awscc.ec2.vpc {
             Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         );
 
+        let mut parsed = empty_parsed();
+        parsed.resources.push(subnet);
         let result =
-            validate_resource_ref_types(&[subnet], &schemas, &test_schema_key_fn, &HashSet::new());
+            validate_resource_ref_types(&parsed, &schemas, &test_schema_key_fn, &HashSet::new());
         assert_eq!(
             result.unwrap_err(),
             "awscc.ec2.subnet.web-subnet: unknown binding 'vpc' in reference vpc.vpc_id"
@@ -1138,12 +1142,11 @@ let vpc = awscc.ec2.vpc {
             Value::resource_ref("vpc".to_string(), "nonexistent_attr".to_string(), vec![]),
         );
 
-        let result = validate_resource_ref_types(
-            &[vpc, subnet],
-            &schemas,
-            &test_schema_key_fn,
-            &HashSet::new(),
-        );
+        let mut parsed = empty_parsed();
+        parsed.resources.push(vpc);
+        parsed.resources.push(subnet);
+        let result =
+            validate_resource_ref_types(&parsed, &schemas, &test_schema_key_fn, &HashSet::new());
         assert_eq!(
             result.unwrap_err(),
             "awscc.ec2.subnet.web-subnet: unknown attribute 'nonexistent_attr' on 'vpc' in reference vpc.nonexistent_attr"
@@ -1184,12 +1187,11 @@ let vpc = awscc.ec2.vpc {
             ),
         );
 
-        let result = validate_resource_ref_types(
-            &[igw, route],
-            &schemas,
-            &test_schema_key_fn,
-            &HashSet::new(),
-        );
+        let mut parsed = empty_parsed();
+        parsed.resources.push(igw);
+        parsed.resources.push(route);
+        let result =
+            validate_resource_ref_types(&parsed, &schemas, &test_schema_key_fn, &HashSet::new());
         let err = result.unwrap_err();
         assert!(
             err.contains("Did you mean 'internet_gateway_id'?"),
@@ -1222,17 +1224,57 @@ let vpc = awscc.ec2.vpc {
             ),
         );
 
-        let result = validate_resource_ref_types(
-            &[vpc, subnet],
-            &schemas,
-            &test_schema_key_fn,
-            &HashSet::new(),
-        );
+        let mut parsed = empty_parsed();
+        parsed.resources.push(vpc);
+        parsed.resources.push(subnet);
+        let result =
+            validate_resource_ref_types(&parsed, &schemas, &test_schema_key_fn, &HashSet::new());
         let err = result.unwrap_err();
         assert!(
             !err.contains("Did you mean"),
             "Should not suggest when name is too different, got: {}",
             err
+        );
+    }
+
+    #[test]
+    fn ref_type_mismatch_inside_for_body_is_rejected() {
+        // Inside a for body, assigning an Int-typed attribute to a Bool-typed
+        // target must be flagged.
+        let src = r#"
+            provider test {
+                source = 'x/y'
+                version = '0.1'
+                region = 'ap-northeast-1'
+            }
+            let vpc = test.r.vpc { name = "v" }
+            for _, id in orgs.xs {
+                test.r.pool_user {
+                    pool_id = vpc.vpc_id
+                }
+            }
+        "#;
+        let parsed = crate::parser::parse(src, &ProviderContext::default()).unwrap();
+
+        let mut schemas = HashMap::new();
+        // test.r.vpc exposes `vpc_id: Int`
+        schemas.insert(
+            "r.vpc".to_string(),
+            make_schema("r.vpc", vec![("vpc_id", AttributeType::Int)]),
+        );
+        // test.r.pool_user requires `pool_id: Bool` — incompatible with Int.
+        schemas.insert(
+            "r.pool_user".to_string(),
+            make_schema("r.pool_user", vec![("pool_id", AttributeType::Bool)]),
+        );
+
+        let result =
+            validate_resource_ref_types(&parsed, &schemas, &test_schema_key_fn, &HashSet::new());
+        assert!(result.is_err(), "expected type-mismatch error in for body");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("pool_id"),
+            "expected error to mention pool_id, got: {msg}"
         );
     }
 

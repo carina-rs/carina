@@ -205,7 +205,7 @@ pub fn validate_and_resolve_with_config(
         for us in &parsed.upstream_states {
             argument_names.insert(us.binding.clone());
         }
-        validate_resource_ref_types_with_ctx(&ctx, &parsed.resources, &argument_names)?;
+        validate_resource_ref_types_with_ctx(&ctx, parsed, &argument_names)?;
         validate_attribute_param_ref_types_with_ctx(
             &ctx,
             &parsed.attribute_params,
