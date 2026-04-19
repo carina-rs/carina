@@ -147,17 +147,15 @@ impl DiagnosticEngine {
             self.check_undefined_references(&text, &all_bindings, &declared_providers);
         diagnostics.extend(undef_diags);
 
-        // Upstream_state field-ref check: must run even when the current
-        // document fails to parse on its own (e.g. when the downstream
-        // references a `let` declared in a sibling file). Uses a
-        // directory-scoped parse fed with the current buffer, not just
-        // disk content.
-        if let Some(base) = base_path {
-            diagnostics.extend(self.check_upstream_state_field_references(
-                doc,
-                current_file_name,
-                base,
-            ));
+        // Checks that need cross-file context share one directory-scoped parse
+        // (buffer substituted for its on-disk copy). Both must run even when
+        // the current document fails to parse on its own — a `for` or `let`
+        // commonly references a binding declared in a sibling file.
+        if let Some(base) = base_path
+            && let Some(merged) = self.parse_merged_with_buffer(doc, current_file_name, base)
+        {
+            diagnostics.extend(self.check_upstream_state_field_references(doc, &merged, base));
+            diagnostics.extend(self.check_for_iterable_bindings(doc, &merged, current_file_name));
         }
 
         // Semantic analysis on parsed file

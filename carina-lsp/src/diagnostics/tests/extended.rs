@@ -2502,3 +2502,173 @@ fn upstream_state_broken_upstream_surfaces_resolve_error() {
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+// =====================================================================
+// for-expression iterable: undefined binding (#1998)
+// =====================================================================
+
+#[test]
+fn for_iterable_undefined_binding_is_flagged() {
+    // `org` is a typo for `orgs` — the binding doesn't exist. LSP must
+    // flag it, the same way `let x = org.accounts` outside a `for` does.
+    let (_tmp, base, name) = set_up_project_with_upstream(
+        r#"let orgs = upstream_state { source = '../organizations' }
+for name, _ in org.accounts {
+    awscc.ec2.vpc {
+        name = name
+        cidr_block = '10.0.0.0/16'
+    }
+}
+"#,
+        Some(
+            r#"exports { accounts: string = "x" }
+"#,
+        ),
+    );
+
+    let engine = test_engine();
+    let buffer = std::fs::read_to_string(base.join(&name)).unwrap();
+    let diagnostics = analyze_with_buffer(&engine, &base, &name, &buffer);
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("Undefined identifier `org`")),
+        "got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn for_iterable_defined_binding_passes() {
+    // `orgs` is correct — no undefined-identifier diagnostic.
+    let (_tmp, base, name) = set_up_project_with_upstream(
+        r#"let orgs = upstream_state { source = '../organizations' }
+for name, _ in orgs.accounts {
+    awscc.ec2.vpc {
+        name = name
+        cidr_block = '10.0.0.0/16'
+    }
+}
+"#,
+        Some(
+            r#"exports { accounts: string = "x" }
+"#,
+        ),
+    );
+
+    let engine = test_engine();
+    let buffer = std::fs::read_to_string(base.join(&name)).unwrap();
+    let diagnostics = analyze_with_buffer(&engine, &base, &name, &buffer);
+
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|d| d.message.contains("Undefined identifier")),
+        "correctly-named binding should not flag, got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn for_iterable_undefined_binding_cross_file_is_flagged() {
+    // `orgs` is declared in sibling file, but main.crn typos it as `org`.
+    // The directory-scoped merge must still catch it.
+    let tmp = tempfile::tempdir().unwrap();
+    let upstream = tmp.path().join("organizations");
+    std::fs::create_dir(&upstream).unwrap();
+    std::fs::write(
+        upstream.join("exports.crn"),
+        r#"exports { accounts: string = "x" }
+"#,
+    )
+    .unwrap();
+    let base = tmp.path().join("downstream");
+    std::fs::create_dir(&base).unwrap();
+    std::fs::write(
+        base.join("upstream.crn"),
+        r#"let orgs = upstream_state { source = '../organizations' }
+"#,
+    )
+    .unwrap();
+    let main = r#"for name, _ in org.accounts {
+    awscc.ec2.vpc {
+        name = name
+        cidr_block = '10.0.0.0/16'
+    }
+}
+"#;
+    std::fs::write(base.join("main.crn"), main).unwrap();
+
+    let engine = test_engine();
+    let diagnostics = analyze_with_buffer(&engine, &base, "main.crn", main);
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("Undefined identifier `org`")),
+        "cross-file typo must be flagged after directory merge, got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn for_iterable_undefined_binding_not_duplicated_across_siblings() {
+    // Two sibling files with `for _ in <same_undefined>.<attr>` on the same
+    // 1-based line must produce exactly one diagnostic in the currently
+    // edited file — not one per deferred in the merged parse.
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("project");
+    std::fs::create_dir(&base).unwrap();
+    let main = r#"for name, _ in missing.accounts {
+    awscc.ec2.vpc { name = name cidr_block = '10.0.0.0/16' }
+}
+"#;
+    let sibling = r#"for name, _ in missing.accounts {
+    awscc.ec2.vpc { name = name cidr_block = '10.0.0.0/16' }
+}
+"#;
+    std::fs::write(base.join("main.crn"), main).unwrap();
+    std::fs::write(base.join("sibling.crn"), sibling).unwrap();
+
+    let engine = test_engine();
+    let diagnostics = analyze_with_buffer(&engine, &base, "main.crn", main);
+
+    let hits: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.message.contains("Undefined identifier `missing`"))
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "expected one diagnostic in main.crn, got {}: {:?}",
+        hits.len(),
+        hits.iter()
+            .map(|d| (&d.range, &d.message))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn for_iterable_multiline_header_still_flagged() {
+    // Pest's `WHITESPACE` includes NEWLINE, so `for _ in\n    bad.attr {`
+    // parses. `deferred.line` points at the `for` keyword's line, which
+    // doesn't contain the iterable token — the diagnostic must still surface
+    // (anchored at the `for` line) rather than be silently dropped.
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("project");
+    std::fs::create_dir(&base).unwrap();
+    let main = "for name, _ in\n    missing.accounts {\n    awscc.ec2.vpc { name = name cidr_block = '10.0.0.0/16' }\n}\n";
+    std::fs::write(base.join("main.crn"), main).unwrap();
+
+    let engine = test_engine();
+    let diagnostics = analyze_with_buffer(&engine, &base, "main.crn", main);
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("Undefined identifier `missing`")),
+        "multi-line for header must still flag the undefined iterable, got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}

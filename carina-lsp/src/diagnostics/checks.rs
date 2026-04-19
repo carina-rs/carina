@@ -101,6 +101,70 @@ fn find_source_value_position(text: &str, expected: &str) -> Option<(u32, u32, u
     None
 }
 
+/// On the known `line_one_based` of a `for <pat> in <binding>.<attr>` header,
+/// find the character columns spanning `<binding>`. `DeferredForExpression`
+/// already carries the line; this narrows the scan to that one line.
+fn find_for_iterable_binding_column(
+    text: &str,
+    line_one_based: usize,
+    binding: &str,
+) -> Option<(u32, u32)> {
+    let line = text.lines().nth(line_one_based.saturating_sub(1))?;
+    let in_byte = line.find(" in ")?;
+    let after_in = &line[in_byte + 4..];
+    let after_in_trimmed = after_in.trim_start();
+    let ident_end = after_in_trimmed
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(after_in_trimmed.len());
+    if &after_in_trimmed[..ident_end] != binding {
+        return None;
+    }
+    let byte_in_line = in_byte + 4 + (after_in.len() - after_in_trimmed.len());
+    let start_col = line[..byte_in_line].chars().count() as u32;
+    let end_col = start_col + binding.chars().count() as u32;
+    Some((start_col, end_col))
+}
+
+/// Binding names declared anywhere in the merged parse — the same set
+/// `carina_core::parser::check_deferred_for_iterables` uses to decide whether
+/// a for-iterable's root is in scope.
+fn collect_known_bindings(merged: &ParsedFile) -> HashSet<&str> {
+    let mut known: HashSet<&str> = HashSet::new();
+    known.extend(merged.resources.iter().filter_map(|r| r.binding.as_deref()));
+    known.extend(merged.arguments.iter().map(|a| a.name.as_str()));
+    known.extend(
+        merged
+            .module_calls
+            .iter()
+            .filter_map(|c| c.binding_name.as_deref()),
+    );
+    known.extend(merged.upstream_states.iter().map(|u| u.binding.as_str()));
+    known.extend(merged.imports.iter().map(|i| i.alias.as_str()));
+    known.extend(merged.user_functions.keys().map(String::as_str));
+    known.extend(merged.variables.keys().map(String::as_str));
+    known.extend(merged.structural_bindings.iter().map(String::as_str));
+    known
+}
+
+/// Whether `deferred` was parsed from the editor's current document.
+/// `DeferredForExpression.file` is stamped with the full source path, so we
+/// compare by basename to the LSP-supplied `current_file_name`.
+fn deferred_in_current_file(
+    deferred: &carina_core::parser::DeferredForExpression,
+    current_file_name: Option<&str>,
+) -> bool {
+    let Some(current) = current_file_name else {
+        return false;
+    };
+    let Some(file) = deferred.file.as_deref() else {
+        return false;
+    };
+    std::path::Path::new(file)
+        .file_name()
+        .and_then(|n| n.to_str())
+        == Some(current)
+}
+
 /// Check if a string looks like an unresolved cross-file reference ("binding.attribute").
 fn is_dot_notation_ref(s: &str) -> bool {
     let parts: Vec<&str> = s.split('.').collect();
@@ -283,34 +347,38 @@ impl DiagnosticEngine {
         None
     }
 
-    /// Reject references like `orgs.account` whose field isn't declared by
-    /// the upstream's `exports { }` block.
-    ///
-    /// Uses a directory-scoped parse that overrides the on-disk copy of
-    /// `current_file_name` with the editor's in-memory buffer, so edits
-    /// produce diagnostics before the user saves. Runs even when the
-    /// single-file parse fails — common when a `for` iterates over a
-    /// binding declared in a sibling file.
-    pub(super) fn check_upstream_state_field_references(
+    /// Run a directory-scoped parse with the current editor buffer substituted
+    /// for its on-disk copy, so diagnostics that need cross-file context
+    /// (upstream-state exports, for-iterable bindings) update on keystrokes.
+    pub(super) fn parse_merged_with_buffer(
         &self,
         doc: &Document,
         current_file_name: Option<&str>,
         base_path: &std::path::Path,
-    ) -> Vec<Diagnostic> {
-        let mut overrides: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
+    ) -> Option<ParsedFile> {
+        let mut overrides: HashMap<String, String> = HashMap::new();
         if let Some(name) = current_file_name {
             overrides.insert(name.to_string(), doc.text());
         }
-        let merged = carina_core::config_loader::parse_directory_with_overrides(
+        carina_core::config_loader::parse_directory_with_overrides(
             base_path,
             &self.provider_context,
             &overrides,
-        );
-        let Ok(merged) = merged else {
-            return Vec::new();
-        };
+        )
+        .ok()
+    }
 
+    /// Reject references like `orgs.account` whose field isn't declared by
+    /// the upstream's `exports { }` block.
+    ///
+    /// Runs even when the single-file parse fails — common when a `for`
+    /// iterates over a binding declared in a sibling file.
+    pub(super) fn check_upstream_state_field_references(
+        &self,
+        doc: &Document,
+        merged: &ParsedFile,
+        base_path: &std::path::Path,
+    ) -> Vec<Diagnostic> {
         let (exports, resolve_errors) = carina_core::upstream_exports::resolve_upstream_exports(
             base_path,
             &merged.upstream_states,
@@ -344,7 +412,7 @@ impl DiagnosticEngine {
         // anchor later diagnostics at subsequent occurrences instead of
         // stacking them on the first.
         let field_errors =
-            carina_core::upstream_exports::check_upstream_state_field_references(&merged, &exports);
+            carina_core::upstream_exports::check_upstream_state_field_references(merged, &exports);
         let mut seen_count: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         for err in field_errors {
@@ -369,6 +437,63 @@ impl DiagnosticEngine {
         diagnostics
     }
 
+    /// Flag `for _ in <name>.<attr>` whose root binding `<name>` is not
+    /// declared anywhere in the directory-scoped parse.
+    ///
+    /// The same typo outside a `for` is rejected at single-file parse time,
+    /// but for-iterables are deferred until directory merge (they may name a
+    /// sibling `upstream_state` or `let`), so this check has to run on the
+    /// merged buffer+disk parse too.
+    pub(super) fn check_for_iterable_bindings(
+        &self,
+        doc: &Document,
+        merged: &ParsedFile,
+        current_file_name: Option<&str>,
+    ) -> Vec<Diagnostic> {
+        let known = collect_known_bindings(merged);
+        let text = doc.text();
+        let mut diagnostics = Vec::new();
+        // Iterating the deferred list directly (rather than the error list
+        // from `check_deferred_for_iterables`) keeps a 1:1 mapping between
+        // deferred expressions and diagnostics; two sibling files with
+        // `for _ in <same>.attr` on the same line would otherwise collide on
+        // the error's `(name, line)` key.
+        for deferred in &merged.deferred_for_expressions {
+            if !deferred_in_current_file(deferred, current_file_name) {
+                continue;
+            }
+            if known.contains(deferred.iterable_binding.as_str()) {
+                continue;
+            }
+            let line_zero_based = deferred.line.saturating_sub(1) as u32;
+            let (col, end_col) =
+                find_for_iterable_binding_column(&text, deferred.line, &deferred.iterable_binding)
+                    .unwrap_or_else(|| {
+                        // Multi-line `for` headers put the iterable on a later line;
+                        // anchor the squiggle at the `for` keyword line so the user
+                        // still sees the error.
+                        let line_chars = text
+                            .lines()
+                            .nth(deferred.line.saturating_sub(1))
+                            .map(|l| l.chars().count() as u32)
+                            .unwrap_or(0);
+                        (0, line_chars)
+                    });
+            diagnostics.push(carina_diagnostic(
+                line_zero_based,
+                col,
+                end_col,
+                DiagnosticSeverity::ERROR,
+                carina_core::parser::ParseError::UndefinedIdentifier {
+                    name: deferred.iterable_binding.clone(),
+                    line: deferred.line,
+                }
+                .to_string(),
+            ));
+        }
+        diagnostics
+    }
+
     /// Flag `upstream_state { source = ... }` paths that do not resolve to an
     /// existing directory relative to the project's base path.
     ///
@@ -380,8 +505,8 @@ impl DiagnosticEngine {
     /// Scope: **directory existence only.** Parsing the upstream's `.crn`
     /// files (across every sibling file in the upstream directory) and
     /// checking references against its declared exports is the job of
-    /// [`Self::check_upstream_state_field_references`], which runs a full
-    /// directory-scoped parse via `parse_directory_with_overrides`.
+    /// [`Self::check_upstream_state_field_references`], which consumes the
+    /// merged directory parse from [`Self::parse_merged_with_buffer`].
     pub(super) fn check_upstream_state_sources(
         &self,
         doc: &Document,

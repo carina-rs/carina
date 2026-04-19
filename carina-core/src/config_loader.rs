@@ -168,8 +168,13 @@ pub fn load_configuration_with_config(
             return Err(e.to_string());
         }
 
-        if let Err(e) = parser::check_deferred_for_iterables(&merged) {
-            return Err(e.to_string());
+        let iterable_errors = parser::check_deferred_for_iterables(&merged);
+        if !iterable_errors.is_empty() {
+            return Err(iterable_errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"));
         }
 
         Ok(LoadedConfig {
@@ -261,12 +266,10 @@ pub fn parse_directory_with_overrides(
         return Err(e.to_string());
     }
 
-    // Per-file parse deliberately skips this check: the iterable may reference
-    // an `upstream_state` or `let` declared in a sibling file.
-    if let Err(e) = parser::check_deferred_for_iterables(&merged) {
-        return Err(e.to_string());
-    }
-
+    // Deferred-for-iterable validation is left to callers. LSP needs the
+    // ParsedFile even when an iterable names an undefined binding, so it
+    // can surface the error as a diagnostic; CLI entry points run
+    // `check_deferred_for_iterables` themselves.
     Ok(merged)
 }
 
@@ -906,7 +909,7 @@ awscc.ec2.security_group {
     }
 
     #[test]
-    fn parse_directory_rejects_undefined_iterable_even_after_merge() {
+    fn parse_directory_leaves_undefined_iterable_for_caller_to_check() {
         let dir = create_temp_dir("undefined_for_iterable");
         fs::write(
             dir.join("main.crn"),
@@ -921,7 +924,34 @@ awscc.ec2.security_group {
 
         let result = parse_directory(&dir, &ProviderContext::default());
         cleanup(&dir);
-        let err = result.expect_err("undefined iterable should still error after merge");
+        let parsed = result.expect("parse_directory should not fail on undefined iterable");
+        let errs = parser::check_deferred_for_iterables(&parsed);
+        assert_eq!(errs.len(), 1, "expected one error, got {errs:?}");
+        match &errs[0] {
+            parser::ParseError::UndefinedIdentifier { name, .. } => {
+                assert_eq!(name, "does_not_exist");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        // `load_configuration_with_config` still fails fast for CLI callers.
+        let dir2 = create_temp_dir("undefined_for_iterable_cli");
+        fs::write(
+            dir2.join("main.crn"),
+            r#"for name, account_id in does_not_exist.accounts {
+  aws.s3.bucket {
+    name = name
+  }
+}
+"#,
+        )
+        .unwrap();
+        let cli_result = load_configuration_with_config(&dir2, &ProviderContext::default());
+        cleanup(&dir2);
+        let err = match cli_result {
+            Ok(_) => panic!("CLI load path should fail on undefined iterable"),
+            Err(e) => e,
+        };
         assert!(
             err.contains("Undefined identifier `does_not_exist`"),
             "unexpected error: {err}"
