@@ -183,6 +183,10 @@ enum Commands {
         /// Re-resolve all provider versions from constraints, ignoring lock file
         #[arg(long)]
         upgrade: bool,
+        /// Require the lock file to match providers.crn exactly; error if any
+        /// provider is missing from the lock. Intended for CI (like cargo --locked).
+        #[arg(long, conflicts_with = "upgrade")]
+        locked: bool,
     },
     /// Lint .crn files for style issues
     Lint {
@@ -393,8 +397,12 @@ async fn main() {
             run_force_unlock(&lock_id, &path, &provider_context).await
         }
         Commands::State { command } => run_state_command(command, &provider_context).await,
-        Commands::Init { path, upgrade } => {
-            if let Err(e) = commands::init::run_init(&path, upgrade) {
+        Commands::Init {
+            path,
+            upgrade,
+            locked,
+        } => {
+            if let Err(e) = commands::init::run_init(&path, upgrade, locked) {
                 eprintln!("{}", format!("Error: {e}").red());
                 std::process::exit(1);
             }
