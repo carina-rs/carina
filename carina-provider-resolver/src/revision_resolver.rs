@@ -373,20 +373,31 @@ pub fn resolve_provider_by_revision(
     // 2. Check cache
     let wasm_path = cache_path_revision(base_dir, source, &sha);
     if wasm_path.exists() {
-        if let Some(lock_entry) = lock_file.find_by_source_and_sha(source, &sha) {
-            let actual_hash = super::provider_resolver::sha256_file(&wasm_path)
-                .map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
-            if actual_hash != lock_entry.sha256 {
-                return Err(format!(
-                    "SHA256 mismatch for provider '{}' ({}@{}). Expected: {}, got: {}. Re-run `carina init` to re-download.",
-                    name,
-                    source,
-                    &sha[..12],
-                    lock_entry.sha256,
-                    actual_hash
-                ));
-            }
+        let actual_hash = super::provider_resolver::sha256_file(&wasm_path)
+            .map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
+        if let Some(lock_entry) = lock_file.find_by_source_and_sha(source, &sha)
+            && actual_hash != lock_entry.sha256
+        {
+            return Err(format!(
+                "SHA256 mismatch for provider '{}' ({}@{}). Expected: {}, got: {}. Re-run `carina init` to re-download.",
+                name,
+                source,
+                &sha[..12],
+                lock_entry.sha256,
+                actual_hash
+            ));
         }
+        // Record the entry so a caller that subsequently writes the lock
+        // doesn't stomp it with an empty in-memory LockFile (issue #2032).
+        lock_file.upsert(super::provider_resolver::LockEntry {
+            name: name.to_string(),
+            source: source.to_string(),
+            kind: super::provider_resolver::LockEntryKind::Revision {
+                revision: revision.to_string(),
+                resolved_sha: sha.clone(),
+            },
+            sha256: actual_hash,
+        });
         return Ok((wasm_path, sha));
     }
 
