@@ -27,6 +27,36 @@ pub struct LockEntry {
     pub sha256: String,
 }
 
+impl LockEntry {
+    fn validate(&self) -> Result<(), String> {
+        let has_version = !self.version.trim().is_empty();
+        let has_revision = self.revision.is_some();
+        let has_resolved_sha = self.resolved_sha.is_some();
+
+        // file:// sources use the literal "file" as version; no revision/sha.
+        if self.version == "file" {
+            if has_revision || has_resolved_sha {
+                return Err(format!(
+                    "entry for '{}' is malformed: file:// provider must not have revision or resolved_sha",
+                    self.name
+                ));
+            }
+            return Ok(());
+        }
+
+        match (has_version, has_revision, has_resolved_sha) {
+            // Version mode: version set, nothing else.
+            (true, false, false) => Ok(()),
+            // Revision mode: revision + resolved_sha set, version empty (filler).
+            (false, true, true) => Ok(()),
+            _ => Err(format!(
+                "entry for '{}' is malformed (version={:?}, revision={:?}, resolved_sha={:?}): expected either version-mode (version set, no revision) or revision-mode (revision and resolved_sha both set, version empty)",
+                self.name, self.version, self.revision, self.resolved_sha
+            )),
+        }
+    }
+}
+
 /// The full carina-providers.lock file.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LockFile {
@@ -35,9 +65,49 @@ pub struct LockFile {
 }
 
 impl LockFile {
-    pub fn load(path: &Path) -> Option<Self> {
-        let content = fs::read_to_string(path).ok()?;
-        toml::from_str(&content).ok()
+    /// Load and validate `carina-providers.lock`.
+    ///
+    /// Returns `Ok(None)` when the file is absent (normal first-run case),
+    /// `Ok(Some(lock))` when the file parses and every entry is self-consistent,
+    /// and `Err` when the file is present but unreadable, unparseable, or
+    /// contains a malformed entry. Collapsing parse errors into "treat as
+    /// empty" was how issue #2028 sneaked past the resolver — an entry with
+    /// `version = ""` but `revision = "main"` was reused as if it were
+    /// version-mode and produced `.../download/v/...` URLs.
+    pub fn load(path: &Path) -> Result<Option<Self>, String> {
+        let content = match fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("Failed to read {}: {e}", path.display())),
+        };
+        let lock: Self = toml::from_str(&content)
+            .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
+        lock.validate().map_err(|e| {
+            format!(
+                "{}: {e}\nhint: delete {} and re-run `carina init`, or `carina init --upgrade`",
+                path.display(),
+                path.display()
+            )
+        })?;
+        Ok(Some(lock))
+    }
+
+    /// Reject lock entries that carry logically impossible field combinations.
+    ///
+    /// A valid entry is one of:
+    /// - **Version mode**: `version` non-empty; `revision` and `resolved_sha` absent.
+    /// - **Revision mode**: `version` empty (filler); `revision` and `resolved_sha` both set.
+    /// - **file:// source**: `version` is the literal string `"file"`;
+    ///   `revision` and `resolved_sha` absent. Kept separate because file
+    ///   sources bypass GitHub releases entirely.
+    ///
+    /// Anything else — empty `version` without a `revision`, `revision` without
+    /// `resolved_sha`, both modes half-populated — is rejected.
+    fn validate(&self) -> Result<(), String> {
+        for entry in &self.provider {
+            entry.validate()?;
+        }
+        Ok(())
     }
 
     pub fn save(&self, path: &Path) -> io::Result<()> {
@@ -87,8 +157,22 @@ pub fn detect_target() -> Result<String, String> {
     Ok(target.to_string())
 }
 
+/// Reject obviously bogus version strings before they get spliced into a URL
+/// template. Empty or whitespace-only values were producing `.../download/v/...`
+/// URLs that 404 and confused users into chasing release-side bugs (#2028).
+fn check_version_for_url(version: &str) -> Result<(), String> {
+    if version.trim().is_empty() {
+        return Err("refusing to build download URL with empty version string. \
+             This usually means carina-providers.lock is malformed — \
+             delete it and re-run `carina init`, or run `carina init --upgrade`."
+            .to_string());
+    }
+    Ok(())
+}
+
 /// Construct the download URL for a provider binary.
 pub fn download_url(source: &str, version: &str, target: &str) -> Result<String, String> {
+    check_version_for_url(version)?;
     let parts: Vec<&str> = source.split('/').collect();
     if parts.len() != 3 || parts[0] != "github.com" {
         return Err(format!(
@@ -105,6 +189,7 @@ pub fn download_url(source: &str, version: &str, target: &str) -> Result<String,
 
 /// Construct the download URL for a WASM provider binary.
 pub fn download_url_wasm(source: &str, version: &str) -> Result<String, String> {
+    check_version_for_url(version)?;
     let parts: Vec<&str> = source.split('/').collect();
     if parts.len() != 3 || parts[0] != "github.com" {
         return Err(format!(
@@ -417,7 +502,7 @@ pub fn resolve_single_config(base_dir: &Path, config: &ProviderConfig) -> Result
         .ok_or_else(|| format!("Provider '{}' has no source", config.name))?;
 
     let lock_path = base_dir.join("carina-providers.lock");
-    let mut lock_file = LockFile::load(&lock_path).unwrap_or_default();
+    let mut lock_file = LockFile::load(&lock_path)?.unwrap_or_default();
 
     let binary_path = if let Some(revision) = &config.revision {
         let (path, _sha) = crate::revision_resolver::resolve_provider_by_revision(
@@ -489,7 +574,7 @@ pub fn find_installed_provider(
     }
 
     let lock_path = base_dir.join("carina-providers.lock");
-    let lock_file = LockFile::load(&lock_path).unwrap_or_default();
+    let lock_file = LockFile::load(&lock_path)?.unwrap_or_default();
 
     // Only the project-local `.carina/` counts. The global plugin cache is an
     // install-time optimization consulted by `carina init`; treating it as a
@@ -535,6 +620,35 @@ pub fn is_wasm_provider(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext == "wasm")
 }
 
+/// Decide whether the locked version can be reused for this version-mode config.
+///
+/// Returns `None` when the lock entry is missing, belongs to revision mode
+/// (its `version` is filler, not a real tag), or fails the configured
+/// constraint. The caller must then fetch a real tag. Splitting this out keeps
+/// the decision testable and keeps `resolve_version` from ever cloning an
+/// empty version string into a URL (issue #2028).
+fn try_reuse_locked_version(
+    source: &str,
+    config: &ProviderConfig,
+    lock_file: &LockFile,
+) -> Option<String> {
+    let entry = lock_file.find_by_source(source)?;
+
+    // Revision-mode entries legitimately store `version = ""` as filler.
+    // They carry no usable tag, so version-mode resolution must skip them.
+    if entry.version.trim().is_empty() || entry.revision.is_some() {
+        return None;
+    }
+
+    match &config.version {
+        Some(constraint) if constraint.matches(&entry.version).unwrap_or(false) => {
+            Some(entry.version.clone())
+        }
+        None => Some(entry.version.clone()),
+        _ => None,
+    }
+}
+
 /// Resolve the exact version to use for a provider.
 fn resolve_version(
     source: &str,
@@ -542,16 +656,8 @@ fn resolve_version(
     lock_file: &LockFile,
     upgrade: bool,
 ) -> Result<String, String> {
-    if !upgrade && let Some(lock_entry) = lock_file.find_by_source(source) {
-        match &config.version {
-            Some(constraint) if constraint.matches(&lock_entry.version).unwrap_or(false) => {
-                return Ok(lock_entry.version.clone());
-            }
-            None => {
-                return Ok(lock_entry.version.clone());
-            }
-            _ => {}
-        }
+    if !upgrade && let Some(version) = try_reuse_locked_version(source, config, lock_file) {
+        return Ok(version);
     }
 
     match &config.version {
@@ -583,7 +689,7 @@ pub fn resolve_all(
     upgrade: bool,
 ) -> Result<HashMap<String, PathBuf>, String> {
     let lock_path = base_dir.join("carina-providers.lock");
-    let mut lock_file = LockFile::load(&lock_path).unwrap_or_default();
+    let mut lock_file = LockFile::load(&lock_path)?.unwrap_or_default();
     let mut resolved = HashMap::new();
 
     for config in providers {
@@ -687,7 +793,7 @@ pub fn validate_lock_constraints(
     providers: &[ProviderConfig],
 ) -> Result<(), String> {
     let lock_path = base_dir.join("carina-providers.lock");
-    let lock_file = match LockFile::load(&lock_path) {
+    let lock_file = match LockFile::load(&lock_path)? {
         Some(lf) => lf,
         None => return Ok(()),
     };
@@ -840,7 +946,7 @@ mod tests {
         });
 
         lock.save(&lock_path).unwrap();
-        let loaded = LockFile::load(&lock_path).unwrap();
+        let loaded = LockFile::load(&lock_path).unwrap().unwrap();
 
         assert_eq!(loaded.provider.len(), 1);
         assert_eq!(loaded.provider[0].name, "awscc");
@@ -906,6 +1012,236 @@ mod tests {
         assert_eq!(loaded.provider[0].constraint.as_deref(), Some("~0.5.0"));
     }
 
+    /// An entry with `version = ""` and neither `revision` nor `resolved_sha`
+    /// cannot be used by either the version-mode or revision-mode code path.
+    /// Loading it as "treat as empty" previously masked the real problem
+    /// (#2028) — the resolver would fall through to version-mode, find the
+    /// entry by source, and splice `version = ""` into the release URL.
+    #[test]
+    fn load_rejects_entry_with_neither_version_nor_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("carina-providers.lock");
+        fs::write(
+            &lock_path,
+            r#"
+[[provider]]
+name = "awscc"
+source = "github.com/carina-rs/carina-provider-awscc"
+version = ""
+sha256 = "effbed"
+"#,
+        )
+        .unwrap();
+
+        let err = LockFile::load(&lock_path)
+            .expect_err("entry with no version and no revision must be rejected");
+        assert!(err.contains("awscc"), "error should name provider: {err}");
+        assert!(
+            err.contains("malformed") || err.contains("inconsistent"),
+            "error should describe the problem: {err}"
+        );
+        assert!(
+            err.contains("carina init"),
+            "error should point at the recovery command: {err}"
+        );
+    }
+
+    /// Half-populated version-mode entries (version set but revision or
+    /// resolved_sha also set) are an impossible combination too.
+    #[test]
+    fn load_rejects_version_mode_with_resolved_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("carina-providers.lock");
+        fs::write(
+            &lock_path,
+            r#"
+[[provider]]
+name = "awscc"
+source = "github.com/carina-rs/carina-provider-awscc"
+version = "0.5.2"
+resolved_sha = "deadbeef"
+sha256 = "abc123"
+"#,
+        )
+        .unwrap();
+
+        let err = LockFile::load(&lock_path)
+            .expect_err("version-mode entry with a resolved_sha must be rejected");
+        assert!(err.contains("awscc"), "error should name provider: {err}");
+    }
+
+    /// Revision mode without `resolved_sha` cannot be used to locate a
+    /// cached binary, so it's also malformed.
+    #[test]
+    fn load_rejects_revision_without_resolved_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("carina-providers.lock");
+        fs::write(
+            &lock_path,
+            r#"
+[[provider]]
+name = "awscc"
+source = "github.com/carina-rs/carina-provider-awscc"
+version = ""
+revision = "main"
+sha256 = "effbed"
+"#,
+        )
+        .unwrap();
+
+        let err =
+            LockFile::load(&lock_path).expect_err("revision without resolved_sha must be rejected");
+        assert!(err.contains("awscc"), "error should name provider: {err}");
+    }
+
+    /// Happy path: a well-formed version-mode entry loads fine.
+    #[test]
+    fn load_accepts_version_mode_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("carina-providers.lock");
+        fs::write(
+            &lock_path,
+            r#"
+[[provider]]
+name = "awscc"
+source = "github.com/carina-rs/carina-provider-awscc"
+version = "0.5.2"
+sha256 = "abc123"
+"#,
+        )
+        .unwrap();
+
+        let lock = LockFile::load(&lock_path)
+            .expect("version-mode entry must load")
+            .expect("file exists so loader must return Some");
+        assert_eq!(lock.provider.len(), 1);
+        assert_eq!(lock.provider[0].version, "0.5.2");
+    }
+
+    /// Happy path: a well-formed revision-mode entry loads fine. Revision-mode
+    /// entries legitimately write `version = ""` as filler; they're distinguished
+    /// from malformed entries by also carrying `revision` and `resolved_sha`.
+    #[test]
+    fn load_accepts_revision_mode_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("carina-providers.lock");
+        fs::write(
+            &lock_path,
+            r#"
+[[provider]]
+name = "awscc"
+source = "github.com/carina-rs/carina-provider-awscc"
+version = ""
+revision = "main"
+resolved_sha = "81b6910fb34e84784daac2a02c915e821b2da570"
+sha256 = "abc123"
+"#,
+        )
+        .unwrap();
+
+        let lock = LockFile::load(&lock_path)
+            .expect("revision-mode entry must load")
+            .expect("file exists so loader must return Some");
+        assert_eq!(lock.provider.len(), 1);
+        assert_eq!(lock.provider[0].revision.as_deref(), Some("main"));
+    }
+
+    /// The original #2028 repro: a lock entry written by a prior revision-mode
+    /// `init` (so `version = ""`, `revision = "main"`, `resolved_sha = Some(...)`)
+    /// is still present after the user removes `revision` from their `.crn`.
+    /// `resolve_version` used to happily return `lock_entry.version.clone()`
+    /// (an empty string), which then got spliced into `.../releases/download/v/...`.
+    ///
+    /// A revision-mode lock entry carries no usable version, so version-mode
+    /// resolution must ignore it and go fetch a real tag instead.
+    #[test]
+    fn resolve_version_ignores_empty_version_from_revision_mode_entry() {
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "awscc".into(),
+            source: "github.com/carina-rs/carina-provider-awscc".into(),
+            version: String::new(),
+            constraint: None,
+            revision: Some("main".into()),
+            resolved_sha: Some("deadbeefcafe".into()),
+            sha256: "abc".into(),
+        });
+        let config = ProviderConfig {
+            name: "awscc".into(),
+            source: Some("github.com/carina-rs/carina-provider-awscc".into()),
+            version: None,
+            revision: None,
+            attributes: std::collections::HashMap::new(),
+            default_tags: std::collections::HashMap::new(),
+        };
+
+        // We can't hit the network in a unit test, so just check that the
+        // reuse path does not fire. `try_reuse_locked_version` is the pure
+        // piece of `resolve_version` — if it returns `None`, the caller
+        // proceeds to fetch tags instead of splicing "" into a URL.
+        assert!(
+            try_reuse_locked_version("github.com/carina-rs/carina-provider-awscc", &config, &lock)
+                .is_none(),
+            "must not reuse a revision-mode lock entry for a version-mode `.crn`"
+        );
+    }
+
+    /// Sanity check the happy path: version-mode lock + no constraint → reuse.
+    #[test]
+    fn resolve_version_reuses_well_formed_lock_entry() {
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "awscc".into(),
+            source: "github.com/carina-rs/carina-provider-awscc".into(),
+            version: "0.5.2".into(),
+            constraint: None,
+            revision: None,
+            resolved_sha: None,
+            sha256: "abc".into(),
+        });
+        let config = ProviderConfig {
+            name: "awscc".into(),
+            source: Some("github.com/carina-rs/carina-provider-awscc".into()),
+            version: None,
+            revision: None,
+            attributes: std::collections::HashMap::new(),
+            default_tags: std::collections::HashMap::new(),
+        };
+
+        assert_eq!(
+            try_reuse_locked_version("github.com/carina-rs/carina-provider-awscc", &config, &lock),
+            Some("0.5.2".to_string())
+        );
+    }
+
+    /// Defense-in-depth: even if a malformed entry sneaks past the loader,
+    /// URL builders must refuse to splice an empty version into the URL
+    /// template. Otherwise the user gets a confusing 404 instead of a clear
+    /// "your lock file is broken" message.
+    #[test]
+    fn download_url_rejects_empty_version() {
+        let err = download_url(
+            "github.com/carina-rs/carina-provider-awscc",
+            "",
+            "aarch64-apple-darwin",
+        )
+        .expect_err("download_url must reject empty version");
+        assert!(
+            err.to_lowercase().contains("version"),
+            "error should mention version: {err}"
+        );
+    }
+
+    #[test]
+    fn download_url_wasm_rejects_empty_version() {
+        let err = download_url_wasm("github.com/carina-rs/carina-provider-awscc", "")
+            .expect_err("download_url_wasm must reject empty version");
+        assert!(
+            err.to_lowercase().contains("version"),
+            "error should mention version: {err}"
+        );
+    }
+
     #[test]
     fn lock_entry_without_constraint_deserializes() {
         let toml_str = r#"
@@ -945,7 +1281,9 @@ sha256 = "abc123"
         assert!(dest.starts_with(tmp.path().join(".carina/providers/file")));
 
         // Verify lock file created
-        let lock = LockFile::load(&tmp.path().join("carina-providers.lock")).unwrap();
+        let lock = LockFile::load(&tmp.path().join("carina-providers.lock"))
+            .unwrap()
+            .unwrap();
         let entry = lock.find_by_source(&source).unwrap();
         assert_eq!(entry.version, "file");
         assert!(!entry.sha256.is_empty());
