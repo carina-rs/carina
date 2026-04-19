@@ -1544,6 +1544,30 @@ fn for_binding_declaration_position_does_not_suggest_bindings() {
 }
 
 #[test]
+fn for_iterable_fires_immediately_after_in_without_trailing_space() {
+    // User types `for name, _ in` and invokes completion before adding a
+    // space — the cursor is right after the `n` of `in` and the rest of
+    // the line is empty. Must still offer bindings so the popup shows
+    // up without forcing the user to press space first.
+    let provider = test_provider();
+    let source = "let orgs = upstream_state { source = '../organizations' }\nfor name, _ in";
+    let doc = create_document(source);
+    let last_line = source.lines().next_back().unwrap_or("");
+    let position = Position {
+        line: 1,
+        character: last_line.chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+
+    assert!(
+        completions.iter().any(|c| c.label == "orgs"),
+        "expected `orgs` even with no space after `in`, got: {:?}",
+        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn for_iterable_after_dot_does_not_trigger() {
     // `for _ in orgs.<HERE>` is field-access, handled by dot completion
     // (#1996) — the ForIterable context must not fire once a `.` appears

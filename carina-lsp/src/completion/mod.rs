@@ -667,11 +667,15 @@ fn is_let_upstream_state_line(trimmed: &str) -> bool {
 /// which is a separate completion context (see #1996).
 fn extract_for_iterable_partial(prefix: &str) -> Option<String> {
     let rest = prefix.trim_start().strip_prefix("for ")?;
-    // A real `in` token is surrounded by whitespace on both sides — so a
-    // pattern like `information` or `in_place` can't masquerade as the
-    // keyword. `match_indices(" in ")` guarantees both boundaries at once.
-    let in_rel = rest.match_indices(" in ").next().map(|(i, _)| i)?;
-    let after_in = rest[in_rel + 4..].trim_start();
+    // A real `in` token has whitespace on the left (so `information` can't
+    // masquerade) and either whitespace or end-of-prefix on the right (so
+    // the moment the cursor lands just past `in` — with no trailing space
+    // yet — still fires).
+    let after_in = rest.match_indices(" in").find_map(|(idx, _)| {
+        let after = &rest[idx + 3..];
+        let right_ok = after.is_empty() || after.starts_with(|c: char| c.is_whitespace());
+        right_ok.then_some(after.trim_start())
+    })?;
     // Anything non-identifier (`.`, `[`, whitespace, `{`, etc.) means the
     // user has moved past the root-binding position — into field access,
     // indexing, or the loop body — all of which are other contexts.
