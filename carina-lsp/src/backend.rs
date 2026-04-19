@@ -57,6 +57,7 @@ impl ProviderState {
         provider_errors: HashMap<String, String>,
         configs: Vec<(PathBuf, carina_core::parser::ProviderConfig)>,
         prober: Option<ProviderInstallProber>,
+        install_fingerprint: Vec<(String, bool)>,
     ) -> Self {
         let schemas = Arc::new(provider_mod::collect_schemas(&factories));
         let provider_names: Vec<String> = factories.iter().map(|f| f.name().to_string()).collect();
@@ -67,7 +68,6 @@ impl ProviderState {
         // Extract custom type names from provider schemas for completion
         let custom_type_names = provider_mod::collect_custom_type_names(&schemas);
         let factories_arc = Arc::new(factories);
-        let install_fingerprint = probe_install_fingerprint(prober.as_ref(), &configs);
         Self {
             diagnostic_engine: DiagnosticEngine::new(
                 Arc::clone(&schemas),
@@ -149,7 +149,7 @@ impl ProviderStates {
         Self {
             by_dir: HashMap::new(),
             import_map: HashMap::new(),
-            empty: ProviderState::new(vec![], HashMap::new(), vec![], None),
+            empty: ProviderState::new(vec![], HashMap::new(), vec![], None, vec![]),
         }
     }
 
@@ -194,10 +194,16 @@ impl ProviderStates {
     }
 }
 
-/// Result of building provider factories: loaded factories + per-provider error messages.
+/// Result of building provider factories: loaded factories, per-provider
+/// error messages, and the `(name, is_installed)` observations the builder
+/// made. The fingerprint is returned here (rather than recomputed) so the
+/// stored factories and the drift-poll baseline describe the exact same
+/// filesystem snapshot — any later divergence is a real change, not a
+/// TOCTOU artifact or a file://-vs-`.carina/` mismatch.
 pub type FactoryBuildResult = (
     Vec<Box<dyn ProviderFactory>>,
     HashMap<String, String>, // provider name -> error reason
+    Vec<(String, bool)>,     // install fingerprint
 );
 
 /// Function type for building provider factories from configs with their source directories.
@@ -728,7 +734,7 @@ async fn load_schemas_impl(
         let dir_configs: Vec<(PathBuf, carina_core::parser::ProviderConfig)> =
             configs.iter().map(|c| (dir.clone(), c.clone())).collect();
 
-        let (dir_factories, dir_errors) = tokio::task::spawn_blocking({
+        let (dir_factories, dir_errors, dir_fingerprint) = tokio::task::spawn_blocking({
             let configs = dir_configs.clone();
             let builder = Arc::clone(factory_builder);
             move || builder(&configs)
@@ -755,6 +761,7 @@ async fn load_schemas_impl(
             dir_errors,
             dir_configs,
             install_prober.cloned(),
+            dir_fingerprint,
         );
         total_schemas += state.schema_count();
         states.by_dir.insert(dir.clone(), state);
