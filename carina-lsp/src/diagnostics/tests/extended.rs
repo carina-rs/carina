@@ -1627,10 +1627,11 @@ fn map_key_validation_warns_on_invalid_key() {
 }
 
 #[test]
-fn string_based_custom_types_are_compatible() {
-    // Regression test for #1822: when both the source and sink are String-based
-    // Custom types (e.g., AwsAccountId → TargetId), the LSP should not flag a
-    // type mismatch, matching the CLI's behavior (#1795).
+fn distinct_semantic_customs_are_rejected() {
+    // Regression test for #2079: distinct semantic-typed Custom types
+    // (AwsAccountId vs TargetId) are NOT assignable. The previous permissive
+    // rule (#1795) collapsed all String-based Customs into one compatibility
+    // class, which silently accepted `target_id = sso.identity_store_id`.
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     fn validate_account_id(v: &carina_core::resource::Value) -> Result<(), String> {
@@ -1692,8 +1693,8 @@ target_id = caller.account_id
         .iter()
         .find(|d| d.message.contains("Type mismatch"));
     assert!(
-        type_mismatch.is_none(),
-        "String-based Custom types should be compatible (AwsAccountId → TargetId). Got: {:?}",
+        type_mismatch.is_some(),
+        "AwsAccountId → TargetId must be rejected (distinct semantic types). Got: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }

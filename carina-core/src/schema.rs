@@ -506,28 +506,100 @@ impl AttributeType {
         matches!(self, AttributeType::Custom { base, .. } if matches!(**base, AttributeType::String))
     }
 
-    /// Check if two attribute types are compatible for ResourceRef assignment.
+    /// Check if a value of `self`'s type can be assigned to a sink of
+    /// `sink`'s type. Directional: narrowing source → wider sink is OK,
+    /// but widening source → narrower sink is NG.
     ///
-    /// Compatibility rules:
-    /// - Union type accepts any member type name
-    /// - Same type name is always compatible
-    /// - Either side being `String` is compatible (String is the base for Custom types)
-    /// - Both sides being String-based Custom types are compatible
-    pub fn is_compatible_with(&self, other: &AttributeType) -> bool {
-        let self_name = self.type_name();
-        let other_name = other.type_name();
-
-        if self.accepts_type_name(&other_name) || other.accepts_type_name(&self_name) {
-            return true;
+    /// Rules (first match wins):
+    /// 1. Union sink: OK if source is assignable to any member.
+    /// 2. Union source: OK iff source is assignable to sink for every member.
+    /// 3. Custom→Custom with both `semantic_name: Some` and names differ: NG.
+    /// 4. Custom→Custom: check pattern (pat-1 literal equality) and length
+    ///    containment (source ⊆ sink), then recurse on base.
+    /// 5. Custom source → non-Custom sink: recurse on `source.base`.
+    /// 6. non-Custom source → Custom sink: NG (source has no proof of
+    ///    satisfying the sink's semantic/pattern/length).
+    /// 7. Otherwise: same primitive type names.
+    pub fn is_assignable_to(&self, sink: &AttributeType) -> bool {
+        use AttributeType::*;
+        if let Union(members) = sink {
+            return members.iter().any(|m| self.is_assignable_to(m));
         }
-        if self_name == "String" || other_name == "String" {
-            return true;
+        if let Union(members) = self {
+            return members.iter().all(|m| m.is_assignable_to(sink));
         }
-        if self.is_string_based_custom() && other.is_string_based_custom() {
-            return true;
+        match (self, sink) {
+            (
+                Custom {
+                    semantic_name: Some(s_name),
+                    ..
+                },
+                Custom {
+                    semantic_name: Some(k_name),
+                    ..
+                },
+            ) if s_name != k_name => false,
+            // Anonymous source → semantic sink has no proof of identity.
+            (
+                Custom {
+                    semantic_name: None,
+                    ..
+                },
+                Custom {
+                    semantic_name: Some(_),
+                    ..
+                },
+            ) => false,
+            (
+                Custom {
+                    pattern: s_pat,
+                    length: s_len,
+                    base: s_base,
+                    ..
+                },
+                Custom {
+                    pattern: k_pat,
+                    length: k_len,
+                    base: k_base,
+                    ..
+                },
+            ) => {
+                if let (Some(sp), Some(kp)) = (s_pat, k_pat) {
+                    if sp != kp {
+                        return false;
+                    }
+                } else if k_pat.is_some() && s_pat.is_none() {
+                    return false;
+                }
+                if !length_contains(s_len.as_ref(), k_len.as_ref()) {
+                    return false;
+                }
+                s_base.is_assignable_to(k_base)
+            }
+            (Custom { base, .. }, non_custom) => base.is_assignable_to(non_custom),
+            (_non_custom, Custom { .. }) => false,
+            (a, b) => a.type_name() == b.type_name(),
         }
-        false
     }
+}
+
+/// Source length is contained in sink length (narrow ⊆ wide).
+/// Missing bounds are treated as unbounded on that side.
+fn length_contains(
+    source: Option<&(Option<u64>, Option<u64>)>,
+    sink: Option<&(Option<u64>, Option<u64>)>,
+) -> bool {
+    let Some((s_min, s_max)) = source else {
+        return sink.is_none();
+    };
+    let Some((k_min, k_max)) = sink else {
+        return true;
+    };
+    let s_min = s_min.unwrap_or(0);
+    let s_max = s_max.unwrap_or(u64::MAX);
+    let k_min = k_min.unwrap_or(0);
+    let k_max = k_max.unwrap_or(u64::MAX);
+    k_min <= s_min && s_max <= k_max
 }
 
 impl fmt::Display for AttributeType {
@@ -3442,45 +3514,155 @@ mod tests {
         }
     }
 
-    #[test]
-    fn is_compatible_with_same_type() {
-        assert!(AttributeType::String.is_compatible_with(&AttributeType::String));
-        assert!(AttributeType::Int.is_compatible_with(&AttributeType::Int));
+    fn make_custom_anon_pattern(pattern: &str) -> AttributeType {
+        AttributeType::Custom {
+            semantic_name: None,
+            base: Box::new(AttributeType::String),
+            pattern: Some(pattern.to_string()),
+            length: None,
+            validate: |_| Ok(()),
+            namespace: None,
+            to_dsl: None,
+        }
+    }
+
+    fn make_custom_anon_len(min: u64, max: u64) -> AttributeType {
+        AttributeType::Custom {
+            semantic_name: None,
+            base: Box::new(AttributeType::String),
+            pattern: None,
+            length: Some((Some(min), Some(max))),
+            validate: |_| Ok(()),
+            namespace: None,
+            to_dsl: None,
+        }
     }
 
     #[test]
-    fn is_compatible_with_different_base_types() {
-        assert!(!AttributeType::Bool.is_compatible_with(&AttributeType::Int));
-        assert!(!AttributeType::Int.is_compatible_with(&AttributeType::Bool));
+    fn assignable_allows_same_primitives() {
+        assert!(AttributeType::String.is_assignable_to(&AttributeType::String));
+        assert!(AttributeType::Int.is_assignable_to(&AttributeType::Int));
+        assert!(!AttributeType::Int.is_assignable_to(&AttributeType::String));
+        assert!(!AttributeType::Bool.is_assignable_to(&AttributeType::Int));
     }
 
     #[test]
-    fn is_compatible_with_string_and_custom() {
-        let custom = make_custom("VpcId", AttributeType::String);
-        assert!(AttributeType::String.is_compatible_with(&custom));
-        assert!(custom.is_compatible_with(&AttributeType::String));
+    fn assignable_rejects_distinct_semantic_names() {
+        let vpc = make_custom("VpcId", AttributeType::String);
+        let subnet = make_custom("SubnetId", AttributeType::String);
+        assert!(!vpc.is_assignable_to(&subnet));
+        assert!(!subnet.is_assignable_to(&vpc));
     }
 
     #[test]
-    fn is_compatible_with_two_string_based_customs() {
-        let vpc_id = make_custom("VpcId", AttributeType::String);
-        let subnet_id = make_custom("SubnetId", AttributeType::String);
-        assert!(vpc_id.is_compatible_with(&subnet_id));
+    fn assignable_allows_same_semantic_name() {
+        let a = make_custom("VpcId", AttributeType::String);
+        let b = make_custom("VpcId", AttributeType::String);
+        assert!(a.is_assignable_to(&b));
     }
 
     #[test]
-    fn is_compatible_with_union_accepts_member() {
-        let vpc_id = make_custom("VpcId", AttributeType::String);
-        let union = AttributeType::Union(vec![vpc_id, AttributeType::String]);
-        let other_vpc_id = make_custom("VpcId", AttributeType::String);
-        assert!(union.is_compatible_with(&other_vpc_id));
+    fn assignable_narrow_to_anonymous_unconstrained_sink() {
+        // Semantic source with no pattern assigns to fully-anonymous unconstrained sink.
+        let account = make_custom("AwsAccountId", AttributeType::String);
+        let anon = AttributeType::Custom {
+            semantic_name: None,
+            base: Box::new(AttributeType::String),
+            pattern: None,
+            length: None,
+            validate: |_| Ok(()),
+            namespace: None,
+            to_dsl: None,
+        };
+        assert!(account.is_assignable_to(&anon));
     }
 
     #[test]
-    fn is_compatible_with_int_custom_rejects_string_custom() {
+    fn assignable_source_without_pattern_rejected_by_patterned_sink() {
+        let account = make_custom("AwsAccountId", AttributeType::String);
+        let anon = make_custom_anon_pattern("^\\d{12}$");
+        // Source has no pattern; sink demands one → NG.
+        assert!(!account.is_assignable_to(&anon));
+    }
+
+    #[test]
+    fn assignable_anon_to_anon_length_containment() {
+        let narrow = make_custom_anon_len(1, 36);
+        let wide = make_custom_anon_len(1, 64);
+        assert!(narrow.is_assignable_to(&wide));
+        assert!(!wide.is_assignable_to(&narrow));
+    }
+
+    #[test]
+    fn assignable_rejects_non_custom_to_custom() {
+        let vpc = make_custom("VpcId", AttributeType::String);
+        assert!(!AttributeType::String.is_assignable_to(&vpc));
+    }
+
+    #[test]
+    fn assignable_custom_to_non_custom_recurses_on_base() {
+        // AwsAccountId (base: String) assigns to a plain String sink.
+        let account = make_custom("AwsAccountId", AttributeType::String);
+        assert!(account.is_assignable_to(&AttributeType::String));
+    }
+
+    #[test]
+    fn assignable_union_sink_accepts_assignable_member() {
+        let vpc = make_custom("VpcId", AttributeType::String);
+        let other_vpc = make_custom("VpcId", AttributeType::String);
+        let union = AttributeType::Union(vec![vpc, AttributeType::String]);
+        assert!(other_vpc.is_assignable_to(&union));
+    }
+
+    #[test]
+    fn assignable_union_source_requires_all_members_assignable() {
+        // All members of source must be assignable to sink.
+        let vpc = make_custom("VpcId", AttributeType::String);
+        let anon_any = AttributeType::Custom {
+            semantic_name: None,
+            base: Box::new(AttributeType::String),
+            pattern: None,
+            length: None,
+            validate: |_| Ok(()),
+            namespace: None,
+            to_dsl: None,
+        };
+        let both_ok = AttributeType::Union(vec![vpc.clone(), vpc.clone()]);
+        assert!(both_ok.is_assignable_to(&vpc));
+
+        let subnet = make_custom("SubnetId", AttributeType::String);
+        let mixed = AttributeType::Union(vec![vpc.clone(), subnet]);
+        // One member (SubnetId) not assignable to VpcId sink → whole union NG.
+        assert!(!mixed.is_assignable_to(&vpc));
+
+        // But is assignable to an anonymous unconstrained sink.
+        assert!(mixed.is_assignable_to(&anon_any));
+    }
+
+    #[test]
+    fn semantic_custom_assigns_to_anonymous_unconstrained_sink() {
+        // Replaces the old buggy `is_compatible_with_two_string_based_customs`
+        // which asserted VpcId <-> SubnetId were symmetric-compatible.
+        let vpc = make_custom("VpcId", AttributeType::String);
+        let anon = AttributeType::Custom {
+            semantic_name: None,
+            base: Box::new(AttributeType::String),
+            pattern: None,
+            length: None,
+            validate: |_| Ok(()),
+            namespace: None,
+            to_dsl: None,
+        };
+        assert!(vpc.is_assignable_to(&anon));
+        // Reverse: anon has no proof it's a VpcId → NG.
+        assert!(!anon.is_assignable_to(&vpc));
+    }
+
+    #[test]
+    fn assignable_int_custom_rejects_string_custom() {
         let int_custom = make_custom("Port", AttributeType::Int);
         let string_custom = make_custom("VpcId", AttributeType::String);
-        assert!(!int_custom.is_compatible_with(&string_custom));
+        assert!(!int_custom.is_assignable_to(&string_custom));
     }
 
     #[test]
