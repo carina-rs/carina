@@ -247,9 +247,23 @@ pub fn validate_and_resolve_with_config(
             parsed,
             &upstream_exports,
         );
-        if !resolve_errors.is_empty() || !field_errors.is_empty() {
+        // Phase 2 of #1992: names are known to exist; now check each
+        // reference's declared export type against the consuming
+        // attribute's expected type. Skipped when the export has no
+        // `: T` annotation (nothing to compare) — see
+        // `check_upstream_state_field_types` for the details.
+        let type_errors = carina_core::upstream_exports::check_upstream_state_field_types(
+            parsed,
+            &upstream_exports,
+            ctx.schemas(),
+            &|r: &carina_core::resource::Resource| {
+                carina_core::provider::schema_key_for_resource(ctx.factories(), r)
+            },
+        );
+        if !resolve_errors.is_empty() || !field_errors.is_empty() || !type_errors.is_empty() {
             let mut lines: Vec<String> = resolve_errors.iter().map(ToString::to_string).collect();
             lines.extend(field_errors.iter().map(ToString::to_string));
+            lines.extend(type_errors.iter().map(ToString::to_string));
             return Err(AppError::Validation(lines.join("\n")));
         }
     }

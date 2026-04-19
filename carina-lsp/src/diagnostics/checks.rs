@@ -405,22 +405,64 @@ impl DiagnosticEngine {
             ));
         }
 
-        // Multiple `UpstreamFieldError`s can share the same `binding.field`
+        // Multiple `Upstream*Error`s can share the same `binding.field`
         // text (e.g. two `let` bindings that both reference `orgs.bad`).
         // `find_ref_value_position` returns the first occurrence; tracking
         // how many times we've already consumed each ref text lets us
         // anchor later diagnostics at subsequent occurrences instead of
-        // stacking them on the first.
+        // stacking them on the first. The same counter is shared between
+        // Phase 1 (unknown name) and Phase 2 (type mismatch) so two errors
+        // on the same ref don't collide on the first occurrence either.
         let field_errors =
             carina_core::upstream_exports::check_upstream_state_field_references(merged, &exports);
+        let type_errors = carina_core::upstream_exports::check_upstream_state_field_types(
+            merged,
+            &exports,
+            &self.schemas,
+            &|r: &carina_core::resource::Resource| {
+                carina_core::provider::schema_key_for_resource(&self.factories, r)
+            },
+        );
         let mut seen_count: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
-        for err in field_errors {
-            let ref_text = format!("{}.{}", err.binding, err.field);
+        self.push_upstream_ref_diagnostics(
+            doc,
+            &mut seen_count,
+            &mut diagnostics,
+            field_errors
+                .iter()
+                .map(|e| (e.binding.as_str(), e.field.as_str(), e.diagnostic_message())),
+        );
+        self.push_upstream_ref_diagnostics(
+            doc,
+            &mut seen_count,
+            &mut diagnostics,
+            type_errors
+                .iter()
+                .map(|e| (e.binding.as_str(), e.field.as_str(), e.diagnostic_message())),
+        );
+
+        diagnostics
+    }
+
+    /// Emit ERROR diagnostics anchored at each `binding.field` ref occurrence
+    /// in the current document. Shared by the Phase 1 (unknown name) and
+    /// Phase 2 (type mismatch) `upstream_state` checks — they produce
+    /// different errors but anchor the same way and need a shared
+    /// `seen_count` to keep their ranges disjoint when both fire on the same
+    /// ref.
+    fn push_upstream_ref_diagnostics<'a, I>(
+        &self,
+        doc: &Document,
+        seen_count: &mut std::collections::HashMap<String, usize>,
+        diagnostics: &mut Vec<Diagnostic>,
+        errs: I,
+    ) where
+        I: IntoIterator<Item = (&'a str, &'a str, String)>,
+    {
+        for (binding, field, message) in errs {
+            let ref_text = format!("{}.{}", binding, field);
             let skip = *seen_count.get(&ref_text).unwrap_or(&0);
-            // Only surface errors whose reference appears in the current
-            // document; sibling-file errors are handled when that file is
-            // analyzed.
             let Some((line, col)) = self.find_ref_value_position_nth(doc, &ref_text, skip) else {
                 continue;
             };
@@ -431,10 +473,9 @@ impl DiagnosticEngine {
                 col,
                 end_col,
                 DiagnosticSeverity::ERROR,
-                err.diagnostic_message(),
+                message,
             ));
         }
-        diagnostics
     }
 
     /// Flag `for _ in <name>.<attr>` whose root binding `<name>` is not

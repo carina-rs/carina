@@ -604,7 +604,7 @@ impl CompletionProvider {
         };
 
         let mut items: Vec<CompletionItem> = keys
-            .iter()
+            .keys()
             .map(|key| CompletionItem {
                 label: key.clone(),
                 kind: Some(CompletionItemKind::FIELD),
