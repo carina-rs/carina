@@ -97,7 +97,21 @@ async fn main() {
         let factory_builder: carina_lsp::backend::FactoryBuilder =
             std::sync::Arc::new(build_factories);
 
-        Backend::new(client, provider_context, Some(factory_builder))
+        // Provider install prober: used by the drift poller to notice when
+        // `<project>/.carina/` is deleted mid-session. Injected here so
+        // provider-resolver calls stay out of the library crate (enforced
+        // by `scripts/check-provider-boundaries.sh`).
+        let install_prober: carina_lsp::backend::ProviderInstallProber =
+            std::sync::Arc::new(|dir, cfg| {
+                carina_provider_resolver::find_installed_provider(dir, cfg).is_ok()
+            });
+
+        Backend::with_install_prober(
+            client,
+            provider_context,
+            Some(factory_builder),
+            Some(install_prober),
+        )
     });
     Server::new(stdin, stdout, socket).serve(service).await;
 }

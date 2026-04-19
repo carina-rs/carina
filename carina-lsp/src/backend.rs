@@ -40,6 +40,9 @@ struct ProviderState {
     /// Configs and their source directory, retained so a background poller can
     /// re-probe provider installation without re-scanning the workspace.
     configs: Vec<(PathBuf, carina_core::parser::ProviderConfig)>,
+    /// Injected install prober. Kept here so `is_stale()` can recompute the
+    /// fingerprint with the same function that built the snapshot.
+    prober: Option<ProviderInstallProber>,
     /// Snapshot of which providers resolved to an installed local binary when
     /// this state was built. Compared against a fresh probe to detect
     /// `.carina/` deletions the editor's file watcher did not report
@@ -53,6 +56,7 @@ impl ProviderState {
         factories: Vec<Box<dyn ProviderFactory>>,
         provider_errors: HashMap<String, String>,
         configs: Vec<(PathBuf, carina_core::parser::ProviderConfig)>,
+        prober: Option<ProviderInstallProber>,
     ) -> Self {
         let schemas = Arc::new(provider_mod::collect_schemas(&factories));
         let provider_names: Vec<String> = factories.iter().map(|f| f.name().to_string()).collect();
@@ -63,7 +67,7 @@ impl ProviderState {
         // Extract custom type names from provider schemas for completion
         let custom_type_names = provider_mod::collect_custom_type_names(&schemas);
         let factories_arc = Arc::new(factories);
-        let install_fingerprint = probe_install_fingerprint(&configs);
+        let install_fingerprint = probe_install_fingerprint(prober.as_ref(), &configs);
         Self {
             diagnostic_engine: DiagnosticEngine::new(
                 Arc::clone(&schemas),
@@ -80,6 +84,7 @@ impl ProviderState {
             semantic_tokens_provider: SemanticTokensProvider::new(&region_completions),
             hover_provider: HoverProvider::new(schemas, region_completions),
             configs,
+            prober,
             install_fingerprint,
         }
     }
@@ -91,21 +96,33 @@ impl ProviderState {
     /// True when a fresh probe of the configured providers no longer matches
     /// the fingerprint captured at build time.
     fn is_stale(&self) -> bool {
-        probe_install_fingerprint(&self.configs) != self.install_fingerprint
+        probe_install_fingerprint(self.prober.as_ref(), &self.configs) != self.install_fingerprint
     }
 }
+
+/// Checks whether a single provider config resolves to an installed local
+/// binary. Injected from `main.rs` so provider-resolver calls stay out of
+/// the provider-agnostic `carina-lsp` library code.
+pub type ProviderInstallProber =
+    Arc<dyn Fn(&Path, &carina_core::parser::ProviderConfig) -> bool + Send + Sync>;
 
 /// Compute `(provider_name, is_installed)` pairs for a list of configs.
 /// Ordered to match the input so equality comparisons are stable.
 fn probe_install_fingerprint(
+    prober: Option<&ProviderInstallProber>,
     configs: &[(PathBuf, carina_core::parser::ProviderConfig)],
 ) -> Vec<(String, bool)> {
+    let Some(prober) = prober else {
+        // Without a prober we can't tell, so claim every provider is still
+        // installed — the poller falls back to a never-stale snapshot.
+        return configs
+            .iter()
+            .map(|(_, cfg)| (cfg.name.clone(), true))
+            .collect();
+    };
     configs
         .iter()
-        .map(|(dir, cfg)| {
-            let installed = carina_provider_resolver::find_installed_provider(dir, cfg).is_ok();
-            (cfg.name.clone(), installed)
-        })
+        .map(|(dir, cfg)| (cfg.name.clone(), prober(dir, cfg)))
         .collect()
 }
 
@@ -132,7 +149,7 @@ impl ProviderStates {
         Self {
             by_dir: HashMap::new(),
             import_map: HashMap::new(),
-            empty: ProviderState::new(vec![], HashMap::new(), vec![]),
+            empty: ProviderState::new(vec![], HashMap::new(), vec![], None),
         }
     }
 
@@ -198,6 +215,7 @@ pub struct Backend {
     provider_context: Arc<ProviderContext>,
     workspace_root: Arc<tokio::sync::OnceCell<Option<PathBuf>>>,
     factory_builder: Option<FactoryBuilder>,
+    install_prober: Option<ProviderInstallProber>,
     /// Set once `initialized` spawns the background `.carina/` drift poller,
     /// to keep it from double-spawning on clients that re-send `initialized`.
     poller_spawned: std::sync::atomic::AtomicBool,
@@ -209,6 +227,18 @@ impl Backend {
         provider_context: ProviderContext,
         factory_builder: Option<FactoryBuilder>,
     ) -> Self {
+        Self::with_install_prober(client, provider_context, factory_builder, None)
+    }
+
+    /// Construct a backend with a custom install prober. `main.rs` uses this
+    /// to inject a `carina_provider_resolver::find_installed_provider`-based
+    /// prober without pulling the resolver into the library crate.
+    pub fn with_install_prober(
+        client: Client,
+        provider_context: ProviderContext,
+        factory_builder: Option<FactoryBuilder>,
+        install_prober: Option<ProviderInstallProber>,
+    ) -> Self {
         let provider_context = Arc::new(provider_context);
 
         Self {
@@ -218,6 +248,7 @@ impl Backend {
             provider_context,
             workspace_root: Arc::new(tokio::sync::OnceCell::new()),
             factory_builder,
+            install_prober,
             poller_spawned: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -318,6 +349,7 @@ impl Backend {
         let documents = Arc::clone(&self.documents);
         let workspace_root = Arc::clone(&self.workspace_root);
         let factory_builder = self.factory_builder.as_ref().map(Arc::clone);
+        let install_prober = self.install_prober.as_ref().map(Arc::clone);
         let client = self.client.clone();
 
         tokio::spawn(async move {
@@ -335,6 +367,7 @@ impl Backend {
                         &client,
                         workspace_root.as_ref(),
                         factory_builder.as_ref(),
+                        install_prober.as_ref(),
                         providers.as_ref(),
                         documents.as_ref(),
                     )
@@ -350,6 +383,7 @@ impl Backend {
             &self.client,
             self.workspace_root.as_ref(),
             self.factory_builder.as_ref(),
+            self.install_prober.as_ref(),
             self.providers.as_ref(),
             self.documents.as_ref(),
         )
@@ -660,6 +694,7 @@ async fn load_schemas_impl(
     client: &Client,
     workspace_root: &tokio::sync::OnceCell<Option<PathBuf>>,
     factory_builder: Option<&FactoryBuilder>,
+    install_prober: Option<&ProviderInstallProber>,
     providers: &tokio::sync::RwLock<ProviderStates>,
     documents: &DashMap<Url, Document>,
 ) {
@@ -715,7 +750,12 @@ async fn load_schemas_impl(
                 .await;
         }
 
-        let state = ProviderState::new(dir_factories, dir_errors, dir_configs);
+        let state = ProviderState::new(
+            dir_factories,
+            dir_errors,
+            dir_configs,
+            install_prober.cloned(),
+        );
         total_schemas += state.schema_count();
         states.by_dir.insert(dir.clone(), state);
     }
@@ -854,41 +894,54 @@ mod tests {
         }
     }
 
+    /// Stub prober for tests: reports a provider as installed iff the
+    /// attribute `_installed_at` points at an existing file. Lets us
+    /// exercise the fingerprint logic without pulling the resolver crate.
+    fn test_prober() -> ProviderInstallProber {
+        Arc::new(|_dir, cfg| {
+            cfg.attributes
+                .get("_installed_at")
+                .and_then(|v| match v {
+                    carina_core::resource::Value::String(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .map(|p| std::path::Path::new(p).exists())
+                .unwrap_or(false)
+        })
+    }
+
     /// The background drift poller relies on this flipping when `.carina/`
     /// is deleted out from under the LSP. Tests the invariant directly:
-    /// build a `file://` install, probe (installed), delete it, probe again
-    /// (not installed). If these two results are equal the poller will never
+    /// build an install, probe (installed), delete it, probe again (not
+    /// installed). If these two results are equal the poller will never
     /// fire and a VS Code user deleting `.carina/` mid-session will keep
     /// seeing stale diagnostics until they save a `.crn`.
     #[test]
     fn install_fingerprint_flips_when_local_wasm_is_deleted() {
         use carina_core::parser::ProviderConfig;
+        use carina_core::resource::Value;
 
         let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path();
-
-        let source_wasm = base.join("carina-provider-foo.wasm");
-        std::fs::write(&source_wasm, b"fake").unwrap();
-        let install_dir = base
-            .join(".carina")
-            .join("providers")
-            .join("file")
-            .join("carina-provider-foo");
-        std::fs::create_dir_all(&install_dir).unwrap();
-        let installed = install_dir.join("carina-provider-foo.wasm");
+        let installed = tmp.path().join("carina-provider-foo.wasm");
         std::fs::write(&installed, b"fake").unwrap();
 
+        let mut attributes = std::collections::HashMap::new();
+        attributes.insert(
+            "_installed_at".to_string(),
+            Value::String(installed.display().to_string()),
+        );
         let config = ProviderConfig {
             name: "foo".into(),
-            source: Some(format!("file://{}", source_wasm.display())),
+            source: Some("github.com/carina-rs/stub".into()),
             version: None,
             revision: None,
-            attributes: std::collections::HashMap::new(),
+            attributes,
             default_tags: std::collections::HashMap::new(),
         };
-        let configs = vec![(base.to_path_buf(), config)];
+        let configs = vec![(tmp.path().to_path_buf(), config)];
+        let prober = test_prober();
 
-        let before = probe_install_fingerprint(&configs);
+        let before = probe_install_fingerprint(Some(&prober), &configs);
         assert_eq!(
             before,
             vec![("foo".to_string(), true)],
@@ -896,7 +949,7 @@ mod tests {
         );
 
         std::fs::remove_file(&installed).unwrap();
-        let after = probe_install_fingerprint(&configs);
+        let after = probe_install_fingerprint(Some(&prober), &configs);
         assert_eq!(
             after,
             vec![("foo".to_string(), false)],
@@ -918,9 +971,10 @@ mod tests {
             default_tags: std::collections::HashMap::new(),
         };
         let configs = vec![(tmp.path().to_path_buf(), config)];
+        let prober = test_prober();
         assert_eq!(
-            probe_install_fingerprint(&configs),
-            probe_install_fingerprint(&configs),
+            probe_install_fingerprint(Some(&prober), &configs),
+            probe_install_fingerprint(Some(&prober), &configs),
             "two back-to-back probes with no fs change must agree"
         );
     }
