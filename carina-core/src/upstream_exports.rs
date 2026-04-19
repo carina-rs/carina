@@ -193,12 +193,22 @@ pub fn check_upstream_state_field_references(
         for (name, value) in parsed.variables.iter() {
             check(value, &format!("let {}", name));
         }
-        for resource in &parsed.resources {
+        // Direct resources and deferred for-body template resources share
+        // one walk via `iter_all_resources`. Location strings use the
+        // `ResourceContext::Deferred` branch to mention the for header so
+        // users can tell body errors from top-level ones.
+        for (ctx, resource) in parsed.iter_all_resources() {
             for (attr_name, expr) in resource.attributes.iter() {
-                check(
-                    expr.as_value(),
-                    &format!("{} attribute `{}`", resource.id, attr_name),
-                );
+                let location = match ctx {
+                    ResourceContext::Direct => {
+                        format!("{} attribute `{}`", resource.id, attr_name)
+                    }
+                    ResourceContext::Deferred(d) => format!(
+                        "for-body `{}` {} attribute `{}`",
+                        d.header, resource.id, attr_name
+                    ),
+                };
+                check(expr.as_value(), &location);
             }
         }
         for attr in &parsed.attribute_params {
@@ -215,26 +225,6 @@ pub fn check_upstream_state_field_references(
             let caller = call.binding_name.as_deref().unwrap_or(&call.module_name);
             for (arg_name, v) in call.arguments.iter() {
                 check(v, &format!("module `{}` argument `{}`", caller, arg_name));
-            }
-        }
-        // Deferred for-expression bodies: the body is parked on the
-        // deferred expression until plan-time expansion and isn't reached
-        // by the `resources` walk above.
-        for deferred in &parsed.deferred_for_expressions {
-            for (attr_name, expr) in deferred.template_resource.attributes.iter() {
-                check(
-                    expr.as_value(),
-                    &format!(
-                        "for-body `{}` {} attribute `{}`",
-                        deferred.header, deferred.template_resource.id, attr_name
-                    ),
-                );
-            }
-            for (attr_name, value) in &deferred.attributes {
-                check(
-                    value,
-                    &format!("for-body `{}` attribute `{}`", deferred.header, attr_name),
-                );
             }
         }
     }
@@ -750,6 +740,26 @@ mod tests {
             errs.iter().any(|e| e.field == "NONEXISTENT"),
             "for-body ref to non-exported field must be flagged, got: {errs:?}"
         );
+    }
+
+    #[test]
+    fn for_body_field_error_reported_once_not_twice() {
+        // Regression: the old code walked both `deferred.template_resource.attributes`
+        // and `deferred.attributes`, potentially reporting the same ref twice.
+        let parsed = parse_project(
+            r#"
+            let orgs = upstream_state { source = "../organizations" }
+            for name, _ in orgs.accounts {
+                aws.s3.bucket {
+                    name = orgs.missing
+                }
+            }
+            "#,
+        );
+        let exports = mk_exports(&[("orgs", &["accounts"])]);
+        let errs = check_upstream_state_field_references(&parsed, &exports);
+        let missing: Vec<_> = errs.iter().filter(|e| e.field == "missing").collect();
+        assert_eq!(missing.len(), 1, "must not double-report, got: {missing:?}");
     }
 
     #[test]
