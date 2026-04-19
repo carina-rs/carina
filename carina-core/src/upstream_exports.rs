@@ -14,15 +14,21 @@
 //! Both are pure functions so `validate`, LSP diagnostics, and any other
 //! surface can share the same logic without duplicating traversal code.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::config_loader::{find_crn_files_in_dir, parse_directory};
-use crate::parser::{ParsedFile, ProviderContext, UpstreamState};
+use crate::parser::{ParsedFile, ProviderContext, TypeExpr, UpstreamState};
 use crate::resource::Value;
-use crate::schema::suggest_similar_name;
+use crate::schema::{AttributeType, ResourceSchema, suggest_similar_name};
 
-pub type UpstreamExports = HashMap<String, HashSet<String>>;
+/// Exports declared by each `upstream_state` binding: binding name →
+/// (export name → declared type, or `None` if the export has no annotation).
+///
+/// Phase 1 (#1990) only needed the key set; Phase 2 (#1992) adds the type
+/// side so downstream consumers whose expected type is known can be checked
+/// for shape compatibility.
+pub type UpstreamExports = HashMap<String, HashMap<String, Option<TypeExpr>>>;
 
 /// An `upstream_state` binding whose source directory exists but couldn't
 /// be parsed. Downstream field-reference checks against this binding are
@@ -113,15 +119,15 @@ pub fn resolve_upstream_exports(
             continue;
         }
         if matches!(find_crn_files_in_dir(&source_abs), Ok(files) if files.is_empty()) {
-            out.insert(us.binding.clone(), HashSet::new());
+            out.insert(us.binding.clone(), HashMap::new());
             continue;
         }
         match parse_directory(&source_abs, config) {
             Ok(parsed) => {
-                let keys: HashSet<String> = parsed
+                let keys: HashMap<String, Option<TypeExpr>> = parsed
                     .export_params
                     .iter()
-                    .map(|e| e.name.clone())
+                    .map(|e| (e.name.clone(), e.type_expr.clone()))
                     .collect();
                 out.insert(us.binding.clone(), keys);
             }
@@ -154,7 +160,7 @@ pub fn check_upstream_state_field_references(
     // re-materialize the same Vec for every error.
     let known_by_binding: HashMap<&str, Vec<&str>> = exports
         .iter()
-        .map(|(b, keys)| (b.as_str(), keys.iter().map(String::as_str).collect()))
+        .map(|(b, keys)| (b.as_str(), keys.keys().map(String::as_str).collect()))
         .collect();
 
     // Ref-checking closure lives in its own scope so the `&mut errors`
@@ -168,7 +174,7 @@ pub fn check_upstream_state_field_references(
                 let Some(keys) = exports.get(binding) else {
                     return;
                 };
-                if keys.contains(field) {
+                if keys.contains_key(field) {
                     return;
                 }
                 let known = known_by_binding
@@ -240,7 +246,7 @@ pub fn check_upstream_state_field_references(
         let Some(keys) = exports.get(deferred.iterable_binding.as_str()) else {
             continue;
         };
-        if keys.contains(&deferred.iterable_attr) {
+        if keys.contains_key(&deferred.iterable_attr) {
             continue;
         }
         let known = known_by_binding
@@ -267,6 +273,117 @@ pub fn check_upstream_state_field_references(
         ))
     });
     errors
+}
+
+/// A reference to an `upstream_state` export whose declared type is
+/// incompatible with the consumer's expected type.
+///
+/// Complements `UpstreamFieldError`: this one fires when the *name* is
+/// valid but the *type* isn't. Types are kept structured so future code
+/// actions (e.g. wrap in a cast, jump to definition) can inspect them.
+#[derive(Debug, Clone)]
+pub struct UpstreamTypeError {
+    pub location: String,
+    pub binding: String,
+    pub field: String,
+    pub export_type: TypeExpr,
+    pub expected_type: AttributeType,
+}
+
+impl UpstreamTypeError {
+    pub fn diagnostic_message(&self) -> String {
+        format!(
+            "upstream_state `{}.{}` is declared as `{}` but this position expects `{}`",
+            self.binding,
+            self.field,
+            self.export_type,
+            self.expected_type.type_name()
+        )
+    }
+}
+
+impl std::fmt::Display for UpstreamTypeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.location, self.diagnostic_message())
+    }
+}
+
+impl std::error::Error for UpstreamTypeError {}
+
+/// For each resource attribute whose value is an `upstream_state` field
+/// reference, compare the export's declared type against the attribute's
+/// expected type and emit an error when they don't fit.
+///
+/// Exports without a declared type (no `: T` annotation) are skipped —
+/// there's nothing to compare.
+pub fn check_upstream_state_field_types(
+    parsed: &ParsedFile,
+    exports: &UpstreamExports,
+    schemas: &HashMap<String, ResourceSchema>,
+    schema_key_fn: &dyn Fn(&crate::resource::Resource) -> String,
+) -> Vec<UpstreamTypeError> {
+    let mut errors: Vec<UpstreamTypeError> = Vec::new();
+    for resource in &parsed.resources {
+        let key = schema_key_fn(resource);
+        let Some(schema) = schemas.get(&key) else {
+            continue;
+        };
+        for (attr_name, expr) in resource.attributes.iter() {
+            if attr_name.starts_with('_') {
+                continue;
+            }
+            let Some(attr_schema) = schema.attributes.get(attr_name) else {
+                continue;
+            };
+            check_ref_against_type(
+                expr.as_value(),
+                &attr_schema.attr_type,
+                exports,
+                &format!("{} attribute `{}`", resource.id, attr_name),
+                &mut errors,
+            );
+        }
+    }
+    errors.sort_by(|a, b| {
+        (a.location.as_str(), a.binding.as_str(), a.field.as_str()).cmp(&(
+            b.location.as_str(),
+            b.binding.as_str(),
+            b.field.as_str(),
+        ))
+    });
+    errors
+}
+
+fn check_ref_against_type(
+    value: &Value,
+    expected: &AttributeType,
+    exports: &UpstreamExports,
+    location: &str,
+    errors: &mut Vec<UpstreamTypeError>,
+) {
+    value.visit_refs(&mut |path| {
+        let binding = path.binding();
+        let field = path.attribute();
+        let Some(keys) = exports.get(binding) else {
+            return;
+        };
+        let Some(Some(export_type)) = keys.get(field) else {
+            // Either the field isn't in the export set (already reported
+            // by `check_upstream_state_field_references`) or it has no
+            // declared type — nothing to type-check against.
+            return;
+        };
+        if crate::validation::is_type_expr_compatible_with_schema(export_type, expected) {
+            return;
+        }
+        errors.push(UpstreamTypeError {
+            location: location.to_string(),
+            binding: binding.to_string(),
+            field: field.to_string(),
+            export_type: export_type.clone(),
+            expected_type: expected.clone(),
+        });
+    });
 }
 
 #[cfg(test)]
@@ -302,7 +419,7 @@ mod tests {
             .map(|(binding, keys)| {
                 (
                     binding.to_string(),
-                    keys.iter().map(|s| s.to_string()).collect(),
+                    keys.iter().map(|s| (s.to_string(), None)).collect(),
                 )
             })
             .collect()
@@ -334,7 +451,7 @@ mod tests {
         let (got, errs) =
             resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], &ctx());
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
-        assert!(got.get("orgs").unwrap().contains("accounts"));
+        assert!(got.get("orgs").unwrap().contains_key("accounts"));
 
         // Same call a second time with an identical UpstreamState produces
         // the same result — guards against any accidental dependence on
@@ -366,8 +483,8 @@ mod tests {
 
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
         let keys = got.get("orgs").expect("resolved");
-        assert!(keys.contains("accounts"));
-        assert!(keys.contains("region"));
+        assert!(keys.contains_key("accounts"));
+        assert!(keys.contains_key("region"));
     }
 
     #[test]
@@ -390,7 +507,7 @@ mod tests {
             resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], &ctx());
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
         let keys = got.get("orgs").expect("resolved");
-        assert!(keys.contains("accounts"));
+        assert!(keys.contains_key("accounts"));
     }
 
     #[test]
@@ -425,12 +542,12 @@ mod tests {
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
         let keys = got.get("orgs").expect("resolved");
         assert!(
-            keys.contains("accounts"),
+            keys.contains_key("accounts"),
             "export from accounts.crn must be merged, got {:?}",
             keys
         );
         assert!(
-            keys.contains("region"),
+            keys.contains_key("region"),
             "export from region.crn must be merged, got {:?}",
             keys
         );
@@ -651,5 +768,210 @@ mod tests {
         assert_eq!(errs[0].field, "account");
         assert_eq!(errs[0].suggestion.as_deref(), Some("accounts"));
         assert!(errs[0].location.contains("for"));
+    }
+
+    // ================================================================
+    // Phase 2 of #1992: type compatibility (`check_upstream_state_field_types`)
+    // ================================================================
+
+    /// Build an `UpstreamExports` with typed entries.
+    fn mk_typed_exports(pairs: &[(&str, &[(&str, TypeExpr)])]) -> UpstreamExports {
+        pairs
+            .iter()
+            .map(|(binding, fields)| {
+                (
+                    binding.to_string(),
+                    fields
+                        .iter()
+                        .map(|(name, ty)| (name.to_string(), Some(ty.clone())))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Minimal schema registry for test resources: `test.r.res` with a single
+    /// typed attribute.
+    fn schema_with_attr(
+        attr_name: &str,
+        attr_type: crate::schema::AttributeType,
+    ) -> HashMap<String, crate::schema::ResourceSchema> {
+        use crate::schema::{AttributeSchema, ResourceSchema};
+        let schema =
+            ResourceSchema::new("test.r.res").attribute(AttributeSchema::new(attr_name, attr_type));
+        let mut map = HashMap::new();
+        map.insert("test.r.res".to_string(), schema);
+        map
+    }
+
+    fn parse_project_with_provider(source: &str, provider_name: &str) -> ParsedFile {
+        let tmp = tempfile::tempdir().unwrap();
+        let full = format!(
+            "provider {} {{\n  source = 'x/y'\n  version = '0.1'\n  region = 'ap-northeast-1'\n}}\n{}",
+            provider_name, source
+        );
+        fs::write(tmp.path().join("main.crn"), full).unwrap();
+        parse_directory(tmp.path(), &ctx()).expect("parse_directory")
+    }
+
+    #[test]
+    fn type_check_flags_string_consumer_with_int_export() {
+        // Export is `int`, consumer expects string-compatible — mismatch.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.count
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[("orgs", &[("count", TypeExpr::Int)])]);
+        let schemas = schema_with_attr("name", crate::schema::AttributeType::String);
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas, &|r| {
+            format!("{}.{}", r.id.provider, r.id.resource_type)
+        });
+        assert_eq!(errs.len(), 1, "unexpected: {errs:?}");
+        assert_eq!(errs[0].binding, "orgs");
+        assert_eq!(errs[0].field, "count");
+        assert!(matches!(errs[0].export_type, TypeExpr::Int));
+        assert!(matches!(
+            errs[0].expected_type,
+            crate::schema::AttributeType::String
+        ));
+        assert!(errs[0].diagnostic_message().contains("String"));
+    }
+
+    #[test]
+    fn type_check_passes_when_export_type_matches_consumer() {
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.region
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[("orgs", &[("region", TypeExpr::String)])]);
+        let schemas = schema_with_attr("name", crate::schema::AttributeType::String);
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas, &|r| {
+            format!("{}.{}", r.id.provider, r.id.resource_type)
+        });
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn type_check_skips_exports_without_type_annotation() {
+        // Phase 2 requires an annotation on the export to compare against.
+        // Without one (export parsed with no `: T`), skip — don't false-flag.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.count
+                }
+            "#,
+            "test",
+        );
+        let mut exports: UpstreamExports = HashMap::new();
+        let mut fields = HashMap::new();
+        fields.insert("count".to_string(), None);
+        exports.insert("orgs".to_string(), fields);
+        let schemas = schema_with_attr("name", crate::schema::AttributeType::String);
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas, &|r| {
+            format!("{}.{}", r.id.provider, r.id.resource_type)
+        });
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn type_check_skips_unknown_field() {
+        // Field isn't in the export set at all — that's the field-name
+        // checker's job (#1990). The type checker must not double-report.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.missing
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[("orgs", &[("count", TypeExpr::Int)])]);
+        let schemas = schema_with_attr("name", crate::schema::AttributeType::String);
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas, &|r| {
+            format!("{}.{}", r.id.provider, r.id.resource_type)
+        });
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn type_check_list_element_mismatch() {
+        // Export is `list(int)`, consumer expects `list(string)`.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.counts
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[("counts", TypeExpr::List(Box::new(TypeExpr::Int)))],
+        )]);
+        let schemas = schema_with_attr(
+            "name",
+            crate::schema::AttributeType::list(crate::schema::AttributeType::String),
+        );
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas, &|r| {
+            format!("{}.{}", r.id.provider, r.id.resource_type)
+        });
+        assert_eq!(errs.len(), 1, "unexpected: {errs:?}");
+    }
+
+    #[test]
+    fn type_check_accepts_custom_type_chain() {
+        // Consumer attribute is `Custom { name: "KmsKeyArn", base: Arn }`;
+        // export declares plain `TypeExpr::Simple("arn")`. The type checker
+        // walks Custom's base chain, so `arn` accepts `KmsKeyArn`.
+        use crate::schema::AttributeType;
+        fn noop_validate(_v: &crate::resource::Value) -> Result<(), String> {
+            Ok(())
+        }
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.key_arn
+                }
+            "#,
+            "test",
+        );
+        let exports =
+            mk_typed_exports(&[("orgs", &[("key_arn", TypeExpr::Simple("arn".to_string()))])]);
+        let kms_arn = AttributeType::Custom {
+            name: "KmsKeyArn".to_string(),
+            base: Box::new(AttributeType::Custom {
+                name: "Arn".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: noop_validate,
+                namespace: None,
+                to_dsl: None,
+            }),
+            validate: noop_validate,
+            namespace: None,
+            to_dsl: None,
+        };
+        let schemas = schema_with_attr("name", kms_arn);
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas, &|r| {
+            format!("{}.{}", r.id.provider, r.id.resource_type)
+        });
+        assert!(
+            errs.is_empty(),
+            "Custom type chain must accept base ancestor, got: {errs:?}"
+        );
     }
 }
