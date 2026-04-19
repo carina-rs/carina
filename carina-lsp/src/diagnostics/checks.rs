@@ -636,6 +636,35 @@ impl DiagnosticEngine {
         bindings
     }
 
+    /// Extract provider names declared with `provider NAME {` in the current
+    /// document text. Used to treat an unresolved `NAME.` prefix as a provider
+    /// namespace rather than an undefined `let` binding when the provider is
+    /// declared but not yet downloaded (issue #2019).
+    pub(super) fn extract_declared_provider_names(&self, text: &str) -> HashSet<String> {
+        let mut names = HashSet::new();
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix("provider") else {
+                continue;
+            };
+            let Some(rest) = rest.strip_prefix(|c: char| c.is_ascii_whitespace()) else {
+                continue;
+            };
+            let name_end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            if name_end == 0 {
+                continue;
+            }
+            let name = &rest[..name_end];
+            let after_name = rest[name_end..].trim_start();
+            if after_name.starts_with('{') {
+                names.insert(name.to_string());
+            }
+        }
+        names
+    }
+
     /// Check attributes blocks for type mismatches and undefined binding references.
     pub(super) fn check_attributes_blocks(
         &self,
@@ -1066,6 +1095,7 @@ impl DiagnosticEngine {
         &self,
         text: &str,
         defined_bindings: &HashSet<String>,
+        declared_providers: &HashSet<String>,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
@@ -1082,11 +1112,18 @@ impl DiagnosticEngine {
                     continue;
                 }
 
-                // Skip if it starts with a provider prefix (enum values like aws.Region.xxx)
+                // Skip if it starts with a provider prefix. Include providers
+                // declared in the current document (issue #2019) so that an
+                // enum reference like `awscc.Region.ap_northeast_1` is not
+                // flagged as an undefined `let` binding when the provider is
+                // declared but not yet downloaded.
                 let is_provider_prefix = self
                     .provider_names
                     .iter()
-                    .any(|name| after_eq_trimmed.starts_with(&format!("{}.", name)));
+                    .any(|name| after_eq_trimmed.starts_with(&format!("{}.", name)))
+                    || declared_providers
+                        .iter()
+                        .any(|name| after_eq_trimmed.starts_with(&format!("{}.", name)));
                 if is_provider_prefix {
                     continue;
                 }
