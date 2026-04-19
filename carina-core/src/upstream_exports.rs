@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::config_loader::{find_crn_files_in_dir, parse_directory};
-use crate::parser::{ParsedFile, ProviderContext, TypeExpr, UpstreamState};
+use crate::parser::{ParsedFile, ProviderContext, ResourceContext, TypeExpr, UpstreamState};
 use crate::resource::Value;
 use crate::schema::{AttributeType, ResourceSchema, suggest_similar_name};
 
@@ -323,7 +323,7 @@ pub fn check_upstream_state_field_types(
     schema_key_fn: &dyn Fn(&crate::resource::Resource) -> String,
 ) -> Vec<UpstreamTypeError> {
     let mut errors: Vec<UpstreamTypeError> = Vec::new();
-    for resource in &parsed.resources {
+    for (ctx, resource) in parsed.iter_all_resources() {
         let key = schema_key_fn(resource);
         let Some(schema) = schemas.get(&key) else {
             continue;
@@ -335,11 +335,18 @@ pub fn check_upstream_state_field_types(
             let Some(attr_schema) = schema.attributes.get(attr_name) else {
                 continue;
             };
+            let location = match ctx {
+                ResourceContext::Direct => format!("{} attribute `{}`", resource.id, attr_name),
+                ResourceContext::Deferred(d) => format!(
+                    "for-body `{}` {} attribute `{}`",
+                    d.header, resource.id, attr_name
+                ),
+            };
             check_ref_against_type(
                 expr.as_value(),
                 &attr_schema.attr_type,
                 exports,
-                &format!("{} attribute `{}`", resource.id, attr_name),
+                &location,
                 &mut errors,
             );
         }
@@ -930,6 +937,38 @@ mod tests {
             format!("{}.{}", r.id.provider, r.id.resource_type)
         });
         assert_eq!(errs.len(), 1, "unexpected: {errs:?}");
+    }
+
+    #[test]
+    fn type_check_flags_for_body_attribute() {
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                for _, account_id in orgs.counts {
+                    test.r.res {
+                        name = orgs.count
+                    }
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[
+                ("count", TypeExpr::Int),
+                ("counts", TypeExpr::List(Box::new(TypeExpr::Int))),
+            ],
+        )]);
+        let schemas = schema_with_attr("name", crate::schema::AttributeType::String);
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas, &|r| {
+            format!("{}.{}", r.id.provider, r.id.resource_type)
+        });
+        assert_eq!(
+            errs.len(),
+            1,
+            "expected one error inside for body, got {errs:?}"
+        );
+        assert!(errs[0].location.contains("for"));
     }
 
     #[test]
