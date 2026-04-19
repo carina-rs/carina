@@ -79,6 +79,16 @@ pub fn check_backend_lock(
     }
 }
 
+/// Error message for a provider block that declares no `source` attribute.
+/// Shared between `init` (pre-resolution check) and validation (post-load check)
+/// so both surfaces report the same text.
+pub fn missing_provider_source_message(name: &str) -> String {
+    format!(
+        "Provider '{}' has no source configured. Add `source = 'github.com/...'` to the provider block.",
+        name
+    )
+}
+
 /// Save the backend lock file for the current configuration.
 /// Called after state is successfully written to ensure the lock
 /// exists for future backend-change detection.
@@ -157,10 +167,7 @@ pub fn validate_and_resolve_with_config(
                 if let Some(reason) = load_errors.get(&provider.name) {
                     errors.push(reason.clone());
                 } else if provider.source.is_none() {
-                    errors.push(format!(
-                        "Provider '{}' has no source configured. Add `source = 'github.com/...'` to the provider block.",
-                        provider.name
-                    ));
+                    errors.push(missing_provider_source_message(&provider.name));
                 }
             }
         }

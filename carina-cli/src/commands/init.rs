@@ -26,14 +26,18 @@ pub fn run_init(path: &Path, upgrade: bool, locked: bool) -> Result<(), String> 
     let loaded = load_configuration_with_config(&path_buf, &provider_context)
         .map_err(|e| format!("Failed to load configuration: {e}"))?;
 
-    let sourced_providers: Vec<_> = loaded
+    let missing_source: Vec<String> = loaded
         .parsed
         .providers
         .iter()
-        .filter(|p| p.source.is_some())
+        .filter(|p| p.source.is_none())
+        .map(|p| crate::commands::missing_provider_source_message(&p.name))
         .collect();
+    if !missing_source.is_empty() {
+        return Err(missing_source.join("\n"));
+    }
 
-    if !sourced_providers.is_empty() {
+    if !loaded.parsed.providers.is_empty() {
         let action = match mode {
             LockMode::Upgrade => "Upgrading",
             LockMode::Locked => "Verifying locked",
@@ -41,7 +45,12 @@ pub fn run_init(path: &Path, upgrade: bool, locked: bool) -> Result<(), String> 
         };
         println!(
             "{}",
-            format!("{} {} provider(s)...", action, sourced_providers.len()).cyan()
+            format!(
+                "{} {} provider(s)...",
+                action,
+                loaded.parsed.providers.len()
+            )
+            .cyan()
         );
 
         let resolved =
