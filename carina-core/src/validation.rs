@@ -511,9 +511,11 @@ pub fn validate_export_params(
 /// A binding is unused if its name never appears as a `ResourceRef.binding_name`
 /// in any resource attribute, module call argument, or attribute parameter value.
 pub fn check_unused_bindings(parsed: &ParsedFile) -> Vec<String> {
-    // Collect all defined binding names (skip discard pattern `_`)
+    // Collect all defined binding names (skip discard pattern `_`).
+    // Walk top-level and for-body resources so bindings declared inside a
+    // `for` template are also tracked.
     let mut defined_bindings: Vec<String> = Vec::new();
-    for resource in &parsed.resources {
+    for (_ctx, resource) in parsed.iter_all_resources() {
         if let Some(ref binding_name) = resource.binding {
             if binding_name == "_" {
                 continue;
@@ -526,9 +528,11 @@ pub fn check_unused_bindings(parsed: &ParsedFile) -> Vec<String> {
         return Vec::new();
     }
 
-    // Collect all referenced binding names
+    // Collect all referenced binding names. Walk both top-level resources
+    // and for-body template resources so bindings referenced only inside a
+    // `for` loop are counted as used.
     let mut referenced: HashSet<String> = HashSet::new();
-    for resource in &parsed.resources {
+    for (_ctx, resource) in parsed.iter_all_resources() {
         for (attr_name, value) in &resource.attributes {
             if attr_name.starts_with('_') {
                 continue;
