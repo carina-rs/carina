@@ -837,7 +837,8 @@ fn check_resource_ref_type_mismatch(
     let ref_schema = binding_schema_map.get(ref_binding)?;
     let ref_attr_schema = ref_schema.attributes.get(ref_attr)?;
 
-    if expected_type.is_compatible_with(&ref_attr_schema.attr_type) {
+    // Directional: the ref (source) must be assignable to the expected (sink).
+    if ref_attr_schema.attr_type.is_assignable_to(expected_type) {
         None
     } else {
         Some(format!(

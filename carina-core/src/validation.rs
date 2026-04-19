@@ -139,16 +139,24 @@ pub fn validate_resource_ref_types(
             };
             let ref_type_name = ref_attr_schema.attr_type.type_name();
 
-            if attr_schema
+            // Directional check: source (the referenced attribute) must be
+            // assignable to the sink (the current resource's attribute).
+            if ref_attr_schema
                 .attr_type
-                .is_compatible_with(&ref_attr_schema.attr_type)
+                .is_assignable_to(&attr_schema.attr_type)
             {
                 continue;
             }
 
             all_errors.push(format!(
-                "{}: type mismatch for '{}': expected {}, got {} (from {}.{})",
-                resource.id, attr_name, expected_type_name, ref_type_name, ref_binding, ref_attr,
+                "{}: cannot assign {} to '{}': expected {}, got {} (from {}.{})",
+                resource.id,
+                ref_type_name,
+                attr_name,
+                expected_type_name,
+                ref_type_name,
+                ref_binding,
+                ref_attr,
             ));
         }
     }
