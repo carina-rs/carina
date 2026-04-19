@@ -174,9 +174,11 @@ impl DiagnosticEngine {
                 diagnostics.extend(self.check_module_calls(doc, parsed, base));
                 diagnostics.extend(self.check_upstream_state_sources(doc, parsed, base));
             }
-            // Build binding_name -> (provider, resource_type) map for ResourceRef type checking
+            // Build binding_name -> (provider, resource_type) map for ResourceRef type checking.
+            // Walk both top-level resources and for-body template resources so
+            // for-body refs can be type-checked against their referenced binding.
             let mut binding_schema_map: HashMap<String, ResourceSchema> = HashMap::new();
-            for res in &parsed.resources {
+            for (_ctx, res) in parsed.iter_all_resources() {
                 if let Some(ref binding_name) = res.binding {
                     let full_type = format!("{}.{}", res.id.provider, res.id.resource_type);
                     if let Some(s) = self.schemas.get(&full_type).cloned() {
@@ -185,8 +187,9 @@ impl DiagnosticEngine {
                 }
             }
 
-            // Check resource types
-            for resource in &parsed.resources {
+            // Check resource types — include for-body template resources so
+            // attribute/type/enum validation fires inside `for` loops too.
+            for (_ctx, resource) in parsed.iter_all_resources() {
                 let provider = &resource.id.provider;
                 let full_resource_type = format!("{}.{}", provider, resource.id.resource_type);
 

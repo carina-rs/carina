@@ -839,9 +839,10 @@ impl DiagnosticEngine {
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
-        // Collect defined binding names from parsed resources
+        // Collect defined binding names from parsed resources, including
+        // bindings declared inside for-body templates.
         let mut defined_bindings: HashSet<String> = HashSet::new();
-        for resource in &parsed.resources {
+        for (_ctx, resource) in parsed.iter_all_resources() {
             if let Some(ref binding_name) = resource.binding {
                 defined_bindings.insert(binding_name.clone());
             }
@@ -1343,7 +1344,7 @@ impl DiagnosticEngine {
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
-        for resource in &parsed.resources {
+        for (_ctx, resource) in parsed.iter_all_resources() {
             for value in resource.attributes.values() {
                 self.collect_unknown_function_diagnostics(doc, value, &mut diagnostics);
             }
@@ -1427,7 +1428,7 @@ impl DiagnosticEngine {
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
-        for resource in &parsed.resources {
+        for (_ctx, resource) in parsed.iter_all_resources() {
             for (attr_name, attr_value) in &resource.attributes {
                 if attr_name.starts_with('_') {
                     continue;

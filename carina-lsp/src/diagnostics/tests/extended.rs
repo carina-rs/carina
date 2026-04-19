@@ -2672,3 +2672,22 @@ fn for_iterable_multiline_header_still_flagged() {
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn enum_mismatch_inside_for_body_surfaces_as_diagnostic() {
+    let provider = test_engine_with_enum_attr();
+    let source = r#"
+for _, id in orgs.xs {
+  test.r.mode_holder {
+    mode = "aaaa"
+  }
+}
+"#;
+    let doc = create_document(source);
+    let diagnostics = provider.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    assert!(
+        diagnostics.iter().any(|d| d.message.contains("aaaa")),
+        "expected enum-mismatch diagnostic inside for body, got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
