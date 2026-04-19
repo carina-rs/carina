@@ -1,5 +1,25 @@
 # Unify resource walk across `parsed.resources` and deferred for-bodies
 
+## Status
+
+Shipped 2026-04-19. All checkers listed under "Scope" iterate via
+`ParsedFile::iter_all_resources`. `// allow: direct — <reason>` annotations
+are in place on legitimate direct consumers, and the CI lint
+`scripts/check-no-direct-resources-access.sh` prevents regressions.
+
+Merge PRs:
+
+- Task 1 — API introduction: #2060
+- Task 2 — `check_upstream_state_field_types`: #2062
+- Task 3 — `check_upstream_state_field_references` collapse: #2065
+- Task 4 — `check_unused_bindings`: #2061
+- Task 5 — `validate_resource_ref_types`: #2069
+- Task 6 — `validate_resources` (covers #2044): #2070
+- Task 7 — LSP diagnostics resource walk: #2063
+- Task 8 — LSP unused-binding / unknown-ref checks: #2071
+- Task 9 — `// allow: direct` annotations: #2074
+- Task 10 — CI lint: #2075
+
 ## Goal
 
 Eliminate the structural cause of "checker silently skips for-body resources"
