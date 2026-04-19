@@ -12,14 +12,14 @@ use crate::schema::{AttributeType, ResourceSchema, suggest_similar_name};
 /// Checks that each resource's type is known, data sources use the `read` keyword,
 /// and all attributes pass schema validation.
 pub fn validate_resources(
-    resources: &[Resource],
+    parsed: &ParsedFile,
     schemas: &HashMap<String, ResourceSchema>,
     schema_key_fn: &dyn Fn(&Resource) -> String,
     known_providers: &HashSet<String>,
 ) -> Result<(), String> {
     let mut all_errors = Vec::new();
 
-    for resource in resources {
+    for (_ctx, resource) in parsed.iter_all_resources() {
         // Skip virtual resources (module attribute containers)
         if resource.is_virtual() {
             continue;
@@ -2087,10 +2087,59 @@ let vpc = awscc.ec2.vpc {
         let mut known = HashSet::new();
         known.insert("awscc".to_string());
 
-        let err = validate_resources(&[vpc], &schemas, &test_schema_key_fn, &known).unwrap_err();
+        let mut parsed = empty_parsed();
+        parsed.resources.push(vpc);
+        let err = validate_resources(&parsed, &schemas, &test_schema_key_fn, &known).unwrap_err();
         assert!(
             err.contains("Exactly one of [cidr_block, ipv4_ipam_pool_id] must be specified"),
             "expected exclusive_required error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn enum_membership_violation_in_for_body_is_flagged() {
+        // Regression for #2044: inside a `for` body, a string literal that
+        // isn't a valid member of a StringEnum attribute must be flagged.
+        let src = r#"
+            provider test {
+                source = 'x/y'
+                version = '0.1'
+                region = 'ap-northeast-1'
+            }
+            for _, id in orgs.xs {
+                test.r.mode_holder {
+                    mode = "aaaa"
+                }
+            }
+        "#;
+        let parsed = crate::parser::parse(src, &ProviderContext::default()).unwrap();
+
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "r.mode_holder".to_string(),
+            make_schema(
+                "r.mode_holder",
+                vec![(
+                    "mode",
+                    AttributeType::StringEnum {
+                        name: "Mode".to_string(),
+                        values: vec!["on".to_string(), "off".to_string()],
+                        namespace: None,
+                        to_dsl: None,
+                    },
+                )],
+            ),
+        );
+
+        let mut known = HashSet::new();
+        known.insert("test".to_string());
+
+        let result = validate_resources(&parsed, &schemas, &test_schema_key_fn, &known);
+        assert!(result.is_err(), "expected enum-mismatch error in for body");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("aaaa"),
+            "expected error to mention 'aaaa', got: {err}"
         );
     }
 }

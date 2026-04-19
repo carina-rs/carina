@@ -198,7 +198,7 @@ pub fn validate_and_resolve_with_config(
     resolve_names_with_ctx(&ctx, &mut parsed.resources)?;
 
     if !skip_resource_validation {
-        validate_resources_with_ctx(&ctx, &parsed.resources)?;
+        validate_resources_with_ctx(&ctx, parsed)?;
         let mut argument_names: HashSet<String> =
             parsed.arguments.iter().map(|a| a.name.clone()).collect();
         // Upstream state bindings are resolved at plan time, skip type validation
