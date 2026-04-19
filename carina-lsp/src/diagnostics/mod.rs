@@ -427,13 +427,14 @@ impl DiagnosticEngine {
                                 }
                                 (
                                     carina_core::schema::AttributeType::Custom {
-                                        name,
+                                        semantic_name,
                                         validate,
                                         namespace,
                                         ..
                                     },
                                     value,
                                 ) => {
+                                    let name = semantic_name.as_deref().unwrap_or("");
                                     // Handle bare/shorthand enum identifiers by expanding to full namespace format.
                                     // These are String values like "dedicated" or "InstanceTenancy.dedicated".
                                     let resolved_value = match value {

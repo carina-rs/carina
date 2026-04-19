@@ -374,8 +374,14 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
             base,
             namespace,
         } => CoreAttributeType::Custom {
-            name: name.clone(),
+            semantic_name: if name.is_empty() {
+                None
+            } else {
+                Some(name.clone())
+            },
             base: Box::new(proto_attr_type_to_core(base)),
+            pattern: None,
+            length: None,
             validate: |_| Ok(()), // Validation is handled via ProviderContext.validators
             namespace: namespace.clone(),
             to_dsl: None,

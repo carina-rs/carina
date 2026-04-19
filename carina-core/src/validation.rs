@@ -1712,8 +1712,10 @@ let vpc = awscc.ec2.vpc {
         role_schema = role_schema.attribute(AttributeSchema::new(
             "arn",
             AttributeType::Custom {
-                name: "IamRoleArn".to_string(),
+                semantic_name: Some("IamRoleArn".to_string()),
                 base: Box::new(AttributeType::String),
+                pattern: None,
+                length: None,
                 validate: |_| Ok(()),
                 namespace: None,
                 to_dsl: None,
@@ -1863,14 +1865,18 @@ let vpc = awscc.ec2.vpc {
     fn type_compat_subtype_accepted() {
         // arn accepts KmsKeyArn (subtype via base chain: KmsKeyArn → Arn)
         let kms_key_arn = AttributeType::Custom {
-            name: "KmsKeyArn".to_string(),
+            semantic_name: Some("KmsKeyArn".to_string()),
             base: Box::new(AttributeType::Custom {
-                name: "Arn".to_string(),
+                semantic_name: Some("Arn".to_string()),
                 base: Box::new(AttributeType::String),
+                pattern: None,
+                length: None,
                 validate: |_| Ok(()),
                 namespace: None,
                 to_dsl: None,
             }),
+            pattern: None,
+            length: None,
             validate: |_| Ok(()),
             namespace: None,
             to_dsl: None,
@@ -1885,14 +1891,18 @@ let vpc = awscc.ec2.vpc {
     fn type_compat_sibling_rejected() {
         // kms_key_arn rejects IamRoleArn (sibling: IamRoleArn → Arn, not KmsKeyArn)
         let iam_role_arn = AttributeType::Custom {
-            name: "IamRoleArn".to_string(),
+            semantic_name: Some("IamRoleArn".to_string()),
             base: Box::new(AttributeType::Custom {
-                name: "Arn".to_string(),
+                semantic_name: Some("Arn".to_string()),
                 base: Box::new(AttributeType::String),
+                pattern: None,
+                length: None,
                 validate: |_| Ok(()),
                 namespace: None,
                 to_dsl: None,
             }),
+            pattern: None,
+            length: None,
             validate: |_| Ok(()),
             namespace: None,
             to_dsl: None,
@@ -1907,14 +1917,18 @@ let vpc = awscc.ec2.vpc {
     fn type_compat_resource_id_subtype() {
         // aws_resource_id accepts VpcId (subtype)
         let vpc_id = AttributeType::Custom {
-            name: "VpcId".to_string(),
+            semantic_name: Some("VpcId".to_string()),
             base: Box::new(AttributeType::Custom {
-                name: "AwsResourceId".to_string(),
+                semantic_name: Some("AwsResourceId".to_string()),
                 base: Box::new(AttributeType::String),
+                pattern: None,
+                length: None,
                 validate: |_| Ok(()),
                 namespace: None,
                 to_dsl: None,
             }),
+            pattern: None,
+            length: None,
             validate: |_| Ok(()),
             namespace: None,
             to_dsl: None,
@@ -1929,14 +1943,18 @@ let vpc = awscc.ec2.vpc {
     fn type_compat_resource_id_siblings_rejected() {
         // vpc_id rejects SubnetId (sibling)
         let subnet_id = AttributeType::Custom {
-            name: "SubnetId".to_string(),
+            semantic_name: Some("SubnetId".to_string()),
             base: Box::new(AttributeType::Custom {
-                name: "AwsResourceId".to_string(),
+                semantic_name: Some("AwsResourceId".to_string()),
                 base: Box::new(AttributeType::String),
+                pattern: None,
+                length: None,
                 validate: |_| Ok(()),
                 namespace: None,
                 to_dsl: None,
             }),
+            pattern: None,
+            length: None,
             validate: |_| Ok(()),
             namespace: None,
             to_dsl: None,
@@ -1950,8 +1968,10 @@ let vpc = awscc.ec2.vpc {
     #[test]
     fn type_compat_exact_match() {
         let arn = AttributeType::Custom {
-            name: "Arn".to_string(),
+            semantic_name: Some("Arn".to_string()),
             base: Box::new(AttributeType::String),
+            pattern: None,
+            length: None,
             validate: |_| Ok(()),
             namespace: None,
             to_dsl: None,

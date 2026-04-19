@@ -372,7 +372,10 @@ impl CompletionProvider {
     /// Extract the Custom type name from an AttributeType, if it is a Custom type.
     fn extract_custom_type_name(attr_type: &AttributeType) -> Option<&str> {
         match attr_type {
-            AttributeType::Custom { name, .. } => Some(name),
+            AttributeType::Custom {
+                semantic_name: Some(name),
+                ..
+            } => Some(name),
             _ => None,
         }
     }
@@ -419,15 +422,22 @@ impl CompletionProvider {
             AttributeType::Float => {
                 vec![] // No specific completions for floats
             }
-            AttributeType::Custom { name, .. } if name == "Cidr" || name == "Ipv4Cidr" => {
-                self.cidr_completions()
-            }
-            AttributeType::Custom { name, .. } if name == "Ipv6Cidr" => {
-                self.ipv6_cidr_completions()
-            }
-            AttributeType::Custom { name, .. } if name == "Arn" => self.arn_completions(),
             AttributeType::Custom {
-                name, namespace, ..
+                semantic_name: Some(name),
+                ..
+            } if name == "Cidr" || name == "Ipv4Cidr" => self.cidr_completions(),
+            AttributeType::Custom {
+                semantic_name: Some(name),
+                ..
+            } if name == "Ipv6Cidr" => self.ipv6_cidr_completions(),
+            AttributeType::Custom {
+                semantic_name: Some(name),
+                ..
+            } if name == "Arn" => self.arn_completions(),
+            AttributeType::Custom {
+                semantic_name: Some(name),
+                namespace,
+                ..
             } if name == "AvailabilityZone" => {
                 self.availability_zone_completions(namespace.as_deref().unwrap_or(""), name)
             }
