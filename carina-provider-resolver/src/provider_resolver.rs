@@ -299,6 +299,50 @@ fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> Result<PathBuf, Strin
     ))
 }
 
+/// Validate a cached version-mode binary and ensure the lock file records it.
+///
+/// When a previous `carina init` left a binary in `.carina/providers/`, the
+/// next run must still upsert a matching lock entry before the caller saves
+/// the lock. Otherwise an empty in-memory `LockFile` gets written back to
+/// disk and stomps the on-disk record (issue #2032).
+fn verify_or_record_version_cache(
+    binary_path: &Path,
+    source: &str,
+    version: &str,
+    name: &str,
+    lock_file: &mut LockFile,
+) -> Result<(), String> {
+    let actual_hash =
+        sha256_file(binary_path).map_err(|e| format!("Failed to hash binary: {e}"))?;
+    // Preserve any constraint already recorded; the resolver callers
+    // overwrite it afterwards when the `.crn` specifies one.
+    let existing_constraint = match lock_file.find(source, version) {
+        Some(entry) => {
+            if actual_hash != entry.sha256 {
+                return Err(format!(
+                    "SHA256 mismatch for provider '{}' ({}@{}). Expected: {}, got: {}. Re-run `carina init` to re-download.",
+                    name, source, version, entry.sha256, actual_hash
+                ));
+            }
+            match &entry.kind {
+                LockEntryKind::Version { constraint, .. } => constraint.clone(),
+                _ => None,
+            }
+        }
+        None => None,
+    };
+    lock_file.upsert(LockEntry {
+        name: name.to_string(),
+        source: source.to_string(),
+        kind: LockEntryKind::Version {
+            version: version.to_string(),
+            constraint: existing_constraint,
+        },
+        sha256: actual_hash,
+    });
+    Ok(())
+}
+
 /// Resolve a single provider: download if missing, verify if cached.
 ///
 /// Resolution order:
@@ -316,32 +360,14 @@ pub fn resolve_provider(
     // 1. Check local WASM cache first.
     let wasm_path = cache_path_wasm(base_dir, source, version);
     if wasm_path.exists() {
-        if let Some(lock_entry) = lock_file.find(source, version) {
-            let actual_hash =
-                sha256_file(&wasm_path).map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
-            if actual_hash != lock_entry.sha256 {
-                return Err(format!(
-                    "SHA256 mismatch for provider '{}' ({}@{}). Expected: {}, got: {}. Re-run `carina init` to re-download.",
-                    name, source, version, lock_entry.sha256, actual_hash
-                ));
-            }
-        }
+        verify_or_record_version_cache(&wasm_path, source, version, name, lock_file)?;
         return Ok(wasm_path);
     }
 
     // 2. Check native binary cache.
     let binary_path = cache_path(base_dir, source, version);
     if binary_path.exists() {
-        if let Some(lock_entry) = lock_file.find(source, version) {
-            let actual_hash =
-                sha256_file(&binary_path).map_err(|e| format!("Failed to hash binary: {e}"))?;
-            if actual_hash != lock_entry.sha256 {
-                return Err(format!(
-                    "SHA256 mismatch for provider '{}' ({}@{}). Expected: {}, got: {}. Re-run `carina init` to re-download.",
-                    name, source, version, lock_entry.sha256, actual_hash
-                ));
-            }
-        }
+        verify_or_record_version_cache(&binary_path, source, version, name, lock_file)?;
         return Ok(binary_path);
     }
 
@@ -912,6 +938,64 @@ mod tests {
         let mut lock_file = LockFile::default();
         let result = resolve_provider(base, source, version, "awscc", &mut lock_file).unwrap();
         assert_eq!(result, wasm_path);
+    }
+
+    /// Issue #2032: when `resolve_provider` hits the project-local WASM cache,
+    /// it must still upsert a lock entry before returning. Otherwise the caller
+    /// writes an empty `LockFile` back to disk on subsequent `carina init` runs
+    /// and silently wipes the existing entry.
+    #[test]
+    fn resolve_upserts_lock_entry_when_wasm_cache_is_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let source = "github.com/carina-rs/carina-provider-awscc";
+        let version = "0.1.0";
+
+        let wasm_path = cache_path_wasm(base, source, version);
+        fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
+        fs::File::create(&wasm_path)
+            .unwrap()
+            .write_all(b"fake wasm content")
+            .unwrap();
+
+        let mut lock_file = LockFile::default();
+        resolve_provider(base, source, version, "awscc", &mut lock_file).unwrap();
+
+        let entry = lock_file
+            .find_by_source(source)
+            .expect("cache-hit path must upsert a lock entry");
+        match &entry.kind {
+            LockEntryKind::Version {
+                version: locked, ..
+            } => assert_eq!(locked, version),
+            other => panic!("expected Version variant, got {other:?}"),
+        }
+        assert!(!entry.sha256.is_empty(), "entry must record a sha256");
+    }
+
+    /// Same guarantee for the native binary cache path.
+    #[test]
+    fn resolve_upserts_lock_entry_when_native_cache_is_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let source = "github.com/carina-rs/carina-provider-awscc";
+        let version = "0.1.0";
+
+        // Only the native binary exists — no WASM in the cache.
+        let native_path = cache_path(base, source, version);
+        fs::create_dir_all(native_path.parent().unwrap()).unwrap();
+        fs::File::create(&native_path)
+            .unwrap()
+            .write_all(b"fake native binary")
+            .unwrap();
+
+        let mut lock_file = LockFile::default();
+        resolve_provider(base, source, version, "awscc", &mut lock_file).unwrap();
+
+        assert!(
+            lock_file.find_by_source(source).is_some(),
+            "native-cache-hit path must upsert a lock entry"
+        );
     }
 
     /// Round-trip a version-mode entry through TOML. The serialized form carries
