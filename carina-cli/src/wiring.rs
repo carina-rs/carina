@@ -158,7 +158,7 @@ pub fn build_factories_from_providers(
 
 pub fn validate_resources_with_ctx(
     ctx: &WiringContext,
-    resources: &[Resource],
+    parsed: &ParsedFile,
 ) -> Result<(), AppError> {
     let known_providers: HashSet<String> = ctx
         .factories()
@@ -166,7 +166,7 @@ pub fn validate_resources_with_ctx(
         .map(|f| f.name().to_string())
         .collect();
     validation::validate_resources(
-        resources,
+        parsed,
         ctx.schemas(),
         &|r| provider_mod::schema_key_for_resource(ctx.factories(), r),
         &known_providers,
@@ -1368,7 +1368,11 @@ pub(crate) fn resolve_data_source_refs_for_refresh(
 #[cfg(test)]
 pub fn validate_resources(resources: &[Resource]) -> Result<(), AppError> {
     let ctx = WiringContext::new(vec![]);
-    validate_resources_with_ctx(&ctx, resources)
+    let parsed = ParsedFile {
+        resources: resources.to_vec(),
+        ..ParsedFile::default()
+    };
+    validate_resources_with_ctx(&ctx, &parsed)
 }
 
 #[cfg(test)]
