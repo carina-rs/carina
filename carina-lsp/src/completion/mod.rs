@@ -172,6 +172,7 @@ impl CompletionProvider {
         let mut module_name: Option<String> = None;
         let mut provider_block_name: Option<String> = None;
         let mut in_args_or_attrs_block = false;
+        let mut in_exports_block = false;
         let mut in_upstream_state_block = false;
         // Track nested block names at each depth level (index 0 = depth 1, etc.)
         let mut nested_block_names: Vec<String> = Vec::new();
@@ -225,6 +226,9 @@ impl CompletionProvider {
                 && trimmed.ends_with('{')
             {
                 in_args_or_attrs_block = true;
+                if trimmed.starts_with("exports") {
+                    in_exports_block = true;
+                }
                 resource_type.clear();
                 module_name = None;
             } else if brace_depth == 0 && is_let_upstream_state_line(trimmed) {
@@ -291,6 +295,7 @@ impl CompletionProvider {
                         module_name = None;
                         provider_block_name = None;
                         in_args_or_attrs_block = false;
+                        in_exports_block = false;
                         in_upstream_state_block = false;
                         nested_block_names.clear();
                     } else if brace_depth == for_body_depth {
@@ -384,6 +389,16 @@ impl CompletionProvider {
             let after_eq = prefix.split('=').next_back().unwrap_or("").trim();
             // Don't show completions if user is typing a string literal (except just starting)
             if !after_eq.starts_with('"') || after_eq == "\"" {
+                // Exports-block values are type-annotated (e.g.
+                // `accounts: map(aws_account_id) = ...`); until the
+                // completion engine can read that annotation and filter
+                // by it, returning nothing beats the old behavior of
+                // dumping every built-in function and region into the
+                // popup (#1993). Matches the "prefer empty to generic"
+                // stance established by #1974.
+                if in_exports_block {
+                    return CompletionContext::None;
+                }
                 // Extract attribute name from current line
                 let attr_name = self.extract_attr_name(&prefix);
                 return CompletionContext::AfterEquals {

@@ -1799,3 +1799,87 @@ for _, id in orgs.
         "orgs has no source set, must not resolve to other's exports"
     );
 }
+
+// =====================================================================
+// exports block: type-aware value-position completion (#1993)
+// =====================================================================
+
+#[test]
+fn exports_value_position_excludes_builtin_functions() {
+    // `exports { accounts: map(string) = { k = <HERE> } }` must not suggest
+    // built-in functions like `replace` — they don't produce a string the
+    // map entry could use without an extra call site, and offering every
+    // function clutters the popup.
+    let provider = test_provider();
+    let source = "\
+exports {
+  accounts: map(string) = {
+    k = re
+  }
+}
+";
+    let doc = create_document(source);
+    let position = Position {
+        line: 2,
+        character: "    k = re".chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+
+    assert!(
+        !completions.iter().any(|c| c.label == "replace"),
+        "`replace` must not appear at exports value position, got: {:?}",
+        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn exports_top_level_value_excludes_builtin_functions() {
+    // `exports { id: string = <HERE> }` — directly at the top-level of the
+    // exports block, not nested in a map.
+    let provider = test_provider();
+    let source = "\
+exports {
+  id: string = re
+}
+";
+    let doc = create_document(source);
+    let position = Position {
+        line: 1,
+        character: "  id: string = re".chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+
+    assert!(
+        !completions.iter().any(|c| c.label == "replace"),
+        "`replace` must not appear at exports value position, got: {:?}",
+        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn exports_value_position_returns_none_context() {
+    // Stronger guarantee than "no `replace` / no `.Region.`": the context
+    // itself must be `None`, so no handler fires and no generic candidate
+    // set can leak through — regardless of which providers are registered.
+    let provider = test_provider();
+    for source in [
+        "exports {\n  id: string = re\n}\n",
+        "exports {\n  accounts: map(string) = {\n    k = re\n  }\n}\n",
+    ] {
+        let last_line = source.lines().find(|l| l.contains(" = ")).unwrap();
+        let line_idx = source.lines().position(|l| l == last_line).unwrap() as u32;
+        let position = Position {
+            line: line_idx,
+            character: last_line.chars().count() as u32,
+        };
+        let context = provider.get_completion_context(source, position);
+        assert!(
+            matches!(context, CompletionContext::None),
+            "expected None, got {:?} for source:\n{}",
+            context,
+            source
+        );
+    }
+}
