@@ -528,7 +528,7 @@ pub fn check_unused_bindings(parsed: &ParsedFile) -> Vec<String> {
 
     // Collect all referenced binding names
     let mut referenced: HashSet<String> = HashSet::new();
-    for resource in &parsed.resources {
+    for (_ctx, resource) in parsed.iter_all_resources() {
         for (attr_name, value) in &resource.attributes {
             if attr_name.starts_with('_') {
                 continue;
@@ -1025,6 +1025,31 @@ let vpc = awscc.ec2.vpc {
             unused,
             vec!["vpc"],
             "genuinely unused binding should still be warned"
+        );
+    }
+
+    #[test]
+    fn binding_used_inside_for_body_is_not_flagged_as_unused() {
+        use crate::parser::parse;
+
+        let src = r#"
+            provider test {
+                source = 'x/y'
+                version = '0.1'
+                region = 'ap-northeast-1'
+            }
+            let vpc = test.r.res { name = "v" }
+            for _, id in orgs.accounts {
+                test.r.res {
+                    name = vpc.name
+                }
+            }
+        "#;
+        let parsed = parse(src, &crate::parser::ProviderContext::default()).unwrap();
+        let unused = check_unused_bindings(&parsed);
+        assert!(
+            !unused.iter().any(|b| b == "vpc"),
+            "`vpc` is referenced inside the for body, got: {unused:?}"
         );
     }
 
