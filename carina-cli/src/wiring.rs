@@ -176,11 +176,11 @@ pub fn validate_resources_with_ctx(
 
 pub fn validate_resource_ref_types_with_ctx(
     ctx: &WiringContext,
-    resources: &[Resource],
+    parsed: &ParsedFile,
     argument_names: &HashSet<String>,
 ) -> Result<(), AppError> {
     validation::validate_resource_ref_types(
-        resources,
+        parsed,
         ctx.schemas(),
         &|r| provider_mod::schema_key_for_resource(ctx.factories(), r),
         argument_names,
