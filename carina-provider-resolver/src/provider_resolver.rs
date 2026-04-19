@@ -491,7 +491,11 @@ pub fn find_installed_provider(
     let lock_path = base_dir.join("carina-providers.lock");
     let lock_file = LockFile::load(&lock_path).unwrap_or_default();
 
-    // Check revision-based cache
+    // Only the project-local `.carina/` counts. The global plugin cache is an
+    // install-time optimization consulted by `carina init`; treating it as a
+    // runtime source lets validate/plan/apply silently succeed when a prior
+    // project already pulled this provider and the current project has no
+    // local install yet (issue #2018).
     if let Some(revision) = &config.revision {
         if let Some(lock_entry) = lock_file.find_by_source(source)
             && let Some(ref sha) = lock_entry.resolved_sha
@@ -499,13 +503,6 @@ pub fn find_installed_provider(
             let wasm_path = crate::revision_resolver::cache_path_revision(base_dir, source, sha);
             if wasm_path.exists() {
                 return Ok(wasm_path);
-            }
-            // Check global cache
-            if let Some(global_path) =
-                crate::revision_resolver::global_cache_path_revision(source, sha)
-                && global_path.exists()
-            {
-                return Ok(global_path);
             }
         }
         return Err(format!(
@@ -515,7 +512,6 @@ pub fn find_installed_provider(
         ));
     }
 
-    // Check version-based cache
     if let Some(lock_entry) = lock_file.find_by_source(source) {
         let version = &lock_entry.version;
         let wasm_path = cache_path_wasm(base_dir, source, version);
@@ -525,12 +521,6 @@ pub fn find_installed_provider(
         let binary_path = cache_path(base_dir, source, version);
         if binary_path.exists() {
             return Ok(binary_path);
-        }
-        // Check global cache
-        if let Some(global_wasm) = global_cache_path_wasm(source, version)
-            && global_wasm.exists()
-        {
-            return Ok(global_wasm);
         }
     }
 
@@ -975,5 +965,129 @@ sha256 = "abc123"
 
         let err = resolve_all(tmp.path(), &providers, false).unwrap_err();
         assert!(err.contains("not found"));
+    }
+
+    /// Serialize env-var tests in this module. `CARINA_PLUGIN_CACHE_DIR` is
+    /// process-wide state and cargo test runs threads, so tests that touch it
+    /// must hold this lock for their whole body.
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// Issue #2018: if the project's local `.carina/` is missing, the binary
+    /// on disk that actually matters is absent — even if the shared global
+    /// plugin cache still has a copy from a previous project. Falling back to
+    /// the global cache makes `validate` claim the project is ready when
+    /// re-running `carina init` is the real prerequisite.
+    #[test]
+    fn find_installed_provider_revision_requires_local_install_not_global_cache() {
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+
+        let global = tmp.path().join("_global_cache");
+        // SAFETY: env_lock() above serializes access with any other test that
+        // touches CARINA_PLUGIN_CACHE_DIR in this process.
+        unsafe { std::env::set_var("CARINA_PLUGIN_CACHE_DIR", &global) };
+
+        let source = "github.com/carina-rs/carina-provider-awscc";
+        let sha = "deadbeefcafe1234567890";
+
+        let lock_path = base.join("carina-providers.lock");
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "awscc".into(),
+            source: source.into(),
+            version: String::new(),
+            constraint: None,
+            revision: Some("main".into()),
+            resolved_sha: Some(sha.into()),
+            sha256: "deadbeef".into(),
+        });
+        lock.save(&lock_path).unwrap();
+
+        // Global cache populated, local `.carina/` deliberately absent.
+        let global_wasm =
+            crate::revision_resolver::global_cache_path_revision(source, sha).unwrap();
+        fs::create_dir_all(global_wasm.parent().unwrap()).unwrap();
+        fs::File::create(&global_wasm)
+            .unwrap()
+            .write_all(b"fake wasm from a prior project")
+            .unwrap();
+
+        let config = ProviderConfig {
+            name: "awscc".into(),
+            source: Some(source.into()),
+            version: None,
+            revision: Some("main".into()),
+            attributes: std::collections::HashMap::new(),
+            default_tags: std::collections::HashMap::new(),
+        };
+
+        let err = find_installed_provider(base, &config)
+            .expect_err("missing local .carina/ must not be masked by a global-cache hit");
+        assert!(
+            err.contains("carina init"),
+            "error should point at `carina init`, got: {err}"
+        );
+
+        // SAFETY: still holding env_lock.
+        unsafe { std::env::remove_var("CARINA_PLUGIN_CACHE_DIR") };
+    }
+
+    /// Companion for the revision case above: same requirement for version-pinned
+    /// providers. Lock file + global cache without a local `.carina/` must fail.
+    #[test]
+    fn find_installed_provider_version_requires_local_install_not_global_cache() {
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+
+        let global = tmp.path().join("_global_cache");
+        // SAFETY: env_lock() serializes.
+        unsafe { std::env::set_var("CARINA_PLUGIN_CACHE_DIR", &global) };
+
+        let source = "github.com/carina-rs/carina-provider-awscc";
+        let version = "0.1.0";
+
+        let lock_path = base.join("carina-providers.lock");
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "awscc".into(),
+            source: source.into(),
+            version: version.into(),
+            constraint: None,
+            revision: None,
+            resolved_sha: None,
+            sha256: "deadbeef".into(),
+        });
+        lock.save(&lock_path).unwrap();
+
+        let global_wasm = global_cache_path_wasm(source, version).unwrap();
+        fs::create_dir_all(global_wasm.parent().unwrap()).unwrap();
+        fs::File::create(&global_wasm)
+            .unwrap()
+            .write_all(b"fake wasm from a prior project")
+            .unwrap();
+
+        let config = ProviderConfig {
+            name: "awscc".into(),
+            source: Some(source.into()),
+            version: None,
+            revision: None,
+            attributes: std::collections::HashMap::new(),
+            default_tags: std::collections::HashMap::new(),
+        };
+
+        let err = find_installed_provider(base, &config)
+            .expect_err("missing local .carina/ must not be masked by a global-cache hit");
+        assert!(
+            err.contains("carina init"),
+            "error should point at `carina init`, got: {err}"
+        );
+
+        // SAFETY: still holding env_lock.
+        unsafe { std::env::remove_var("CARINA_PLUGIN_CACHE_DIR") };
     }
 }
