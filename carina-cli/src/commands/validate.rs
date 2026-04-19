@@ -101,8 +101,8 @@ pub fn run_validate(
         }
         let output = ValidateOutput {
             status: "ok",
-            resource_count: parsed.resources.len(),
-            resources: parsed.resources.iter().map(|r| r.id.to_string()).collect(),
+            resource_count: parsed.resources.len(), // allow: direct — display/reporting
+            resources: parsed.resources.iter().map(|r| r.id.to_string()).collect(), // allow: direct — display/reporting
             warnings,
         };
         println!(
@@ -117,7 +117,7 @@ pub fn run_validate(
         "{}",
         format!(
             "✓ {} resources validated successfully.",
-            parsed.resources.len()
+            parsed.resources.len() // allow: direct — display/reporting
         )
         .green()
         .bold()

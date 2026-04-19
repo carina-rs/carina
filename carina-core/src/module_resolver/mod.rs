@@ -252,7 +252,7 @@ impl<'cfg> ModuleResolver<'cfg> {
                 .unwrap_or_else(|| call.module_name.clone());
 
             match self.expand_module_call(call, &instance_prefix) {
-                Ok(expanded) => parsed.resources.extend(expanded),
+                Ok(expanded) => parsed.resources.extend(expanded), // allow: direct — module expansion, handled separately
                 Err(e) => {
                     self.base_dir = original_base_dir;
                     self.imported_modules = original_imported;
@@ -595,7 +595,7 @@ pub fn resolve_modules_with_config(
             .unwrap_or_else(|| call.module_name.clone());
 
         let expanded = resolver.expand_module_call(call, &instance_prefix)?;
-        parsed.resources.extend(expanded);
+        parsed.resources.extend(expanded); // allow: direct — module expansion, handled separately
     }
 
     Ok(())

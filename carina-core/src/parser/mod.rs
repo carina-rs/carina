@@ -4464,7 +4464,7 @@ pub fn resolve_resource_refs_with_config(
 /// bindings declared in sibling files that only become visible after merging.
 pub(crate) fn check_deferred_for_iterables(parsed: &ParsedFile) -> Vec<ParseError> {
     let mut known: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    known.extend(parsed.resources.iter().filter_map(|r| r.binding.as_deref()));
+    known.extend(parsed.resources.iter().filter_map(|r| r.binding.as_deref())); // allow: direct — parser-internal, pre-expansion
     known.extend(parsed.arguments.iter().map(|a| a.name.as_str()));
     known.extend(
         parsed
@@ -6805,7 +6805,7 @@ aws.s3.bucket {
         assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
 
         let parsed = result.unwrap();
-        assert_eq!(parsed.resources.len(), 2);
+        assert_eq!(parsed.resources.len(), 2); // allow: direct — fixture test inspection
         assert_eq!(parsed.arguments.len(), 3);
     }
 
@@ -9482,7 +9482,7 @@ aws.s3.bucket {
         "#;
         let mut parsed = parse(input, &config).unwrap();
         resolve_resource_refs_with_config(&mut parsed, &config).unwrap();
-        assert_eq!(parsed.resources.len(), 1);
+        assert_eq!(parsed.resources.len(), 1); // allow: direct — fixture test inspection
         let secret_val = parsed.resources[0].get_attr("secret").unwrap();
         assert_eq!(*secret_val, Value::String("decrypted:AQICAHh".to_string()));
     }
@@ -10393,7 +10393,7 @@ awscc.ec2.vpc {
 
         let mut parsed = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(parsed.deferred_for_expressions.len(), 1);
-        assert_eq!(parsed.resources.len(), 0, "no resources before expansion");
+        assert_eq!(parsed.resources.len(), 0, "no resources before expansion"); // allow: direct — fixture test inspection
 
         // Simulate loading upstream_state with actual values
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -10424,7 +10424,7 @@ awscc.ec2.vpc {
         );
         // Two concrete resources should be generated
         assert_eq!(
-            parsed.resources.len(),
+            parsed.resources.len(), // allow: direct — fixture test inspection
             2,
             "should have 2 expanded resources"
         );
@@ -10474,7 +10474,7 @@ awscc.ec2.vpc {
             1,
             "should stay deferred when remote data not available"
         );
-        assert_eq!(parsed.resources.len(), 0);
+        assert_eq!(parsed.resources.len(), 0); // allow: direct — fixture test inspection
     }
 
     #[test]
@@ -10511,7 +10511,7 @@ awscc.ec2.vpc {
         parsed.expand_deferred_for_expressions(&remote_bindings);
 
         assert_eq!(parsed.deferred_for_expressions.len(), 0);
-        assert_eq!(parsed.resources.len(), 2);
+        assert_eq!(parsed.resources.len(), 2); // allow: direct — fixture test inspection
 
         // Verify both key and value are substituted.
         let mut by_name: HashMap<String, &Resource> = HashMap::new();
@@ -10566,7 +10566,7 @@ awscc.ec2.vpc {
 
         parsed.expand_deferred_for_expressions(&remote_bindings);
 
-        assert_eq!(parsed.resources.len(), 2);
+        assert_eq!(parsed.resources.len(), 2); // allow: direct — fixture test inspection
         assert_eq!(
             parsed.resources[0].get_attr("target_id"),
             Some(&Value::String("111111111111".to_string()))
@@ -10616,7 +10616,7 @@ awscc.ec2.vpc {
         remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
         parsed.expand_deferred_for_expressions(&remote_bindings);
-        assert_eq!(parsed.resources.len(), 1);
+        assert_eq!(parsed.resources.len(), 1); // allow: direct — fixture test inspection
 
         // label must have the placeholder substituted in the interpolation.
         let label = parsed.resources[0].get_attr("label");
@@ -10678,7 +10678,7 @@ awscc.ec2.vpc {
         parsed.expand_deferred_for_expressions(&remote_bindings);
 
         assert_eq!(
-            parsed.resources.len(),
+            parsed.resources.len(), // allow: direct — fixture test inspection
             0,
             "simple binding with map iterable should not silently expand"
         );
@@ -10726,7 +10726,7 @@ awscc.ec2.vpc {
 
         // Mismatch: should NOT expand silently with numeric indices
         assert_eq!(
-            parsed.resources.len(),
+            parsed.resources.len(), // allow: direct — fixture test inspection
             0,
             "map binding with list iterable should not silently expand"
         );

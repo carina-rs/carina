@@ -146,7 +146,7 @@ async fn run_destroy_locked(
 
     // Collect all resources (managed + orphans) before sorting.
     // We use the unsorted list for state reads, then sort once at the end.
-    let mut all_resources: Vec<Resource> = parsed.resources.clone();
+    let mut all_resources: Vec<Resource> = parsed.resources.clone(); // allow: direct — plan-time reconciliation
 
     if !refresh {
         eprintln!(

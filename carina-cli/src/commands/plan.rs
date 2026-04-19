@@ -144,7 +144,8 @@ pub async fn run_plan(
             let backend_resource_type = backend
                 .resource_type()
                 .ok_or("Backend does not specify a resource type")?;
-            let has_bucket_resource = parsed.resources.iter().any(|r| {
+            #[rustfmt::skip]
+            let has_bucket_resource = parsed.resources.iter().any(|r| { // allow: direct — plan-time reconciliation
                 r.id.resource_type == backend_resource_type
                     && r.attributes
                         .get("bucket")
