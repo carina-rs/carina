@@ -90,8 +90,15 @@ pub enum AttributeType {
     },
     /// Custom type (with validation function)
     Custom {
-        name: String,
+        /// Some(name) when this type carries a semantic identity (e.g. "VpcId",
+        /// "AwsAccountId"). None when this is a generic string/int pattern type
+        /// synthesized by codegen for a property without a named semantic.
+        semantic_name: Option<String>,
         base: Box<AttributeType>,
+        /// Optional regex pattern constraint (for structural comparison).
+        pattern: Option<String>,
+        /// Optional length bounds (min, max).
+        length: Option<(Option<u64>, Option<u64>)>,
         validate: fn(&Value) -> Result<(), String>,
         /// Namespace for resolving shorthand enum values (e.g., "aws.vpc")
         /// When set, allows `dedicated` to be resolved to `aws.vpc.InstanceTenancy.dedicated`
@@ -212,7 +219,7 @@ impl AttributeType {
                 ..
             }
             | AttributeType::Custom {
-                name,
+                semantic_name: Some(name),
                 namespace: Some(namespace),
                 to_dsl,
                 ..
@@ -325,7 +332,7 @@ impl AttributeType {
             (
                 AttributeType::Custom {
                     validate,
-                    name,
+                    semantic_name,
                     namespace,
                     ..
                 },
@@ -336,7 +343,9 @@ impl AttributeType {
                 if matches!(v, Value::ResourceRef { .. } | Value::Interpolation(_)) {
                     return Ok(());
                 }
-                let resolved_value = Self::resolve_enum_input(name, namespace.as_deref(), v)?;
+                let name_for_resolve = semantic_name.as_deref().unwrap_or("");
+                let resolved_value =
+                    Self::resolve_enum_input(name_for_resolve, namespace.as_deref(), v)?;
                 validate(&resolved_value)
                     .map_err(|msg| TypeError::ValidationFailed { message: msg })
             }
@@ -460,7 +469,16 @@ impl AttributeType {
             AttributeType::Float => "Float".to_string(),
             AttributeType::Bool => "Bool".to_string(),
             AttributeType::StringEnum { name, .. } => name.clone(),
-            AttributeType::Custom { name, .. } => name.clone(),
+            AttributeType::Custom {
+                semantic_name,
+                pattern,
+                length,
+                ..
+            } => custom_display_name(
+                semantic_name.as_deref(),
+                pattern.as_deref(),
+                length.as_ref(),
+            ),
             AttributeType::List { inner, .. } => format!("List<{}>", inner.type_name()),
             AttributeType::Map { value: inner, .. } => format!("Map<{}>", inner.type_name()),
             AttributeType::Struct { name, .. } => format!("Struct({})", name),
@@ -515,6 +533,45 @@ impl AttributeType {
 impl fmt::Display for AttributeType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.type_name())
+    }
+}
+
+fn custom_display_name(
+    semantic_name: Option<&str>,
+    pattern: Option<&str>,
+    length: Option<&(Option<u64>, Option<u64>)>,
+) -> String {
+    if let Some(n) = semantic_name {
+        return n.to_string();
+    }
+    let mut s = String::from("String");
+    let has_pattern = pattern.is_some();
+    let has_length = length.is_some();
+    if has_pattern || has_length {
+        s.push('(');
+        if has_pattern {
+            s.push_str("pattern");
+        }
+        if let Some((min, max)) = length {
+            if has_pattern {
+                s.push_str(", ");
+            }
+            s.push_str(&format!(
+                "len: {}",
+                length_display(min.as_ref(), max.as_ref())
+            ));
+        }
+        s.push(')');
+    }
+    s
+}
+
+fn length_display(min: Option<&u64>, max: Option<&u64>) -> String {
+    match (min, max) {
+        (Some(lo), Some(hi)) => format!("{}..={}", lo, hi),
+        (Some(lo), None) => format!("{}..", lo),
+        (None, Some(hi)) => format!("..={}", hi),
+        (None, None) => "..".to_string(),
     }
 }
 
@@ -1295,8 +1352,10 @@ pub mod types {
     /// Positive integer type
     pub fn positive_int() -> AttributeType {
         AttributeType::Custom {
-            name: "PositiveInt".to_string(),
+            semantic_name: Some("PositiveInt".to_string()),
             base: Box::new(AttributeType::Int),
+            pattern: None,
+            length: None,
             validate: |value| {
                 if let Value::Int(n) = value {
                     if *n > 0 {
@@ -1316,8 +1375,10 @@ pub mod types {
     /// IPv4 CIDR block type (e.g., "10.0.0.0/16")
     pub fn ipv4_cidr() -> AttributeType {
         AttributeType::Custom {
-            name: "Ipv4Cidr".to_string(),
+            semantic_name: Some("Ipv4Cidr".to_string()),
             base: Box::new(AttributeType::String),
+            pattern: None,
+            length: None,
             validate: |value| {
                 if let Value::String(s) = value {
                     validate_ipv4_cidr(s)
@@ -1333,8 +1394,10 @@ pub mod types {
     /// IPv4 address type (e.g., "10.0.1.5", "192.168.0.1")
     pub fn ipv4_address() -> AttributeType {
         AttributeType::Custom {
-            name: "Ipv4Address".to_string(),
+            semantic_name: Some("Ipv4Address".to_string()),
             base: Box::new(AttributeType::String),
+            pattern: None,
+            length: None,
             validate: |value| {
                 if let Value::String(s) = value {
                     validate_ipv4_address(s)
@@ -1350,8 +1413,10 @@ pub mod types {
     /// IPv6 address type (e.g., "2001:db8::1", "::1")
     pub fn ipv6_address() -> AttributeType {
         AttributeType::Custom {
-            name: "Ipv6Address".to_string(),
+            semantic_name: Some("Ipv6Address".to_string()),
             base: Box::new(AttributeType::String),
+            pattern: None,
+            length: None,
             validate: |value| {
                 if let Value::String(s) = value {
                     validate_ipv6_address(s)
@@ -1367,8 +1432,10 @@ pub mod types {
     /// IPv6 CIDR block type (e.g., "2001:db8::/32", "::/0")
     pub fn ipv6_cidr() -> AttributeType {
         AttributeType::Custom {
-            name: "Ipv6Cidr".to_string(),
+            semantic_name: Some("Ipv6Cidr".to_string()),
             base: Box::new(AttributeType::String),
+            pattern: None,
+            length: None,
             validate: |value| {
                 if let Value::String(s) = value {
                     validate_ipv6_cidr(s)
@@ -2544,8 +2611,10 @@ mod tests {
     fn validate_union_type() {
         // Create two Custom types that validate different prefixes
         let type_a = AttributeType::Custom {
-            name: "TypeA".to_string(),
+            semantic_name: Some("TypeA".to_string()),
             base: Box::new(AttributeType::String),
+            pattern: None,
+            length: None,
             validate: |value| {
                 if let Value::String(s) = value {
                     if s.starts_with("a-") {
@@ -2561,8 +2630,10 @@ mod tests {
             to_dsl: None,
         };
         let type_b = AttributeType::Custom {
-            name: "TypeB".to_string(),
+            semantic_name: Some("TypeB".to_string()),
             base: Box::new(AttributeType::String),
+            pattern: None,
+            length: None,
             validate: |value| {
                 if let Value::String(s) = value {
                     if s.starts_with("b-") {
@@ -2645,15 +2716,19 @@ mod tests {
     #[test]
     fn union_type_name() {
         let type_a = AttributeType::Custom {
-            name: "TypeA".to_string(),
+            semantic_name: Some("TypeA".to_string()),
             base: Box::new(AttributeType::String),
+            pattern: None,
+            length: None,
             validate: |_| Ok(()),
             namespace: None,
             to_dsl: None,
         };
         let type_b = AttributeType::Custom {
-            name: "TypeB".to_string(),
+            semantic_name: Some("TypeB".to_string()),
             base: Box::new(AttributeType::String),
+            pattern: None,
+            length: None,
             validate: |_| Ok(()),
             namespace: None,
             to_dsl: None,
@@ -2666,15 +2741,19 @@ mod tests {
     #[test]
     fn union_accepts_type_name() {
         let type_a = AttributeType::Custom {
-            name: "TypeA".to_string(),
+            semantic_name: Some("TypeA".to_string()),
             base: Box::new(AttributeType::String),
+            pattern: None,
+            length: None,
             validate: |_| Ok(()),
             namespace: None,
             to_dsl: None,
         };
         let type_b = AttributeType::Custom {
-            name: "TypeB".to_string(),
+            semantic_name: Some("TypeB".to_string()),
             base: Box::new(AttributeType::String),
+            pattern: None,
+            length: None,
             validate: |_| Ok(()),
             namespace: None,
             to_dsl: None,
@@ -3353,8 +3432,10 @@ mod tests {
 
     fn make_custom(name: &str, base: AttributeType) -> AttributeType {
         AttributeType::Custom {
-            name: name.to_string(),
+            semantic_name: Some(name.to_string()),
             base: Box::new(base),
+            pattern: None,
+            length: None,
             validate: |_| Ok(()),
             namespace: None,
             to_dsl: None,
@@ -3400,5 +3481,73 @@ mod tests {
         let int_custom = make_custom("Port", AttributeType::Int);
         let string_custom = make_custom("VpcId", AttributeType::String);
         assert!(!int_custom.is_compatible_with(&string_custom));
+    }
+
+    #[test]
+    fn custom_carries_semantic_name_pattern_length() {
+        let t = AttributeType::Custom {
+            semantic_name: Some("VpcId".to_string()),
+            base: Box::new(AttributeType::String),
+            pattern: Some("^vpc-[a-f0-9]+$".to_string()),
+            length: Some((Some(8), Some(21))),
+            validate: |_| Ok(()),
+            namespace: None,
+            to_dsl: None,
+        };
+        match t {
+            AttributeType::Custom {
+                semantic_name,
+                pattern,
+                length,
+                ..
+            } => {
+                assert_eq!(semantic_name.as_deref(), Some("VpcId"));
+                assert_eq!(pattern.as_deref(), Some("^vpc-[a-f0-9]+$"));
+                assert_eq!(length, Some((Some(8), Some(21))));
+            }
+            _ => panic!("expected Custom"),
+        }
+    }
+
+    #[test]
+    fn custom_type_name_anonymous_pattern_only() {
+        let t = AttributeType::Custom {
+            semantic_name: None,
+            base: Box::new(AttributeType::String),
+            pattern: Some("^foo$".to_string()),
+            length: None,
+            validate: |_| Ok(()),
+            namespace: None,
+            to_dsl: None,
+        };
+        assert_eq!(t.type_name(), "String(pattern)");
+    }
+
+    #[test]
+    fn custom_type_name_anonymous_length_only() {
+        let t = AttributeType::Custom {
+            semantic_name: None,
+            base: Box::new(AttributeType::String),
+            pattern: None,
+            length: Some((Some(1), Some(64))),
+            validate: |_| Ok(()),
+            namespace: None,
+            to_dsl: None,
+        };
+        assert_eq!(t.type_name(), "String(len: 1..=64)");
+    }
+
+    #[test]
+    fn custom_type_name_anonymous_pattern_and_length() {
+        let t = AttributeType::Custom {
+            semantic_name: None,
+            base: Box::new(AttributeType::String),
+            pattern: Some("^.*$".to_string()),
+            length: Some((Some(1), Some(64))),
+            validate: |_| Ok(()),
+            namespace: None,
+            to_dsl: None,
+        };
+        assert_eq!(t.type_name(), "String(pattern, len: 1..=64)");
     }
 }

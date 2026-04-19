@@ -1191,8 +1191,10 @@ fn resource_ref_type_check_helper_regression() {
         .attribute(AttributeSchema::new(
             "my_id",
             AttributeType::Custom {
-                name: "MyId".to_string(),
+                semantic_name: Some("MyId".to_string()),
                 base: Box::new(AttributeType::String),
+                pattern: None,
+                length: None,
                 validate: dummy_validate,
                 namespace: Some("test".to_string()),
                 to_dsl: None,
@@ -1217,8 +1219,10 @@ fn resource_ref_type_check_helper_regression() {
         .attribute(AttributeSchema::new(
             "custom_attr",
             AttributeType::Custom {
-                name: "MyId".to_string(),
+                semantic_name: Some("MyId".to_string()),
                 base: Box::new(AttributeType::String),
+                pattern: None,
+                length: None,
                 validate: dummy_validate,
                 namespace: Some("test".to_string()),
                 to_dsl: None,
@@ -1647,8 +1651,10 @@ fn string_based_custom_types_are_compatible() {
     let source_schema = ResourceSchema::new("sts.caller_identity").attribute(AttributeSchema::new(
         "account_id",
         AttributeType::Custom {
-            name: "AwsAccountId".to_string(),
+            semantic_name: Some("AwsAccountId".to_string()),
             base: Box::new(AttributeType::String),
+            pattern: None,
+            length: None,
             validate: validate_account_id,
             namespace: Some("aws".to_string()),
             to_dsl: None,
@@ -1659,8 +1665,10 @@ fn string_based_custom_types_are_compatible() {
     let target_schema = ResourceSchema::new("sso.assignment").attribute(AttributeSchema::new(
         "target_id",
         AttributeType::Custom {
-            name: "TargetId".to_string(),
+            semantic_name: Some("TargetId".to_string()),
             base: Box::new(AttributeType::String),
+            pattern: None,
+            length: None,
             validate: validate_target_id,
             namespace: Some("awscc".to_string()),
             to_dsl: None,
@@ -1701,8 +1709,10 @@ fn exports_cross_file_ref_no_false_positive() {
     use std::collections::HashMap;
 
     let aws_account_id_type = AttributeType::Custom {
-        name: "AwsAccountId".to_string(),
+        semantic_name: Some("AwsAccountId".to_string()),
         base: Box::new(AttributeType::String),
+        pattern: None,
+        length: None,
         validate: |v| match v {
             Value::String(s) if s.len() == 12 && s.chars().all(|c| c.is_ascii_digit()) => Ok(()),
             Value::String(s) => Err(format!(

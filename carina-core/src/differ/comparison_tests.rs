@@ -89,8 +89,10 @@ fn type_aware_union_numeric() {
 #[test]
 fn type_aware_custom_delegates_to_base() {
     let custom_type = AttributeType::Custom {
-        name: "Port".to_string(),
+        semantic_name: Some("Port".to_string()),
         base: Box::new(AttributeType::Float),
+        pattern: None,
+        length: None,
         validate: |_| Ok(()),
         namespace: None,
         to_dsl: None,
@@ -308,8 +310,10 @@ fn type_aware_struct_ignores_default_custom_type() {
             StructField::new(
                 "port",
                 AttributeType::Custom {
-                    name: "Port".to_string(),
+                    semantic_name: Some("Port".to_string()),
                     base: Box::new(AttributeType::Int),
+                    pattern: None,
+                    length: None,
                     validate: |_| Ok(()),
                     namespace: None,
                     to_dsl: None,

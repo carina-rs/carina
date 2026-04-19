@@ -1002,14 +1002,18 @@ mod tests {
         let exports =
             mk_typed_exports(&[("orgs", &[("key_arn", TypeExpr::Simple("arn".to_string()))])]);
         let kms_arn = AttributeType::Custom {
-            name: "KmsKeyArn".to_string(),
+            semantic_name: Some("KmsKeyArn".to_string()),
             base: Box::new(AttributeType::Custom {
-                name: "Arn".to_string(),
+                semantic_name: Some("Arn".to_string()),
                 base: Box::new(AttributeType::String),
+                pattern: None,
+                length: None,
                 validate: noop_validate,
                 namespace: None,
                 to_dsl: None,
             }),
+            pattern: None,
+            length: None,
             validate: noop_validate,
             namespace: None,
             to_dsl: None,

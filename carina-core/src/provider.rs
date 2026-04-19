@@ -560,13 +560,21 @@ fn collect_validators_from_type(
     use crate::schema::AttributeType;
 
     match attr_type {
-        AttributeType::Custom { name, validate, .. } => {
+        AttributeType::Custom {
+            semantic_name: Some(name),
+            validate,
+            ..
+        } => {
             let snake_name = crate::parser::pascal_to_snake(name);
             validators.entry(snake_name).or_insert_with(|| {
                 let validate_fn = *validate;
                 Box::new(move |s: &str| validate_fn(&crate::resource::Value::String(s.to_string())))
             });
         }
+        AttributeType::Custom {
+            semantic_name: None,
+            ..
+        } => {}
         AttributeType::List { inner, .. } => {
             collect_validators_from_type(inner, validators);
         }
@@ -596,9 +604,16 @@ fn collect_type_names_from_type(
     use crate::schema::AttributeType;
 
     match attr_type {
-        AttributeType::Custom { name, .. } => {
+        AttributeType::Custom {
+            semantic_name: Some(name),
+            ..
+        } => {
             names.insert(crate::parser::pascal_to_snake(name));
         }
+        AttributeType::Custom {
+            semantic_name: None,
+            ..
+        } => {}
         AttributeType::List { inner, .. } => {
             collect_type_names_from_type(inner, names);
         }
