@@ -59,6 +59,29 @@ pub(super) fn test_engine_with_nested_structs() -> DiagnosticEngine {
     )
 }
 
+pub(super) fn test_engine_with_enum_attr() -> DiagnosticEngine {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mode_enum = AttributeType::StringEnum {
+        name: "Mode".to_string(),
+        values: vec!["fast".to_string(), "slow".to_string()],
+        namespace: None,
+        to_dsl: None,
+    };
+
+    let schema = ResourceSchema::new("test.r.mode_holder")
+        .attribute(AttributeSchema::new("mode", mode_enum));
+
+    let mut schemas = HashMap::new();
+    schemas.insert("test.r.mode_holder".to_string(), schema);
+
+    DiagnosticEngine::new(
+        Arc::new(schemas),
+        vec!["test".to_string()],
+        Arc::new(vec![]),
+    )
+}
+
 pub(super) fn test_engine_with_block_name_nested() -> DiagnosticEngine {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
