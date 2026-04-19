@@ -111,6 +111,19 @@ pub struct DeferredForExpression {
     pub template_resource: Resource,
 }
 
+/// Origin of a resource yielded by [`ParsedFile::iter_all_resources`].
+///
+/// `Direct` means the resource was declared at top-level and its iterable
+/// (if any) resolved at parse time. `Deferred` means the resource is the
+/// template body of a `for` expression whose iterable resolves later;
+/// consumers that care about loop-variable placeholders need the
+/// `DeferredForExpression` reference to filter them out.
+#[derive(Debug, Clone, Copy)]
+pub enum ResourceContext<'a> {
+    Direct,
+    Deferred(&'a DeferredForExpression),
+}
+
 /// Resource type path for typed references (e.g., aws.vpc, aws.security_group)
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ResourceTypePath {
@@ -439,6 +452,26 @@ pub struct ParsedFile {
 }
 
 impl ParsedFile {
+    /// Iterate every resource reachable from the parsed file — both
+    /// top-level `resources` and the `template_resource` of each deferred
+    /// for-expression — tagged with its origin context.
+    ///
+    /// Per-attribute checkers (type, enum, required, ref validity, etc.)
+    /// should prefer this over `self.resources.iter()` so they stay in sync
+    /// with for-body code. See
+    /// `docs/specs/2026-04-19-unify-resource-walk-design.md` for the
+    /// rationale.
+    pub fn iter_all_resources(&self) -> impl Iterator<Item = (ResourceContext<'_>, &Resource)> {
+        self.resources
+            .iter()
+            .map(|r| (ResourceContext::Direct, r))
+            .chain(
+                self.deferred_for_expressions
+                    .iter()
+                    .map(|d| (ResourceContext::Deferred(d), &d.template_resource)),
+            )
+    }
+
     /// Find a resource by resource type and name attribute value
     pub fn find_resource_by_attr(
         &self,
@@ -4552,6 +4585,37 @@ pub fn parse_and_resolve(input: &str) -> Result<ParsedFile, ParseError> {
 mod tests {
     use super::*;
     use crate::resource::InterpolationPart;
+
+    #[test]
+    fn iter_all_resources_yields_direct_then_deferred() {
+        let src = r#"
+            provider test {
+                source = 'x/y'
+                version = '0.1'
+                region = 'ap-northeast-1'
+            }
+            test.r.res {
+                name = "direct"
+            }
+            for _, id in orgs.accounts {
+                test.r.res {
+                    name = id
+                }
+            }
+        "#;
+        let parsed = parse(src, &ProviderContext::default()).unwrap();
+
+        let items: Vec<_> = parsed.iter_all_resources().collect();
+        assert_eq!(items.len(), 2, "expected one direct + one deferred");
+
+        assert!(matches!(items[0].0, ResourceContext::Direct));
+        assert_eq!(
+            items[0].1.get_attr("name"),
+            Some(&Value::String("direct".to_string()))
+        );
+
+        assert!(matches!(items[1].0, ResourceContext::Deferred(_)));
+    }
 
     #[test]
     fn parse_provider_block() {
