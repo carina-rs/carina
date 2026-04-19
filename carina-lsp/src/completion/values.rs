@@ -474,6 +474,63 @@ impl CompletionProvider {
         ]
     }
 
+    /// Completions for `for <pat> in <HERE>` — every binding that
+    /// `check_deferred_for_iterables` treats as in-scope: `let`,
+    /// `upstream_state`, module calls, imports, and argument parameters.
+    pub(super) fn for_iterable_completions(
+        &self,
+        text: &str,
+        position: Position,
+        partial: &str,
+    ) -> Vec<CompletionItem> {
+        let partial_chars = partial.chars().count() as u32;
+        let range = Range {
+            start: Position {
+                line: position.line,
+                character: position.character.saturating_sub(partial_chars),
+            },
+            end: position,
+        };
+
+        let mut items = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let push = |items: &mut Vec<CompletionItem>,
+                    seen: &mut std::collections::HashSet<String>,
+                    name: String,
+                    detail: &str| {
+            if !seen.insert(name.clone()) {
+                return;
+            }
+            items.push(CompletionItem {
+                label: name.clone(),
+                kind: Some(CompletionItemKind::VARIABLE),
+                detail: Some(detail.to_string()),
+                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                    range,
+                    new_text: name,
+                })),
+                ..Default::default()
+            });
+        };
+
+        for (name, rhs) in Self::extract_let_bindings(text) {
+            let detail = if rhs.starts_with("upstream_state") {
+                "upstream_state binding"
+            } else if rhs.starts_with("import ") {
+                "module import"
+            } else {
+                "binding"
+            };
+            push(&mut items, &mut seen, name, detail);
+        }
+
+        for (name, _) in self.extract_argument_parameters(text) {
+            push(&mut items, &mut seen, name, "argument");
+        }
+
+        items
+    }
+
     pub(super) fn upstream_state_block_completions(&self) -> Vec<CompletionItem> {
         vec![CompletionItem {
             label: "source".to_string(),
