@@ -52,6 +52,19 @@ impl CompletionProvider {
         base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {
         let text = doc.text();
+
+        // `<binding>.<partial>` where `<binding>` is an `upstream_state` is
+        // matched ahead of the block-context walk: the same prefix would
+        // otherwise be interpreted as `AfterEquals` (dot-after-binding inside
+        // a resource block) or fall through to `TopLevel`, neither of which
+        // knows how to surface upstream exports.
+        if let Some((binding, partial, source)) =
+            detect_upstream_state_dot(&text, position, base_path)
+        {
+            return self
+                .upstream_state_dot_completions(&binding, &partial, &source, position, base_path);
+        }
+
         let context = self.get_completion_context(&text, position);
 
         match context {
@@ -686,6 +699,132 @@ fn extract_for_iterable_partial(prefix: &str) -> Option<String> {
         return None;
     }
     Some(after_in.to_string())
+}
+
+/// If the prefix up to `position` ends with `<binding>.<partial>` where
+/// `<binding>` matches a `let <binding> = upstream_state { ... }` declared
+/// anywhere in `base_path`, return `(binding, partial, source_path)`. The
+/// source is returned alongside so the handler doesn't have to re-scan
+/// sibling files. Bare `<binding>` (no dot yet) is the ForIterable / value
+/// completion surface, not this one.
+fn detect_upstream_state_dot(
+    text: &str,
+    position: Position,
+    base_path: Option<&std::path::Path>,
+) -> Option<(String, String, String)> {
+    let line_idx = position.line as usize;
+    let current_line = text.lines().nth(line_idx)?;
+    let col = position.character as usize;
+    let prefix: String = current_line.chars().take(col).collect();
+    let dot_rel = prefix.rfind('.')?;
+    let before_dot = &prefix[..dot_rel];
+    let after_dot = &prefix[dot_rel + 1..];
+    if !after_dot
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    let binding_start = before_dot
+        .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let binding = &before_dot[binding_start..];
+    if binding.is_empty()
+        || !binding
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+    {
+        return None;
+    }
+    let bindings = collect_upstream_state_bindings(text, base_path);
+    let source = bindings.get(binding)?.clone();
+    Some((binding.to_string(), after_dot.to_string(), source))
+}
+
+/// Return every `let <name> = upstream_state { source = '...' }` declared
+/// in the current buffer or any sibling `.crn` under `base_path`, as a map
+/// from binding name to source path (relative, as written).
+///
+/// Intentionally does a text scan rather than going through `parse_directory`:
+/// completion runs on partial, often syntactically invalid buffers. We only
+/// need binding → source to feed `resolve_upstream_exports`, which then
+/// parses the *upstream* directory (separate from the downstream buffer).
+fn collect_upstream_state_bindings(
+    text: &str,
+    base_path: Option<&std::path::Path>,
+) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    scan_upstream_state_let(text, &mut out);
+    let Some(base) = base_path else {
+        return out;
+    };
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "crn")
+            && let Ok(content) = std::fs::read_to_string(&path)
+        {
+            scan_upstream_state_let(&content, &mut out);
+        }
+    }
+    out
+}
+
+/// Line-by-line state machine that captures `let <name> = upstream_state { ... }`
+/// and the first `source = '...'` inside its body. Handles both the common
+/// multi-line form and the single-line
+/// `let x = upstream_state { source = '...' }`.
+///
+/// A bare `find("let ")` walk would match `let ` embedded in comments or
+/// string literals; requiring `let` at the start of a trimmed line dodges
+/// those false positives.
+fn scan_upstream_state_let(text: &str, out: &mut std::collections::HashMap<String, String>) {
+    let mut pending: Option<String> = None;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if let Some((name, rhs)) = crate::let_parse::parse_let_header(line) {
+            // Any new `let` ends a previous `upstream_state` search window,
+            // preventing a sibling block's `source` from being misattributed.
+            pending = None;
+            let rhs_after = rhs.strip_prefix("upstream_state").map(str::trim_start);
+            if let Some(after_keyword) = rhs_after {
+                if let Some(body) = after_keyword.strip_prefix('{')
+                    && let Some(src) = find_source_in_line(body)
+                {
+                    out.insert(name.to_string(), src);
+                    continue;
+                }
+                pending = Some(name.to_string());
+            }
+            continue;
+        }
+        if let Some(binding) = &pending {
+            if let Some(src) = find_source_in_line(trimmed) {
+                out.insert(binding.clone(), src);
+                pending = None;
+                continue;
+            }
+            if trimmed.starts_with('}') {
+                pending = None;
+            }
+        }
+    }
+}
+
+/// If `segment` (a single line or the tail of one) contains `source = '...'`
+/// or `source = "..."`, return the inner string.
+fn find_source_in_line(segment: &str) -> Option<String> {
+    let trimmed = segment.trim_start();
+    let rest = trimmed.strip_prefix("source")?.trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
+    let quote = rest.chars().next().filter(|c| *c == '\'' || *c == '"')?;
+    let inner = &rest[quote.len_utf8()..];
+    let end = inner.find(quote)?;
+    Some(inner[..end].to_string())
 }
 
 /// If `prefix` ends with `source = '<partial>` or `source = "<partial>`
