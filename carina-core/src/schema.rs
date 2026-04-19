@@ -266,6 +266,17 @@ impl AttributeType {
                 if matches!(resolved_value, Value::ResourceRef { .. }) {
                     return Ok(());
                 }
+                // Capture the user's original input for diagnostics. The parser
+                // collapses both quoted literals (`"aaa"`) and bare identifiers
+                // (`dedicated`) into `Value::String`, and `resolve_enum_input`
+                // rewrites the non-dotted form into a synthesized namespaced
+                // string for lookup. That synthesized form must stay internal:
+                // error messages should quote what the user actually typed.
+                // See #2077.
+                let user_input = match v {
+                    Value::String(s) => Some(s.as_str()),
+                    _ => None,
+                };
                 if let Value::String(s) = &resolved_value {
                     // Check if the raw string directly matches a valid enum value
                     // before namespace validation. This handles values containing
@@ -290,9 +301,13 @@ impl AttributeType {
                         if !prefix_matches {
                             // Fall back to strict namespace validation, which
                             // produces a clear error for the common bare form.
+                            let user_form = user_input.unwrap_or(s.as_str());
                             validate_enum_namespace(s, name, ns).map_err(|message| {
                                 TypeError::ValidationFailed {
-                                    message: format!("Invalid {} '{}': {}", name, s, message),
+                                    message: format!(
+                                        "Invalid {} '{}': {}",
+                                        name, user_form, message
+                                    ),
                                 }
                             })?;
                         }
@@ -317,7 +332,7 @@ impl AttributeType {
                             }
                         }
                         Err(TypeError::InvalidEnumVariant {
-                            value: s.clone(),
+                            value: user_input.unwrap_or(s.as_str()).to_string(),
                             expected,
                         })
                     }
@@ -1881,6 +1896,50 @@ mod tests {
         );
         // Invalid value should still be rejected
         assert!(t.validate(&Value::String("ipsec.2".to_string())).is_err());
+    }
+
+    #[test]
+    fn invalid_enum_error_preserves_user_typed_string_literal() {
+        // Regression for #2077. A quoted string literal like `target_type = "aaa"`
+        // should surface in the error as the typed value, not as the synthesized
+        // namespaced form `awscc.sso.assignment.TargetType.aaa`.
+        let t = AttributeType::StringEnum {
+            name: "TargetType".to_string(),
+            values: vec!["AWS_ACCOUNT".to_string()],
+            namespace: Some("awscc.sso.assignment".to_string()),
+            to_dsl: None,
+        };
+        let err = t.validate(&Value::String("aaa".to_string())).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'aaa'"),
+            "error should quote the user's typed value, got: {msg}"
+        );
+        assert!(
+            !msg.contains("awscc.sso.assignment.TargetType.aaa"),
+            "error must not leak the synthesized namespaced form, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn invalid_enum_error_preserves_bare_identifier_form() {
+        // When the user types the namespaced form directly (bare identifier
+        // path produces the same `Value::String(...)`), the error echoes the
+        // full form back — still the "user-typed" form because that's what
+        // was in the Value. This verifies the fix doesn't regress that case.
+        let t = AttributeType::StringEnum {
+            name: "TargetType".to_string(),
+            values: vec!["AWS_ACCOUNT".to_string()],
+            namespace: Some("awscc.sso.assignment".to_string()),
+            to_dsl: None,
+        };
+        let input = "awscc.sso.assignment.TargetType.NOT_REAL".to_string();
+        let err = t.validate(&Value::String(input.clone())).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&input),
+            "error should echo the user's namespaced input, got: {msg}"
+        );
     }
 
     #[test]
