@@ -4429,7 +4429,7 @@ pub fn resolve_resource_refs_with_config(
 /// This must run on a fully merged `ParsedFile` (directory-wide), not on a
 /// single-file parse — iterables commonly reference `upstream_state` or `let`
 /// bindings declared in sibling files that only become visible after merging.
-pub fn check_deferred_for_iterables(parsed: &ParsedFile) -> Vec<ParseError> {
+pub(crate) fn check_deferred_for_iterables(parsed: &ParsedFile) -> Vec<ParseError> {
     let mut known: std::collections::HashSet<&str> = std::collections::HashSet::new();
     known.extend(parsed.resources.iter().filter_map(|r| r.binding.as_deref()));
     known.extend(parsed.arguments.iter().map(|a| a.name.as_str()));

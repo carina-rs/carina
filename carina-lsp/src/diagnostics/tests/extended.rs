@@ -2611,3 +2611,64 @@ fn for_iterable_undefined_binding_cross_file_is_flagged() {
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn for_iterable_undefined_binding_not_duplicated_across_siblings() {
+    // Two sibling files with `for _ in <same_undefined>.<attr>` on the same
+    // 1-based line must produce exactly one diagnostic in the currently
+    // edited file — not one per deferred in the merged parse.
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("project");
+    std::fs::create_dir(&base).unwrap();
+    let main = r#"for name, _ in missing.accounts {
+    awscc.ec2.vpc { name = name cidr_block = '10.0.0.0/16' }
+}
+"#;
+    let sibling = r#"for name, _ in missing.accounts {
+    awscc.ec2.vpc { name = name cidr_block = '10.0.0.0/16' }
+}
+"#;
+    std::fs::write(base.join("main.crn"), main).unwrap();
+    std::fs::write(base.join("sibling.crn"), sibling).unwrap();
+
+    let engine = test_engine();
+    let diagnostics = analyze_with_buffer(&engine, &base, "main.crn", main);
+
+    let hits: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.message.contains("Undefined identifier `missing`"))
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "expected one diagnostic in main.crn, got {}: {:?}",
+        hits.len(),
+        hits.iter()
+            .map(|d| (&d.range, &d.message))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn for_iterable_multiline_header_still_flagged() {
+    // Pest's `WHITESPACE` includes NEWLINE, so `for _ in\n    bad.attr {`
+    // parses. `deferred.line` points at the `for` keyword's line, which
+    // doesn't contain the iterable token — the diagnostic must still surface
+    // (anchored at the `for` line) rather than be silently dropped.
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("project");
+    std::fs::create_dir(&base).unwrap();
+    let main = "for name, _ in\n    missing.accounts {\n    awscc.ec2.vpc { name = name cidr_block = '10.0.0.0/16' }\n}\n";
+    std::fs::write(base.join("main.crn"), main).unwrap();
+
+    let engine = test_engine();
+    let diagnostics = analyze_with_buffer(&engine, &base, "main.crn", main);
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("Undefined identifier `missing`")),
+        "multi-line for header must still flag the undefined iterable, got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}

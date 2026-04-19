@@ -125,6 +125,27 @@ fn find_for_iterable_binding_column(
     Some((start_col, end_col))
 }
 
+/// Binding names declared anywhere in the merged parse — the same set
+/// `carina_core::parser::check_deferred_for_iterables` uses to decide whether
+/// a for-iterable's root is in scope.
+fn collect_known_bindings(merged: &ParsedFile) -> HashSet<&str> {
+    let mut known: HashSet<&str> = HashSet::new();
+    known.extend(merged.resources.iter().filter_map(|r| r.binding.as_deref()));
+    known.extend(merged.arguments.iter().map(|a| a.name.as_str()));
+    known.extend(
+        merged
+            .module_calls
+            .iter()
+            .filter_map(|c| c.binding_name.as_deref()),
+    );
+    known.extend(merged.upstream_states.iter().map(|u| u.binding.as_str()));
+    known.extend(merged.imports.iter().map(|i| i.alias.as_str()));
+    known.extend(merged.user_functions.keys().map(String::as_str));
+    known.extend(merged.variables.keys().map(String::as_str));
+    known.extend(merged.structural_bindings.iter().map(String::as_str));
+    known
+}
+
 /// Whether `deferred` was parsed from the editor's current document.
 /// `DeferredForExpression.file` is stamped with the full source path, so we
 /// compare by basename to the LSP-supplied `current_file_name`.
@@ -429,33 +450,45 @@ impl DiagnosticEngine {
         merged: &ParsedFile,
         current_file_name: Option<&str>,
     ) -> Vec<Diagnostic> {
-        let mut diagnostics = Vec::new();
+        let known = collect_known_bindings(merged);
         let text = doc.text();
-        for err in carina_core::parser::check_deferred_for_iterables(merged) {
-            let carina_core::parser::ParseError::UndefinedIdentifier { name, line } = &err else {
+        let mut diagnostics = Vec::new();
+        // Iterating the deferred list directly (rather than the error list
+        // from `check_deferred_for_iterables`) keeps a 1:1 mapping between
+        // deferred expressions and diagnostics; two sibling files with
+        // `for _ in <same>.attr` on the same line would otherwise collide on
+        // the error's `(name, line)` key.
+        for deferred in &merged.deferred_for_expressions {
+            if !deferred_in_current_file(deferred, current_file_name) {
                 continue;
-            };
-            // Surface only errors whose `for` header lives in the current
-            // document; sibling-file typos are reported when that file is
-            // analyzed. Matching by (name, line) uniquely identifies the
-            // deferred expression that produced the error.
-            let Some(deferred) = merged.deferred_for_expressions.iter().find(|d| {
-                d.iterable_binding == *name
-                    && d.line == *line
-                    && deferred_in_current_file(d, current_file_name)
-            }) else {
+            }
+            if known.contains(deferred.iterable_binding.as_str()) {
                 continue;
-            };
-            let Some((col, end_col)) = find_for_iterable_binding_column(&text, deferred.line, name)
-            else {
-                continue;
-            };
+            }
+            let line_zero_based = deferred.line.saturating_sub(1) as u32;
+            let (col, end_col) =
+                find_for_iterable_binding_column(&text, deferred.line, &deferred.iterable_binding)
+                    .unwrap_or_else(|| {
+                        // Multi-line `for` headers put the iterable on a later line;
+                        // anchor the squiggle at the `for` keyword line so the user
+                        // still sees the error.
+                        let line_chars = text
+                            .lines()
+                            .nth(deferred.line.saturating_sub(1))
+                            .map(|l| l.chars().count() as u32)
+                            .unwrap_or(0);
+                        (0, line_chars)
+                    });
             diagnostics.push(carina_diagnostic(
-                (deferred.line.saturating_sub(1)) as u32,
+                line_zero_based,
                 col,
                 end_col,
                 DiagnosticSeverity::ERROR,
-                err.to_string(),
+                carina_core::parser::ParseError::UndefinedIdentifier {
+                    name: deferred.iterable_binding.clone(),
+                    line: deferred.line,
+                }
+                .to_string(),
             ));
         }
         diagnostics
