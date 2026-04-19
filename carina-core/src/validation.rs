@@ -739,14 +739,14 @@ mod tests {
         let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc")
             .with_binding("vpc")
             .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()));
-        parsed.resources.push(vpc);
+        parsed.resources.push(vpc); // allow: direct — fixture test inspection
 
         // Resource that references the binding
         let subnet = Resource::with_provider("awscc", "ec2.subnet", "web-subnet").with_attribute(
             "vpc_id",
             Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         );
-        parsed.resources.push(subnet);
+        parsed.resources.push(subnet); // allow: direct — fixture test inspection
 
         assert!(check_unused_bindings(&parsed).is_empty());
     }
@@ -758,7 +758,7 @@ mod tests {
         let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc")
             .with_binding("vpc")
             .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()));
-        parsed.resources.push(vpc);
+        parsed.resources.push(vpc); // allow: direct — fixture test inspection
 
         let unused = check_unused_bindings(&parsed);
         assert_eq!(unused, vec!["vpc"]);
@@ -771,7 +771,7 @@ mod tests {
         // Anonymous resource (no _binding attribute)
         let bucket = Resource::with_provider("awscc", "s3.bucket", "my-bucket")
             .with_attribute("bucket_name", Value::String("my-bucket".to_string()));
-        parsed.resources.push(bucket);
+        parsed.resources.push(bucket); // allow: direct — fixture test inspection
 
         assert!(check_unused_bindings(&parsed).is_empty());
     }
@@ -781,7 +781,7 @@ mod tests {
         let mut parsed = empty_parsed();
 
         let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc").with_binding("vpc");
-        parsed.resources.push(vpc);
+        parsed.resources.push(vpc); // allow: direct — fixture test inspection
 
         // Reference inside a Map inside a List
         let mut map = HashMap::new();
@@ -791,7 +791,7 @@ mod tests {
         );
         let sg = Resource::with_provider("awscc", "ec2.security_group", "web-sg")
             .with_attribute("tags", Value::List(vec![Value::Map(map)]));
-        parsed.resources.push(sg);
+        parsed.resources.push(sg); // allow: direct — fixture test inspection
 
         assert!(check_unused_bindings(&parsed).is_empty());
     }
@@ -801,7 +801,7 @@ mod tests {
         let mut parsed = empty_parsed();
 
         let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc").with_binding("vpc");
-        parsed.resources.push(vpc);
+        parsed.resources.push(vpc); // allow: direct — fixture test inspection
 
         let mut args = HashMap::new();
         args.insert(
@@ -822,18 +822,18 @@ mod tests {
         let mut parsed = empty_parsed();
 
         let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc").with_binding("vpc");
-        parsed.resources.push(vpc);
+        parsed.resources.push(vpc); // allow: direct — fixture test inspection
 
         let sg =
             Resource::with_provider("awscc", "ec2.security_group", "web-sg").with_binding("web_sg");
-        parsed.resources.push(sg);
+        parsed.resources.push(sg); // allow: direct — fixture test inspection
 
         // Only vpc is referenced
         let subnet = Resource::with_provider("awscc", "ec2.subnet", "web-subnet").with_attribute(
             "vpc_id",
             Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         );
-        parsed.resources.push(subnet);
+        parsed.resources.push(subnet); // allow: direct — fixture test inspection
 
         let unused = check_unused_bindings(&parsed);
         assert_eq!(unused, vec!["web_sg"]);
@@ -844,7 +844,7 @@ mod tests {
         let mut parsed = empty_parsed();
 
         let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc").with_binding("vpc");
-        parsed.resources.push(vpc);
+        parsed.resources.push(vpc); // allow: direct — fixture test inspection
 
         parsed
             .attribute_params
@@ -866,7 +866,7 @@ mod tests {
         let mut parsed = empty_parsed();
 
         let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc").with_binding("vpc");
-        parsed.resources.push(vpc);
+        parsed.resources.push(vpc); // allow: direct — fixture test inspection
 
         parsed.export_params.push(crate::parser::ExportParameter {
             name: "vpc_id".to_string(),
@@ -1114,7 +1114,7 @@ let vpc = awscc.ec2.vpc {
         );
 
         let mut parsed = empty_parsed();
-        parsed.resources.push(subnet);
+        parsed.resources.push(subnet); // allow: direct — fixture test inspection
         let result =
             validate_resource_ref_types(&parsed, &schemas, &test_schema_key_fn, &HashSet::new());
         assert_eq!(
@@ -1147,8 +1147,8 @@ let vpc = awscc.ec2.vpc {
         );
 
         let mut parsed = empty_parsed();
-        parsed.resources.push(vpc);
-        parsed.resources.push(subnet);
+        parsed.resources.push(vpc); // allow: direct — fixture test inspection
+        parsed.resources.push(subnet); // allow: direct — fixture test inspection
         let result =
             validate_resource_ref_types(&parsed, &schemas, &test_schema_key_fn, &HashSet::new());
         assert_eq!(
@@ -1192,8 +1192,8 @@ let vpc = awscc.ec2.vpc {
         );
 
         let mut parsed = empty_parsed();
-        parsed.resources.push(igw);
-        parsed.resources.push(route);
+        parsed.resources.push(igw); // allow: direct — fixture test inspection
+        parsed.resources.push(route); // allow: direct — fixture test inspection
         let result =
             validate_resource_ref_types(&parsed, &schemas, &test_schema_key_fn, &HashSet::new());
         let err = result.unwrap_err();
@@ -1229,8 +1229,8 @@ let vpc = awscc.ec2.vpc {
         );
 
         let mut parsed = empty_parsed();
-        parsed.resources.push(vpc);
-        parsed.resources.push(subnet);
+        parsed.resources.push(vpc); // allow: direct — fixture test inspection
+        parsed.resources.push(subnet); // allow: direct — fixture test inspection
         let result =
             validate_resource_ref_types(&parsed, &schemas, &test_schema_key_fn, &HashSet::new());
         let err = result.unwrap_err();
@@ -1616,7 +1616,7 @@ let vpc = awscc.ec2.vpc {
 
         let caller = Resource::with_provider("aws", "sts.caller_identity", "caller_identity")
             .with_binding("_");
-        parsed.resources.push(caller);
+        parsed.resources.push(caller); // allow: direct — fixture test inspection
 
         assert!(check_unused_bindings(&parsed).is_empty());
     }
@@ -2092,7 +2092,7 @@ let vpc = awscc.ec2.vpc {
         known.insert("awscc".to_string());
 
         let mut parsed = empty_parsed();
-        parsed.resources.push(vpc);
+        parsed.resources.push(vpc); // allow: direct — fixture test inspection
         let err = validate_resources(&parsed, &schemas, &test_schema_key_fn, &known).unwrap_err();
         assert!(
             err.contains("Exactly one of [cidr_block, ipv4_ipam_pool_id] must be specified"),
