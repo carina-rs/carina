@@ -4429,7 +4429,7 @@ pub fn resolve_resource_refs_with_config(
 /// This must run on a fully merged `ParsedFile` (directory-wide), not on a
 /// single-file parse — iterables commonly reference `upstream_state` or `let`
 /// bindings declared in sibling files that only become visible after merging.
-pub(crate) fn check_deferred_for_iterables(parsed: &ParsedFile) -> Result<(), ParseError> {
+pub fn check_deferred_for_iterables(parsed: &ParsedFile) -> Vec<ParseError> {
     let mut known: std::collections::HashSet<&str> = std::collections::HashSet::new();
     known.extend(parsed.resources.iter().filter_map(|r| r.binding.as_deref()));
     known.extend(parsed.arguments.iter().map(|a| a.name.as_str()));
@@ -4445,15 +4445,15 @@ pub(crate) fn check_deferred_for_iterables(parsed: &ParsedFile) -> Result<(), Pa
     known.extend(parsed.variables.keys().map(String::as_str));
     known.extend(parsed.structural_bindings.iter().map(String::as_str));
 
-    for deferred in &parsed.deferred_for_expressions {
-        if !known.contains(deferred.iterable_binding.as_str()) {
-            return Err(ParseError::UndefinedIdentifier {
-                name: deferred.iterable_binding.clone(),
-                line: deferred.line,
-            });
-        }
-    }
-    Ok(())
+    parsed
+        .deferred_for_expressions
+        .iter()
+        .filter(|d| !known.contains(d.iterable_binding.as_str()))
+        .map(|d| ParseError::UndefinedIdentifier {
+            name: d.iterable_binding.clone(),
+            line: d.line,
+        })
+        .collect()
 }
 
 fn resolve_value_with_config(
@@ -10814,9 +10814,9 @@ awscc.ec2.vpc {
         // per-file parsing.
         let parsed = parse(input, &ProviderContext::default())
             .expect("single-file parse must not reject cross-file iterables");
-        let err = check_deferred_for_iterables(&parsed)
-            .expect_err("undefined `orgs` must be a hard error");
-        match err {
+        let errs = check_deferred_for_iterables(&parsed);
+        assert_eq!(errs.len(), 1, "expected one error, got {errs:?}");
+        match &errs[0] {
             ParseError::UndefinedIdentifier { name, .. } => {
                 assert_eq!(name, "orgs");
             }
