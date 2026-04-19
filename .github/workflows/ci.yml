@@ -51,6 +51,13 @@ jobs:
       - uses: actions/checkout@v4
       - run: bash scripts/check-provider-boundaries.sh
 
+  check-resources-access:
+    name: Check Direct parsed.resources Access
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/check-no-direct-resources-access.sh
+
   check-plan-fixtures:
     name: Check Plan Fixtures
     runs-on: ubuntu-latest
