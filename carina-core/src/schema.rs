@@ -836,6 +836,11 @@ pub struct ResourceSchema {
     /// Per-resource operational config (timeouts, retries).
     /// When None, provider defaults are used.
     pub operation_config: Option<OperationConfig>,
+    /// Declarative "exactly one of" groups. Each inner vec is a group of
+    /// attribute names where exactly one must be specified. Unlike `validator`
+    /// (a function pointer), this is plain data and survives the WASM plugin
+    /// boundary.
+    pub exclusive_required: Vec<Vec<String>>,
 }
 
 impl ResourceSchema {
@@ -849,6 +854,7 @@ impl ResourceSchema {
             name_attribute: None,
             force_replace: false,
             operation_config: None,
+            exclusive_required: Vec::new(),
         }
     }
 
@@ -864,6 +870,20 @@ impl ResourceSchema {
 
     pub fn with_validator(mut self, validator: ResourceValidator) -> Self {
         self.validator = Some(validator);
+        self
+    }
+
+    /// Declare that exactly one of the given attributes must be specified.
+    ///
+    /// Equivalent to a CloudFormation `oneOf` of required properties. Stored
+    /// as data (not a closure) so the constraint survives serialization —
+    /// in particular, crossing the WASM plugin boundary.
+    ///
+    /// Multiple calls append additional groups; each group is evaluated
+    /// independently by `validate()`.
+    pub fn exclusive_required(mut self, fields: &[&str]) -> Self {
+        self.exclusive_required
+            .push(fields.iter().map(|s| s.to_string()).collect());
         self
     }
 
@@ -1014,6 +1034,14 @@ impl ResourceSchema {
                     name: name.clone(),
                     suggestion,
                 });
+            }
+        }
+
+        // Evaluate declarative exclusive-required groups (WASM-safe).
+        for group in &self.exclusive_required {
+            let refs: Vec<&str> = group.iter().map(|s| s.as_str()).collect();
+            if let Err(mut e) = validators::validate_exclusive_required(attributes, &refs) {
+                errors.append(&mut e);
             }
         }
 
@@ -2431,6 +2459,85 @@ mod tests {
         );
         let result = schema.validate(&attrs4);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn exclusive_required_declarative() {
+        // Same semantics as the closure-based form above, but declared as data
+        // so it can cross the WASM plugin boundary.
+        let schema = ResourceSchema::new("vpc")
+            .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
+            .attribute(AttributeSchema::new(
+                "ipv4_ipam_pool_id",
+                AttributeType::String,
+            ))
+            .exclusive_required(&["cidr_block", "ipv4_ipam_pool_id"]);
+
+        // Valid: exactly one present
+        let mut one = HashMap::new();
+        one.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        assert!(schema.validate(&one).is_ok());
+
+        // Invalid: neither present
+        let empty = HashMap::new();
+        let err = schema.validate(&empty).unwrap_err();
+        assert!(
+            err.iter().any(|e| e
+                .to_string()
+                .contains("Exactly one of [cidr_block, ipv4_ipam_pool_id] must be specified")),
+            "missing expected error, got: {:?}",
+            err
+        );
+
+        // Invalid: both present
+        let mut both = HashMap::new();
+        both.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        both.insert(
+            "ipv4_ipam_pool_id".to_string(),
+            Value::String("pool-1".to_string()),
+        );
+        let err = schema.validate(&both).unwrap_err();
+        assert!(
+            err.iter().any(|e| e
+                .to_string()
+                .contains("Only one of [cidr_block, ipv4_ipam_pool_id] can be specified")),
+            "missing expected error, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn exclusive_required_multiple_groups() {
+        let schema = ResourceSchema::new("multi")
+            .attribute(AttributeSchema::new("a", AttributeType::String))
+            .attribute(AttributeSchema::new("b", AttributeType::String))
+            .attribute(AttributeSchema::new("x", AttributeType::String))
+            .attribute(AttributeSchema::new("y", AttributeType::String))
+            .exclusive_required(&["a", "b"])
+            .exclusive_required(&["x", "y"]);
+
+        // Neither group satisfied → two errors
+        let err = schema.validate(&HashMap::new()).unwrap_err();
+        assert_eq!(
+            err.iter()
+                .filter(|e| e.to_string().contains("Exactly one of"))
+                .count(),
+            2,
+            "expected two missing-group errors, got: {:?}",
+            err
+        );
+
+        // Satisfy both groups
+        let mut ok = HashMap::new();
+        ok.insert("a".to_string(), Value::String("1".to_string()));
+        ok.insert("x".to_string(), Value::String("1".to_string()));
+        assert!(schema.validate(&ok).is_ok());
     }
 
     #[test]

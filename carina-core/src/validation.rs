@@ -1060,6 +1060,7 @@ let vpc = awscc.ec2.vpc {
             name_attribute: None,
             force_replace: false,
             operation_config: None,
+            exclusive_required: Vec::new(),
         }
     }
 
@@ -1994,6 +1995,35 @@ let vpc = awscc.ec2.vpc {
         assert!(
             err.contains("accounts") && err.contains("type mismatch"),
             "error should mention the export name and type mismatch, got: {err}"
+        );
+    }
+
+    /// `validate_resources` must reject a resource whose schema declares an
+    /// `exclusive_required` group that is not satisfied — mirrors
+    /// `awscc.ec2.vpc {}` with no cidr_block / ipam pool.
+    #[test]
+    fn validate_resources_rejects_missing_exclusive_required() {
+        let schema = make_schema(
+            "ec2.vpc",
+            vec![
+                ("cidr_block", AttributeType::String),
+                ("ipv4_ipam_pool_id", AttributeType::String),
+            ],
+        )
+        .exclusive_required(&["cidr_block", "ipv4_ipam_pool_id"]);
+
+        let mut schemas = HashMap::new();
+        schemas.insert("ec2.vpc".to_string(), schema);
+
+        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc");
+
+        let mut known = HashSet::new();
+        known.insert("awscc".to_string());
+
+        let err = validate_resources(&[vpc], &schemas, &test_schema_key_fn, &known).unwrap_err();
+        assert!(
+            err.contains("Exactly one of [cidr_block, ipv4_ipam_pool_id] must be specified"),
+            "expected exclusive_required error, got: {err}"
         );
     }
 }
