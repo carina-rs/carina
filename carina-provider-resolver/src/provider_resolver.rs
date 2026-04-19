@@ -674,14 +674,173 @@ fn resolve_version(
     }
 }
 
+/// How strictly `resolve_all` treats a pre-existing lock file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockMode {
+    /// Default for `carina init`: error on mismatch between `.crn` and lock,
+    /// but a provider absent from the lock (first-time add) is accepted.
+    Normal,
+    /// Rebuild the lock from scratch: ignore existing entries and resolve
+    /// every provider as if starting fresh. Set by `carina init --upgrade`.
+    Upgrade,
+    /// Strict CI mode: the lock must match the `.crn` exactly. A provider
+    /// present in `.crn` but missing from the lock is an error.
+    /// Set by `carina init --locked`. Mirrors Cargo's `--locked`.
+    Locked,
+}
+
+/// Compare `.crn` provider configs against the lock file and return an
+/// error when they disagree. Silent rewrites of the lock on mismatch were
+/// defeating the reproducibility contract (issue #2026); every mature tool
+/// (Cargo, npm ci, Terraform, Bundler) errors instead.
+///
+/// Categories detected:
+/// - Version constraint that no longer accepts the locked version.
+/// - `.crn` switched from version mode to revision mode (or vice versa)
+///   since the lock was written.
+/// - Same mode but different revision.
+/// - (`--locked` only) provider present in `.crn` but missing from the lock.
+///
+/// Orphan lock entries (present in lock, absent in `.crn`) are intentionally
+/// not reported here — they don't block `init` and the normal resolve loop
+/// leaves them in place. `--upgrade` is the way to prune.
+pub fn check_lock_mismatch(
+    providers: &[ProviderConfig],
+    lock_file: &LockFile,
+    mode: LockMode,
+) -> Result<(), String> {
+    if mode == LockMode::Upgrade {
+        return Ok(());
+    }
+
+    for config in providers {
+        let source = match &config.source {
+            Some(s) if !s.starts_with("file://") => s.as_str(),
+            // No source or file:// — either the resolver skips it or the
+            // sha256 is refreshed every run, so there's nothing to mismatch.
+            _ => continue,
+        };
+
+        let lock_entry = match lock_file.find_by_source(source) {
+            Some(entry) => entry,
+            None => {
+                if mode == LockMode::Locked {
+                    return Err(format!(
+                        "provider '{}' is declared in .crn but missing from carina-providers.lock\n\
+                         hint: running with --locked requires the lock to be committed up-to-date;\n\
+                               re-run without --locked (or `carina init --upgrade`) to populate it.",
+                        config.name
+                    ));
+                }
+                continue;
+            }
+        };
+
+        match (&config.revision, &config.version, &lock_entry.kind) {
+            // .crn revision — lock revision: must match literally.
+            (
+                Some(crn_rev),
+                _,
+                LockEntryKind::Revision {
+                    revision: locked_rev,
+                    ..
+                },
+            ) => {
+                if crn_rev != locked_rev {
+                    return Err(mismatch_error(
+                        &config.name,
+                        &format!("revision = '{locked_rev}'"),
+                        &format!("revision = '{crn_rev}'"),
+                    ));
+                }
+            }
+            // .crn revision — lock version (mode switched).
+            (
+                Some(crn_rev),
+                _,
+                LockEntryKind::Version {
+                    version: locked_ver,
+                    ..
+                },
+            ) => {
+                return Err(mismatch_error(
+                    &config.name,
+                    &format!("version  = '{locked_ver}'"),
+                    &format!("revision = '{crn_rev}'"),
+                ));
+            }
+            // .crn version constraint — lock version: constraint must still accept it.
+            (
+                None,
+                Some(constraint),
+                LockEntryKind::Version {
+                    version: locked_ver,
+                    ..
+                },
+            ) => {
+                if !constraint.matches(locked_ver).unwrap_or(false) {
+                    return Err(mismatch_error(
+                        &config.name,
+                        &format!("version = '{locked_ver}'"),
+                        &format!("constraint = '{}'", constraint.raw),
+                    ));
+                }
+            }
+            // .crn version — lock revision (mode switched).
+            (
+                None,
+                Some(constraint),
+                LockEntryKind::Revision {
+                    revision: locked_rev,
+                    ..
+                },
+            ) => {
+                return Err(mismatch_error(
+                    &config.name,
+                    &format!("revision = '{locked_rev}'"),
+                    &format!("version constraint = '{}'", constraint.raw),
+                ));
+            }
+            // No constraint, no revision in .crn — accept whatever is locked.
+            (None, None, _) => {}
+            // .crn has both revision and version (parser should reject this);
+            // treat as accept and let the resolver surface its own error.
+            (Some(_), Some(_), _) => {}
+            // .crn provider vs a file-mode lock entry: sources shouldn't match,
+            // so this arm is effectively unreachable, but bail safely.
+            (_, _, LockEntryKind::File) => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn mismatch_error(name: &str, lock_shape: &str, crn_shape: &str) -> String {
+    format!(
+        "lock file does not match providers.crn\n  \
+         provider '{name}':\n    \
+         providers.crn:  {crn_shape}\n    \
+         lock:           {lock_shape}\n  \
+         hint: run `carina init --upgrade` to resolve providers from the current\n        \
+         configuration and rewrite carina-providers.lock"
+    )
+}
+
 /// Resolve all providers that need GitHub source resolution.
 pub fn resolve_all(
     base_dir: &Path,
     providers: &[ProviderConfig],
-    upgrade: bool,
+    mode: LockMode,
 ) -> Result<HashMap<String, PathBuf>, String> {
     let lock_path = base_dir.join("carina-providers.lock");
     let mut lock_file = LockFile::load(&lock_path)?.unwrap_or_default();
+
+    // Fail before touching the filesystem if the lock disagrees with .crn.
+    // Rewriting the lock requires `--upgrade`; `--locked` tightens this to
+    // require every provider to be present in the lock too.
+    check_lock_mismatch(providers, &lock_file, mode)?;
+
+    let upgrade = mode == LockMode::Upgrade;
     let mut resolved = HashMap::new();
 
     for config in providers {
@@ -1207,7 +1366,7 @@ sha256 = "abc"
             default_tags: std::collections::HashMap::new(),
         }];
 
-        let result = resolve_all(tmp.path(), &providers, false).unwrap();
+        let result = resolve_all(tmp.path(), &providers, LockMode::Normal).unwrap();
         let dest = result.get("test").expect("provider should be resolved");
         assert!(dest.exists());
         assert!(dest.starts_with(tmp.path().join(".carina/providers/file")));
@@ -1231,7 +1390,7 @@ sha256 = "abc"
             attributes: std::collections::HashMap::new(),
             default_tags: std::collections::HashMap::new(),
         }];
-        let err = resolve_all(tmp.path(), &providers, false).unwrap_err();
+        let err = resolve_all(tmp.path(), &providers, LockMode::Normal).unwrap_err();
         assert!(err.contains("not found"));
     }
 
@@ -1313,5 +1472,176 @@ sha256 = "abc"
 
         // SAFETY: still holding env_lock.
         unsafe { std::env::remove_var("CARINA_PLUGIN_CACHE_DIR") };
+    }
+
+    // --- Issue #2026: lock vs .crn mismatch must error without --upgrade ---
+
+    fn versioned_config(source: &str, constraint: &str) -> ProviderConfig {
+        ProviderConfig {
+            name: "awscc".into(),
+            source: Some(source.into()),
+            version: Some(
+                carina_core::version_constraint::VersionConstraint::parse(constraint).unwrap(),
+            ),
+            revision: None,
+            attributes: std::collections::HashMap::new(),
+            default_tags: std::collections::HashMap::new(),
+        }
+    }
+
+    const SRC: &str = "github.com/carina-rs/carina-provider-awscc";
+
+    #[test]
+    fn check_mismatch_detects_constraint_unsatisfied() {
+        let mut lock = LockFile::default();
+        lock.upsert(version_entry(SRC, "0.5.2"));
+        let cfg = versioned_config(SRC, "~0.6.0");
+
+        let err = check_lock_mismatch(&[cfg], &lock, LockMode::Normal)
+            .expect_err("lock version 0.5.2 does not satisfy ~0.6.0 — must error");
+        assert!(err.contains("awscc"), "{err}");
+        assert!(err.contains("0.5.2"), "{err}");
+        assert!(err.contains("~0.6.0"), "{err}");
+        assert!(err.contains("--upgrade"), "{err}");
+    }
+
+    #[test]
+    fn check_mismatch_detects_version_to_revision_switch() {
+        let mut lock = LockFile::default();
+        lock.upsert(version_entry(SRC, "0.5.2"));
+        let cfg = provider_config(SRC, Some("main"));
+
+        let err = check_lock_mismatch(&[cfg], &lock, LockMode::Normal)
+            .expect_err(".crn revision vs lock version must error");
+        assert!(err.contains("awscc"), "{err}");
+        assert!(err.contains("revision"), "{err}");
+        assert!(err.contains("version"), "{err}");
+        assert!(err.contains("--upgrade"), "{err}");
+    }
+
+    #[test]
+    fn check_mismatch_detects_revision_to_version_switch() {
+        let mut lock = LockFile::default();
+        lock.upsert(revision_entry(SRC, "main", "abc123"));
+        let cfg = versioned_config(SRC, "~0.5.0");
+
+        let err = check_lock_mismatch(&[cfg], &lock, LockMode::Normal)
+            .expect_err(".crn version vs lock revision must error");
+        assert!(err.contains("awscc"), "{err}");
+        assert!(err.contains("--upgrade"), "{err}");
+    }
+
+    #[test]
+    fn check_mismatch_detects_revision_change() {
+        let mut lock = LockFile::default();
+        lock.upsert(revision_entry(SRC, "main", "abc123"));
+        let cfg = provider_config(SRC, Some("develop"));
+
+        let err = check_lock_mismatch(&[cfg], &lock, LockMode::Normal)
+            .expect_err(".crn revision changed vs lock — must error");
+        assert!(err.contains("awscc"), "{err}");
+        assert!(err.contains("main"), "{err}");
+        assert!(err.contains("develop"), "{err}");
+        assert!(err.contains("--upgrade"), "{err}");
+    }
+
+    /// Adding a new provider not in the lock is fine in Normal mode — that's
+    /// the expected first-time flow.
+    #[test]
+    fn check_mismatch_allows_new_provider_in_normal_mode() {
+        let lock = LockFile::default();
+        let cfg = provider_config(SRC, Some("main"));
+        assert!(check_lock_mismatch(&[cfg], &lock, LockMode::Normal).is_ok());
+    }
+
+    /// In `--locked` mode, a provider missing from the lock is an error (the
+    /// lock is supposed to be the full source of truth, matching `cargo --locked`).
+    #[test]
+    fn check_mismatch_rejects_new_provider_in_locked_mode() {
+        let lock = LockFile::default();
+        let cfg = provider_config(SRC, Some("main"));
+
+        let err = check_lock_mismatch(&[cfg], &lock, LockMode::Locked)
+            .expect_err("--locked must error when a provider is missing from the lock");
+        assert!(err.contains("awscc"), "{err}");
+        assert!(err.contains("locked"), "{err}");
+    }
+
+    /// Happy path: lock matches .crn exactly → no error.
+    #[test]
+    fn check_mismatch_accepts_matching_version() {
+        let mut lock = LockFile::default();
+        lock.upsert(version_entry(SRC, "0.5.2"));
+        let cfg = versioned_config(SRC, "~0.5.0");
+
+        assert!(check_lock_mismatch(&[cfg], &lock, LockMode::Normal).is_ok());
+    }
+
+    #[test]
+    fn check_mismatch_accepts_matching_revision() {
+        let mut lock = LockFile::default();
+        lock.upsert(revision_entry(SRC, "main", "abc"));
+        let cfg = provider_config(SRC, Some("main"));
+
+        assert!(check_lock_mismatch(&[cfg], &lock, LockMode::Normal).is_ok());
+    }
+
+    /// .crn without a version constraint and lock with a pinned version is OK
+    /// (no constraint means "accept whatever is locked").
+    #[test]
+    fn check_mismatch_accepts_unconstrained_version_config() {
+        let mut lock = LockFile::default();
+        lock.upsert(version_entry(SRC, "0.5.2"));
+        let cfg = provider_config(SRC, None);
+
+        assert!(check_lock_mismatch(&[cfg], &lock, LockMode::Normal).is_ok());
+    }
+
+    /// End-to-end: `resolve_all` in Normal mode with a stale lock errors
+    /// *before* doing any network or filesystem work, and leaves the existing
+    /// lock file untouched. That's the invariant the whole fix is built on.
+    #[test]
+    fn resolve_all_errors_on_mismatch_without_touching_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let lock_path = base.join("carina-providers.lock");
+
+        // Pre-existing lock: revision mode.
+        let mut lock = LockFile::default();
+        lock.upsert(revision_entry(SRC, "main", "abc123"));
+        lock.save(&lock_path).unwrap();
+        let before = fs::read_to_string(&lock_path).unwrap();
+
+        // .crn now wants a version — should error, not fall through to a
+        // network fetch, and not rewrite the lock.
+        let providers = vec![versioned_config(SRC, "~0.5.0")];
+        let err = resolve_all(base, &providers, LockMode::Normal)
+            .expect_err("mismatched lock must abort resolve_all");
+        assert!(err.contains("--upgrade"), "{err}");
+
+        let after = fs::read_to_string(&lock_path).unwrap();
+        assert_eq!(before, after, "lock must be untouched on mismatch error");
+    }
+
+    /// file:// providers skip the lock-mismatch check — their `sha256` is
+    /// refreshed on every `init` by design.
+    #[test]
+    fn check_mismatch_skips_file_sources() {
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "test".into(),
+            source: "file:///tmp/provider.wasm".into(),
+            kind: LockEntryKind::File,
+            sha256: "abc".into(),
+        });
+        let cfg = ProviderConfig {
+            name: "test".into(),
+            source: Some("file:///tmp/provider.wasm".into()),
+            version: None,
+            revision: None,
+            attributes: std::collections::HashMap::new(),
+            default_tags: std::collections::HashMap::new(),
+        };
+        assert!(check_lock_mismatch(&[cfg], &lock, LockMode::Normal).is_ok());
     }
 }

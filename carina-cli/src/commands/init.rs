@@ -5,9 +5,20 @@ use colored::Colorize;
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::parser::ProviderContext;
 
-use carina_provider_resolver;
+use carina_provider_resolver::{self, LockMode};
 
-pub fn run_init(path: &Path, upgrade: bool) -> Result<(), String> {
+pub fn run_init(path: &Path, upgrade: bool, locked: bool) -> Result<(), String> {
+    if upgrade && locked {
+        return Err("--upgrade and --locked are mutually exclusive".to_string());
+    }
+    let mode = if upgrade {
+        LockMode::Upgrade
+    } else if locked {
+        LockMode::Locked
+    } else {
+        LockMode::Normal
+    };
+
     let base_dir = get_base_dir(path);
     let path_buf = path.to_path_buf();
 
@@ -23,14 +34,18 @@ pub fn run_init(path: &Path, upgrade: bool) -> Result<(), String> {
         .collect();
 
     if !sourced_providers.is_empty() {
-        let action = if upgrade { "Upgrading" } else { "Resolving" };
+        let action = match mode {
+            LockMode::Upgrade => "Upgrading",
+            LockMode::Locked => "Verifying locked",
+            LockMode::Normal => "Resolving",
+        };
         println!(
             "{}",
             format!("{} {} provider(s)...", action, sourced_providers.len()).cyan()
         );
 
         let resolved =
-            carina_provider_resolver::resolve_all(base_dir, &loaded.parsed.providers, upgrade)?;
+            carina_provider_resolver::resolve_all(base_dir, &loaded.parsed.providers, mode)?;
 
         println!(
             "{}",
