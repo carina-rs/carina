@@ -1620,3 +1620,182 @@ fn for_iterable_after_dot_does_not_trigger() {
         completions.iter().map(|c| &c.label).collect::<Vec<_>>()
     );
 }
+
+// =====================================================================
+// upstream_state exports completion after `<binding>.` (#1996)
+// =====================================================================
+
+fn set_up_upstream_project(
+    upstream_exports: &str,
+    downstream_main: &str,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let upstream = tmp.path().join("organizations");
+    std::fs::create_dir(&upstream).unwrap();
+    std::fs::write(upstream.join("exports.crn"), upstream_exports).unwrap();
+    let base = tmp.path().join("downstream");
+    std::fs::create_dir(&base).unwrap();
+    std::fs::write(base.join("main.crn"), downstream_main).unwrap();
+    (tmp, base)
+}
+
+#[test]
+fn upstream_state_dot_completion_in_for_iterable_lists_exports() {
+    let provider = test_provider();
+    let (_tmp, base) = set_up_upstream_project(
+        "exports {\n  accounts: map(string) = \"x\"\n  region: string = \"ap-northeast-1\"\n}\n",
+        "let orgs = upstream_state { source = '../organizations' }\nfor _, id in orgs.\n",
+    );
+    let main_src = std::fs::read_to_string(base.join("main.crn")).unwrap();
+    let doc = create_document(&main_src);
+    // Cursor right after `orgs.` on line 1.
+    let position = Position {
+        line: 1,
+        character: "for _, id in orgs.".chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&base));
+
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"accounts"),
+        "expected `accounts` in completions, got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"region"),
+        "expected `region` in completions, got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn upstream_state_dot_completion_cross_file_binding() {
+    // `let orgs = ...` declared in a sibling .crn file, referenced from
+    // main.crn. The completion must still find the exports.
+    let provider = test_provider();
+    let tmp = tempfile::tempdir().unwrap();
+    let upstream = tmp.path().join("organizations");
+    std::fs::create_dir(&upstream).unwrap();
+    std::fs::write(
+        upstream.join("exports.crn"),
+        "exports {\n  accounts: map(string) = \"x\"\n}\n",
+    )
+    .unwrap();
+    let base = tmp.path().join("downstream");
+    std::fs::create_dir(&base).unwrap();
+    std::fs::write(
+        base.join("backend.crn"),
+        "let orgs = upstream_state { source = '../organizations' }\n",
+    )
+    .unwrap();
+    let main = "for _, id in orgs.\n";
+    std::fs::write(base.join("main.crn"), main).unwrap();
+    let doc = create_document(main);
+    let position = Position {
+        line: 0,
+        character: "for _, id in orgs.".chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&base));
+
+    assert!(
+        completions.iter().any(|c| c.label == "accounts"),
+        "expected `accounts` from sibling-declared upstream_state, got: {:?}",
+        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn upstream_state_dot_completion_text_edit_replaces_partial() {
+    // `orgs.acc<cursor>` — the TextEdit must replace the `acc` partial so
+    // accepting `accounts` yields `orgs.accounts`, not `orgs.accaccounts`.
+    let provider = test_provider();
+    let (_tmp, base) = set_up_upstream_project(
+        "exports {\n  accounts: map(string) = \"x\"\n}\n",
+        "let orgs = upstream_state { source = '../organizations' }\nfor _, id in orgs.acc\n",
+    );
+    let main_src = std::fs::read_to_string(base.join("main.crn")).unwrap();
+    let doc = create_document(&main_src);
+    let position = Position {
+        line: 1,
+        character: "for _, id in orgs.acc".chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&base));
+    let accounts = completions
+        .iter()
+        .find(|c| c.label == "accounts")
+        .expect("expected `accounts` completion");
+    match accounts.text_edit.as_ref() {
+        Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) => {
+            assert_eq!(edit.new_text, "accounts");
+            assert_eq!(edit.range.start.line, 1);
+            // `for _, id in orgs.` occupies cols 0..18; `acc` starts at col 18
+            assert_eq!(edit.range.start.character, 18);
+            assert_eq!(edit.range.end.character, 21);
+        }
+        other => panic!("expected TextEdit::Edit, got {:?}", other),
+    }
+}
+
+#[test]
+fn upstream_state_dot_completion_missing_source_does_not_crash() {
+    // Source directory doesn't exist — must return no completions, not panic.
+    let provider = test_provider();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().to_path_buf();
+    let main = "let orgs = upstream_state { source = '../does-not-exist' }\nfor _, id in orgs.\n";
+    std::fs::write(base.join("main.crn"), main).unwrap();
+    let doc = create_document(main);
+    let position = Position {
+        line: 1,
+        character: "for _, id in orgs.".chars().count() as u32,
+    };
+
+    let _ = provider.complete(&doc, position, Some(&base));
+    // No crash is the entire assertion here.
+}
+
+#[test]
+fn upstream_state_dot_completion_ignores_unrelated_let_source() {
+    // `let orgs = upstream_state { ... }` declares the binding but omits
+    // the source on the opening line. The next `let` declares a sibling
+    // block with its own `source`. The scanner must not misattribute that
+    // sibling's source to `orgs`.
+    let provider = test_provider();
+    let tmp = tempfile::tempdir().unwrap();
+    let upstream = tmp.path().join("organizations");
+    std::fs::create_dir(&upstream).unwrap();
+    std::fs::write(
+        upstream.join("exports.crn"),
+        "exports {\n  accounts: map(string) = \"x\"\n}\n",
+    )
+    .unwrap();
+    let other = tmp.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    std::fs::write(other.join("exports.crn"), "exports {\n}\n").unwrap();
+    let base = tmp.path().join("downstream");
+    std::fs::create_dir(&base).unwrap();
+    // `orgs` opens without `source` on the opening line (malformed or
+    // mid-edit), then a different `let` with its own source follows.
+    let main = "\
+let orgs = upstream_state {
+}
+let other = upstream_state { source = '../other' }
+for _, id in orgs.
+";
+    std::fs::write(base.join("main.crn"), main).unwrap();
+    let doc = create_document(main);
+    let position = Position {
+        line: 3,
+        character: "for _, id in orgs.".chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&base));
+
+    assert!(
+        !completions.iter().any(|c| c.label == "accounts"),
+        "orgs has no source set, must not resolve to other's exports"
+    );
+}

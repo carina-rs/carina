@@ -564,6 +564,62 @@ impl CompletionProvider {
         items
     }
 
+    /// Completions for `<binding>.<partial>` where `<binding>` is an
+    /// `upstream_state`. Lists every key declared in the upstream's
+    /// `exports { }` block, via `resolve_upstream_exports`.
+    pub(super) fn upstream_state_dot_completions(
+        &self,
+        binding: &str,
+        partial: &str,
+        source: &str,
+        position: Position,
+        base_path: Option<&Path>,
+    ) -> Vec<CompletionItem> {
+        let Some(base) = base_path else {
+            return Vec::new();
+        };
+        let upstream = carina_core::parser::UpstreamState {
+            binding: binding.to_string(),
+            source: std::path::PathBuf::from(source),
+        };
+        let (exports, _errors) = carina_core::upstream_exports::resolve_upstream_exports(
+            base,
+            &[upstream],
+            &Default::default(),
+        );
+        let Some(keys) = exports.get(binding) else {
+            return Vec::new();
+        };
+
+        // Replace just `<partial>` (the characters after the dot), so
+        // accepting a suggestion slots into the existing `<binding>.` prefix
+        // instead of duplicating it.
+        let partial_chars = partial.chars().count() as u32;
+        let range = Range {
+            start: Position {
+                line: position.line,
+                character: position.character.saturating_sub(partial_chars),
+            },
+            end: position,
+        };
+
+        let mut items: Vec<CompletionItem> = keys
+            .iter()
+            .map(|key| CompletionItem {
+                label: key.clone(),
+                kind: Some(CompletionItemKind::FIELD),
+                detail: Some(format!("export from upstream_state `{}`", binding)),
+                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                    range,
+                    new_text: key.clone(),
+                })),
+                ..Default::default()
+            })
+            .collect();
+        items.sort_by(|a, b| a.label.cmp(&b.label));
+        items
+    }
+
     pub(super) fn upstream_state_block_completions(&self) -> Vec<CompletionItem> {
         vec![CompletionItem {
             label: "source".to_string(),
