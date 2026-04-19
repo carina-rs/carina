@@ -1469,3 +1469,154 @@ fn upstream_state_source_text_edit_range_covers_typed_partial() {
     assert_eq!(edit.range.end.line, 1);
     assert_eq!(edit.range.end.character, 19);
 }
+
+// =====================================================================
+// for-iterable binding completion (#2037)
+// =====================================================================
+
+#[test]
+fn for_iterable_position_suggests_let_binding() {
+    // `for _ in <HERE>`: the in-scope `let` binding should appear.
+    let provider = test_provider();
+    let source = "let orgs = upstream_state { source = '../organizations' }\nfor name, _ in o";
+    let doc = create_document(source);
+    let last_line = source.lines().next_back().unwrap_or("");
+    let position = Position {
+        line: 1,
+        character: last_line.chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+
+    assert!(
+        completions.iter().any(|c| c.label == "orgs"),
+        "expected `orgs` in completions, got: {:?}",
+        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn for_iterable_position_suggests_module_call_binding() {
+    // A module call binding (`let x = mymod { ... }`) must also appear.
+    let provider = test_provider();
+    let source = "\
+import './mods' as mymod
+let inst = mymod { foo = 1 }
+for name, _ in i";
+    let doc = create_document(source);
+    let last_line = source.lines().next_back().unwrap_or("");
+    let position = Position {
+        line: 2,
+        character: last_line.chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+
+    assert!(
+        completions.iter().any(|c| c.label == "inst"),
+        "expected `inst` in completions, got: {:?}",
+        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn for_binding_declaration_position_does_not_suggest_bindings() {
+    // `for <HERE>, _ in orgs.accounts`: cursor is on the loop-variable
+    // declaration (before `in`), not on the iterable. Existing bindings
+    // must not appear — only the iterable position triggers ForIterable.
+    let provider = test_provider();
+    // Cursor after `for ` on line 1; the `, _ in orgs.accounts {` tail is
+    // already on the line, so the full line is a valid-looking for-header.
+    let source = "let orgs = upstream_state { source = '../organizations' }\nfor , _ in orgs.accounts {\n}\n";
+    let doc = create_document(source);
+    let position = Position {
+        line: 1,
+        character: 4, // cursor sits right after "for "
+    };
+
+    let completions = provider.complete(&doc, position, None);
+
+    assert!(
+        !completions.iter().any(|c| c.label == "orgs"),
+        "binding-declaration position must not offer existing bindings, got: {:?}",
+        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn for_iterable_offers_binding_declared_in_sibling_file() {
+    // `let orgs = upstream_state { ... }` commonly lives in a sibling
+    // `backend.crn` while the `for _ in orgs.accounts` sits in `main.crn`.
+    // Completion must surface bindings from the whole directory, not just
+    // the current buffer.
+    let provider = test_provider();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    std::fs::write(
+        base.join("backend.crn"),
+        "let orgs = upstream_state { source = '../organizations' }\n",
+    )
+    .unwrap();
+    let main = "for _, account_id in or";
+    std::fs::write(base.join("main.crn"), main).unwrap();
+    let doc = create_document(main);
+    let position = Position {
+        line: 0,
+        character: main.chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(base));
+
+    assert!(
+        completions.iter().any(|c| c.label == "orgs"),
+        "expected `orgs` from sibling backend.crn, got: {:?}",
+        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn for_iterable_fires_immediately_after_in_without_trailing_space() {
+    // User types `for name, _ in` and invokes completion before adding a
+    // space — the cursor is right after the `n` of `in` and the rest of
+    // the line is empty. Must still offer bindings so the popup shows
+    // up without forcing the user to press space first.
+    let provider = test_provider();
+    let source = "let orgs = upstream_state { source = '../organizations' }\nfor name, _ in";
+    let doc = create_document(source);
+    let last_line = source.lines().next_back().unwrap_or("");
+    let position = Position {
+        line: 1,
+        character: last_line.chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+
+    assert!(
+        completions.iter().any(|c| c.label == "orgs"),
+        "expected `orgs` even with no space after `in`, got: {:?}",
+        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn for_iterable_after_dot_does_not_trigger() {
+    // `for _ in orgs.<HERE>` is field-access, handled by dot completion
+    // (#1996) — the ForIterable context must not fire once a `.` appears
+    // in the iterable partial.
+    let provider = test_provider();
+    let source = "let orgs = upstream_state { source = '../organizations' }\nfor name, _ in orgs.";
+    let doc = create_document(source);
+    let last_line = source.lines().next_back().unwrap_or("");
+    let position = Position {
+        line: 1,
+        character: last_line.chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+
+    assert!(
+        !completions.iter().any(|c| c.label == "orgs"),
+        "after-dot position must not echo the binding back, got: {:?}",
+        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+}

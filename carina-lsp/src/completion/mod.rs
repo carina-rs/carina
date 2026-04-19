@@ -94,6 +94,9 @@ impl CompletionProvider {
             CompletionContext::InsideUpstreamStateSource { partial_path } => {
                 self.upstream_state_source_completions(&partial_path, position, base_path)
             }
+            CompletionContext::ForIterable { partial } => {
+                self.for_iterable_completions(&text, position, &partial, base_path)
+            }
             CompletionContext::None => vec![],
         }
     }
@@ -109,6 +112,13 @@ impl CompletionProvider {
         let current_line = lines[line_idx];
         let col = position.character as usize;
         let prefix: String = current_line.chars().take(col).collect();
+
+        // `for <pat> in <HERE>`: offer in-scope bindings. Detected before the
+        // block-context walk because a `for` header sits at brace_depth 0 and
+        // would otherwise fall through to `TopLevel`.
+        if let Some(partial) = extract_for_iterable_partial(&prefix) {
+            return CompletionContext::ForIterable { partial };
+        }
 
         // Check if we're typing after "<provider>.Region." or "<provider>.Region"
         for provider_name in &self.provider_names {
@@ -625,6 +635,13 @@ enum CompletionContext {
     InsideUpstreamStateSource {
         partial_path: String,
     },
+    /// Cursor is at the iterable position of a `for ... in <HERE>` header
+    /// (after the `in` keyword, before any `.` field access). The partial is
+    /// whatever the user has typed so far, used by the handler to compute
+    /// the replace range.
+    ForIterable {
+        partial: String,
+    },
     None,
 }
 
@@ -641,6 +658,34 @@ fn is_let_upstream_state_line(trimmed: &str) -> bool {
     // longer identifier like `upstream_states`.
     let next = rest.trim_start();
     next.starts_with('{') || next.is_empty()
+}
+
+/// If the cursor sits at the iterable position of a `for <pat> in <partial>`
+/// header — i.e. after the `in` keyword and inside (possibly empty) identifier
+/// characters — return the partial identifier typed so far. A `.` in the
+/// partial means the user has moved past the root binding into field access,
+/// which is a separate completion context (see #1996).
+fn extract_for_iterable_partial(prefix: &str) -> Option<String> {
+    let rest = prefix.trim_start().strip_prefix("for ")?;
+    // A real `in` token has whitespace on the left (so `information` can't
+    // masquerade) and either whitespace or end-of-prefix on the right (so
+    // the moment the cursor lands just past `in` — with no trailing space
+    // yet — still fires).
+    let after_in = rest.match_indices(" in").find_map(|(idx, _)| {
+        let after = &rest[idx + 3..];
+        let right_ok = after.is_empty() || after.starts_with(|c: char| c.is_whitespace());
+        right_ok.then_some(after.trim_start())
+    })?;
+    // Anything non-identifier (`.`, `[`, whitespace, `{`, etc.) means the
+    // user has moved past the root-binding position — into field access,
+    // indexing, or the loop body — all of which are other contexts.
+    if !after_in
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    Some(after_in.to_string())
 }
 
 /// If `prefix` ends with `source = '<partial>` or `source = "<partial>`

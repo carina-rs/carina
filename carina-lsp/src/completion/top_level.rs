@@ -288,19 +288,31 @@ impl CompletionProvider {
         params
     }
 
+    /// Extract every `let <name> = <rhs>` from `text`.
+    ///
+    /// Returns `Vec<(name, rhs)>` where `rhs` is the trimmed text after `=`
+    /// (e.g. `awscc.ec2.vpc { ... }`, `upstream_state { ... }`, `import '...'`).
+    /// Callers classify the rhs themselves — `extract_resource_bindings` maps
+    /// it to a schema key, the for-iterable handler keys it into a detail
+    /// label, etc.
+    pub(super) fn extract_let_bindings(text: &str) -> Vec<(String, String)> {
+        text.lines()
+            .filter_map(|line| {
+                crate::let_parse::parse_let_header(line)
+                    .map(|(name, rhs)| (name.to_string(), rhs.to_string()))
+            })
+            .collect()
+    }
+
     /// Extract resource binding names and their resource types from text
     /// (variables defined with `let binding_name = awscc.ec2.vpc {`)
     /// Returns Vec<(binding_name, resource_type)> where resource_type is the schema key
     /// (e.g., "awscc.ec2.vpc")
     pub(super) fn extract_resource_bindings(&self, text: &str) -> Vec<(String, String)> {
-        let mut bindings = Vec::new();
-        for line in text.lines() {
-            if let Some((binding_name, after_eq)) = crate::let_parse::parse_let_header(line) {
-                let resource_type = self.extract_resource_type(after_eq).unwrap_or_default();
-                bindings.push((binding_name.to_string(), resource_type));
-            }
-        }
-        bindings
+        Self::extract_let_bindings(text)
+            .into_iter()
+            .map(|(name, rhs)| (name, self.extract_resource_type(&rhs).unwrap_or_default()))
+            .collect()
     }
 
     pub(super) fn module_parameter_completions(

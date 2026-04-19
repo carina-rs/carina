@@ -22,6 +22,31 @@ struct BindingDotContext {
     resource_type: String,
 }
 
+/// Concatenate every `.crn` file in `base_path` into one string. The
+/// current-file buffer is scanned separately by the caller (it might
+/// contain unsaved edits that differ from disk), so returning disk
+/// content for the whole directory is fine — duplicates are deduped
+/// by the completion handler's `seen` set.
+fn read_sibling_crn(base_path: Option<&Path>) -> String {
+    let Some(base) = base_path else {
+        return String::new();
+    };
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "crn")
+            && let Ok(content) = std::fs::read_to_string(&path)
+        {
+            out.push_str(&content);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 fn type_completion_item(label: String, detail: String, range: Range) -> CompletionItem {
     CompletionItem {
         label: label.clone(),
@@ -472,6 +497,71 @@ impl CompletionProvider {
                 ..Default::default()
             },
         ]
+    }
+
+    /// Completions for `for <pat> in <HERE>` — every binding that
+    /// `check_deferred_for_iterables` treats as in-scope: `let`,
+    /// `upstream_state`, module calls, imports, and argument parameters.
+    ///
+    /// Bindings commonly live in sibling `.crn` files (a typical pattern
+    /// is `let orgs = upstream_state { ... }` in `backend.crn` iterated
+    /// from `main.crn`), so we read every `.crn` in `base_path`, not just
+    /// the current buffer.
+    pub(super) fn for_iterable_completions(
+        &self,
+        text: &str,
+        position: Position,
+        partial: &str,
+        base_path: Option<&Path>,
+    ) -> Vec<CompletionItem> {
+        let partial_chars = partial.chars().count() as u32;
+        let range = Range {
+            start: Position {
+                line: position.line,
+                character: position.character.saturating_sub(partial_chars),
+            },
+            end: position,
+        };
+
+        let mut items = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let push = |items: &mut Vec<CompletionItem>,
+                    seen: &mut std::collections::HashSet<String>,
+                    name: String,
+                    detail: &str| {
+            if !seen.insert(name.clone()) {
+                return;
+            }
+            items.push(CompletionItem {
+                label: name.clone(),
+                kind: Some(CompletionItemKind::VARIABLE),
+                detail: Some(detail.to_string()),
+                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                    range,
+                    new_text: name,
+                })),
+                ..Default::default()
+            });
+        };
+
+        let sibling_text = read_sibling_crn(base_path);
+        for source in [text, sibling_text.as_str()] {
+            for (name, rhs) in Self::extract_let_bindings(source) {
+                let detail = if rhs.starts_with("upstream_state") {
+                    "upstream_state binding"
+                } else if rhs.starts_with("import ") {
+                    "module import"
+                } else {
+                    "binding"
+                };
+                push(&mut items, &mut seen, name, detail);
+            }
+            for (name, _) in self.extract_argument_parameters(source) {
+                push(&mut items, &mut seen, name, "argument");
+            }
+        }
+
+        items
     }
 
     pub(super) fn upstream_state_block_completions(&self) -> Vec<CompletionItem> {
