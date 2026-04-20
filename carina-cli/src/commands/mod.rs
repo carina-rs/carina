@@ -196,25 +196,36 @@ pub fn validate_and_resolve_with_config(
         }
     }
 
+    let mut errors: Vec<AppError> = Vec::new();
+
     // Validate provider region
-    validate_provider_region_with_ctx(&ctx, parsed)?;
+    errors.extend(validate_provider_region_with_ctx(&ctx, parsed));
 
     // Enrich provider context with custom type validators from loaded schemas
     let enriched_context = enrich_provider_context(ctx.schemas(), ctx.factories_arc());
 
-    // Validate module call arguments before expansion (needs enriched context for custom type validators)
-    validate_module_calls(parsed, base_dir, &enriched_context)?;
+    // Validate module call arguments before expansion (needs enriched
+    // context for custom type validators)
+    errors.extend(validate_module_calls(parsed, base_dir, &enriched_context));
 
     // Validate module attribute parameter ref types before expansion
     if !skip_resource_validation {
-        validate_module_attribute_param_types(&ctx, parsed, base_dir)?;
+        errors.extend(validate_module_attribute_param_types(
+            &ctx, parsed, base_dir,
+        ));
+    }
+
+    // Module expansion assumes the checks above succeeded — feeding
+    // broken module calls into `resolve_modules_with_config` can
+    // surface confusing secondary errors, so gate it on a clean
+    // accumulator.
+    if !errors.is_empty() {
+        return Err(collapse_errors(errors));
     }
 
     // Resolve module imports and expand module calls
     module_resolver::resolve_modules_with_config(parsed, base_dir, &enriched_context)
         .map_err(|e| format!("Module resolution error: {}", e))?;
-
-    let mut errors: Vec<AppError> = Vec::new();
 
     // Resolve names (let bindings -> resource names) — must succeed
     // before per-resource schema checks can look up the renamed
