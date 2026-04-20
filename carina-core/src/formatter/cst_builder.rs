@@ -54,7 +54,10 @@ impl<'a> CstBuilder<'a> {
                 pair.as_str().to_string(),
             ))),
             Rule::newline => Some(CstChild::Trivia(Trivia::Newline)),
-            Rule::comment => Some(CstChild::Trivia(Trivia::LineComment(
+            Rule::line_comment => Some(CstChild::Trivia(Trivia::LineComment(
+                pair.as_str().to_string(),
+            ))),
+            Rule::block_comment => Some(CstChild::Trivia(Trivia::BlockComment(
                 pair.as_str().to_string(),
             ))),
 
@@ -321,6 +324,11 @@ impl<'a> CstBuilder<'a> {
             Rule::validation_block_attr => None,
 
             Rule::file => None,
+
+            // `comment` is a silent alternation; the matching `line_comment`
+            // / `block_comment` branches above emit the actual trivia. This
+            // arm exists only so the exhaustive match compiles.
+            Rule::comment => None,
         }
     }
 

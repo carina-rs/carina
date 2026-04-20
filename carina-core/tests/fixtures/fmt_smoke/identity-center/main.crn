@@ -1,0 +1,70 @@
+# IAM Identity Center
+#
+# Manages Identity Center (SSO) for the management account.
+#
+# Note: AWS::IdentityStore::User is not supported by CloudFormation, so users
+# must be created manually via `aws identitystore create-user`. Groups,
+# memberships, permission sets, and assignments are managed here.
+
+let caller = read aws.sts.caller_identity {}
+
+let sso = awscc.sso.instance {
+  name = 'carina-rs'
+
+  tags = {
+    Project   = 'carina-rs'
+    ManagedBy = 'carina'
+  }
+}
+
+let admins = awscc.identitystore.group {
+  display_name      = 'admins'
+  description       = 'Administrator group'
+  identity_store_id = sso.identity_store_id
+}
+
+let mizzy = read aws.identitystore.user {
+  identity_store_id = sso.identity_store_id
+  user_name         = 'gosukenator@gmail.com'
+}
+
+awscc.identitystore.group_membership {
+  group_id          = admins.group_id
+  identity_store_id = sso.identity_store_id
+
+  member_id = {
+    user_id = mizzy.user_id
+  }
+}
+
+let administrator_access = awscc.sso.permission_set {
+  name         = 'AdministratorAccess'
+  description  = 'Provides full access to AWS services and resources'
+  instance_arn = sso.instance_arn
+
+  managed_policies = ['arn:aws:iam::aws:policy/AdministratorAccess']
+
+  session_duration = 'PT8H'
+}
+
+awscc.sso.assignment {
+  instance_arn       = sso.instance_arn
+  permission_set_arn = administrator_access.permission_set_arn
+  principal_id       = admins.group_id
+  principal_type     = GROUP
+  target_id          = caller.account_id
+  target_type        = AWS_ACCOUNT
+}
+
+# admins → AdministratorAccess on the registry child accounts.
+for _, account_id in orgs.accounts {
+  awscc.sso.assignment {
+    instance_arn       = sso.instance_arn
+    permission_set_arn = administrator_access.permission_set_arn
+    principal_id       = admins.group_id
+    principal_type     = GROUP
+    target_id          = account_id
+    //target_type        = awscc.sso.assignment.TargetType.AWS_ACCOUNT
+    target_type = "aaa"
+  }
+}
