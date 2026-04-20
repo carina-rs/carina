@@ -690,6 +690,23 @@ fn string_enum_value_matches(input: &str, expected: &str) -> bool {
 /// context. Presence of `attribute` and `type_name` is independent — both,
 /// either, or neither may be set. `expected` is rendered as-is; callers are
 /// responsible for passing fully-qualified variants for namespaced enums.
+fn format_string_literal_expected_enum(
+    user_typed: &str,
+    attribute: Option<&str>,
+    type_name: &str,
+    expected: &[String],
+) -> String {
+    let target = match attribute {
+        Some(a) => format!("'{}' ({})", a, type_name),
+        None => type_name.to_string(),
+    };
+    let joined = expected.join(", ");
+    format!(
+        "{} expects an enum identifier, got a string literal \"{}\". Use one of: {}",
+        target, user_typed, joined
+    )
+}
+
 fn format_invalid_enum(
     value: &str,
     attribute: Option<&str>,
@@ -740,6 +757,32 @@ pub enum TypeError {
         /// Allowed variants in the form the user should type — i.e.
         /// fully-qualified (`awscc.sso.assignment.TargetType.AWS_ACCOUNT`)
         /// for namespaced enums, bare (`fast`, `slow`) otherwise.
+        expected: Vec<String>,
+    },
+
+    /// The value was written in the source as a quoted string literal
+    /// (e.g. `target_type = "aaa"`) on an attribute whose type is an enum
+    /// of namespaced identifiers. This is a shape mismatch — the user
+    /// needs to drop the quotes and type one of the enum identifiers —
+    /// and is reported separately from `InvalidEnumVariant` so the
+    /// message can explain the form, not just list valid variants.
+    /// See #2094.
+    #[error(
+        "{}",
+        format_string_literal_expected_enum(user_typed, attribute.as_deref(), type_name, expected)
+    )]
+    StringLiteralExpectedEnum {
+        /// The string the user actually typed between the quotes
+        /// (e.g. `"aaa"`).
+        user_typed: String,
+        /// Attribute the value was assigned to (e.g. `"target_type"`).
+        attribute: Option<String>,
+        /// Name of the enum type the value was being matched against
+        /// (e.g. `"TargetType"`). Always set for this variant — callers
+        /// only build it when they already know the enum type.
+        type_name: String,
+        /// Allowed variants in their canonical, user-typeable form
+        /// (fully-qualified for namespaced enums, bare otherwise).
         expected: Vec<String>,
     },
 
@@ -803,14 +846,43 @@ impl TypeError {
     /// is tracked as future work.
     #[must_use]
     pub fn with_attribute(mut self, attribute: impl Into<String>) -> Self {
-        if let TypeError::InvalidEnumVariant {
-            attribute: attr_slot,
-            ..
-        } = &mut self
-        {
-            *attr_slot = Some(attribute.into());
+        match &mut self {
+            TypeError::InvalidEnumVariant {
+                attribute: attr_slot,
+                ..
+            }
+            | TypeError::StringLiteralExpectedEnum {
+                attribute: attr_slot,
+                ..
+            } => {
+                *attr_slot = Some(attribute.into());
+            }
+            _ => {}
         }
         self
+    }
+
+    /// If this error describes an enum-variant mismatch on a value that
+    /// was originally written as a quoted string literal, reshape it into
+    /// `StringLiteralExpectedEnum` so the message reports the form
+    /// mismatch rather than a missing variant. Returns the error
+    /// unchanged when the variant doesn't carry a known enum type.
+    #[must_use]
+    pub fn into_string_literal_diagnostic(self) -> Self {
+        match self {
+            TypeError::InvalidEnumVariant {
+                value,
+                attribute,
+                type_name: Some(type_name),
+                expected,
+            } => TypeError::StringLiteralExpectedEnum {
+                user_typed: value,
+                attribute,
+                type_name,
+                expected,
+            },
+            other => other,
+        }
     }
 }
 
@@ -1227,8 +1299,41 @@ impl ResourceSchema {
             .collect()
     }
 
-    /// Validate resource attributes
+    /// Validate resource attributes.
+    ///
+    /// This variant does not have origin information for string values, so
+    /// it cannot distinguish a user-typed `target_type = "aaa"` from a
+    /// bare-identifier `target_type = aaa` — both surface as
+    /// `InvalidEnumVariant`. Call `validate_with_origins` when the caller
+    /// knows which attributes were written as quoted string literals
+    /// (see #2094).
     pub fn validate(&self, attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
+        self.validate_inner(attributes, &|_attr_name| false)
+    }
+
+    /// Validate resource attributes, reshaping enum-variant errors into
+    /// `StringLiteralExpectedEnum` for attributes whose value was written
+    /// in the source as a quoted string literal.
+    ///
+    /// `is_string_literal` answers "was this top-level attribute on the
+    /// current resource written as `attr = \"...\"`?". A `true` response
+    /// upgrades any `InvalidEnumVariant` for that attribute into
+    /// `StringLiteralExpectedEnum` so the error message describes the
+    /// form mismatch instead of asking the user to match a list of
+    /// variants. Non-enum errors are passed through unchanged.
+    pub fn validate_with_origins(
+        &self,
+        attributes: &HashMap<String, Value>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+    ) -> Result<(), Vec<TypeError>> {
+        self.validate_inner(attributes, is_string_literal)
+    }
+
+    fn validate_inner(
+        &self,
+        attributes: &HashMap<String, Value>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+    ) -> Result<(), Vec<TypeError>> {
         let mut errors = Vec::new();
 
         // Check required attributes
@@ -1262,7 +1367,13 @@ impl ResourceSchema {
                     // Tag the error with the attribute name the user actually
                     // wrote (which may be a block-name alias), so diagnostics
                     // point back at a token that appears in their source.
-                    errors.push(e.with_attribute(name));
+                    let tagged = e.with_attribute(name);
+                    let reshaped = if is_string_literal(name.as_str()) {
+                        tagged.into_string_literal_diagnostic()
+                    } else {
+                        tagged
+                    };
+                    errors.push(reshaped);
                 }
             } else {
                 let suggestion = suggest_similar_name(name, &known);
@@ -2109,6 +2220,152 @@ mod tests {
         assert!(
             joined.contains("'target_type'"),
             "schema.validate must wrap enum errors with attribute name, got: {joined}"
+        );
+    }
+
+    #[test]
+    fn string_literal_expected_enum_formats_shape_message() {
+        // The new variant's message must read as a shape complaint, not as
+        // "unknown variant" — that's the whole point of the PR 2094 split.
+        let err = TypeError::StringLiteralExpectedEnum {
+            user_typed: "aaa".to_string(),
+            attribute: Some("target_type".to_string()),
+            type_name: "TargetType".to_string(),
+            expected: vec!["awscc.sso.assignment.TargetType.AWS_ACCOUNT".to_string()],
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("got a string literal"),
+            "message should name the shape mismatch, got: {msg}"
+        );
+        assert!(
+            msg.contains("\"aaa\""),
+            "message should echo the typed value in quotes, got: {msg}"
+        );
+        assert!(
+            msg.contains("target_type") && msg.contains("TargetType"),
+            "message should name attribute and enum type, got: {msg}"
+        );
+        assert!(
+            msg.contains("awscc.sso.assignment.TargetType.AWS_ACCOUNT"),
+            "message should list the valid variants, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn into_string_literal_diagnostic_reshapes_invalid_enum_variant() {
+        // The helper is the one bridge between the two diagnostics — the
+        // shape is specifically a conversion of `InvalidEnumVariant` when
+        // we know the value came from a string literal.
+        let original = TypeError::InvalidEnumVariant {
+            value: "aaa".to_string(),
+            attribute: Some("target_type".to_string()),
+            type_name: Some("TargetType".to_string()),
+            expected: vec!["awscc.sso.assignment.TargetType.AWS_ACCOUNT".to_string()],
+        };
+        let reshaped = original.into_string_literal_diagnostic();
+        match reshaped {
+            TypeError::StringLiteralExpectedEnum {
+                user_typed,
+                attribute,
+                type_name,
+                expected,
+            } => {
+                assert_eq!(user_typed, "aaa");
+                assert_eq!(attribute.as_deref(), Some("target_type"));
+                assert_eq!(type_name, "TargetType");
+                assert_eq!(
+                    expected,
+                    vec!["awscc.sso.assignment.TargetType.AWS_ACCOUNT".to_string()]
+                );
+            }
+            other => panic!("expected StringLiteralExpectedEnum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn into_string_literal_diagnostic_without_type_name_passes_through() {
+        // If the enum type wasn't captured (e.g. an error synthesized by a
+        // plugin), there's nothing to reshape into — the original error
+        // stays intact so we don't drop information on the floor.
+        let original = TypeError::InvalidEnumVariant {
+            value: "aaa".to_string(),
+            attribute: Some("target_type".to_string()),
+            type_name: None,
+            expected: vec![],
+        };
+        let reshaped = original.into_string_literal_diagnostic();
+        assert!(matches!(reshaped, TypeError::InvalidEnumVariant { .. }));
+    }
+
+    #[test]
+    fn schema_validate_with_origins_emits_string_literal_diagnostic_for_quoted_enum() {
+        // `validate_with_origins` is the entry point the CLI/LSP wiring
+        // calls once it knows which attributes were written as quoted
+        // string literals. A quoted-literal assignment to a StringEnum
+        // must reshape into `StringLiteralExpectedEnum`.
+        let schema = ResourceSchema::new("test.assignment").attribute(
+            AttributeSchema::new(
+                "target_type",
+                AttributeType::StringEnum {
+                    name: "TargetType".to_string(),
+                    values: vec!["AWS_ACCOUNT".to_string()],
+                    namespace: Some("awscc.sso.assignment".to_string()),
+                    to_dsl: None,
+                },
+            )
+            .required(),
+        );
+        let mut attrs = HashMap::new();
+        attrs.insert("target_type".to_string(), Value::String("aaa".to_string()));
+
+        // String-literal origin → reshaped diagnostic
+        let errs = schema
+            .validate_with_origins(&attrs, &|name| name == "target_type")
+            .unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, TypeError::StringLiteralExpectedEnum { .. })),
+            "expected StringLiteralExpectedEnum variant, got: {errs:?}"
+        );
+
+        // No string-literal origin → classic InvalidEnumVariant (unchanged
+        // behaviour for bare-identifier / namespaced inputs)
+        let errs = schema
+            .validate_with_origins(&attrs, &|_| false)
+            .unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, TypeError::InvalidEnumVariant { .. })),
+            "expected InvalidEnumVariant variant when origin is not a literal, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn schema_validate_with_origins_leaves_valid_values_alone() {
+        // A valid enum value (bare or namespaced) must still pass even
+        // when the caller tags it as string-literal origin — the shape
+        // check is only triggered on a failing match.
+        let schema = ResourceSchema::new("test.assignment").attribute(
+            AttributeSchema::new(
+                "target_type",
+                AttributeType::StringEnum {
+                    name: "TargetType".to_string(),
+                    values: vec!["AWS_ACCOUNT".to_string()],
+                    namespace: Some("awscc.sso.assignment".to_string()),
+                    to_dsl: None,
+                },
+            )
+            .required(),
+        );
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "target_type".to_string(),
+            Value::String("AWS_ACCOUNT".to_string()),
+        );
+        assert!(
+            schema.validate_with_origins(&attrs, &|_| true).is_ok(),
+            "valid enum value should pass regardless of origin tag"
         );
     }
 

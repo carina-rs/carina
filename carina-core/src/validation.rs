@@ -35,7 +35,20 @@ pub fn validate_resources(
                         schema.resource_type, schema.resource_type
                     ));
                 }
-                if let Err(errors) = schema.validate(&resource.resolved_attributes()) {
+                // Consult parser-recorded string-literal origins so that
+                // `target_type = "aaa"` (a shape mismatch) gets a dedicated
+                // diagnostic, distinct from `target_type = aaa` (a variant
+                // mismatch). See #2094.
+                let literal_top_level_attrs: HashSet<&str> = parsed
+                    .string_literal_paths
+                    .iter()
+                    .filter(|p| p.resource_id == resource.id && p.attribute_chain.len() == 1)
+                    .map(|p| p.attribute_chain[0].as_str())
+                    .collect();
+                let is_string_literal = |attr: &str| literal_top_level_attrs.contains(attr);
+                if let Err(errors) = schema
+                    .validate_with_origins(&resource.resolved_attributes(), &is_string_literal)
+                {
                     for error in errors {
                         all_errors.push(format!("{}: {}", resource.id, error));
                     }
@@ -2173,6 +2186,126 @@ let vpc = awscc.ec2.vpc {
         assert!(
             err.contains("aaaa"),
             "expected error to mention 'aaaa', got: {err}"
+        );
+    }
+
+    /// Tests for #2094 — the four cases the PR 2 diagnostic must distinguish:
+    ///   1. `mode = "aaa"` (string literal)   → StringLiteralExpectedEnum
+    ///   2. `mode = aaa`   (bare invalid)     → InvalidEnumVariant (unchanged)
+    ///   3. `mode = fast`  (bare valid)       → pass (unchanged)
+    ///   4. fully-qualified form              → pass (unchanged)
+    fn mode_schema() -> HashMap<String, ResourceSchema> {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "r.mode_holder".to_string(),
+            make_schema(
+                "r.mode_holder",
+                vec![(
+                    "mode",
+                    AttributeType::StringEnum {
+                        name: "Mode".to_string(),
+                        values: vec!["fast".to_string(), "slow".to_string()],
+                        namespace: Some("test.r".to_string()),
+                        to_dsl: None,
+                    },
+                )],
+            ),
+        );
+        schemas
+    }
+
+    fn mode_known() -> HashSet<String> {
+        let mut known = HashSet::new();
+        known.insert("test".to_string());
+        known
+    }
+
+    fn parse_mode(src: &str) -> ParsedFile {
+        crate::parser::parse(src, &ProviderContext::default()).unwrap()
+    }
+
+    #[test]
+    fn quoted_literal_enum_value_yields_string_literal_diagnostic() {
+        // Case 1: `mode = "aaa"` — the parser tagged the path, validation
+        // must surface the shape-mismatch message, not a variant list.
+        let parsed = parse_mode(
+            r#"
+            let holder = test.r.mode_holder {
+                mode = "aaa"
+            }
+            "#,
+        );
+        let err = validate_resources(&parsed, &mode_schema(), &test_schema_key_fn, &mode_known())
+            .unwrap_err();
+        assert!(
+            err.contains("got a string literal"),
+            "quoted literal must emit the shape-mismatch diagnostic, got: {err}"
+        );
+        assert!(
+            err.contains("\"aaa\""),
+            "diagnostic must echo the user's literal, got: {err}"
+        );
+        assert!(
+            err.contains("test.r.Mode.fast") || err.contains("test.r.Mode.slow"),
+            "diagnostic must list fully-qualified valid variants, got: {err}"
+        );
+    }
+
+    #[test]
+    fn bare_invalid_enum_value_keeps_invalid_variant_diagnostic() {
+        // Case 2: `mode = aaa` — the parser did NOT tag this as a literal,
+        // so the classic `InvalidEnumVariant` message must still be used.
+        // Guards against regressing #2077/#2098 wording.
+        let parsed = parse_mode(
+            r#"
+            let holder = test.r.mode_holder {
+                mode = aaa
+            }
+            "#,
+        );
+        let err = validate_resources(&parsed, &mode_schema(), &test_schema_key_fn, &mode_known())
+            .unwrap_err();
+        assert!(
+            !err.contains("got a string literal"),
+            "bare identifier must NOT get the shape-mismatch diagnostic, got: {err}"
+        );
+        assert!(
+            err.contains("aaa"),
+            "diagnostic must still echo the typed value, got: {err}"
+        );
+    }
+
+    #[test]
+    fn bare_valid_enum_value_passes() {
+        // Case 3: `mode = fast` — bare identifier resolves to a real
+        // variant and must pass cleanly.
+        let parsed = parse_mode(
+            r#"
+            let holder = test.r.mode_holder {
+                mode = fast
+            }
+            "#,
+        );
+        assert!(
+            validate_resources(&parsed, &mode_schema(), &test_schema_key_fn, &mode_known()).is_ok(),
+            "bare valid identifier must pass"
+        );
+    }
+
+    #[test]
+    fn fully_qualified_enum_value_passes() {
+        // Case 4: `mode = test.r.Mode.fast` — fully-qualified form must
+        // still pass unchanged.
+        let parsed = parse_mode(
+            r#"
+            let holder = test.r.mode_holder {
+                mode = test.r.Mode.fast
+            }
+            "#,
+        );
+        assert!(
+            validate_resources(&parsed, &mode_schema(), &test_schema_key_fn, &mode_known()).is_ok(),
+            "fully-qualified identifier must pass"
         );
     }
 }
