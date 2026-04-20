@@ -40,10 +40,19 @@ pub enum ParseError {
     #[error("Duplicate binding at line {line}: {name}")]
     DuplicateBinding { name: String, line: usize },
 
-    #[error(
-        "Undefined identifier `{name}`: no `let`, `upstream_state`, `read`, module import, or function binding with that name is in scope"
-    )]
-    UndefinedIdentifier { name: String, line: usize },
+    #[error("{}", format_undefined_identifier(name, suggestion.as_deref(), in_scope))]
+    UndefinedIdentifier {
+        name: String,
+        line: usize,
+        /// Edit-distance close match among in-scope bindings, if any.
+        /// Filled by the check site when a `suggest_similar_name` result is
+        /// available; None for hand-constructed errors.
+        suggestion: Option<String>,
+        /// Concrete binding names in scope at the check site, sorted for
+        /// deterministic rendering. Empty when no bindings have been
+        /// declared at all.
+        in_scope: Vec<String>,
+    },
 
     #[error("Module not found: {0}")]
     ModuleNotFound(String),
@@ -56,6 +65,35 @@ pub enum ParseError {
 
     #[error("User-defined function error: {0}")]
     UserFunctionError(String),
+}
+
+/// Render the `UndefinedIdentifier` message. When a close match exists
+/// (`suggestion`), lead with `Did you mean ...?`. Otherwise list the
+/// concrete in-scope names so the reader learns what is available,
+/// followed by the abstract list of binding kinds as a trailing aside.
+/// See #2038.
+fn format_undefined_identifier(
+    name: &str,
+    suggestion: Option<&str>,
+    in_scope: &[String],
+) -> String {
+    if let Some(s) = suggestion {
+        return format!("Undefined identifier `{}`. Did you mean `{}`?", name, s);
+    }
+    let kinds = "let / upstream_state / read / module / function / for / fn / arguments";
+    if in_scope.is_empty() {
+        format!(
+            "Undefined identifier `{}`: no bindings are in scope ({})",
+            name, kinds,
+        )
+    } else {
+        format!(
+            "Undefined identifier `{}`. In-scope names: {} ({})",
+            name,
+            in_scope.join(", "),
+            kinds,
+        )
+    }
 }
 
 /// A structured warning emitted during parsing (non-fatal).
@@ -4266,9 +4304,42 @@ fn check_undefined_in_value(
         }
     });
     if let Some(name) = undefined {
-        return Err(ParseError::UndefinedIdentifier { name, line: 0 });
+        return Err(undefined_identifier_error(known, name, 0));
     }
     Ok(())
+}
+
+/// Build an `UndefinedIdentifier` error enriched with the best
+/// did-you-mean suggestion and the sorted in-scope binding list.
+fn undefined_identifier_error(
+    known: &std::collections::HashSet<&str>,
+    name: String,
+    line: usize,
+) -> ParseError {
+    ParseError::undefined_identifier(name, line, known.iter().map(|s| s.to_string()).collect())
+}
+
+impl ParseError {
+    /// Construct an `UndefinedIdentifier` error with did-you-mean suggestion
+    /// and sorted in-scope binding list. `known_bindings` is the set of
+    /// names that are in scope at the check site — they will be sorted
+    /// and used to compute the close-match suggestion. See #2038.
+    pub fn undefined_identifier(
+        name: String,
+        line: usize,
+        known_bindings: Vec<String>,
+    ) -> ParseError {
+        let known_refs: Vec<&str> = known_bindings.iter().map(String::as_str).collect();
+        let suggestion = crate::schema::suggest_similar_name(&name, &known_refs);
+        let mut in_scope = known_bindings;
+        in_scope.sort();
+        ParseError::UndefinedIdentifier {
+            name,
+            line,
+            suggestion,
+            in_scope,
+        }
+    }
 }
 
 /// Resolve forward references after the full binding set is known.
@@ -4482,10 +4553,7 @@ pub(crate) fn check_deferred_for_iterables(parsed: &ParsedFile) -> Vec<ParseErro
         .deferred_for_expressions
         .iter()
         .filter(|d| !known.contains(d.iterable_binding.as_str()))
-        .map(|d| ParseError::UndefinedIdentifier {
-            name: d.iterable_binding.clone(),
-            line: d.line,
-        })
+        .map(|d| undefined_identifier_error(&known, d.iterable_binding.clone(), d.line))
         .collect()
 }
 
@@ -10886,6 +10954,67 @@ awscc.ec2.vpc {
             }
             other => panic!("Expected UndefinedIdentifier, got: {other}"),
         }
+    }
+
+    #[test]
+    fn undefined_identifier_error_suggests_close_match() {
+        // Regression for #2038. When a typo has a close edit-distance match
+        // among the in-scope bindings, the error should name it so the user
+        // doesn't have to guess which binding they meant.
+        let input = r#"
+            let orgs = upstream_state { source = "../a" }
+            for _, id in org.accounts {
+                aws.s3_bucket {
+                    name = id
+                }
+            }
+        "#;
+        let parsed = parse(input, &ProviderContext::default())
+            .expect("single-file parse must not reject cross-file iterables");
+        let errs = check_deferred_for_iterables(&parsed);
+        assert_eq!(errs.len(), 1, "expected one error, got {errs:?}");
+        let msg = errs[0].to_string();
+        assert!(
+            msg.contains("`org`"),
+            "error should quote the unknown name, got: {msg}"
+        );
+        assert!(
+            msg.contains("Did you mean `orgs`") || msg.contains("Did you mean 'orgs'"),
+            "error should suggest the close match 'orgs', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn undefined_identifier_error_lists_in_scope_names_without_close_match() {
+        // When nothing is close, fall back to listing the concrete in-scope
+        // names so the reader learns what _is_ available. The abstract
+        // "no let/upstream_state/..." kind enumeration alone is noise.
+        let input = r#"
+            let orgs = upstream_state { source = "../a" }
+            let admins = upstream_state { source = "../b" }
+            for _, id in xyzzy.accounts {
+                aws.s3_bucket {
+                    name = id
+                }
+            }
+        "#;
+        let parsed = parse(input, &ProviderContext::default())
+            .expect("single-file parse must not reject cross-file iterables");
+        let errs = check_deferred_for_iterables(&parsed);
+        assert_eq!(errs.len(), 1, "expected one error, got {errs:?}");
+        let msg = errs[0].to_string();
+        assert!(
+            msg.contains("`xyzzy`"),
+            "error should quote the unknown name, got: {msg}"
+        );
+        assert!(
+            msg.contains("orgs") && msg.contains("admins"),
+            "error should list in-scope names (orgs, admins), got: {msg}"
+        );
+        assert!(
+            !msg.contains("Did you mean"),
+            "no close match exists; there should be no 'Did you mean' line, got: {msg}"
+        );
     }
 
     #[test]

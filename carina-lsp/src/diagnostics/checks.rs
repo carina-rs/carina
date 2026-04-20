@@ -520,16 +520,21 @@ impl DiagnosticEngine {
                             .unwrap_or(0);
                         (0, line_chars)
                     });
+            // Build the same enriched UndefinedIdentifier the CLI would emit
+            // so the editor shows the did-you-mean suggestion and the list of
+            // in-scope bindings (#2038).
+            let in_scope: Vec<String> = known.iter().map(|s| s.to_string()).collect();
+            let err = carina_core::parser::ParseError::undefined_identifier(
+                deferred.iterable_binding.clone(),
+                deferred.line,
+                in_scope,
+            );
             diagnostics.push(carina_diagnostic(
                 line_zero_based,
                 col,
                 end_col,
                 DiagnosticSeverity::ERROR,
-                carina_core::parser::ParseError::UndefinedIdentifier {
-                    name: deferred.iterable_binding.clone(),
-                    line: deferred.line,
-                }
-                .to_string(),
+                err.to_string(),
             ));
         }
         diagnostics
