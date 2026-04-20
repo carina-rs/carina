@@ -349,6 +349,7 @@ impl AttributeType {
                         }
                         Err(TypeError::InvalidEnumVariant {
                             value: user_input.unwrap_or(s.as_str()).to_string(),
+                            attribute: None,
                             type_name: Some(name.clone()),
                             expected,
                         })
@@ -685,21 +686,33 @@ fn string_enum_value_matches(input: &str, expected: &str) -> bool {
         || input.replace('_', "-").eq_ignore_ascii_case(expected)
 }
 
-/// Render the `InvalidEnumVariant` message. When `type_name` is present,
-/// call out the enum's declared name so the reader knows which enum is
-/// expected (see #2095). `expected` is rendered as-is — callers are
+/// Render the `InvalidEnumVariant` message with the richest available
+/// context. Presence of `attribute` and `type_name` is independent — both,
+/// either, or neither may be set. `expected` is rendered as-is; callers are
 /// responsible for passing fully-qualified variants for namespaced enums.
-fn format_invalid_enum(value: &str, type_name: Option<&str>, expected: &[String]) -> String {
+fn format_invalid_enum(
+    value: &str,
+    attribute: Option<&str>,
+    type_name: Option<&str>,
+    expected: &[String],
+) -> String {
     let joined = expected.join(", ");
-    match type_name {
-        Some(t) => format!(
-            "Invalid value '{}' for {}: expected one of {}",
-            value, t, joined
-        ),
-        None => format!(
+    let qualifier = match (attribute, type_name) {
+        (Some(a), Some(t)) => format!(" for '{}' ({})", a, t),
+        (Some(a), None) => format!(" for '{}'", a),
+        (None, Some(t)) => format!(" for {}", t),
+        (None, None) => String::new(),
+    };
+    if qualifier.is_empty() {
+        format!(
             "Invalid enum variant '{}', expected one of: {}",
             value, joined
-        ),
+        )
+    } else {
+        format!(
+            "Invalid value '{}'{}: expected one of {}",
+            value, qualifier, joined
+        )
     }
 }
 
@@ -709,9 +722,16 @@ pub enum TypeError {
     #[error("Type mismatch: expected {expected}, got {got}")]
     TypeMismatch { expected: String, got: String },
 
-    #[error("{}", format_invalid_enum(value, type_name.as_deref(), expected))]
+    #[error(
+        "{}",
+        format_invalid_enum(value, attribute.as_deref(), type_name.as_deref(), expected)
+    )]
     InvalidEnumVariant {
         value: String,
+        /// Attribute the value was assigned to (e.g. `"target_id"`). Set by
+        /// caller-side wrapping (see `TypeError::with_attribute`) — the
+        /// `AttributeType::validate` primitive itself doesn't know the name.
+        attribute: Option<String>,
         /// Name of the `StringEnum` type that was being matched against
         /// (e.g. `"TargetType"`). Set when available so the diagnostic can
         /// tell the reader which enum is expected; None for callers that
@@ -766,6 +786,32 @@ pub enum TypeError {
 
     #[error("'{attribute}' cannot use block syntax; use map assignment: {attribute} = {{ ... }}")]
     BlockSyntaxNotAllowed { attribute: String },
+}
+
+impl TypeError {
+    /// Attach an attribute name to the error. Currently only affects
+    /// `InvalidEnumVariant`; other variants return `self` unchanged.
+    ///
+    /// Callers that know which attribute produced the error (e.g. the
+    /// attribute loop in `ResourceSchema::validate`) wrap the primitive
+    /// error before it reaches CLI/LSP diagnostic text. This keeps
+    /// `AttributeType::validate` unaware of attribute names while still
+    /// letting the final message say `for 'target_id'`.
+    ///
+    /// See #2098. `InvalidEnumVariant` is the only variant enriched for
+    /// now; adding the same slot to `ValidationFailed` / `TypeMismatch`
+    /// is tracked as future work.
+    #[must_use]
+    pub fn with_attribute(mut self, attribute: impl Into<String>) -> Self {
+        if let TypeError::InvalidEnumVariant {
+            attribute: attr_slot,
+            ..
+        } = &mut self
+        {
+            *attr_slot = Some(attribute.into());
+        }
+        self
+    }
 }
 
 impl Value {
@@ -1213,7 +1259,10 @@ impl ResourceSchema {
 
             if let Some(schema) = self.attributes.get(canonical) {
                 if let Err(e) = schema.attr_type.validate(value) {
-                    errors.push(e);
+                    // Tag the error with the attribute name the user actually
+                    // wrote (which may be a block-name alias), so diagnostics
+                    // point back at a token that appears in their source.
+                    errors.push(e.with_attribute(name));
                 }
             } else {
                 let suggestion = suggest_similar_name(name, &known);
@@ -1985,6 +2034,81 @@ mod tests {
         assert!(
             msg.contains("awscc.sso.assignment.TargetType.AWS_ACCOUNT"),
             "error should list variants in fully-qualified form, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn with_attribute_adds_attribute_name_to_enum_error() {
+        // Regression for #2098. When a caller knows which attribute produced
+        // the error, wrapping it with `with_attribute` must surface the name
+        // in the rendered message so the reader can locate it in their .crn.
+        let t = AttributeType::StringEnum {
+            name: "TargetType".to_string(),
+            values: vec!["AWS_ACCOUNT".to_string()],
+            namespace: Some("awscc.sso.assignment".to_string()),
+            to_dsl: None,
+        };
+        let err = t
+            .validate(&Value::String("aaa".to_string()))
+            .unwrap_err()
+            .with_attribute("target_id");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'target_id'"),
+            "error should quote the attribute name, got: {msg}"
+        );
+        assert!(
+            msg.contains("TargetType"),
+            "error should still name the enum type, got: {msg}"
+        );
+        assert!(
+            msg.contains("'aaa'"),
+            "error should still quote the user value, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn with_attribute_is_noop_for_variants_that_dont_carry_attribute() {
+        // `with_attribute` is a no-op for TypeError variants that don't
+        // carry an attribute slot — it must not panic or corrupt the
+        // message.
+        let original = TypeError::TypeMismatch {
+            expected: "String".to_string(),
+            got: "Int".to_string(),
+        };
+        let expected_msg = original.to_string();
+        let wrapped = original.with_attribute("foo").to_string();
+        assert_eq!(wrapped, expected_msg);
+    }
+
+    #[test]
+    fn schema_validate_wraps_enum_error_with_attribute_name() {
+        // End-to-end at the ResourceSchema boundary: the attribute loop in
+        // `ResourceSchema::validate` must wrap type errors with the attribute
+        // name so every downstream consumer (CLI, LSP) sees the plumbed form.
+        let schema = ResourceSchema::new("test.assignment").attribute(
+            AttributeSchema::new(
+                "target_type",
+                AttributeType::StringEnum {
+                    name: "TargetType".to_string(),
+                    values: vec!["AWS_ACCOUNT".to_string()],
+                    namespace: Some("awscc.sso.assignment".to_string()),
+                    to_dsl: None,
+                },
+            )
+            .required(),
+        );
+        let mut attrs = HashMap::new();
+        attrs.insert("target_type".to_string(), Value::String("aaa".to_string()));
+        let errs = schema.validate(&attrs).unwrap_err();
+        let joined = errs
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("'target_type'"),
+            "schema.validate must wrap enum errors with attribute name, got: {joined}"
         );
     }
 
