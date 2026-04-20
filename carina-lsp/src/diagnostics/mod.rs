@@ -1009,15 +1009,12 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
             DiagnosticSeverity::ERROR,
             format!("Duplicate binding: {}", name),
         ),
-        ParseError::UndefinedIdentifier { name, line } => carina_diagnostic(
+        err @ ParseError::UndefinedIdentifier { line, .. } => carina_diagnostic(
             line.saturating_sub(1) as u32,
             0,
             0,
             DiagnosticSeverity::ERROR,
-            format!(
-                "Undefined identifier `{}`: no `let`, `upstream_state`, `read`, module import, or function binding with that name is in scope",
-                name
-            ),
+            err.to_string(),
         ),
         ParseError::ModuleNotFound(name) => carina_diagnostic_range(
             Range::default(),
