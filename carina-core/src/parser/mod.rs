@@ -1876,6 +1876,20 @@ fn identifier_appears_in(text: &str, name: &str) -> bool {
     false
 }
 
+/// Whether `s` is shaped like a bare Carina identifier — the first byte is
+/// `A-Za-z_` and the rest are `A-Za-z0-9_`. Used to recover from the
+/// parser's collapse of unresolved identifiers into `Value::String(s)`
+/// when we need to decide whether to render an error as "identifier" vs
+/// "string literal". See #2101.
+fn is_bare_identifier(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    match bytes.next() {
+        Some(b) if b.is_ascii_alphabetic() || b == b'_' => {}
+        _ => return false,
+    }
+    bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 /// Result of parsing a for expression body: either a resource or a module call
 enum ForBodyResult {
     Resource(Box<Resource>),
@@ -2090,6 +2104,82 @@ fn parse_for_expr(
             // Return empty — the for body produces zero concrete resources
         }
         _ => {
+            // Special case: the parser collapses bare unresolved identifiers
+            // (e.g. `for _ in org { ... }`) into `Value::String("org")` — the
+            // same slot a quoted literal uses. Reporting those as
+            // `iterable is string "org"` is misleading: the user wrote an
+            // identifier, not a literal, and the likely fault is a typo for
+            // a known binding. Record them as deferred for-expressions so
+            // `check_deferred_for_iterables` (which runs on the merged
+            // directory-wide ParsedFile, so cross-file upstream_state /
+            // module bindings are visible) can emit a proper
+            // UndefinedIdentifier with the did-you-mean machinery from
+            // #2038 / #2100. See #2101.
+            if let Value::String(s) = &iterable
+                && is_bare_identifier(s)
+            {
+                let header = match &binding {
+                    ForBinding::Simple(var) => format!("for {} in {}", var, s),
+                    ForBinding::Indexed(idx, val) => format!("for ({}, {}) in {}", idx, val, s),
+                    ForBinding::Map(k, v) => format!("for {}, {} in {}", k, v, s),
+                };
+                let mut template_ctx = ctx.clone();
+                let placeholder = || Value::String(DEFERRED_UPSTREAM_PLACEHOLDER.to_string());
+                let bind = |c: &mut ParseContext, name: &str, v: Value| {
+                    if name != "_" {
+                        c.set_variable(name.to_string(), v);
+                    }
+                };
+                match &binding {
+                    ForBinding::Simple(var) => {
+                        bind(&mut template_ctx, var, placeholder());
+                    }
+                    ForBinding::Indexed(idx, val) => {
+                        bind(
+                            &mut template_ctx,
+                            idx,
+                            Value::String(DEFERRED_UPSTREAM_INDEX_PLACEHOLDER.to_string()),
+                        );
+                        bind(&mut template_ctx, val, placeholder());
+                    }
+                    ForBinding::Map(k, v) => {
+                        bind(
+                            &mut template_ctx,
+                            k,
+                            Value::String(DEFERRED_UPSTREAM_KEY_PLACEHOLDER.to_string()),
+                        );
+                        bind(&mut template_ctx, v, placeholder());
+                    }
+                }
+                let address = format!("{}[?]", binding_name);
+                if let Ok(ForBodyResult::Resource(resource)) =
+                    parse_for_body(body_pair, &template_ctx, &address)
+                {
+                    let attrs: Vec<(String, Value)> = resource
+                        .attributes
+                        .iter()
+                        .filter(|(k, _)| !k.starts_with('_'))
+                        .map(|(k, expr)| (k.clone(), expr.0.clone()))
+                        .collect();
+                    ctx.deferred_for_expressions.push(DeferredForExpression {
+                        file: None,
+                        line: for_line,
+                        header,
+                        resource_type: if resource.id.provider.is_empty() {
+                            resource.id.resource_type.clone()
+                        } else {
+                            format!("{}.{}", resource.id.provider, resource.id.resource_type)
+                        },
+                        attributes: attrs,
+                        binding_name: binding_name.to_string(),
+                        iterable_binding: s.clone(),
+                        iterable_attr: String::new(),
+                        binding: binding.clone(),
+                        template_resource: *resource,
+                    });
+                }
+                return Ok((resources, module_calls));
+            }
             let iterable_type = match &iterable {
                 Value::String(s) => {
                     format!("string \"{}\"", if s.len() > 50 { &s[..50] } else { s })
@@ -11014,6 +11104,50 @@ awscc.ec2.vpc {
         assert!(
             !msg.contains("Did you mean"),
             "no close match exists; there should be no 'Did you mean' line, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn bare_identifier_iterable_is_reported_as_undefined_not_string() {
+        // Regression for #2101. When the iterable is a bare undeclared
+        // identifier — `for ... in org { ... }` rather than the dotted
+        // `org.accounts` — the parser previously reported
+        // `iterable is string "org" (expected map)`, calling the identifier
+        // a string and leaving the user with no did-you-mean.
+        //
+        // The fix records these as `DeferredForExpression` so
+        // `check_deferred_for_iterables` validates them against the merged
+        // directory-wide binding set (mirrors the dotted-form path). That
+        // gives us cross-file visibility for the did-you-mean candidates.
+        let input = r#"
+            let orgs = upstream_state { source = "../a" }
+            for _, id in org {
+                aws.s3_bucket {
+                    name = id
+                }
+            }
+        "#;
+        let parsed = parse(input, &ProviderContext::default())
+            .expect("single-file parse must not reject bare-iterable identifiers; the cross-file check runs later");
+        let errs = check_deferred_for_iterables(&parsed);
+        assert_eq!(errs.len(), 1, "expected one error, got {errs:?}");
+        let err = &errs[0];
+        let msg = err.to_string();
+        assert!(
+            matches!(err, ParseError::UndefinedIdentifier { .. }),
+            "expected UndefinedIdentifier, got: {err:?}"
+        );
+        assert!(
+            msg.contains("`org`"),
+            "error should quote the identifier, got: {msg}"
+        );
+        assert!(
+            !msg.contains("\"org\""),
+            "error must not render the identifier as a quoted string literal, got: {msg}"
+        );
+        assert!(
+            msg.contains("Did you mean `orgs`") || msg.contains("Did you mean 'orgs'"),
+            "error should suggest the close match 'orgs' via #2038 plumbing, got: {msg}"
         );
     }
 
