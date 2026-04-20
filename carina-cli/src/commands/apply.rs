@@ -1014,7 +1014,10 @@ pub async fn run_apply(
                     ) {
                         return Err(AppError::Config(format!("Module resolution error: {}", e)));
                     }
-                    resolve_names_with_ctx(&ctx, &mut parsed.resources)?;
+                    let name_errors = resolve_names_with_ctx(&ctx, &mut parsed.resources);
+                    if !name_errors.is_empty() {
+                        return Err(super::collapse_errors(name_errors));
+                    }
                 } else {
                     return Err(AppError::Config(format!(
                         "Backend bucket '{}' not found and auto_create is disabled",
