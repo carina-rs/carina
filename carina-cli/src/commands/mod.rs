@@ -150,6 +150,26 @@ fn enrich_provider_context(
     }
 }
 
+/// Collapse an accumulated error Vec into a single `AppError`.
+///
+/// Panics on empty input — callers must guard with `is_empty()` first.
+/// A single accumulated error passes through unchanged so variants like
+/// `AppError::Config` reach callers (e.g. `run_validate`) with their
+/// original kind; multiple errors are joined as one
+/// `AppError::Validation` for the existing combined-message surface.
+pub(crate) fn collapse_errors(errors: Vec<AppError>) -> AppError {
+    if errors.len() == 1 {
+        return errors.into_iter().next().unwrap();
+    }
+    AppError::Validation(
+        errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
 pub fn validate_and_resolve_with_config(
     parsed: &mut ParsedFile,
     base_dir: &Path,
@@ -194,11 +214,17 @@ pub fn validate_and_resolve_with_config(
     module_resolver::resolve_modules_with_config(parsed, base_dir, &enriched_context)
         .map_err(|e| format!("Module resolution error: {}", e))?;
 
-    // Resolve names (let bindings -> resource names)
-    resolve_names_with_ctx(&ctx, &mut parsed.resources)?;
+    let mut errors: Vec<AppError> = Vec::new();
+
+    // Resolve names (let bindings -> resource names) — must succeed
+    // before per-resource schema checks can look up the renamed
+    // attributes, so its failures gate the remaining pipeline.
+    errors.extend(resolve_names_with_ctx(&ctx, &mut parsed.resources));
+    if !errors.is_empty() {
+        return Err(collapse_errors(errors));
+    }
 
     if !skip_resource_validation {
-        let mut errors: Vec<AppError> = Vec::new();
         errors.extend(validate_resources_with_ctx(&ctx, parsed));
         let mut argument_names: HashSet<String> =
             parsed.arguments.iter().map(|a| a.name.clone()).collect();
@@ -217,13 +243,7 @@ pub fn validate_and_resolve_with_config(
             &parsed.resources,
         ));
         if !errors.is_empty() {
-            return Err(AppError::Validation(
-                errors
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ));
+            return Err(collapse_errors(errors));
         }
     }
 
@@ -240,8 +260,17 @@ pub fn validate_and_resolve_with_config(
         )?;
     }
 
-    // Compute anonymous identifiers
-    compute_anonymous_identifiers_with_ctx(&ctx, &mut parsed.resources, &parsed.providers)?;
+    // Compute anonymous identifiers — downstream plan code assumes
+    // every resource has a stable id, so a collision error must stop
+    // the pipeline here.
+    errors.extend(compute_anonymous_identifiers_with_ctx(
+        &ctx,
+        &mut parsed.resources,
+        &parsed.providers,
+    ));
+    if !errors.is_empty() {
+        return Err(collapse_errors(errors));
+    }
 
     // Reject references to `upstream_state` fields that the upstream's
     // `exports { }` block does not declare. Gated like the other

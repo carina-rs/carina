@@ -212,25 +212,23 @@ pub fn validate_attribute_param_ref_types_with_ctx(
 }
 
 /// Resolve block name aliases and attribute prefixes in one step.
-pub fn resolve_names_with_ctx(
-    ctx: &WiringContext,
-    resources: &mut [Resource],
-) -> Result<(), AppError> {
-    resolve_block_names(resources, ctx.schemas(), |r| {
+pub fn resolve_names_with_ctx(ctx: &WiringContext, resources: &mut [Resource]) -> Vec<AppError> {
+    let mut errors = lift_validation_result(resolve_block_names(resources, ctx.schemas(), |r| {
         provider_mod::schema_key_for_resource(ctx.factories(), r)
-    })
-    .map_err(AppError::Validation)?;
-    resolve_attr_prefixes_with_ctx(ctx, resources)
+    }));
+    errors.extend(resolve_attr_prefixes_with_ctx(ctx, resources));
+    errors
 }
 
 pub fn resolve_attr_prefixes_with_ctx(
     ctx: &WiringContext,
     resources: &mut [Resource],
-) -> Result<(), AppError> {
-    identifier::resolve_attr_prefixes(resources, ctx.schemas(), &|r| {
-        provider_mod::schema_key_for_resource(ctx.factories(), r)
-    })
-    .map_err(AppError::Validation)
+) -> Vec<AppError> {
+    lift_validation_result(identifier::resolve_attr_prefixes(
+        resources,
+        ctx.schemas(),
+        &|r| provider_mod::schema_key_for_resource(ctx.factories(), r),
+    ))
 }
 
 pub fn reconcile_prefixed_names(resources: &mut [Resource], state_file: &Option<StateFile>) {
@@ -377,15 +375,17 @@ pub fn compute_anonymous_identifiers_with_ctx(
     ctx: &WiringContext,
     resources: &mut [Resource],
     providers: &[ProviderConfig],
-) -> Result<(), AppError> {
-    identifier::compute_anonymous_identifiers(
+) -> Vec<AppError> {
+    match identifier::compute_anonymous_identifiers(
         resources,
         providers,
         ctx.schemas(),
         &|r| provider_mod::schema_key_for_resource(ctx.factories(), r),
         &|name| identity_attributes_for_provider(ctx, name),
-    )
-    .map_err(AppError::Config)
+    ) {
+        Ok(()) => Vec::new(),
+        Err(msg) => vec![AppError::Config(msg)],
+    }
 }
 
 /// Encapsulates the plan-time normalization pipeline.
@@ -1381,7 +1381,41 @@ pub fn validate_resources(resources: &[Resource]) -> Result<(), AppError> {
         resources: resources.to_vec(),
         ..ParsedFile::default()
     };
-    let errors = validate_resources_with_ctx(&ctx, &parsed);
+    errors_to_legacy_result(validate_resources_with_ctx(&ctx, &parsed))
+}
+
+#[cfg(test)]
+pub fn resolve_names(resources: &mut [Resource]) -> Result<(), AppError> {
+    let ctx = WiringContext::new(vec![]);
+    errors_to_legacy_result(resolve_names_with_ctx(&ctx, resources))
+}
+
+#[cfg(test)]
+pub fn resolve_attr_prefixes(resources: &mut [Resource]) -> Result<(), AppError> {
+    let ctx = WiringContext::new(vec![]);
+    errors_to_legacy_result(resolve_attr_prefixes_with_ctx(&ctx, resources))
+}
+
+#[cfg(test)]
+pub fn compute_anonymous_identifiers(
+    resources: &mut [Resource],
+    providers: &[ProviderConfig],
+) -> Result<(), AppError> {
+    let ctx = WiringContext::new(vec![]);
+    let errors = compute_anonymous_identifiers_with_ctx(&ctx, resources, providers);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(crate::commands::collapse_errors(errors))
+    }
+}
+
+/// Test-only adapter: collapse a `Vec<AppError>` back into the
+/// `Result<(), AppError>` shape pre-#2105 callers expect. Always
+/// joins as `AppError::Validation` — the three wrappers that use it
+/// only return validation-kind errors.
+#[cfg(test)]
+fn errors_to_legacy_result(errors: Vec<AppError>) -> Result<(), AppError> {
     if errors.is_empty() {
         Ok(())
     } else {
@@ -1393,27 +1427,6 @@ pub fn validate_resources(resources: &[Resource]) -> Result<(), AppError> {
                 .join("\n"),
         ))
     }
-}
-
-#[cfg(test)]
-pub fn resolve_names(resources: &mut [Resource]) -> Result<(), AppError> {
-    let ctx = WiringContext::new(vec![]);
-    resolve_names_with_ctx(&ctx, resources)
-}
-
-#[cfg(test)]
-pub fn resolve_attr_prefixes(resources: &mut [Resource]) -> Result<(), AppError> {
-    let ctx = WiringContext::new(vec![]);
-    resolve_attr_prefixes_with_ctx(&ctx, resources)
-}
-
-#[cfg(test)]
-pub fn compute_anonymous_identifiers(
-    resources: &mut [Resource],
-    providers: &[ProviderConfig],
-) -> Result<(), AppError> {
-    let ctx = WiringContext::new(vec![]);
-    compute_anonymous_identifiers_with_ctx(&ctx, resources, providers)
 }
 
 #[cfg(test)]
@@ -1932,5 +1945,27 @@ mod tests {
         for err in &errors {
             assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         }
+    }
+
+    // Smoke test for the dependency-chain wrappers: empty input
+    // exercises each wrapper and pins the `Vec<AppError>` return
+    // type. A regression back to `Result` fails to compile here.
+    #[test]
+    fn dependency_chain_wrappers_return_vec_app_error() {
+        let ctx = WiringContext::new(vec![]);
+        let mut resources: Vec<Resource> = Vec::new();
+        let providers: Vec<ProviderConfig> = Vec::new();
+
+        let errors = resolve_names_with_ctx(&ctx, &mut resources);
+        assert!(errors.is_empty(), "resolve_names: got {errors:?}");
+
+        let errors = resolve_attr_prefixes_with_ctx(&ctx, &mut resources);
+        assert!(errors.is_empty(), "resolve_attr_prefixes: got {errors:?}");
+
+        let errors = compute_anonymous_identifiers_with_ctx(&ctx, &mut resources, &providers);
+        assert!(
+            errors.is_empty(),
+            "compute_anonymous_identifiers: got {errors:?}",
+        );
     }
 }
