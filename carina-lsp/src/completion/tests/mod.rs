@@ -204,3 +204,35 @@ pub(super) fn test_provider_with_nameless_enum() -> CompletionProvider {
 
     CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![])
 }
+
+/// Provider exposing both a namespaced `StringEnum` (`principal_type`) and a
+/// `Custom` semantic subtype (`target_id` → `aws_account_id`) on the same
+/// resource. Used to reproduce the two value-position completion leaks
+/// reported in the parent issue.
+pub(super) fn test_provider_with_custom_semantic_attr() -> CompletionProvider {
+    fn noop_validate(_v: &carina_core::resource::Value) -> Result<(), String> {
+        Ok(())
+    }
+    let account_id = AttributeType::Custom {
+        semantic_name: Some("aws_account_id".to_string()),
+        base: Box::new(AttributeType::String),
+        pattern: None,
+        length: None,
+        validate: noop_validate,
+        namespace: None,
+        to_dsl: None,
+    };
+    let principal_type = AttributeType::StringEnum {
+        name: "PrincipalType".to_string(),
+        values: vec!["GROUP".to_string(), "USER".to_string()],
+        namespace: Some("awscc.sso.assignment".to_string()),
+        to_dsl: None,
+    };
+    let schema = ResourceSchema::new("awscc.sso.assignment")
+        .attribute(AttributeSchema::new("principal_type", principal_type))
+        .attribute(AttributeSchema::new("target_id", account_id));
+
+    let mut schemas = HashMap::new();
+    schemas.insert("awscc.sso.assignment".to_string(), schema);
+    CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![])
+}

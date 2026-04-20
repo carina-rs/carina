@@ -908,7 +908,8 @@ fn context_detection_type_position_in_attributes() {
 #[test]
 fn string_enum_completion_derives_namespace_from_resource_type() {
     // When a StringEnum has name but no namespace (WASM provider case),
-    // completions should use the resource_type as namespace to produce DSL format.
+    // completions derive the namespace from the resource type and emit
+    // fully-qualified identifiers.
     let provider = test_provider_with_nameless_enum();
     let doc = create_document(
         r#"awscc.s3.bucket {
@@ -924,25 +925,22 @@ versioning_status =
 
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
-    // Should produce bare enum value completions (not full namespace path)
     assert!(
-        labels.contains(&"Enabled"),
-        "Should produce bare enum completion. Got: {:?}",
+        labels.contains(&"awscc.s3.bucket.VersioningStatus.Enabled"),
+        "expected fully-qualified enum identifier; got: {:?}",
         labels
     );
     assert!(
-        labels.contains(&"Suspended"),
-        "Should include all enum variants as bare values"
-    );
-    // Should NOT have full namespaced format
-    assert!(
-        !completions
-            .iter()
-            .any(|c| c.label.contains("awscc.s3.bucket")),
-        "Should not show full namespace path. Got: {:?}",
+        labels.contains(&"awscc.s3.bucket.VersioningStatus.Suspended"),
+        "expected all enum variants in fully-qualified form; got: {:?}",
         labels
     );
-    // Should NOT have quoted string format
+    assert!(
+        !labels.contains(&"Enabled") && !labels.contains(&"Suspended"),
+        "bare tail tokens must not be offered for namespaced enums; got: {:?}",
+        labels
+    );
+    // Should NOT have quoted string format.
     assert!(
         !completions
             .iter()
@@ -953,7 +951,8 @@ versioning_status =
 
 #[test]
 fn string_enum_completion_in_struct_derives_namespace() {
-    // StringEnum inside a struct field should also derive namespace from resource_type.
+    // StringEnum inside a struct field also resolves via the resource type
+    // and emits the fully-qualified form.
     let provider = test_provider_with_nameless_enum();
     let doc = create_document(
         r#"awscc.s3.bucket {
@@ -971,8 +970,13 @@ versioning_configuration {
 
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
-        labels.contains(&"Enabled"),
-        "Should produce bare enum completion inside struct. Got: {:?}",
+        labels.contains(&"awscc.s3.bucket.VersioningStatus.Enabled"),
+        "expected fully-qualified enum identifier inside struct; got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.contains(&"Enabled"),
+        "bare tail token must not be offered inside struct; got: {:?}",
         labels
     );
 }
@@ -1159,13 +1163,13 @@ for item in items {
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
-        labels.contains(&"Enabled"),
-        "StringEnum 'Enabled' must still be offered inside a for body. Got: {:?}",
+        labels.contains(&"awscc.s3.bucket.VersioningStatus.Enabled"),
+        "StringEnum 'Enabled' must still be offered (fully-qualified) inside a for body. Got: {:?}",
         labels
     );
     assert!(
-        labels.contains(&"Suspended"),
-        "StringEnum 'Suspended' must still be offered inside a for body. Got: {:?}",
+        labels.contains(&"awscc.s3.bucket.VersioningStatus.Suspended"),
+        "StringEnum 'Suspended' must still be offered (fully-qualified) inside a for body. Got: {:?}",
         labels
     );
     assert!(
@@ -1205,8 +1209,8 @@ fn string_enum_completion_inside_nested_for_loop_body() {
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
-        labels.contains(&"Enabled"),
-        "Enum candidate must reach nested for body. Got: {:?}",
+        labels.contains(&"awscc.s3.bucket.VersioningStatus.Enabled"),
+        "Enum candidate (fully-qualified) must reach nested for body. Got: {:?}",
         labels
     );
     assert!(
