@@ -2019,3 +2019,95 @@ fn string_returning_builtins_still_offered_for_plain_string_attr() {
         labels
     );
 }
+
+#[test]
+fn for_loop_binding_not_offered_at_incompatible_enum_attribute() {
+    // `for _, account_id in orgs.accounts` where `orgs.accounts` is
+    // `map(aws_account_id)`. Inside the body, `principal_type` is a
+    // `StringEnum` — `account_id` (semantic type `aws_account_id`)
+    // can't type-check as `PrincipalType`, so it must be filtered out.
+    let provider = test_provider_with_custom_semantic_attr();
+    let (_tmp, base) = set_up_upstream_project(
+        "exports {\n  accounts: map(aws_account_id) = \"x\"\n}\n",
+        r#"let orgs = upstream_state { source = '../organizations' }
+for _, account_id in orgs.accounts {
+  awscc.sso.assignment {
+    principal_type =
+  }
+}
+"#,
+    );
+    let main_src = std::fs::read_to_string(base.join("main.crn")).unwrap();
+    let doc = create_document(&main_src);
+    let position = Position {
+        line: 3,
+        character: "    principal_type = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, Some(&base));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        !labels.contains(&"account_id"),
+        "for-loop binding 'account_id' (aws_account_id) must not be offered at a PrincipalType enum attribute. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn for_loop_binding_offered_at_matching_custom_attribute() {
+    // Same repro as above but the cursor is on `target_id`, which is
+    // `Custom{aws_account_id}`. The for-loop binding's element type
+    // matches, so it must appear.
+    let provider = test_provider_with_custom_semantic_attr();
+    let (_tmp, base) = set_up_upstream_project(
+        "exports {\n  accounts: map(aws_account_id) = \"x\"\n}\n",
+        r#"let orgs = upstream_state { source = '../organizations' }
+for _, account_id in orgs.accounts {
+  awscc.sso.assignment {
+    target_id =
+  }
+}
+"#,
+    );
+    let main_src = std::fs::read_to_string(base.join("main.crn")).unwrap();
+    let doc = create_document(&main_src);
+    let position = Position {
+        line: 3,
+        character: "    target_id = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, Some(&base));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"account_id"),
+        "for-loop binding 'account_id' must appear at a matching `aws_account_id` attribute. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn for_loop_binding_without_resolvable_iterable_falls_back_to_unconditional() {
+    // If the iterable can't be resolved (e.g. no upstream_state,
+    // unknown binding), preserve the old permissive behaviour so the
+    // user still gets autocomplete on the name.
+    let provider = test_provider_with_custom_semantic_attr();
+    let doc = create_document(
+        r#"for _, account_id in unknown_source.accounts {
+  awscc.sso.assignment {
+    principal_type =
+  }
+}
+"#,
+    );
+    let position = Position {
+        line: 2,
+        character: "    principal_type = ".chars().count() as u32,
+    };
+    // No base path → no upstream resolution possible. The binding still
+    // shows (permissive fallback).
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"account_id"),
+        "unresolvable iterable should preserve the permissive fallback. Got: {:?}",
+        labels
+    );
+}

@@ -522,20 +522,59 @@ fn is_after_let_binding(line: &str, prefix_start: usize) -> bool {
     crate::let_parse::parse_let_header(&line[..byte_end]).is_some()
 }
 
-/// Extract `for`-loop binding names that are in scope at the given position.
-///
-/// Walks the text up to `position`, tracking a stack of open `for` bodies.
-/// Each `for <bindings> in ... {` pushes the bindings (after filtering out
-/// `_` discards); the matching `}` pops them. The returned vector preserves
-/// declaration order (outer loops first, then inner).
+/// Which slot of a `for` header introduced a given binding. Encodes the
+/// header shape so a downstream type inferencer can project the correct
+/// element type out of the iterable's own type: e.g. `Value` against
+/// `list(T)` yields `T`, `PairKey` against `map(T)` yields `String`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ForBindingSlot {
+    /// `for x in iter` — `x` is the element.
+    Value,
+    /// First slot of `for a, b in iter` — the index (for lists) or key
+    /// (for maps). The scanner can't distinguish `for (i, x) in list`
+    /// from `for k, v in map` from text alone; the type inferencer
+    /// resolves the ambiguity using the iterable's actual type.
+    PairKey,
+    /// Second slot of `for a, b in iter` — the element value.
+    PairValue,
+}
+
+/// An `upstream_state` export referenced by a `for` header's iterable.
+/// Only the two-segment `binding.export` shape is captured because it's
+/// the only form we can currently resolve to a declared type.
+#[derive(Debug, Clone)]
+pub(super) struct IterableExportRef {
+    pub binding: String,
+    pub export: String,
+}
+
+/// One binding introduced by a `for` header that is in scope at a given
+/// position. Carries enough context for the LSP to resolve the binding's
+/// inferred type: the iterable export the header refers to and the
+/// binding's slot in the header.
+#[derive(Debug, Clone)]
+pub(super) struct ForScopeBinding {
+    /// The bare identifier the user typed (never `_`).
+    pub name: String,
+    /// Slot in the header that introduced this name — see `ForBindingSlot`.
+    pub slot: ForBindingSlot,
+    /// Parsed iterable reference. `None` when the iterable isn't a
+    /// two-segment `binding.export` shape (e.g. a local `let`, a
+    /// function call, or a bare identifier) — the type inferencer bails
+    /// in that case and the caller falls back to the permissive suggest.
+    pub iterable: Option<IterableExportRef>,
+}
+
+/// Extract the full binding info for every `for`-loop binding in scope at
+/// `position`. See `ForScopeBinding` for what each entry carries.
 ///
 /// Parsing is intentionally line- and brace-based rather than AST-based:
 /// the document may not parse while the user is typing, so we cannot
 /// depend on a successful parse of the partial text.
-pub(super) fn extract_for_binding_names_in_scope(
+pub(super) fn extract_for_bindings_in_scope(
     text: &str,
     position: tower_lsp::lsp_types::Position,
-) -> Vec<String> {
+) -> Vec<ForScopeBinding> {
     // Byte offset of the cursor inside `text`.
     let cursor_byte_offset: usize = {
         let mut offset = 0usize;
@@ -555,10 +594,10 @@ pub(super) fn extract_for_binding_names_in_scope(
         offset
     };
 
-    // Each frame on the stack represents one open `for` body: the bindings it
-    // introduced plus a depth counter of *nested* `{` inside it. The frame
-    // pops when that depth reaches -1 (the loop's own `}`).
-    let mut stack: Vec<(Vec<String>, i32)> = Vec::new();
+    // Each frame on the stack represents one open `for` body: the bindings
+    // it introduced plus a depth counter of *nested* `{` inside it. The
+    // frame pops when that depth reaches -1 (the loop's own `}`).
+    let mut stack: Vec<(Vec<ForScopeBinding>, i32)> = Vec::new();
     let bytes = text.as_bytes();
     let mut i = 0usize;
 
@@ -576,28 +615,48 @@ pub(super) fn extract_for_binding_names_in_scope(
         let trimmed = line.trim_start();
         // `for ...` header: collect bindings; the body opens at the first `{`
         // on this line.
-        let mut pending_frame: Option<Vec<String>> = None;
+        let mut pending_frame: Option<Vec<ForScopeBinding>> = None;
         if let Some(rest) = trimmed.strip_prefix("for ")
-            && let Some(header) = rest.split(" in ").next()
+            && let Some((header, after_in)) = rest.split_once(" in ")
         {
-            let mut names: Vec<String> = Vec::new();
+            let iterable_raw = after_in.split_once('{').map(|(l, _)| l).unwrap_or(after_in);
+            let mut segments = iterable_raw.trim().split('.').filter(|s| !s.is_empty());
+            let iterable = match (segments.next(), segments.next(), segments.next()) {
+                (Some(binding), Some(export), None) => Some(IterableExportRef {
+                    binding: binding.to_string(),
+                    export: export.to_string(),
+                }),
+                _ => None,
+            };
             let cleaned = header.trim().trim_start_matches('(').trim_end_matches(')');
-            for part in cleaned.split(',') {
-                let name = part.trim();
-                if name.is_empty() || name == "_" {
+            let raw_parts: Vec<&str> = cleaned.split(',').map(|p| p.trim()).collect();
+            let is_pair = raw_parts.len() == 2;
+            let mut bindings: Vec<ForScopeBinding> = Vec::new();
+            for (index, part) in raw_parts.iter().enumerate() {
+                if part.is_empty() || *part == "_" {
                     continue;
                 }
-                names.push(name.to_string());
+                let slot = match (is_pair, index) {
+                    (false, _) => ForBindingSlot::Value,
+                    (true, 0) => ForBindingSlot::PairKey,
+                    (true, 1) => ForBindingSlot::PairValue,
+                    _ => continue,
+                };
+                bindings.push(ForScopeBinding {
+                    name: part.to_string(),
+                    slot,
+                    iterable: iterable.clone(),
+                });
             }
-            pending_frame = Some(names);
+            pending_frame = Some(bindings);
         }
 
         for b in line.bytes() {
             match b {
                 b'{' => {
-                    if let Some(names) = pending_frame.take() {
+                    if let Some(bindings) = pending_frame.take() {
                         // This `{` starts the body of the `for` header on this line.
-                        stack.push((names, 0));
+                        stack.push((bindings, 0));
                     } else if let Some(frame) = stack.last_mut() {
                         frame.1 += 1;
                     }
@@ -616,13 +675,23 @@ pub(super) fn extract_for_binding_names_in_scope(
         }
     }
 
-    stack.into_iter().flat_map(|(names, _)| names).collect()
+    stack
+        .into_iter()
+        .flat_map(|(bindings, _)| bindings)
+        .collect()
 }
 
 #[cfg(test)]
 mod helper_tests {
-    use super::{extract_for_binding_names_in_scope, is_after_let_binding};
+    use super::{extract_for_bindings_in_scope, is_after_let_binding};
     use tower_lsp::lsp_types::Position;
+
+    fn names(text: &str, position: Position) -> Vec<String> {
+        extract_for_bindings_in_scope(text, position)
+            .into_iter()
+            .map(|b| b.name)
+            .collect()
+    }
 
     #[test]
     fn detects_after_let_binding() {
@@ -649,21 +718,21 @@ mod helper_tests {
     fn for_scope_simple_binding_inside_body() {
         let text = "for item in items {\n  x\n}\n";
         // cursor on line 1 ("  x")
-        let names = extract_for_binding_names_in_scope(text, pos(1, 3));
+        let names = names(text, pos(1, 3));
         assert_eq!(names, vec!["item".to_string()]);
     }
 
     #[test]
     fn for_scope_map_bindings_inside_body() {
         let text = "for name, account_id in orgs.accounts {\n  x\n}\n";
-        let names = extract_for_binding_names_in_scope(text, pos(1, 3));
+        let names = names(text, pos(1, 3));
         assert_eq!(names, vec!["name".to_string(), "account_id".to_string()]);
     }
 
     #[test]
     fn for_scope_indexed_bindings_inside_body() {
         let text = "for (i, item) in items {\n  x\n}\n";
-        let names = extract_for_binding_names_in_scope(text, pos(1, 3));
+        let names = names(text, pos(1, 3));
         assert_eq!(names, vec!["i".to_string(), "item".to_string()]);
     }
 
@@ -671,7 +740,7 @@ mod helper_tests {
     fn for_scope_discard_excluded() {
         // `_` is a discard marker and must not appear as a candidate.
         let text = "for _, v in m {\n  x\n}\n";
-        let names = extract_for_binding_names_in_scope(text, pos(1, 3));
+        let names = names(text, pos(1, 3));
         assert_eq!(names, vec!["v".to_string()]);
     }
 
@@ -679,7 +748,7 @@ mod helper_tests {
     fn for_scope_outside_body_no_bindings() {
         // Cursor after the closing `}` — loop variable out of scope.
         let text = "for item in items {\n  x\n}\nfoo\n";
-        let names = extract_for_binding_names_in_scope(text, pos(3, 2));
+        let names = names(text, pos(3, 2));
         assert!(names.is_empty(), "expected empty, got: {:?}", names);
     }
 
@@ -687,7 +756,7 @@ mod helper_tests {
     fn for_scope_nested_stacks_outer_and_inner() {
         let text = "for outer in xs {\n  for inner in ys {\n    x\n  }\n}\n";
         // cursor on line 2 ("    x") — both outer and inner visible
-        let names = extract_for_binding_names_in_scope(text, pos(2, 5));
+        let names = names(text, pos(2, 5));
         assert_eq!(names, vec!["outer".to_string(), "inner".to_string()]);
     }
 
@@ -698,7 +767,7 @@ mod helper_tests {
         // values (e.g. JSON embedded as a string).
         let text = "for item in items {\n  test.foo.bar {\n    attr = \"hello { world }\"\n    x\n  }\n}\n";
         // Cursor on line 3 ("    x") — still inside the for body
-        let names = extract_for_binding_names_in_scope(text, pos(3, 5));
+        let names = names(text, pos(3, 5));
         assert_eq!(names, vec!["item".to_string()]);
     }
 
@@ -707,7 +776,7 @@ mod helper_tests {
         // After the first loop closes, its binding must go out of scope
         // even while a second loop with a different binding is open.
         let text = "for a in xs {\n  x\n}\nfor b in ys {\n  y\n}\n";
-        let on_b = extract_for_binding_names_in_scope(text, pos(4, 3));
+        let on_b = names(text, pos(4, 3));
         assert_eq!(on_b, vec!["b".to_string()]);
     }
 }
