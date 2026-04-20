@@ -10,7 +10,7 @@ use carina_core::config_loader::{
 use carina_core::lint::find_duplicate_attrs;
 use carina_core::parser::{ProviderContext, UpstreamState};
 
-use super::validate_and_resolve_with_config;
+use super::validate_and_resolve_errors;
 use crate::error::AppError;
 use crate::wiring::check_unused_bindings;
 
@@ -42,17 +42,9 @@ pub fn run_validate(
 
     let base_dir = get_base_dir(path);
 
-    // Collect every static error before reporting, so the user sees them
-    // all in one pass instead of fixing one, re-running, and finding the
-    // next. See #2102.
-    //
-    // Dependency ordering still applies: `validate_and_resolve_with_config`
-    // performs module expansion and name resolution that later steps rely
-    // on. We don't delay those errors behind other checks — but we _do_
-    // accumulate the deferred for-iterable errors (already collected by
-    // `load_configuration_with_config`) and run the `upstream_state.source`
-    // existence check up front so both categories of findings surface
-    // together with anything the validators downstream report.
+    // Collect every static error before reporting, so the user sees
+    // them all in one pass instead of fixing one, re-running, and
+    // finding the next. See #2102 / #2105.
     let mut error_reports: Vec<String> = Vec::new();
     error_reports.extend(
         loaded
@@ -72,23 +64,11 @@ pub fn run_validate(
         println!("{}", "Validating...".cyan());
     }
 
-    if let Err(err) = validate_and_resolve_with_config(&mut parsed, base_dir, false) {
-        match err {
-            AppError::Validation(msg) => error_reports.push(msg),
-            other => {
-                // Non-validation error (IO, config, etc.) — surface
-                // immediately alongside whatever we already collected.
-                if !error_reports.is_empty() {
-                    return Err(AppError::Validation(format!(
-                        "{}\n{}",
-                        error_reports.join("\n"),
-                        other
-                    )));
-                }
-                return Err(other);
-            }
-        }
-    }
+    error_reports.extend(
+        validate_and_resolve_errors(&mut parsed, base_dir, false)
+            .iter()
+            .map(ToString::to_string),
+    );
 
     if !error_reports.is_empty() {
         return Err(AppError::Validation(error_reports.join("\n")));

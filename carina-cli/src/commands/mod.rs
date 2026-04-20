@@ -175,28 +175,43 @@ pub fn validate_and_resolve_with_config(
     base_dir: &Path,
     skip_resource_validation: bool,
 ) -> Result<(), AppError> {
+    let errors = validate_and_resolve_errors(parsed, base_dir, skip_resource_validation);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(collapse_errors(errors))
+    }
+}
+
+/// Vec-returning twin of [`validate_and_resolve_with_config`]. `run_validate`
+/// uses it to fold findings into its own accumulator; the `Result`-returning
+/// wrapper above flushes through `collapse_errors` for the rest of the CLI.
+pub fn validate_and_resolve_errors(
+    parsed: &mut ParsedFile,
+    base_dir: &Path,
+    skip_resource_validation: bool,
+) -> Vec<AppError> {
     let (factories, load_errors) = build_factories_from_providers(&parsed.providers, base_dir);
     let ctx = WiringContext::new(factories);
 
-    // Check for declared providers whose plugins failed to load
+    let mut errors: Vec<AppError> = Vec::new();
+
+    // Check for declared providers whose plugins failed to load.
     if !skip_resource_validation {
-        let mut errors = Vec::new();
         for provider in &parsed.providers {
             let loaded = ctx.factories().iter().any(|f| f.name() == provider.name);
-            if !loaded {
-                if let Some(reason) = load_errors.get(&provider.name) {
-                    errors.push(reason.clone());
-                } else if provider.source.is_none() {
-                    errors.push(missing_provider_source_message(&provider.name));
-                }
+            if loaded {
+                continue;
+            }
+            if let Some(reason) = load_errors.get(&provider.name) {
+                errors.push(AppError::Validation(reason.clone()));
+            } else if provider.source.is_none() {
+                errors.push(AppError::Validation(missing_provider_source_message(
+                    &provider.name,
+                )));
             }
         }
-        if !errors.is_empty() {
-            return Err(AppError::Validation(errors.join("\n")));
-        }
     }
-
-    let mut errors: Vec<AppError> = Vec::new();
 
     // Validate provider region
     errors.extend(validate_provider_region_with_ctx(&ctx, parsed));
@@ -217,22 +232,24 @@ pub fn validate_and_resolve_with_config(
 
     // Module expansion assumes the checks above succeeded — feeding
     // broken module calls into `resolve_modules_with_config` can
-    // surface confusing secondary errors, so gate it on a clean
-    // accumulator.
+    // surface confusing secondary errors, so gate it here.
     if !errors.is_empty() {
-        return Err(collapse_errors(errors));
+        return errors;
     }
 
-    // Resolve module imports and expand module calls
-    module_resolver::resolve_modules_with_config(parsed, base_dir, &enriched_context)
-        .map_err(|e| format!("Module resolution error: {}", e))?;
+    if let Err(e) =
+        module_resolver::resolve_modules_with_config(parsed, base_dir, &enriched_context)
+    {
+        errors.push(AppError::Config(format!("Module resolution error: {}", e)));
+        return errors;
+    }
 
     // Resolve names (let bindings -> resource names) — must succeed
     // before per-resource schema checks can look up the renamed
     // attributes, so its failures gate the remaining pipeline.
     errors.extend(resolve_names_with_ctx(&ctx, &mut parsed.resources));
     if !errors.is_empty() {
-        return Err(collapse_errors(errors));
+        return errors;
     }
 
     if !skip_resource_validation {
@@ -254,21 +271,28 @@ pub fn validate_and_resolve_with_config(
             &parsed.resources,
         ));
         if !errors.is_empty() {
-            return Err(collapse_errors(errors));
+            return errors;
         }
     }
 
     // Validate export values against their type annotations
     if !skip_resource_validation {
-        carina_core::validation::validate_export_params(&parsed.export_params, &enriched_context)?;
-        carina_core::validation::validate_export_param_ref_types(
+        if let Err(msg) = carina_core::validation::validate_export_params(
+            &parsed.export_params,
+            &enriched_context,
+        ) {
+            errors.extend(split_validation_message(&msg));
+        }
+        if let Err(msg) = carina_core::validation::validate_export_param_ref_types(
             &parsed.export_params,
             &parsed.resources,
             ctx.schemas(),
             &|r: &carina_core::resource::Resource| {
                 carina_core::provider::schema_key_for_resource(ctx.factories(), r)
             },
-        )?;
+        ) {
+            errors.extend(split_validation_message(&msg));
+        }
     }
 
     // Compute anonymous identifiers — downstream plan code assumes
@@ -280,7 +304,7 @@ pub fn validate_and_resolve_with_config(
         &parsed.providers,
     ));
     if !errors.is_empty() {
-        return Err(collapse_errors(errors));
+        return errors;
     }
 
     // Reject references to `upstream_state` fields that the upstream's
@@ -314,15 +338,36 @@ pub fn validate_and_resolve_with_config(
                 carina_core::provider::schema_key_for_resource(ctx.factories(), r)
             },
         );
-        if !resolve_errors.is_empty() || !field_errors.is_empty() || !type_errors.is_empty() {
-            let mut lines: Vec<String> = resolve_errors.iter().map(ToString::to_string).collect();
-            lines.extend(field_errors.iter().map(ToString::to_string));
-            lines.extend(type_errors.iter().map(ToString::to_string));
-            return Err(AppError::Validation(lines.join("\n")));
-        }
+        errors.extend(
+            resolve_errors
+                .iter()
+                .map(|e| AppError::Validation(e.to_string())),
+        );
+        errors.extend(
+            field_errors
+                .iter()
+                .map(|e| AppError::Validation(e.to_string())),
+        );
+        errors.extend(
+            type_errors
+                .iter()
+                .map(|e| AppError::Validation(e.to_string())),
+        );
     }
 
-    Ok(())
+    errors
+}
+
+/// Split the newline-joined error strings that `carina_core::validation::*`
+/// helpers return into individual `AppError::Validation` entries. Mirrors
+/// the `lift_validation_result` helper in `wiring.rs` for the two
+/// `validate_export_*` core functions that are still called inline here.
+fn split_validation_message(joined: &str) -> Vec<AppError> {
+    joined
+        .split('\n')
+        .filter(|s| !s.is_empty())
+        .map(|s| AppError::Validation(s.to_string()))
+        .collect()
 }
 
 #[cfg(test)]
