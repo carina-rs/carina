@@ -2109,15 +2109,76 @@ fn parse_for_expr(
             // same slot a quoted literal uses. Reporting those as
             // `iterable is string "org"` is misleading: the user wrote an
             // identifier, not a literal, and the likely fault is a typo for
-            // a known binding. Route them through UndefinedIdentifier so
-            // the #2038 / #2100 did-you-mean machinery kicks in. See #2101.
+            // a known binding. Record them as deferred for-expressions so
+            // `check_deferred_for_iterables` (which runs on the merged
+            // directory-wide ParsedFile, so cross-file upstream_state /
+            // module bindings are visible) can emit a proper
+            // UndefinedIdentifier with the did-you-mean machinery from
+            // #2038 / #2100. See #2101.
             if let Value::String(s) = &iterable
                 && is_bare_identifier(s)
             {
-                let known = collect_known_bindings(ctx);
-                if !known.contains(s.as_str()) {
-                    return Err(undefined_identifier_error(&known, s.clone(), for_line));
+                let header = match &binding {
+                    ForBinding::Simple(var) => format!("for {} in {}", var, s),
+                    ForBinding::Indexed(idx, val) => format!("for ({}, {}) in {}", idx, val, s),
+                    ForBinding::Map(k, v) => format!("for {}, {} in {}", k, v, s),
+                };
+                let mut template_ctx = ctx.clone();
+                let placeholder = || Value::String(DEFERRED_UPSTREAM_PLACEHOLDER.to_string());
+                let bind = |c: &mut ParseContext, name: &str, v: Value| {
+                    if name != "_" {
+                        c.set_variable(name.to_string(), v);
+                    }
+                };
+                match &binding {
+                    ForBinding::Simple(var) => {
+                        bind(&mut template_ctx, var, placeholder());
+                    }
+                    ForBinding::Indexed(idx, val) => {
+                        bind(
+                            &mut template_ctx,
+                            idx,
+                            Value::String(DEFERRED_UPSTREAM_INDEX_PLACEHOLDER.to_string()),
+                        );
+                        bind(&mut template_ctx, val, placeholder());
+                    }
+                    ForBinding::Map(k, v) => {
+                        bind(
+                            &mut template_ctx,
+                            k,
+                            Value::String(DEFERRED_UPSTREAM_KEY_PLACEHOLDER.to_string()),
+                        );
+                        bind(&mut template_ctx, v, placeholder());
+                    }
                 }
+                let address = format!("{}[?]", binding_name);
+                if let Ok(ForBodyResult::Resource(resource)) =
+                    parse_for_body(body_pair, &template_ctx, &address)
+                {
+                    let attrs: Vec<(String, Value)> = resource
+                        .attributes
+                        .iter()
+                        .filter(|(k, _)| !k.starts_with('_'))
+                        .map(|(k, expr)| (k.clone(), expr.0.clone()))
+                        .collect();
+                    ctx.deferred_for_expressions.push(DeferredForExpression {
+                        file: None,
+                        line: for_line,
+                        header,
+                        resource_type: if resource.id.provider.is_empty() {
+                            resource.id.resource_type.clone()
+                        } else {
+                            format!("{}.{}", resource.id.provider, resource.id.resource_type)
+                        },
+                        attributes: attrs,
+                        binding_name: binding_name.to_string(),
+                        iterable_binding: s.clone(),
+                        iterable_attr: String::new(),
+                        binding: binding.clone(),
+                        template_resource: *resource,
+                    });
+                }
+                return Ok((resources, module_calls));
             }
             let iterable_type = match &iterable {
                 Value::String(s) => {
@@ -11052,9 +11113,12 @@ awscc.ec2.vpc {
         // identifier — `for ... in org { ... }` rather than the dotted
         // `org.accounts` — the parser previously reported
         // `iterable is string "org" (expected map)`, calling the identifier
-        // a string and leaving the user with no did-you-mean. Route this
-        // case through UndefinedIdentifier so the message matches the
-        // dotted form.
+        // a string and leaving the user with no did-you-mean.
+        //
+        // The fix records these as `DeferredForExpression` so
+        // `check_deferred_for_iterables` validates them against the merged
+        // directory-wide binding set (mirrors the dotted-form path). That
+        // gives us cross-file visibility for the did-you-mean candidates.
         let input = r#"
             let orgs = upstream_state { source = "../a" }
             for _, id in org {
@@ -11063,8 +11127,11 @@ awscc.ec2.vpc {
                 }
             }
         "#;
-        let err = parse(input, &ProviderContext::default())
-            .expect_err("bare undeclared identifier as iterable must error");
+        let parsed = parse(input, &ProviderContext::default())
+            .expect("single-file parse must not reject bare-iterable identifiers; the cross-file check runs later");
+        let errs = check_deferred_for_iterables(&parsed);
+        assert_eq!(errs.len(), 1, "expected one error, got {errs:?}");
+        let err = &errs[0];
         let msg = err.to_string();
         assert!(
             matches!(err, ParseError::UndefinedIdentifier { .. }),
