@@ -1,6 +1,6 @@
 //! Configuration loading and .crn file discovery utilities
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -49,24 +49,7 @@ pub fn load_configuration_with_config(
             return Err(format!("No .crn files found in {}", path.display()));
         }
 
-        let empty_parsed = || ParsedFile {
-            providers: vec![],
-            resources: vec![],
-            variables: HashMap::new(),
-            imports: vec![],
-            module_calls: vec![],
-            arguments: vec![],
-            attribute_params: vec![],
-            export_params: vec![],
-            backend: None,
-            state_blocks: vec![],
-            user_functions: HashMap::new(),
-            upstream_states: vec![],
-            requires: vec![],
-            structural_bindings: HashSet::new(),
-            warnings: vec![],
-            deferred_for_expressions: vec![],
-        };
+        let empty_parsed = ParsedFile::default;
         let mut merged = empty_parsed();
         let mut unresolved_merged = empty_parsed();
         let mut parse_errors = Vec::new();

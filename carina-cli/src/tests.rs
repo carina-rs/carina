@@ -681,6 +681,7 @@ fn test_find_state_bucket_resource_matching_type() {
         structural_bindings: HashSet::new(),
         warnings: vec![],
         deferred_for_expressions: vec![],
+        string_literal_paths: std::collections::HashSet::new(),
     };
 
     // Matching resource type
@@ -1976,6 +1977,7 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
         structural_bindings: HashSet::new(),
         warnings: vec![],
         deferred_for_expressions: vec![],
+        string_literal_paths: std::collections::HashSet::new(),
     };
 
     // MockProvider returns not_found for both resources (simulates external deletion)

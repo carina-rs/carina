@@ -897,6 +897,7 @@ mod tests {
             structural_bindings: HashSet::new(),
             warnings: vec![],
             deferred_for_expressions: vec![],
+            string_literal_paths: HashSet::new(),
         }
     }
 
@@ -1033,6 +1034,7 @@ mod tests {
             structural_bindings: HashSet::new(),
             warnings: vec![],
             deferred_for_expressions: vec![],
+            string_literal_paths: HashSet::new(),
         }
     }
 
@@ -1160,6 +1162,7 @@ mod tests {
             structural_bindings: HashSet::new(),
             warnings: vec![],
             deferred_for_expressions: vec![],
+            string_literal_paths: HashSet::new(),
         }
     }
 
@@ -1510,6 +1513,7 @@ mod tests {
             structural_bindings: HashSet::new(),
             warnings: vec![],
             deferred_for_expressions: vec![],
+            string_literal_paths: HashSet::new(),
         }
     }
 
@@ -1827,6 +1831,7 @@ mod tests {
             structural_bindings: HashSet::new(),
             warnings: vec![],
             deferred_for_expressions: vec![],
+            string_literal_paths: HashSet::new(),
         }
     }
 
@@ -1999,6 +2004,7 @@ mod tests {
             structural_bindings: HashSet::new(),
             warnings: vec![],
             deferred_for_expressions: vec![],
+            string_literal_paths: HashSet::new(),
         };
 
         let resolver = {
@@ -2064,6 +2070,7 @@ mod tests {
             structural_bindings: HashSet::new(),
             warnings: vec![],
             deferred_for_expressions: vec![],
+            string_literal_paths: HashSet::new(),
         };
 
         let resolver = {
@@ -2157,6 +2164,7 @@ mod tests {
             structural_bindings: HashSet::new(),
             warnings: vec![],
             deferred_for_expressions: vec![],
+            string_literal_paths: HashSet::new(),
         };
 
         let resolver = {
@@ -2226,6 +2234,7 @@ mod tests {
             structural_bindings: HashSet::new(),
             warnings: vec![],
             deferred_for_expressions: vec![],
+            string_literal_paths: HashSet::new(),
         };
 
         let resolver = {
@@ -2292,6 +2301,7 @@ mod tests {
             structural_bindings: HashSet::new(),
             warnings: vec![],
             deferred_for_expressions: vec![],
+            string_literal_paths: HashSet::new(),
         };
 
         let resolver = {
@@ -2384,6 +2394,7 @@ mod tests {
             structural_bindings: HashSet::new(),
             warnings: vec![],
             deferred_for_expressions: vec![],
+            string_literal_paths: HashSet::new(),
         };
 
         let resolver = {
