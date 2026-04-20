@@ -429,7 +429,7 @@ impl DiagnosticEngine {
                                         .attr_type
                                         .validate(value)
                                         .err()
-                                        .map(|e| e.to_string())
+                                        .map(|e| e.with_attribute(attr_name).to_string())
                                 }
                                 (
                                     carina_core::schema::AttributeType::Custom {
@@ -505,7 +505,7 @@ impl DiagnosticEngine {
                                         .attr_type
                                         .validate(attr_value)
                                         .err()
-                                        .map(|e| e.to_string())
+                                        .map(|e| e.with_attribute(attr_name).to_string())
                                 }
                                 // Validate Map value types
                                 (carina_core::schema::AttributeType::Map { .. }, Value::Map(_)) => {
@@ -513,7 +513,7 @@ impl DiagnosticEngine {
                                         .attr_type
                                         .validate(attr_value)
                                         .err()
-                                        .map(|e| e.to_string())
+                                        .map(|e| e.with_attribute(attr_name).to_string())
                                 }
                                 // Validate Union static values (non-ResourceRef)
                                 (carina_core::schema::AttributeType::Union(_), value)
@@ -523,7 +523,7 @@ impl DiagnosticEngine {
                                         .attr_type
                                         .validate(value)
                                         .err()
-                                        .map(|e| e.to_string())
+                                        .map(|e| e.with_attribute(attr_name).to_string())
                                 }
                                 _ => None,
                             };

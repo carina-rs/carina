@@ -2771,3 +2771,33 @@ for _, id in orgs.xs {
         bad.range.start.line, bad.range
     );
 }
+
+#[test]
+fn lsp_enum_diagnostic_includes_attribute_name() {
+    // Regression for #2098. The LSP enum-mismatch diagnostic must quote
+    // the attribute name (e.g. `'mode'`) so a reader can locate the bad
+    // token in their file when the same enum type appears on several
+    // attributes.
+    let provider = test_engine_with_enum_attr();
+    let doc = create_document(
+        r#"test.r.mode_holder {
+  mode = "aaaa"
+}
+"#,
+    );
+    let diagnostics = provider.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let bad = diagnostics
+        .iter()
+        .find(|d| d.message.contains("aaaa"))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected enum-mismatch diagnostic, got: {:?}",
+                diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        bad.message.contains("'mode'"),
+        "diagnostic should name the attribute, got: {}",
+        bad.message
+    );
+}
