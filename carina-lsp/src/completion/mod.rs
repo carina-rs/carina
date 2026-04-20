@@ -86,6 +86,7 @@ impl CompletionProvider {
                 &text,
                 current_binding.as_deref(),
                 position,
+                base_path,
             ),
             CompletionContext::InsideStructBlock {
                 resource_type,

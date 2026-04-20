@@ -120,6 +120,7 @@ impl CompletionProvider {
         text: &str,
         current_binding: Option<&str>,
         position: Position,
+        base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
 
@@ -200,17 +201,54 @@ impl CompletionProvider {
             });
         }
 
-        // Add for-loop binding names in scope at the cursor.
-        // Type inference for loop variables is a follow-up; for now we offer
-        // the bare identifier so the user at least gets autocomplete on the
-        // name itself.
-        let for_bindings = super::top_level::extract_for_binding_names_in_scope(text, position);
-        for name in &for_bindings {
+        // Add for-loop binding names in scope, filtered by inferred element
+        // type where possible. When the iterable is an `upstream_state`
+        // export with a declared type, we infer the binding's type and
+        // only suggest it at attribute positions whose type accepts it.
+        // Inference failure (no type annotation, non-upstream iterable,
+        // no schema for the target attribute) falls back to an
+        // unconditional suggest so the user still gets autocomplete on
+        // the bare name.
+        let attr_type_for_for_filter = self
+            .schemas
+            .get(resource_type)
+            .and_then(|s| s.attributes.get(attr_name))
+            .map(|a| &a.attr_type);
+        let for_bindings = super::top_level::extract_for_bindings_in_scope(text, position);
+        // Cache upstream binding → source text scan and the resolved
+        // exports per upstream. Without this, each for-binding re-scans
+        // every sibling `.crn` plus re-parses the upstream project —
+        // every keystroke in a value position.
+        let upstream_sources: std::collections::HashMap<String, String> =
+            if for_bindings.iter().any(|b| b.iterable.is_some()) {
+                super::collect_upstream_state_bindings(text, base_path)
+            } else {
+                std::collections::HashMap::new()
+            };
+        let mut exports_cache: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, Option<carina_core::parser::TypeExpr>>,
+        > = std::collections::HashMap::new();
+        for binding in &for_bindings {
+            if let Some(attr_type) = attr_type_for_for_filter
+                && let Some(element_type) = infer_for_binding_type(
+                    binding,
+                    &upstream_sources,
+                    base_path,
+                    &mut exports_cache,
+                )
+                && !carina_core::validation::is_type_expr_compatible_with_schema(
+                    &element_type,
+                    attr_type,
+                )
+            {
+                continue;
+            }
             completions.push(CompletionItem {
-                label: name.clone(),
+                label: binding.name.clone(),
                 kind: Some(CompletionItemKind::VARIABLE),
                 detail: Some("for-loop binding".to_string()),
-                insert_text: Some(name.clone()),
+                insert_text: Some(binding.name.clone()),
                 ..Default::default()
             });
         }
@@ -1018,6 +1056,65 @@ impl CompletionProvider {
                 })
                 .collect(),
         }
+    }
+}
+
+/// Infer the static type of a for-loop binding by resolving its iterable
+/// to an `upstream_state` export's declared `TypeExpr`. Returns `None`
+/// when inference isn't possible — the caller falls back to
+/// unconditional suggestion so the user still gets autocomplete on the
+/// bare name.
+///
+/// Current reach: `for _, v in <binding>.<export>` where `<binding>` is
+/// an `upstream_state` binding and `<export>` has a `: map(T) = ...` or
+/// `: list(T) = ...` annotation. Direct `let` iterables and inferred
+/// `ResourceRef` types are future work.
+///
+/// `exports_cache` memoizes the per-upstream exports map across bindings
+/// in the same call site so multiple `for`-variables in scope don't each
+/// re-read and re-parse the upstream project directory.
+fn infer_for_binding_type(
+    binding: &super::top_level::ForScopeBinding,
+    upstream_sources: &std::collections::HashMap<String, String>,
+    base_path: Option<&Path>,
+    exports_cache: &mut std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, Option<carina_core::parser::TypeExpr>>,
+    >,
+) -> Option<carina_core::parser::TypeExpr> {
+    use super::top_level::ForBindingSlot;
+    use carina_core::parser::TypeExpr;
+
+    let iterable = binding.iterable.as_ref()?;
+    let base = base_path?;
+    let source = upstream_sources.get(&iterable.binding)?;
+
+    let exports = exports_cache
+        .entry(iterable.binding.clone())
+        .or_insert_with(|| {
+            let upstream = carina_core::parser::UpstreamState {
+                binding: iterable.binding.clone(),
+                source: std::path::PathBuf::from(source),
+            };
+            let (resolved, _errors) = carina_core::upstream_exports::resolve_upstream_exports(
+                base,
+                &[upstream],
+                &Default::default(),
+            );
+            resolved.get(&iterable.binding).cloned().unwrap_or_default()
+        });
+    let export_type = exports.get(&iterable.export)?.as_ref()?;
+
+    match (export_type, binding.slot) {
+        (TypeExpr::List(inner), ForBindingSlot::Value | ForBindingSlot::PairValue) => {
+            Some((**inner).clone())
+        }
+        (TypeExpr::List(_), ForBindingSlot::PairKey) => Some(TypeExpr::Int),
+        (TypeExpr::Map(inner), ForBindingSlot::Value | ForBindingSlot::PairValue) => {
+            Some((**inner).clone())
+        }
+        (TypeExpr::Map(_), ForBindingSlot::PairKey) => Some(TypeExpr::String),
+        _ => None,
     }
 }
 
