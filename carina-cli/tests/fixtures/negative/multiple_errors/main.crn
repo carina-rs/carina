@@ -1,0 +1,20 @@
+# Negative test for #2102: validate must emit every static error in one pass.
+#
+# This fixture seeds two independent errors:
+#  - Error 1: `for _ in org.accounts` — `org` is not declared.
+#  - Error 2: `for _ in missing.stuff` — `missing` is not declared either.
+# Both should surface in a single `carina validate` run.
+
+let orgs = upstream_state { source = "../nonexistent_sibling" }
+
+for _, id in org.accounts {
+  aws.s3_bucket {
+    name = id
+  }
+}
+
+for _, id in missing.stuff {
+  aws.s3_bucket {
+    name = id
+  }
+}
