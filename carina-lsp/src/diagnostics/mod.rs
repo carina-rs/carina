@@ -425,11 +425,24 @@ impl DiagnosticEngine {
                                 ),
                                 // Custom type validation (all Custom types use their validate fn)
                                 (carina_core::schema::AttributeType::StringEnum { .. }, value) => {
-                                    attr_schema
-                                        .attr_type
-                                        .validate(value)
-                                        .err()
-                                        .map(|e| e.with_attribute(attr_name).to_string())
+                                    attr_schema.attr_type.validate(value).err().map(|e| {
+                                        let tagged = e.with_attribute(attr_name);
+                                        // Mirror PR 2 (#2112) diagnostic parity in the LSP:
+                                        // if the parser tagged this attribute as a quoted
+                                        // string literal, reshape the enum-variant error
+                                        // into the shape-mismatch variant so editor hovers
+                                        // match CLI output. See #2094.
+                                        let reshaped = if is_quoted_literal_attr(
+                                            parsed,
+                                            &resource.id,
+                                            attr_name,
+                                        ) {
+                                            tagged.into_string_literal_diagnostic()
+                                        } else {
+                                            tagged
+                                        };
+                                        reshaped.to_string()
+                                    })
                                 }
                                 (
                                     carina_core::schema::AttributeType::Custom {
@@ -471,7 +484,33 @@ impl DiagnosticEngine {
                                     };
 
                                     // Use schema's validate function for all Custom types
-                                    validate(&resolved_value).err().map(|e| e.to_string())
+                                    validate(&resolved_value).err().map(|inner_msg| {
+                                        // For namespaced Custom types (enum-like), mirror
+                                        // the CLI shape-mismatch diagnostic when the user
+                                        // wrote a quoted string literal. The Custom
+                                        // validator itself returns a free-form string, so
+                                        // we wrap its message rather than reshape a
+                                        // TypeError. See #2094.
+                                        if namespace.is_some()
+                                            && matches!(value, Value::String(s) if !s.contains('.'))
+                                            && is_quoted_literal_attr(
+                                                parsed,
+                                                &resource.id,
+                                                attr_name,
+                                            )
+                                        {
+                                            let typed = match value {
+                                                Value::String(s) => s.as_str(),
+                                                _ => "",
+                                            };
+                                            format!(
+                                                "'{}' ({}) expects an enum identifier, got a string literal \"{}\". {}",
+                                                attr_name, name, typed, inner_msg
+                                            )
+                                        } else {
+                                            inner_msg
+                                        }
+                                    })
                                 }
                                 // String type - check for bare resource binding
                                 (carina_core::schema::AttributeType::String, Value::String(s)) => {
@@ -941,6 +980,23 @@ fn strip_line_comment(line: &str) -> &str {
 /// Check whether a ResourceRef value is type-compatible with the expected attribute type.
 /// Returns `Some(message)` on mismatch, `None` when compatible or when the binding/attribute
 /// cannot be resolved (unknown bindings are not flagged here).
+/// Returns true when the parser tagged the top-level attribute `attr` on
+/// `resource_id` as having been written in the source as a quoted string
+/// literal (see #2094). Used by the enum / namespaced-Custom diagnostic
+/// arms to flip their message into the shape-mismatch form so editor
+/// warnings match CLI output.
+fn is_quoted_literal_attr(
+    parsed: &ParsedFile,
+    resource_id: &carina_core::resource::ResourceId,
+    attr: &str,
+) -> bool {
+    parsed.string_literal_paths.iter().any(|p| {
+        &p.resource_id == resource_id
+            && p.attribute_chain.len() == 1
+            && p.attribute_chain[0] == attr
+    })
+}
+
 fn check_resource_ref_type_mismatch(
     binding_schema_map: &HashMap<String, ResourceSchema>,
     expected_type: &carina_core::schema::AttributeType,
