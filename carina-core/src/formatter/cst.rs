@@ -24,8 +24,10 @@ pub enum Trivia {
     Whitespace(String),
     /// Single newline
     Newline,
-    /// Line comment including the # prefix
+    /// Line comment including its prefix (`#` or `//`)
     LineComment(String),
+    /// Block comment including its `/* */` delimiters.
+    BlockComment(String),
 }
 
 impl Trivia {
@@ -34,6 +36,7 @@ impl Trivia {
             Trivia::Whitespace(s) => s,
             Trivia::Newline => "\n",
             Trivia::LineComment(s) => s,
+            Trivia::BlockComment(s) => s,
         }
     }
 }

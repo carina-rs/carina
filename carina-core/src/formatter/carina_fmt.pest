@@ -5,11 +5,19 @@
 file = { SOI ~ file_content* ~ EOI }
 file_content = _{ trivia | statement }
 
-// Trivia: whitespace and comments that we want to preserve
+// Trivia: whitespace and comments that we want to preserve.
+//
+// The main parser accepts `//` and `#` line comments plus `/* ... */`
+// block comments (see `carina.pest`'s `line_comment` / `block_comment`).
+// The formatter has to accept the same three forms or it can't parse
+// real source — for example the `identity-center/` fixture uses `//`
+// comments inside attribute blocks.
 trivia = { ws | comment | newline }
 ws = @{ (" " | "\t")+ }
 newline = @{ NEWLINE }
-comment = @{ "#" ~ (!NEWLINE ~ ANY)* }
+comment = _{ line_comment | block_comment }
+line_comment = @{ ("//" | "#") ~ (!NEWLINE ~ ANY)* }
+block_comment = @{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
 
 statement = { backend_block | provider_block | arguments_block | attributes_block | exports_block | import_state_block | removed_block | moved_block | require_statement | if_expr | for_expr | fn_def | let_binding | module_call | anonymous_resource }
 

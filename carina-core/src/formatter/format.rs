@@ -95,7 +95,7 @@ impl Formatter {
         for child in &node.children {
             match child {
                 CstChild::Trivia(trivia) => match trivia {
-                    Trivia::LineComment(_) => {
+                    Trivia::LineComment(_) | Trivia::BlockComment(_) => {
                         pending_comments.push(trivia);
                         blank_line_count = 0;
                     }
@@ -1170,7 +1170,10 @@ impl Formatter {
     fn block_has_content(&self, node: &CstNode) -> bool {
         node.children.iter().any(|child| {
             matches!(child, CstChild::Node(n) if n.kind == NodeKind::Attribute || n.kind == NodeKind::NestedBlock || n.kind == NodeKind::LocalBinding)
-                || matches!(child, CstChild::Trivia(Trivia::LineComment(_)))
+                || matches!(
+                    child,
+                    CstChild::Trivia(Trivia::LineComment(_) | Trivia::BlockComment(_))
+                )
         })
     }
 
@@ -1206,7 +1209,7 @@ impl Formatter {
                     attr_index += 1;
                     newline_count = 0;
                 }
-                CstChild::Trivia(Trivia::LineComment(s)) => {
+                CstChild::Trivia(Trivia::LineComment(s) | Trivia::BlockComment(s)) => {
                     // Check if this is an inline comment (on same line as previous attribute)
                     if attr_index > 0 && !s.is_empty() && newline_count == 0 {
                         inline_comments.insert(
@@ -1932,7 +1935,7 @@ impl Formatter {
 
     fn write_trivia(&mut self, trivia: &Trivia) {
         match trivia {
-            Trivia::LineComment(s) => self.write(s),
+            Trivia::LineComment(s) | Trivia::BlockComment(s) => self.write(s),
             Trivia::Newline => self.write_newline(),
             Trivia::Whitespace(s) => self.write(s),
         }

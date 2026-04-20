@@ -1,0 +1,8 @@
+backend s3 {
+  bucket = 'carina-rs-state'
+  key    = 'management/identity-center/carina.state.json'
+}
+
+let orgs = upstream_state {
+  source = '../organizations'
+}
