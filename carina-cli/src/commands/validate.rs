@@ -42,10 +42,29 @@ pub fn run_validate(
 
     let base_dir = get_base_dir(path);
 
-    // Surface bad `upstream_state.source` paths before printing warnings —
-    // otherwise the "validate does not inspect" warning implies the
-    // source is reachable and misdirects the user.
-    check_upstream_state_sources(base_dir, &parsed.upstream_states)?;
+    // Collect every static error before reporting, so the user sees them
+    // all in one pass instead of fixing one, re-running, and finding the
+    // next. See #2102.
+    //
+    // Dependency ordering still applies: `validate_and_resolve_with_config`
+    // performs module expansion and name resolution that later steps rely
+    // on. We don't delay those errors behind other checks — but we _do_
+    // accumulate the deferred for-iterable errors (already collected by
+    // `load_configuration_with_config`) and run the `upstream_state.source`
+    // existence check up front so both categories of findings surface
+    // together with anything the validators downstream report.
+    let mut error_reports: Vec<String> = Vec::new();
+    error_reports.extend(
+        loaded
+            .iterable_binding_errors
+            .iter()
+            .map(ToString::to_string),
+    );
+    if let Err(AppError::Validation(msg)) =
+        check_upstream_state_sources(base_dir, &parsed.upstream_states)
+    {
+        error_reports.push(msg);
+    }
 
     parsed.print_warnings();
 
@@ -53,7 +72,27 @@ pub fn run_validate(
         println!("{}", "Validating...".cyan());
     }
 
-    validate_and_resolve_with_config(&mut parsed, base_dir, false)?;
+    if let Err(err) = validate_and_resolve_with_config(&mut parsed, base_dir, false) {
+        match err {
+            AppError::Validation(msg) => error_reports.push(msg),
+            other => {
+                // Non-validation error (IO, config, etc.) — surface
+                // immediately alongside whatever we already collected.
+                if !error_reports.is_empty() {
+                    return Err(AppError::Validation(format!(
+                        "{}\n{}",
+                        error_reports.join("\n"),
+                        other
+                    )));
+                }
+                return Err(other);
+            }
+        }
+    }
+
+    if !error_reports.is_empty() {
+        return Err(AppError::Validation(error_reports.join("\n")));
+    }
 
     // Check for unused let bindings (warnings, not errors)
     let unused_warnings = check_unused_bindings(&loaded.unresolved_parsed);

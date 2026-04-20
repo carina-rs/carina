@@ -98,3 +98,36 @@ fn invalid_region() {
 fn missing_provider_plugin() {
     assert_validate_fails("missing_provider_plugin", "has no source configured");
 }
+
+#[test]
+fn validate_reports_multiple_static_errors_in_one_pass() {
+    // Regression for #2102. Independent static errors in the same project
+    // must all surface in a single `carina validate` run so the user fixes
+    // them in one pass.
+    //
+    // The fixture declares `let orgs = upstream_state { ... }` (source
+    // path intentionally missing) plus two for-expressions with typo'd
+    // iterable bindings. Three distinct diagnostics are expected in the
+    // combined output: the missing upstream source and both undefined
+    // identifiers.
+    let output = carina_validate("multiple_errors");
+    assert!(
+        !output.status.success(),
+        "expected validation to fail, got:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`org`"),
+        "missing `org` identifier diagnostic: {stderr}"
+    );
+    assert!(
+        stderr.contains("`missing`"),
+        "missing `missing` identifier diagnostic: {stderr}"
+    );
+    assert!(
+        stderr.contains("nonexistent_sibling"),
+        "missing upstream_state source diagnostic: {stderr}"
+    );
+}
