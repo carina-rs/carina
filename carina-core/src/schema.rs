@@ -322,17 +322,34 @@ impl AttributeType {
                     if matches_canonical || matches_alias {
                         Ok(())
                     } else {
-                        let mut expected = values.clone();
+                        // Build the allowed-values list in the form the user
+                        // should type — fully-qualified for namespaced enums,
+                        // bare otherwise. Also include `to_dsl` aliases so
+                        // the message covers every shape validation accepts.
+                        let mut expected: Vec<String> = Vec::new();
+                        let mut push = |v: &str| {
+                            let rendered = match namespace.as_deref() {
+                                Some(ns) => format!("{}.{}.{}", ns, name, v),
+                                None => v.to_string(),
+                            };
+                            if !expected.contains(&rendered) {
+                                expected.push(rendered);
+                            }
+                        };
+                        for v in values {
+                            push(v);
+                        }
                         if let Some(f) = to_dsl {
                             for v in values {
                                 let alias = f(v);
-                                if alias != *v && !expected.contains(&alias) {
-                                    expected.push(alias);
+                                if alias != *v {
+                                    push(&alias);
                                 }
                             }
                         }
                         Err(TypeError::InvalidEnumVariant {
                             value: user_input.unwrap_or(s.as_str()).to_string(),
+                            type_name: Some(name.clone()),
                             expected,
                         })
                     }
@@ -668,15 +685,41 @@ fn string_enum_value_matches(input: &str, expected: &str) -> bool {
         || input.replace('_', "-").eq_ignore_ascii_case(expected)
 }
 
+/// Render the `InvalidEnumVariant` message. When `type_name` is present,
+/// call out the enum's declared name so the reader knows which enum is
+/// expected (see #2095). `expected` is rendered as-is — callers are
+/// responsible for passing fully-qualified variants for namespaced enums.
+fn format_invalid_enum(value: &str, type_name: Option<&str>, expected: &[String]) -> String {
+    let joined = expected.join(", ");
+    match type_name {
+        Some(t) => format!(
+            "Invalid value '{}' for {}: expected one of {}",
+            value, t, joined
+        ),
+        None => format!(
+            "Invalid enum variant '{}', expected one of: {}",
+            value, joined
+        ),
+    }
+}
+
 /// Type error
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum TypeError {
     #[error("Type mismatch: expected {expected}, got {got}")]
     TypeMismatch { expected: String, got: String },
 
-    #[error("Invalid enum variant '{value}', expected one of: {}", expected.join(", "))]
+    #[error("{}", format_invalid_enum(value, type_name.as_deref(), expected))]
     InvalidEnumVariant {
         value: String,
+        /// Name of the `StringEnum` type that was being matched against
+        /// (e.g. `"TargetType"`). Set when available so the diagnostic can
+        /// tell the reader which enum is expected; None for callers that
+        /// build the error by hand without type context.
+        type_name: Option<String>,
+        /// Allowed variants in the form the user should type — i.e.
+        /// fully-qualified (`awscc.sso.assignment.TargetType.AWS_ACCOUNT`)
+        /// for namespaced enums, bare (`fast`, `slow`) otherwise.
         expected: Vec<String>,
     },
 
@@ -1918,6 +1961,53 @@ mod tests {
         assert!(
             !msg.contains("awscc.sso.assignment.TargetType.aaa"),
             "error must not leak the synthesized namespaced form, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn invalid_enum_error_names_the_enum_type_and_fully_qualified_variants() {
+        // Regression for #2095. The message must identify which enum is
+        // expected and list allowed variants in their fully-qualified form
+        // so the user can copy-paste one into their .crn without having to
+        // synthesize the namespace prefix.
+        let t = AttributeType::StringEnum {
+            name: "TargetType".to_string(),
+            values: vec!["AWS_ACCOUNT".to_string()],
+            namespace: Some("awscc.sso.assignment".to_string()),
+            to_dsl: None,
+        };
+        let err = t.validate(&Value::String("aaa".to_string())).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("TargetType"),
+            "error should name the enum type, got: {msg}"
+        );
+        assert!(
+            msg.contains("awscc.sso.assignment.TargetType.AWS_ACCOUNT"),
+            "error should list variants in fully-qualified form, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn invalid_enum_error_without_namespace_uses_bare_variants() {
+        // Non-namespaced enums must keep emitting bare variant names — there's
+        // no namespace to prefix with.
+        let t = AttributeType::StringEnum {
+            name: "Mode".to_string(),
+            values: vec!["fast".to_string(), "slow".to_string()],
+            namespace: None,
+            to_dsl: None,
+        };
+        let err = t.validate(&Value::String("zzz".to_string())).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fast") && msg.contains("slow"),
+            "error should list bare variants, got: {msg}"
+        );
+        // Guard against accidentally printing "None.Mode.fast" or similar.
+        assert!(
+            !msg.contains(".Mode."),
+            "non-namespaced enum must not synthesize a prefix, got: {msg}"
         );
     }
 
