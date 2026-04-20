@@ -167,6 +167,7 @@ impl Formatter {
             NodeKind::AnonymousResource => self.format_anonymous_resource(node),
             NodeKind::ResourceExpr => self.format_resource_expr(node),
             NodeKind::ReadResourceExpr => self.format_read_resource_expr(node),
+            NodeKind::UpstreamStateExpr => self.format_upstream_state_expr(node),
             NodeKind::FnDef => self.format_fn_def(node),
             NodeKind::FnParam => self.format_default(node),
             NodeKind::ForExpr => self.format_for_expr(node),
@@ -834,20 +835,12 @@ impl Formatter {
                 break;
             }
         }
+        self.format_block_body_tail(node);
+    }
 
-        if self.block_has_content(node) {
-            self.write(" {");
-            self.write_newline();
-            self.current_indent += 1;
-
-            self.format_block_attributes(node);
-
-            self.current_indent -= 1;
-            self.write_indent();
-            self.write("}");
-        } else {
-            self.write(" {}");
-        }
+    fn format_upstream_state_expr(&mut self, node: &CstNode) {
+        self.write("upstream_state");
+        self.format_block_body_tail(node);
     }
 
     fn format_read_resource_expr(&mut self, node: &CstNode) {
@@ -861,14 +854,19 @@ impl Formatter {
                 break;
             }
         }
+        self.format_block_body_tail(node);
+    }
 
+    /// Emit the ` { ... }` tail (or ` {}` when empty) for block-shaped
+    /// expressions. Caller is responsible for writing the keyword or
+    /// type prefix; this fn only formats the brace block and its
+    /// attributes.
+    fn format_block_body_tail(&mut self, node: &CstNode) {
         if self.block_has_content(node) {
             self.write(" {");
             self.write_newline();
             self.current_indent += 1;
-
             self.format_block_attributes(node);
-
             self.current_indent -= 1;
             self.write_indent();
             self.write("}");
@@ -3036,6 +3034,56 @@ require   port >= 1 && port <= 65535  , "port must be valid"
             thumbprint_line,
             "Comment should be directly above thumbprint_list. Got:\n{}",
             result
+        );
+    }
+
+    /// Regression for #2117: the formatter grammar missed `upstream_state`
+    /// entirely, so `let orgs = upstream_state { source = '..' }` couldn't
+    /// be formatted.
+    #[test]
+    fn test_format_upstream_state_expr() {
+        let input = "let orgs = upstream_state {\n    source = '../organizations'\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert!(
+            result.contains("upstream_state"),
+            "upstream_state keyword must be preserved. Got:\n{}",
+            result
+        );
+        assert!(
+            result.contains("source = '../organizations'"),
+            "source attribute must be preserved. Got:\n{}",
+            result
+        );
+    }
+
+    /// Regression for #2117: `for _, v in map { ... }` uses the discard
+    /// pattern `_`, which the formatter's `for_*_binding` productions did
+    /// not accept.
+    #[test]
+    fn test_format_for_binding_discard_pattern() {
+        let input =
+            "for _, account_id in orgs {\n  aws.s3.bucket {\n    name = account_id\n  }\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert!(
+            result.contains("for _, account_id in orgs"),
+            "discard pattern `_` must survive formatting. Got:\n{}",
+            result
+        );
+    }
+
+    /// Idempotence for both constructs above.
+    #[test]
+    fn test_format_upstream_state_and_for_discard_idempotent() {
+        let input = "let orgs = upstream_state {\n  source = '../organizations'\n}\n\nfor _, account_id in orgs {\n  aws.s3.bucket {\n    name = account_id\n  }\n}\n";
+        let config = FormatConfig::default();
+        let first = format(input, &config).unwrap();
+        let second = format(&first, &config).unwrap();
+        assert_eq!(
+            first, second,
+            "Formatting must be idempotent.\nfirst:\n{}\nsecond:\n{}",
+            first, second
         );
     }
 }
