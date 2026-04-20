@@ -1876,6 +1876,20 @@ fn identifier_appears_in(text: &str, name: &str) -> bool {
     false
 }
 
+/// Whether `s` is shaped like a bare Carina identifier — the first byte is
+/// `A-Za-z_` and the rest are `A-Za-z0-9_`. Used to recover from the
+/// parser's collapse of unresolved identifiers into `Value::String(s)`
+/// when we need to decide whether to render an error as "identifier" vs
+/// "string literal". See #2101.
+fn is_bare_identifier(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    match bytes.next() {
+        Some(b) if b.is_ascii_alphabetic() || b == b'_' => {}
+        _ => return false,
+    }
+    bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 /// Result of parsing a for expression body: either a resource or a module call
 enum ForBodyResult {
     Resource(Box<Resource>),
@@ -2090,6 +2104,21 @@ fn parse_for_expr(
             // Return empty — the for body produces zero concrete resources
         }
         _ => {
+            // Special case: the parser collapses bare unresolved identifiers
+            // (e.g. `for _ in org { ... }`) into `Value::String("org")` — the
+            // same slot a quoted literal uses. Reporting those as
+            // `iterable is string "org"` is misleading: the user wrote an
+            // identifier, not a literal, and the likely fault is a typo for
+            // a known binding. Route them through UndefinedIdentifier so
+            // the #2038 / #2100 did-you-mean machinery kicks in. See #2101.
+            if let Value::String(s) = &iterable
+                && is_bare_identifier(s)
+            {
+                let known = collect_known_bindings(ctx);
+                if !known.contains(s.as_str()) {
+                    return Err(undefined_identifier_error(&known, s.clone(), for_line));
+                }
+            }
             let iterable_type = match &iterable {
                 Value::String(s) => {
                     format!("string \"{}\"", if s.len() > 50 { &s[..50] } else { s })
@@ -11014,6 +11043,44 @@ awscc.ec2.vpc {
         assert!(
             !msg.contains("Did you mean"),
             "no close match exists; there should be no 'Did you mean' line, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn bare_identifier_iterable_is_reported_as_undefined_not_string() {
+        // Regression for #2101. When the iterable is a bare undeclared
+        // identifier — `for ... in org { ... }` rather than the dotted
+        // `org.accounts` — the parser previously reported
+        // `iterable is string "org" (expected map)`, calling the identifier
+        // a string and leaving the user with no did-you-mean. Route this
+        // case through UndefinedIdentifier so the message matches the
+        // dotted form.
+        let input = r#"
+            let orgs = upstream_state { source = "../a" }
+            for _, id in org {
+                aws.s3_bucket {
+                    name = id
+                }
+            }
+        "#;
+        let err = parse(input, &ProviderContext::default())
+            .expect_err("bare undeclared identifier as iterable must error");
+        let msg = err.to_string();
+        assert!(
+            matches!(err, ParseError::UndefinedIdentifier { .. }),
+            "expected UndefinedIdentifier, got: {err:?}"
+        );
+        assert!(
+            msg.contains("`org`"),
+            "error should quote the identifier, got: {msg}"
+        );
+        assert!(
+            !msg.contains("\"org\""),
+            "error must not render the identifier as a quoted string literal, got: {msg}"
+        );
+        assert!(
+            msg.contains("Did you mean `orgs`") || msg.contains("Did you mean 'orgs'"),
+            "error should suggest the close match 'orgs' via #2038 plumbing, got: {msg}"
         );
     }
 
