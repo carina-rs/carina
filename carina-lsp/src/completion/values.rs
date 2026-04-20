@@ -232,8 +232,13 @@ impl CompletionProvider {
                 return completions;
             }
 
-            // Include built-in function completions for non-Struct value positions
-            completions.extend(self.builtin_function_completions());
+            // Built-in function completions filtered by return-type fit.
+            // Offering every built-in at e.g. an `aws_account_id` cursor
+            // would pollute the popup with suggestions that can't produce
+            // the right value.
+            completions.extend(Self::builtin_function_completions_for_type(
+                &attr_schema.attr_type,
+            ));
 
             // First check if schema defines completions for this attribute
             if let Some(schema_completions) = &attr_schema.completions {
@@ -712,8 +717,25 @@ impl CompletionProvider {
 
     /// Provide completions for built-in function names.
     pub(super) fn builtin_function_completions(&self) -> Vec<CompletionItem> {
+        Self::builtin_completions_matching(|_| true)
+    }
+
+    /// Return built-in function completions whose declared return type is
+    /// compatible with the attribute's declared `AttributeType`. Used by
+    /// value-position completion to avoid suggesting `concat` / `join` /
+    /// etc. at cursors whose type is e.g. an `aws_account_id`.
+    pub(super) fn builtin_function_completions_for_type(
+        attr_type: &AttributeType,
+    ) -> Vec<CompletionItem> {
+        Self::builtin_completions_matching(|ret| return_type_fits(ret, attr_type))
+    }
+
+    fn builtin_completions_matching(
+        accept: impl Fn(builtins::BuiltinReturnType) -> bool,
+    ) -> Vec<CompletionItem> {
         builtins::builtin_functions()
             .iter()
+            .filter(|func| accept(func.return_type))
             .map(|func| CompletionItem {
                 label: func.name.to_string(),
                 kind: Some(CompletionItemKind::FUNCTION),
@@ -959,22 +981,28 @@ impl CompletionProvider {
 
     pub(super) fn string_enum_completions(
         &self,
-        _type_name: &str,
+        type_name: &str,
         values: &[String],
         namespace: Option<&str>,
         to_dsl: Option<fn(&str) -> String>,
     ) -> Vec<CompletionItem> {
         match namespace {
-            Some(_) => {
-                // Bare enum values — the schema context resolves them automatically
+            Some(ns) => {
+                // Offer the fully-qualified form
+                // `<namespace>.<TypeName>.<Variant>`. The bare tail alone
+                // used to leak into sibling-attribute popups via the
+                // generic identifier pool; the qualified form is always
+                // valid and unambiguous.
                 values
                     .iter()
                     .map(|value| {
                         let dsl_value = to_dsl.map_or_else(|| value.clone(), |f| f(value));
+                        let full = format!("{}.{}.{}", ns, type_name, dsl_value);
                         CompletionItem {
-                            label: dsl_value,
+                            label: full.clone(),
                             kind: Some(CompletionItemKind::ENUM_MEMBER),
                             detail: Some(value.clone()),
+                            insert_text: Some(full),
                             ..Default::default()
                         }
                     })
@@ -990,6 +1018,49 @@ impl CompletionProvider {
                 })
                 .collect(),
         }
+    }
+}
+
+/// Decide whether a built-in's declared return type is assignable to the
+/// attribute's declared `AttributeType`.
+///
+/// Matching rules:
+/// * `BuiltinReturnType::Any` fits any base-typed attribute (String, Int,
+///   List, Map) — the built-in's concrete shape depends on its arguments.
+///   It does not fit `Custom` or `StringEnum`: no argument-derived result
+///   can prove the semantic invariant those types require.
+/// * A built-in returning plain `String` fits only a schema-declared
+///   `String` or a `Union` containing one. It does **not** fit a `Custom`
+///   type (even one whose base is `String`) because the Custom type
+///   carries a semantic meaning the built-in cannot produce (e.g. an
+///   `aws_account_id` must be a 12-digit string, and `join(...)` offers
+///   no such guarantee).
+/// * `List`, `Map`, `Int`, `Secret` match their corresponding
+///   `AttributeType` constructor. For `List` / `Map` the inner type
+///   doesn't participate in the check — the built-in's declared element
+///   type is unknown at this layer.
+fn return_type_fits(ret: builtins::BuiltinReturnType, attr_type: &AttributeType) -> bool {
+    use builtins::BuiltinReturnType as R;
+    match attr_type {
+        AttributeType::Union(members) => members.iter().any(|m| return_type_fits(ret, m)),
+        AttributeType::String => matches!(ret, R::String | R::Any),
+        AttributeType::Int => matches!(ret, R::Int | R::Any),
+        // No built-in currently returns a Bool; leave as unfit.
+        AttributeType::Bool => false,
+        AttributeType::List { .. } => matches!(ret, R::List | R::Any),
+        AttributeType::Map { .. } => matches!(ret, R::Map | R::Any),
+        // StringEnum expects a specific identifier form; no built-in
+        // currently produces such values, and `Any` alone doesn't give us
+        // enough confidence to suggest one.
+        AttributeType::StringEnum { .. } => false,
+        // Custom types carry a semantic meaning (Cidr, AwsAccountId, Arn,
+        // …) that built-ins don't declare. Not even `Any` fits — we need
+        // a semantic return annotation before a built-in can be suggested
+        // here.
+        AttributeType::Custom { .. } => false,
+        // Float and Struct attributes — no matching built-in today.
+        AttributeType::Float => false,
+        AttributeType::Struct { .. } => false,
     }
 }
 

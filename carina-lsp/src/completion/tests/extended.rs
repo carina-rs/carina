@@ -1883,3 +1883,139 @@ fn exports_value_position_returns_none_context() {
         );
     }
 }
+
+/// At a value position whose attribute type is a `Custom` semantic
+/// subtype (e.g. `aws_account_id`), built-in function completions must not
+/// be offered — none of them can produce a value of that semantic type.
+#[test]
+fn builtin_functions_filtered_out_for_custom_semantic_value_position() {
+    let provider = test_provider_with_custom_semantic_attr();
+    let doc = create_document(
+        r#"awscc.sso.assignment {
+  target_id = 
+}
+"#,
+    );
+    let position = Position {
+        line: 1,
+        character: 15,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    for builtin in [
+        "concat",
+        "cidr_subnet",
+        "decrypt",
+        "env",
+        "flatten",
+        "join",
+        "keys",
+        "length",
+        "lookup",
+        "lower",
+        "upper",
+    ] {
+        assert!(
+            !labels.contains(&builtin),
+            "built-in '{}' must NOT appear at aws_account_id value position. Got: {:?}",
+            builtin,
+            labels
+        );
+    }
+}
+
+/// Completion at a value position must not offer bare enum-tail tokens
+/// (e.g. `GROUP`) harvested from namespaced enum values used elsewhere in
+/// the file.
+#[test]
+fn namespaced_enum_tail_tokens_do_not_leak_into_sibling_value_position() {
+    let provider = test_provider_with_custom_semantic_attr();
+    let doc = create_document(
+        r#"awscc.sso.assignment {
+  principal_type = awscc.sso.assignment.PrincipalType.GROUP
+  target_id = 
+}
+"#,
+    );
+    let position = Position {
+        line: 2,
+        character: 15,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        !labels.contains(&"GROUP"),
+        "bare 'GROUP' (tail of PrincipalType.GROUP) must not leak into target_id value position. Got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.contains(&"USER"),
+        "bare 'USER' must not leak into target_id value position. Got: {:?}",
+        labels
+    );
+}
+
+/// Namespaced `StringEnum` completions must offer the fully-qualified
+/// form (`awscc.sso.assignment.PrincipalType.GROUP`), not the bare tail
+/// (`GROUP`). The bare form is accepted by the DSL resolver but causes
+/// the sibling-attribute leak exercised above.
+#[test]
+fn namespaced_enum_completions_offer_full_form_not_bare_tail() {
+    let provider = test_provider_with_custom_semantic_attr();
+    let doc = create_document(
+        r#"awscc.sso.assignment {
+  principal_type = 
+}
+"#,
+    );
+    let position = Position {
+        line: 1,
+        character: 19,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels
+            .iter()
+            .any(|l| l.contains("awscc.sso.assignment.PrincipalType.GROUP")),
+        "expected fully-qualified 'awscc.sso.assignment.PrincipalType.GROUP' completion, got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.contains(&"GROUP"),
+        "bare 'GROUP' must not be offered for namespaced enum — use fully-qualified form. Got: {:?}",
+        labels
+    );
+}
+
+/// A plain `String` attribute still sees string-returning built-ins, and
+/// list-returning ones stay filtered out — guards against over-filtering.
+#[test]
+fn string_returning_builtins_still_offered_for_plain_string_attr() {
+    let provider = test_provider_single_attr();
+    let doc = create_document(
+        r#"test.foo.bar {
+  attr =
+}
+"#,
+    );
+    let position = Position {
+        line: 1,
+        character: 9,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    for builtin in ["join", "upper", "lower"] {
+        assert!(
+            labels.contains(&builtin),
+            "string-returning '{}' must appear at plain String attr. Got: {:?}",
+            builtin,
+            labels
+        );
+    }
+    assert!(
+        !labels.contains(&"concat"),
+        "list-returning 'concat' must not appear at String attr. Got: {:?}",
+        labels
+    );
+}
