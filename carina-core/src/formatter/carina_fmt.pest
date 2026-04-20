@@ -220,9 +220,16 @@ function_call = {
 // Import expression: import "path" (used in let binding RHS)
 import_expr = { kw_import ~ trivia+ ~ string }
 
+// Upstream state expression: upstream_state { source = '..' }
+// Used as the RHS of a `let` binding — mirrors carina.pest:14.
+upstream_state_expr = {
+    kw_upstream_state ~ trivia* ~ open_brace ~ block_content* ~ close_brace
+}
+
 // Primary value
 primary = {
     read_resource_expr
+  | upstream_state_expr
   | resource_expr
   | import_expr
   | for_expr
@@ -261,9 +268,13 @@ for_expr = {
 
 // For binding: simple (x), indexed ((i, x)), or map (k, v)
 for_binding = { for_indexed_binding | for_map_binding | for_simple_binding }
-for_simple_binding = { identifier }
-for_indexed_binding = { open_paren ~ trivia* ~ identifier ~ trivia* ~ comma ~ trivia* ~ identifier ~ trivia* ~ close_paren }
-for_map_binding = { identifier ~ trivia* ~ comma ~ trivia+ ~ identifier }
+for_simple_binding = { discard_pattern | identifier }
+for_indexed_binding = {
+    open_paren ~ trivia* ~ (discard_pattern | identifier) ~ trivia* ~ comma ~ trivia* ~ (discard_pattern | identifier) ~ trivia* ~ close_paren
+}
+for_map_binding = {
+    (discard_pattern | identifier) ~ trivia* ~ comma ~ trivia+ ~ (discard_pattern | identifier)
+}
 
 // For iterable: restricted to simple expressions
 for_iterable = { function_call | list | variable_ref | open_paren ~ trivia* ~ expression ~ trivia* ~ close_paren }
@@ -355,3 +366,4 @@ kw_to = { "to" }
 kw_from = { "from" }
 kw_id = { "id" }
 kw_require = { "require" }
+kw_upstream_state = { "upstream_state" }

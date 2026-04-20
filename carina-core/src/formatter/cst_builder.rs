@@ -148,6 +148,9 @@ impl<'a> CstBuilder<'a> {
             Rule::read_resource_expr => Some(CstChild::Node(
                 self.build_node(NodeKind::ReadResourceExpr, pair),
             )),
+            Rule::upstream_state_expr => Some(CstChild::Node(
+                self.build_node(NodeKind::UpstreamStateExpr, pair),
+            )),
             Rule::fn_def => Some(CstChild::Node(self.build_node(NodeKind::FnDef, pair))),
             Rule::fn_param => Some(CstChild::Node(self.build_node(NodeKind::FnParam, pair))),
             Rule::fn_local_let => Some(CstChild::Node(
@@ -286,6 +289,10 @@ impl<'a> CstBuilder<'a> {
             ))),
 
             Rule::kw_require => Some(CstChild::Token(Token::new("require".to_string(), span))),
+            Rule::kw_upstream_state => Some(CstChild::Token(Token::new(
+                "upstream_state".to_string(),
+                span,
+            ))),
 
             // Validate expression rules - treat as opaque node preserving source text
             Rule::validate_expr => Some(CstChild::Node(

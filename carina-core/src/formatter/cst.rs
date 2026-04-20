@@ -73,6 +73,7 @@ pub enum NodeKind {
     AnonymousResource,
     ResourceExpr,
     ReadResourceExpr,
+    UpstreamStateExpr,
     FnDef,
     FnParam,
     ForExpr,
