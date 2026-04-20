@@ -565,15 +565,18 @@ pub fn check_unused_bindings(parsed: &ParsedFile) -> Vec<String> {
 pub fn validate_provider_region_with_ctx(
     ctx: &WiringContext,
     parsed: &ParsedFile,
-) -> Result<(), AppError> {
-    validation::validate_provider_config(parsed, ctx.factories()).map_err(AppError::Validation)
+) -> Vec<AppError> {
+    lift_validation_result(validation::validate_provider_config(
+        parsed,
+        ctx.factories(),
+    ))
 }
 
 pub fn validate_module_calls(
     parsed: &ParsedFile,
     base_dir: &Path,
     config: &carina_core::parser::ProviderContext,
-) -> Result<(), AppError> {
+) -> Vec<AppError> {
     let mut imported_modules = HashMap::new();
     for import in &parsed.imports {
         let module_path = base_dir.join(&import.path);
@@ -582,15 +585,19 @@ pub fn validate_module_calls(
         }
     }
 
-    validation::validate_module_calls(&parsed.module_calls, &imported_modules, config)
-        .map_err(AppError::Validation)
+    lift_validation_result(validation::validate_module_calls(
+        &parsed.module_calls,
+        &imported_modules,
+        config,
+    ))
 }
 
 pub fn validate_module_attribute_param_types(
     ctx: &WiringContext,
     parsed: &ParsedFile,
     base_dir: &Path,
-) -> Result<(), AppError> {
+) -> Vec<AppError> {
+    let mut errors = Vec::new();
     for import in &parsed.imports {
         let module_path = base_dir.join(&import.path);
         let Some(module_parsed) = module_resolver::load_module(&module_path) else {
@@ -599,15 +606,24 @@ pub fn validate_module_attribute_param_types(
         if module_parsed.attribute_params.is_empty() {
             continue;
         }
-        validation::validate_attribute_param_ref_types(
+        if let Err(joined) = validation::validate_attribute_param_ref_types(
             &module_parsed.attribute_params,
             &module_parsed.resources,
             ctx.schemas(),
             &|r| provider_mod::schema_key_for_resource(ctx.factories(), r),
-        )
-        .map_err(|e| AppError::Validation(format!("{}: {}", import.path, e)))?;
+        ) {
+            // Preserve the module-path prefix the legacy wrapper emitted
+            // so diagnostics point at which imported module failed.
+            let prefix = import.path.to_string();
+            errors.extend(
+                joined
+                    .split('\n')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| AppError::Validation(format!("{}: {}", prefix, s))),
+            );
+        }
     }
-    Ok(())
+    errors
 }
 
 pub async fn get_provider_with_ctx(
@@ -1966,6 +1982,29 @@ mod tests {
         assert!(
             errors.is_empty(),
             "compute_anonymous_identifiers: got {errors:?}",
+        );
+    }
+
+    // Smoke test for the module/provider wrappers: empty input exercises
+    // each wrapper and pins the `Vec<AppError>` return type. A regression
+    // back to `Result` fails to compile here.
+    #[test]
+    fn module_and_provider_wrappers_return_vec_app_error() {
+        let ctx = WiringContext::new(vec![]);
+        let parsed = ParsedFile::default();
+        let base_dir = std::path::Path::new("/tmp/nonexistent-carina-pr3-test");
+        let provider_ctx = carina_core::parser::ProviderContext::default();
+
+        let errors = validate_provider_region_with_ctx(&ctx, &parsed);
+        assert!(errors.is_empty(), "provider_region: got {errors:?}");
+
+        let errors = validate_module_calls(&parsed, base_dir, &provider_ctx);
+        assert!(errors.is_empty(), "module_calls: got {errors:?}");
+
+        let errors = validate_module_attribute_param_types(&ctx, &parsed, base_dir);
+        assert!(
+            errors.is_empty(),
+            "module_attribute_param_types: got {errors:?}",
         );
     }
 }
