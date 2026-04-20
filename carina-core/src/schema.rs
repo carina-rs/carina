@@ -690,6 +690,55 @@ fn string_enum_value_matches(input: &str, expected: &str) -> bool {
 /// context. Presence of `attribute` and `type_name` is independent — both,
 /// either, or neither may be set. `expected` is rendered as-is; callers are
 /// responsible for passing fully-qualified variants for namespaced enums.
+/// Reshape an error from `AttributeType::validate` into a shape-mismatch
+/// diagnostic when the attribute's value came from a quoted string literal
+/// and the schema expects an enum-shaped identifier (a `StringEnum`, or a
+/// namespaced `Custom` type).
+///
+/// For `StringEnum`, `into_string_literal_diagnostic` does the work since
+/// the underlying error already carries type name and variants. For a
+/// namespaced `Custom`, validation returns `ValidationFailed { message }`
+/// with no structured fields — we still emit
+/// `StringLiteralExpectedEnum` using the semantic name, leaving `expected`
+/// empty because the custom validator doesn't enumerate variants. The
+/// originating message is carried along through the formatter's
+/// `expected` slot so it doesn't get lost.
+fn reshape_for_string_literal(
+    tagged: TypeError,
+    attr_type: &AttributeType,
+    value: &Value,
+    attr_name: &str,
+) -> TypeError {
+    // StringEnum: the error already has enough structure to reshape cleanly.
+    if matches!(attr_type, AttributeType::StringEnum { .. }) {
+        return tagged.into_string_literal_diagnostic();
+    }
+
+    // Namespaced Custom: manually build the shape-mismatch diagnostic from
+    // the semantic name. `ValidationFailed` has no attribute slot so
+    // `with_attribute` is a no-op; we thread the attribute name in
+    // explicitly. `expected` is left empty — custom validators don't
+    // enumerate variants — but we carry the original validator message in
+    // it so its detail (which often lists valid forms) stays visible.
+    if let AttributeType::Custom {
+        semantic_name: Some(name),
+        namespace: Some(_),
+        ..
+    } = attr_type
+        && let Value::String(typed) = value
+        && let TypeError::ValidationFailed { message } = &tagged
+    {
+        return TypeError::StringLiteralExpectedEnum {
+            user_typed: typed.clone(),
+            attribute: Some(attr_name.to_string()),
+            type_name: name.clone(),
+            expected: vec![message.clone()],
+        };
+    }
+
+    tagged
+}
+
 fn format_string_literal_expected_enum(
     user_typed: &str,
     attribute: Option<&str>,
@@ -1369,7 +1418,7 @@ impl ResourceSchema {
                     // point back at a token that appears in their source.
                     let tagged = e.with_attribute(name);
                     let reshaped = if is_string_literal(name.as_str()) {
-                        tagged.into_string_literal_diagnostic()
+                        reshape_for_string_literal(tagged, &schema.attr_type, value, name)
                     } else {
                         tagged
                     };
@@ -2366,6 +2415,57 @@ mod tests {
         assert!(
             schema.validate_with_origins(&attrs, &|_| true).is_ok(),
             "valid enum value should pass regardless of origin tag"
+        );
+    }
+
+    #[test]
+    fn schema_validate_with_origins_reshapes_custom_namespaced_type() {
+        // #2094 / PR 3: a quoted literal written against an
+        // `AttributeType::Custom` with a namespace must also surface as
+        // `StringLiteralExpectedEnum`. Custom validation returns
+        // `ValidationFailed { message }` with no structured type slots, so
+        // the reshape carries the original message forward in `expected`
+        // while marking the variant and type name correctly.
+        fn validate_mode(v: &Value) -> Result<(), String> {
+            match v {
+                Value::String(s) if s == "test.r.Mode.fast" => Ok(()),
+                Value::String(s) => Err(format!("invalid Mode '{}': expected fast", s)),
+                _ => Err("expected string".to_string()),
+            }
+        }
+        let schema = ResourceSchema::new("test.r.mode_holder").attribute(
+            AttributeSchema::new(
+                "mode",
+                AttributeType::Custom {
+                    semantic_name: Some("Mode".to_string()),
+                    base: Box::new(AttributeType::String),
+                    pattern: None,
+                    length: None,
+                    validate: validate_mode,
+                    namespace: Some("test.r".to_string()),
+                    to_dsl: None,
+                },
+            )
+            .required(),
+        );
+        let mut attrs = HashMap::new();
+        // Two-part form like "test.r.Mode.aaa" would skip the Custom
+        // branch by passing validation; use a bare-shape literal that
+        // resolve_enum_input can't save.
+        attrs.insert("mode".to_string(), Value::String("aaa".to_string()));
+        let errs = schema
+            .validate_with_origins(&attrs, &|n| n == "mode")
+            .unwrap_err();
+        let variant_match = errs.iter().any(|e| {
+            matches!(
+                e,
+                TypeError::StringLiteralExpectedEnum { type_name, .. }
+                    if type_name == "Mode"
+            )
+        });
+        assert!(
+            variant_match,
+            "expected StringLiteralExpectedEnum for Custom namespaced type, got: {errs:?}"
         );
     }
 

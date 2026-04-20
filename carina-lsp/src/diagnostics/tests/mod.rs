@@ -82,6 +82,75 @@ pub(super) fn test_engine_with_enum_attr() -> DiagnosticEngine {
     )
 }
 
+/// Variant of `test_engine_with_enum_attr` whose `mode` attribute is a
+/// namespaced enum — exercises the shape-mismatch branch of #2094 where
+/// the LSP diagnostic should say "got a string literal" for
+/// `mode = "aaa"`.
+pub(super) fn test_engine_with_namespaced_enum_attr() -> DiagnosticEngine {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mode_enum = AttributeType::StringEnum {
+        name: "Mode".to_string(),
+        values: vec!["fast".to_string(), "slow".to_string()],
+        namespace: Some("test.r".to_string()),
+        to_dsl: None,
+    };
+
+    let schema = ResourceSchema::new("test.r.mode_holder")
+        .attribute(AttributeSchema::new("mode", mode_enum));
+
+    let mut schemas = HashMap::new();
+    schemas.insert("test.r.mode_holder".to_string(), schema);
+
+    DiagnosticEngine::new(
+        Arc::new(schemas),
+        vec!["test".to_string()],
+        Arc::new(vec![]),
+    )
+}
+
+/// Engine whose `mode` attribute is a `Custom` type with a namespace — the
+/// other shape #2094 wants to treat as "expects an enum identifier".
+pub(super) fn test_engine_with_custom_namespaced_attr() -> DiagnosticEngine {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    fn validate_mode(v: &carina_core::resource::Value) -> Result<(), String> {
+        match v {
+            carina_core::resource::Value::String(s)
+                if s == "test.r.Mode.fast" || s == "test.r.Mode.slow" =>
+            {
+                Ok(())
+            }
+            carina_core::resource::Value::String(s) => {
+                Err(format!("invalid Mode '{}': expected fast or slow", s))
+            }
+            _ => Err("expected string".to_string()),
+        }
+    }
+
+    let mode_custom = AttributeType::Custom {
+        semantic_name: Some("Mode".to_string()),
+        base: Box::new(AttributeType::String),
+        pattern: None,
+        length: None,
+        validate: validate_mode,
+        namespace: Some("test.r".to_string()),
+        to_dsl: None,
+    };
+
+    let schema = ResourceSchema::new("test.r.mode_holder")
+        .attribute(AttributeSchema::new("mode", mode_custom));
+
+    let mut schemas = HashMap::new();
+    schemas.insert("test.r.mode_holder".to_string(), schema);
+
+    DiagnosticEngine::new(
+        Arc::new(schemas),
+        vec!["test".to_string()],
+        Arc::new(vec![]),
+    )
+}
+
 pub(super) fn test_engine_with_block_name_nested() -> DiagnosticEngine {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 

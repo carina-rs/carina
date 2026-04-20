@@ -2801,3 +2801,105 @@ fn lsp_enum_diagnostic_includes_attribute_name() {
         bad.message
     );
 }
+
+/// Regression for #2094: the LSP must mirror the CLI's
+/// `StringLiteralExpectedEnum` diagnostic when the user writes
+/// `mode = "aaa"` against a namespaced `StringEnum` attribute.
+/// See PR 2 (#2112) for the CLI side.
+#[test]
+fn lsp_quoted_literal_on_namespaced_enum_says_got_a_string_literal() {
+    let provider = test_engine_with_namespaced_enum_attr();
+    let doc = create_document(
+        r#"test.r.mode_holder {
+  mode = "aaa"
+}
+"#,
+    );
+    let diagnostics = provider.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let bad = diagnostics
+        .iter()
+        .find(|d| d.message.contains("got a string literal"))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected shape-mismatch diagnostic for quoted literal on enum attribute, got: {:?}",
+                diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        bad.message.contains("\"aaa\""),
+        "diagnostic must echo the user's literal, got: {}",
+        bad.message
+    );
+    assert!(
+        bad.message.contains("'mode'"),
+        "diagnostic must name the attribute, got: {}",
+        bad.message
+    );
+    assert!(
+        bad.message.contains("test.r.Mode.fast") || bad.message.contains("test.r.Mode.slow"),
+        "diagnostic must list valid variants, got: {}",
+        bad.message
+    );
+}
+
+/// Bare-identifier mistake on the same namespaced enum must keep the
+/// classic InvalidEnumVariant wording — no shape-mismatch phrasing.
+#[test]
+fn lsp_bare_invalid_on_namespaced_enum_keeps_invalid_variant_wording() {
+    let provider = test_engine_with_namespaced_enum_attr();
+    let doc = create_document(
+        r#"test.r.mode_holder {
+  mode = aaa
+}
+"#,
+    );
+    let diagnostics = provider.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diag = diagnostics
+        .iter()
+        .find(|d| d.message.contains("aaa"))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected diagnostic for bare invalid identifier, got: {:?}",
+                diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        !diag.message.contains("got a string literal"),
+        "bare identifier must NOT trigger the shape-mismatch wording, got: {}",
+        diag.message
+    );
+}
+
+/// Regression for #2094 Custom-type case: a namespaced `AttributeType::Custom`
+/// written as `mode = "aaa"` must emit a shape-mismatch diagnostic just
+/// like `StringEnum`.
+#[test]
+fn lsp_quoted_literal_on_namespaced_custom_says_got_a_string_literal() {
+    let provider = test_engine_with_custom_namespaced_attr();
+    let doc = create_document(
+        r#"test.r.mode_holder {
+  mode = "aaa"
+}
+"#,
+    );
+    let diagnostics = provider.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let bad = diagnostics
+        .iter()
+        .find(|d| d.message.contains("got a string literal"))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected shape-mismatch diagnostic for quoted literal on Custom namespaced attribute, got: {:?}",
+                diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        bad.message.contains("\"aaa\""),
+        "diagnostic must echo the user's literal, got: {}",
+        bad.message
+    );
+    assert!(
+        bad.message.contains("'mode'"),
+        "diagnostic must name the attribute, got: {}",
+        bad.message
+    );
+}
