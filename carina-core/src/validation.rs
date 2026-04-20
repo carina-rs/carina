@@ -709,6 +709,7 @@ mod tests {
             structural_bindings: HashSet::new(),
             warnings: Vec::new(),
             deferred_for_expressions: Vec::new(),
+            string_literal_paths: std::collections::HashSet::new(),
         }
     }
 

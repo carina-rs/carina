@@ -494,6 +494,7 @@ mod tests {
             structural_bindings: HashSet::new(),
             warnings: vec![],
             deferred_for_expressions: vec![],
+            string_literal_paths: std::collections::HashSet::new(),
         }
     }
 
