@@ -156,50 +156,59 @@ pub fn build_factories_from_providers(
     (factories, load_errors)
 }
 
-pub fn validate_resources_with_ctx(
-    ctx: &WiringContext,
-    parsed: &ParsedFile,
-) -> Result<(), AppError> {
+/// Lift a core-validation `Result<(), String>` into per-finding
+/// `AppError::Validation` entries. The underlying `validation::*`
+/// helpers join every finding with `\n`, so splitting here lets
+/// callers surface each finding as its own `AppError`.
+fn lift_validation_result(res: Result<(), String>) -> Vec<AppError> {
+    let Err(joined) = res else {
+        return Vec::new();
+    };
+    joined
+        .split('\n')
+        .filter(|s| !s.is_empty())
+        .map(|s| AppError::Validation(s.to_string()))
+        .collect()
+}
+
+pub fn validate_resources_with_ctx(ctx: &WiringContext, parsed: &ParsedFile) -> Vec<AppError> {
     let known_providers: HashSet<String> = ctx
         .factories()
         .iter()
         .map(|f| f.name().to_string())
         .collect();
-    validation::validate_resources(
+    lift_validation_result(validation::validate_resources(
         parsed,
         ctx.schemas(),
         &|r| provider_mod::schema_key_for_resource(ctx.factories(), r),
         &known_providers,
-    )
-    .map_err(AppError::Validation)
+    ))
 }
 
 pub fn validate_resource_ref_types_with_ctx(
     ctx: &WiringContext,
     parsed: &ParsedFile,
     argument_names: &HashSet<String>,
-) -> Result<(), AppError> {
-    validation::validate_resource_ref_types(
+) -> Vec<AppError> {
+    lift_validation_result(validation::validate_resource_ref_types(
         parsed,
         ctx.schemas(),
         &|r| provider_mod::schema_key_for_resource(ctx.factories(), r),
         argument_names,
-    )
-    .map_err(AppError::Validation)
+    ))
 }
 
 pub fn validate_attribute_param_ref_types_with_ctx(
     ctx: &WiringContext,
     attribute_params: &[carina_core::parser::AttributeParameter],
     resources: &[Resource],
-) -> Result<(), AppError> {
-    validation::validate_attribute_param_ref_types(
+) -> Vec<AppError> {
+    lift_validation_result(validation::validate_attribute_param_ref_types(
         attribute_params,
         resources,
         ctx.schemas(),
         &|r| provider_mod::schema_key_for_resource(ctx.factories(), r),
-    )
-    .map_err(AppError::Validation)
+    ))
 }
 
 /// Resolve block name aliases and attribute prefixes in one step.
@@ -1372,7 +1381,18 @@ pub fn validate_resources(resources: &[Resource]) -> Result<(), AppError> {
         resources: resources.to_vec(),
         ..ParsedFile::default()
     };
-    validate_resources_with_ctx(&ctx, &parsed)
+    let errors = validate_resources_with_ctx(&ctx, &parsed);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::Validation(
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -1888,5 +1908,29 @@ mod tests {
             Some(&Value::String("gosukenator@gmail.com".into())),
             "literal inputs should pass through untouched"
         );
+    }
+
+    // Two resources with unknown types must surface as two distinct
+    // `AppError::Validation` entries instead of one joined string, so
+    // the driver can accumulate diagnostics across validators.
+    #[test]
+    fn validate_resources_with_ctx_returns_each_error_as_app_error() {
+        let ctx = WiringContext::new(vec![]);
+
+        // Empty provider string sidesteps the "unknown provider, skip"
+        // escape hatch (`known_providers` is empty), so each bad resource
+        // produces its own "Unknown resource type" entry.
+        let r1 = Resource::new("foo.nothing", "first");
+        let r2 = Resource::new("bar.nothing", "second");
+        let parsed = ParsedFile {
+            resources: vec![r1, r2],
+            ..ParsedFile::default()
+        };
+
+        let errors = validate_resources_with_ctx(&ctx, &parsed);
+        assert_eq!(errors.len(), 2, "got {errors:?}");
+        for err in &errors {
+            assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        }
     }
 }

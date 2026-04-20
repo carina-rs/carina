@@ -198,19 +198,33 @@ pub fn validate_and_resolve_with_config(
     resolve_names_with_ctx(&ctx, &mut parsed.resources)?;
 
     if !skip_resource_validation {
-        validate_resources_with_ctx(&ctx, parsed)?;
+        let mut errors: Vec<AppError> = Vec::new();
+        errors.extend(validate_resources_with_ctx(&ctx, parsed));
         let mut argument_names: HashSet<String> =
             parsed.arguments.iter().map(|a| a.name.clone()).collect();
         // Upstream state bindings are resolved at plan time, skip type validation
         for us in &parsed.upstream_states {
             argument_names.insert(us.binding.clone());
         }
-        validate_resource_ref_types_with_ctx(&ctx, parsed, &argument_names)?;
-        validate_attribute_param_ref_types_with_ctx(
+        errors.extend(validate_resource_ref_types_with_ctx(
+            &ctx,
+            parsed,
+            &argument_names,
+        ));
+        errors.extend(validate_attribute_param_ref_types_with_ctx(
             &ctx,
             &parsed.attribute_params,
             &parsed.resources,
-        )?;
+        ));
+        if !errors.is_empty() {
+            return Err(AppError::Validation(
+                errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ));
+        }
     }
 
     // Validate export values against their type annotations
