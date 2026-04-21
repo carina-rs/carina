@@ -641,12 +641,20 @@ impl CompletionProvider {
             end: position,
         };
 
+        // Render the export's declared `TypeExpr` into the detail when it
+        // exists so the user can see `map(aws_account_id)` at the popup
+        // instead of cross-referencing the upstream's `exports.crn`. Exports
+        // declared without a type annotation fall back to the generic
+        // phrasing (still useful; tells the user which binding it came from).
         let mut items: Vec<CompletionItem> = keys
-            .keys()
-            .map(|key| CompletionItem {
+            .iter()
+            .map(|(key, type_expr)| CompletionItem {
                 label: key.clone(),
                 kind: Some(CompletionItemKind::FIELD),
-                detail: Some(format!("export from upstream_state `{}`", binding)),
+                detail: Some(match type_expr {
+                    Some(t) => format!("export from upstream_state `{}`: {}", binding, t),
+                    None => format!("export from upstream_state `{}`", binding),
+                }),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range,
                     new_text: key.clone(),
