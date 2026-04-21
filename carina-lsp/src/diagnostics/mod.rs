@@ -128,38 +128,49 @@ impl DiagnosticEngine {
         let mut diagnostics = Vec::new();
         let text = doc.text();
 
-        // Extract defined resource bindings. BufferOnly is intentional:
-        // sibling-file bindings are pre-resolved by the caller and come in
-        // via `sibling_bindings` below.
-        let defined_bindings =
-            self.extract_resource_bindings(crate::completion::DslSource::BufferOnly(&text));
-
         // Parse errors
         if let Some(error) = doc.parse_error() {
             diagnostics.push(parse_error_to_diagnostic(error));
         }
 
-        // Check for undefined resource references in the raw text
-        // Include sibling file bindings to avoid false positives for cross-file refs
-        let mut all_bindings = defined_bindings.clone();
-        for name in sibling_bindings.keys() {
-            all_bindings.insert(name.clone());
-        }
-        let declared_providers = self.extract_declared_provider_names(&text);
-        let undef_diags =
-            self.check_undefined_references(&text, &all_bindings, &declared_providers);
-        diagnostics.extend(undef_diags);
-
         // Checks that need cross-file context share one directory-scoped parse
-        // (buffer substituted for its on-disk copy). Both must run even when
+        // (buffer substituted for its on-disk copy). All must run even when
         // the current document fails to parse on its own — a `for` or `let`
         // commonly references a binding declared in a sibling file.
-        if let Some(base) = base_path
+        //
+        // The merged parse is also the authoritative source of "what
+        // bindings are in scope?" for the text-scan undefined-reference
+        // check below. Falling back to the current file's bindings +
+        // `sibling_bindings` (populated by a hand-rolled text scan in
+        // `Backend::scan_sibling_context`) used to miss `upstream_state`,
+        // `import`, and module-call bindings, producing false positives
+        // like "Undefined resource: 'orgs'" when `orgs` was declared in
+        // `backend.crn` (#2131 / #2132).
+        let declared_providers = self.extract_declared_provider_names(&text);
+        let known_bindings: HashSet<String> = if let Some(base) = base_path
             && let Some(merged) = self.parse_merged_with_buffer(doc, current_file_name, base)
         {
             diagnostics.extend(self.check_upstream_state_field_references(doc, &merged, base));
             diagnostics.extend(self.check_for_iterable_bindings(doc, &merged, current_file_name));
-        }
+            carina_core::parser::collect_known_bindings_merged(&merged)
+                .into_iter()
+                .map(String::from)
+                .collect()
+        } else {
+            // No base_path or merge failed — fall back to the current
+            // file plus any bindings the caller pre-scanned.
+            let mut bindings =
+                self.extract_resource_bindings(crate::completion::DslSource::BufferOnly(&text));
+            for name in sibling_bindings.keys() {
+                bindings.insert(name.clone());
+            }
+            bindings
+        };
+        diagnostics.extend(self.check_undefined_references(
+            &text,
+            &known_bindings,
+            &declared_providers,
+        ));
 
         // Semantic analysis on parsed file
         if let Some(parsed) = doc.parsed() {

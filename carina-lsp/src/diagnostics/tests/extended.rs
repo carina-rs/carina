@@ -2903,3 +2903,103 @@ fn lsp_quoted_literal_on_namespaced_custom_says_got_a_string_literal() {
         bad.message
     );
 }
+
+// #2131 / #2132: a ResourceRef whose root is declared in a sibling `.crn`
+// must NOT be flagged `Undefined resource`. The LSP text-scan used to
+// feed on the current file's bindings plus a hand-rolled sibling scan
+// that skipped `upstream_state`, `import`, and module-call bindings.
+// Merged-parse is the source of truth.
+#[test]
+fn upstream_state_binding_in_sibling_file_is_not_undefined() {
+    let tmp = tempfile::tempdir().unwrap();
+    let upstream = tmp.path().join("organizations");
+    std::fs::create_dir(&upstream).unwrap();
+    std::fs::write(
+        upstream.join("exports.crn"),
+        "exports {\n  accounts: map(aws_account_id) = \"x\"\n}\n",
+    )
+    .unwrap();
+    let base = tmp.path().join("downstream");
+    std::fs::create_dir(&base).unwrap();
+    std::fs::write(
+        base.join("backend.crn"),
+        "let orgs = upstream_state { source = '../organizations' }\n",
+    )
+    .unwrap();
+    // The #2131 repro: `orgs.accounts` on the RHS of an assignment.
+    // The text-scan `check_undefined_references` only inspects lines
+    // that contain `=`, so the bug surfaces inside a resource block.
+    let main = "awscc.ec2.vpc {\n  target_id = orgs.accounts\n}\n";
+    std::fs::write(base.join("main.crn"), main).unwrap();
+
+    let engine = test_engine();
+    let diagnostics = analyze_with_buffer(&engine, &base, "main.crn", main);
+
+    let undefined: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| {
+            d.message.contains("Undefined resource") || d.message.contains("Undefined identifier")
+        })
+        .collect();
+    assert!(
+        undefined.is_empty(),
+        "sibling-declared `upstream_state` binding must not be flagged. Got: {:?}",
+        undefined.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+// `import` bindings in a sibling file were also invisible to the old
+// text-scan (no `provider.service.type` RHS). Cover that shape too.
+#[test]
+fn import_binding_in_sibling_file_is_not_undefined() {
+    let tmp = tempfile::tempdir().unwrap();
+    let module = tmp.path().join("modules").join("vpc");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::write(module.join("main.crn"), "arguments {\n  name: string\n}\n").unwrap();
+    let base = tmp.path().join("downstream");
+    std::fs::create_dir(&base).unwrap();
+    std::fs::write(
+        base.join("imports.crn"),
+        "let vpc_mod = import '../modules/vpc'\n",
+    )
+    .unwrap();
+    let main = "awscc.ec2.vpc {\n  name = vpc_mod.name\n}\n";
+    std::fs::write(base.join("main.crn"), main).unwrap();
+
+    let engine = test_engine();
+    let diagnostics = analyze_with_buffer(&engine, &base, "main.crn", main);
+
+    let undefined: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| {
+            d.message.contains("Undefined resource") || d.message.contains("Undefined identifier")
+        })
+        .collect();
+    assert!(
+        undefined.is_empty(),
+        "sibling-declared `import` binding must not be flagged. Got: {:?}",
+        undefined.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+// Genuine undefined still fires (typo against no declared binding at all).
+#[test]
+fn undefined_binding_in_current_file_still_flagged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("downstream");
+    std::fs::create_dir(&base).unwrap();
+    let main = "awscc.ec2.vpc {\n  name = nowhere.value\n}\n";
+    std::fs::write(base.join("main.crn"), main).unwrap();
+
+    let engine = test_engine();
+    let diagnostics = analyze_with_buffer(&engine, &base, "main.crn", main);
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("Undefined resource")
+                || d.message.contains("Undefined identifier")),
+        "typo against a truly undeclared root must still be flagged. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
