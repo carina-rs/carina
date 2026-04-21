@@ -1805,11 +1805,14 @@ for _, id in orgs.
 // =====================================================================
 
 #[test]
-fn exports_value_position_excludes_builtin_functions() {
-    // `exports { accounts: map(string) = { k = <HERE> } }` must not suggest
-    // built-in functions like `replace` — they don't produce a string the
-    // map entry could use without an extra call site, and offering every
-    // function clutters the popup.
+fn exports_value_position_excludes_region_pollution() {
+    // `exports { accounts: map(string) = { k = <HERE> } }` — the map
+    // value type is `string`, which accepts `replace` et al. What must
+    // NOT appear is provider-specific literal noise like
+    // `aws.Region.*`, whose type is an enum that can't reach a plain
+    // `string` entry. Regression guard for the #1993 repro: the popup
+    // should be driven by the declared type, never by "everything
+    // the provider knows about".
     let provider = test_provider();
     let source = "\
 exports {
@@ -1825,18 +1828,19 @@ exports {
     };
 
     let completions = provider.complete(&doc, position, None);
-
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
-        !completions.iter().any(|c| c.label == "replace"),
-        "`replace` must not appear at exports value position, got: {:?}",
-        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+        !labels.iter().any(|l| l.contains(".Region.")),
+        "no region literals at map(string) value position, got: {:?}",
+        labels
     );
 }
 
 #[test]
-fn exports_top_level_value_excludes_builtin_functions() {
-    // `exports { id: string = <HERE> }` — directly at the top-level of the
-    // exports block, not nested in a map.
+fn exports_top_level_value_excludes_region_pollution() {
+    // Same guard at the top level of the exports block. The type
+    // filter should keep the popup useful without falling back to the
+    // old noisy "all regions + all built-ins" set.
     let provider = test_provider();
     let source = "\
 exports {
@@ -1850,38 +1854,12 @@ exports {
     };
 
     let completions = provider.complete(&doc, position, None);
-
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
-        !completions.iter().any(|c| c.label == "replace"),
-        "`replace` must not appear at exports value position, got: {:?}",
-        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+        !labels.iter().any(|l| l.contains(".Region.")),
+        "no region literals at string exports value position, got: {:?}",
+        labels
     );
-}
-
-#[test]
-fn exports_value_position_returns_none_context() {
-    // Stronger guarantee than "no `replace` / no `.Region.`": the context
-    // itself must be `None`, so no handler fires and no generic candidate
-    // set can leak through — regardless of which providers are registered.
-    let provider = test_provider();
-    for source in [
-        "exports {\n  id: string = re\n}\n",
-        "exports {\n  accounts: map(string) = {\n    k = re\n  }\n}\n",
-    ] {
-        let last_line = source.lines().find(|l| l.contains(" = ")).unwrap();
-        let line_idx = source.lines().position(|l| l == last_line).unwrap() as u32;
-        let position = Position {
-            line: line_idx,
-            character: last_line.chars().count() as u32,
-        };
-        let context = provider.get_completion_context(source, position);
-        assert!(
-            matches!(context, CompletionContext::None),
-            "expected None, got {:?} for source:\n{}",
-            context,
-            source
-        );
-    }
 }
 
 /// At a value position whose attribute type is a `Custom` semantic
@@ -2108,6 +2086,240 @@ fn for_loop_binding_without_resolvable_iterable_falls_back_to_unconditional() {
     assert!(
         labels.contains(&"account_id"),
         "unresolvable iterable should preserve the permissive fallback. Got: {:?}",
+        labels
+    );
+}
+
+/// Top-level `exports { region: string = ▉ }` must offer string-
+/// returning built-in helpers. The annotation sits on the same line;
+/// the LSP previously returned nothing because the type was ignored.
+#[test]
+fn exports_top_level_string_position_offers_string_builtins() {
+    let provider = test_provider();
+    let doc = create_document(
+        r#"exports {
+  region: string =
+}
+"#,
+    );
+    let position = Position {
+        line: 1,
+        character: "  region: string = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    for expected in ["join", "lower", "upper", "trim"] {
+        assert!(
+            labels.contains(&expected),
+            "string-returning built-in '{}' must appear at `exports {{ region: string = ▉ }}`. Got: {:?}",
+            expected,
+            labels
+        );
+    }
+}
+
+/// Non-string built-ins must not appear when the declared type is
+/// `string` — filter correctness.
+#[test]
+fn exports_top_level_string_position_excludes_non_string_builtins() {
+    let provider = test_provider();
+    let doc = create_document(
+        r#"exports {
+  region: string =
+}
+"#,
+    );
+    let position = Position {
+        line: 1,
+        character: "  region: string = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    for banned in ["flatten", "keys"] {
+        assert!(
+            !labels.contains(&banned),
+            "list-returning '{}' must not appear at a `string` exports position. Got: {:?}",
+            banned,
+            labels
+        );
+    }
+}
+
+/// Inside a nested `{ ... }` block that is the value of
+/// `accounts: map(T) = { ... }`, the element type is `T` and only
+/// `T`-compatible candidates should appear. Guards against the repro
+/// where `registry_dev = re|` suggests `replace`.
+#[test]
+fn exports_map_value_position_filters_by_element_type() {
+    let provider = test_provider();
+    let doc = create_document(
+        r#"exports {
+  accounts: map(aws_account_id) = {
+    registry_prod = x
+  }
+}
+"#,
+    );
+    // Cursor on the `registry_prod = ` line after `= `.
+    let position = Position {
+        line: 2,
+        character: "    registry_prod = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    // `replace` returns `string`; `aws_account_id` is a Custom
+    // semantic subtype — no built-in produces it, so `replace` must
+    // not appear.
+    assert!(
+        !labels.contains(&"replace"),
+        "`replace` must not be suggested inside a `map(aws_account_id)` value position. Got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.contains(&"join"),
+        "`join` must not be suggested inside a `map(aws_account_id)` value position. Got: {:?}",
+        labels
+    );
+}
+
+/// Fall back to empty when the annotation can't be resolved —
+/// unknown entry, missing colon, etc. Silent beats noisy; this
+/// guards against a regression that would dump every built-in.
+#[test]
+fn exports_value_without_type_annotation_returns_empty() {
+    let provider = test_provider();
+    let doc = create_document(
+        r#"exports {
+  mystery =
+}
+"#,
+    );
+    let position = Position {
+        line: 1,
+        character: "  mystery = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, None);
+    // Empty is acceptable; what's NOT acceptable is dumping every
+    // built-in.
+    assert!(
+        !completions.iter().any(|c| c.label == "replace"),
+        "no annotation must not surface `replace`. Got: {:?}",
+        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+}
+
+/// Real-world acceptance: the repro `exports.crn` used by
+/// `carina-rs/infra/aws/management/organizations/`. Completion at the
+/// `registry_dev = re|` position must not offer `replace` (it returns
+/// a plain String, the map element type is `aws_account_id`).
+#[test]
+fn exports_map_value_real_world_shape_filters_unrelated_builtins() {
+    let provider = test_provider();
+    let source = "\
+exports {
+  accounts: map(aws_account_id) = {
+    registry_prod = registry_prod.account_id
+    registry_dev  = re
+  }
+}
+";
+    let doc = create_document(source);
+    let position = Position {
+        line: 3,
+        character: "  registry_dev  = re".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    for banned in ["replace", "join", "lower", "upper", "trim", "env", "lookup"] {
+        assert!(
+            !labels.contains(&banned),
+            "String-returning '{}' must not appear in a `map(aws_account_id)` value position. Got: {:?}",
+            banned,
+            labels
+        );
+    }
+}
+
+/// Resource-ref candidates: a binding whose resource schema exposes an
+/// attribute of the target type should appear as `<binding>.<attr>`
+/// at the value position. Guards the "offer matching refs" half of
+/// the issue spec.
+#[test]
+fn exports_map_value_offers_matching_resource_refs() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use std::collections::HashMap;
+    fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
+        Ok(())
+    }
+    let account_id = AttributeType::Custom {
+        semantic_name: Some("AwsAccountId".to_string()),
+        base: Box::new(AttributeType::String),
+        pattern: None,
+        length: None,
+        validate: validate_noop,
+        namespace: None,
+        to_dsl: None,
+    };
+    let schema = ResourceSchema::new("awscc.organizations.account")
+        .attribute(AttributeSchema::new("account_id", account_id));
+    let mut schemas = HashMap::new();
+    schemas.insert("awscc.organizations.account".to_string(), schema);
+    let provider =
+        CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![]);
+
+    let source = "\
+let registry_prod = awscc.organizations.account {
+  name = 'prod'
+}
+
+exports {
+  accounts: map(aws_account_id) = {
+    registry_prod = re
+  }
+}
+";
+    let doc = create_document(source);
+    let position = Position {
+        line: 6,
+        character: "    registry_prod = re".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"registry_prod.account_id"),
+        "expected `registry_prod.account_id` at `map(aws_account_id)` value position. Got: {:?}",
+        labels
+    );
+}
+
+/// List element position: `exports { items: list(string) = [▉] }` —
+/// string-returning built-ins should appear inside the list.
+#[test]
+fn exports_list_value_position_filters_by_element_type() {
+    let provider = test_provider();
+    let doc = create_document(
+        r#"exports {
+  items: list(string) = [
+    re
+  ]
+}
+"#,
+    );
+    // Cursor on `    re` line.
+    let position = Position {
+        line: 2,
+        character: "    re".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    // The list-element case is harder to detect from text alone
+    // (square brackets don't change brace_depth). The conservative
+    // acceptable behaviour is either (a) type-filtered suggestions or
+    // (b) nothing — but never a regional/builtin dump. Guard the
+    // never-dump half.
+    assert!(
+        !labels.iter().any(|l| l.contains(".Region.")),
+        "list-element position must not regress into region dump. Got: {:?}",
         labels
     );
 }

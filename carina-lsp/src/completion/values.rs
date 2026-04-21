@@ -758,6 +758,90 @@ impl CompletionProvider {
         Self::builtin_completions_matching(|_| true)
     }
 
+    /// Type-aware completions at a value position inside an `exports`
+    /// block. `type_expr_text` is the raw annotation (`string`,
+    /// `map(aws_account_id)`, `list(string)`, …) pulled off the
+    /// enclosing entry. When `in_nested` is true the cursor is inside
+    /// that entry's `{ ... }` map/list body, so the effective type is
+    /// the annotation unwrapped by one level.
+    ///
+    /// When the annotation can't be parsed this returns the empty
+    /// list — "silent rather than noisy" stays the right fallback
+    /// since an unknown type offers no basis for suggestion.
+    pub(super) fn exports_value_completions(
+        &self,
+        type_expr_text: &str,
+        in_nested: bool,
+        text: &str,
+    ) -> Vec<CompletionItem> {
+        let Some(annotation) = parse_exports_type_text(type_expr_text) else {
+            return Vec::new();
+        };
+        let effective = if in_nested {
+            match &annotation {
+                AttributeType::List { inner, .. } | AttributeType::Map { value: inner, .. } => {
+                    (**inner).clone()
+                }
+                // Inside `{ ... }` of a non-collection annotation we
+                // don't know what the user means — fall silent.
+                _ => return Vec::new(),
+            }
+        } else {
+            annotation
+        };
+
+        let mut items = Self::builtin_function_completions_for_type(&effective);
+        items.extend(self.resource_ref_completions_for_type(&effective, text));
+        items
+    }
+
+    /// Find resource-ref paths (`<binding>.<attr>`) whose leaf
+    /// attribute is assignable to `target` and return them as
+    /// completion items. `text` is the current buffer; we scan it for
+    /// `let <binding> = <resource_type> { ... }` declarations and look
+    /// up each binding's resource schema. Used by the `exports`
+    /// value-position handler to surface matching references alongside
+    /// type-compatible built-ins.
+    fn resource_ref_completions_for_type(
+        &self,
+        target: &AttributeType,
+        text: &str,
+    ) -> Vec<CompletionItem> {
+        let mut items: Vec<CompletionItem> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (binding_name, resource_type) in self.extract_resource_bindings(text) {
+            if resource_type.is_empty() {
+                continue;
+            }
+            let Some(schema) = self.schemas.get(&resource_type) else {
+                continue;
+            };
+            for attr in schema.attributes.values() {
+                if !attr.attr_type.is_assignable_to(target) {
+                    continue;
+                }
+                let full_ref = format!("{}.{}", binding_name, attr.name);
+                if !seen.insert(full_ref.clone()) {
+                    continue;
+                }
+                items.push(CompletionItem {
+                    label: full_ref.clone(),
+                    kind: Some(CompletionItemKind::REFERENCE),
+                    detail: Some(format!(
+                        "Reference to {}'s {} ({})",
+                        binding_name,
+                        attr.name,
+                        attr.attr_type.type_name()
+                    )),
+                    insert_text: Some(full_ref),
+                    ..Default::default()
+                });
+            }
+        }
+        items.sort_by(|a, b| a.label.cmp(&b.label));
+        items
+    }
+
     /// Return built-in function completions whose declared return type is
     /// compatible with the attribute's declared `AttributeType`. Used by
     /// value-position completion to avoid suggesting `concat` / `join` /
@@ -1159,6 +1243,95 @@ fn return_type_fits(ret: builtins::BuiltinReturnType, attr_type: &AttributeType)
         AttributeType::Float => false,
         AttributeType::Struct { .. } => false,
     }
+}
+
+/// Parse the raw text of an `exports` entry's type annotation into an
+/// `AttributeType` good enough to drive value-position completion
+/// filtering. Accepts the shapes the DSL grammar produces at this
+/// surface:
+///
+/// * primitive names (`string`, `int`, `float`, `bool`)
+/// * `list(T)` / `map(T)` with recursive inner parsing
+/// * a bare identifier interpreted as a custom semantic subtype — the
+///   name is PascalCase'd (`aws_account_id` → `AwsAccountId`) and
+///   stored as `Custom { semantic_name: Some(PascalCase), base: String }`
+///   so `is_assignable_to` matches schemas that declare the same
+///   semantic name.
+///
+/// Namespaced identifiers (`aws.vpc.VpcId`) are **not** parsed today —
+/// they fall into `None` and the caller silently drops to the empty
+/// completion set. Add a dotted-path branch when a real corpus shows
+/// users reaching for that shape in `exports` annotations.
+///
+/// Returns `None` for anything we don't understand; the caller falls
+/// back to the empty completion set rather than dumping everything.
+fn parse_exports_type_text(text: &str) -> Option<AttributeType> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if let Some(inner) = strip_generic("list", text) {
+        return parse_exports_type_text(inner).map(AttributeType::list);
+    }
+    if let Some(inner) = strip_generic("map", text) {
+        let inner_ty = parse_exports_type_text(inner)?;
+        return Some(AttributeType::Map {
+            key: Box::new(AttributeType::String),
+            value: Box::new(inner_ty),
+        });
+    }
+    match text {
+        "string" => Some(AttributeType::String),
+        "int" => Some(AttributeType::Int),
+        "float" => Some(AttributeType::Float),
+        "bool" => Some(AttributeType::Bool),
+        name if is_valid_custom_name(name) => Some(AttributeType::Custom {
+            semantic_name: Some(snake_to_pascal(name)),
+            base: Box::new(AttributeType::String),
+            pattern: None,
+            length: None,
+            validate: noop_validate,
+            namespace: None,
+            to_dsl: None,
+        }),
+        _ => None,
+    }
+}
+
+/// `list(...)` / `map(...)` wrapper stripper. Returns the inner text
+/// between balanced parens, `None` for any other shape.
+fn strip_generic<'a>(prefix: &str, text: &'a str) -> Option<&'a str> {
+    let rest = text.strip_prefix(prefix)?;
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix('(')?;
+    let rest = rest.strip_suffix(')')?;
+    Some(rest)
+}
+
+fn is_valid_custom_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && s.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+}
+
+fn snake_to_pascal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut next_upper = true;
+    for ch in s.chars() {
+        if ch == '_' {
+            next_upper = true;
+        } else if next_upper {
+            out.extend(ch.to_uppercase());
+            next_upper = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn noop_validate(_v: &carina_core::resource::Value) -> Result<(), String> {
+    Ok(())
 }
 
 /// Scan `ancestor` for directories that look like carina projects.
