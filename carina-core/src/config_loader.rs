@@ -20,13 +20,12 @@ pub struct LoadedConfig {
     /// so this preserves the original references for accurate unused binding analysis.
     pub unresolved_parsed: ParsedFile,
     pub backend_file: Option<PathBuf>,
-    /// Identifier-scope errors surfaced by the post-merge passes:
-    /// `check_undefined_references` (ResourceRef roots in resources /
-    /// attribute / module / export values) and
-    /// `check_deferred_for_iterables` (for-expression iterables). Empty
-    /// when every reference resolves against the directory-wide binding
-    /// set. The loader does not short-circuit on these so that later
-    /// validators can also run in a single pass.
+    /// Identifier-scope errors surfaced by [`parser::check_identifier_scope`]
+    /// on the merged directory parse: ResourceRef roots in resources /
+    /// attribute / module / export values and unresolved for-expression
+    /// iterables. Empty when every reference resolves against the
+    /// directory-wide binding set. The loader does not short-circuit on
+    /// these so that later validators can also run in a single pass.
     pub identifier_scope_errors: Vec<parser::ParseError>,
 }
 
@@ -167,10 +166,8 @@ pub fn load_configuration_with_config(
 
         // Identifier-scope checks are accumulated rather than short-
         // circuited so `carina validate` can keep going and report every
-        // static error in one pass (#2102, #2126). The caller reads
-        // `identifier_scope_errors` and merges them with its own findings.
-        let mut identifier_scope_errors = parser::check_undefined_references(&merged);
-        identifier_scope_errors.extend(parser::check_deferred_for_iterables(&merged));
+        // static error in one pass (#2102, #2126, #2138).
+        let identifier_scope_errors = parser::check_identifier_scope(&merged);
 
         Ok(LoadedConfig {
             parsed: merged,
@@ -262,10 +259,11 @@ pub fn parse_directory_with_overrides(
         return Err(e.to_string());
     }
 
-    // Deferred-for-iterable validation is left to callers. LSP needs the
-    // ParsedFile even when an iterable names an undefined binding, so it
-    // can surface the error as a diagnostic; CLI entry points run
-    // `check_deferred_for_iterables` themselves.
+    // Identifier-scope validation is left to callers. LSP needs the
+    // ParsedFile even when a reference is unresolved, so it can surface
+    // the error as a diagnostic; CLI entry points call
+    // `parser::check_identifier_scope` themselves (see
+    // `load_configuration_with_config`).
     Ok(merged)
 }
 
@@ -921,7 +919,7 @@ awscc.ec2.security_group {
         let result = parse_directory(&dir, &ProviderContext::default());
         cleanup(&dir);
         let parsed = result.expect("parse_directory should not fail on undefined iterable");
-        let errs = parser::check_deferred_for_iterables(&parsed);
+        let errs = parser::check_identifier_scope(&parsed);
         assert_eq!(errs.len(), 1, "expected one error, got {errs:?}");
         match &errs[0] {
             parser::ParseError::UndefinedIdentifier { name, .. } => {
@@ -963,9 +961,8 @@ awscc.ec2.security_group {
     }
 
     // Acceptance for #2126. Per-file parse must not reject a ResourceRef
-    // whose root is declared in a sibling `.crn`. The check has to live on
-    // the merged `ParsedFile`, same place `check_deferred_for_iterables`
-    // already lives.
+    // whose root is declared in a sibling `.crn`. The check lives on the
+    // merged `ParsedFile` via `check_identifier_scope` (#2138).
     #[test]
     fn parse_directory_accepts_cross_file_resource_ref() {
         let dir = create_temp_dir("cross_file_resource_ref");
