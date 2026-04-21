@@ -48,7 +48,7 @@ pub fn run_validate(
     let mut error_reports: Vec<String> = Vec::new();
     error_reports.extend(
         loaded
-            .iterable_binding_errors
+            .identifier_scope_errors
             .iter()
             .map(ToString::to_string),
     );
