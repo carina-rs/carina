@@ -200,7 +200,7 @@ impl std::fmt::Display for ResourceTypePath {
 }
 
 /// Type expression for arguments/attributes parameters
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TypeExpr {
     String,
     Bool,
@@ -222,6 +222,16 @@ pub enum TypeExpr {
         /// Type name in PascalCase (e.g., "VpcId")
         type_name: String,
     },
+    /// Structural record type: `struct { name: type, ... }`.
+    ///
+    /// Field order matches source order and participates in `PartialEq` —
+    /// two struct types with the same fields in different order are not
+    /// equal. A `Value::Map` satisfies a struct type when every field
+    /// name appears as a key with a value that matches the field's type,
+    /// with no extra keys.
+    Struct {
+        fields: Vec<(String, TypeExpr)>,
+    },
 }
 
 impl std::fmt::Display for TypeExpr {
@@ -240,6 +250,20 @@ impl std::fmt::Display for TypeExpr {
                 path,
                 type_name,
             } => write!(f, "{}.{}.{}", provider, path, type_name),
+            TypeExpr::Struct { fields } => {
+                if fields.is_empty() {
+                    write!(f, "struct {{}}")
+                } else {
+                    write!(f, "struct {{ ")?;
+                    for (i, (name, ty)) in fields.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}: {}", name, ty)?;
+                    }
+                    write!(f, " }}")
+                }
+            }
         }
     }
 }
@@ -1524,6 +1548,30 @@ fn parse_type_expr(pair: pest::iterators::Pair<Rule>) -> Result<TypeExpr, ParseE
                 })?;
                 Ok(TypeExpr::Ref(path))
             }
+        }
+        Rule::type_struct => {
+            let mut fields = Vec::new();
+            for child in inner.into_inner() {
+                if child.as_rule() != Rule::struct_field_list {
+                    continue;
+                }
+                for field_pair in child.into_inner() {
+                    if field_pair.as_rule() != Rule::struct_field {
+                        continue;
+                    }
+                    let mut field_inner = field_pair.into_inner();
+                    let name = next_pair(&mut field_inner, "field name", "struct field")?
+                        .as_str()
+                        .to_string();
+                    let ty = parse_type_expr(next_pair(
+                        &mut field_inner,
+                        "field type",
+                        "struct field",
+                    )?)?;
+                    fields.push((name, ty));
+                }
+            }
+            Ok(TypeExpr::Struct { fields })
         }
         _ => Ok(TypeExpr::String),
     }
@@ -3138,6 +3186,7 @@ fn check_fn_arg_type(
                 true
             }
         }
+        TypeExpr::Struct { .. } => matches!(value, Value::Map(_)),
     };
     if !type_matches {
         let actual_type = value_type_name(value);
@@ -3200,6 +3249,7 @@ fn check_fn_return_type(
                 true
             }
         }
+        TypeExpr::Struct { .. } => matches!(value, Value::Map(_)),
     };
     if !type_matches {
         let actual_type = value_type_name(value);
@@ -3227,7 +3277,7 @@ pub fn pascal_to_snake(s: &str) -> String {
 }
 
 /// Return a human-readable type name for a Value
-fn value_type_name(value: &Value) -> &'static str {
+pub(crate) fn value_type_name(value: &Value) -> &'static str {
     match value {
         Value::String(_) => "string",
         Value::Int(_) => "int",
@@ -5665,6 +5715,96 @@ mod tests {
             result.arguments[1].type_expr,
             TypeExpr::Ref(ResourceTypePath::new("aws", "security_group.ingress_rule"))
         );
+    }
+
+    #[test]
+    fn parse_struct_type_expression() {
+        let input = r#"
+            exports {
+                accounts: struct {
+                    registry_prod: aws_account_id,
+                    registry_dev:  aws_account_id,
+                } = {
+                    registry_prod = "111111111111"
+                    registry_dev  = "222222222222"
+                }
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(result.export_params.len(), 1);
+        let ep = &result.export_params[0];
+        assert_eq!(ep.name, "accounts");
+        let expected = TypeExpr::Struct {
+            fields: vec![
+                (
+                    "registry_prod".to_string(),
+                    TypeExpr::Simple("aws_account_id".to_string()),
+                ),
+                (
+                    "registry_dev".to_string(),
+                    TypeExpr::Simple("aws_account_id".to_string()),
+                ),
+            ],
+        };
+        assert_eq!(ep.type_expr, Some(expected));
+    }
+
+    #[test]
+    fn parse_struct_type_nested_in_list_and_map() {
+        let input = r#"
+            arguments {
+                items: list(struct { name: string, value: int })
+                registry: map(struct { arn: string, id: string })
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(
+            result.arguments[0].type_expr,
+            TypeExpr::List(Box::new(TypeExpr::Struct {
+                fields: vec![
+                    ("name".to_string(), TypeExpr::String),
+                    ("value".to_string(), TypeExpr::Int),
+                ],
+            }))
+        );
+        assert_eq!(
+            result.arguments[1].type_expr,
+            TypeExpr::Map(Box::new(TypeExpr::Struct {
+                fields: vec![
+                    ("arn".to_string(), TypeExpr::String),
+                    ("id".to_string(), TypeExpr::String),
+                ],
+            }))
+        );
+    }
+
+    #[test]
+    fn struct_type_expr_display_renders_with_braces() {
+        let t = TypeExpr::Struct {
+            fields: vec![
+                ("name".to_string(), TypeExpr::String),
+                ("value".to_string(), TypeExpr::Int),
+            ],
+        };
+        assert_eq!(t.to_string(), "struct { name: string, value: int }");
+
+        let empty = TypeExpr::Struct { fields: vec![] };
+        assert_eq!(empty.to_string(), "struct {}");
+    }
+
+    #[test]
+    fn struct_type_expr_roundtrips_through_serde_json() {
+        let t = TypeExpr::Struct {
+            fields: vec![
+                ("name".to_string(), TypeExpr::String),
+                ("value".to_string(), TypeExpr::Int),
+            ],
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        let back: TypeExpr = serde_json::from_str(&json).unwrap();
+        assert_eq!(t, back);
     }
 
     #[test]

@@ -137,6 +137,11 @@ impl<'a> CstBuilder<'a> {
             Rule::type_list => Some(CstChild::Node(self.build_node(NodeKind::TypeExpr, pair))),
             Rule::type_map => Some(CstChild::Node(self.build_node(NodeKind::TypeExpr, pair))),
             Rule::type_ref => Some(CstChild::Node(self.build_node(NodeKind::TypeExpr, pair))),
+            Rule::type_struct => Some(CstChild::Node(self.build_node(NodeKind::TypeExpr, pair))),
+            Rule::struct_field_list => {
+                Some(CstChild::Node(self.build_node(NodeKind::TypeExpr, pair)))
+            }
+            Rule::struct_field => Some(CstChild::Node(self.build_node(NodeKind::TypeExpr, pair))),
             Rule::let_binding => Some(CstChild::Node(self.build_node(NodeKind::LetBinding, pair))),
             Rule::local_binding => Some(CstChild::Node(
                 self.build_node(NodeKind::LocalBinding, pair),
@@ -267,6 +272,7 @@ impl<'a> CstBuilder<'a> {
             Rule::kw_exports => Some(CstChild::Token(Token::new("exports".to_string(), span))),
             Rule::kw_list => Some(CstChild::Token(Token::new("list".to_string(), span))),
             Rule::kw_map => Some(CstChild::Token(Token::new("map".to_string(), span))),
+            Rule::kw_struct => Some(CstChild::Token(Token::new("struct".to_string(), span))),
             Rule::kw_for => Some(CstChild::Token(Token::new("for".to_string(), span))),
             Rule::kw_in => Some(CstChild::Token(Token::new("in".to_string(), span))),
             Rule::kw_if => Some(CstChild::Token(Token::new("if".to_string(), span))),

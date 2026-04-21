@@ -1189,6 +1189,20 @@ fn infer_for_binding_type(
             Some((**inner).clone())
         }
         (TypeExpr::Map(_), ForBindingSlot::PairKey) => Some(TypeExpr::String),
+        // Iterating a struct binds each field as a (name, value) pair,
+        // matching the runtime's map-iteration semantics. Field types
+        // may differ, so we only surface a value type when all fields
+        // share it — otherwise no completion is inferred.
+        (TypeExpr::Struct { fields }, ForBindingSlot::Value | ForBindingSlot::PairValue) => {
+            let mut iter = fields.iter().map(|(_, ty)| ty);
+            let first = iter.next()?;
+            if iter.all(|ty| ty == first) {
+                Some(first.clone())
+            } else {
+                None
+            }
+        }
+        (TypeExpr::Struct { .. }, ForBindingSlot::PairKey) => Some(TypeExpr::String),
         _ => None,
     }
 }

@@ -1050,6 +1050,25 @@ impl ModuleSignature {
                     c.reset
                 )
             }
+            TypeExpr::Struct { fields } => {
+                if fields.is_empty() {
+                    format!("{}struct {{}}{}", c.green, c.reset)
+                } else {
+                    let mut out = format!("{}struct {{ ", c.green);
+                    for (i, (name, ty)) in fields.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        out.push_str(name);
+                        out.push_str(": ");
+                        out.push_str(&self.format_type_expr(ty, c));
+                        out.push_str(c.green);
+                    }
+                    out.push_str(" }");
+                    out.push_str(c.reset);
+                    out
+                }
+            }
             _ => format!("{}{}{}", c.green, type_expr, c.reset),
         }
     }

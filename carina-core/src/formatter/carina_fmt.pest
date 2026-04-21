@@ -133,9 +133,9 @@ exports_param = {
   | identifier ~ trivia* ~ equals ~ trivia* ~ expression
 }
 
-// Type expression: string, bool, int, cidr, arn, etc., list(type), map(type), aws.resource (resource ref)
+// Type expression: string, bool, int, cidr, arn, etc., list(type), map(type), aws.resource (resource ref), struct { field: type, ... }
 type_expr = {
-    type_ref | type_list | type_map | type_primitive
+    type_struct | type_ref | type_list | type_map | type_primitive
 }
 
 type_primitive = @{ identifier }
@@ -145,6 +145,12 @@ type_list = { kw_list ~ trivia* ~ open_paren ~ trivia* ~ type_expr ~ trivia* ~ c
 type_map = { kw_map ~ trivia* ~ open_paren ~ trivia* ~ type_expr ~ trivia* ~ close_paren }
 
 type_ref = { namespaced_id }
+
+type_struct = { kw_struct ~ trivia* ~ open_brace ~ trivia* ~ struct_field_list? ~ trivia* ~ close_brace }
+
+struct_field_list = { struct_field ~ (trivia* ~ comma ~ trivia* ~ struct_field)* ~ (trivia* ~ comma)? }
+
+struct_field = { identifier ~ trivia* ~ colon ~ trivia* ~ type_expr }
 
 // State manipulation blocks
 
@@ -362,6 +368,7 @@ kw_attributes = { "attributes" }
 kw_exports = { "exports" }
 kw_list = { "list" }
 kw_map = { "map" }
+kw_struct = { "struct" }
 kw_for = { "for" }
 kw_in = { "in" }
 kw_if = { "if" }

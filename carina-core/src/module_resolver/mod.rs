@@ -743,6 +743,23 @@ fn check_type_match(
                 TypeCheckResult::Mismatch
             }
         }
+        TypeExpr::Struct { fields } => {
+            let Value::Map(entries) = value else {
+                return TypeCheckResult::Mismatch;
+            };
+            if crate::validation::struct_field_shape_errors(fields, entries).is_some() {
+                return TypeCheckResult::Mismatch;
+            }
+            for (name, ty) in fields {
+                if let Some(v) = entries.get(name) {
+                    match check_type_match(ty, v, config) {
+                        TypeCheckResult::Ok => {}
+                        other => return other,
+                    }
+                }
+            }
+            TypeCheckResult::Ok
+        }
     }
 }
 

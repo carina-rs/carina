@@ -363,6 +363,21 @@ fn collect_ref_type_errors(
                 );
             }
         }
+        (TypeExpr::Struct { fields }, Value::Map(map)) => {
+            for (name, field_ty) in fields {
+                if let Some(value) = map.get(name) {
+                    collect_ref_type_errors(
+                        field_ty,
+                        value,
+                        param_name,
+                        binding_map,
+                        schemas,
+                        schema_key_fn,
+                        errors,
+                    );
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -406,6 +421,36 @@ pub fn is_type_expr_compatible_with_schema(
                 value: schema_inner,
                 ..
             } => is_type_expr_compatible_with_schema(inner, schema_inner),
+            _ => false,
+        },
+        TypeExpr::Struct {
+            fields: expr_fields,
+        } => match attr_type {
+            AttributeType::Struct {
+                fields: schema_fields,
+                ..
+            } => {
+                if expr_fields.len() != schema_fields.len() {
+                    return false;
+                }
+                expr_fields.iter().all(|(name, expr_ty)| {
+                    schema_fields
+                        .iter()
+                        .find(|f| &f.name == name)
+                        .is_some_and(|f| {
+                            is_type_expr_compatible_with_schema(expr_ty, &f.field_type)
+                        })
+                })
+            }
+            // A consumer annotated as `map(T)` may receive a `struct { a: T,
+            // b: T }` value — the shape coerces as long as every field type
+            // satisfies T.
+            AttributeType::Map {
+                value: schema_inner,
+                ..
+            } => expr_fields
+                .iter()
+                .all(|(_, ty)| is_type_expr_compatible_with_schema(ty, schema_inner)),
             _ => false,
         },
         _ => true, // Ref, SchemaType — conservatively accept
@@ -681,6 +726,14 @@ pub fn validate_type_expr_value(
             }
             None
         }
+        (TypeExpr::Struct { fields }, Value::Map(entries)) => {
+            validate_struct_fields(fields, entries, config)
+        }
+        (TypeExpr::Struct { .. }, _) => Some(format!(
+            "expected {}, got {}.",
+            type_expr,
+            crate::parser::value_type_name(value)
+        )),
         (TypeExpr::Bool, Value::String(s)) => Some(format!(
             "expected bool, got string \"{}\". Use true or false.",
             s
@@ -707,6 +760,44 @@ pub fn validate_type_expr_value(
         }
         _ => None,
     }
+}
+
+/// Check shape-level problems of a `Value::Map` against a struct field
+/// list: extra keys and missing keys. Returns `None` when the key sets
+/// match. Callers then walk each field with their own type-check pass.
+pub fn struct_field_shape_errors(
+    fields: &[(String, TypeExpr)],
+    entries: &HashMap<String, Value>,
+) -> Option<String> {
+    for key in entries.keys() {
+        if !fields.iter().any(|(name, _)| name == key) {
+            return Some(format!("expected struct, unknown field '{}'.", key));
+        }
+    }
+    for (name, _) in fields {
+        if !entries.contains_key(name) {
+            return Some(format!("expected struct, missing field '{}'.", name));
+        }
+    }
+    None
+}
+
+fn validate_struct_fields(
+    fields: &[(String, TypeExpr)],
+    entries: &HashMap<String, Value>,
+    config: &ProviderContext,
+) -> Option<String> {
+    if let Some(e) = struct_field_shape_errors(fields, entries) {
+        return Some(e);
+    }
+    for (name, ty) in fields {
+        if let Some(v) = entries.get(name)
+            && let Some(e) = validate_type_expr_value(ty, v, config)
+        {
+            return Some(format!("field '{}': {}", name, e));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1688,6 +1779,134 @@ let vpc = awscc.ec2.vpc {
             "Expected validation error for list element"
         );
         assert!(result.unwrap().contains("Element 0"));
+    }
+
+    fn struct_type_name_value() -> TypeExpr {
+        TypeExpr::Struct {
+            fields: vec![
+                ("name".to_string(), TypeExpr::String),
+                ("value".to_string(), TypeExpr::Int),
+            ],
+        }
+    }
+
+    #[test]
+    fn validate_type_expr_struct_accepts_well_formed_map() {
+        let mut map = HashMap::new();
+        map.insert("name".to_string(), Value::String("x".to_string()));
+        map.insert("value".to_string(), Value::Int(1));
+        let result = validate_type_expr_value(
+            &struct_type_name_value(),
+            &Value::Map(map),
+            &ProviderContext::default(),
+        );
+        assert!(result.is_none(), "got error: {:?}", result);
+    }
+
+    #[test]
+    fn validate_type_expr_struct_rejects_missing_field() {
+        let mut map = HashMap::new();
+        map.insert("name".to_string(), Value::String("x".to_string()));
+        let result = validate_type_expr_value(
+            &struct_type_name_value(),
+            &Value::Map(map),
+            &ProviderContext::default(),
+        );
+        assert_eq!(
+            result.as_deref(),
+            Some("expected struct, missing field 'value'.")
+        );
+    }
+
+    #[test]
+    fn validate_type_expr_struct_rejects_unknown_field() {
+        let mut map = HashMap::new();
+        map.insert("name".to_string(), Value::String("x".to_string()));
+        map.insert("value".to_string(), Value::Int(1));
+        map.insert("extra".to_string(), Value::String("y".to_string()));
+        let result = validate_type_expr_value(
+            &struct_type_name_value(),
+            &Value::Map(map),
+            &ProviderContext::default(),
+        );
+        assert_eq!(
+            result.as_deref(),
+            Some("expected struct, unknown field 'extra'.")
+        );
+    }
+
+    #[test]
+    fn validate_type_expr_struct_rejects_wrong_field_type() {
+        let mut map = HashMap::new();
+        map.insert("name".to_string(), Value::String("x".to_string()));
+        map.insert("value".to_string(), Value::String("not-an-int".to_string()));
+        let result = validate_type_expr_value(
+            &struct_type_name_value(),
+            &Value::Map(map),
+            &ProviderContext::default(),
+        );
+        assert!(result.is_some());
+        let msg = result.unwrap();
+        assert!(msg.contains("value"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn validate_type_expr_struct_rejects_non_map_value() {
+        let result = validate_type_expr_value(
+            &struct_type_name_value(),
+            &Value::String("oops".to_string()),
+            &ProviderContext::default(),
+        );
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("struct"));
+    }
+
+    #[test]
+    fn is_type_expr_compatible_struct_matches_same_shape_schema() {
+        use crate::schema::StructField;
+        let expr = TypeExpr::Struct {
+            fields: vec![
+                ("name".to_string(), TypeExpr::String),
+                ("value".to_string(), TypeExpr::Int),
+            ],
+        };
+        let schema = AttributeType::Struct {
+            name: "Row".to_string(),
+            fields: vec![
+                StructField::new("name", AttributeType::String),
+                StructField::new("value", AttributeType::Int),
+            ],
+        };
+        assert!(is_type_expr_compatible_with_schema(&expr, &schema));
+    }
+
+    #[test]
+    fn is_type_expr_compatible_struct_flows_into_map_when_fields_share_type() {
+        // A downstream consumer annotated `map(string)` accepts a
+        // `struct { a: string, b: string }` — every field satisfies string.
+        let expr = TypeExpr::Struct {
+            fields: vec![
+                ("a".to_string(), TypeExpr::String),
+                ("b".to_string(), TypeExpr::String),
+            ],
+        };
+        let schema = AttributeType::Map {
+            key: Box::new(AttributeType::String),
+            value: Box::new(AttributeType::String),
+        };
+        assert!(is_type_expr_compatible_with_schema(&expr, &schema));
+    }
+
+    #[test]
+    fn is_type_expr_compatible_struct_rejects_map_with_wrong_element_type() {
+        let expr = TypeExpr::Struct {
+            fields: vec![("a".to_string(), TypeExpr::String)],
+        };
+        let schema = AttributeType::Map {
+            key: Box::new(AttributeType::String),
+            value: Box::new(AttributeType::Int),
+        };
+        assert!(!is_type_expr_compatible_with_schema(&expr, &schema));
     }
 
     #[test]
