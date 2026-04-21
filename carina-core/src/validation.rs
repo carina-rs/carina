@@ -430,16 +430,18 @@ pub fn is_type_expr_compatible_with_schema(
                 fields: schema_fields,
                 ..
             } => {
+                // Bijection: every schema field must match exactly one expr
+                // field. We check schema ⇒ expr membership with equal
+                // lengths; the parser's duplicate-name rejection keeps
+                // expr_fields unique, which together forces a one-to-one
+                // correspondence.
                 if expr_fields.len() != schema_fields.len() {
                     return false;
                 }
-                expr_fields.iter().all(|(name, expr_ty)| {
-                    schema_fields
-                        .iter()
-                        .find(|f| &f.name == name)
-                        .is_some_and(|f| {
-                            is_type_expr_compatible_with_schema(expr_ty, &f.field_type)
-                        })
+                schema_fields.iter().all(|sf| {
+                    expr_fields.iter().any(|(n, t)| {
+                        n == &sf.name && is_type_expr_compatible_with_schema(t, &sf.field_type)
+                    })
                 })
             }
             // A consumer annotated as `map(T)` may receive a `struct { a: T,
@@ -769,10 +771,15 @@ pub fn struct_field_shape_errors(
     fields: &[(String, TypeExpr)],
     entries: &HashMap<String, Value>,
 ) -> Option<String> {
-    for key in entries.keys() {
-        if !fields.iter().any(|(name, _)| name == key) {
-            return Some(format!("expected struct, unknown field '{}'.", key));
-        }
+    // Sort unknown keys so the diagnostic is stable across HashMap's
+    // per-process random hash seed.
+    let mut unknown: Vec<&String> = entries
+        .keys()
+        .filter(|k| !fields.iter().any(|(name, _)| &name == k))
+        .collect();
+    unknown.sort();
+    if let Some(key) = unknown.first() {
+        return Some(format!("expected struct, unknown field '{key}'."));
     }
     for (name, _) in fields {
         if !entries.contains_key(name) {
@@ -1859,6 +1866,50 @@ let vpc = awscc.ec2.vpc {
         );
         assert!(result.is_some());
         assert!(result.unwrap().contains("struct"));
+    }
+
+    #[test]
+    fn struct_field_shape_errors_is_deterministic_for_multiple_unknowns() {
+        // Multiple unknown keys must produce the *same* alphabetically-first
+        // error on every call, independent of HashMap's per-process random
+        // hash seed.
+        let fields: Vec<(String, TypeExpr)> = vec![("a".to_string(), TypeExpr::String)];
+        let mut entries = HashMap::new();
+        entries.insert("a".to_string(), Value::String("ok".into()));
+        entries.insert("z_extra".to_string(), Value::String("x".into()));
+        entries.insert("b_extra".to_string(), Value::String("y".into()));
+        entries.insert("m_extra".to_string(), Value::String("z".into()));
+
+        let first = struct_field_shape_errors(&fields, &entries);
+        for _ in 0..20 {
+            assert_eq!(first, struct_field_shape_errors(&fields, &entries));
+        }
+        assert_eq!(
+            first.as_deref(),
+            Some("expected struct, unknown field 'b_extra'.")
+        );
+    }
+
+    #[test]
+    fn is_type_expr_compatible_struct_rejects_missing_schema_field_when_expr_has_extra() {
+        // Regression: the old `expr.iter().all(find in schema)` logic let an
+        // expr struct omit a required schema field as long as sizes matched.
+        // The bijection fix must reject this.
+        use crate::schema::StructField;
+        let expr = TypeExpr::Struct {
+            fields: vec![
+                ("a".to_string(), TypeExpr::Int),
+                ("c".to_string(), TypeExpr::Int),
+            ],
+        };
+        let schema = AttributeType::Struct {
+            name: "Row".to_string(),
+            fields: vec![
+                StructField::new("a", AttributeType::Int),
+                StructField::new("b", AttributeType::String),
+            ],
+        };
+        assert!(!is_type_expr_compatible_with_schema(&expr, &schema));
     }
 
     #[test]

@@ -1550,7 +1550,7 @@ fn parse_type_expr(pair: pest::iterators::Pair<Rule>) -> Result<TypeExpr, ParseE
             }
         }
         Rule::type_struct => {
-            let mut fields = Vec::new();
+            let mut fields: Vec<(String, TypeExpr)> = Vec::new();
             for child in inner.into_inner() {
                 if child.as_rule() != Rule::struct_field_list {
                     continue;
@@ -1568,6 +1568,11 @@ fn parse_type_expr(pair: pest::iterators::Pair<Rule>) -> Result<TypeExpr, ParseE
                         "field type",
                         "struct field",
                     )?)?;
+                    if fields.iter().any(|(existing, _)| existing == &name) {
+                        return Err(ParseError::InvalidResourceType(format!(
+                            "struct has duplicate field name '{name}'"
+                        )));
+                    }
                     fields.push((name, ty));
                 }
             }
@@ -5777,6 +5782,21 @@ mod tests {
                     ("id".to_string(), TypeExpr::String),
                 ],
             }))
+        );
+    }
+
+    #[test]
+    fn parse_struct_type_rejects_duplicate_field_name() {
+        let input = r#"
+            exports {
+                x: struct { a: string, a: int } = { a = "hi" }
+            }
+        "#;
+        let err = parse(input, &ProviderContext::default()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("duplicate field name 'a'"),
+            "expected duplicate-name error, got: {msg}"
         );
     }
 

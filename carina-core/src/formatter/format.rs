@@ -736,7 +736,16 @@ impl Formatter {
     }
 
     fn format_type_expr(&mut self, node: &CstNode) {
-        // Type expressions: aws.vpc, list(cidr), map(string), string, bool, int, cidr
+        // Type expressions: aws.vpc, list(cidr), map(string), string, bool,
+        // int, cidr, struct { name: type, ... }.
+        //
+        // Struct types need canonical spacing (`struct { a: int, b: string }`);
+        // handle them via a dedicated path so the default fall-through
+        // doesn't collapse whitespace between `struct`, `{`, `:`, `,`, `}`.
+        if Self::type_expr_is_struct(node) {
+            self.format_struct_type_expr(node);
+            return;
+        }
         for child in &node.children {
             match child {
                 CstChild::Token(token) => {
@@ -749,7 +758,115 @@ impl Formatter {
                     }
                 }
                 CstChild::Node(n) => {
-                    // Recursively format nested type expressions
+                    self.format_type_expr(n);
+                }
+                CstChild::Trivia(_) => {}
+            }
+        }
+    }
+
+    /// A `type_expr` node is a struct when it either carries the `struct`
+    /// keyword directly or wraps a single child that does. Intermediate
+    /// wrapping happens because `type_struct` is itself reparented to
+    /// `NodeKind::TypeExpr` by the CST builder.
+    fn type_expr_is_struct(node: &CstNode) -> bool {
+        for child in &node.children {
+            match child {
+                CstChild::Token(t) if t.text == "struct" => return true,
+                CstChild::Token(_) => return false,
+                CstChild::Node(_) | CstChild::Trivia(_) => continue,
+            }
+        }
+        false
+    }
+
+    fn format_struct_type_expr(&mut self, node: &CstNode) {
+        // Emit `struct ` from the first Token child (the `struct` keyword),
+        // then format each nested struct_field child. struct_field_list is a
+        // single wrapper node; we descend into it transparently.
+        let mut wrote_struct_kw = false;
+        let mut fields: Vec<&CstNode> = Vec::new();
+        Self::collect_struct_parts(node, &mut wrote_struct_kw, &mut fields);
+
+        self.write("struct");
+        if fields.is_empty() {
+            self.write(" {}");
+            return;
+        }
+        self.write(" { ");
+        for (i, field) in fields.iter().enumerate() {
+            if i > 0 {
+                self.write(", ");
+            }
+            self.format_struct_field(field);
+        }
+        self.write(" }");
+    }
+
+    /// Walk the struct subtree and collect the per-field nodes while
+    /// tolerating the CstBuilder's flattening of struct_field_list /
+    /// struct_field into NodeKind::TypeExpr.
+    fn collect_struct_parts<'a>(
+        node: &'a CstNode,
+        saw_kw: &mut bool,
+        fields: &mut Vec<&'a CstNode>,
+    ) {
+        for child in &node.children {
+            match child {
+                CstChild::Token(t) if t.text == "struct" => *saw_kw = true,
+                CstChild::Token(_) => {}
+                CstChild::Node(n) => {
+                    if Self::type_expr_is_struct_field(n) {
+                        fields.push(n);
+                    } else {
+                        Self::collect_struct_parts(n, saw_kw, fields);
+                    }
+                }
+                CstChild::Trivia(_) => {}
+            }
+        }
+    }
+
+    /// Heuristic: a struct_field node contains a name Token, a `:` Token,
+    /// and a nested type_expr Node — and crucially no `struct` keyword at
+    /// its own top level. We recognize it by "has an identifier Token
+    /// directly followed (ignoring trivia) by a `:` Token."
+    fn type_expr_is_struct_field(node: &CstNode) -> bool {
+        let mut saw_ident = false;
+        for child in &node.children {
+            match child {
+                CstChild::Token(t) => {
+                    if t.text == ":" && saw_ident {
+                        return true;
+                    }
+                    if t.text == "struct" || t.text == "{" || t.text == "}" {
+                        return false;
+                    }
+                    saw_ident = true;
+                }
+                CstChild::Node(_) => return false,
+                CstChild::Trivia(_) => {}
+            }
+        }
+        false
+    }
+
+    fn format_struct_field(&mut self, node: &CstNode) {
+        let mut wrote_name = false;
+        for child in &node.children {
+            match child {
+                CstChild::Token(t) => {
+                    if t.text == ":" {
+                        self.write(": ");
+                    } else if !wrote_name {
+                        self.write(&t.text);
+                        wrote_name = true;
+                    } else {
+                        // Unexpected extra token in field; emit defensively.
+                        self.write_token(&t.text);
+                    }
+                }
+                CstChild::Node(n) => {
                     self.format_type_expr(n);
                 }
                 CstChild::Trivia(_) => {}
@@ -1988,6 +2105,52 @@ mod tests {
         let result = format(input, &config).unwrap();
 
         assert!(result.contains("  name = 'test'"));
+    }
+
+    #[test]
+    fn test_format_struct_type_canonical_spacing() {
+        let input = "attributes {\n  config: struct{a:int,b:string} = { a = 1, b = 'x' }\n}\n";
+        let result = format(input, &FormatConfig::default()).unwrap();
+        assert!(
+            result.contains("struct { a: int, b: string }"),
+            "expected canonical struct spacing, got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_format_struct_type_empty() {
+        let input = "attributes {\n  x: struct{} = {}\n}\n";
+        let result = format(input, &FormatConfig::default()).unwrap();
+        assert!(
+            result.contains("struct {}"),
+            "expected `struct {{}}`, got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_format_struct_type_nested_in_list_and_map() {
+        let input =
+            "attributes {\n  xs: list(struct{a:int}) = []\n  m: map(struct{b:string}) = {}\n}\n";
+        let result = format(input, &FormatConfig::default()).unwrap();
+        assert!(
+            result.contains("list(struct { a: int })"),
+            "expected list(struct {{ a: int }}), got:\n{result}"
+        );
+        assert!(
+            result.contains("map(struct { b: string })"),
+            "expected map(struct {{ b: string }}), got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_format_struct_type_field_is_itself_struct() {
+        let input =
+            "attributes {\n  outer: struct{inner:struct{x:int}} = { inner = { x = 1 } }\n}\n";
+        let result = format(input, &FormatConfig::default()).unwrap();
+        assert!(
+            result.contains("struct { inner: struct { x: int } }"),
+            "expected nested struct spacing, got:\n{result}"
+        );
     }
 
     #[test]

@@ -552,11 +552,9 @@ mod tests {
 
     #[test]
     fn resolve_reads_struct_typed_export_from_multi_file_directory() {
-        // Mirrors the real infra/aws/management/organizations/ shape:
-        // main.crn declares the let bindings, exports.crn annotates their
-        // public shape with `struct { ... }`, and a sibling backend.crn is
-        // parsed at the same time. The resolver must see the struct type
-        // on the export.
+        // Multi-file upstream: `exports.crn` carries the struct-typed export
+        // while a sibling `backend.crn` is parsed in the same directory.
+        // The resolver must surface the struct annotation on the export.
         use crate::parser::TypeExpr;
 
         let tmp = tempfile::tempdir().unwrap();
