@@ -125,25 +125,12 @@ fn find_for_iterable_binding_column(
     Some((start_col, end_col))
 }
 
-/// Binding names declared anywhere in the merged parse — the same set
-/// `carina_core::parser::check_deferred_for_iterables` uses to decide whether
-/// a for-iterable's root is in scope.
+/// Binding names declared anywhere in the merged parse. Delegates to
+/// [`carina_core::parser::collect_known_bindings_merged`] so LSP
+/// diagnostics stay consistent with the CLI's post-merge checks
+/// (`check_deferred_for_iterables`, `check_undefined_references`).
 fn collect_known_bindings(merged: &ParsedFile) -> HashSet<&str> {
-    let mut known: HashSet<&str> = HashSet::new();
-    known.extend(merged.resources.iter().filter_map(|r| r.binding.as_deref()));
-    known.extend(merged.arguments.iter().map(|a| a.name.as_str()));
-    known.extend(
-        merged
-            .module_calls
-            .iter()
-            .filter_map(|c| c.binding_name.as_deref()),
-    );
-    known.extend(merged.upstream_states.iter().map(|u| u.binding.as_str()));
-    known.extend(merged.imports.iter().map(|i| i.alias.as_str()));
-    known.extend(merged.user_functions.keys().map(String::as_str));
-    known.extend(merged.variables.keys().map(String::as_str));
-    known.extend(merged.structural_bindings.iter().map(String::as_str));
-    known
+    carina_core::parser::collect_known_bindings_merged(merged)
 }
 
 /// Whether `deferred` was parsed from the editor's current document.

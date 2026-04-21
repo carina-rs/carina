@@ -20,12 +20,14 @@ pub struct LoadedConfig {
     /// so this preserves the original references for accurate unused binding analysis.
     pub unresolved_parsed: ParsedFile,
     pub backend_file: Option<PathBuf>,
-    /// Deferred for-iterables whose binding didn't resolve against the
-    /// directory-wide merge. Empty when every iterable is in scope. The
-    /// caller is responsible for surfacing these — the loader does not
-    /// short-circuit on them so that later validators can also run and
-    /// their findings can be reported alongside.
-    pub iterable_binding_errors: Vec<parser::ParseError>,
+    /// Identifier-scope errors surfaced by the post-merge passes:
+    /// `check_undefined_references` (ResourceRef roots in resources /
+    /// attribute / module / export values) and
+    /// `check_deferred_for_iterables` (for-expression iterables). Empty
+    /// when every reference resolves against the directory-wide binding
+    /// set. The loader does not short-circuit on these so that later
+    /// validators can also run in a single pass.
+    pub identifier_scope_errors: Vec<parser::ParseError>,
 }
 
 /// Load configuration from a directory containing .crn files
@@ -163,17 +165,18 @@ pub fn load_configuration_with_config(
             return Err(e.to_string());
         }
 
-        // Deferred for-iterable binding errors are accumulated rather than
-        // short-circuited so `carina validate` can keep going and report
-        // every static error in one pass (#2102). The caller reads
-        // `iterable_binding_errors` and merges them with its own findings.
-        let iterable_binding_errors = parser::check_deferred_for_iterables(&merged);
+        // Identifier-scope checks are accumulated rather than short-
+        // circuited so `carina validate` can keep going and report every
+        // static error in one pass (#2102, #2126). The caller reads
+        // `identifier_scope_errors` and merges them with its own findings.
+        let mut identifier_scope_errors = parser::check_undefined_references(&merged);
+        identifier_scope_errors.extend(parser::check_deferred_for_iterables(&merged));
 
         Ok(LoadedConfig {
             parsed: merged,
             unresolved_parsed: unresolved_merged,
             backend_file,
-            iterable_binding_errors,
+            identifier_scope_errors,
         })
     } else {
         Err(format!("Path not found: {}", path.display()))
@@ -928,7 +931,7 @@ awscc.ec2.security_group {
         }
 
         // `load_configuration_with_config` surfaces the error via
-        // `LoadedConfig::iterable_binding_errors` rather than short-
+        // `LoadedConfig::identifier_scope_errors` rather than short-
         // circuiting, so the CLI caller can collect it together with
         // findings from later validators in a single pass (#2102).
         let dir2 = create_temp_dir("undefined_for_iterable_cli");
@@ -943,19 +946,51 @@ awscc.ec2.security_group {
         )
         .unwrap();
         let loaded = load_configuration_with_config(&dir2, &ProviderContext::default())
-            .expect("load_configuration should not short-circuit on iterable binding errors");
+            .expect("load_configuration should not short-circuit on identifier-scope errors");
         cleanup(&dir2);
         assert_eq!(
-            loaded.iterable_binding_errors.len(),
+            loaded.identifier_scope_errors.len(),
             1,
-            "expected one iterable binding error, got {:?}",
-            loaded.iterable_binding_errors,
+            "expected one identifier-scope error, got {:?}",
+            loaded.identifier_scope_errors,
         );
-        match &loaded.iterable_binding_errors[0] {
+        match &loaded.identifier_scope_errors[0] {
             parser::ParseError::UndefinedIdentifier { name, .. } => {
                 assert_eq!(name, "does_not_exist");
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    // Acceptance for #2126. Per-file parse must not reject a ResourceRef
+    // whose root is declared in a sibling `.crn`. The check has to live on
+    // the merged `ParsedFile`, same place `check_deferred_for_iterables`
+    // already lives.
+    #[test]
+    fn parse_directory_accepts_cross_file_resource_ref() {
+        let dir = create_temp_dir("cross_file_resource_ref");
+        fs::write(
+            dir.join("main.crn"),
+            r#"let attach = aws.organizations.attach {
+    target_id = caller.account_id
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("backend.crn"),
+            r#"let caller = read aws.sts.caller_identity {}
+"#,
+        )
+        .unwrap();
+
+        let loaded = load_configuration_with_config(&dir, &ProviderContext::default())
+            .expect("directory with cross-file ResourceRef must load without error");
+        cleanup(&dir);
+        assert!(
+            loaded.identifier_scope_errors.is_empty(),
+            "no identifier-scope errors expected, got: {:?}",
+            loaded.identifier_scope_errors,
+        );
     }
 }

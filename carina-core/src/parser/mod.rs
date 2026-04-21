@@ -1092,16 +1092,12 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
         &mut export_params,
     );
 
-    // Third pass: every remaining ResourceRef must point at a declared binding.
-    // Anything else is a typo or a stale reference to something the user removed.
-    let known_bindings = collect_known_bindings(&ctx);
-    check_undefined_bindings(
-        &known_bindings,
-        &resources,
-        &attribute_params,
-        &module_calls,
-        &export_params,
-    )?;
+    // "Is every ResourceRef root declared somewhere?" is a semantic
+    // question the per-file parse cannot answer: the referent may live
+    // in a sibling `.crn`. The check runs post-merge via
+    // `check_undefined_references(&ParsedFile)` — wired into
+    // `load_configuration_with_config` alongside
+    // `check_deferred_for_iterables`. See #2126.
 
     let string_literal_paths = ctx.string_literal_paths.borrow().clone();
     Ok(ParsedFile {
@@ -4613,79 +4609,6 @@ fn unescape_single_quoted(s: &str) -> String {
     result
 }
 
-/// Collect every identifier that is a valid binding source in the fully parsed
-/// context. Anything not in this set that appears as the root of a dotted
-/// reference is a typo / missing binding.
-fn collect_known_bindings<'ctx>(
-    ctx: &'ctx ParseContext<'_>,
-) -> std::collections::HashSet<&'ctx str> {
-    let mut set: std::collections::HashSet<&'ctx str> = std::collections::HashSet::new();
-    set.extend(ctx.resource_bindings.keys().map(String::as_str));
-    set.extend(ctx.upstream_states.keys().map(String::as_str));
-    set.extend(ctx.imported_modules.keys().map(String::as_str));
-    set.extend(ctx.user_functions.keys().map(String::as_str));
-    set.extend(ctx.structural_bindings.iter().map(String::as_str));
-    set.extend(ctx.variables.keys().map(String::as_str));
-    set
-}
-
-/// Reject references whose root identifier is not declared anywhere in scope.
-///
-/// Note: deferred for-expression iterables are not checked here. They may name
-/// bindings declared in sibling files (e.g. an `upstream_state` in `backend.crn`
-/// iterated from `main.crn`) that only become visible after directory-wide
-/// merging. That check runs in `check_deferred_for_iterables` instead.
-fn check_undefined_bindings(
-    known: &std::collections::HashSet<&str>,
-    resources: &[Resource],
-    attribute_params: &[AttributeParameter],
-    module_calls: &[ModuleCall],
-    export_params: &[ExportParameter],
-) -> Result<(), ParseError> {
-    for resource in resources {
-        for expr in resource.attributes.values() {
-            check_undefined_in_value(known, &expr.0)?;
-        }
-    }
-    for attr in attribute_params {
-        if let Some(value) = &attr.value {
-            check_undefined_in_value(known, value)?;
-        }
-    }
-    for call in module_calls {
-        for v in call.arguments.values() {
-            check_undefined_in_value(known, v)?;
-        }
-    }
-    for export in export_params {
-        if let Some(value) = &export.value {
-            check_undefined_in_value(known, value)?;
-        }
-    }
-    Ok(())
-}
-
-fn check_undefined_in_value(
-    known: &std::collections::HashSet<&str>,
-    value: &Value,
-) -> Result<(), ParseError> {
-    let mut undefined: Option<String> = None;
-    value.visit_refs(&mut |path| {
-        if undefined.is_some() {
-            return;
-        }
-        let root = path.binding();
-        let root_ident = root.split(['[', ']']).next().unwrap_or(root);
-        if !known.contains(root_ident) {
-            undefined = Some(root_ident.to_string());
-        }
-    });
-    if let Some(name) = undefined {
-        return Err(undefined_identifier_error(known, name, 0));
-    }
-    Ok(())
-}
-
 /// Build an `UndefinedIdentifier` error enriched with the best
 /// did-you-mean suggestion and the sorted in-scope binding list.
 fn undefined_identifier_error(
@@ -4905,12 +4828,16 @@ pub fn resolve_resource_refs_with_config(
     Ok(())
 }
 
-/// Verify that every deferred for-expression iterable names a declared binding.
+/// Every binding name declared in the merged `ParsedFile`: resources,
+/// arguments, module calls, upstream states, imports, user functions,
+/// variables, and for/if structural bindings.
 ///
-/// This must run on a fully merged `ParsedFile` (directory-wide), not on a
-/// single-file parse — iterables commonly reference `upstream_state` or `let`
-/// bindings declared in sibling files that only become visible after merging.
-pub(crate) fn check_deferred_for_iterables(parsed: &ParsedFile) -> Vec<ParseError> {
+/// This is the canonical answer to "is this identifier in scope?" for
+/// directory-wide checks. The same set feeds
+/// [`check_deferred_for_iterables`] and [`check_undefined_references`],
+/// and the LSP borrows it (via `carina_lsp::diagnostics::checks`) to
+/// keep diagnostic suggestions consistent with the CLI.
+pub fn collect_known_bindings_merged(parsed: &ParsedFile) -> std::collections::HashSet<&str> {
     let mut known: std::collections::HashSet<&str> = std::collections::HashSet::new();
     known.extend(parsed.resources.iter().filter_map(|r| r.binding.as_deref())); // allow: direct — parser-internal, pre-expansion
     known.extend(parsed.arguments.iter().map(|a| a.name.as_str()));
@@ -4925,13 +4852,72 @@ pub(crate) fn check_deferred_for_iterables(parsed: &ParsedFile) -> Vec<ParseErro
     known.extend(parsed.user_functions.keys().map(String::as_str));
     known.extend(parsed.variables.keys().map(String::as_str));
     known.extend(parsed.structural_bindings.iter().map(String::as_str));
+    known
+}
 
+/// Verify that every deferred for-expression iterable names a declared binding.
+///
+/// This must run on a fully merged `ParsedFile` (directory-wide), not on a
+/// single-file parse — iterables commonly reference `upstream_state` or `let`
+/// bindings declared in sibling files that only become visible after merging.
+pub(crate) fn check_deferred_for_iterables(parsed: &ParsedFile) -> Vec<ParseError> {
+    let known = collect_known_bindings_merged(parsed);
     parsed
         .deferred_for_expressions
         .iter()
         .filter(|d| !known.contains(d.iterable_binding.as_str()))
         .map(|d| undefined_identifier_error(&known, d.iterable_binding.clone(), d.line))
         .collect()
+}
+
+/// Verify that every ResourceRef in the merged file names a declared binding.
+///
+/// Walks resources, attribute parameters, module calls, and export
+/// parameters; emits `UndefinedIdentifier` for each ResourceRef whose
+/// root is not in [`collect_known_bindings_merged`]. Runs post-merge
+/// — per-file parse cannot answer the question because the referent
+/// may live in a sibling `.crn`.
+pub fn check_undefined_references(parsed: &ParsedFile) -> Vec<ParseError> {
+    let known = collect_known_bindings_merged(parsed);
+    let mut errors = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let mut check = |value: &Value| {
+        value.visit_refs(&mut |path| {
+            let root = path.binding();
+            let root_ident = root.split(['[', ']']).next().unwrap_or(root);
+            if !known.contains(root_ident) && seen.insert(root_ident.to_string()) {
+                errors.push(undefined_identifier_error(
+                    &known,
+                    root_ident.to_string(),
+                    0,
+                ));
+            }
+        });
+    };
+
+    for resource in &parsed.resources {
+        for expr in resource.attributes.values() {
+            check(&expr.0);
+        }
+    }
+    for attr in &parsed.attribute_params {
+        if let Some(value) = &attr.value {
+            check(value);
+        }
+    }
+    for call in &parsed.module_calls {
+        for v in call.arguments.values() {
+            check(v);
+        }
+    }
+    for export in &parsed.export_params {
+        if let Some(value) = &export.value {
+            check(value);
+        }
+    }
+
+    errors
 }
 
 fn resolve_value_with_config(
