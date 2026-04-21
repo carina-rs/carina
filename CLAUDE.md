@@ -233,6 +233,41 @@ merged uniformly — no file name (including `main.crn`) is privileged.
 - CLI: `load_module()` / `ModuleResolver::load_module` require a directory path.
 - LSP: Module loading in `diagnostics/checks.rs` handles directory modules for proper validation.
 
+### Directory-scoped, never single-file
+
+**Carina configurations are directory units.** Every feature that reads DSL
+source — completion, diagnostics, validation, formatting, hover, code lens,
+etc. — must consider sibling `.crn` files in the same directory as
+first-class input, not as an afterthought. A `let` binding in `main.crn`
+must be visible from `exports.crn`; a `provider` block in `providers.crn`
+must apply to `main.crn`. Anything that looks at only one file is a bug.
+
+When implementing or modifying such a feature:
+
+1. **Acceptance test must use multiple files.** A unit test built from a
+   single string is not sufficient evidence. Write a `tempfile::tempdir()`
+   fixture that mirrors the real `infra/aws/management/<dir>/` shape —
+   typically `main.crn` + `exports.crn` + `providers.crn` + `backend.crn` —
+   and assert behavior under that shape. The bare-string variant is fine
+   *in addition to* the directory variant, never *instead of* it.
+2. **Real-infra smoke test.** Where feasible, run the built binary
+   (`carina fmt`, `carina validate`, etc.) against `carina-rs/infra/`
+   directly before declaring the issue done. The acceptance condition
+   in the original issue almost always names a real path; respect it.
+3. **API signal.** Helpers that take a single `&str` of source text
+   (`extract_resource_bindings`, `extract_let_bindings`, similar
+   text-scan utilities) silently invite single-file thinking. When you
+   see one in the call path, the question to ask is "does this caller
+   need the sibling files too?" — most of the time the answer is yes.
+
+Past breakage from violating this rule: PR #2120 (closed #2043 too
+early) shipped `exports` value-position completion that scanned only
+the current buffer; the real `exports.crn` references bindings in
+`main.crn`, so users got zero LSP candidates. PR #2121 fixed it by
+threading `base_path` into the same handler. Same class of mistake
+recurred from PR #2118 (closed #2117 prematurely) where the formatter
+fix passed unit tests but never ran against the real infra fixture.
+
 ## Git Workflow
 
 ### Worktree-Based Development

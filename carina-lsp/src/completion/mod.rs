@@ -91,7 +91,7 @@ impl CompletionProvider {
             CompletionContext::AfterEqualsInExports {
                 type_expr_text,
                 in_nested,
-            } => self.exports_value_completions(&type_expr_text, in_nested, &text),
+            } => self.exports_value_completions(&type_expr_text, in_nested, &text, base_path),
             CompletionContext::InsideStructBlock {
                 resource_type,
                 attr_path,
