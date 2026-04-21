@@ -2439,3 +2439,169 @@ exports {
         labels
     );
 }
+
+/// Sibling-file case for Custom-type resource-ref completion inside a
+/// resource block value. When the user types
+/// `account_id = ▉` in `other.crn` and `registry_prod` is declared in
+/// `main.crn`, the completion list must include
+/// `registry_prod.account_id`.
+#[test]
+fn custom_type_value_ref_includes_sibling_file_bindings() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use std::collections::HashMap;
+    fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
+        Ok(())
+    }
+    let account_id = AttributeType::Custom {
+        semantic_name: Some("AwsAccountId".to_string()),
+        base: Box::new(AttributeType::String),
+        pattern: None,
+        length: None,
+        validate: validate_noop,
+        namespace: None,
+        to_dsl: None,
+    };
+    let account_schema = ResourceSchema::new("awscc.organizations.account")
+        .attribute(AttributeSchema::new("account_id", account_id.clone()));
+    let consumer_schema = ResourceSchema::new("awscc.organizations.policy_target_attachment")
+        .attribute(AttributeSchema::new("target_id", account_id));
+    let mut schemas = HashMap::new();
+    schemas.insert("awscc.organizations.account".to_string(), account_schema);
+    schemas.insert(
+        "awscc.organizations.policy_target_attachment".to_string(),
+        consumer_schema,
+    );
+    let provider =
+        CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    std::fs::write(
+        base.join("main.crn"),
+        "let registry_prod = awscc.organizations.account {\n  name = 'prod'\n}\n",
+    )
+    .unwrap();
+    let other_src = "\
+let attach = awscc.organizations.policy_target_attachment {
+  target_id =
+}
+";
+    std::fs::write(base.join("other.crn"), other_src).unwrap();
+
+    let doc = create_document(other_src);
+    // Cursor at end of `  target_id = `
+    let position = Position {
+        line: 1,
+        character: "  target_id = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, Some(base));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"registry_prod.account_id"),
+        "cross-file Custom-type ref must be offered. Got: {:?}",
+        labels
+    );
+}
+
+/// Sibling-file case for `arguments` parameter completion. Module shapes
+/// that declare `arguments { ... }` in a dedicated `arguments.crn` must
+/// still surface those parameters when the user is editing `main.crn`.
+#[test]
+fn argument_parameters_include_sibling_file_args() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use std::collections::HashMap;
+    let schema = ResourceSchema::new("awscc.s3.bucket")
+        .attribute(AttributeSchema::new("name", AttributeType::String));
+    let mut schemas = HashMap::new();
+    schemas.insert("awscc.s3.bucket".to_string(), schema);
+    let provider =
+        CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    std::fs::write(
+        base.join("arguments.crn"),
+        "arguments {\n  stage_name: string\n}\n",
+    )
+    .unwrap();
+    let main_src = "\
+let b = awscc.s3.bucket {
+  name =
+}
+";
+    std::fs::write(base.join("main.crn"), main_src).unwrap();
+
+    let doc = create_document(main_src);
+    let position = Position {
+        line: 1,
+        character: "  name = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, Some(base));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"stage_name"),
+        "cross-file arguments parameter must be offered. Got: {:?}",
+        labels
+    );
+}
+
+/// Sibling-file case for `binding.` dot-completion. Typing
+/// `account_id = registry_prod.` in `other.crn` must list
+/// `registry_prod`'s attributes even when the binding is declared in
+/// `main.crn`.
+#[test]
+fn binding_dot_completion_resolves_sibling_file_binding() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use std::collections::HashMap;
+    fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
+        Ok(())
+    }
+    let account_id = AttributeType::Custom {
+        semantic_name: Some("AwsAccountId".to_string()),
+        base: Box::new(AttributeType::String),
+        pattern: None,
+        length: None,
+        validate: validate_noop,
+        namespace: None,
+        to_dsl: None,
+    };
+    let account_schema = ResourceSchema::new("awscc.organizations.account")
+        .attribute(AttributeSchema::new("account_id", account_id.clone()));
+    let consumer_schema = ResourceSchema::new("awscc.organizations.policy_target_attachment")
+        .attribute(AttributeSchema::new("target_id", account_id));
+    let mut schemas = HashMap::new();
+    schemas.insert("awscc.organizations.account".to_string(), account_schema);
+    schemas.insert(
+        "awscc.organizations.policy_target_attachment".to_string(),
+        consumer_schema,
+    );
+    let provider =
+        CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    std::fs::write(
+        base.join("main.crn"),
+        "let registry_prod = awscc.organizations.account {\n  name = 'prod'\n}\n",
+    )
+    .unwrap();
+    let other_src = "\
+let attach = awscc.organizations.policy_target_attachment {
+  target_id = registry_prod.
+}
+";
+    std::fs::write(base.join("other.crn"), other_src).unwrap();
+
+    let doc = create_document(other_src);
+    let position = Position {
+        line: 1,
+        character: "  target_id = registry_prod.".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, Some(base));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"registry_prod.account_id"),
+        "dot-completion must resolve cross-file binding. Got: {:?}",
+        labels
+    );
+}
