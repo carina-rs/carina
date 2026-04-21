@@ -19,7 +19,7 @@ operating_region {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let unknown = diagnostics
         .iter()
@@ -45,7 +45,7 @@ outer {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let unknown = diagnostics
         .iter()
@@ -70,7 +70,7 @@ outer {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let mismatch = diagnostics
         .iter()
@@ -97,7 +97,7 @@ outer {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     // Filter to only struct-related diagnostics (ignore unknown attribute warnings from test schema)
     let struct_diags: Vec<_> = diagnostics
@@ -126,7 +126,7 @@ instance_tenancy = awscc.ec2.vpc.InstanceTenancy.invalid_value
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let enum_diag = diagnostics
         .iter()
@@ -152,7 +152,7 @@ instance_tenancy = awscc.ec2.vpc.InstanceTenancy.default
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let enum_diag = diagnostics
         .iter()
@@ -184,7 +184,7 @@ security_group_ingress {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let enum_diag = diagnostics
         .iter()
@@ -215,7 +215,7 @@ security_group_ingress {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let enum_diag = diagnostics
         .iter()
@@ -247,7 +247,7 @@ security_group_ingress {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let port_diag = diagnostics
         .iter()
@@ -289,7 +289,7 @@ protocols = ["tcp", "invalid_protocol"]
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let item_diag = diagnostics
         .iter()
@@ -322,7 +322,7 @@ operating_regions = [{
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let mixed_error = diagnostics.iter().find(|d| {
         d.message.contains("operating_region")
@@ -370,7 +370,7 @@ mode = "invalid_mode"
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let type_error = diagnostics
         .iter()
@@ -416,7 +416,7 @@ mode = "active"
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let type_error = diagnostics
         .iter()
@@ -462,7 +462,7 @@ mode = 42
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let type_error = diagnostics
         .iter()
@@ -487,7 +487,7 @@ attributes {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let undefined_diag = diagnostics
         .iter()
@@ -516,7 +516,7 @@ attributes {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let undefined_diag = diagnostics
         .iter()
@@ -541,7 +541,7 @@ attributes {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let type_diag = diagnostics
         .iter()
@@ -573,7 +573,7 @@ attributes {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let type_diag = diagnostics
         .iter()
@@ -601,7 +601,7 @@ config = {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let unknown = diagnostics
         .iter()
@@ -652,7 +652,7 @@ attributes {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let type_diag = diagnostics
         .iter()
@@ -684,7 +684,7 @@ cidr_block = "10.0.1.0/24"
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let undefined_diag = diagnostics
         .iter()
@@ -716,7 +716,7 @@ cidr_block = "10.0.1.0/24"
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let undefined_diag = diagnostics
         .iter()
@@ -745,7 +745,7 @@ awscc.ec2.vpc {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let provider_diag = diagnostics.iter().find(|d| {
         d.message
@@ -773,7 +773,7 @@ awscc.ec2.vpc {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let provider_diag = diagnostics.iter().find(|d| {
         d.message
@@ -799,7 +799,7 @@ awscc.ec2.vpc {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
     let func_diag = diagnostics
         .iter()
         .find(|d| d.message.contains("Unknown function 'not_a_function'"));
@@ -826,7 +826,7 @@ awscc.ec2.vpc {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
     let func_diag = diagnostics
         .iter()
         .find(|d| d.message.contains("Unknown function"));
@@ -860,7 +860,7 @@ awscc.ec2.route {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let typo_diag = diagnostics.iter().find(|d| {
         d.message
@@ -891,7 +891,7 @@ awscc.ec2.vpc_gateway_attachment {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let ref_diag = diagnostics
         .iter()
@@ -915,7 +915,7 @@ let name = join("-", parts)
 "#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let pipe_diag = diagnostics
         .iter()
@@ -1060,7 +1060,7 @@ let name = parts |> join("-")
 "#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let pipe_diag = diagnostics
         .iter()
@@ -1085,7 +1085,7 @@ attributes {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let type_diag = diagnostics
         .iter()
@@ -1110,7 +1110,7 @@ attributes {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let type_diag = diagnostics
         .iter()
@@ -1135,7 +1135,7 @@ attributes {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let type_diag = diagnostics
         .iter()
@@ -1160,7 +1160,7 @@ attributes {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let type_diag = diagnostics
         .iter()
@@ -1244,7 +1244,7 @@ test.target {
 union_attr = src.my_id
 }"#,
     );
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
     let union_mismatch = diagnostics
         .iter()
         .find(|d| d.message.contains("Type mismatch") && d.message.contains("MyId"));
@@ -1264,7 +1264,7 @@ test.target {
 enum_attr = src.my_id
 }"#,
     );
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
     let enum_mismatch = diagnostics
         .iter()
         .find(|d| d.message.contains("Type mismatch") && d.message.contains("MyId"));
@@ -1284,7 +1284,7 @@ test.target {
 custom_attr = src.my_id
 }"#,
     );
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
     let custom_mismatch = diagnostics
         .iter()
         .find(|d| d.message.contains("Type mismatch") && d.message.contains("custom_attr"));
@@ -1304,7 +1304,7 @@ test.target {
 union_attr = src.name
 }"#,
     );
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
     let string_mismatch = diagnostics
         .iter()
         .find(|d| d.message.contains("Type mismatch") && d.message.contains("union_attr"));
@@ -1328,7 +1328,7 @@ attributes {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let type_diag = diagnostics
         .iter()
@@ -1373,7 +1373,7 @@ fn resource_validation_failed_with_attribute_points_to_attribute_line() {
         "mock.test.resource {\n  name = 'test'\n  tags = {\n    key = 'Project'\n    value = 'carina'\n  }\n}",
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
     let tags_diag = diagnostics
         .iter()
         .find(|d| d.message.contains("tags key/value error"));
@@ -1408,7 +1408,7 @@ fn warning_when_provider_loaded_but_schema_missing() {
 "#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let unknown_type = diagnostics
         .iter()
@@ -1447,7 +1447,7 @@ fn error_when_provider_not_loaded_at_all() {
 "#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let not_downloaded = diagnostics.iter().find(|d| {
         d.message.contains("Provider 'awscc' is not downloaded")
@@ -1490,7 +1490,7 @@ fn no_undefined_resource_for_namespaced_enum_value() {
 "#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let undefined = diagnostics
         .iter()
@@ -1522,7 +1522,7 @@ fn no_undefined_resource_for_declared_but_uninstalled_provider() {
 "#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let undefined = diagnostics
         .iter()
@@ -1548,7 +1548,7 @@ fn undefined_resource_still_fires_when_identifier_is_not_a_declared_provider() {
 "#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let undefined = diagnostics
         .iter()
@@ -1615,7 +1615,7 @@ fn map_key_validation_warns_on_invalid_key() {
 }
 "#,
     );
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
     let has_key_error = diagnostics
         .iter()
         .any(|d| d.message.contains("Map key") || d.message.contains("unknown_op"));
@@ -1688,7 +1688,7 @@ awscc.sso.assignment {
 target_id = caller.account_id
 }"#,
     );
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
     let type_mismatch = diagnostics
         .iter()
         .find(|d| d.message.contains("Type mismatch"));
@@ -1741,7 +1741,7 @@ fn exports_cross_file_ref_no_false_positive() {
 }"#,
     );
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     let false_positive = diagnostics
         .iter()
@@ -1765,18 +1765,8 @@ fn exports_type_warning_survives_formatter_round_trip() {
     let formatted = format(original, &FormatConfig::default()).unwrap();
 
     let engine = test_engine();
-    let before = engine.analyze(
-        &create_document(original),
-        None,
-        &HashMap::new(),
-        &HashSet::new(),
-    );
-    let after = engine.analyze(
-        &create_document(&formatted),
-        None,
-        &HashMap::new(),
-        &HashSet::new(),
-    );
+    let before = engine.analyze(&create_document(original), None);
+    let after = engine.analyze(&create_document(&formatted), None);
 
     let before_warning = before
         .iter()
@@ -1820,18 +1810,8 @@ exports {
 }"#;
     let formatted = format(original, &FormatConfig::default()).unwrap();
 
-    let before = engine.analyze(
-        &create_document(original),
-        None,
-        &HashMap::new(),
-        &HashSet::new(),
-    );
-    let after = engine.analyze(
-        &create_document(&formatted),
-        None,
-        &HashMap::new(),
-        &HashSet::new(),
-    );
+    let before = engine.analyze(&create_document(original), None);
+    let after = engine.analyze(&create_document(&formatted), None);
 
     let before_warning = before
         .iter()
@@ -1895,7 +1875,7 @@ exports {
         text: formatted.clone(),
     });
 
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
     let warning = diagnostics
         .iter()
         .find(|d| d.message.contains("export 'values': type mismatch"))
@@ -1927,7 +1907,7 @@ fn exports_type_warning_after_format_with_cross_file_ref() {
   accounts: list(bool) = [registry_prod.account_id, registry_dev.account_id]
 }"#,
     );
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
 
     // "registry_prod.account_id" is a cross-file ref (dot-notation string).
     // It should NOT produce a false positive (12-digit check etc.).
@@ -1958,7 +1938,7 @@ fn exports_type_warning_for_literal_mismatch() {
   flag: bool = 'hello'
 }"#,
     );
-    let diagnostics = engine.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, None);
     eprintln!(
         "literal mismatch diagnostics: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
@@ -1978,7 +1958,7 @@ fn exports_type_warning_multiline_vs_oneline() {
     let engine = test_engine();
     // Multi-line (before format)
     let doc_multi = create_document("exports {\n  flag: bool = 'hello'\n}");
-    let diag_multi = engine.analyze(&doc_multi, None, &HashMap::new(), &HashSet::new());
+    let diag_multi = engine.analyze(&doc_multi, None);
     eprintln!(
         "multi-line: {:?}",
         diag_multi.iter().map(|d| &d.message).collect::<Vec<_>>()
@@ -1987,7 +1967,7 @@ fn exports_type_warning_multiline_vs_oneline() {
     // After user types but before format - with wrong type and literal
     let doc_literal =
         create_document("exports {\n  accounts: list(bool) = ['literal1', 'literal2']\n}");
-    let diag_literal = engine.analyze(&doc_literal, None, &HashMap::new(), &HashSet::new());
+    let diag_literal = engine.analyze(&doc_literal, None);
     eprintln!(
         "literal list(bool): {:?}",
         diag_literal.iter().map(|d| &d.message).collect::<Vec<_>>()
@@ -2007,26 +1987,18 @@ fn exports_map_type_warning_for_cross_file_ref() {
         .collect();
     let engine = custom_engine(schemas);
 
-    let doc = create_document(
-        r#"exports {
-  accounts: map(bool) = {
-    prod = registry_prod.account_id
-    dev  = registry_dev.account_id
-  }
-}"#,
-    );
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("downstream");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(
+        base.join("main.crn"),
+        "let registry_prod = awscc.organizations.account { name = 'prod' }\nlet registry_dev = awscc.organizations.account { name = 'dev' }\n",
+    )
+    .unwrap();
+    let exports = "exports {\n  accounts: map(bool) = {\n    prod = registry_prod.account_id\n    dev  = registry_dev.account_id\n  }\n}";
+    std::fs::write(base.join("exports.crn"), exports).unwrap();
 
-    let mut sibling_bindings = HashMap::new();
-    sibling_bindings.insert(
-        "registry_prod".to_string(),
-        "awscc.organizations.account".to_string(),
-    );
-    sibling_bindings.insert(
-        "registry_dev".to_string(),
-        "awscc.organizations.account".to_string(),
-    );
-
-    let diagnostics = engine.analyze(&doc, None, &sibling_bindings, &HashSet::new());
+    let diagnostics = analyze_with_buffer(&engine, &base, "exports.crn", exports);
 
     let type_warning = diagnostics
         .iter()
@@ -2045,28 +2017,18 @@ fn no_undefined_resource_for_sibling_binding_in_exports() {
         vec!["awscc".to_string()],
         Arc::new(vec![]),
     );
-    let doc = create_document(
-        r#"exports {
-  accounts: map(aws_account_id) = {
-    prod = registry_prod.account_id
-    dev = registry_dev.account_id
-  }
-}
-"#,
-    );
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("downstream");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(
+        base.join("main.crn"),
+        "let registry_prod = awscc.organizations.account { name = 'prod' }\nlet registry_dev = awscc.organizations.account { name = 'dev' }\n",
+    )
+    .unwrap();
+    let exports = "exports {\n  accounts: map(aws_account_id) = {\n    prod = registry_prod.account_id\n    dev = registry_dev.account_id\n  }\n}\n";
+    std::fs::write(base.join("exports.crn"), exports).unwrap();
 
-    // registry_prod and registry_dev are defined in sibling files
-    let mut sibling_bindings = HashMap::new();
-    sibling_bindings.insert(
-        "registry_prod".to_string(),
-        "awscc.organizations.account".to_string(),
-    );
-    sibling_bindings.insert(
-        "registry_dev".to_string(),
-        "awscc.organizations.account".to_string(),
-    );
-
-    let diagnostics = engine.analyze(&doc, None, &sibling_bindings, &HashSet::new());
+    let diagnostics = analyze_with_buffer(&engine, &base, "exports.crn", exports);
 
     let undefined = diagnostics
         .iter()
@@ -2091,7 +2053,7 @@ fn upstream_state_missing_source_directory_is_flagged() {
 "#,
     );
 
-    let diagnostics = engine.analyze(&doc, Some(&base), &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, Some(&base));
 
     let diag = diagnostics
         .iter()
@@ -2134,7 +2096,7 @@ let orgs = upstream_state {
 "#,
     );
 
-    let diagnostics = engine.analyze(&doc, Some(&base), &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, Some(&base));
 
     let diag = diagnostics
         .iter()
@@ -2166,7 +2128,7 @@ fn upstream_state_existing_source_directory_is_ok() {
 "#,
     );
 
-    let diagnostics = engine.analyze(&doc, Some(&base), &HashMap::new(), &HashSet::new());
+    let diagnostics = engine.analyze(&doc, Some(&base));
 
     let diag = diagnostics
         .iter()
@@ -2205,13 +2167,7 @@ fn analyze_with_buffer(
     buffer: &str,
 ) -> Vec<tower_lsp::lsp_types::Diagnostic> {
     let doc = create_document(buffer);
-    engine.analyze_with_filename(
-        &doc,
-        Some(filename),
-        Some(base),
-        &HashMap::new(),
-        &HashSet::new(),
-    )
+    engine.analyze_with_filename(&doc, Some(filename), Some(base))
 }
 
 #[test]
@@ -2694,7 +2650,7 @@ for _, id in orgs.xs {
 }
 "#;
     let doc = create_document(source);
-    let diagnostics = provider.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = provider.analyze(&doc, None);
     // Match "Unused" (LSP check_unused_bindings) and "unused" (parser warnings)
     // case-insensitively so the assertion fires whichever path flags `vpc`.
     assert!(
@@ -2717,7 +2673,7 @@ for _, id in orgs.xs {
 }
 "#;
     let doc = create_document(source);
-    let diagnostics = provider.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = provider.analyze(&doc, None);
     assert!(
         diagnostics.iter().any(|d| d.message.contains("aaaa")),
         "expected enum-mismatch diagnostic inside for body, got: {:?}",
@@ -2755,7 +2711,7 @@ for _, id in orgs.xs {
 }
 "#;
     let doc = create_document(source);
-    let diagnostics = provider.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = provider.analyze(&doc, None);
     let bad = diagnostics
         .iter()
         .find(|d| d.message.contains("aaaa"))
@@ -2785,7 +2741,7 @@ fn lsp_enum_diagnostic_includes_attribute_name() {
 }
 "#,
     );
-    let diagnostics = provider.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = provider.analyze(&doc, None);
     let bad = diagnostics
         .iter()
         .find(|d| d.message.contains("aaaa"))
@@ -2815,7 +2771,7 @@ fn lsp_quoted_literal_on_namespaced_enum_says_got_a_string_literal() {
 }
 "#,
     );
-    let diagnostics = provider.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = provider.analyze(&doc, None);
     let bad = diagnostics
         .iter()
         .find(|d| d.message.contains("got a string literal"))
@@ -2853,7 +2809,7 @@ fn lsp_bare_invalid_on_namespaced_enum_keeps_invalid_variant_wording() {
 }
 "#,
     );
-    let diagnostics = provider.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = provider.analyze(&doc, None);
     let diag = diagnostics
         .iter()
         .find(|d| d.message.contains("aaa"))
@@ -2882,7 +2838,7 @@ fn lsp_quoted_literal_on_namespaced_custom_says_got_a_string_literal() {
 }
 "#,
     );
-    let diagnostics = provider.analyze(&doc, None, &HashMap::new(), &HashSet::new());
+    let diagnostics = provider.analyze(&doc, None);
     let bad = diagnostics
         .iter()
         .find(|d| d.message.contains("got a string literal"))
@@ -3000,6 +2956,125 @@ fn undefined_binding_in_current_file_still_flagged() {
             .any(|d| d.message.contains("Undefined resource")
                 || d.message.contains("Undefined identifier")),
         "typo against a truly undeclared root must still be flagged. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+// #2134: a resource `let` binding used only from a sibling `.crn`
+// inside a list literal must not be flagged as unused. The old
+// `scan_sibling_context::referenced` text scan only matched lines
+// with `=` where the RHS *starts with* `binding_name.`; a reference
+// nested inside `[ binding.field, ... ]` or `func(binding.field)`
+// misses that heuristic.
+#[test]
+fn binding_referenced_only_from_sibling_list_literal_is_not_unused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("downstream");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(
+        base.join("main.crn"),
+        "let admin_group = awscc.identitystore.group {\n  display_name = 'admins'\n  identity_store_id = 'd-xxx'\n}\n",
+    )
+    .unwrap();
+    // The sibling references `admin_group` inside a list literal —
+    // the text scan's "starts with `admin_group.`" heuristic misses it.
+    std::fs::write(
+        base.join("policy.crn"),
+        "awscc.iam.policy {\n  name = 'admins-policy'\n  principals = [admin_group.group_id]\n}\n",
+    )
+    .unwrap();
+
+    let engine = test_engine();
+    let main_src = std::fs::read_to_string(base.join("main.crn")).unwrap();
+    let diagnostics = analyze_with_buffer(&engine, &base, "main.crn", &main_src);
+
+    let unused: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.message.contains("Unused let binding") && d.message.contains("admin_group"))
+        .collect();
+    assert!(
+        unused.is_empty(),
+        "binding referenced from sibling list literal must not be flagged unused. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+// Unused-binding detection still fires when no sibling references
+// the binding at all.
+#[test]
+fn unreferenced_binding_is_still_flagged_unused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("downstream");
+    std::fs::create_dir_all(&base).unwrap();
+    let main =
+        "let orphan = awscc.ec2.vpc {\n  name = 'stranded'\n  cidr_block = '10.0.0.0/16'\n}\n";
+    std::fs::write(base.join("main.crn"), main).unwrap();
+    std::fs::write(
+        base.join("other.crn"),
+        "awscc.s3.bucket {\n  name = 'unrelated'\n}\n",
+    )
+    .unwrap();
+
+    let engine = test_engine();
+    let diagnostics = analyze_with_buffer(&engine, &base, "main.crn", main);
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("Unused let binding") && d.message.contains("orphan")),
+        "truly unused binding must still fire. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+// #2134: `exports { key: T = sibling_binding.attr }` where
+// `sibling_binding` is declared in a sibling `.crn` as
+// `upstream_state`, `import`, or a resource must get a correct type
+// mismatch diagnostic (not silently accepted, not falsely flagged).
+// The old `scan_sibling_context` only returned a `HashMap<binding,
+// resource_type>` for bindings declared as `let x = provider.service.type {`.
+// For the `let x = <upstream_state|import>{}` shapes the map was
+// empty, so the type check short-circuited via the "can't resolve"
+// fall-through.
+//
+// This test isn't asserting a new diagnostic — it asserts no
+// regression: the existing "type mismatch" path still works when the
+// sibling binding is a real resource declared in a sibling file.
+#[test]
+fn exports_type_check_resolves_resource_binding_from_sibling_file() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use std::collections::HashMap as StdHashMap;
+
+    // Schema: registry_prod.account_id is String.
+    let schema = ResourceSchema::new("awscc.organizations.account")
+        .attribute(AttributeSchema::new("account_id", AttributeType::String));
+    let schemas: StdHashMap<String, ResourceSchema> = vec![(schema.resource_type.clone(), schema)]
+        .into_iter()
+        .collect();
+    let engine = custom_engine(schemas);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("downstream");
+    std::fs::create_dir_all(&base).unwrap();
+    // Resource binding lives in main.crn.
+    std::fs::write(
+        base.join("main.crn"),
+        "let registry_prod = awscc.organizations.account {\n  name = 'prod'\n}\n",
+    )
+    .unwrap();
+    // exports.crn references it. `map(bool)` is incompatible with
+    // String, so we expect a type-mismatch warning — which is what
+    // proves the sibling-binding resolution actually happened.
+    let exports =
+        "exports {\n  accounts: map(bool) = {\n    prod = registry_prod.account_id\n  }\n}\n";
+    std::fs::write(base.join("exports.crn"), exports).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "exports.crn", exports);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| { d.message.contains("type mismatch") || d.message.contains("expected") }),
+        "type-mismatch warning should fire for map(bool) vs String. Got: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
