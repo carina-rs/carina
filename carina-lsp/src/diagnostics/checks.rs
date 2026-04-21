@@ -731,22 +731,23 @@ impl DiagnosticEngine {
         None
     }
 
-    /// Check for unused `let` bindings and emit warnings.
-    pub(super) fn check_unused_bindings(
+    /// Format a stream of unused-binding names into LSP diagnostics.
+    /// The caller decides which bindings count as unused (derived from
+    /// `carina_core::validation::check_unused_bindings` on the merged
+    /// parse) and which to anchor the warning on — this helper only
+    /// handles the final position lookup and diagnostic construction.
+    pub(super) fn unused_binding_diagnostics<I>(
         &self,
         doc: &Document,
-        parsed: &ParsedFile,
-    ) -> Vec<Diagnostic> {
-        let unused_bindings = carina_core::validation::check_unused_bindings(parsed);
-        if unused_bindings.is_empty() {
-            return Vec::new();
-        }
-
+        unused_bindings: I,
+    ) -> Vec<Diagnostic>
+    where
+        I: IntoIterator<Item = String>,
+    {
         let text = doc.text();
         let mut diagnostics = Vec::new();
-
-        for binding_name in &unused_bindings {
-            if let Some((line, col)) = self.find_let_binding_position(&text, binding_name) {
+        for binding_name in unused_bindings {
+            if let Some((line, col)) = self.find_let_binding_position(&text, &binding_name) {
                 diagnostics.push(carina_diagnostic(
                     line,
                     col,
@@ -759,7 +760,6 @@ impl DiagnosticEngine {
                 ));
             }
         }
-
         diagnostics
     }
 

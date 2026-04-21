@@ -264,75 +264,6 @@ impl Backend {
         self.workspace_root.get().and_then(|opt| opt.as_ref())
     }
 
-    /// Scan sibling `.crn` files in the same directory for `let` bindings
-    /// and references to the current file's bindings.
-    ///
-    /// ## Scope
-    ///
-    /// Intentionally **one directory level only** (the parent directory of
-    /// the file being edited). Carina is directory-scoped — each directory
-    /// is its own parse unit. Files in nested subdirectories are separate
-    /// modules or upstream projects with their own binding scopes, so they
-    /// must not leak bindings into this cross-file reference check.
-    /// Dedicated diagnostics
-    /// ([`crate::diagnostics::checks::DiagnosticEngine::check_upstream_state_field_references`])
-    /// handle references that do cross a directory boundary (upstream
-    /// state exports, module call arguments) via
-    /// `parse_directory_with_overrides`.
-    ///
-    /// ## Returns
-    /// - `bindings`: binding_name → resource_type for `let` bindings in the
-    ///   current file's sibling `.crn`s.
-    /// - `referenced`: binding names from the current file that appear to be
-    ///   referenced by those siblings.
-    fn scan_sibling_context(
-        dir: &Path,
-        current_uri: &Url,
-        current_bindings: &std::collections::HashSet<String>,
-    ) -> (HashMap<String, String>, std::collections::HashSet<String>) {
-        let mut bindings = HashMap::new();
-        let mut referenced = std::collections::HashSet::new();
-        let current_path = current_uri.to_file_path().ok();
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => return (bindings, referenced),
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "crn")
-                && current_path.as_ref() != Some(&path)
-                && let Ok(content) = std::fs::read_to_string(&path)
-            {
-                for line in content.lines() {
-                    let trimmed = line.trim();
-                    if let Some((binding, after_eq)) = crate::let_parse::parse_let_header(line) {
-                        // Strip "read " prefix if present
-                        let type_part = after_eq.strip_prefix("read ").unwrap_or(after_eq);
-                        // Extract "provider.service.type" before "{"
-                        if let Some(brace) = type_part.find('{') {
-                            let resource_type = type_part[..brace].trim();
-                            if resource_type.contains('.') {
-                                bindings.insert(binding.to_string(), resource_type.to_string());
-                            }
-                        }
-                    }
-
-                    // Check if this line references any binding from the current file
-                    // Look for "binding_name." patterns after "="
-                    if let Some(eq_pos) = trimmed.find('=') {
-                        let after_eq = trimmed[eq_pos + 1..].trim();
-                        for name in current_bindings.iter() {
-                            if after_eq.starts_with(&format!("{}.", name)) {
-                                referenced.insert(name.clone());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        (bindings, referenced)
-    }
-
     async fn update_diagnostics(&self, uri: Url) {
         publish_diagnostics_for(&self.client, &self.documents, &self.providers, uri).await;
     }
@@ -656,22 +587,6 @@ async fn publish_diagnostics_for(
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()));
 
-    let current_bindings: std::collections::HashSet<String> = {
-        let text = doc.text();
-        let mut bindings = std::collections::HashSet::new();
-        for line in text.lines() {
-            if let Some((name, _)) = crate::let_parse::parse_let_header(line) {
-                bindings.insert(name.to_string());
-            }
-        }
-        bindings
-    };
-
-    let (sibling_bindings, sibling_referenced) = base_path
-        .as_ref()
-        .map(|dir| Backend::scan_sibling_context(dir, &uri, &current_bindings))
-        .unwrap_or_default();
-
     let current_file_name: Option<String> = uri
         .to_file_path()
         .ok()
@@ -686,8 +601,6 @@ async fn publish_diagnostics_for(
         &doc,
         current_file_name.as_deref(),
         base_path.as_deref(),
-        &sibling_bindings,
-        &sibling_referenced,
     );
     drop(guard);
 

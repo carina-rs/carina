@@ -554,6 +554,15 @@ pub fn check_unused_bindings(parsed: &ParsedFile) -> Vec<String> {
     // Collect all referenced binding names. Walk both top-level resources
     // and for-body template resources so bindings referenced only inside a
     // `for` loop are counted as used.
+    //
+    // `collect_dot_notation_refs` also runs on resource attributes: when
+    // a resource in file A references `binding.attr` where `binding` is
+    // declared in sibling file B, per-file parse stores it as
+    // `Value::String("binding.attr")`. `resolve_resource_refs_with_config`
+    // lifts those to `ResourceRef` only when the value sits at the top
+    // level of an attribute; inside a list / map / interpolation the
+    // string form survives, so a reference nested in
+    // `principals = [binding.attr]` would otherwise be missed.
     let mut referenced: HashSet<String> = HashSet::new();
     for (_ctx, resource) in parsed.iter_all_resources() {
         for (attr_name, value) in &resource.attributes {
@@ -561,11 +570,13 @@ pub fn check_unused_bindings(parsed: &ParsedFile) -> Vec<String> {
                 continue;
             }
             collect_resource_refs(value, &mut referenced);
+            collect_dot_notation_refs(value, &mut referenced);
         }
     }
     for call in &parsed.module_calls {
         for value in call.arguments.values() {
             collect_resource_refs(value, &mut referenced);
+            collect_dot_notation_refs(value, &mut referenced);
         }
     }
     for attr_param in &parsed.attribute_params {

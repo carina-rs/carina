@@ -103,14 +103,8 @@ impl DiagnosticEngine {
         self
     }
 
-    pub fn analyze(
-        &self,
-        doc: &Document,
-        base_path: Option<&Path>,
-        sibling_bindings: &HashMap<String, String>,
-        sibling_referenced: &HashSet<String>,
-    ) -> Vec<Diagnostic> {
-        self.analyze_with_filename(doc, None, base_path, sibling_bindings, sibling_referenced)
+    pub fn analyze(&self, doc: &Document, base_path: Option<&Path>) -> Vec<Diagnostic> {
+        self.analyze_with_filename(doc, None, base_path)
     }
 
     /// Like [`analyze`] but lets the caller pass the current document's file
@@ -122,8 +116,6 @@ impl DiagnosticEngine {
         doc: &Document,
         current_file_name: Option<&str>,
         base_path: Option<&Path>,
-        sibling_bindings: &HashMap<String, String>,
-        sibling_referenced: &HashSet<String>,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
         let text = doc.text();
@@ -133,38 +125,35 @@ impl DiagnosticEngine {
             diagnostics.push(parse_error_to_diagnostic(error));
         }
 
-        // Checks that need cross-file context share one directory-scoped parse
-        // (buffer substituted for its on-disk copy). All must run even when
-        // the current document fails to parse on its own — a `for` or `let`
-        // commonly references a binding declared in a sibling file.
-        //
-        // The merged parse is also the authoritative source of "what
-        // bindings are in scope?" for the text-scan undefined-reference
-        // check below. Falling back to the current file's bindings +
-        // `sibling_bindings` (populated by a hand-rolled text scan in
-        // `Backend::scan_sibling_context`) used to miss `upstream_state`,
-        // `import`, and module-call bindings, producing false positives
-        // like "Undefined resource: 'orgs'" when `orgs` was declared in
-        // `backend.crn` (#2131 / #2132).
+        // Build the directory-scoped merged parse once up-front — it is
+        // the authoritative source of truth for every check that needs
+        // cross-file context: undefined-identifier (#2132), upstream-
+        // state field references, for-iterable bindings, unused-let
+        // filtering, and exports type validation (#2134). The buffer is
+        // substituted for its on-disk copy so diagnostics update on
+        // keystrokes.
+        let merged =
+            base_path.and_then(|base| self.parse_merged_with_buffer(doc, current_file_name, base));
+
+        if let (Some(base), Some(merged)) = (base_path, merged.as_ref()) {
+            diagnostics.extend(self.check_upstream_state_field_references(doc, merged, base));
+            diagnostics.extend(self.check_for_iterable_bindings(doc, merged, current_file_name));
+        }
+
+        // `known_bindings` for the text-scan undefined-reference check.
+        // When no merged parse is available (no base_path, or directory
+        // parse fails) the fallback is the current buffer's `let` headers
+        // only — cross-file bindings become undetectable and we'd rather
+        // miss typos than manufacture false positives against
+        // `upstream_state` / `import` bindings the old text scan used to
+        // mishandle (#2131 / #2132).
         let declared_providers = self.extract_declared_provider_names(&text);
-        let known_bindings: HashSet<String> = if let Some(base) = base_path
-            && let Some(merged) = self.parse_merged_with_buffer(doc, current_file_name, base)
-        {
-            diagnostics.extend(self.check_upstream_state_field_references(doc, &merged, base));
-            diagnostics.extend(self.check_for_iterable_bindings(doc, &merged, current_file_name));
-            carina_core::parser::collect_known_bindings_merged(&merged)
+        let known_bindings: HashSet<String> = match merged.as_ref() {
+            Some(merged) => carina_core::parser::collect_known_bindings_merged(merged)
                 .into_iter()
                 .map(String::from)
-                .collect()
-        } else {
-            // No base_path or merge failed — fall back to the current
-            // file plus any bindings the caller pre-scanned.
-            let mut bindings =
-                self.extract_resource_bindings(crate::completion::DslSource::BufferOnly(&text));
-            for name in sibling_bindings.keys() {
-                bindings.insert(name.clone());
-            }
-            bindings
+                .collect(),
+            None => self.extract_resource_bindings(crate::completion::DslSource::BufferOnly(&text)),
         };
         diagnostics.extend(self.check_undefined_references(
             &text,
@@ -695,16 +684,38 @@ impl DiagnosticEngine {
             // Check attributes blocks
             diagnostics.extend(self.check_attributes_blocks(doc, parsed));
 
-            // Check exports blocks
-            diagnostics.extend(self.check_exports_blocks(doc, parsed, None, sibling_bindings));
+            // Exports type check. When a merged parse is available the
+            // sibling-binding → resource-type map is built from it so
+            // `upstream_state` / `import` / module-call bindings are
+            // visible (#2134); otherwise fall back to an empty map and
+            // rely on the local-to-file checks that `check_exports_blocks`
+            // performs (e.g. type annotation sanity, literal-value shape).
+            let sibling_bindings = merged
+                .as_ref()
+                .map(exports_sibling_bindings_from)
+                .unwrap_or_default();
+            diagnostics.extend(self.check_exports_blocks(doc, parsed, None, &sibling_bindings));
 
-            // Check for unused let bindings (exclude bindings referenced by sibling files)
-            let unused_diags = self.check_unused_bindings(doc, parsed);
-            diagnostics.extend(unused_diags.into_iter().filter(|d| {
-                !sibling_referenced
-                    .iter()
-                    .any(|name| d.message.contains(&format!("'{}'", name)))
-            }));
+            // Unused `let` detection. When a merged parse is available,
+            // run the core check against it (so references from sibling
+            // files count as usage) and filter the result to bindings
+            // declared in the current file — the LSP warning surface is
+            // per-document. Without a merged parse there are no sibling
+            // references to consider, so run the per-file check.
+            let unused_binding_names: Vec<String> = match merged.as_ref() {
+                Some(merged) => {
+                    let current_file_bindings: HashSet<String> = parsed
+                        .iter_all_resources()
+                        .filter_map(|(_, r)| r.binding.clone())
+                        .collect();
+                    carina_core::validation::check_unused_bindings(merged)
+                        .into_iter()
+                        .filter(|b| current_file_bindings.contains(b))
+                        .collect()
+                }
+                None => carina_core::validation::check_unused_bindings(parsed),
+            };
+            diagnostics.extend(self.unused_binding_diagnostics(doc, unused_binding_names));
 
             // Surface unused-for-binding warnings (recorded in parsed.warnings by
             // the parser) as LSP diagnostics. Other ParseWarnings (e.g. the
@@ -1032,6 +1043,26 @@ fn check_resource_ref_type_mismatch(
             ref_attr
         ))
     }
+}
+
+/// Build the binding-name → resource-type map that
+/// [`check_exports_blocks`] uses to type-check cross-file references.
+/// Replaces the hand-rolled `Backend::scan_sibling_context` output —
+/// merged parse sees every resource in the directory, including those
+/// declared in sibling files (#2134).
+fn exports_sibling_bindings_from(merged: &ParsedFile) -> HashMap<String, String> {
+    merged
+        .resources
+        .iter()
+        .filter_map(|r| {
+            r.binding.as_ref().map(|b| {
+                (
+                    b.clone(),
+                    format!("{}.{}", r.id.provider, r.id.resource_type),
+                )
+            })
+        })
+        .collect()
 }
 
 fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
