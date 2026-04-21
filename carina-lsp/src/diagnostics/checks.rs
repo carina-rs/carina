@@ -796,9 +796,15 @@ impl DiagnosticEngine {
         None
     }
 
-    /// Extract resource binding names from text (variables defined with `let binding_name = aws...` or `let binding_name = read aws...`)
-    pub(super) fn extract_resource_bindings(&self, text: &str) -> HashSet<String> {
+    /// Extract resource binding names from `src` (variables defined with
+    /// `let binding_name = aws...` or `let binding_name = read aws...`).
+    /// See [`DslSource`] for the explicit buffer-vs-directory choice.
+    pub(super) fn extract_resource_bindings(
+        &self,
+        src: crate::completion::DslSource<'_>,
+    ) -> HashSet<String> {
         let mut bindings = HashSet::new();
+        let text = src.merged_text();
         for line in text.lines() {
             if let Some((name, _)) = crate::let_parse::parse_let_header(line) {
                 bindings.insert(name.to_string());
