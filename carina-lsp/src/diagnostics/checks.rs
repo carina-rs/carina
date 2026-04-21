@@ -127,8 +127,8 @@ fn find_for_iterable_binding_column(
 
 /// Binding names declared anywhere in the merged parse. Delegates to
 /// [`carina_core::parser::collect_known_bindings_merged`] so LSP
-/// diagnostics stay consistent with the CLI's post-merge checks
-/// (`check_deferred_for_iterables`, `check_undefined_references`).
+/// diagnostics stay consistent with the CLI's
+/// [`carina_core::parser::check_identifier_scope`] pass.
 fn collect_known_bindings(merged: &ParsedFile) -> HashSet<&str> {
     carina_core::parser::collect_known_bindings_merged(merged)
 }
@@ -481,11 +481,11 @@ impl DiagnosticEngine {
         let known = collect_known_bindings(merged);
         let text = doc.text();
         let mut diagnostics = Vec::new();
-        // Iterating the deferred list directly (rather than the error list
-        // from `check_deferred_for_iterables`) keeps a 1:1 mapping between
-        // deferred expressions and diagnostics; two sibling files with
-        // `for _ in <same>.attr` on the same line would otherwise collide on
-        // the error's `(name, line)` key.
+        // Iterating the deferred list directly (rather than the subset of
+        // errors `check_identifier_scope` produces for iterables) keeps a
+        // 1:1 mapping between deferred expressions and diagnostics; two
+        // sibling files with `for _ in <same>.attr` on the same line
+        // would otherwise collide on the error's `(name, line)` key.
         for deferred in &merged.deferred_for_expressions {
             if !deferred_in_current_file(deferred, current_file_name) {
                 continue;

@@ -1095,9 +1095,8 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
     // "Is every ResourceRef root declared somewhere?" is a semantic
     // question the per-file parse cannot answer: the referent may live
     // in a sibling `.crn`. The check runs post-merge via
-    // `check_undefined_references(&ParsedFile)` — wired into
-    // `load_configuration_with_config` alongside
-    // `check_deferred_for_iterables`. See #2126.
+    // `check_identifier_scope(&ParsedFile)` — wired into
+    // `load_configuration_with_config`. See #2126 / #2138.
 
     let string_literal_paths = ctx.string_literal_paths.borrow().clone();
     Ok(ParsedFile {
@@ -2141,11 +2140,11 @@ fn parse_for_expr(
             // `iterable is string "org"` is misleading: the user wrote an
             // identifier, not a literal, and the likely fault is a typo for
             // a known binding. Record them as deferred for-expressions so
-            // `check_deferred_for_iterables` (which runs on the merged
+            // `check_identifier_scope` (which runs on the merged
             // directory-wide ParsedFile, so cross-file upstream_state /
             // module bindings are visible) can emit a proper
             // UndefinedIdentifier with the did-you-mean machinery from
-            // #2038 / #2100. See #2101.
+            // #2038 / #2100. See #2101 / #2138.
             if let Value::String(s) = &iterable
                 && is_bare_identifier(s)
             {
@@ -4833,8 +4832,7 @@ pub fn resolve_resource_refs_with_config(
 /// variables, and for/if structural bindings.
 ///
 /// This is the canonical answer to "is this identifier in scope?" for
-/// directory-wide checks. The same set feeds
-/// [`check_deferred_for_iterables`] and [`check_undefined_references`],
+/// directory-wide checks. The same set feeds [`check_identifier_scope`]
 /// and the LSP borrows it (via `carina_lsp::diagnostics::checks`) to
 /// keep diagnostic suggestions consistent with the CLI.
 pub fn collect_known_bindings_merged(parsed: &ParsedFile) -> std::collections::HashSet<&str> {
@@ -4855,31 +4853,38 @@ pub fn collect_known_bindings_merged(parsed: &ParsedFile) -> std::collections::H
     known
 }
 
-/// Verify that every deferred for-expression iterable names a declared binding.
+/// Directory-wide identifier-scope validation for a merged [`ParsedFile`].
 ///
-/// This must run on a fully merged `ParsedFile` (directory-wide), not on a
-/// single-file parse — iterables commonly reference `upstream_state` or `let`
-/// bindings declared in sibling files that only become visible after merging.
-pub(crate) fn check_deferred_for_iterables(parsed: &ParsedFile) -> Vec<ParseError> {
-    let known = collect_known_bindings_merged(parsed);
-    parsed
-        .deferred_for_expressions
-        .iter()
-        .filter(|d| !known.contains(d.iterable_binding.as_str()))
-        .map(|d| undefined_identifier_error(&known, d.iterable_binding.clone(), d.line))
-        .collect()
-}
-
-/// Verify that every ResourceRef in the merged file names a declared binding.
+/// Emits one flat list of `UndefinedIdentifier` errors covering:
 ///
-/// Walks resources, attribute parameters, module calls, and export
-/// parameters; emits `UndefinedIdentifier` for each ResourceRef whose
-/// root is not in [`collect_known_bindings_merged`]. Runs post-merge
-/// — per-file parse cannot answer the question because the referent
-/// may live in a sibling `.crn`.
-pub fn check_undefined_references(parsed: &ParsedFile) -> Vec<ParseError> {
+/// - Every `ResourceRef` whose root binding is not in scope (roots in
+///   resource attributes, attribute-parameter values, module-call
+///   arguments, and export-parameter values).
+/// - Every deferred for-expression iterable whose root is not in scope.
+///
+/// Errors are returned in a deterministic order: ResourceRef findings
+/// first (in resource / attribute / module / export order), then
+/// deferred-iterable findings. The caller (CLI `load_configuration_with_config`,
+/// LSP analysis pipeline) just inspects the returned `Vec` — both
+/// checks share the same `collect_known_bindings_merged` pass, so there
+/// is no performance reason to split them at the callsite.
+///
+/// **This is the canonical entry point for "is this identifier in
+/// scope?" checks.** Follow the #2104 rule: any new semantic check in
+/// that family gets added *here*, not as a new sibling function.
+pub fn check_identifier_scope(parsed: &ParsedFile) -> Vec<ParseError> {
     let known = collect_known_bindings_merged(parsed);
     let mut errors = Vec::new();
+    accumulate_undefined_reference_errors(parsed, &known, &mut errors);
+    accumulate_deferred_iterable_errors(parsed, &known, &mut errors);
+    errors
+}
+
+fn accumulate_undefined_reference_errors(
+    parsed: &ParsedFile,
+    known: &std::collections::HashSet<&str>,
+    errors: &mut Vec<ParseError>,
+) {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     let mut check = |value: &Value| {
@@ -4887,11 +4892,7 @@ pub fn check_undefined_references(parsed: &ParsedFile) -> Vec<ParseError> {
             let root = path.binding();
             let root_ident = root.split(['[', ']']).next().unwrap_or(root);
             if !known.contains(root_ident) && seen.insert(root_ident.to_string()) {
-                errors.push(undefined_identifier_error(
-                    &known,
-                    root_ident.to_string(),
-                    0,
-                ));
+                errors.push(undefined_identifier_error(known, root_ident.to_string(), 0));
             }
         });
     };
@@ -4916,8 +4917,22 @@ pub fn check_undefined_references(parsed: &ParsedFile) -> Vec<ParseError> {
             check(value);
         }
     }
+}
 
-    errors
+fn accumulate_deferred_iterable_errors(
+    parsed: &ParsedFile,
+    known: &std::collections::HashSet<&str>,
+    errors: &mut Vec<ParseError>,
+) {
+    for d in &parsed.deferred_for_expressions {
+        if !known.contains(d.iterable_binding.as_str()) {
+            errors.push(undefined_identifier_error(
+                known,
+                d.iterable_binding.clone(),
+                d.line,
+            ));
+        }
+    }
 }
 
 fn resolve_value_with_config(
@@ -11303,13 +11318,13 @@ awscc.ec2.vpc {
                 }
             }
         "#;
-        // Iterable-binding validation runs in `check_deferred_for_iterables`
+        // Iterable-binding validation runs in `check_identifier_scope`
         // on the merged directory-level `ParsedFile`, so that cross-file
         // `upstream_state` bindings in sibling files aren't rejected during
         // per-file parsing.
         let parsed = parse(input, &ProviderContext::default())
             .expect("single-file parse must not reject cross-file iterables");
-        let errs = check_deferred_for_iterables(&parsed);
+        let errs = check_identifier_scope(&parsed);
         assert_eq!(errs.len(), 1, "expected one error, got {errs:?}");
         match &errs[0] {
             ParseError::UndefinedIdentifier { name, .. } => {
@@ -11334,7 +11349,7 @@ awscc.ec2.vpc {
         "#;
         let parsed = parse(input, &ProviderContext::default())
             .expect("single-file parse must not reject cross-file iterables");
-        let errs = check_deferred_for_iterables(&parsed);
+        let errs = check_identifier_scope(&parsed);
         assert_eq!(errs.len(), 1, "expected one error, got {errs:?}");
         let msg = errs[0].to_string();
         assert!(
@@ -11363,7 +11378,7 @@ awscc.ec2.vpc {
         "#;
         let parsed = parse(input, &ProviderContext::default())
             .expect("single-file parse must not reject cross-file iterables");
-        let errs = check_deferred_for_iterables(&parsed);
+        let errs = check_identifier_scope(&parsed);
         assert_eq!(errs.len(), 1, "expected one error, got {errs:?}");
         let msg = errs[0].to_string();
         assert!(
@@ -11389,7 +11404,7 @@ awscc.ec2.vpc {
         // a string and leaving the user with no did-you-mean.
         //
         // The fix records these as `DeferredForExpression` so
-        // `check_deferred_for_iterables` validates them against the merged
+        // `check_identifier_scope` validates them against the merged
         // directory-wide binding set (mirrors the dotted-form path). That
         // gives us cross-file visibility for the did-you-mean candidates.
         let input = r#"
@@ -11402,7 +11417,7 @@ awscc.ec2.vpc {
         "#;
         let parsed = parse(input, &ProviderContext::default())
             .expect("single-file parse must not reject bare-iterable identifiers; the cross-file check runs later");
-        let errs = check_deferred_for_iterables(&parsed);
+        let errs = check_identifier_scope(&parsed);
         assert_eq!(errs.len(), 1, "expected one error, got {errs:?}");
         let err = &errs[0];
         let msg = err.to_string();
