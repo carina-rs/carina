@@ -88,6 +88,10 @@ impl CompletionProvider {
                 position,
                 base_path,
             ),
+            CompletionContext::AfterEqualsInExports {
+                type_expr_text,
+                in_nested,
+            } => self.exports_value_completions(&type_expr_text, in_nested, &text),
             CompletionContext::InsideStructBlock {
                 resource_type,
                 attr_path,
@@ -175,6 +179,12 @@ impl CompletionProvider {
         let mut in_args_or_attrs_block = false;
         let mut in_exports_block = false;
         let mut in_upstream_state_block = false;
+        // Type annotation of the most recent `<name>: <type> = ...` entry
+        // inside an `exports { ... }` block. Recorded at brace_depth 1 and
+        // consulted when the cursor lands inside that entry's value
+        // position (depth 1 for top-level, depth 2+ for nested map/list).
+        // Cleared when the entry closes or a new one starts.
+        let mut exports_entry_type: Option<String> = None;
         // Track nested block names at each depth level (index 0 = depth 1, etc.)
         let mut nested_block_names: Vec<String> = Vec::new();
         // Depth-of-for-bodies currently open. A `for ... { <body> }` stacks a
@@ -273,6 +283,18 @@ impl CompletionProvider {
                 }
             }
 
+            // Inside an `exports` block, capture the type annotation of
+            // the current entry: `<name>: <type> = ...`. Recorded at
+            // depth 1 (the exports block body itself). Used by value-
+            // position completion to filter candidates by the declared
+            // type.
+            if in_exports_block
+                && brace_depth == 1
+                && let Some(ty) = extract_exports_entry_type(trimmed)
+            {
+                exports_entry_type = Some(ty);
+            }
+
             // Track for-body opens so the opening `{` increments both
             // brace_depth and for_body_depth. The matching `}` drops
             // for_body_depth alongside brace_depth.
@@ -298,7 +320,12 @@ impl CompletionProvider {
                         in_args_or_attrs_block = false;
                         in_exports_block = false;
                         in_upstream_state_block = false;
+                        exports_entry_type = None;
                         nested_block_names.clear();
+                    } else if brace_depth == 1 && in_exports_block {
+                        // Closing a nested `{ ... }` inside an exports
+                        // map/list value — the next entry starts fresh.
+                        exports_entry_type = None;
                     } else if brace_depth == for_body_depth {
                         // Closed the resource/module block that was inside the
                         // current for body — forget its type so the next
@@ -390,14 +417,24 @@ impl CompletionProvider {
             let after_eq = prefix.split('=').next_back().unwrap_or("").trim();
             // Don't show completions if user is typing a string literal (except just starting)
             if !after_eq.starts_with('"') || after_eq == "\"" {
-                // Exports-block values are type-annotated (e.g.
-                // `accounts: map(aws_account_id) = ...`); until the
-                // completion engine can read that annotation and filter
-                // by it, returning nothing beats the old behavior of
-                // dumping every built-in function and region into the
-                // popup (#1993). Matches the "prefer empty to generic"
-                // stance established by #1974.
+                // Inside an `exports` block, filter value-position
+                // candidates by the entry's declared type. If the
+                // annotation can't be resolved the original empty
+                // fallback from #1993 still applies — it is preferable
+                // to silence than to dump every built-in.
                 if in_exports_block {
+                    if let Some(entry_type) = exports_entry_type.as_deref() {
+                        // `brace_depth == 1` means the value sits
+                        // directly after `= ` at the top of the exports
+                        // entry; `>= 2` means it's inside the entry's
+                        // `{ ... }` map or list body, so the relevant
+                        // type is unwrapped by one level.
+                        let in_nested = brace_depth >= 2;
+                        return CompletionContext::AfterEqualsInExports {
+                            type_expr_text: entry_type.to_string(),
+                            in_nested,
+                        };
+                    }
                     return CompletionContext::None;
                 }
                 // Extract attribute name from current line
@@ -642,6 +679,16 @@ enum CompletionContext {
         attr_name: String,
         current_binding: Option<String>,
     },
+    /// Cursor is at a value position inside an `exports { ... }` block
+    /// for an entry that carries a type annotation. `type_expr_text` is
+    /// the raw annotation text (`string`, `map(aws_account_id)`, etc.);
+    /// `in_nested` is true when the cursor is inside that entry's
+    /// `{ ... }` map or list body, meaning the effective type is the
+    /// annotation unwrapped by one level.
+    AfterEqualsInExports {
+        type_expr_text: String,
+        in_nested: bool,
+    },
     InsideStructBlock {
         resource_type: String,
         attr_path: Vec<String>,
@@ -676,6 +723,21 @@ enum CompletionContext {
 
 /// Detect a `let <binding> = upstream_state {` opening line, where `<binding>`
 /// is a bare identifier. Used to enter the upstream_state block context.
+/// Extract the type annotation from a line that opens an `exports`
+/// entry, e.g. `accounts: map(aws_account_id) = { ...` returns
+/// `Some("map(aws_account_id)")`. Returns `None` when the line doesn't
+/// match the `<name>: <type> =` shape — either because there's no
+/// colon, no equals, or the type portion is empty.
+fn extract_exports_entry_type(line: &str) -> Option<String> {
+    let (before_eq, _) = line.split_once('=')?;
+    let (_name, after_colon) = before_eq.split_once(':')?;
+    let type_text = after_colon.trim();
+    if type_text.is_empty() {
+        return None;
+    }
+    Some(type_text.to_string())
+}
+
 fn is_let_upstream_state_line(trimmed: &str) -> bool {
     let Some((_, rhs)) = crate::let_parse::parse_let_header(trimmed) else {
         return false;
