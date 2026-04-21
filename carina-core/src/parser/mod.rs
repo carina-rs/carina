@@ -399,7 +399,7 @@ pub struct ModuleCall {
 }
 
 /// Provider configuration
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProviderConfig {
     pub name: String,
     pub attributes: HashMap<String, Value>,

@@ -629,24 +629,60 @@ async fn load_schemas_impl(
     let dir_providers = workspace::discover_providers_by_dir(&workspace_root);
     let import_map = workspace::discover_import_map(&workspace_root);
 
+    // Drain the current states up-front so matching per-dir entries can
+    // be reused without re-running the factory builder. Anything left in
+    // `old_states` at the end is dropped (e.g. a directory whose
+    // provider block was deleted in this save). Reusing factories is the
+    // fix for the RSS-grows-per-save pathology in #2136: every `.crn`
+    // save fires this code, but the only work that must actually happen
+    // is re-parsing when the provider configuration changed.
+    let (mut old_states, old_import_map) = {
+        let mut guard = providers.write().await;
+        (
+            std::mem::take(&mut guard.by_dir),
+            std::mem::take(&mut guard.import_map),
+        )
+    };
+
     if dir_providers.is_empty() {
+        let dropped_any = !old_states.is_empty();
         let mut states = ProviderStates::new();
-        states.import_map = import_map;
+        states.import_map = import_map.clone();
         *providers.write().await = states;
-        let uris: Vec<Url> = documents.iter().map(|r| r.key().clone()).collect();
-        for uri in uris {
-            publish_diagnostics_for(client, documents, providers, uri).await;
+        if dropped_any || old_import_map != import_map {
+            let uris: Vec<Url> = documents.iter().map(|r| r.key().clone()).collect();
+            for uri in uris {
+                publish_diagnostics_for(client, documents, providers, uri).await;
+            }
         }
         return;
     }
 
     let mut states = ProviderStates::new();
     let mut total_schemas = 0;
+    // Track whether any dir was freshly rebuilt (or whether the set of
+    // known dirs changed). When every dir was reused and the import map
+    // hasn't changed either, the whole load is a no-op and we can skip
+    // the per-document diagnostic re-publish — that is the hot path for
+    // the `.crn`-save → save-save-save loop in #2136.
+    let mut any_work = false;
 
     for (dir, configs) in &dir_providers {
         let dir_configs: Vec<(PathBuf, carina_core::parser::ProviderConfig)> =
             configs.iter().map(|c| (dir.clone(), c.clone())).collect();
 
+        // Reuse the existing state when its cached configs are still the
+        // current truth. Skips the WASM parse and all downstream schema /
+        // completion / diagnostic scaffolding.
+        if let Some(existing) = old_states.remove(dir)
+            && configs_match(&existing.configs, &dir_configs)
+        {
+            total_schemas += existing.schema_count();
+            states.by_dir.insert(dir.clone(), existing);
+            continue;
+        }
+
+        any_work = true;
         let (dir_factories, dir_errors, dir_fingerprint) = tokio::task::spawn_blocking({
             let configs = dir_configs.clone();
             let builder = Arc::clone(factory_builder);
@@ -680,23 +716,51 @@ async fn load_schemas_impl(
         states.by_dir.insert(dir.clone(), state);
     }
 
+    // `old_states` was drained by `remove()` above; anything left is a
+    // directory whose provider block was deleted, which counts as work
+    // too (downstream diagnostics depend on it being gone).
+    any_work |= !old_states.is_empty();
+    // Import map changes don't affect factories but do shift which
+    // `ProviderState` applies to module files; republish diagnostics in
+    // that case even when factories were all reused.
+    let import_map_changed = old_import_map != import_map;
     states.import_map = import_map;
     let dir_count = states.by_dir.len();
     *providers.write().await = states;
-    client
-        .log_message(
-            MessageType::INFO,
-            format!(
-                "Loaded providers for {} directory(s), {} resource type schema(s) total",
-                dir_count, total_schemas
-            ),
-        )
-        .await;
 
-    let uris: Vec<Url> = documents.iter().map(|r| r.key().clone()).collect();
-    for uri in uris {
-        publish_diagnostics_for(client, documents, providers, uri).await;
+    if any_work {
+        client
+            .log_message(
+                MessageType::INFO,
+                format!(
+                    "Loaded providers for {} directory(s), {} resource type schema(s) total",
+                    dir_count, total_schemas
+                ),
+            )
+            .await;
     }
+
+    if any_work || import_map_changed {
+        let uris: Vec<Url> = documents.iter().map(|r| r.key().clone()).collect();
+        for uri in uris {
+            publish_diagnostics_for(client, documents, providers, uri).await;
+        }
+    }
+}
+
+/// True when the two config lists describe the same set of providers
+/// per directory, including attribute values and default tags. Used by
+/// [`load_schemas_impl`] to reuse the existing factory instead of
+/// re-parsing WASM on every `.crn` save (#2136). Relies on
+/// `PartialEq` derived on `ProviderConfig`; `VersionConstraint`
+/// already implements `PartialEq` by comparing its raw DSL form, so
+/// two configs parsed from the same source text compare equal even
+/// though their internal `semver::VersionReq` may not.
+fn configs_match(
+    a: &[(PathBuf, carina_core::parser::ProviderConfig)],
+    b: &[(PathBuf, carina_core::parser::ProviderConfig)],
+) -> bool {
+    a == b
 }
 
 /// Decide whether a batch of watched-file events requires rebuilding provider
@@ -897,5 +961,113 @@ mod tests {
             probe_install_fingerprint(Some(&prober), &configs),
             "two back-to-back probes with no fs change must agree"
         );
+    }
+}
+
+#[cfg(test)]
+mod reload_skip_tests {
+    use super::*;
+    use carina_core::parser::ProviderConfig;
+    use carina_core::resource::Value;
+    use std::collections::HashMap;
+
+    fn mk_config(name: &str, source: Option<&str>) -> ProviderConfig {
+        ProviderConfig {
+            name: name.into(),
+            attributes: HashMap::new(),
+            default_tags: HashMap::new(),
+            source: source.map(String::from),
+            version: None,
+            revision: None,
+        }
+    }
+
+    // #2136: save of a non-provider `.crn` must not trigger a
+    // FactoryBuilder rebuild. `configs_match` is the gate that keeps
+    // `load_schemas_impl` from re-running the expensive WASM parse when
+    // the on-disk provider config didn't actually change.
+    #[test]
+    fn configs_match_returns_true_for_identical_lists() {
+        let dir = std::path::PathBuf::from("/tmp/x");
+        let a = vec![(
+            dir.clone(),
+            mk_config("awscc", Some("github.com/carina-rs/carina-provider-awscc")),
+        )];
+        let b = vec![(
+            dir,
+            mk_config("awscc", Some("github.com/carina-rs/carina-provider-awscc")),
+        )];
+        assert!(configs_match(&a, &b));
+    }
+
+    #[test]
+    fn configs_match_returns_false_when_source_changes() {
+        let dir = std::path::PathBuf::from("/tmp/x");
+        let a = vec![(
+            dir.clone(),
+            mk_config("awscc", Some("github.com/carina-rs/carina-provider-awscc")),
+        )];
+        let b = vec![(dir, mk_config("awscc", Some("file:///local/awscc")))];
+        assert!(!configs_match(&a, &b));
+    }
+
+    #[test]
+    fn configs_match_returns_false_when_provider_added() {
+        let dir = std::path::PathBuf::from("/tmp/x");
+        let a = vec![(
+            dir.clone(),
+            mk_config("awscc", Some("github.com/carina-rs/carina-provider-awscc")),
+        )];
+        let b = vec![
+            (
+                dir.clone(),
+                mk_config("awscc", Some("github.com/carina-rs/carina-provider-awscc")),
+            ),
+            (
+                dir,
+                mk_config("aws", Some("github.com/carina-rs/carina-provider-aws")),
+            ),
+        ];
+        assert!(!configs_match(&a, &b));
+    }
+
+    #[test]
+    fn configs_match_returns_false_when_attributes_change() {
+        let dir = std::path::PathBuf::from("/tmp/x");
+        let mut cfg_a = mk_config("awscc", Some("github.com/carina-rs/carina-provider-awscc"));
+        cfg_a
+            .attributes
+            .insert("region".into(), Value::String("us-east-1".into()));
+        let mut cfg_b = mk_config("awscc", Some("github.com/carina-rs/carina-provider-awscc"));
+        cfg_b
+            .attributes
+            .insert("region".into(), Value::String("ap-northeast-1".into()));
+        let a = vec![(dir.clone(), cfg_a)];
+        let b = vec![(dir, cfg_b)];
+        assert!(!configs_match(&a, &b));
+    }
+
+    #[test]
+    fn configs_match_true_regardless_of_attribute_insertion_order() {
+        // HashMap iteration order is unspecified; configs_match must not
+        // depend on the order in which attributes were inserted.
+        let dir = std::path::PathBuf::from("/tmp/x");
+        let mut cfg_a = mk_config("awscc", Some("github.com/carina-rs/carina-provider-awscc"));
+        cfg_a
+            .attributes
+            .insert("region".into(), Value::String("us-east-1".into()));
+        cfg_a
+            .attributes
+            .insert("profile".into(), Value::String("dev".into()));
+        let mut cfg_b = mk_config("awscc", Some("github.com/carina-rs/carina-provider-awscc"));
+        cfg_b
+            .attributes
+            .insert("profile".into(), Value::String("dev".into()));
+        cfg_b
+            .attributes
+            .insert("region".into(), Value::String("us-east-1".into()));
+        let a = vec![(dir.clone(), cfg_a)];
+        let b = vec![(dir, cfg_b)];
+        assert!(configs_match(&a, &b));
     }
 }
