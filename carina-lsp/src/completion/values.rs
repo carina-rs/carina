@@ -773,6 +773,7 @@ impl CompletionProvider {
         type_expr_text: &str,
         in_nested: bool,
         text: &str,
+        base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {
         let Some(annotation) = parse_exports_type_text(type_expr_text) else {
             return Vec::new();
@@ -791,51 +792,55 @@ impl CompletionProvider {
         };
 
         let mut items = Self::builtin_function_completions_for_type(&effective);
-        items.extend(self.resource_ref_completions_for_type(&effective, text));
+        items.extend(self.resource_ref_completions_for_type(&effective, text, base_path));
         items
     }
 
     /// Find resource-ref paths (`<binding>.<attr>`) whose leaf
     /// attribute is assignable to `target` and return them as
-    /// completion items. `text` is the current buffer; we scan it for
-    /// `let <binding> = <resource_type> { ... }` declarations and look
-    /// up each binding's resource schema. Used by the `exports`
-    /// value-position handler to surface matching references alongside
-    /// type-compatible built-ins.
+    /// completion items. Scans both the current buffer and every
+    /// sibling `.crn` file under `base_path` — exports commonly live
+    /// in `exports.crn` while the resource bindings they reference
+    /// are declared in `main.crn`, so a current-buffer-only scan
+    /// misses them entirely (see #2043 follow-up).
     fn resource_ref_completions_for_type(
         &self,
         target: &AttributeType,
         text: &str,
+        base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {
         let mut items: Vec<CompletionItem> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for (binding_name, resource_type) in self.extract_resource_bindings(text) {
-            if resource_type.is_empty() {
-                continue;
-            }
-            let Some(schema) = self.schemas.get(&resource_type) else {
-                continue;
-            };
-            for attr in schema.attributes.values() {
-                if !attr.attr_type.is_assignable_to(target) {
+        let sibling_text = read_sibling_crn(base_path);
+        for source in [text, sibling_text.as_str()] {
+            for (binding_name, resource_type) in self.extract_resource_bindings(source) {
+                if resource_type.is_empty() {
                     continue;
                 }
-                let full_ref = format!("{}.{}", binding_name, attr.name);
-                if !seen.insert(full_ref.clone()) {
+                let Some(schema) = self.schemas.get(&resource_type) else {
                     continue;
+                };
+                for attr in schema.attributes.values() {
+                    if !attr.attr_type.is_assignable_to(target) {
+                        continue;
+                    }
+                    let full_ref = format!("{}.{}", binding_name, attr.name);
+                    if !seen.insert(full_ref.clone()) {
+                        continue;
+                    }
+                    items.push(CompletionItem {
+                        label: full_ref.clone(),
+                        kind: Some(CompletionItemKind::REFERENCE),
+                        detail: Some(format!(
+                            "Reference to {}'s {} ({})",
+                            binding_name,
+                            attr.name,
+                            attr.attr_type.type_name()
+                        )),
+                        insert_text: Some(full_ref),
+                        ..Default::default()
+                    });
                 }
-                items.push(CompletionItem {
-                    label: full_ref.clone(),
-                    kind: Some(CompletionItemKind::REFERENCE),
-                    detail: Some(format!(
-                        "Reference to {}'s {} ({})",
-                        binding_name,
-                        attr.name,
-                        attr.attr_type.type_name()
-                    )),
-                    insert_text: Some(full_ref),
-                    ..Default::default()
-                });
             }
         }
         items.sort_by(|a, b| a.label.cmp(&b.label));

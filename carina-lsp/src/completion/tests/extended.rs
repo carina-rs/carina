@@ -2323,3 +2323,119 @@ fn exports_list_value_position_filters_by_element_type() {
         labels
     );
 }
+
+/// Repro: in the real `organizations/exports.crn`, the user types
+/// `registry_dev = r|` at depth 2 (inside the `map(aws_account_id)`
+/// body with a preceding entry on the line above). LSP currently
+/// returns zero LSP items — VSCode falls back to word-based. We
+/// expect matching resource-ref refs.
+#[test]
+fn exports_map_value_multiple_entries_returns_refs() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use std::collections::HashMap;
+    fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
+        Ok(())
+    }
+    let account_id = AttributeType::Custom {
+        semantic_name: Some("AwsAccountId".to_string()),
+        base: Box::new(AttributeType::String),
+        pattern: None,
+        length: None,
+        validate: validate_noop,
+        namespace: None,
+        to_dsl: None,
+    };
+    let schema = ResourceSchema::new("awscc.organizations.account")
+        .attribute(AttributeSchema::new("account_id", account_id));
+    let mut schemas = HashMap::new();
+    schemas.insert("awscc.organizations.account".to_string(), schema);
+    let provider =
+        CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![]);
+
+    let source = "\
+let registry_prod = awscc.organizations.account {
+  name = 'prod'
+}
+
+let registry_dev = awscc.organizations.account {
+  name = 'dev'
+}
+
+exports {
+  accounts: map(aws_account_id) = {
+    registry_prod = r
+    registry_dev = r
+  }
+}
+";
+    let doc = create_document(source);
+    // Cursor on `    registry_dev = r|` — line 11 (0-indexed).
+    let position = Position {
+        line: 11,
+        character: "    registry_dev = r".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"registry_dev.account_id"),
+        "expected `registry_dev.account_id` with earlier `registry_prod = ...` sibling present. Got: {:?}",
+        labels
+    );
+}
+
+/// Sibling-file case: `exports.crn` references bindings declared in
+/// `main.crn` — the real shape used by `carina-rs/infra`. Completion
+/// must surface those bindings as `<binding>.<attr>` candidates
+/// scanning sibling `.crn` files, not just the current buffer.
+#[test]
+fn exports_map_value_includes_bindings_from_sibling_files() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use std::collections::HashMap;
+    fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
+        Ok(())
+    }
+    let account_id = AttributeType::Custom {
+        semantic_name: Some("AwsAccountId".to_string()),
+        base: Box::new(AttributeType::String),
+        pattern: None,
+        length: None,
+        validate: validate_noop,
+        namespace: None,
+        to_dsl: None,
+    };
+    let schema = ResourceSchema::new("awscc.organizations.account")
+        .attribute(AttributeSchema::new("account_id", account_id));
+    let mut schemas = HashMap::new();
+    schemas.insert("awscc.organizations.account".to_string(), schema);
+    let provider =
+        CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    std::fs::write(
+        base.join("main.crn"),
+        "let registry_prod = awscc.organizations.account {\n  name = 'prod'\n}\n",
+    )
+    .unwrap();
+    let exports_src = "\
+exports {
+  accounts: map(aws_account_id) = {
+    registry_prod = r
+  }
+}
+";
+    std::fs::write(base.join("exports.crn"), exports_src).unwrap();
+
+    let doc = create_document(exports_src);
+    let position = Position {
+        line: 2,
+        character: "    registry_prod = r".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, Some(base));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"registry_prod.account_id"),
+        "cross-file binding must be offered. Got: {:?}",
+        labels
+    );
+}
