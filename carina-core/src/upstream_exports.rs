@@ -551,6 +551,49 @@ mod tests {
     }
 
     #[test]
+    fn resolve_reads_struct_typed_export_from_multi_file_directory() {
+        // Multi-file upstream: `exports.crn` carries the struct-typed export
+        // while a sibling `backend.crn` is parsed in the same directory.
+        // The resolver must surface the struct annotation on the export.
+        use crate::parser::TypeExpr;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream_dir = tmp.path().join("organizations");
+        fs::create_dir(&upstream_dir).unwrap();
+        write_crn(
+            &upstream_dir,
+            "exports.crn",
+            r#"exports {
+                accounts: struct {
+                    registry_prod: string,
+                    registry_dev:  string,
+                } = {
+                    registry_prod = "111111111111"
+                    registry_dev  = "222222222222"
+                }
+            }"#,
+        );
+        write_crn(
+            &upstream_dir,
+            "backend.crn",
+            r#"backend local { path = "carina.state.json" }"#,
+        );
+        let base = tmp.path().join("downstream");
+        fs::create_dir(&base).unwrap();
+
+        let (got, errs) =
+            resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], &ctx());
+        assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
+        let keys = got.get("orgs").expect("resolved");
+        let accounts_ty = keys.get("accounts").expect("accounts export").as_ref();
+        let ty = accounts_ty.expect("type annotation present");
+        assert!(
+            matches!(ty, TypeExpr::Struct { fields } if fields.len() == 2),
+            "expected struct with 2 fields, got {ty:?}"
+        );
+    }
+
+    #[test]
     fn resolve_skips_missing_source_directory() {
         // Missing-directory is `check_upstream_state_sources`' job; this
         // resolver stays quiet about it.

@@ -380,6 +380,7 @@ impl CompletionProvider {
                 format!("{}.{}", resource_path.provider, resource_path.resource_type)
             }
             schema_type @ parser::TypeExpr::SchemaType { .. } => schema_type.to_string(),
+            struct_type @ parser::TypeExpr::Struct { .. } => struct_type.to_string(),
         }
     }
 

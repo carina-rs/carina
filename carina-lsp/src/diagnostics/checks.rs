@@ -1032,6 +1032,22 @@ impl DiagnosticEngine {
                 }
                 None
             }
+            // Recurse through this ref-aware walker — not `validate_type_expr_value` —
+            // so cross-file refs inside struct fields still resolve against sibling bindings.
+            (TypeExpr::Struct { fields }, Value::Map(map)) => {
+                if let Some(e) = carina_core::validation::struct_field_shape_errors(fields, map) {
+                    return Some(e);
+                }
+                for (name, field_ty) in fields {
+                    if let Some(v) = map.get(name)
+                        && let Some(e) =
+                            self.validate_type_with_ref_awareness(field_ty, v, sibling_bindings)
+                    {
+                        return Some(format!("field '{}': {}", name, e));
+                    }
+                }
+                None
+            }
             // ResourceRef: skip (resolved at runtime)
             (_, Value::ResourceRef { .. }) => None,
             // Everything else: normal validation
@@ -1251,6 +1267,9 @@ impl DiagnosticEngine {
             }
             TypeExpr::List(inner) => self.check_unknown_type_names(inner),
             TypeExpr::Map(inner) => self.check_unknown_type_names(inner),
+            TypeExpr::Struct { fields } => fields
+                .iter()
+                .find_map(|(_, ty)| self.check_unknown_type_names(ty)),
             _ => None,
         }
     }

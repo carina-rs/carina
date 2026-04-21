@@ -90,12 +90,15 @@ exports_param = {
   | identifier ~ "=" ~ expression
 }
 
-// Type expression: string, bool, int, float, cidr, arn, etc., list(type), map(type), aws.vpc (resource ref)
-type_expr = { type_ref | type_generic | type_simple }
+// Type expression: string, bool, int, float, cidr, arn, etc., list(type), map(type), aws.vpc (resource ref), struct { field: type, ... }
+type_expr = { type_struct | type_ref | type_generic | type_simple }
 type_simple = @{ identifier }
 type_generic = { ("list" | "map") ~ "(" ~ type_expr ~ ")" }
 type_ref = { resource_type_path }
 resource_type_path = @{ identifier ~ ("." ~ identifier)+ }
+type_struct = { "struct" ~ "{" ~ struct_field_list? ~ "}" }
+struct_field_list = { struct_field ~ ("," ~ struct_field)* ~ ","? }
+struct_field = { identifier ~ ":" ~ type_expr }
 
 // Import expression: import "path" (used in let binding RHS)
 import_expr = { "import" ~ string }
