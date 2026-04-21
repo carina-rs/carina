@@ -8,7 +8,7 @@ use tower_lsp::lsp_types::{
 
 use carina_core::parser;
 
-use super::CompletionProvider;
+use super::{CompletionProvider, DslSource};
 
 impl CompletionProvider {
     pub(super) fn top_level_completions(
@@ -237,8 +237,10 @@ impl CompletionProvider {
         completions
     }
 
-    pub(super) fn extract_argument_parameters(&self, text: &str) -> Vec<(String, String)> {
+    pub(super) fn extract_argument_parameters(&self, src: DslSource<'_>) -> Vec<(String, String)> {
+        let text = src.merged_text();
         let mut params = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut in_arguments_block = false;
         let mut brace_depth = 0;
 
@@ -277,7 +279,7 @@ impl CompletionProvider {
                         } else {
                             rest.to_string()
                         };
-                        if !name.is_empty() {
+                        if !name.is_empty() && seen.insert(name.clone()) {
                             params.push((name, type_hint));
                         }
                     }
@@ -288,28 +290,32 @@ impl CompletionProvider {
         params
     }
 
-    /// Extract every `let <name> = <rhs>` from `text`.
+    /// Extract every `let <name> = <rhs>` from `src`.
     ///
     /// Returns `Vec<(name, rhs)>` where `rhs` is the trimmed text after `=`
     /// (e.g. `awscc.ec2.vpc { ... }`, `upstream_state { ... }`, `import '...'`).
     /// Callers classify the rhs themselves — `extract_resource_bindings` maps
     /// it to a schema key, the for-iterable handler keys it into a detail
-    /// label, etc.
-    pub(super) fn extract_let_bindings(text: &str) -> Vec<(String, String)> {
+    /// label, etc. Duplicates (same binding name appearing in the buffer
+    /// and in a sibling `.crn`) are deduped, buffer-first.
+    pub(super) fn extract_let_bindings(src: DslSource<'_>) -> Vec<(String, String)> {
+        let text = src.merged_text();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         text.lines()
             .filter_map(|line| {
                 crate::let_parse::parse_let_header(line)
+                    .filter(|(name, _)| seen.insert(name.to_string()))
                     .map(|(name, rhs)| (name.to_string(), rhs.to_string()))
             })
             .collect()
     }
 
-    /// Extract resource binding names and their resource types from text
-    /// (variables defined with `let binding_name = awscc.ec2.vpc {`)
+    /// Extract resource binding names and their resource types from `src`
+    /// (variables defined with `let binding_name = awscc.ec2.vpc {`).
     /// Returns Vec<(binding_name, resource_type)> where resource_type is the schema key
-    /// (e.g., "awscc.ec2.vpc")
-    pub(super) fn extract_resource_bindings(&self, text: &str) -> Vec<(String, String)> {
-        Self::extract_let_bindings(text)
+    /// (e.g., "awscc.ec2.vpc"). See [`DslSource`] for buffer-vs-directory choice.
+    pub(super) fn extract_resource_bindings(&self, src: DslSource<'_>) -> Vec<(String, String)> {
+        Self::extract_let_bindings(src)
             .into_iter()
             .map(|(name, rhs)| (name, self.extract_resource_type(&rhs).unwrap_or_default()))
             .collect()

@@ -1,10 +1,13 @@
 //! Completion provider for the Carina LSP.
 
+pub(crate) mod dsl_source;
 mod top_level;
 mod values;
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) use dsl_source::DslSource;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -816,39 +819,25 @@ fn detect_upstream_state_dot(
     {
         return None;
     }
-    let bindings = collect_upstream_state_bindings(text, base_path);
+    let mut src_buf = String::new();
+    let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
+    let bindings = collect_upstream_state_bindings(src);
     let source = bindings.get(binding)?.clone();
     Some((binding.to_string(), after_dot.to_string(), source))
 }
 
 /// Return every `let <name> = upstream_state { source = '...' }` declared
-/// in the current buffer or any sibling `.crn` under `base_path`, as a map
-/// from binding name to source path (relative, as written).
+/// in `src` as a map from binding name to source path (relative, as written).
 ///
 /// Intentionally does a text scan rather than going through `parse_directory`:
 /// completion runs on partial, often syntactically invalid buffers. We only
 /// need binding → source to feed `resolve_upstream_exports`, which then
 /// parses the *upstream* directory (separate from the downstream buffer).
 fn collect_upstream_state_bindings(
-    text: &str,
-    base_path: Option<&std::path::Path>,
+    src: DslSource<'_>,
 ) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
-    scan_upstream_state_let(text, &mut out);
-    let Some(base) = base_path else {
-        return out;
-    };
-    let Ok(entries) = std::fs::read_dir(base) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "crn")
-            && let Ok(content) = std::fs::read_to_string(&path)
-        {
-            scan_upstream_state_let(&content, &mut out);
-        }
-    }
+    scan_upstream_state_let(src.merged_text(), &mut out);
     out
 }
 

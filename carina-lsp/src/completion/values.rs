@@ -9,7 +9,7 @@ use tower_lsp::lsp_types::{
 use carina_core::builtins;
 use carina_core::schema::AttributeType;
 
-use super::CompletionProvider;
+use super::{CompletionProvider, DslSource};
 
 /// How far up the directory tree to walk when suggesting upstream_state sources.
 const UPSTREAM_SOURCE_MAX_UP: usize = 6;
@@ -20,31 +20,6 @@ const UPSTREAM_SOURCE_MAX_ITEMS: usize = 100;
 struct BindingDotContext {
     binding_name: String,
     resource_type: String,
-}
-
-/// Concatenate every `.crn` file in `base_path` into one string. The
-/// current-file buffer is scanned separately by the caller (it might
-/// contain unsaved edits that differ from disk), so returning disk
-/// content for the whole directory is fine — duplicates are deduped
-/// by the completion handler's `seen` set.
-fn read_sibling_crn(base_path: Option<&Path>) -> String {
-    let Some(base) = base_path else {
-        return String::new();
-    };
-    let Ok(entries) = std::fs::read_dir(base) else {
-        return String::new();
-    };
-    let mut out = String::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "crn")
-            && let Ok(content) = std::fs::read_to_string(&path)
-        {
-            out.push_str(&content);
-            out.push('\n');
-        }
-    }
-    out
 }
 
 fn type_completion_item(label: String, detail: String, range: Range) -> CompletionItem {
@@ -130,16 +105,18 @@ impl CompletionProvider {
         // "igw.internet_gateway_id" replaces "igw." instead of being appended.
         let ref_edit_range = self.compute_value_prefix_range(text, position);
 
-        // Read sibling `.crn` files once and reuse across every site that
-        // needs cross-file bindings or arguments. Every keystroke in a
-        // value position triggers this helper, so re-reading the directory
-        // per site would multiply disk I/O.
-        let sibling_text = read_sibling_crn(base_path);
+        // Binding scans here see the current buffer *and* every sibling
+        // `.crn` under `base_path`. Helpers take `DslSource` to make the
+        // choice explicit at the call site — see `dsl_source.rs`. The
+        // sibling read happens exactly once; the same `src` is reused
+        // across every helper below.
+        let mut src_buf = String::new();
+        let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
 
         // Check if the user has typed "binding." after "=" — if so, show only
         // that binding's resource attributes, not built-in functions or generic completions.
         if let Some(dot_binding) =
-            self.detect_binding_dot_context(text, position, current_binding, &sibling_text)
+            self.detect_binding_dot_context(text, position, current_binding, src)
         {
             return self.binding_attribute_completions(
                 &dot_binding.binding_name,
@@ -151,58 +128,43 @@ impl CompletionProvider {
         // Type-based resource reference completions:
         // Look up the attribute's type from the schema. If it's a Custom type,
         // find bindings whose resource schema has an attribute with the same Custom type name.
-        // Scans both the current buffer and every sibling `.crn` in `base_path` —
-        // Carina configurations are directory-scoped, so `registry_prod` may live in
-        // `main.crn` while the consumer block lives in `other.crn`.
         if let Some(schema) = self.schemas.get(resource_type)
             && let Some(attr_schema) = schema.attributes.get(attr_name)
         {
             let target_type_name = Self::extract_custom_type_name(&attr_schema.attr_type);
             if let Some(target_name) = target_type_name {
-                let mut seen_refs: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                for source in [text, sibling_text.as_str()] {
-                    for (binding_name, binding_resource_type) in
-                        &self.extract_resource_bindings(source)
-                    {
-                        if binding_resource_type.is_empty() {
-                            continue;
-                        }
-                        // Skip self-references: don't suggest the current resource's own binding
-                        if current_binding.is_some_and(|cb| cb == binding_name) {
-                            continue;
-                        }
-                        // Look up the binding's resource schema and find attributes
-                        // with matching Custom type name
-                        if let Some(binding_schema) = self.schemas.get(binding_resource_type) {
-                            for binding_attr in binding_schema.attributes.values() {
-                                if let Some(binding_type_name) =
-                                    Self::extract_custom_type_name(&binding_attr.attr_type)
-                                    && binding_type_name == target_name
-                                {
-                                    let full_ref =
-                                        format!("{}.{}", binding_name, binding_attr.name);
-                                    if !seen_refs.insert(full_ref.clone()) {
-                                        continue;
-                                    }
-                                    completions.push(CompletionItem {
-                                        label: full_ref.clone(),
-                                        kind: Some(CompletionItemKind::REFERENCE),
-                                        detail: Some(format!(
-                                            "Reference to {}'s {} ({})",
-                                            binding_name, binding_attr.name, target_name
-                                        )),
-                                        text_edit: Some(
-                                            tower_lsp::lsp_types::CompletionTextEdit::Edit(
-                                                TextEdit {
-                                                    range: ref_edit_range,
-                                                    new_text: full_ref,
-                                                },
-                                            ),
-                                        ),
-                                        ..Default::default()
-                                    });
-                                }
+                for (binding_name, binding_resource_type) in &self.extract_resource_bindings(src) {
+                    if binding_resource_type.is_empty() {
+                        continue;
+                    }
+                    // Skip self-references: don't suggest the current resource's own binding
+                    if current_binding.is_some_and(|cb| cb == binding_name) {
+                        continue;
+                    }
+                    // Look up the binding's resource schema and find attributes
+                    // with matching Custom type name
+                    if let Some(binding_schema) = self.schemas.get(binding_resource_type) {
+                        for binding_attr in binding_schema.attributes.values() {
+                            if let Some(binding_type_name) =
+                                Self::extract_custom_type_name(&binding_attr.attr_type)
+                                && binding_type_name == target_name
+                            {
+                                let full_ref = format!("{}.{}", binding_name, binding_attr.name);
+                                completions.push(CompletionItem {
+                                    label: full_ref.clone(),
+                                    kind: Some(CompletionItemKind::REFERENCE),
+                                    detail: Some(format!(
+                                        "Reference to {}'s {} ({})",
+                                        binding_name, binding_attr.name, target_name
+                                    )),
+                                    text_edit: Some(
+                                        tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                                            range: ref_edit_range,
+                                            new_text: full_ref,
+                                        }),
+                                    ),
+                                    ..Default::default()
+                                });
                             }
                         }
                     }
@@ -211,22 +173,16 @@ impl CompletionProvider {
         }
 
         // Add argument parameter references (lexically scoped — direct name access).
-        // Scan both the current buffer and sibling `.crn` files: module shapes
-        // sometimes split `arguments { ... }` into a dedicated `arguments.crn`.
-        let mut seen_args: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for source in [text, sibling_text.as_str()] {
-            for (name, type_hint) in self.extract_argument_parameters(source) {
-                if !seen_args.insert(name.clone()) {
-                    continue;
-                }
-                completions.push(CompletionItem {
-                    label: name.clone(),
-                    kind: Some(CompletionItemKind::VARIABLE),
-                    detail: Some(format!("argument: {}", type_hint)),
-                    insert_text: Some(name),
-                    ..Default::default()
-                });
-            }
+        // The shared `src` surfaces `arguments { ... }` even when split into
+        // a dedicated `arguments.crn`.
+        for (name, type_hint) in self.extract_argument_parameters(src) {
+            completions.push(CompletionItem {
+                label: name.clone(),
+                kind: Some(CompletionItemKind::VARIABLE),
+                detail: Some(format!("argument: {}", type_hint)),
+                insert_text: Some(name),
+                ..Default::default()
+            });
         }
 
         // Add for-loop binding names in scope, filtered by inferred element
@@ -243,13 +199,12 @@ impl CompletionProvider {
             .and_then(|s| s.attributes.get(attr_name))
             .map(|a| &a.attr_type);
         let for_bindings = super::top_level::extract_for_bindings_in_scope(text, position);
-        // Cache upstream binding → source text scan and the resolved
-        // exports per upstream. Without this, each for-binding re-scans
-        // every sibling `.crn` plus re-parses the upstream project —
-        // every keystroke in a value position.
+        // Cache the resolved exports per upstream. Without this, each
+        // for-binding re-parses the upstream project every keystroke.
+        // The sibling scan itself reuses the already-resolved `src`.
         let upstream_sources: std::collections::HashMap<String, String> =
             if for_bindings.iter().any(|b| b.iterable.is_some()) {
-                super::collect_upstream_state_bindings(text, base_path)
+                super::collect_upstream_state_bindings(src)
             } else {
                 std::collections::HashMap::new()
             };
@@ -331,18 +286,18 @@ impl CompletionProvider {
         completions
     }
 
-    /// Detect if the user has typed `binding_name.` after `=` on the current line.
-    /// Returns the binding name and its resource type if detected.
+    /// Detect if the user has typed `binding_name.` after `=` on the current
+    /// line. Returns the binding name and its resource type if detected.
     ///
-    /// `sibling_text` is pre-read sibling `.crn` content; the binding may be
-    /// declared in a neighbouring file (e.g. `main.crn`) while the cursor is
-    /// in `other.crn`.
+    /// `src` must be [`DslSource::DirectoryScoped`] in normal use so that a
+    /// binding declared in a sibling `.crn` can be resolved. `BufferOnly` is
+    /// only correct when the feature is genuinely buffer-local.
     fn detect_binding_dot_context(
         &self,
         text: &str,
         position: Position,
         current_binding: Option<&str>,
-        sibling_text: &str,
+        src: DslSource<'_>,
     ) -> Option<BindingDotContext> {
         let lines: Vec<&str> = text.lines().collect();
         let line_idx = position.line as usize;
@@ -369,18 +324,16 @@ impl CompletionProvider {
             return None;
         }
 
-        for source in [text, sibling_text] {
-            for (binding_name, binding_resource_type) in &self.extract_resource_bindings(source) {
-                if binding_name == candidate_binding && !binding_resource_type.is_empty() {
-                    // Skip self-references
-                    if current_binding.is_some_and(|cb| cb == binding_name) {
-                        return None;
-                    }
-                    return Some(BindingDotContext {
-                        binding_name: binding_name.clone(),
-                        resource_type: binding_resource_type.clone(),
-                    });
+        for (binding_name, binding_resource_type) in &self.extract_resource_bindings(src) {
+            if binding_name == candidate_binding && !binding_resource_type.is_empty() {
+                // Skip self-references
+                if current_binding.is_some_and(|cb| cb == binding_name) {
+                    return None;
                 }
+                return Some(BindingDotContext {
+                    binding_name: binding_name.clone(),
+                    resource_type: binding_resource_type.clone(),
+                });
             }
         }
 
@@ -630,21 +583,20 @@ impl CompletionProvider {
             });
         };
 
-        let sibling_text = read_sibling_crn(base_path);
-        for source in [text, sibling_text.as_str()] {
-            for (name, rhs) in Self::extract_let_bindings(source) {
-                let detail = if rhs.starts_with("upstream_state") {
-                    "upstream_state binding"
-                } else if rhs.starts_with("import ") {
-                    "module import"
-                } else {
-                    "binding"
-                };
-                push(&mut items, &mut seen, name, detail);
-            }
-            for (name, _) in self.extract_argument_parameters(source) {
-                push(&mut items, &mut seen, name, "argument");
-            }
+        let mut src_buf = String::new();
+        let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
+        for (name, rhs) in Self::extract_let_bindings(src) {
+            let detail = if rhs.starts_with("upstream_state") {
+                "upstream_state binding"
+            } else if rhs.starts_with("import ") {
+                "module import"
+            } else {
+                "binding"
+            };
+            push(&mut items, &mut seen, name, detail);
+        }
+        for (name, _) in self.extract_argument_parameters(src) {
+            push(&mut items, &mut seen, name, "argument");
         }
 
         items
@@ -829,13 +781,11 @@ impl CompletionProvider {
         items
     }
 
-    /// Find resource-ref paths (`<binding>.<attr>`) whose leaf
-    /// attribute is assignable to `target` and return them as
-    /// completion items. Scans both the current buffer and every
-    /// sibling `.crn` file under `base_path` — exports commonly live
-    /// in `exports.crn` while the resource bindings they reference
-    /// are declared in `main.crn`, so a current-buffer-only scan
-    /// misses them entirely (see #2043 follow-up).
+    /// Find resource-ref paths (`<binding>.<attr>`) whose leaf attribute is
+    /// assignable to `target` and return them as completion items. Uses a
+    /// directory-scoped [`DslSource`] so exports in `exports.crn` can
+    /// reference bindings declared in a sibling `main.crn`
+    /// (see #2043 follow-up).
     fn resource_ref_completions_for_type(
         &self,
         target: &AttributeType,
@@ -843,37 +793,32 @@ impl CompletionProvider {
         base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {
         let mut items: Vec<CompletionItem> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let sibling_text = read_sibling_crn(base_path);
-        for source in [text, sibling_text.as_str()] {
-            for (binding_name, resource_type) in self.extract_resource_bindings(source) {
-                if resource_type.is_empty() {
+        let mut src_buf = String::new();
+        let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
+        for (binding_name, resource_type) in self.extract_resource_bindings(src) {
+            if resource_type.is_empty() {
+                continue;
+            }
+            let Some(schema) = self.schemas.get(&resource_type) else {
+                continue;
+            };
+            for attr in schema.attributes.values() {
+                if !attr.attr_type.is_assignable_to(target) {
                     continue;
                 }
-                let Some(schema) = self.schemas.get(&resource_type) else {
-                    continue;
-                };
-                for attr in schema.attributes.values() {
-                    if !attr.attr_type.is_assignable_to(target) {
-                        continue;
-                    }
-                    let full_ref = format!("{}.{}", binding_name, attr.name);
-                    if !seen.insert(full_ref.clone()) {
-                        continue;
-                    }
-                    items.push(CompletionItem {
-                        label: full_ref.clone(),
-                        kind: Some(CompletionItemKind::REFERENCE),
-                        detail: Some(format!(
-                            "Reference to {}'s {} ({})",
-                            binding_name,
-                            attr.name,
-                            attr.attr_type.type_name()
-                        )),
-                        insert_text: Some(full_ref),
-                        ..Default::default()
-                    });
-                }
+                let full_ref = format!("{}.{}", binding_name, attr.name);
+                items.push(CompletionItem {
+                    label: full_ref.clone(),
+                    kind: Some(CompletionItemKind::REFERENCE),
+                    detail: Some(format!(
+                        "Reference to {}'s {} ({})",
+                        binding_name,
+                        attr.name,
+                        attr.attr_type.type_name()
+                    )),
+                    insert_text: Some(full_ref),
+                    ..Default::default()
+                });
             }
         }
         items.sort_by(|a, b| a.label.cmp(&b.label));

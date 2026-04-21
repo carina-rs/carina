@@ -128,8 +128,11 @@ impl DiagnosticEngine {
         let mut diagnostics = Vec::new();
         let text = doc.text();
 
-        // Extract defined resource bindings
-        let defined_bindings = self.extract_resource_bindings(&text);
+        // Extract defined resource bindings. BufferOnly is intentional:
+        // sibling-file bindings are pre-resolved by the caller and come in
+        // via `sibling_bindings` below.
+        let defined_bindings =
+            self.extract_resource_bindings(crate::completion::DslSource::BufferOnly(&text));
 
         // Parse errors
         if let Some(error) = doc.parse_error() {
