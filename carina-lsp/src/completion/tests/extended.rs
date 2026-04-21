@@ -1800,6 +1800,53 @@ for _, id in orgs.
     );
 }
 
+// #2128: surface the export's declared `TypeExpr` in the completion
+// detail so the user sees `map(aws_account_id)` instead of the generic
+// "export from upstream_state `orgs`". Untyped exports keep the fallback
+// phrasing.
+#[test]
+fn upstream_state_dot_completion_detail_shows_type_expr() {
+    let provider = test_provider();
+    let (_tmp, base) = set_up_upstream_project(
+        "exports {\n  accounts: map(aws_account_id) = \"x\"\n  untyped = \"y\"\n}\n",
+        "let orgs = upstream_state { source = '../organizations' }\nfor _, id in orgs.\n",
+    );
+    let main_src = std::fs::read_to_string(base.join("main.crn")).unwrap();
+    let doc = create_document(&main_src);
+    let position = Position {
+        line: 1,
+        character: "for _, id in orgs.".chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&base));
+    let accounts = completions
+        .iter()
+        .find(|c| c.label == "accounts")
+        .expect("expected `accounts` in completions");
+    let detail = accounts.detail.as_deref().unwrap_or("");
+    assert!(
+        detail.contains("map(aws_account_id)"),
+        "typed export detail must include the TypeExpr rendering, got: {:?}",
+        detail
+    );
+
+    let untyped = completions
+        .iter()
+        .find(|c| c.label == "untyped")
+        .expect("expected `untyped` in completions");
+    let detail = untyped.detail.as_deref().unwrap_or("");
+    assert!(
+        !detail.contains('('),
+        "untyped export detail must not render a bogus type, got: {:?}",
+        detail
+    );
+    assert!(
+        detail.contains("orgs"),
+        "untyped fallback detail should still identify the binding, got: {:?}",
+        detail
+    );
+}
+
 // =====================================================================
 // exports block: type-aware value-position completion (#1993)
 // =====================================================================
