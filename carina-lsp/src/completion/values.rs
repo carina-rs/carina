@@ -130,9 +130,16 @@ impl CompletionProvider {
         // "igw.internet_gateway_id" replaces "igw." instead of being appended.
         let ref_edit_range = self.compute_value_prefix_range(text, position);
 
+        // Read sibling `.crn` files once and reuse across every site that
+        // needs cross-file bindings or arguments. Every keystroke in a
+        // value position triggers this helper, so re-reading the directory
+        // per site would multiply disk I/O.
+        let sibling_text = read_sibling_crn(base_path);
+
         // Check if the user has typed "binding." after "=" — if so, show only
         // that binding's resource attributes, not built-in functions or generic completions.
-        if let Some(dot_binding) = self.detect_binding_dot_context(text, position, current_binding)
+        if let Some(dot_binding) =
+            self.detect_binding_dot_context(text, position, current_binding, &sibling_text)
         {
             return self.binding_attribute_completions(
                 &dot_binding.binding_name,
@@ -144,44 +151,58 @@ impl CompletionProvider {
         // Type-based resource reference completions:
         // Look up the attribute's type from the schema. If it's a Custom type,
         // find bindings whose resource schema has an attribute with the same Custom type name.
+        // Scans both the current buffer and every sibling `.crn` in `base_path` —
+        // Carina configurations are directory-scoped, so `registry_prod` may live in
+        // `main.crn` while the consumer block lives in `other.crn`.
         if let Some(schema) = self.schemas.get(resource_type)
             && let Some(attr_schema) = schema.attributes.get(attr_name)
         {
             let target_type_name = Self::extract_custom_type_name(&attr_schema.attr_type);
             if let Some(target_name) = target_type_name {
-                let bindings = self.extract_resource_bindings(text);
-                for (binding_name, binding_resource_type) in &bindings {
-                    if binding_resource_type.is_empty() {
-                        continue;
-                    }
-                    // Skip self-references: don't suggest the current resource's own binding
-                    if current_binding.is_some_and(|cb| cb == binding_name) {
-                        continue;
-                    }
-                    // Look up the binding's resource schema and find attributes
-                    // with matching Custom type name
-                    if let Some(binding_schema) = self.schemas.get(binding_resource_type) {
-                        for binding_attr in binding_schema.attributes.values() {
-                            if let Some(binding_type_name) =
-                                Self::extract_custom_type_name(&binding_attr.attr_type)
-                                && binding_type_name == target_name
-                            {
-                                let full_ref = format!("{}.{}", binding_name, binding_attr.name);
-                                completions.push(CompletionItem {
-                                    label: full_ref.clone(),
-                                    kind: Some(CompletionItemKind::REFERENCE),
-                                    detail: Some(format!(
-                                        "Reference to {}'s {} ({})",
-                                        binding_name, binding_attr.name, target_name
-                                    )),
-                                    text_edit: Some(
-                                        tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
-                                            range: ref_edit_range,
-                                            new_text: full_ref,
-                                        }),
-                                    ),
-                                    ..Default::default()
-                                });
+                let mut seen_refs: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for source in [text, sibling_text.as_str()] {
+                    for (binding_name, binding_resource_type) in
+                        &self.extract_resource_bindings(source)
+                    {
+                        if binding_resource_type.is_empty() {
+                            continue;
+                        }
+                        // Skip self-references: don't suggest the current resource's own binding
+                        if current_binding.is_some_and(|cb| cb == binding_name) {
+                            continue;
+                        }
+                        // Look up the binding's resource schema and find attributes
+                        // with matching Custom type name
+                        if let Some(binding_schema) = self.schemas.get(binding_resource_type) {
+                            for binding_attr in binding_schema.attributes.values() {
+                                if let Some(binding_type_name) =
+                                    Self::extract_custom_type_name(&binding_attr.attr_type)
+                                    && binding_type_name == target_name
+                                {
+                                    let full_ref =
+                                        format!("{}.{}", binding_name, binding_attr.name);
+                                    if !seen_refs.insert(full_ref.clone()) {
+                                        continue;
+                                    }
+                                    completions.push(CompletionItem {
+                                        label: full_ref.clone(),
+                                        kind: Some(CompletionItemKind::REFERENCE),
+                                        detail: Some(format!(
+                                            "Reference to {}'s {} ({})",
+                                            binding_name, binding_attr.name, target_name
+                                        )),
+                                        text_edit: Some(
+                                            tower_lsp::lsp_types::CompletionTextEdit::Edit(
+                                                TextEdit {
+                                                    range: ref_edit_range,
+                                                    new_text: full_ref,
+                                                },
+                                            ),
+                                        ),
+                                        ..Default::default()
+                                    });
+                                }
                             }
                         }
                     }
@@ -189,16 +210,23 @@ impl CompletionProvider {
             }
         }
 
-        // Add argument parameter references (lexically scoped — direct name access)
-        let argument_params = self.extract_argument_parameters(text);
-        for (name, type_hint) in &argument_params {
-            completions.push(CompletionItem {
-                label: name.clone(),
-                kind: Some(CompletionItemKind::VARIABLE),
-                detail: Some(format!("argument: {}", type_hint)),
-                insert_text: Some(name.clone()),
-                ..Default::default()
-            });
+        // Add argument parameter references (lexically scoped — direct name access).
+        // Scan both the current buffer and sibling `.crn` files: module shapes
+        // sometimes split `arguments { ... }` into a dedicated `arguments.crn`.
+        let mut seen_args: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for source in [text, sibling_text.as_str()] {
+            for (name, type_hint) in self.extract_argument_parameters(source) {
+                if !seen_args.insert(name.clone()) {
+                    continue;
+                }
+                completions.push(CompletionItem {
+                    label: name.clone(),
+                    kind: Some(CompletionItemKind::VARIABLE),
+                    detail: Some(format!("argument: {}", type_hint)),
+                    insert_text: Some(name),
+                    ..Default::default()
+                });
+            }
         }
 
         // Add for-loop binding names in scope, filtered by inferred element
@@ -305,11 +333,16 @@ impl CompletionProvider {
 
     /// Detect if the user has typed `binding_name.` after `=` on the current line.
     /// Returns the binding name and its resource type if detected.
+    ///
+    /// `sibling_text` is pre-read sibling `.crn` content; the binding may be
+    /// declared in a neighbouring file (e.g. `main.crn`) while the cursor is
+    /// in `other.crn`.
     fn detect_binding_dot_context(
         &self,
         text: &str,
         position: Position,
         current_binding: Option<&str>,
+        sibling_text: &str,
     ) -> Option<BindingDotContext> {
         let lines: Vec<&str> = text.lines().collect();
         let line_idx = position.line as usize;
@@ -336,18 +369,18 @@ impl CompletionProvider {
             return None;
         }
 
-        // Look up this binding in the file's bindings
-        let bindings = self.extract_resource_bindings(text);
-        for (binding_name, binding_resource_type) in &bindings {
-            if binding_name == candidate_binding && !binding_resource_type.is_empty() {
-                // Skip self-references
-                if current_binding.is_some_and(|cb| cb == binding_name) {
-                    return None;
+        for source in [text, sibling_text] {
+            for (binding_name, binding_resource_type) in &self.extract_resource_bindings(source) {
+                if binding_name == candidate_binding && !binding_resource_type.is_empty() {
+                    // Skip self-references
+                    if current_binding.is_some_and(|cb| cb == binding_name) {
+                        return None;
+                    }
+                    return Some(BindingDotContext {
+                        binding_name: binding_name.clone(),
+                        resource_type: binding_resource_type.clone(),
+                    });
                 }
-                return Some(BindingDotContext {
-                    binding_name: binding_name.clone(),
-                    resource_type: binding_resource_type.clone(),
-                });
             }
         }
 
