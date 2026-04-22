@@ -45,7 +45,7 @@ fn build_module_signature() -> FileSignature {
             vpc: aws.vpc {
                 description = "The VPC to deploy into"
             }
-            enable_https: bool = true
+            enable_https: Bool = true
         }
 
         attributes {

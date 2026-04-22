@@ -2109,10 +2109,10 @@ mod tests {
 
     #[test]
     fn test_format_struct_type_canonical_spacing() {
-        let input = "attributes {\n  config: struct{a:int,b:string} = { a = 1, b = 'x' }\n}\n";
+        let input = "attributes {\n  config: struct{a: Int,b: String} = { a = 1, b = 'x' }\n}\n";
         let result = format(input, &FormatConfig::default()).unwrap();
         assert!(
-            result.contains("struct { a: int, b: string }"),
+            result.contains("struct { a: Int, b: String }"),
             "expected canonical struct spacing, got:\n{result}"
         );
     }
@@ -2130,25 +2130,25 @@ mod tests {
     #[test]
     fn test_format_struct_type_nested_in_list_and_map() {
         let input =
-            "attributes {\n  xs: list(struct{a:int}) = []\n  m: map(struct{b:string}) = {}\n}\n";
+            "attributes {\n  xs: list(struct{a: Int}) = []\n  m: map(struct{b: String}) = {}\n}\n";
         let result = format(input, &FormatConfig::default()).unwrap();
         assert!(
-            result.contains("list(struct { a: int })"),
-            "expected list(struct {{ a: int }}), got:\n{result}"
+            result.contains("list(struct { a: Int })"),
+            "expected list(struct {{ a: Int }}), got:\n{result}"
         );
         assert!(
-            result.contains("map(struct { b: string })"),
-            "expected map(struct {{ b: string }}), got:\n{result}"
+            result.contains("map(struct { b: String })"),
+            "expected map(struct {{ b: String }}), got:\n{result}"
         );
     }
 
     #[test]
     fn test_format_struct_type_field_is_itself_struct() {
         let input =
-            "attributes {\n  outer: struct{inner:struct{x:int}} = { inner = { x = 1 } }\n}\n";
+            "attributes {\n  outer: struct{inner:struct{x: Int}} = { inner = { x = 1 } }\n}\n";
         let result = format(input, &FormatConfig::default()).unwrap();
         assert!(
-            result.contains("struct { inner: struct { x: int } }"),
+            result.contains("struct { inner: struct { x: Int } }"),
             "expected nested struct spacing, got:\n{result}"
         );
     }
@@ -2808,7 +2808,7 @@ mod tests {
   vpc: awscc.ec2.Vpc {
     description = "The VPC to deploy into"
   }
-  port: int {
+  port: Int {
     description = "Web server port"
     default     = 8080
   }
@@ -2816,18 +2816,18 @@ mod tests {
 "#;
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
-        let expected = "arguments {\n  vpc: awscc.ec2.Vpc {\n    description = 'The VPC to deploy into'\n  }\n  port: int {\n    description = 'Web server port'\n    default     = 8080\n  }\n}\n";
+        let expected = "arguments {\n  vpc: awscc.ec2.Vpc {\n    description = 'The VPC to deploy into'\n  }\n  port: Int {\n    description = 'Web server port'\n    default     = 8080\n  }\n}\n";
         assert_eq!(result, expected);
     }
 
     #[test]
     fn format_arguments_mixed_simple_and_block_form() {
         let input = r#"arguments {
-  enable_https: bool = true
+  enable_https: Bool = true
   vpc: awscc.ec2.Vpc {
     description = "The VPC to deploy into"
   }
-  port: int {
+  port: Int {
     description = "Web server port"
     default     = 8080
   }
@@ -2835,7 +2835,7 @@ mod tests {
 "#;
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
-        let expected = "arguments {\n  enable_https: bool = true\n  vpc: awscc.ec2.Vpc {\n    description = 'The VPC to deploy into'\n  }\n  port: int {\n    description = 'Web server port'\n    default     = 8080\n  }\n}\n";
+        let expected = "arguments {\n  enable_https: Bool = true\n  vpc: awscc.ec2.Vpc {\n    description = 'The VPC to deploy into'\n  }\n  port: Int {\n    description = 'Web server port'\n    default     = 8080\n  }\n}\n";
         assert_eq!(result, expected);
     }
 
@@ -2845,7 +2845,7 @@ mod tests {
   vpc: awscc.ec2.Vpc {
     description = "The VPC"
   }
-  port: int {
+  port: Int {
     description = "Port"
     default     = 8080
   }
@@ -2860,8 +2860,8 @@ mod tests {
     #[test]
     fn format_arguments_mixed_with_alignment() {
         let input = r#"arguments {
-  short: bool = true
-  longer_name: string = "hello"
+  short: Bool = true
+  longer_name: String = "hello"
   vpc: awscc.ec2.Vpc {
     description = "The VPC"
   }
@@ -2871,7 +2871,7 @@ mod tests {
             align_attributes: true,
             ..Default::default()
         };
-        let expected = "arguments {\n  short      : bool = true\n  longer_name: string = 'hello'\n  vpc: awscc.ec2.Vpc {\n    description = 'The VPC'\n  }\n}\n";
+        let expected = "arguments {\n  short      : Bool = true\n  longer_name: String = 'hello'\n  vpc: awscc.ec2.Vpc {\n    description = 'The VPC'\n  }\n}\n";
         let result = format(input, &config).unwrap();
         assert_eq!(result, expected);
     }
@@ -2880,7 +2880,7 @@ mod tests {
     #[ignore] // TODO: formatter doesn't handle validation { ... } block yet
     fn format_arguments_block_form_with_validation_block() {
         let input = r#"arguments {
-  port: int {
+  port: Int {
     description = "Web server port"
     default     = 8080
     validation {
@@ -2925,8 +2925,8 @@ mod tests {
     #[test]
     fn format_fn_def_with_typed_params() {
         let config = FormatConfig::default();
-        let input = "fn greet(name:string) {\n  name\n}\n";
-        let expected = "fn greet(name: string) {\n  name\n}\n";
+        let input = "fn greet(name:String) {\n  name\n}\n";
+        let expected = "fn greet(name: String) {\n  name\n}\n";
         let result = format(input, &config).unwrap();
         assert_eq!(result, expected);
     }
@@ -2935,9 +2935,9 @@ mod tests {
     fn format_fn_def_with_typed_param_and_default() {
         let config = FormatConfig::default();
         let input =
-            "fn tag(env:string,suffix:string=\"default\") {\n  join(\"-\", [env, suffix])\n}\n";
+            "fn tag(env:String,suffix:String=\"default\") {\n  join(\"-\", [env, suffix])\n}\n";
         let expected =
-            "fn tag(env: string, suffix: string = 'default') {\n  join('-', [env, suffix])\n}\n";
+            "fn tag(env: String, suffix: String = 'default') {\n  join('-', [env, suffix])\n}\n";
         let result = format(input, &config).unwrap();
         assert_eq!(result, expected);
     }
@@ -2945,8 +2945,8 @@ mod tests {
     #[test]
     fn format_fn_def_with_resource_type_param() {
         let config = FormatConfig::default();
-        let input = "fn make(vpc:awscc.ec2.Vpc,cidr:string) {\n  vpc\n}\n";
-        let expected = "fn make(vpc: awscc.ec2.Vpc, cidr: string) {\n  vpc\n}\n";
+        let input = "fn make(vpc:awscc.ec2.Vpc,cidr:String) {\n  vpc\n}\n";
+        let expected = "fn make(vpc: awscc.ec2.Vpc, cidr: String) {\n  vpc\n}\n";
         let result = format(input, &config).unwrap();
         assert_eq!(result, expected);
     }
@@ -2954,8 +2954,8 @@ mod tests {
     #[test]
     fn format_fn_def_mixed_typed_untyped() {
         let config = FormatConfig::default();
-        let input = "fn tag(env,suffix:string) {\n  suffix\n}\n";
-        let expected = "fn tag(env, suffix: string) {\n  suffix\n}\n";
+        let input = "fn tag(env,suffix:String) {\n  suffix\n}\n";
+        let expected = "fn tag(env, suffix: String) {\n  suffix\n}\n";
         let result = format(input, &config).unwrap();
         assert_eq!(result, expected);
     }
@@ -2963,8 +2963,8 @@ mod tests {
     #[test]
     fn format_fn_def_with_return_type() {
         let config = FormatConfig::default();
-        let input = "fn greet(name:string):string {\n  name\n}\n";
-        let expected = "fn greet(name: string): string {\n  name\n}\n";
+        let input = "fn greet(name:String):String {\n  name\n}\n";
+        let expected = "fn greet(name: String): String {\n  name\n}\n";
         let result = format(input, &config).unwrap();
         assert_eq!(result, expected);
     }
@@ -2991,26 +2991,26 @@ mod tests {
     fn format_custom_schema_type_annotations() {
         let config = FormatConfig::default();
 
-        // Custom type in arguments block
-        let input = "arguments {\nvpc_cidr: cidr\nserver_ip: ipv4_address\n}\n";
+        // Custom type in arguments block — PascalCase per Strategy Y.
+        let input = "arguments {\nvpc_cidr: Cidr\nserver_ip: Ipv4Address\n}\n";
         let result = format(input, &config).unwrap();
         assert!(
-            result.contains("vpc_cidr") && result.contains("cidr"),
-            "Expected 'vpc_cidr' and 'cidr' in:\n{}",
+            result.contains("vpc_cidr") && result.contains("Cidr"),
+            "Expected 'vpc_cidr' and 'Cidr' in:\n{}",
             result
         );
         assert!(
-            result.contains("server_ip") && result.contains("ipv4_address"),
-            "Expected 'server_ip' and 'ipv4_address' in:\n{}",
+            result.contains("server_ip") && result.contains("Ipv4Address"),
+            "Expected 'server_ip' and 'Ipv4Address' in:\n{}",
             result
         );
 
         // Custom type in fn param
-        let input = "fn f(addr: arn) {\n  addr\n}\n";
+        let input = "fn f(addr: Arn) {\n  addr\n}\n";
         let result = format(input, &config).unwrap();
         assert!(
-            result.contains("addr: arn"),
-            "Expected 'addr: arn' in:\n{}",
+            result.contains("addr: Arn"),
+            "Expected 'addr: Arn' in:\n{}",
             result
         );
     }
@@ -3018,7 +3018,7 @@ mod tests {
     #[test]
     fn test_format_require_statement() {
         let input = r#"arguments {
-  port: int
+  port: Int
 }
 require   port >= 1 && port <= 65535  , "port must be valid"
 "#;

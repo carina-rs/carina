@@ -839,7 +839,7 @@ mod tests {
         let input = r#"
             arguments {
                 vpc: aws.vpc
-                enable_https: bool = true
+                enable_https: Bool = true
             }
             attributes {
                 sg: aws.security_group = web_sg.id

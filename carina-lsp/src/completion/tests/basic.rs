@@ -122,8 +122,8 @@ fn module_parameter_completion_with_directory_module() {
     let module_content = r#"
 arguments {
 vpc: aws.ec2.Vpc
-cidr_blocks: list(cidr)
-enable_https: bool = true
+cidr_blocks: list(Cidr)
+enable_https: Bool = true
 }
 
 let web_sg = aws.ec2.SecurityGroup {
@@ -877,7 +877,7 @@ fn context_detection_type_position_in_fn_parameter() {
 #[test]
 fn context_detection_type_position_in_fn_return_type() {
     let provider = test_provider();
-    let text = "fn greet(name: string): ";
+    let text = "fn greet(name: String): ";
     let context = provider.get_completion_context(
         text,
         Position {
@@ -895,7 +895,7 @@ fn context_detection_type_position_in_fn_return_type() {
 #[test]
 fn context_detection_not_type_position_inside_fn_body() {
     let provider = test_provider();
-    let text = "fn greet(name: string) {\n  let x = ";
+    let text = "fn greet(name: String) {\n  let x = ";
     let context = provider.get_completion_context(
         text,
         Position {
@@ -1081,7 +1081,7 @@ fn module_call_scaffolding_includes_arguments() {
     std::fs::create_dir_all(&module_dir).unwrap();
     std::fs::write(
         module_dir.join("main.crn"),
-        "arguments {\n  name: string\n  port: int\n}\n",
+        "arguments {\n  name: String\n  port: Int\n}\n",
     )
     .unwrap();
 
@@ -1326,7 +1326,7 @@ fn import_path_completion_lists_directories_only() {
     std::fs::create_dir_all(&modules_dir).unwrap();
     std::fs::write(
         modules_dir.join("web.crn"),
-        "arguments {\n  name: string\n}\n",
+        "arguments {\n  name: String\n}\n",
     )
     .unwrap();
     std::fs::create_dir_all(modules_dir.join("shared")).unwrap();

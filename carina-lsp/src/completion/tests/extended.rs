@@ -657,7 +657,7 @@ fn builtin_function_completions_have_function_kind_and_signature() {
     assert_eq!(join.kind, Some(CompletionItemKind::FUNCTION));
     assert_eq!(
         join.detail.as_deref(),
-        Some("join(separator: string, list: list) -> string")
+        Some("join(separator: String, list: list) -> String")
     );
     assert_eq!(join.insert_text.as_deref(), Some("join($0)"));
     assert_eq!(join.insert_text_format, Some(InsertTextFormat::SNIPPET));
@@ -1643,7 +1643,7 @@ fn set_up_upstream_project(
 fn upstream_state_dot_completion_in_for_iterable_lists_exports() {
     let provider = test_provider();
     let (_tmp, base) = set_up_upstream_project(
-        "exports {\n  accounts: map(string) = \"x\"\n  region: string = \"ap-northeast-1\"\n}\n",
+        "exports {\n  accounts: map(String) = \"x\"\n  region: String = \"ap-northeast-1\"\n}\n",
         "let orgs = upstream_state { source = '../organizations' }\nfor _, id in orgs.\n",
     );
     let main_src = std::fs::read_to_string(base.join("main.crn")).unwrap();
@@ -1679,7 +1679,7 @@ fn upstream_state_dot_completion_cross_file_binding() {
     std::fs::create_dir(&upstream).unwrap();
     std::fs::write(
         upstream.join("exports.crn"),
-        "exports {\n  accounts: map(string) = \"x\"\n}\n",
+        "exports {\n  accounts: map(String) = \"x\"\n}\n",
     )
     .unwrap();
     let base = tmp.path().join("downstream");
@@ -1712,7 +1712,7 @@ fn upstream_state_dot_completion_text_edit_replaces_partial() {
     // accepting `accounts` yields `orgs.accounts`, not `orgs.accaccounts`.
     let provider = test_provider();
     let (_tmp, base) = set_up_upstream_project(
-        "exports {\n  accounts: map(string) = \"x\"\n}\n",
+        "exports {\n  accounts: map(String) = \"x\"\n}\n",
         "let orgs = upstream_state { source = '../organizations' }\nfor _, id in orgs.acc\n",
     );
     let main_src = std::fs::read_to_string(base.join("main.crn")).unwrap();
@@ -1769,7 +1769,7 @@ fn upstream_state_dot_completion_ignores_unrelated_let_source() {
     std::fs::create_dir(&upstream).unwrap();
     std::fs::write(
         upstream.join("exports.crn"),
-        "exports {\n  accounts: map(string) = \"x\"\n}\n",
+        "exports {\n  accounts: map(String) = \"x\"\n}\n",
     )
     .unwrap();
     let other = tmp.path().join("other");
@@ -1801,14 +1801,14 @@ for _, id in orgs.
 }
 
 // #2128: surface the export's declared `TypeExpr` in the completion
-// detail so the user sees `map(aws_account_id)` instead of the generic
+// detail so the user sees `map(AwsAccountId)` instead of the generic
 // "export from upstream_state `orgs`". Untyped exports keep the fallback
 // phrasing.
 #[test]
 fn upstream_state_dot_completion_detail_shows_type_expr() {
     let provider = test_provider();
     let (_tmp, base) = set_up_upstream_project(
-        "exports {\n  accounts: map(aws_account_id) = \"x\"\n  untyped = \"y\"\n}\n",
+        "exports {\n  accounts: map(AwsAccountId) = \"x\"\n  untyped = \"y\"\n}\n",
         "let orgs = upstream_state { source = '../organizations' }\nfor _, id in orgs.\n",
     );
     let main_src = std::fs::read_to_string(base.join("main.crn")).unwrap();
@@ -1863,7 +1863,7 @@ fn exports_value_position_excludes_region_pollution() {
     let provider = test_provider();
     let source = "\
 exports {
-  accounts: map(string) = {
+  accounts: map(String) = {
     k = re
   }
 }
@@ -1878,7 +1878,7 @@ exports {
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         !labels.iter().any(|l| l.contains(".Region.")),
-        "no region literals at map(string) value position, got: {:?}",
+        "no region literals at map(String) value position, got: {:?}",
         labels
     );
 }
@@ -1891,13 +1891,13 @@ fn exports_top_level_value_excludes_region_pollution() {
     let provider = test_provider();
     let source = "\
 exports {
-  id: string = re
+  id: String = re
 }
 ";
     let doc = create_document(source);
     let position = Position {
         line: 1,
-        character: "  id: string = re".chars().count() as u32,
+        character: "  id: String = re".chars().count() as u32,
     };
 
     let completions = provider.complete(&doc, position, None);
@@ -2048,12 +2048,12 @@ fn string_returning_builtins_still_offered_for_plain_string_attr() {
 #[test]
 fn for_loop_binding_not_offered_at_incompatible_enum_attribute() {
     // `for _, account_id in orgs.accounts` where `orgs.accounts` is
-    // `map(aws_account_id)`. Inside the body, `principal_type` is a
+    // `map(AwsAccountId)`. Inside the body, `principal_type` is a
     // `StringEnum` — `account_id` (semantic type `aws_account_id`)
     // can't type-check as `PrincipalType`, so it must be filtered out.
     let provider = test_provider_with_custom_semantic_attr();
     let (_tmp, base) = set_up_upstream_project(
-        "exports {\n  accounts: map(aws_account_id) = \"x\"\n}\n",
+        "exports {\n  accounts: map(AwsAccountId) = \"x\"\n}\n",
         r#"let orgs = upstream_state { source = '../organizations' }
 for _, account_id in orgs.accounts {
   awscc.sso.Assignment {
@@ -2084,7 +2084,7 @@ fn for_loop_binding_offered_at_matching_custom_attribute() {
     // matches, so it must appear.
     let provider = test_provider_with_custom_semantic_attr();
     let (_tmp, base) = set_up_upstream_project(
-        "exports {\n  accounts: map(aws_account_id) = \"x\"\n}\n",
+        "exports {\n  accounts: map(AwsAccountId) = \"x\"\n}\n",
         r#"let orgs = upstream_state { source = '../organizations' }
 for _, account_id in orgs.accounts {
   awscc.sso.Assignment {
@@ -2137,7 +2137,7 @@ fn for_loop_binding_without_resolvable_iterable_falls_back_to_unconditional() {
     );
 }
 
-/// Top-level `exports { region: string = ▉ }` must offer string-
+/// Top-level `exports { region: String = ▉ }` must offer string-
 /// returning built-in helpers. The annotation sits on the same line;
 /// the LSP previously returned nothing because the type was ignored.
 #[test]
@@ -2145,20 +2145,20 @@ fn exports_top_level_string_position_offers_string_builtins() {
     let provider = test_provider();
     let doc = create_document(
         r#"exports {
-  region: string =
+  region: String =
 }
 "#,
     );
     let position = Position {
         line: 1,
-        character: "  region: string = ".chars().count() as u32,
+        character: "  region: String = ".chars().count() as u32,
     };
     let completions = provider.complete(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     for expected in ["join", "lower", "upper", "trim"] {
         assert!(
             labels.contains(&expected),
-            "string-returning built-in '{}' must appear at `exports {{ region: string = ▉ }}`. Got: {:?}",
+            "string-returning built-in '{}' must appear at `exports {{ region: String = ▉ }}`. Got: {:?}",
             expected,
             labels
         );
@@ -2172,13 +2172,13 @@ fn exports_top_level_string_position_excludes_non_string_builtins() {
     let provider = test_provider();
     let doc = create_document(
         r#"exports {
-  region: string =
+  region: String =
 }
 "#,
     );
     let position = Position {
         line: 1,
-        character: "  region: string = ".chars().count() as u32,
+        character: "  region: String = ".chars().count() as u32,
     };
     let completions = provider.complete(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
@@ -2201,7 +2201,7 @@ fn exports_map_value_position_filters_by_element_type() {
     let provider = test_provider();
     let doc = create_document(
         r#"exports {
-  accounts: map(aws_account_id) = {
+  accounts: map(AwsAccountId) = {
     registry_prod = x
   }
 }
@@ -2219,12 +2219,12 @@ fn exports_map_value_position_filters_by_element_type() {
     // not appear.
     assert!(
         !labels.contains(&"replace"),
-        "`replace` must not be suggested inside a `map(aws_account_id)` value position. Got: {:?}",
+        "`replace` must not be suggested inside a `map(AwsAccountId)` value position. Got: {:?}",
         labels
     );
     assert!(
         !labels.contains(&"join"),
-        "`join` must not be suggested inside a `map(aws_account_id)` value position. Got: {:?}",
+        "`join` must not be suggested inside a `map(AwsAccountId)` value position. Got: {:?}",
         labels
     );
 }
@@ -2264,7 +2264,7 @@ fn exports_map_value_real_world_shape_filters_unrelated_builtins() {
     let provider = test_provider();
     let source = "\
 exports {
-  accounts: map(aws_account_id) = {
+  accounts: map(AwsAccountId) = {
     registry_prod = registry_prod.account_id
     registry_dev  = re
   }
@@ -2280,7 +2280,7 @@ exports {
     for banned in ["replace", "join", "lower", "upper", "trim", "env", "lookup"] {
         assert!(
             !labels.contains(&banned),
-            "String-returning '{}' must not appear in a `map(aws_account_id)` value position. Got: {:?}",
+            "String-returning '{}' must not appear in a `map(AwsAccountId)` value position. Got: {:?}",
             banned,
             labels
         );
@@ -2320,7 +2320,7 @@ let registry_prod = awscc.organizations.account {
 }
 
 exports {
-  accounts: map(aws_account_id) = {
+  accounts: map(AwsAccountId) = {
     registry_prod = re
   }
 }
@@ -2334,7 +2334,7 @@ exports {
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"registry_prod.account_id"),
-        "expected `registry_prod.account_id` at `map(aws_account_id)` value position. Got: {:?}",
+        "expected `registry_prod.account_id` at `map(AwsAccountId)` value position. Got: {:?}",
         labels
     );
 }
@@ -2346,7 +2346,7 @@ fn exports_list_value_position_filters_by_element_type() {
     let provider = test_provider();
     let doc = create_document(
         r#"exports {
-  items: list(string) = [
+  items: list(String) = [
     re
   ]
 }
@@ -2372,7 +2372,7 @@ fn exports_list_value_position_filters_by_element_type() {
 }
 
 /// Repro: in the real `organizations/exports.crn`, the user types
-/// `registry_dev = r|` at depth 2 (inside the `map(aws_account_id)`
+/// `registry_dev = r|` at depth 2 (inside the `map(AwsAccountId)`
 /// body with a preceding entry on the line above). LSP currently
 /// returns zero LSP items — VSCode falls back to word-based. We
 /// expect matching resource-ref refs.
@@ -2409,7 +2409,7 @@ let registry_dev = awscc.organizations.account {
 }
 
 exports {
-  accounts: map(aws_account_id) = {
+  accounts: map(AwsAccountId) = {
     registry_prod = r
     registry_dev = r
   }
@@ -2466,7 +2466,7 @@ fn exports_map_value_includes_bindings_from_sibling_files() {
     .unwrap();
     let exports_src = "\
 exports {
-  accounts: map(aws_account_id) = {
+  accounts: map(AwsAccountId) = {
     registry_prod = r
   }
 }
@@ -2568,7 +2568,7 @@ fn argument_parameters_include_sibling_file_args() {
     let base = tmp.path();
     std::fs::write(
         base.join("arguments.crn"),
-        "arguments {\n  stage_name: string\n}\n",
+        "arguments {\n  stage_name: String\n}\n",
     )
     .unwrap();
     let main_src = "\

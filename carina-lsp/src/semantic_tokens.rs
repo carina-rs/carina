@@ -1187,9 +1187,9 @@ mod tests {
             "provider aws { region = aws.Region.ap_northeast_1 }",
             "backend s3 { bucket = \"b\" }",
             "let orgs = upstream_state { source = \"../o\" }",
-            "attributes { a: string = \"x\" }",
-            "arguments { a: string }",
-            "exports { a: string = \"x\" }",
+            "attributes { a: String = \"x\" }",
+            "arguments { a: String }",
+            "exports { a: String = \"x\" }",
             "import { to = aws.s3_bucket \"x\" }",
             "moved { from = aws.s3_bucket \"a\" to = aws.s3_bucket \"b\" }",
             "removed { from = aws.s3_bucket \"x\" }",
@@ -1262,9 +1262,10 @@ mod tests {
 
     #[test]
     fn semantic_tokens_does_not_tag_lowercase_after_colon_as_type() {
-        // A lowercase identifier after `:` is either the old spelling (still
-        // accepted by the parser but not a bare PascalCase type) or a
-        // binding/property name; don't emit a type token for it.
+        // A lowercase identifier after `:` is no longer a valid type (Phase
+        // C rejects the old spellings at parse time), and in any case is a
+        // binding/property name in the editor — it must not be tagged as
+        // a TYPE token.
         let provider = SemanticTokensProvider::new(&[]);
         let line = "    port: int";
         let tokens = provider.tokenize_line(line, 0);

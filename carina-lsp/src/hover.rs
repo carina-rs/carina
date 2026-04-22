@@ -995,7 +995,7 @@ awscc.ec2.vpc_gateway_attachment {
             "Should have function name header"
         );
         assert!(
-            content.contains("join(separator: string, list: list) -> string"),
+            content.contains("join(separator: String, list: list) -> String"),
             "Should show signature. Got:\n{}",
             content
         );
@@ -1023,7 +1023,7 @@ awscc.ec2.vpc_gateway_attachment {
         };
 
         assert!(
-            content.contains("cidr_subnet(prefix: string, newbits: int, netnum: int) -> string"),
+            content.contains("cidr_subnet(prefix: String, newbits: Int, netnum: Int) -> String"),
             "Should show cidr_subnet signature. Got:\n{}",
             content
         );
@@ -1192,10 +1192,10 @@ awscc.ec2.vpc_gateway_attachment {
     #[test]
     fn test_no_builtin_hover_for_map_in_type_annotation() {
         let provider = HoverProvider::new(Arc::new(HashMap::new()), vec![]);
-        // Line 1 (0-indexed): "  accounts: map(aws_account_id) = {"
+        // Line 1 (0-indexed): "  accounts: map(AwsAccountId) = {"
         // Position on "map" → should NOT show function hover
         let doc = Document::new(
-            "exports {\n  accounts: map(aws_account_id) = {}\n}".to_string(),
+            "exports {\n  accounts: map(AwsAccountId) = {}\n}".to_string(),
             Arc::new(ProviderContext::default()),
         );
         // Column 14 is inside "map" on line 1

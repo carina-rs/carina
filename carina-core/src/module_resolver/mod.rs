@@ -1794,7 +1794,7 @@ mod tests {
         let tmp_root = std::env::temp_dir().join("carina_test_module_rejects_file");
         let _ = fs::remove_dir_all(&tmp_root);
         fs::create_dir_all(&tmp_root).unwrap();
-        fs::write(tmp_root.join("single.crn"), "arguments {\n  x: string\n}\n").unwrap();
+        fs::write(tmp_root.join("single.crn"), "arguments {\n  x: String\n}\n").unwrap();
 
         let mut resolver = ModuleResolver::new(&tmp_root);
         let err = resolver
@@ -2680,7 +2680,7 @@ mod tests {
         fs::write(tmp_dir.join("main.crn"), "# main module file\n").unwrap();
         fs::write(
             tmp_dir.join("arguments.crn"),
-            "arguments {\n  env: string\n}\n",
+            "arguments {\n  env: String\n}\n",
         )
         .unwrap();
         fs::write(
@@ -2718,11 +2718,11 @@ mod tests {
         fs::create_dir_all(&tmp_dir).unwrap();
 
         // Create files out of lexicographic order to make the sort observable.
-        fs::write(tmp_dir.join("z_last.crn"), "arguments {\n  c: string\n}\n").unwrap();
-        fs::write(tmp_dir.join("a_first.crn"), "arguments {\n  a: string\n}\n").unwrap();
+        fs::write(tmp_dir.join("z_last.crn"), "arguments {\n  c: String\n}\n").unwrap();
+        fs::write(tmp_dir.join("a_first.crn"), "arguments {\n  a: String\n}\n").unwrap();
         fs::write(
             tmp_dir.join("m_middle.crn"),
-            "arguments {\n  b: string\n}\n",
+            "arguments {\n  b: String\n}\n",
         )
         .unwrap();
 

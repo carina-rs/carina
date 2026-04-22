@@ -483,7 +483,7 @@ region = awscc.Region.ap_northeast_1
 }
 
 attributes {
-    sg_id: string = nonexistent.id
+    sg_id: String = nonexistent.id
 }"#,
     );
 
@@ -512,7 +512,7 @@ group_description = "Test security group"
 }
 
 attributes {
-    sg_id: string = sg.group_id
+    sg_id: String = sg.group_id
 }"#,
     );
 
@@ -537,7 +537,7 @@ region = awscc.Region.ap_northeast_1
 }
 
 attributes {
-    flag: string = true
+    flag: String = true
 }"#,
     );
 
@@ -566,10 +566,10 @@ group_description = "Test security group"
 }
 
 attributes {
-    sg_id: string = sg.group_id
-    name: string = "hello"
-    enabled: bool = true
-    count: int = 42
+    sg_id: String = sg.group_id
+    name: String = "hello"
+    enabled: Bool = true
+    count: Int = 42
 }"#,
     );
 
@@ -648,7 +648,7 @@ region = awscc.Region.ap_northeast_1
 }
 
 attributes {
-    flag: string = true
+    flag: String = true
 }"#,
     );
 
@@ -733,7 +733,7 @@ fn provider_in_module_emits_error() {
     let engine = test_engine();
     let doc = create_document(
         r#"arguments {
-    vpc_cidr: string
+    vpc_cidr: String
 }
 
 provider awscc {
@@ -1081,7 +1081,7 @@ region = awscc.Region.ap_northeast_1
 }
 
 attributes {
-    ip: ipv4_address = "not-an-ip"
+    ip: Ipv4Address = "not-an-ip"
 }"#,
     );
 
@@ -1106,7 +1106,7 @@ region = awscc.Region.ap_northeast_1
 }
 
 attributes {
-    ip: ipv4_address = "192.168.1.1"
+    ip: Ipv4Address = "192.168.1.1"
 }"#,
     );
 
@@ -1131,7 +1131,7 @@ region = awscc.Region.ap_northeast_1
 }
 
 attributes {
-    network: ipv4_cidr = "not-a-cidr"
+    network: Ipv4Cidr = "not-a-cidr"
 }"#,
     );
 
@@ -1156,7 +1156,7 @@ region = awscc.Region.ap_northeast_1
 }
 
 attributes {
-    addr: ipv6_address = "not-ipv6"
+    addr: Ipv6Address = "not-ipv6"
 }"#,
     );
 
@@ -1324,7 +1324,7 @@ region = awscc.Region.ap_northeast_1
 }
 
 attributes {
-    net6: ipv6_cidr = "not-a-cidr"
+    net6: Ipv6Cidr = "not-a-cidr"
 }"#,
     );
 
@@ -1735,7 +1735,7 @@ fn exports_cross_file_ref_no_false_positive() {
     // exports.crn parsed alone: "registry_prod.account_id" stays as String
     let doc = create_document(
         r#"exports {
-  accounts: list(aws_account_id) = [
+  accounts: list(AwsAccountId) = [
     registry_prod.account_id,
   ]
 }"#,
@@ -1758,7 +1758,7 @@ fn exports_type_warning_survives_formatter_round_trip() {
     use carina_core::formatter::{FormatConfig, format};
 
     let original = r#"exports {
-  values: list(bool) = [
+  values: list(Bool) = [
     "nope",
   ]
 }"#;
@@ -1777,7 +1777,7 @@ fn exports_type_warning_survives_formatter_round_trip() {
         .find(|d| d.message.contains("expected Bool, got string"))
         .map(|d| d.message.clone());
 
-    assert_eq!(formatted, "exports {\n  values: list(bool) = ['nope']\n}\n");
+    assert_eq!(formatted, "exports {\n  values: list(Bool) = ['nope']\n}\n");
     assert_eq!(before_warning, after_warning);
     assert!(
         after_warning.is_some(),
@@ -1804,7 +1804,7 @@ fn exports_ref_type_warning_survives_formatter_round_trip() {
 }
 
 exports {
-  values: list(string) = [
+  values: list(String) = [
     item.enabled,
   ]
 }"#;
@@ -1824,7 +1824,7 @@ exports {
 
     assert_eq!(
         formatted,
-        "let item = test.sample.resource {\n  enabled = true\n}\n\nexports {\n  values: list(string) = [item.enabled]\n}\n"
+        "let item = test.sample.resource {\n  enabled = true\n}\n\nexports {\n  values: list(String) = [item.enabled]\n}\n"
     );
     assert_eq!(before_warning, after_warning);
     assert!(
@@ -1852,7 +1852,7 @@ fn exports_ref_type_warning_survives_document_reparse_after_format_edit() {
 }
 
 exports {
-  values: list(string) = [
+  values: list(String) = [
     item.enabled,
   ]
 }"#;
@@ -1904,7 +1904,7 @@ fn exports_type_warning_after_format_with_cross_file_ref() {
     // After format-on-save, list is on one line. User changes string→bool.
     let doc = create_document(
         r#"exports {
-  accounts: list(bool) = [registry_prod.account_id, registry_dev.account_id]
+  accounts: list(Bool) = [registry_prod.account_id, registry_dev.account_id]
 }"#,
     );
     let diagnostics = engine.analyze(&doc, None);
@@ -1935,7 +1935,7 @@ fn exports_type_warning_for_literal_mismatch() {
     let engine = test_engine();
     let doc = create_document(
         r#"exports {
-  flag: bool = 'hello'
+  flag: Bool = 'hello'
 }"#,
     );
     let diagnostics = engine.analyze(&doc, None);
@@ -1957,7 +1957,7 @@ fn exports_type_warning_for_literal_mismatch() {
 fn exports_type_warning_multiline_vs_oneline() {
     let engine = test_engine();
     // Multi-line (before format)
-    let doc_multi = create_document("exports {\n  flag: bool = 'hello'\n}");
+    let doc_multi = create_document("exports {\n  flag: Bool = 'hello'\n}");
     let diag_multi = engine.analyze(&doc_multi, None);
     eprintln!(
         "multi-line: {:?}",
@@ -1966,10 +1966,10 @@ fn exports_type_warning_multiline_vs_oneline() {
 
     // After user types but before format - with wrong type and literal
     let doc_literal =
-        create_document("exports {\n  accounts: list(bool) = ['literal1', 'literal2']\n}");
+        create_document("exports {\n  accounts: list(Bool) = ['literal1', 'literal2']\n}");
     let diag_literal = engine.analyze(&doc_literal, None);
     eprintln!(
-        "literal list(bool): {:?}",
+        "literal list(Bool): {:?}",
         diag_literal.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
@@ -1995,7 +1995,7 @@ fn exports_map_type_warning_for_cross_file_ref() {
         "let registry_prod = awscc.organizations.account { name = 'prod' }\nlet registry_dev = awscc.organizations.account { name = 'dev' }\n",
     )
     .unwrap();
-    let exports = "exports {\n  accounts: map(bool) = {\n    prod = registry_prod.account_id\n    dev  = registry_dev.account_id\n  }\n}";
+    let exports = "exports {\n  accounts: map(Bool) = {\n    prod = registry_prod.account_id\n    dev  = registry_dev.account_id\n  }\n}";
     std::fs::write(base.join("exports.crn"), exports).unwrap();
 
     let diagnostics = analyze_with_buffer(&engine, &base, "exports.crn", exports);
@@ -2005,7 +2005,7 @@ fn exports_map_type_warning_for_cross_file_ref() {
         .find(|d| d.message.contains("type mismatch") || d.message.contains("expected"));
     assert!(
         type_warning.is_some(),
-        "Should warn about map(bool) vs String account_id. Got: {:?}",
+        "Should warn about map(Bool) vs String account_id. Got: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
@@ -2025,7 +2025,7 @@ fn no_undefined_resource_for_sibling_binding_in_exports() {
         "let registry_prod = awscc.organizations.account { name = 'prod' }\nlet registry_dev = awscc.organizations.account { name = 'dev' }\n",
     )
     .unwrap();
-    let exports = "exports {\n  accounts: map(aws_account_id) = {\n    prod = registry_prod.account_id\n    dev = registry_dev.account_id\n  }\n}\n";
+    let exports = "exports {\n  accounts: map(AwsAccountId) = {\n    prod = registry_prod.account_id\n    dev = registry_dev.account_id\n  }\n}\n";
     std::fs::write(base.join("exports.crn"), exports).unwrap();
 
     let diagnostics = analyze_with_buffer(&engine, &base, "exports.crn", exports);
@@ -2183,7 +2183,7 @@ for name, _ in orgs.account {
 }
 "#,
         Some(
-            r#"exports { accounts: string = "x" }
+            r#"exports { accounts: String = "x" }
 "#,
         ),
     );
@@ -2213,7 +2213,7 @@ for name, _ in orgs.accounts {
 }
 "#,
         Some(
-            r#"exports { accounts: string = "x" }
+            r#"exports { accounts: String = "x" }
 "#,
         ),
     );
@@ -2240,7 +2240,7 @@ fn upstream_state_buffer_differs_from_disk_uses_buffer() {
 let x = orgs.accounts
 "#,
         Some(
-            r#"exports { accounts: string = "x" }
+            r#"exports { accounts: String = "x" }
 "#,
         ),
     );
@@ -2269,7 +2269,7 @@ fn upstream_state_buffer_fix_clears_diagnostic() {
 let x = orgs.account
 "#,
         Some(
-            r#"exports { accounts: string = "x" }
+            r#"exports { accounts: String = "x" }
 "#,
         ),
     );
@@ -2299,7 +2299,7 @@ fn upstream_state_buffer_retypo_reflags() {
 let x = orgs.accounts
 "#,
         Some(
-            r#"exports { accounts: string = "x" }
+            r#"exports { accounts: String = "x" }
 "#,
         ),
     );
@@ -2330,7 +2330,7 @@ fn upstream_state_cross_file_declaration_is_checked() {
     std::fs::create_dir(&upstream).unwrap();
     std::fs::write(
         upstream.join("exports.crn"),
-        r#"exports { accounts: string = "x" }
+        r#"exports { accounts: String = "x" }
 "#,
     )
     .unwrap();
@@ -2387,7 +2387,7 @@ for other, _ in orgs.bad {
 }
 "#,
         Some(
-            r#"exports { accounts: string = "x" }
+            r#"exports { accounts: String = "x" }
 "#,
         ),
     );
@@ -2488,7 +2488,7 @@ for name, _ in org.accounts {
 }
 "#,
         Some(
-            r#"exports { accounts: string = "x" }
+            r#"exports { accounts: String = "x" }
 "#,
         ),
     );
@@ -2519,7 +2519,7 @@ for name, _ in orgs.accounts {
 }
 "#,
         Some(
-            r#"exports { accounts: string = "x" }
+            r#"exports { accounts: String = "x" }
 "#,
         ),
     );
@@ -2546,7 +2546,7 @@ fn for_iterable_undefined_binding_cross_file_is_flagged() {
     std::fs::create_dir(&upstream).unwrap();
     std::fs::write(
         upstream.join("exports.crn"),
-        r#"exports { accounts: string = "x" }
+        r#"exports { accounts: String = "x" }
 "#,
     )
     .unwrap();
@@ -2872,7 +2872,7 @@ fn upstream_state_binding_in_sibling_file_is_not_undefined() {
     std::fs::create_dir(&upstream).unwrap();
     std::fs::write(
         upstream.join("exports.crn"),
-        "exports {\n  accounts: map(aws_account_id) = \"x\"\n}\n",
+        "exports {\n  accounts: map(AwsAccountId) = \"x\"\n}\n",
     )
     .unwrap();
     let base = tmp.path().join("downstream");
@@ -2911,7 +2911,7 @@ fn import_binding_in_sibling_file_is_not_undefined() {
     let tmp = tempfile::tempdir().unwrap();
     let module = tmp.path().join("modules").join("vpc");
     std::fs::create_dir_all(&module).unwrap();
-    std::fs::write(module.join("main.crn"), "arguments {\n  name: string\n}\n").unwrap();
+    std::fs::write(module.join("main.crn"), "arguments {\n  name: String\n}\n").unwrap();
     let base = tmp.path().join("downstream");
     std::fs::create_dir(&base).unwrap();
     std::fs::write(
@@ -3066,7 +3066,7 @@ fn exports_type_check_resolves_resource_binding_from_sibling_file() {
     // String, so we expect a type-mismatch warning — which is what
     // proves the sibling-binding resolution actually happened.
     let exports =
-        "exports {\n  accounts: map(bool) = {\n    prod = registry_prod.account_id\n  }\n}\n";
+        "exports {\n  accounts: map(Bool) = {\n    prod = registry_prod.account_id\n  }\n}\n";
     std::fs::write(base.join("exports.crn"), exports).unwrap();
 
     let diagnostics = analyze_with_buffer(&engine, &base, "exports.crn", exports);
@@ -3074,7 +3074,7 @@ fn exports_type_check_resolves_resource_binding_from_sibling_file() {
         diagnostics
             .iter()
             .any(|d| { d.message.contains("type mismatch") || d.message.contains("expected") }),
-        "type-mismatch warning should fire for map(bool) vs String. Got: {:?}",
+        "type-mismatch warning should fire for map(Bool) vs String. Got: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }

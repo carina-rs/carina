@@ -931,7 +931,7 @@ impl CompletionProvider {
                 "'arn:aws:${1:service}:${2:region}:${3:account}:${4:resource}'".to_string(),
             ),
             insert_text_format: Some(InsertTextFormat::SNIPPET),
-            detail: Some("ARN format: arn:partition:service:region:account:resource".to_string()),
+            detail: Some("ARN format: Arn:partition:service:region:account:resource".to_string()),
             ..Default::default()
         }]
     }
@@ -1286,19 +1286,28 @@ fn parse_exports_type_text(text: &str) -> Option<AttributeType> {
         });
     }
     match text {
-        "string" => Some(AttributeType::String),
-        "int" => Some(AttributeType::Int),
-        "float" => Some(AttributeType::Float),
-        "bool" => Some(AttributeType::Bool),
-        name if is_valid_custom_name(name) => Some(AttributeType::Custom {
-            semantic_name: Some(snake_to_pascal(name)),
-            base: Box::new(AttributeType::String),
-            pattern: None,
-            length: None,
-            validate: noop_validate,
-            namespace: None,
-            to_dsl: None,
-        }),
+        // Post-Phase C, primitive types are PascalCase. Accept only the new
+        // spellings at the surface.
+        "String" => Some(AttributeType::String),
+        "Int" => Some(AttributeType::Int),
+        "Float" => Some(AttributeType::Float),
+        "Bool" => Some(AttributeType::Bool),
+        // Custom types also ship in PascalCase now (e.g. `AwsAccountId`,
+        // `Ipv4Cidr`). Carry the PascalCase form as `semantic_name` and
+        // canonicalise the internal key to snake_case.
+        name if name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+            && name.chars().all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            Some(AttributeType::Custom {
+                semantic_name: Some(name.to_string()),
+                base: Box::new(AttributeType::String),
+                pattern: None,
+                length: None,
+                validate: noop_validate,
+                namespace: None,
+                to_dsl: None,
+            })
+        }
         _ => None,
     }
 }
@@ -1311,12 +1320,6 @@ fn strip_generic<'a>(prefix: &str, text: &'a str) -> Option<&'a str> {
     let rest = rest.strip_prefix('(')?;
     let rest = rest.strip_suffix(')')?;
     Some(rest)
-}
-
-fn is_valid_custom_name(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && s.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
 }
 
 fn noop_validate(_v: &carina_core::resource::Value) -> Result<(), String> {
