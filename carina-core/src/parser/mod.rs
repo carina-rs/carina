@@ -241,7 +241,7 @@ impl std::fmt::Display for TypeExpr {
             TypeExpr::Bool => write!(f, "Bool"),
             TypeExpr::Int => write!(f, "Int"),
             TypeExpr::Float => write!(f, "Float"),
-            TypeExpr::Simple(name) => write!(f, "{}", name),
+            TypeExpr::Simple(name) => write!(f, "{}", snake_to_pascal(name)),
             TypeExpr::List(inner) => write!(f, "list({})", inner),
             TypeExpr::Map(inner) => write!(f, "map({})", inner),
             TypeExpr::Ref(path) => write!(f, "{}", path),
@@ -9856,13 +9856,26 @@ aws.s3.bucket {
     fn type_expr_display_simple() {
         assert_eq!(
             TypeExpr::Simple("ipv4_cidr".to_string()).to_string(),
-            "ipv4_cidr"
+            "Ipv4Cidr"
         );
         assert_eq!(
             TypeExpr::Simple("ipv4_address".to_string()).to_string(),
-            "ipv4_address"
+            "Ipv4Address"
         );
-        assert_eq!(TypeExpr::Simple("arn".to_string()).to_string(), "arn");
+        assert_eq!(TypeExpr::Simple("arn".to_string()).to_string(), "Arn");
+    }
+
+    #[test]
+    fn type_expr_display_simple_is_pascal_case() {
+        assert_eq!(
+            TypeExpr::Simple("aws_account_id".to_string()).to_string(),
+            "AwsAccountId"
+        );
+        assert_eq!(
+            TypeExpr::Simple("ipv4_cidr".to_string()).to_string(),
+            "Ipv4Cidr"
+        );
+        assert_eq!(TypeExpr::Simple("arn".to_string()).to_string(), "Arn");
     }
 
     // --- Issue #1285: Validate fn call arguments for custom types ---

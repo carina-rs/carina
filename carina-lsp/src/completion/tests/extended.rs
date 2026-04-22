@@ -1825,7 +1825,7 @@ fn upstream_state_dot_completion_detail_shows_type_expr() {
         .expect("expected `accounts` in completions");
     let detail = accounts.detail.as_deref().unwrap_or("");
     assert!(
-        detail.contains("map(aws_account_id)"),
+        detail.contains("map(AwsAccountId)"),
         "typed export detail must include the TypeExpr rendering, got: {:?}",
         detail
     );
