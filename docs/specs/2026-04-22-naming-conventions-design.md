@@ -14,7 +14,7 @@ Unify type-name casing conventions across Carina's DSL so that **types are alway
 
 - Primitives: `string` → `String`, `int` → `Int`, `bool` → `Bool`, `float` → `Float`
 - Custom types: `aws_account_id` → `AwsAccountId`, `ipv4_cidr` → `Ipv4Cidr`, `arn` → `Arn`, `iam_policy_arn` → `IamPolicyArn`, etc.
-- Resource kinds: `aws.vpc` → `aws.ec2.Vpc`, `aws.s3.bucket` → `aws.s3.Bucket`, `aws.security_group` → `aws.ec2.SecurityGroup`, etc. (provider and service segments stay lowercase; the final type segment becomes PascalCase)
+- Resource kinds: `aws.vpc` → `aws.ec2.Vpc`, `aws.s3.Bucket` → `aws.s3.Bucket`, `aws.security_group` → `aws.ec2.SecurityGroup`, etc. (provider and service segments stay lowercase; the final type segment becomes PascalCase)
 - Schema types (`awscc.ec2.VpcId`, `awscc.s3.VersioningStatus`): unchanged — already in the target shape.
 - Enum values: normalize **every** enum value to snake_case (strategy 3B). `.Enabled` → `.enabled`, `.GROUP` → `.group`, `.ap_northeast_1` stays.
 
@@ -61,8 +61,8 @@ Z would keep primitives lowercase (`string`, `int`) and change everything else t
 
 ### D2. Resource kinds get the `provider.service.TypeName` shape
 
-Today: `aws.vpc`, `aws.security_group`, `aws.s3.bucket` — inconsistent depth.
-After Y + 4C: **always** `provider.service.TypeName`. `aws.vpc` is rewritten to `aws.ec2.Vpc`; `aws.security_group` to `aws.ec2.SecurityGroup`; `aws.s3.bucket` to `aws.s3.Bucket`.
+Today: `aws.vpc`, `aws.security_group`, `aws.s3.Bucket` — inconsistent depth.
+After Y + 4C: **always** `provider.service.TypeName`. `aws.vpc` is rewritten to `aws.ec2.Vpc`; `aws.security_group` to `aws.ec2.SecurityGroup`; `aws.s3.Bucket` to `aws.s3.Bucket`.
 
 This aligns resource references with the existing schema-type shape (`awscc.ec2.VpcId`) and matches AWS CloudFormation (`AWS::EC2::VPC`) at the structural level. Provider codegen gains the responsibility of producing the `service` segment correctly; this is mechanical.
 
@@ -112,7 +112,7 @@ Every diagnostic that mentions a type name must emit the PascalCase form. `expec
 
 ### D9. State file schema
 
-State JSON (`carina.state.json`) stores resource ids that include the resource kind (`aws.ec2.vpc.web_vpc_abc123`). Under D2 this becomes `aws.ec2.Vpc.web_vpc_abc123`. Rather than write a migrator, old state files become unreadable; users re-plan against empty state (or hand-edit — the format is documented JSON). This is acceptable per D5.
+State JSON (`carina.state.json`) stores resource ids that include the resource kind (`aws.ec2.Vpc.web_vpc_abc123`). Under D2 this becomes `aws.ec2.Vpc.web_vpc_abc123`. Rather than write a migrator, old state files become unreadable; users re-plan against empty state (or hand-edit — the format is documented JSON). This is acceptable per D5.
 
 ## File structure and architecture
 

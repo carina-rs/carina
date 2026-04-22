@@ -23,7 +23,7 @@ backend s3 {
 }
 
 # Resource declarations
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 
   tags = {
@@ -31,7 +31,7 @@ let vpc = awscc.ec2.vpc {
   }
 }
 
-awscc.ec2.internet_gateway {
+awscc.ec2.InternetGateway {
   tags = {
     Name = 'main'
   }
@@ -89,7 +89,7 @@ Resources represent cloud infrastructure objects. A resource block specifies the
 When you do not need to reference a resource elsewhere, declare it without a binding:
 
 ```crn
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 
   tags = {
@@ -105,7 +105,7 @@ The resource is identified in state by its `name` attribute or a hash of its att
 Use `let` to bind a name to a resource so you can reference its attributes:
 
 ```crn
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 
   tags = {
@@ -113,7 +113,7 @@ let vpc = awscc.ec2.vpc {
   }
 }
 
-let subnet = awscc.ec2.subnet {
+let subnet = awscc.ec2.Subnet {
   vpc_id            = vpc.vpc_id
   cidr_block        = '10.0.1.0/24'
   availability_zone = 'ap-northeast-1a'
@@ -136,7 +136,7 @@ let config = {
 Use `let _ =` when you want to evaluate an expression but do not need to reference the result:
 
 ```crn
-let _ = awscc.ec2.vpc_gateway_attachment {
+let _ = awscc.ec2.VpcGatewayAttachment {
   vpc_id              = vpc.vpc_id
   internet_gateway_id = igw.internet_gateway_id
 }
@@ -155,7 +155,7 @@ The returned value can be referenced like any other bound resource:
 ```crn
 let identity = read aws.sts.caller_identity {}
 
-awscc.ec2.ipam_pool {
+awscc.ec2.IpamPool {
   source_resource = {
     resource_owner = identity.account_id
   }
@@ -167,7 +167,7 @@ awscc.ec2.ipam_pool {
 Attributes are key-value pairs inside a resource block:
 
 ```crn
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
   cidr_block           = '10.0.0.0/16'
   enable_dns_support   = true
   enable_dns_hostnames = true
@@ -179,7 +179,7 @@ awscc.ec2.vpc {
 Some resources accept nested blocks for repeated or structured configuration:
 
 ```crn
-awscc.ec2.ipam {
+awscc.ec2.Ipam {
   tier = advanced
 
   operating_region {
@@ -193,7 +193,7 @@ awscc.ec2.ipam {
 Use `let` inside a resource block to create block-scoped variables. These are evaluated during parsing but are not sent to the provider:
 
 ```crn
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
   let base_cidr = '10.0.0.0/16'
 
   cidr_block = base_cidr
@@ -226,11 +226,11 @@ Import an existing cloud resource into Carina's state:
 
 ```crn
 import {
-  to = awscc.ec2.vpc 'imported_vpc'
+  to = awscc.ec2.Vpc 'imported_vpc'
   id = 'vpc-0123456789abcdef0'
 }
 
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 
   tags = {
@@ -245,8 +245,8 @@ Rename a resource in state without destroying and recreating it:
 
 ```crn
 moved {
-  from = awscc.ec2.vpc 'old_name'
-  to   = awscc.ec2.vpc 'new_name'
+  from = awscc.ec2.Vpc 'old_name'
+  to   = awscc.ec2.Vpc 'new_name'
 }
 ```
 
@@ -256,7 +256,7 @@ Remove a resource from Carina's state without deleting the actual cloud resource
 
 ```crn
 removed {
-  from = awscc.ec2.vpc 'old_vpc'
+  from = awscc.ec2.Vpc 'old_vpc'
 }
 ```
 
@@ -269,7 +269,7 @@ let network = upstream_state {
   source = "../network"
 }
 
-awscc.ec2.security_group {
+awscc.ec2.SecurityGroup {
   vpc_id = network.vpc_id
 }
 ```
@@ -297,11 +297,11 @@ All comments are ignored by the parser.
 Define reusable functions with `fn`:
 
 ```crn
-fn tag_name(env: string, service: string): string {
+fn tag_name(env: String, service: String): String {
   join('-', [env, service, 'vpc'])
 }
 
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 
   tags = {

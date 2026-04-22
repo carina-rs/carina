@@ -19,7 +19,7 @@ provider awscc {
 }
 
 let vpcs = for env in ['dev', 'stg'] {
-  awscc.ec2.vpc {
+  awscc.ec2.Vpc {
     cidr_block = '10.0.0.0/16'
 
     tags = {
@@ -38,7 +38,7 @@ Use the `(index, value)` form to access the iteration index:
 
 ```crn
 let vpcs = for (i, env) in ['dev', 'stg'] {
-  awscc.ec2.vpc {
+  awscc.ec2.Vpc {
     cidr_block = cidr_subnet('10.0.0.0/8', 8, i)
 
     tags = {
@@ -62,7 +62,7 @@ let cidrs = {
 }
 
 let vpcs = for name, cidr in cidrs {
-  awscc.ec2.vpc {
+  awscc.ec2.Vpc {
     cidr_block = cidr
 
     tags = {
@@ -79,7 +79,7 @@ The result of a `for` expression is a list. You can access individual elements w
 
 ```crn
 let vpcs = for env in ['dev', 'stg'] {
-  awscc.ec2.vpc {
+  awscc.ec2.Vpc {
     cidr_block = '10.0.0.0/16'
 
     tags = {
@@ -89,7 +89,7 @@ let vpcs = for env in ['dev', 'stg'] {
 }
 
 # Reference the first VPC's attributes
-awscc.ec2.subnet {
+awscc.ec2.Subnet {
   vpc_id            = vpcs[0].vpc_id
   cidr_block        = '10.0.1.0/24'
   availability_zone = 'ap-northeast-1a'
@@ -105,14 +105,14 @@ awscc.ec2.subnet {
 You can define local `let` bindings inside a `for` body:
 
 ```crn
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 }
 
 let subnets = for (i, az) in ['ap-northeast-1a', 'ap-northeast-1c'] {
   let cidr = cidr_subnet('10.0.0.0/16', 8, i)
 
-  awscc.ec2.subnet {
+  awscc.ec2.Subnet {
     vpc_id            = vpc.vpc_id
     cidr_block        = cidr
     availability_zone = az
@@ -140,7 +140,7 @@ Create a resource only when a condition is true:
 let enabled = true
 
 let vpc = if enabled {
-  awscc.ec2.vpc {
+  awscc.ec2.Vpc {
     cidr_block = '10.0.0.0/16'
 
     tags = {
@@ -159,7 +159,7 @@ Use `if`/`else` as a value expression to choose between two values:
 ```crn
 let is_production = true
 
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
   cidr_block = if is_production { '10.0.0.0/16' } else { '172.16.0.0/16' }
 
   tags = {
@@ -182,7 +182,7 @@ let environments = {
 }
 
 let vpcs = for name, cidr in environments {
-  awscc.ec2.vpc {
+  awscc.ec2.Vpc {
     cidr_block           = cidr
     enable_dns_hostnames = if name == 'prd' { true } else { false }
 

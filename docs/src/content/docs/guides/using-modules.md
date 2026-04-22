@@ -13,12 +13,12 @@ Create a file at `modules/network/main.crn`:
 
 ```crn
 arguments {
-  cidr_block : string
-  subnet_cidr: string
-  az         : string
+  cidr_block : String
+  subnet_cidr: String
+  az         : String
 }
 
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block = cidr_block
 
   tags = {
@@ -26,7 +26,7 @@ let vpc = awscc.ec2.vpc {
   }
 }
 
-let subnet = awscc.ec2.subnet {
+let subnet = awscc.ec2.Subnet {
   vpc_id            = vpc.vpc_id
   cidr_block        = subnet_cidr
   availability_zone = az
@@ -37,8 +37,8 @@ let subnet = awscc.ec2.subnet {
 }
 
 attributes {
-  vpc_id   : awscc.ec2.vpc = vpc.vpc_id
-  subnet_id: awscc.ec2.subnet = subnet.subnet_id
+  vpc_id   : awscc.ec2.Vpc = vpc.vpc_id
+  subnet_id: awscc.ec2.Subnet = subnet.subnet_id
 }
 ```
 
@@ -48,12 +48,12 @@ The `arguments` block declares the inputs the module accepts. Each parameter has
 
 ```crn
 arguments {
-  cidr_block: string
-  env_name  : string
+  cidr_block: String
+  env_name  : String
 }
 ```
 
-Supported types include `string`, `bool`, `int`, `float`, `list(string)`, `map(string)`, and resource type references like `awscc.ec2.vpc`.
+Supported types include `string`, `bool`, `int`, `float`, `list(string)`, `map(string)`, and resource type references like `awscc.ec2.Vpc`.
 
 ### Attributes block
 
@@ -61,8 +61,8 @@ The `attributes` block declares the outputs the module exposes to callers:
 
 ```crn
 attributes {
-  vpc_id   : awscc.ec2.vpc = vpc.vpc_id
-  subnet_id: awscc.ec2.subnet = subnet.subnet_id
+  vpc_id   : awscc.ec2.Vpc = vpc.vpc_id
+  subnet_id: awscc.ec2.Subnet = subnet.subnet_id
 }
 ```
 
@@ -102,7 +102,7 @@ let net = network {
 }
 
 # Use module output to create another resource
-awscc.ec2.route_table {
+awscc.ec2.RouteTable {
   vpc_id = net.vpc_id
   tags   = { Name = 'my-route-table' }
 }
@@ -135,9 +135,9 @@ For example, `modules/network_with_rt/main.crn` can import the network module:
 let network = import '../network'
 
 arguments {
-  cidr_block : string
-  subnet_cidr: string
-  az         : string
+  cidr_block : String
+  subnet_cidr: String
+  az         : String
 }
 
 let net = network {
@@ -146,7 +146,7 @@ let net = network {
   az          = az
 }
 
-let rt = awscc.ec2.route_table {
+let rt = awscc.ec2.RouteTable {
   vpc_id = net.vpc_id
 
   tags = {
@@ -155,8 +155,8 @@ let rt = awscc.ec2.route_table {
 }
 
 attributes {
-  vpc_id        : awscc.ec2.vpc = net.vpc_id
-  route_table_id: awscc.ec2.route_table = rt.route_table_id
+  vpc_id        : awscc.ec2.Vpc = net.vpc_id
+  route_table_id: awscc.ec2.RouteTable = rt.route_table_id
 }
 ```
 

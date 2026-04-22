@@ -23,9 +23,9 @@ carina state list [PATH]
 Output shows provider, resource type, and binding name (or resource name) for each resource:
 
 ```
-aws.s3.bucket my_bucket
-aws.ec2.vpc main_vpc
-aws.ec2.subnet public_subnet
+aws.s3.Bucket my_bucket
+aws.ec2.Vpc main_vpc
+aws.ec2.Subnet public_subnet
 ```
 
 Prints "No resources in state." if the state is empty.
@@ -41,9 +41,9 @@ carina state show [OPTIONS] [PATH]
 Output groups attributes under each resource:
 
 ```
-# aws.s3.bucket (my_bucket)
+# aws.s3.Bucket (my_bucket)
   bucket = "my-bucket-name"
-  versioning_status = aws.s3.bucket.VersioningStatus.Enabled
+  versioning_status = aws.s3.Bucket.VersioningStatus.Enabled
 ```
 
 #### Flags

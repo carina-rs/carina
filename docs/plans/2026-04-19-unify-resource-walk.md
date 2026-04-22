@@ -229,7 +229,7 @@ fn for_body_field_error_reported_once_not_twice() {
         r#"
             let orgs = upstream_state { source = "../organizations" }
             for name, _ in orgs.accounts {
-                aws.s3.bucket {
+                aws.s3.Bucket {
                     name = orgs.missing
                 }
             }

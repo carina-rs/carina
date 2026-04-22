@@ -20,7 +20,7 @@ provider awscc {
 The simplest way to define a resource is an **anonymous resource**. Use this when no other resource needs to reference it:
 
 ```crn
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
   cidr_block           = '10.0.0.0/16'
   enable_dns_support   = true
   enable_dns_hostnames = true
@@ -39,11 +39,11 @@ The resource type follows the pattern `<provider>.<service>.<resource_type>`. Ca
 When another resource needs to reference attributes from a resource, use a `let` binding:
 
 ```crn
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 }
 
-awscc.ec2.subnet {
+awscc.ec2.Subnet {
   vpc_id            = vpc.vpc_id
   cidr_block        = '10.0.1.0/24'
   availability_zone = 'ap-northeast-1a'
@@ -59,7 +59,7 @@ Use anonymous resources when the binding is unused. Unnecessary `let` bindings a
 Resource attributes support several value types:
 
 ```crn
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
   # String
   cidr_block = '10.0.0.0/16'
 
@@ -87,7 +87,7 @@ Strings support interpolation with `${}`:
 ```crn
 let env = 'production'
 
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 
   tags = {
@@ -101,11 +101,11 @@ awscc.ec2.vpc {
 Some resources have nested configuration blocks. Repeat the block name to add multiple entries:
 
 ```crn
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 }
 
-awscc.ec2.security_group {
+awscc.ec2.SecurityGroup {
   vpc_id            = vpc.vpc_id
   group_description = 'Web server security group'
 
@@ -136,7 +136,7 @@ awscc.ec2.security_group {
 You can define local variables inside a resource block with `let`. These are scoped to the block and are **not** sent to the provider:
 
 ```crn
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
   let env  = 'production'
   let name = "local-let-${env}"
 
@@ -170,7 +170,7 @@ Carina supports line comments with `//` or `#`, and block comments with `/* ... 
 /* This is a
    block comment */
 
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'  # inline comment
 }
 ```
@@ -184,7 +184,7 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block           = '10.0.0.0/16'
   enable_dns_support   = true
   enable_dns_hostnames = true
@@ -194,7 +194,7 @@ let vpc = awscc.ec2.vpc {
   }
 }
 
-awscc.ec2.subnet {
+awscc.ec2.Subnet {
   vpc_id                  = vpc.vpc_id
   cidr_block              = '10.0.1.0/24'
   availability_zone       = 'ap-northeast-1a'
@@ -205,7 +205,7 @@ awscc.ec2.subnet {
   }
 }
 
-awscc.ec2.route_table {
+awscc.ec2.RouteTable {
   vpc_id = vpc.vpc_id
 
   tags = {

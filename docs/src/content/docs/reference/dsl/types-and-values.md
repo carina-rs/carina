@@ -110,7 +110,7 @@ let config = {
 Maps are also used for resource tags and nested configuration:
 
 ```crn
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 
   tags = {
@@ -129,9 +129,9 @@ Dot-separated identifiers are used for resource types and enum values. They are 
 Resource types use the format `provider.service.resource_type`:
 
 ```crn
-awscc.ec2.vpc { ... }
-awscc.ec2.subnet { ... }
-awscc.s3.bucket { ... }
+awscc.ec2.Vpc { ... }
+awscc.ec2.Subnet { ... }
+awscc.s3.Bucket { ... }
 ```
 
 ### Enum Identifiers
@@ -144,7 +144,7 @@ awscc.Region.ap_northeast_1
 aws.Region.us_east_1
 
 # Resource-level enums
-awscc.ec2.vpc.InstanceTenancy.default
+awscc.ec2.Vpc.InstanceTenancy.default
 ```
 
 Enum identifiers are used directly as attribute values without quotes:
@@ -154,8 +154,8 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-awscc.ec2.vpc {
-  instance_tenancy = awscc.ec2.vpc.InstanceTenancy.default
+awscc.ec2.Vpc {
+  instance_tenancy = awscc.ec2.Vpc.InstanceTenancy.default
 }
 ```
 
@@ -164,11 +164,11 @@ awscc.ec2.vpc {
 When a resource is bound with `let`, its attributes can be accessed using dot notation:
 
 ```crn
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 }
 
-let subnet = awscc.ec2.subnet {
+let subnet = awscc.ec2.Subnet {
   vpc_id     = vpc.vpc_id      # Reference vpc's vpc_id attribute
   cidr_block = '10.0.1.0/24'
 }
@@ -205,12 +205,12 @@ Type expressions are used in `arguments` and `attributes` blocks in modules, and
 
 ```crn
 arguments {
-  name      : string
-  count     : int
-  ratio     : float
-  enabled   : bool
+  name      : String
+  count     : Int
+  ratio     : Float
+  enabled   : Bool
   cidr_block: cidr
-  role_arn  : arn
+  role_arn  : Arn
 }
 ```
 
@@ -232,8 +232,8 @@ Resource types can be used as type expressions to indicate a reference:
 
 ```crn
 attributes {
-  vpc_id   : awscc.ec2.vpc = vpc.vpc_id
-  subnet_id: awscc.ec2.subnet = subnet.subnet_id
+  vpc_id   : awscc.ec2.Vpc = vpc.vpc_id
+  subnet_id: awscc.ec2.Subnet = subnet.subnet_id
 }
 ```
 

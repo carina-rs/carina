@@ -13,12 +13,12 @@ A module is a directory containing one or more `.crn` files that together declar
 # modules/network/main.crn  (any filename works — main.crn is just convention)
 
 arguments {
-  cidr_block : string
-  subnet_cidr: string
-  az         : string
+  cidr_block : String
+  subnet_cidr: String
+  az         : String
 }
 
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block = cidr_block
 
   tags = {
@@ -26,7 +26,7 @@ let vpc = awscc.ec2.vpc {
   }
 }
 
-let subnet = awscc.ec2.subnet {
+let subnet = awscc.ec2.Subnet {
   vpc_id            = vpc.vpc_id
   cidr_block        = subnet_cidr
   availability_zone = az
@@ -37,8 +37,8 @@ let subnet = awscc.ec2.subnet {
 }
 
 attributes {
-  vpc_id   : awscc.ec2.vpc = vpc.vpc_id
-  subnet_id: awscc.ec2.subnet = subnet.subnet_id
+  vpc_id   : awscc.ec2.Vpc = vpc.vpc_id
+  subnet_id: awscc.ec2.Subnet = subnet.subnet_id
 }
 ```
 
@@ -52,9 +52,9 @@ Each parameter has a name and a type:
 
 ```crn
 arguments {
-  cidr_block: string
-  count     : int
-  enabled   : bool
+  cidr_block: String
+  count     : Int
+  enabled   : Bool
 }
 ```
 
@@ -64,9 +64,9 @@ Parameters can have default values:
 
 ```crn
 arguments {
-  cidr_block: string
-  az        : string = 'ap-northeast-1a'
-  enable_dns: bool   = true
+  cidr_block: String
+  az        : String = 'ap-northeast-1a'
+  enable_dns: Bool   = true
 }
 ```
 
@@ -76,7 +76,7 @@ Parameters can use an expanded block form for description, default values, and v
 
 ```crn
 arguments {
-  instance_count: int {
+  instance_count: Int {
     description = 'Number of instances to create'
     default     = 1
     validation {
@@ -85,7 +85,7 @@ arguments {
     }
   }
 
-  cidr_block: string {
+  cidr_block: String {
     description = 'The CIDR block for the VPC'
     validation {
       condition     = length(cidr_block) > 0
@@ -101,14 +101,14 @@ Parameter types can be any [type expression](/reference/dsl/types-and-values/#ty
 
 ```crn
 arguments {
-  name       : string
-  count      : int
-  ratio      : float
-  enabled    : bool
+  name       : String
+  count      : Int
+  ratio      : Float
+  enabled    : Bool
   subnet_ids : list(string)
   tags       : map(string)
   cidr_block : cidr
-  role_arn   : arn
+  role_arn   : Arn
 }
 ```
 
@@ -120,9 +120,9 @@ Each attribute has a name, an optional type, and a value expression:
 
 ```crn
 attributes {
-  vpc_id        : awscc.ec2.vpc = vpc.vpc_id
-  subnet_id     : awscc.ec2.subnet = subnet.subnet_id
-  route_table_id: awscc.ec2.route_table = rt.route_table_id
+  vpc_id        : awscc.ec2.Vpc = vpc.vpc_id
+  subnet_id     : awscc.ec2.Subnet = subnet.subnet_id
+  route_table_id: awscc.ec2.RouteTable = rt.route_table_id
 }
 ```
 
@@ -161,7 +161,7 @@ let net = network {
   az          = 'ap-northeast-1a'
 }
 
-awscc.ec2.security_group {
+awscc.ec2.SecurityGroup {
   vpc_id = net.vpc_id
 }
 ```
@@ -209,9 +209,9 @@ Modules can import and use other modules:
 let network = import '../network'
 
 arguments {
-  cidr_block : string
-  subnet_cidr: string
-  az         : string
+  cidr_block : String
+  subnet_cidr: String
+  az         : String
 }
 
 let net = network {
@@ -220,7 +220,7 @@ let net = network {
   az          = az
 }
 
-let rt = awscc.ec2.route_table {
+let rt = awscc.ec2.RouteTable {
   vpc_id = net.vpc_id
 
   tags = {
@@ -229,8 +229,8 @@ let rt = awscc.ec2.route_table {
 }
 
 attributes {
-  vpc_id        : awscc.ec2.vpc = net.vpc_id
-  route_table_id: awscc.ec2.route_table = rt.route_table_id
+  vpc_id        : awscc.ec2.Vpc = net.vpc_id
+  route_table_id: awscc.ec2.RouteTable = rt.route_table_id
 }
 ```
 

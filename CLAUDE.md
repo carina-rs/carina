@@ -180,17 +180,17 @@ When modifying the DSL or resource schemas, also update the LSP:
 ### Resource Type Mapping
 
 Resource types in DSL use dot notation (`s3.bucket`, `ec2.vpc`). When mapping between DSL resource types and schema lookups:
-- DSL: `aws.s3.bucket` → Schema key: `s3.bucket`
+- DSL: `aws.s3.Bucket` → Schema key: `s3.bucket`
 - Ensure `extract_resource_type()` in `completion/mod.rs` and resource type validation in `diagnostics/mod.rs` use consistent dot notation
 
 ### Validation Formats
 
 - **Region**: Accepts both DSL format (`aws.Region.ap_northeast_1`) and AWS string format (`"ap-northeast-1"`). Validation normalizes both to AWS format for comparison.
-- **S3 Versioning**: Uses enum `Enabled`/`Suspended`, not boolean. AWS SDK returns these exact strings.
+- **S3 Versioning**: Uses enum `.enabled`/`.suspended` in DSL (AWS SDK returns PascalCase `Enabled`/`Suspended`, normalized to snake_case DSL values).
 
 ### Namespaced Enum Identifiers
 
-Enum values use namespaced identifiers like `aws.s3.VersioningStatus.Enabled`.
+Enum values use namespaced identifiers like `aws.s3.Bucket.VersioningStatus.enabled`.
 
 **When adding new namespaced patterns:**
 

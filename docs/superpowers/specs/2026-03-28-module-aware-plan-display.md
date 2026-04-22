@@ -30,9 +30,9 @@ When modules are used, display a structured summary at the top of plan output be
 ```
 Plan Summary:
   root.crn
-    ~ awscc.s3.bucket
+    ~ awscc.s3.Bucket
   modules/network (instance: net, source: modules/network/main.crn)
-    + awscc.ec2.vpc, + awscc.ec2.subnet ×3, + awscc.ec2.nat_gateway
+    + awscc.ec2.Vpc, + awscc.ec2.Subnet ×3, + awscc.ec2.NatGateway
   modules/monitoring (instance: mon, source: modules/monitoring/main.crn)
     + awscc.cloudwatch.metric_alarm ×2
 
@@ -51,10 +51,10 @@ When a module calls another module (e.g., `web_infra` calls `network`), the summ
 ```
 Plan Summary:
   root.crn
-    ~ awscc.s3.bucket
+    ~ awscc.s3.Bucket
   modules/web_infra (instance: web, source: modules/web_infra/main.crn)
     modules/network (instance: web.net, source: modules/network/main.crn)
-      + awscc.ec2.vpc, + awscc.ec2.subnet ×3
+      + awscc.ec2.Vpc, + awscc.ec2.Subnet ×3
     + awscc.ecs.service ×2
 
   8 to add, 1 to change, 0 to destroy.
@@ -89,14 +89,14 @@ Execution Plan:
 
   module: network (instance: net)
 
-    + awscc.ec2.vpc net.vpc
+    + awscc.ec2.Vpc net.vpc
         cidr_block: "10.0.0.0/16"
           │
-          └─ + awscc.ec2.subnet net.subnet
+          └─ + awscc.ec2.Subnet net.subnet
                 vpc_id: net.vpc.vpc_id
                 availability_zone: "ap-northeast-1a"
 
-  + awscc.ec2.security_group sg
+  + awscc.ec2.SecurityGroup sg
       vpc_id: net.vpc.vpc_id
 
 Plan: 3 to add, 0 to change, 0 to destroy.
@@ -113,16 +113,16 @@ Execution Plan:
 
     module: network (instance: web.net)
 
-      + awscc.ec2.vpc web.net.vpc
+      + awscc.ec2.Vpc web.net.vpc
           cidr_block: "10.0.0.0/16"
             │
-            └─ + awscc.ec2.subnet web.net.subnet
+            └─ + awscc.ec2.Subnet web.net.subnet
                   vpc_id: web.net.vpc.vpc_id
 
     + awscc.ecs.service web.app
         cluster: "main"
 
-  + awscc.ec2.security_group sg
+  + awscc.ec2.SecurityGroup sg
       vpc_id: web.net.vpc.vpc_id
 ```
 
@@ -153,7 +153,7 @@ Always show source file path and argument values at the module boundary header.
     source: modules/network/main.crn
     args: cidr_block = "10.0.0.0/16", az = "ap-northeast-1a"
 
-    + awscc.ec2.vpc net.vpc
+    + awscc.ec2.Vpc net.vpc
         cidr_block: "10.0.0.0/16" (← arg: cidr_block)
 ```
 
@@ -166,7 +166,7 @@ Always show source file path and argument values at the module boundary header.
 Show the full definition→substitution→usage chain on each attribute.
 
 ```
-    + awscc.ec2.vpc net.vpc
+    + awscc.ec2.Vpc net.vpc
         cidr_block: "10.0.0.0/16"
                     └─ defined at main.crn:12 → network(cidr_block) → modules/network/main.crn:3
 ```
@@ -186,7 +186,7 @@ $ carina plan example.crn --trace "10.0.0.0/16"
 
     main.crn:12       import "modules/network" { cidr_block = "10.0.0.0/16" }
       ↓ arg: cidr_block
-    modules/network/main.crn:3   awscc.ec2.vpc.cidr_block
+    modules/network/main.crn:3   awscc.ec2.Vpc.cidr_block
 ```
 
 - Default plan output stays clean; detailed tracing is opt-in
@@ -200,7 +200,7 @@ Embed file path and origin as trailing comments on each attribute line.
 ```
   module: network (instance: net)  # modules/network/main.crn
 
-    + awscc.ec2.vpc net.vpc
+    + awscc.ec2.Vpc net.vpc
         cidr_block: "10.0.0.0/16"  # ← arg:cidr_block @ main.crn:12
 ```
 
@@ -318,14 +318,14 @@ Value traceability manifests differently in each:
       → subnet.availability_zone
 
   Resources:
-    awscc.ec2.vpc (vpc)
-    awscc.ec2.subnet (subnet)
+    awscc.ec2.Vpc (vpc)
+    awscc.ec2.Subnet (subnet)
   ```
 
 - **`plan`** shows **concrete values with origin annotations** — the actual values that were passed and where they ended up. This helps operators verify what will be applied.
 
   ```
-    + awscc.ec2.vpc net.vpc
+    + awscc.ec2.Vpc net.vpc
         cidr_block: "10.0.0.0/16" (← arg: cidr_block)
   ```
 

@@ -13,7 +13,7 @@ The `for` expression iterates over a list or map to create multiple resources or
 
 ```crn
 let vpcs = for env in ['dev', 'stg'] {
-  awscc.ec2.vpc {
+  awscc.ec2.Vpc {
     cidr_block = '10.0.0.0/16'
 
     tags = {
@@ -30,7 +30,7 @@ Use `(index, value)` to access both the index and the element:
 
 ```crn
 let vpcs = for (i, env) in ['dev', 'stg'] {
-  awscc.ec2.vpc {
+  awscc.ec2.Vpc {
     cidr_block = cidr_subnet('10.0.0.0/8', 8, i)
 
     tags = {
@@ -52,7 +52,7 @@ let cidrs = {
 }
 
 let vpcs = for name, cidr in cidrs {
-  awscc.ec2.vpc {
+  awscc.ec2.Vpc {
     cidr_block = cidr
 
     tags = {
@@ -93,7 +93,7 @@ The `if` expression conditionally produces a resource or value.
 let is_production = true
 
 if is_production {
-  awscc.ec2.nat_gateway {
+  awscc.ec2.NatGateway {
     allocation_id = eip.allocation_id
     subnet_id     = subnet.subnet_id
   }
@@ -105,7 +105,7 @@ if is_production {
 `if`/`else` can be used inline to choose between values:
 
 ```crn
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
   cidr_block = if is_production { '10.0.0.0/16' } else { '172.16.0.0/16' }
 
   tags = {
@@ -122,7 +122,7 @@ awscc.ec2.vpc {
 if is_production {
   let cidr = '10.0.0.0/16'
 
-  awscc.ec2.vpc {
+  awscc.ec2.Vpc {
     cidr_block = cidr
   }
 }
@@ -138,7 +138,7 @@ let env = 'prod'
 let zones = ['ap-northeast-1a', 'ap-northeast-1c']
 
 # Top-level resource binding
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 }
 
@@ -255,7 +255,7 @@ let result = 'hello-world' |> replace('-', '_')
 Define functions with `fn`. Parameters can have optional type annotations and default values:
 
 ```crn
-fn tag_name(env: string, service: string): string {
+fn tag_name(env: String, service: String): String {
   join('-', [env, service, 'vpc'])
 }
 ```
@@ -268,7 +268,7 @@ Function parameters support:
 - No annotation: `name` (any type accepted)
 
 ```crn
-fn make_tags(env: string, service: string, team: string = 'platform') {
+fn make_tags(env: String, service: String, team: String = 'platform') {
   {
     Environment = env
     Service     = service
@@ -282,7 +282,7 @@ fn make_tags(env: string, service: string, team: string = 'platform') {
 Functions can contain `let` bindings before the return expression:
 
 ```crn
-fn subnet_name(env: string, az: string): string {
+fn subnet_name(env: String, az: String): String {
   let short_az = replace('ap-northeast-1', '', az)
   "${env}-subnet-${short_az}"
 }
@@ -293,7 +293,7 @@ fn subnet_name(env: string, az: string): string {
 The optional return type annotation follows the parameter list with a colon:
 
 ```crn
-fn cidr_for_env(env: string): string {
+fn cidr_for_env(env: String): String {
   lookup({ dev = '10.0.0.0/16', stg = '10.1.0.0/16' }, env, '10.99.0.0/16')
 }
 ```
@@ -325,7 +325,7 @@ Validate expressions are boolean expressions used in `arguments` blocks for inpu
 
 ```crn
 arguments {
-  instance_count: int {
+  instance_count: Int {
     description = 'Number of instances to create'
     default     = 1
     validation {
@@ -340,7 +340,7 @@ Function calls can be used in validate expressions:
 
 ```crn
 arguments {
-  name: string {
+  name: String {
     validation {
       condition     = length(name) > 0
       error_message = 'Name must not be empty'
