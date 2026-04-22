@@ -7,10 +7,10 @@ provider awscc {
 }
 
 moved {
-  from = awscc.ec2.vpc 'old_vpc'
-  to = awscc.ec2.vpc 'new_vpc'
+  from = awscc.ec2.Vpc 'old_vpc'
+  to = awscc.ec2.Vpc 'new_vpc'
 }
 
-let new_vpc = awscc.ec2.vpc {
+let new_vpc = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 }

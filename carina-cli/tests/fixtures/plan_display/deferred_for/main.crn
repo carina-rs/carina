@@ -11,7 +11,7 @@ let orgs = upstream_state {
 let sso_instance_arn = 'arn:aws:sso:::instance/ssoins-12345'
 
 for account_id in orgs.accounts {
-  awscc.sso.assignment {
+  awscc.sso.Assignment {
     instance_arn   = sso_instance_arn
     principal_id   = 'group-abc-123'
     principal_type = 'GROUP'

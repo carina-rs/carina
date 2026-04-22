@@ -1,4 +1,4 @@
 exports {
-  vpc_id: string = vpc.vpc_id
+  vpc_id: String = vpc.vpc_id
   cidr = vpc.cidr_block
 }

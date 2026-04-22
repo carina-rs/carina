@@ -4,7 +4,7 @@ expression: output
 ---
 Execution Plan:
 
-  + awscc.logs.log_group 
+  + awscc.logs.LogGroup 
       log_group_name: "my-app-logs"
       retention_in_days: 30
 

@@ -5,7 +5,7 @@
   "carina_version": "0.1.0",
   "resources": [
     {
-      "resource_type": "ec2.subnet",
+      "resource_type": "ec2.Subnet",
       "name": "legacy-subnet",
       "provider": "awscc",
       "identifier": "subnet-0abc123",
@@ -23,7 +23,7 @@
       "dependency_bindings": []
     },
     {
-      "resource_type": "ec2.security_group",
+      "resource_type": "ec2.SecurityGroup",
       "name": "old-sg",
       "provider": "awscc",
       "identifier": "sg-0abc123",

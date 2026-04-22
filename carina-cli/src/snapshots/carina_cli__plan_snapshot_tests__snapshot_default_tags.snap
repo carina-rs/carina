@@ -4,13 +4,13 @@ expression: output
 ---
 Execution Plan:
 
-  + awscc.ec2.vpc vpc
+  + awscc.ec2.Vpc vpc
       cidr_block: "10.0.0.0/16"
       tags:
         Environment: "staging"
         Name: "main-vpc"
         │
-        └─ + awscc.ec2.route_table 
+        └─ + awscc.ec2.RouteTable 
               vpc_id: vpc.vpc_id
 
 Plan: 2 to add, 0 to change, 0 to destroy.

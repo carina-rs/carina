@@ -4,7 +4,7 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-awscc.logs.log_group {
+awscc.logs.LogGroup {
   log_group_name    = 'my-app-logs'
   retention_in_days = 30
 }

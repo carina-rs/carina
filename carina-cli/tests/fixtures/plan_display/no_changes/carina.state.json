@@ -5,7 +5,7 @@
   "carina_version": "0.1.0",
   "resources": [
     {
-      "resource_type": "ec2.vpc",
+      "resource_type": "ec2.Vpc",
       "name": "vpc",
       "provider": "awscc",
       "identifier": "vpc-0123456789abcdef0",
@@ -25,7 +25,7 @@
       "dependency_bindings": []
     },
     {
-      "resource_type": "ec2.subnet",
+      "resource_type": "ec2.Subnet",
       "name": "ec2_subnet_aac7c86b",
       "provider": "awscc",
       "identifier": "subnet-0123456789abcdef0",
