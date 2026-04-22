@@ -1494,10 +1494,10 @@ fn parse_type_expr(pair: pest::iterators::Pair<Rule>) -> Result<TypeExpr, ParseE
     let inner = first_inner(pair, "type", "type expression")?;
     match inner.as_rule() {
         Rule::type_simple => match inner.as_str() {
-            "string" => Ok(TypeExpr::String),
-            "bool" => Ok(TypeExpr::Bool),
-            "int" => Ok(TypeExpr::Int),
-            "float" => Ok(TypeExpr::Float),
+            "String" | "string" => Ok(TypeExpr::String),
+            "Bool" | "bool" => Ok(TypeExpr::Bool),
+            "Int" | "int" => Ok(TypeExpr::Int),
+            "Float" | "float" => Ok(TypeExpr::Float),
             other => Ok(TypeExpr::Simple(other.to_string())),
         },
         Rule::type_generic => {
@@ -8945,6 +8945,40 @@ aws.s3.bucket {
         assert_eq!(result.arguments.len(), 2);
         assert!(result.arguments[0].description.is_none());
         assert!(result.arguments[1].description.is_none());
+    }
+
+    #[test]
+    fn parse_accepts_pascal_case_primitives() {
+        let input = r#"
+            arguments {
+                a: String
+                b: Int
+                c: Bool
+                d: Float
+            }
+        "#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(result.arguments[0].type_expr, TypeExpr::String);
+        assert_eq!(result.arguments[1].type_expr, TypeExpr::Int);
+        assert_eq!(result.arguments[2].type_expr, TypeExpr::Bool);
+        assert_eq!(result.arguments[3].type_expr, TypeExpr::Float);
+    }
+
+    #[test]
+    fn parse_still_accepts_lowercase_primitives_during_transition() {
+        let input = r#"
+            arguments {
+                a: string
+                b: int
+                c: bool
+                d: float
+            }
+        "#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(result.arguments[0].type_expr, TypeExpr::String);
+        assert_eq!(result.arguments[1].type_expr, TypeExpr::Int);
+        assert_eq!(result.arguments[2].type_expr, TypeExpr::Bool);
+        assert_eq!(result.arguments[3].type_expr, TypeExpr::Float);
     }
 
     #[test]
