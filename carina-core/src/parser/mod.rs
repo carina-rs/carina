@@ -953,7 +953,8 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
                                 providers.push(provider);
                             }
                             Rule::arguments_block => {
-                                let parsed_arguments = parse_arguments_block(stmt, config)?;
+                                let parsed_arguments =
+                                    parse_arguments_block(stmt, config, &mut ctx.warnings)?;
                                 for arg in &parsed_arguments {
                                     // Register argument names as lexical bindings so that
                                     // `vpc.vpc_id` resolves as ResourceRef and `cidr_block`
@@ -971,11 +972,23 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
                                 arguments.extend(parsed_arguments);
                             }
                             Rule::attributes_block => {
-                                let parsed_attribute_params = parse_attributes_block(stmt, &ctx)?;
+                                let parsed_attribute_params = {
+                                    let warnings = std::mem::take(&mut ctx.warnings);
+                                    let mut warnings = warnings;
+                                    let result = parse_attributes_block(stmt, &ctx, &mut warnings);
+                                    ctx.warnings = warnings;
+                                    result?
+                                };
                                 attribute_params.extend(parsed_attribute_params);
                             }
                             Rule::exports_block => {
-                                let parsed_export_params = parse_exports_block(stmt, &ctx)?;
+                                let parsed_export_params = {
+                                    let warnings = std::mem::take(&mut ctx.warnings);
+                                    let mut warnings = warnings;
+                                    let result = parse_exports_block(stmt, &ctx, &mut warnings);
+                                    ctx.warnings = warnings;
+                                    result?
+                                };
                                 export_params.extend(parsed_export_params);
                             }
                             Rule::import_state_block => {
@@ -1008,7 +1021,13 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
                                 module_calls.extend(expanded_module_calls);
                             }
                             Rule::fn_def => {
-                                let user_fn = parse_fn_def(stmt, &ctx)?;
+                                let user_fn = {
+                                    let warnings = std::mem::take(&mut ctx.warnings);
+                                    let mut warnings = warnings;
+                                    let result = parse_fn_def(stmt, &ctx, &mut warnings);
+                                    ctx.warnings = warnings;
+                                    result?
+                                };
                                 let fn_name = user_fn.name.clone();
                                 // Check for shadowing builtins
                                 if crate::builtins::evaluate_builtin(&fn_name, &[]).is_ok()
@@ -1148,6 +1167,7 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
 fn parse_arguments_block(
     pair: pest::iterators::Pair<Rule>,
     config: &ProviderContext,
+    warnings: &mut Vec<ParseWarning>,
 ) -> Result<Vec<ArgumentParameter>, ParseError> {
     let mut arguments = Vec::new();
     let ctx = ParseContext::new(config);
@@ -1161,6 +1181,7 @@ fn parse_arguments_block(
             let type_expr = parse_type_expr(
                 next_pair(&mut param_inner, "type expression", "arguments parameter")?,
                 config,
+                warnings,
             )?;
 
             // Check if the next element is a block form or simple default
@@ -1414,6 +1435,7 @@ fn parse_validate_expr(pair: pest::iterators::Pair<Rule>) -> Result<ValidateExpr
 fn parse_attributes_block(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
+    warnings: &mut Vec<ParseWarning>,
 ) -> Result<Vec<AttributeParameter>, ParseError> {
     let mut attribute_params = Vec::new();
 
@@ -1432,7 +1454,7 @@ fn parse_attributes_block(
             )?;
             let (type_expr, value) = if next.as_rule() == Rule::type_expr {
                 // Has explicit type annotation: name: type = expr
-                let type_expr = Some(parse_type_expr(next, ctx.config)?);
+                let type_expr = Some(parse_type_expr(next, ctx.config, warnings)?);
                 let expr = next_pair(&mut param_inner, "value expression", "attributes parameter")?;
                 let value = Some(parse_expression(expr, ctx)?);
                 (type_expr, value)
@@ -1456,6 +1478,7 @@ fn parse_attributes_block(
 fn parse_exports_block(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
+    warnings: &mut Vec<ParseWarning>,
 ) -> Result<Vec<ExportParameter>, ParseError> {
     let mut export_params = Vec::new();
 
@@ -1468,7 +1491,7 @@ fn parse_exports_block(
 
             let next = next_pair(&mut param_inner, "type or expression", "exports parameter")?;
             let (type_expr, value) = if next.as_rule() == Rule::type_expr {
-                let type_expr = Some(parse_type_expr(next, ctx.config)?);
+                let type_expr = Some(parse_type_expr(next, ctx.config, warnings)?);
                 let expr = next_pair(&mut param_inner, "value expression", "exports parameter")?;
                 let value = Some(parse_expression(expr, ctx)?);
                 (type_expr, value)
@@ -1492,25 +1515,50 @@ fn parse_exports_block(
 fn parse_type_expr(
     pair: pest::iterators::Pair<Rule>,
     config: &ProviderContext,
+    warnings: &mut Vec<ParseWarning>,
 ) -> Result<TypeExpr, ParseError> {
     let inner = first_inner(pair, "type", "type expression")?;
     match inner.as_rule() {
-        Rule::type_simple => match inner.as_str() {
-            "String" | "string" => Ok(TypeExpr::String),
-            "Bool" | "bool" => Ok(TypeExpr::Bool),
-            "Int" | "int" => Ok(TypeExpr::Int),
-            "Float" | "float" => Ok(TypeExpr::Float),
-            other => {
-                // Transition window: accept PascalCase or snake_case and
-                // canonicalize to snake_case internally.
-                let canonical = if other.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
-                    pascal_to_snake(other)
-                } else {
-                    other.to_string()
-                };
-                Ok(TypeExpr::Simple(canonical))
+        Rule::type_simple => {
+            let line = inner.as_span().start_pos().line_col().0;
+            let text = inner.as_str();
+            let mut warn_deprecated = |new: &str| {
+                warnings.push(ParseWarning {
+                    file: None,
+                    line,
+                    message: format!("deprecated type spelling '{text}'; use '{new}' instead"),
+                });
+            };
+            match text {
+                "String" => Ok(TypeExpr::String),
+                "string" => {
+                    warn_deprecated("String");
+                    Ok(TypeExpr::String)
+                }
+                "Bool" => Ok(TypeExpr::Bool),
+                "bool" => {
+                    warn_deprecated("Bool");
+                    Ok(TypeExpr::Bool)
+                }
+                "Int" => Ok(TypeExpr::Int),
+                "int" => {
+                    warn_deprecated("Int");
+                    Ok(TypeExpr::Int)
+                }
+                "Float" => Ok(TypeExpr::Float),
+                "float" => {
+                    warn_deprecated("Float");
+                    Ok(TypeExpr::Float)
+                }
+                other if other.chars().next().is_some_and(|c| c.is_ascii_uppercase()) => {
+                    Ok(TypeExpr::Simple(pascal_to_snake(other)))
+                }
+                other => {
+                    warn_deprecated(&snake_to_pascal(other));
+                    Ok(TypeExpr::Simple(other.to_string()))
+                }
             }
-        },
+        }
         Rule::type_generic => {
             // Get the full string representation to determine if it's list or map
             let full_str = inner.as_str();
@@ -1521,6 +1569,7 @@ fn parse_type_expr(
             let inner_type = parse_type_expr(
                 next_pair(&mut generic_inner, "inner type", "generic type expression")?,
                 config,
+                warnings,
             )?;
 
             if is_list {
@@ -1578,6 +1627,7 @@ fn parse_type_expr(
                     let ty = parse_type_expr(
                         next_pair(&mut field_inner, "field type", "struct field")?,
                         config,
+                        warnings,
                     )?;
                     if fields.iter().any(|(existing, _)| existing == &name) {
                         return Err(ParseError::InvalidResourceType(format!(
@@ -2917,6 +2967,7 @@ fn parse_moved_block(pair: pest::iterators::Pair<Rule>) -> Result<StateBlock, Pa
 fn parse_fn_def(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
+    warnings: &mut Vec<ParseWarning>,
 ) -> Result<UserFunction, ParseError> {
     let mut inner = pair.into_inner();
     let name = next_pair(&mut inner, "function name", "fn_def")?
@@ -2940,7 +2991,7 @@ fn parse_fn_def(
                 for remaining in param_inner {
                     match remaining.as_rule() {
                         Rule::type_expr => {
-                            param_type = Some(parse_type_expr(remaining, ctx.config)?);
+                            param_type = Some(parse_type_expr(remaining, ctx.config, warnings)?);
                         }
                         _ => {
                             // This is the default expression
@@ -2969,7 +3020,7 @@ fn parse_fn_def(
 
     // Parse optional return type annotation (: type_expr)
     let (return_type, body_pair) = if next_token.as_rule() == Rule::type_expr {
-        let rt = parse_type_expr(next_token, ctx.config)?;
+        let rt = parse_type_expr(next_token, ctx.config, warnings)?;
         let bp = next_pair(&mut inner, "fn_body", "fn_def")?;
         (Some(rt), bp)
     } else {
@@ -9065,6 +9116,54 @@ aws.s3.bucket {
         let input = format!(r#"arguments {{ v: {} }}"#, ty);
         let parsed = parse(&input, &ProviderContext::default()).unwrap();
         assert_eq!(parsed.arguments[0].type_expr, ty);
+    }
+
+    #[test]
+    fn parser_warns_on_lowercase_primitive() {
+        let input = r#"arguments { a: string }"#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("deprecated type spelling 'string'")
+                    && w.message.contains("'String'")),
+            "expected deprecation warning, got {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn parser_warns_on_snake_case_custom_type() {
+        let input = r#"arguments { a: aws_account_id }"#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert!(
+            result.warnings.iter().any(|w| w
+                .message
+                .contains("deprecated type spelling 'aws_account_id'")
+                && w.message.contains("'AwsAccountId'")),
+            "expected deprecation warning, got {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn parser_does_not_warn_on_new_spelling() {
+        let input = r#"
+            arguments {
+                a: String
+                b: AwsAccountId
+            }
+        "#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("deprecated type spelling")),
+            "should not warn on new spellings, got {:?}",
+            result.warnings
+        );
     }
 
     #[test]
