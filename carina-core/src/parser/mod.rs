@@ -9058,6 +9058,16 @@ aws.s3.bucket {
     }
 
     #[test]
+    fn type_expr_ref_display_roundtrips_three_segment_path() {
+        let ty = TypeExpr::Ref(ResourceTypePath::new("aws", "ec2.Vpc"));
+        assert_eq!(ty.to_string(), "aws.ec2.Vpc");
+
+        let input = format!(r#"arguments {{ v: {} }}"#, ty);
+        let parsed = parse(&input, &ProviderContext::default()).unwrap();
+        assert_eq!(parsed.arguments[0].type_expr, ty);
+    }
+
+    #[test]
     fn parse_arguments_block_form_default_only() {
         let input = r#"
             arguments {
