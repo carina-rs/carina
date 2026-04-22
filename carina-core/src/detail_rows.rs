@@ -955,7 +955,7 @@ mod tests {
 
     #[test]
     fn test_names_only_returns_empty() {
-        let resource = Resource::new("s3.bucket", "my-bucket");
+        let resource = Resource::new("s3.Bucket", "my-bucket");
         let effect = Effect::Create(resource);
         let rows = build_detail_rows(&effect, None, DetailLevel::NamesOnly, None);
         assert!(rows.is_empty());
@@ -963,7 +963,7 @@ mod tests {
 
     #[test]
     fn test_create_basic_attributes() {
-        let resource = Resource::new("s3.bucket", "my-bucket")
+        let resource = Resource::new("s3.Bucket", "my-bucket")
             .with_attribute("bucket", Value::String("my-bucket".to_string()))
             .with_attribute("region", Value::String("us-east-1".to_string()));
         let effect = Effect::Create(resource);
@@ -976,7 +976,7 @@ mod tests {
     #[test]
     fn test_update_changed_attributes() {
         let from = State::existing(
-            ResourceId::new("s3.bucket", "my-bucket"),
+            ResourceId::new("s3.Bucket", "my-bucket"),
             [(
                 "versioning".to_string(),
                 Value::String("Disabled".to_string()),
@@ -984,10 +984,10 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = Resource::new("s3.bucket", "my-bucket")
+        let to = Resource::new("s3.Bucket", "my-bucket")
             .with_attribute("versioning", Value::String("Enabled".to_string()));
         let effect = Effect::Update {
-            id: ResourceId::new("s3.bucket", "my-bucket"),
+            id: ResourceId::new("s3.Bucket", "my-bucket"),
             from: Box::new(from),
             to,
             changed_attributes: vec!["versioning".to_string()],
@@ -1001,7 +1001,7 @@ mod tests {
     #[test]
     fn test_update_hidden_unchanged_in_full_mode() {
         let from = State::existing(
-            ResourceId::new("s3.bucket", "my-bucket"),
+            ResourceId::new("s3.Bucket", "my-bucket"),
             [
                 ("name".to_string(), Value::String("test".to_string())),
                 ("region".to_string(), Value::String("us-east-1".to_string())),
@@ -1013,12 +1013,12 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = Resource::new("s3.bucket", "my-bucket")
+        let to = Resource::new("s3.Bucket", "my-bucket")
             .with_attribute("name", Value::String("test".to_string()))
             .with_attribute("region", Value::String("us-east-1".to_string()))
             .with_attribute("versioning", Value::String("Enabled".to_string()));
         let effect = Effect::Update {
-            id: ResourceId::new("s3.bucket", "my-bucket"),
+            id: ResourceId::new("s3.Bucket", "my-bucket"),
             from: Box::new(from),
             to,
             changed_attributes: vec!["versioning".to_string()],
@@ -1032,7 +1032,7 @@ mod tests {
 
     #[test]
     fn test_delete_with_attributes() {
-        let id = ResourceId::new("s3.bucket", "old-bucket");
+        let id = ResourceId::new("s3.Bucket", "old-bucket");
         let effect = Effect::Delete {
             id: id.clone(),
             identifier: "old-bucket".to_string(),
@@ -1058,7 +1058,7 @@ mod tests {
     #[test]
     fn test_update_removed_attribute() {
         let from = State::existing(
-            ResourceId::new("s3.bucket", "my-bucket"),
+            ResourceId::new("s3.Bucket", "my-bucket"),
             [
                 ("name".to_string(), Value::String("test".to_string())),
                 (
@@ -1069,10 +1069,10 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = Resource::new("s3.bucket", "my-bucket")
+        let to = Resource::new("s3.Bucket", "my-bucket")
             .with_attribute("name", Value::String("test".to_string()));
         let effect = Effect::Update {
-            id: ResourceId::new("s3.bucket", "my-bucket"),
+            id: ResourceId::new("s3.Bucket", "my-bucket"),
             from: Box::new(from),
             to,
             changed_attributes: vec!["removed_attr".to_string()],
@@ -1088,7 +1088,7 @@ mod tests {
         tags.insert("Name".to_string(), Value::String("test".to_string()));
         tags.insert("Environment".to_string(), Value::String("prod".to_string()));
         let resource =
-            Resource::new("s3.bucket", "my-bucket").with_attribute("tags", Value::Map(tags));
+            Resource::new("s3.Bucket", "my-bucket").with_attribute("tags", Value::Map(tags));
         let effect = Effect::Create(resource);
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None);
         assert_eq!(rows.len(), 1);
@@ -1109,7 +1109,7 @@ mod tests {
 
     #[test]
     fn test_delete_map_expanded() {
-        let id = ResourceId::new("s3.bucket", "old-bucket");
+        let id = ResourceId::new("s3.Bucket", "old-bucket");
         let effect = Effect::Delete {
             id: id.clone(),
             identifier: "old-bucket".to_string(),
@@ -1142,7 +1142,7 @@ mod tests {
     #[test]
     fn test_replace_basic() {
         let from = State::existing(
-            ResourceId::new("ec2.vpc", "my-vpc"),
+            ResourceId::new("ec2.Vpc", "my-vpc"),
             [(
                 "cidr_block".to_string(),
                 Value::String("10.0.0.0/16".to_string()),
@@ -1150,10 +1150,10 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = Resource::new("ec2.vpc", "my-vpc")
+        let to = Resource::new("ec2.Vpc", "my-vpc")
             .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
         let effect = Effect::Replace {
-            id: ResourceId::new("ec2.vpc", "my-vpc"),
+            id: ResourceId::new("ec2.Vpc", "my-vpc"),
             from: Box::new(from),
             to,
             lifecycle: crate::resource::LifecycleConfig::default(),

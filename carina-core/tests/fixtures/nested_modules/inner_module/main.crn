@@ -1,11 +1,11 @@
 arguments {
-  cidr_block: string
+  cidr_block: String
 }
 
 attributes {
   vpc_id = vpc.vpc_id
 }
 
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block = cidr_block
 }

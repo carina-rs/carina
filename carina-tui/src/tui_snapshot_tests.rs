@@ -46,12 +46,12 @@ fn render_tui_with_schemas(
 fn build_all_create_plan() -> Plan {
     let mut plan = Plan::new();
     plan.add(Effect::Create(
-        Resource::new("ec2.vpc", "my-vpc")
+        Resource::new("ec2.Vpc", "my-vpc")
             .with_binding("vpc")
             .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string())),
     ));
     plan.add(Effect::Create(
-        Resource::new("ec2.route_table", "my-rt")
+        Resource::new("ec2.RouteTable", "my-rt")
             .with_binding("rt")
             .with_attribute(
                 "vpc_id",
@@ -59,7 +59,7 @@ fn build_all_create_plan() -> Plan {
             ),
     ));
     plan.add(Effect::Create(
-        Resource::new("ec2.subnet", "my-subnet")
+        Resource::new("ec2.Subnet", "my-subnet")
             .with_binding("subnet")
             .with_attribute("cidr_block", Value::String("10.0.1.0/24".to_string()))
             .with_attribute(
@@ -74,9 +74,9 @@ fn build_all_create_plan() -> Plan {
 fn build_mixed_operations_plan() -> Plan {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
-        id: ResourceId::new("ec2.vpc", "my-vpc"),
+        id: ResourceId::new("ec2.Vpc", "my-vpc"),
         from: Box::new(State::existing(
-            ResourceId::new("ec2.vpc", "my-vpc"),
+            ResourceId::new("ec2.Vpc", "my-vpc"),
             [
                 (
                     "cidr_block".to_string(),
@@ -87,14 +87,14 @@ fn build_mixed_operations_plan() -> Plan {
             .into_iter()
             .collect(),
         )),
-        to: Resource::new("ec2.vpc", "my-vpc")
+        to: Resource::new("ec2.Vpc", "my-vpc")
             .with_binding("vpc")
             .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()))
             .with_attribute("enable_dns_support", Value::Bool(true)),
         changed_attributes: vec!["enable_dns_support".to_string()],
     });
     plan.add(Effect::Create(
-        Resource::new("ec2.security_group", "my-sg")
+        Resource::new("ec2.SecurityGroup", "my-sg")
             .with_binding("sg")
             .with_attribute(
                 "group_description",
@@ -106,7 +106,7 @@ fn build_mixed_operations_plan() -> Plan {
             ),
     ));
     plan.add(Effect::Delete {
-        id: ResourceId::new("ec2.subnet", "old-subnet"),
+        id: ResourceId::new("ec2.Subnet", "old-subnet"),
         identifier: "subnet-12345678".to_string(),
         lifecycle: LifecycleConfig::default(),
         binding: Some("old_subnet".to_string()),
@@ -142,9 +142,9 @@ fn build_map_key_diff_plan() -> Plan {
     .collect();
 
     plan.add(Effect::Update {
-        id: ResourceId::new("ec2.vpc", "my-vpc"),
+        id: ResourceId::new("ec2.Vpc", "my-vpc"),
         from: Box::new(State::existing(
-            ResourceId::new("ec2.vpc", "my-vpc"),
+            ResourceId::new("ec2.Vpc", "my-vpc"),
             [
                 ("_binding".to_string(), Value::String("vpc".to_string())),
                 (
@@ -156,7 +156,7 @@ fn build_map_key_diff_plan() -> Plan {
             .into_iter()
             .collect(),
         )),
-        to: Resource::new("ec2.vpc", "my-vpc")
+        to: Resource::new("ec2.Vpc", "my-vpc")
             .with_binding("vpc")
             .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()))
             .with_attribute("tags", Value::Map(new_tags)),
@@ -198,14 +198,14 @@ fn snapshot_map_key_diff() {
 fn snapshot_create_with_schema() {
     let mut plan = Plan::new();
     plan.add(Effect::Create(
-        Resource::new("ec2.vpc", "my-vpc")
+        Resource::new("ec2.Vpc", "my-vpc")
             .with_binding("vpc")
             .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string())),
     ));
 
     use carina_core::schema::{AttributeSchema, AttributeType};
 
-    let schema = ResourceSchema::new("ec2.vpc")
+    let schema = ResourceSchema::new("ec2.Vpc")
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String).required())
         .attribute(
             AttributeSchema::new("enable_dns_support", AttributeType::Bool)
@@ -221,7 +221,7 @@ fn snapshot_create_with_schema() {
         );
 
     let schemas: HashMap<String, ResourceSchema> =
-        [("ec2.vpc".to_string(), schema)].into_iter().collect();
+        [("ec2.Vpc".to_string(), schema)].into_iter().collect();
 
     let output = render_tui_with_schemas(&plan, &schemas, 120, 40, 0);
     insta::assert_snapshot!(output);
@@ -301,13 +301,13 @@ fn snapshot_filter_mode_route_table() {
 fn build_moved_with_changes_plan() -> Plan {
     let mut plan = Plan::new();
     plan.add(Effect::Move {
-        from: ResourceId::new("ec2.vpc", "old_vpc"),
-        to: ResourceId::new("ec2.vpc", "new_vpc"),
+        from: ResourceId::new("ec2.Vpc", "old_vpc"),
+        to: ResourceId::new("ec2.Vpc", "new_vpc"),
     });
     plan.add(Effect::Update {
-        id: ResourceId::new("ec2.vpc", "new_vpc"),
+        id: ResourceId::new("ec2.Vpc", "new_vpc"),
         from: Box::new(State::existing(
-            ResourceId::new("ec2.vpc", "new_vpc"),
+            ResourceId::new("ec2.Vpc", "new_vpc"),
             [
                 (
                     "cidr_block".to_string(),
@@ -318,7 +318,7 @@ fn build_moved_with_changes_plan() -> Plan {
             .into_iter()
             .collect(),
         )),
-        to: Resource::new("ec2.vpc", "new_vpc")
+        to: Resource::new("ec2.Vpc", "new_vpc")
             .with_binding("new_vpc")
             .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()))
             .with_attribute(
@@ -332,7 +332,7 @@ fn build_moved_with_changes_plan() -> Plan {
         changed_attributes: vec!["tags".to_string()],
     });
     plan.add(Effect::Create(
-        Resource::new("ec2.subnet", "my-subnet")
+        Resource::new("ec2.Subnet", "my-subnet")
             .with_attribute("cidr_block", Value::String("10.0.1.0/24".to_string()))
             .with_attribute(
                 "vpc_id",
@@ -346,8 +346,8 @@ fn build_moved_with_changes_plan() -> Plan {
 fn build_moved_pure_plan() -> Plan {
     let mut plan = Plan::new();
     plan.add(Effect::Move {
-        from: ResourceId::new("ec2.vpc", "old_vpc"),
-        to: ResourceId::new("ec2.vpc", "new_vpc"),
+        from: ResourceId::new("ec2.Vpc", "old_vpc"),
+        to: ResourceId::new("ec2.Vpc", "new_vpc"),
     });
     plan
 }

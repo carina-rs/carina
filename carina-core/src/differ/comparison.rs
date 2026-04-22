@@ -15,7 +15,7 @@ use crate::value::{SECRET_PREFIX, SecretHashContext, argon2id_hash, value_to_jso
 /// - Struct: recurse with per-field type information, tolerating extra fields
 ///   with default values (e.g., `false` for Bool)
 /// - StringEnum: extract enum values from namespaced identifiers and compare
-///   case-insensitively (e.g., `awscc.s3.bucket.Type.AES256` equals `"AES256"`)
+///   case-insensitively (e.g., `awscc.s3.Bucket.Type.AES256` equals `"AES256"`)
 ///
 /// Without type information, falls back to `Value::semantically_equal()`.
 ///

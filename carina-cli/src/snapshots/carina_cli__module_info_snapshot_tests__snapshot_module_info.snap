@@ -6,7 +6,7 @@ Module: module_info
 
 === ARGUMENTS ===
 
-  vpc_id: awscc.ec2.vpc  (required)
+  vpc_id: awscc.ec2.Vpc  (required)
     The VPC to deploy resources into
   environment: String  (required)
     Deployment environment name
@@ -16,10 +16,10 @@ Module: module_info
 
 === CREATES ===
 
-  web_sg: awscc.ec2.security_group
-    └── web_instance: awscc.ec2.instance
+  web_sg: awscc.ec2.SecurityGroup
+    └── web_instance: awscc.ec2.Instance
 
 === ATTRIBUTES ===
 
-  security_group_id: awscc.ec2.security_group
-  instance_id: awscc.ec2.instance
+  security_group_id: awscc.ec2.SecurityGroup
+  instance_id: awscc.ec2.Instance

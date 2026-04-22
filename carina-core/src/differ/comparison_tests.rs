@@ -215,7 +215,7 @@ fn type_aware_string_enum_namespaced_vs_raw() {
             "AES256".to_string(),
             "aws:kms:dsse".to_string(),
         ],
-        namespace: Some("awscc.s3.bucket".to_string()),
+        namespace: Some("awscc.s3.Bucket".to_string()),
         to_dsl: None,
     };
 
@@ -223,7 +223,7 @@ fn type_aware_string_enum_namespaced_vs_raw() {
     assert!(
         type_aware_equal(
             &Value::String(
-                "awscc.s3.bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256".to_string()
+                "awscc.s3.Bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256".to_string()
             ),
             &Value::String("AES256".to_string()),
             Some(&enum_type),
@@ -236,10 +236,10 @@ fn type_aware_string_enum_namespaced_vs_raw() {
     assert!(
         type_aware_equal(
             &Value::String(
-                "awscc.s3.bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256".to_string()
+                "awscc.s3.Bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256".to_string()
             ),
             &Value::String(
-                "awscc.s3.bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256".to_string()
+                "awscc.s3.Bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256".to_string()
             ),
             Some(&enum_type),
             None,
@@ -251,7 +251,7 @@ fn type_aware_string_enum_namespaced_vs_raw() {
     assert!(
         !type_aware_equal(
             &Value::String(
-                "awscc.s3.bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256".to_string()
+                "awscc.s3.Bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256".to_string()
             ),
             &Value::String("aws:kms".to_string()),
             Some(&enum_type),
@@ -439,7 +439,7 @@ fn type_aware_unordered_list_ignores_reorder() {
 fn write_only_attr_in_desired_not_in_current_no_diff() {
     use crate::schema::{AttributeSchema, ResourceSchema};
 
-    let schema = ResourceSchema::new("ec2.vpc")
+    let schema = ResourceSchema::new("ec2.Vpc")
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
         .attribute(AttributeSchema::new("ipv4_netmask_length", AttributeType::Int).write_only());
 
@@ -468,7 +468,7 @@ fn write_only_attr_in_desired_not_in_current_no_diff() {
 fn write_only_attr_in_both_same_value_no_diff() {
     use crate::schema::{AttributeSchema, ResourceSchema};
 
-    let schema = ResourceSchema::new("ec2.vpc")
+    let schema = ResourceSchema::new("ec2.Vpc")
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
         .attribute(AttributeSchema::new("ipv4_netmask_length", AttributeType::Int).write_only());
 
@@ -499,7 +499,7 @@ fn write_only_attr_in_both_same_value_no_diff() {
 fn write_only_attr_in_both_different_value_detects_diff() {
     use crate::schema::{AttributeSchema, ResourceSchema};
 
-    let schema = ResourceSchema::new("ec2.vpc")
+    let schema = ResourceSchema::new("ec2.Vpc")
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
         .attribute(AttributeSchema::new("ipv4_netmask_length", AttributeType::Int).write_only());
 
@@ -529,7 +529,7 @@ fn write_only_attr_in_both_different_value_detects_diff() {
 fn non_write_only_attr_in_desired_not_in_current_detects_diff() {
     use crate::schema::{AttributeSchema, ResourceSchema};
 
-    let schema = ResourceSchema::new("ec2.vpc")
+    let schema = ResourceSchema::new("ec2.Vpc")
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
         .attribute(AttributeSchema::new("enable_dns", AttributeType::Bool));
 
@@ -804,7 +804,7 @@ fn secret_in_map_with_refresh_no_false_diff() {
     use crate::resource::ResourceId;
     use crate::schema::{AttributeSchema, ResourceSchema};
 
-    let resource_id = ResourceId::with_provider("awscc", "ec2.vpc", "ec2_vpc_fb75c929");
+    let resource_id = ResourceId::with_provider("awscc", "ec2.Vpc", "ec2_vpc_fb75c929");
 
     // Desired: tags map with a secret value (as written in .crn)
     let desired_tags = Value::Map(HashMap::from([
@@ -825,7 +825,7 @@ fn secret_in_map_with_refresh_no_false_diff() {
     ]));
 
     // Build schema with tags as Map(String)
-    let schema = ResourceSchema::new("ec2.vpc").attribute(AttributeSchema::new(
+    let schema = ResourceSchema::new("ec2.Vpc").attribute(AttributeSchema::new(
         "tags",
         AttributeType::map(AttributeType::String),
     ));

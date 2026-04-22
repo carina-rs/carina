@@ -203,8 +203,8 @@ mod tests {
             status: "ok",
             resource_count: 2,
             resources: vec![
-                "aws.s3.bucket.my-bucket".to_string(),
-                "aws.ec2.vpc.main".to_string(),
+                "aws.s3.Bucket.my-bucket".to_string(),
+                "aws.ec2.Vpc.main".to_string(),
             ],
             warnings: vec![],
         };
@@ -270,7 +270,7 @@ mod tests {
         let output = ValidateOutput {
             status: "ok",
             resource_count: 1,
-            resources: vec!["aws.s3.bucket.test".to_string()],
+            resources: vec!["aws.s3.Bucket.test".to_string()],
             warnings: vec![
                 ValidateWarning {
                     warning_type: "unused_binding",

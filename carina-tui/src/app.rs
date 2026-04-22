@@ -17,7 +17,7 @@ use ratatui::widgets::ListState;
 pub struct TreeNode {
     /// Effect type label for display
     pub effect_label: String,
-    /// Resource type (e.g., "awscc.ec2.vpc") for display
+    /// Resource type (e.g., "awscc.ec2.Vpc") for display
     pub resource_type: String,
     /// Name part (binding name or compact hint) for display
     pub name_part: String,
@@ -550,7 +550,7 @@ impl App {
             let mut candidates: Vec<String> = Vec::new();
             let mut seen: HashSet<String> = HashSet::new();
             for node in &self.nodes {
-                // Resource type name (e.g., "ec2.vpc" or "awscc.ec2.vpc")
+                // Resource type name (e.g., "ec2.Vpc" or "awscc.ec2.Vpc")
                 // Use contains() to match anywhere in the dotted name,
                 // consistent with how update_search_matches uses contains()
                 let rt_lower = node.resource_type.to_lowercase();
@@ -815,9 +815,9 @@ mod tests {
     #[test]
     fn app_from_plan_with_effects() {
         let mut plan = Plan::new();
-        plan.add(Effect::Create(Resource::new("s3.bucket", "my-bucket")));
+        plan.add(Effect::Create(Resource::new("s3.Bucket", "my-bucket")));
         plan.add(Effect::Delete {
-            id: ResourceId::new("s3.bucket", "old-bucket"),
+            id: ResourceId::new("s3.Bucket", "old-bucket"),
             identifier: "old-bucket-id".to_string(),
             lifecycle: LifecycleConfig::default(),
             binding: None,
@@ -835,9 +835,9 @@ mod tests {
     #[test]
     fn navigation() {
         let mut plan = Plan::new();
-        plan.add(Effect::Create(Resource::new("s3.bucket", "a")));
-        plan.add(Effect::Create(Resource::new("s3.bucket", "b")));
-        plan.add(Effect::Create(Resource::new("s3.bucket", "c")));
+        plan.add(Effect::Create(Resource::new("s3.Bucket", "a")));
+        plan.add(Effect::Create(Resource::new("s3.Bucket", "b")));
+        plan.add(Effect::Create(Resource::new("s3.Bucket", "c")));
 
         let mut app = App::new(&plan, &HashMap::new());
         assert_eq!(app.selected, 0);
@@ -867,9 +867,9 @@ mod tests {
     fn update_effect_has_detail_rows() {
         let mut plan = Plan::new();
         plan.add(Effect::Update {
-            id: ResourceId::new("s3.bucket", "my-bucket"),
+            id: ResourceId::new("s3.Bucket", "my-bucket"),
             from: Box::new(State::existing(
-                ResourceId::new("s3.bucket", "my-bucket"),
+                ResourceId::new("s3.Bucket", "my-bucket"),
                 [(
                     "versioning".to_string(),
                     Value::String("Disabled".to_string()),
@@ -877,7 +877,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             )),
-            to: Resource::new("s3.bucket", "my-bucket")
+            to: Resource::new("s3.Bucket", "my-bucket")
                 .with_attribute("versioning", Value::String("Enabled".to_string())),
             changed_attributes: vec!["versioning".to_string()],
         });
@@ -897,7 +897,7 @@ mod tests {
     fn internal_attributes_filtered() {
         let mut plan = Plan::new();
         plan.add(Effect::Create(
-            Resource::new("s3.bucket", "my-bucket")
+            Resource::new("s3.Bucket", "my-bucket")
                 .with_attribute("name", Value::String("test".to_string()))
                 .with_binding("my_bucket")
                 .with_module_source(carina_core::resource::ModuleSource::module("web", "web")),
@@ -932,7 +932,7 @@ mod tests {
     fn replace_effect_symbols() {
         let mut plan = Plan::new();
         let from = Box::new(State::existing(
-            ResourceId::new("ec2.vpc", "my-vpc"),
+            ResourceId::new("ec2.Vpc", "my-vpc"),
             [("cidr".to_string(), Value::String("10.0.0.0/16".to_string()))]
                 .into_iter()
                 .collect(),
@@ -940,9 +940,9 @@ mod tests {
 
         // create_before_destroy = true -> "+/-"
         plan.add(Effect::Replace {
-            id: ResourceId::new("ec2.vpc", "my-vpc"),
+            id: ResourceId::new("ec2.Vpc", "my-vpc"),
             from: from.clone(),
-            to: Resource::new("ec2.vpc", "my-vpc"),
+            to: Resource::new("ec2.Vpc", "my-vpc"),
             lifecycle: LifecycleConfig {
                 create_before_destroy: true,
                 ..Default::default()
@@ -955,9 +955,9 @@ mod tests {
 
         // create_before_destroy = false -> "-/+"
         plan.add(Effect::Replace {
-            id: ResourceId::new("ec2.vpc", "my-vpc2"),
+            id: ResourceId::new("ec2.Vpc", "my-vpc2"),
             from,
-            to: Resource::new("ec2.vpc", "my-vpc2"),
+            to: Resource::new("ec2.Vpc", "my-vpc2"),
             lifecycle: LifecycleConfig::default(),
             changed_create_only: vec!["cidr".to_string()],
             cascading_updates: vec![],
@@ -975,12 +975,12 @@ mod tests {
         // Create a plan where subnet depends on vpc via ResourceRef
         let mut plan = Plan::new();
         plan.add(Effect::Create(
-            Resource::new("ec2.vpc", "my-vpc")
+            Resource::new("ec2.Vpc", "my-vpc")
                 .with_binding("vpc")
                 .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string())),
         ));
         plan.add(Effect::Create(
-            Resource::new("ec2.subnet", "my-subnet")
+            Resource::new("ec2.Subnet", "my-subnet")
                 .with_binding("subnet")
                 .with_attribute(
                     "vpc_id",
@@ -1005,7 +1005,7 @@ mod tests {
     fn selected_node_returns_correct_node() {
         let mut plan = Plan::new();
         plan.add(Effect::Create(
-            Resource::new("s3.bucket", "my-bucket")
+            Resource::new("s3.Bucket", "my-bucket")
                 .with_attribute("name", Value::String("test".to_string())),
         ));
 
@@ -1019,7 +1019,7 @@ mod tests {
     #[test]
     fn toggle_focus_switches_panels() {
         let mut plan = Plan::new();
-        plan.add(Effect::Create(Resource::new("s3.bucket", "a")));
+        plan.add(Effect::Create(Resource::new("s3.Bucket", "a")));
         let mut app = App::new(&plan, &HashMap::new());
 
         assert_eq!(app.focused_panel, FocusedPanel::Tree);
@@ -1032,7 +1032,7 @@ mod tests {
     #[test]
     fn detail_scroll_up_down() {
         let mut plan = Plan::new();
-        plan.add(Effect::Create(Resource::new("s3.bucket", "a")));
+        plan.add(Effect::Create(Resource::new("s3.Bucket", "a")));
         let mut app = App::new(&plan, &HashMap::new());
 
         assert_eq!(app.detail_scroll, 0);
@@ -1052,8 +1052,8 @@ mod tests {
     #[test]
     fn detail_scroll_resets_on_navigation() {
         let mut plan = Plan::new();
-        plan.add(Effect::Create(Resource::new("s3.bucket", "a")));
-        plan.add(Effect::Create(Resource::new("s3.bucket", "b")));
+        plan.add(Effect::Create(Resource::new("s3.Bucket", "a")));
+        plan.add(Effect::Create(Resource::new("s3.Bucket", "b")));
         let mut app = App::new(&plan, &HashMap::new());
 
         app.detail_scroll = 5;
@@ -1071,7 +1071,7 @@ mod tests {
         let mut plan = Plan::new();
         for i in 0..10 {
             plan.add(Effect::Create(Resource::new(
-                "s3.bucket",
+                "s3.Bucket",
                 format!("bucket-{}", i),
             )));
         }
@@ -1129,8 +1129,8 @@ mod tests {
     fn tree_scroll_zero_height_does_not_scroll_on_move_down() {
         // When tree_area_height is 0 (before first render), move_down should not scroll
         let mut plan = Plan::new();
-        plan.add(Effect::Create(Resource::new("s3.bucket", "a")));
-        plan.add(Effect::Create(Resource::new("s3.bucket", "b")));
+        plan.add(Effect::Create(Resource::new("s3.Bucket", "a")));
+        plan.add(Effect::Create(Resource::new("s3.Bucket", "b")));
         let mut app = App::new(&plan, &HashMap::new());
         assert_eq!(app.tree_area_height, 0);
 
@@ -1143,12 +1143,12 @@ mod tests {
     fn make_tree_plan() -> Plan {
         let mut plan = Plan::new();
         plan.add(Effect::Create(
-            Resource::new("ec2.vpc", "my-vpc")
+            Resource::new("ec2.Vpc", "my-vpc")
                 .with_binding("vpc")
                 .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string())),
         ));
         plan.add(Effect::Create(
-            Resource::new("ec2.subnet", "my-subnet")
+            Resource::new("ec2.Subnet", "my-subnet")
                 .with_binding("subnet")
                 .with_attribute(
                     "vpc_id",
@@ -1156,7 +1156,7 @@ mod tests {
                 ),
         ));
         plan.add(Effect::Create(
-            Resource::new("s3.bucket", "my-bucket").with_binding("bucket"),
+            Resource::new("s3.Bucket", "my-bucket").with_binding("bucket"),
         ));
         plan
     }
@@ -1178,7 +1178,7 @@ mod tests {
 
         // The s3.bucket should not be visible
         for &idx in &visible {
-            assert_ne!(app.nodes[idx].resource_type, "s3.bucket");
+            assert_ne!(app.nodes[idx].resource_type, "s3.Bucket");
         }
     }
 
@@ -1194,14 +1194,14 @@ mod tests {
         // vpc is ancestor-only (dimmed)
         let vpc_idx = visible
             .iter()
-            .find(|&&idx| app.nodes[idx].resource_type == "ec2.vpc")
+            .find(|&&idx| app.nodes[idx].resource_type == "ec2.Vpc")
             .unwrap();
         assert!(app.is_ancestor_only(*vpc_idx));
 
         // subnet is a match (not dimmed)
         let subnet_idx = visible
             .iter()
-            .find(|&&idx| app.nodes[idx].resource_type == "ec2.subnet")
+            .find(|&&idx| app.nodes[idx].resource_type == "ec2.Subnet")
             .unwrap();
         assert!(!app.is_ancestor_only(*subnet_idx));
     }
@@ -1246,7 +1246,7 @@ mod tests {
         let visible = app.visible_nodes();
         let match_vis_idx = app.search_matches[0];
         let match_node_idx = visible[match_vis_idx];
-        assert_eq!(app.nodes[match_node_idx].resource_type, "ec2.subnet");
+        assert_eq!(app.nodes[match_node_idx].resource_type, "ec2.Subnet");
     }
 
     #[test]
@@ -1258,9 +1258,9 @@ mod tests {
 
         app.tab_complete();
 
-        // "sub" matches both "ec2.subnet" (resource type) and "subnet" (binding);
-        // sorted alphabetically, "ec2.subnet" comes first
-        assert_eq!(app.search_query, "ec2.subnet");
+        // "sub" matches both "ec2.Subnet" (resource type) and "subnet" (binding);
+        // sorted alphabetically, "ec2.Subnet" comes first
+        assert_eq!(app.search_query, "ec2.Subnet");
     }
 
     #[test]
@@ -1319,9 +1319,9 @@ mod tests {
 
         app.tab_complete();
 
-        // "SUB" matches "ec2.subnet" and "subnet" case-insensitively;
-        // sorted alphabetically, "ec2.subnet" comes first
-        assert_eq!(app.search_query, "ec2.subnet");
+        // "SUB" matches "ec2.Subnet" and "subnet" case-insensitively;
+        // sorted alphabetically, "ec2.Subnet" comes first
+        assert_eq!(app.search_query, "ec2.Subnet");
     }
 
     #[test]
@@ -1333,20 +1333,20 @@ mod tests {
 
         app.tab_complete();
 
-        // "net" matches "ec2.subnet" (resource type) and "subnet" (binding)
-        // via contains; sorted alphabetically, "ec2.subnet" comes first
-        assert_eq!(app.search_query, "ec2.subnet");
+        // "net" matches "ec2.Subnet" (resource type) and "subnet" (binding)
+        // via contains; sorted alphabetically, "ec2.Subnet" comes first
+        assert_eq!(app.search_query, "ec2.Subnet");
     }
 
     #[test]
     fn tab_complete_with_provider_prefix() {
-        // Resource types with provider prefix (e.g., "awscc.ec2.vpc")
+        // Resource types with provider prefix (e.g., "awscc.ec2.Vpc")
         let mut plan = Plan::new();
         plan.add(Effect::Create(
-            Resource::with_provider("awscc", "ec2.vpc", "my-vpc").with_binding("vpc"),
+            Resource::with_provider("awscc", "ec2.Vpc", "my-vpc").with_binding("vpc"),
         ));
         plan.add(Effect::Create(
-            Resource::with_provider("awscc", "ec2.subnet", "my-subnet").with_binding("subnet"),
+            Resource::with_provider("awscc", "ec2.Subnet", "my-subnet").with_binding("subnet"),
         ));
         let mut app = App::new(&plan, &HashMap::new());
         app.search_active = true;
@@ -1443,14 +1443,14 @@ mod tests {
         let mut plan = Plan::new();
         // Move from old name to new name
         plan.add(Effect::Move {
-            from: ResourceId::new("s3.bucket", "old-name"),
-            to: ResourceId::new("s3.bucket", "new-name"),
+            from: ResourceId::new("s3.Bucket", "old-name"),
+            to: ResourceId::new("s3.Bucket", "new-name"),
         });
         // Update for the same target
         plan.add(Effect::Update {
-            id: ResourceId::new("s3.bucket", "new-name"),
+            id: ResourceId::new("s3.Bucket", "new-name"),
             from: Box::new(State::existing(
-                ResourceId::new("s3.bucket", "new-name"),
+                ResourceId::new("s3.Bucket", "new-name"),
                 [(
                     "versioning".to_string(),
                     Value::String("Disabled".to_string()),
@@ -1458,7 +1458,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             )),
-            to: Resource::new("s3.bucket", "new-name")
+            to: Resource::new("s3.Bucket", "new-name")
                 .with_attribute("versioning", Value::String("Enabled".to_string())),
             changed_attributes: vec!["versioning".to_string()],
         });
@@ -1473,18 +1473,18 @@ mod tests {
     fn move_suppressed_when_replace_exists_for_same_target() {
         let mut plan = Plan::new();
         plan.add(Effect::Move {
-            from: ResourceId::new("ec2.vpc", "old-vpc"),
-            to: ResourceId::new("ec2.vpc", "new-vpc"),
+            from: ResourceId::new("ec2.Vpc", "old-vpc"),
+            to: ResourceId::new("ec2.Vpc", "new-vpc"),
         });
         plan.add(Effect::Replace {
-            id: ResourceId::new("ec2.vpc", "new-vpc"),
+            id: ResourceId::new("ec2.Vpc", "new-vpc"),
             from: Box::new(State::existing(
-                ResourceId::new("ec2.vpc", "new-vpc"),
+                ResourceId::new("ec2.Vpc", "new-vpc"),
                 [("cidr".to_string(), Value::String("10.0.0.0/16".to_string()))]
                     .into_iter()
                     .collect(),
             )),
-            to: Resource::new("ec2.vpc", "new-vpc"),
+            to: Resource::new("ec2.Vpc", "new-vpc"),
             lifecycle: LifecycleConfig::default(),
             changed_create_only: vec!["cidr".to_string()],
             cascading_updates: vec![],
@@ -1501,8 +1501,8 @@ mod tests {
     fn pure_move_not_suppressed() {
         let mut plan = Plan::new();
         plan.add(Effect::Move {
-            from: ResourceId::new("s3.bucket", "old-name"),
-            to: ResourceId::new("s3.bucket", "new-name"),
+            from: ResourceId::new("s3.Bucket", "old-name"),
+            to: ResourceId::new("s3.Bucket", "new-name"),
         });
 
         let app = App::new(&plan, &HashMap::new());

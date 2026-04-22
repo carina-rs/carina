@@ -926,17 +926,17 @@ mod tests {
         route.dependency_bindings = vec!["rt".to_string(), "tgw_attach".to_string()];
 
         // Other resources
-        let mut vpc = Resource::new("ec2.vpc", "vpc");
+        let mut vpc = Resource::new("ec2.Vpc", "vpc");
         vpc.binding = Some("vpc".to_string());
 
         let mut tgw = Resource::new("ec2.transit_gateway", "tgw");
         tgw.binding = Some("tgw".to_string());
 
-        let mut subnet = Resource::new("ec2.subnet", "subnet");
+        let mut subnet = Resource::new("ec2.Subnet", "subnet");
         subnet.binding = Some("subnet".to_string());
         subnet.dependency_bindings = vec!["vpc".to_string()];
 
-        let mut rt = Resource::new("ec2.route_table", "rt");
+        let mut rt = Resource::new("ec2.RouteTable", "rt");
         rt.binding = Some("rt".to_string());
         rt.dependency_bindings = vec!["vpc".to_string()];
 
@@ -1158,14 +1158,14 @@ mod tests {
         // For deletion: vpc delete must wait for subnet delete → subnet first, then vpc
         let mut plan = Plan::new();
         plan.add(Effect::Delete {
-            id: ResourceId::new("ec2.vpc", "my-vpc"),
+            id: ResourceId::new("ec2.Vpc", "my-vpc"),
             identifier: "vpc-123".to_string(),
             lifecycle: LifecycleConfig::default(),
             binding: Some("vpc".to_string()),
             dependencies: HashSet::new(), // vpc has no deps
         });
         plan.add(Effect::Delete {
-            id: ResourceId::new("ec2.subnet", "my-subnet"),
+            id: ResourceId::new("ec2.Subnet", "my-subnet"),
             identifier: "subnet-456".to_string(),
             lifecycle: LifecycleConfig::default(),
             binding: Some("subnet".to_string()),
@@ -1283,14 +1283,14 @@ mod tests {
     fn test_build_dependency_map_respects_delete_dependencies() {
         let mut plan = Plan::new();
         plan.add(Effect::Delete {
-            id: ResourceId::new("ec2.vpc", "my-vpc"),
+            id: ResourceId::new("ec2.Vpc", "my-vpc"),
             identifier: "vpc-123".to_string(),
             lifecycle: LifecycleConfig::default(),
             binding: Some("vpc".to_string()),
             dependencies: HashSet::new(),
         });
         plan.add(Effect::Delete {
-            id: ResourceId::new("ec2.subnet", "my-subnet"),
+            id: ResourceId::new("ec2.Subnet", "my-subnet"),
             identifier: "subnet-456".to_string(),
             lifecycle: LifecycleConfig::default(),
             binding: Some("subnet".to_string()),

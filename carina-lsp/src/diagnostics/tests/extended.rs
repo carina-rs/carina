@@ -120,9 +120,9 @@ fn string_enum_invalid_value_top_level() {
 region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
 cidr_block = "10.0.0.0/16"
-instance_tenancy = awscc.ec2.vpc.InstanceTenancy.invalid_value
+instance_tenancy = awscc.ec2.Vpc.InstanceTenancy.invalid_value
 }"#,
     );
 
@@ -146,9 +146,9 @@ fn string_enum_valid_value_top_level() {
 region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
 cidr_block = "10.0.0.0/16"
-instance_tenancy = awscc.ec2.vpc.InstanceTenancy.default
+instance_tenancy = awscc.ec2.Vpc.InstanceTenancy.default
 }"#,
     );
 
@@ -173,10 +173,10 @@ fn string_enum_invalid_value_in_struct_field() {
 region = awscc.Region.ap_northeast_1
 }
 
-let sg = awscc.ec2.security_group {
+let sg = awscc.ec2.SecurityGroup {
 group_description = "Test security group"
 security_group_ingress {
-    ip_protocol = awscc.ec2.security_group.IpProtocol.invalid_proto
+    ip_protocol = awscc.ec2.SecurityGroup.IpProtocol.invalid_proto
     from_port = 80
     to_port = 80
     cidr_ip = "0.0.0.0/0"
@@ -204,10 +204,10 @@ fn string_enum_valid_value_in_struct_field() {
 region = awscc.Region.ap_northeast_1
 }
 
-let sg = awscc.ec2.security_group {
+let sg = awscc.ec2.SecurityGroup {
 group_description = "Test security group"
 security_group_ingress {
-    ip_protocol = awscc.ec2.security_group.IpProtocol.tcp
+    ip_protocol = awscc.ec2.SecurityGroup.IpProtocol.tcp
     from_port = 80
     to_port = 80
     cidr_ip = "0.0.0.0/0"
@@ -236,10 +236,10 @@ fn custom_type_validation_in_struct_field() {
 region = awscc.Region.ap_northeast_1
 }
 
-let sg = awscc.ec2.security_group {
+let sg = awscc.ec2.SecurityGroup {
 group_description = "Test security group"
 security_group_ingress {
-    ip_protocol = awscc.ec2.security_group.IpProtocol.tcp
+    ip_protocol = awscc.ec2.SecurityGroup.IpProtocol.tcp
     from_port = 99999
     to_port = 80
     cidr_ip = "0.0.0.0/0"
@@ -507,7 +507,7 @@ fn attributes_block_valid_binding_reference() {
 region = awscc.Region.ap_northeast_1
 }
 
-let sg = awscc.ec2.security_group {
+let sg = awscc.ec2.SecurityGroup {
 group_description = "Test security group"
 }
 
@@ -561,7 +561,7 @@ fn attributes_block_valid_types_no_warning() {
 region = awscc.Region.ap_northeast_1
 }
 
-let sg = awscc.ec2.security_group {
+let sg = awscc.ec2.SecurityGroup {
 group_description = "Test security group"
 }
 
@@ -622,11 +622,11 @@ fn find_let_binding_position_with_multibyte_leading_whitespace() {
 
     // U+3000 (ideographic space) is 3 bytes in UTF-8 but 1 character.
     // Rust's str::trim() strips it as Unicode whitespace.
-    // Line: "\u{3000}let my_var = awscc.ec2.vpc { }"
+    // Line: "\u{3000}let my_var = awscc.ec2.Vpc { }"
     // "let " starts at byte 3, but character offset 1.
     // name_col should be char 1 + 4 = 5 (correct)
     // Bug produces byte 3 + 4 = 7 (wrong)
-    let text = "\u{3000}let my_var = awscc.ec2.vpc { }";
+    let text = "\u{3000}let my_var = awscc.ec2.Vpc { }";
     let result = engine.find_let_binding_position(text, "my_var");
     assert_eq!(
         result,
@@ -672,12 +672,12 @@ fn undefined_reference_detected_for_non_id_name_properties() {
 region = awscc.Region.ap_northeast_1
 }
 
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
 name = "test-vpc"
 cidr_block = "10.0.0.0/16"
 }
 
-awscc.ec2.subnet {
+awscc.ec2.Subnet {
 name = "test-subnet"
 vpc_id = nonexistent_vpc.vpc_id
 cidr_block = "10.0.1.0/24"
@@ -704,12 +704,12 @@ fn defined_reference_not_flagged_for_non_id_name_properties() {
 region = awscc.Region.ap_northeast_1
 }
 
-let main_vpc = awscc.ec2.vpc {
+let main_vpc = awscc.ec2.Vpc {
 name = "test-vpc"
 cidr_block = "10.0.0.0/16"
 }
 
-awscc.ec2.subnet {
+awscc.ec2.Subnet {
 name = "test-subnet"
 vpc_id = main_vpc.vpc_id
 cidr_block = "10.0.1.0/24"
@@ -740,7 +740,7 @@ provider awscc {
     region = awscc.Region.ap_northeast_1
 }
 
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
     cidr_block = args.vpc_cidr
 }"#,
     );
@@ -768,7 +768,7 @@ fn provider_without_module_markers_no_error() {
     region = awscc.Region.ap_northeast_1
 }
 
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
     cidr_block = "10.0.0.0/16"
 }"#,
     );
@@ -794,7 +794,7 @@ fn unknown_function_call_produces_diagnostic() {
     region = awscc.Region.ap_northeast_1
 }
 
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
     cidr_block = not_a_function("hello")
 }"#,
     );
@@ -821,7 +821,7 @@ fn known_function_call_no_diagnostic() {
     region = awscc.Region.ap_northeast_1
 }
 
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
     cidr_block = join("-", ["a", "b"])
 }"#,
     );
@@ -849,7 +849,7 @@ fn resource_ref_typo_suggests_similar_attribute() {
 let igw = awscc.ec2.internet_gateway {
 }
 
-let rt = awscc.ec2.route_table {
+let rt = awscc.ec2.RouteTable {
   vpc_id = "vpc-123"
 }
 
@@ -1663,7 +1663,7 @@ fn distinct_semantic_customs_are_rejected() {
     ));
 
     // Target resource: has a TargetId attribute (also String-based Custom)
-    let target_schema = ResourceSchema::new("sso.assignment").attribute(AttributeSchema::new(
+    let target_schema = ResourceSchema::new("sso.Assignment").attribute(AttributeSchema::new(
         "target_id",
         AttributeType::Custom {
             semantic_name: Some("TargetId".to_string()),
@@ -1678,13 +1678,13 @@ fn distinct_semantic_customs_are_rejected() {
 
     let mut schemas = HashMap::new();
     schemas.insert("aws.sts.caller_identity".to_string(), source_schema);
-    schemas.insert("awscc.sso.assignment".to_string(), target_schema);
+    schemas.insert("awscc.sso.Assignment".to_string(), target_schema);
     let engine = custom_engine(schemas);
 
     let doc = create_document(
         r#"let caller = read aws.sts.caller_identity {}
 
-awscc.sso.assignment {
+awscc.sso.Assignment {
 target_id = caller.account_id
 }"#,
     );
@@ -2176,7 +2176,7 @@ fn upstream_state_unknown_field_in_for_expression_is_flagged() {
     let (_tmp, base, name) = set_up_project_with_upstream(
         r#"let orgs = upstream_state { source = '../organizations' }
 for name, _ in orgs.account {
-    awscc.ec2.vpc {
+    awscc.ec2.Vpc {
         name = name
         cidr_block = '10.0.0.0/16'
     }
@@ -2206,7 +2206,7 @@ fn upstream_state_known_field_passes() {
     let (_tmp, base, name) = set_up_project_with_upstream(
         r#"let orgs = upstream_state { source = '../organizations' }
 for name, _ in orgs.accounts {
-    awscc.ec2.vpc {
+    awscc.ec2.Vpc {
         name = name
         cidr_block = '10.0.0.0/16'
     }
@@ -2343,7 +2343,7 @@ fn upstream_state_cross_file_declaration_is_checked() {
     )
     .unwrap();
     let main_src = r#"for name, _ in orgs.account {
-    awscc.ec2.vpc {
+    awscc.ec2.Vpc {
         name = name
         cidr_block = '10.0.0.0/16'
     }
@@ -2373,14 +2373,14 @@ fn upstream_state_duplicate_bad_refs_anchor_to_distinct_sites() {
 }
 
 for name, _ in orgs.bad {
-    awscc.ec2.vpc {
+    awscc.ec2.Vpc {
         name = name
         cidr_block = '10.0.0.0/16'
     }
 }
 
 for other, _ in orgs.bad {
-    awscc.ec2.subnet {
+    awscc.ec2.Subnet {
         name = other
         cidr_block = '10.0.1.0/24'
     }
@@ -2481,7 +2481,7 @@ fn for_iterable_undefined_binding_is_flagged() {
     let (_tmp, base, name) = set_up_project_with_upstream(
         r#"let orgs = upstream_state { source = '../organizations' }
 for name, _ in org.accounts {
-    awscc.ec2.vpc {
+    awscc.ec2.Vpc {
         name = name
         cidr_block = '10.0.0.0/16'
     }
@@ -2512,7 +2512,7 @@ fn for_iterable_defined_binding_passes() {
     let (_tmp, base, name) = set_up_project_with_upstream(
         r#"let orgs = upstream_state { source = '../organizations' }
 for name, _ in orgs.accounts {
-    awscc.ec2.vpc {
+    awscc.ec2.Vpc {
         name = name
         cidr_block = '10.0.0.0/16'
     }
@@ -2559,7 +2559,7 @@ fn for_iterable_undefined_binding_cross_file_is_flagged() {
     )
     .unwrap();
     let main = r#"for name, _ in org.accounts {
-    awscc.ec2.vpc {
+    awscc.ec2.Vpc {
         name = name
         cidr_block = '10.0.0.0/16'
     }
@@ -2588,11 +2588,11 @@ fn for_iterable_undefined_binding_not_duplicated_across_siblings() {
     let base = tmp.path().join("project");
     std::fs::create_dir(&base).unwrap();
     let main = r#"for name, _ in missing.accounts {
-    awscc.ec2.vpc { name = name cidr_block = '10.0.0.0/16' }
+    awscc.ec2.Vpc { name = name cidr_block = '10.0.0.0/16' }
 }
 "#;
     let sibling = r#"for name, _ in missing.accounts {
-    awscc.ec2.vpc { name = name cidr_block = '10.0.0.0/16' }
+    awscc.ec2.Vpc { name = name cidr_block = '10.0.0.0/16' }
 }
 "#;
     std::fs::write(base.join("main.crn"), main).unwrap();
@@ -2625,7 +2625,7 @@ fn for_iterable_multiline_header_still_flagged() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().join("project");
     std::fs::create_dir(&base).unwrap();
-    let main = "for name, _ in\n    missing.accounts {\n    awscc.ec2.vpc { name = name cidr_block = '10.0.0.0/16' }\n}\n";
+    let main = "for name, _ in\n    missing.accounts {\n    awscc.ec2.Vpc { name = name cidr_block = '10.0.0.0/16' }\n}\n";
     std::fs::write(base.join("main.crn"), main).unwrap();
 
     let engine = test_engine();
@@ -2885,7 +2885,7 @@ fn upstream_state_binding_in_sibling_file_is_not_undefined() {
     // The #2131 repro: `orgs.accounts` on the RHS of an assignment.
     // The text-scan `check_undefined_references` only inspects lines
     // that contain `=`, so the bug surfaces inside a resource block.
-    let main = "awscc.ec2.vpc {\n  target_id = orgs.accounts\n}\n";
+    let main = "awscc.ec2.Vpc {\n  target_id = orgs.accounts\n}\n";
     std::fs::write(base.join("main.crn"), main).unwrap();
 
     let engine = test_engine();
@@ -2919,7 +2919,7 @@ fn import_binding_in_sibling_file_is_not_undefined() {
         "let vpc_mod = import '../modules/vpc'\n",
     )
     .unwrap();
-    let main = "awscc.ec2.vpc {\n  name = vpc_mod.name\n}\n";
+    let main = "awscc.ec2.Vpc {\n  name = vpc_mod.name\n}\n";
     std::fs::write(base.join("main.crn"), main).unwrap();
 
     let engine = test_engine();
@@ -2944,7 +2944,7 @@ fn undefined_binding_in_current_file_still_flagged() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().join("downstream");
     std::fs::create_dir(&base).unwrap();
-    let main = "awscc.ec2.vpc {\n  name = nowhere.value\n}\n";
+    let main = "awscc.ec2.Vpc {\n  name = nowhere.value\n}\n";
     std::fs::write(base.join("main.crn"), main).unwrap();
 
     let engine = test_engine();
@@ -3007,11 +3007,11 @@ fn unreferenced_binding_is_still_flagged_unused() {
     let base = tmp.path().join("downstream");
     std::fs::create_dir_all(&base).unwrap();
     let main =
-        "let orphan = awscc.ec2.vpc {\n  name = 'stranded'\n  cidr_block = '10.0.0.0/16'\n}\n";
+        "let orphan = awscc.ec2.Vpc {\n  name = 'stranded'\n  cidr_block = '10.0.0.0/16'\n}\n";
     std::fs::write(base.join("main.crn"), main).unwrap();
     std::fs::write(
         base.join("other.crn"),
-        "awscc.s3.bucket {\n  name = 'unrelated'\n}\n",
+        "awscc.s3.Bucket {\n  name = 'unrelated'\n}\n",
     )
     .unwrap();
 

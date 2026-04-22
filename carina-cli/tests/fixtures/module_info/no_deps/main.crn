@@ -1,18 +1,18 @@
 arguments {
-  region: string {
+  region: String {
     description = 'AWS region'
   }
 }
 
 attributes {
-  bucket_id: awscc.s3.bucket = logs_bucket.id
-  queue_url: awscc.sqs.queue = event_queue.id
+  bucket_id: awscc.s3.Bucket = logs_bucket.id
+  queue_url: awscc.sqs.Queue = event_queue.id
 }
 
-let logs_bucket = awscc.s3.bucket {
+let logs_bucket = awscc.s3.Bucket {
   bucket_name = 'app-logs'
 }
 
-let event_queue = awscc.sqs.queue {
+let event_queue = awscc.sqs.Queue {
   queue_name = 'events'
 }

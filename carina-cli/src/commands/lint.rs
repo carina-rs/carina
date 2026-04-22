@@ -275,7 +275,7 @@ mod tests {
         fs::create_dir_all(&modules_dir).unwrap();
         fs::write(
             modules_dir.join("main.crn"),
-            "let vpc = awscc.ec2.vpc {\n  tags = {\n    Name = 'x'\n  }\n}\n",
+            "let vpc = awscc.ec2.Vpc {\n  tags = {\n    Name = 'x'\n  }\n}\n",
         )
         .unwrap();
 
@@ -302,7 +302,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("main.crn"),
-            "let vpc = awscc.ec2.vpc {\n  tags = {\n    Name = 'x'\n  }\n}\n",
+            "let vpc = awscc.ec2.Vpc {\n  tags = {\n    Name = 'x'\n  }\n}\n",
         )
         .unwrap();
 

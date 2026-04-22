@@ -6,15 +6,15 @@ fn cascade_dependent_updates_adds_update_for_dependent() {
     // Subnet depends on VPC via ResourceRef
     // cascade_dependent_updates should add a CascadingUpdate to the Replace
 
-    let vpc_id = ResourceId::new("ec2.vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.subnet", "my-subnet");
+    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
+    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
     // Unresolved resources (before ref resolution)
-    let vpc = Resource::new("ec2.vpc", "my-vpc")
+    let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
 
-    let subnet = Resource::new("ec2.subnet", "my-subnet")
+    let subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -97,14 +97,14 @@ fn cascade_skips_resources_already_in_plan() {
     // If the dependent resource already has its own effect (e.g., Update),
     // cascade should not add a duplicate
 
-    let vpc_id = ResourceId::new("ec2.vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.subnet", "my-subnet");
+    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
+    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
-    let vpc = Resource::new("ec2.vpc", "my-vpc")
+    let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
 
-    let subnet = Resource::new("ec2.subnet", "my-subnet")
+    let subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -178,13 +178,13 @@ fn cascade_skips_resources_already_in_plan() {
 fn cascade_no_op_without_create_before_destroy() {
     // Replace without create_before_destroy should not trigger cascading
 
-    let vpc_id = ResourceId::new("ec2.vpc", "my-vpc");
+    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
 
-    let vpc = Resource::new("ec2.vpc", "my-vpc")
+    let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
 
-    let subnet = Resource::new("ec2.subnet", "my-subnet")
+    let subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -232,22 +232,22 @@ fn cascade_transitive_dependencies() {
     // VPC → Subnet → Instance (transitive chain)
     // Only Subnet directly depends on VPC, so only Subnet gets cascading update
 
-    let vpc_id = ResourceId::new("ec2.vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.subnet", "my-subnet");
-    let instance_id = ResourceId::new("ec2.instance", "my-instance");
+    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
+    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
+    let instance_id = ResourceId::new("ec2.Instance", "my-instance");
 
-    let vpc = Resource::new("ec2.vpc", "my-vpc")
+    let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
 
-    let subnet = Resource::new("ec2.subnet", "my-subnet")
+    let subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
             Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         );
 
-    let instance = Resource::new("ec2.instance", "my-instance")
+    let instance = Resource::new("ec2.Instance", "my-instance")
         .with_binding("instance")
         .with_attribute(
             "subnet_id",
@@ -323,15 +323,15 @@ fn cascade_anonymous_resource_dependent() {
     // Anonymous resource (no _binding) that depends on a replaced resource
     // should still get a cascading update
 
-    let vpc_id = ResourceId::new("ec2.vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.subnet", "my-subnet");
+    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
+    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
-    let vpc = Resource::new("ec2.vpc", "my-vpc")
+    let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
 
     // Anonymous subnet (no _binding) with a ResourceRef to the VPC
-    let subnet = Resource::new("ec2.subnet", "my-subnet").with_attribute(
+    let subnet = Resource::new("ec2.Subnet", "my-subnet").with_attribute(
         "vpc_id",
         Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
     );
@@ -400,15 +400,15 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
 
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let vpc_id = ResourceId::new("ec2.vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.subnet", "my-subnet");
+    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
+    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
     // Unresolved resources (before ref resolution)
-    let vpc = Resource::new("ec2.vpc", "my-vpc")
+    let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
 
-    let subnet = Resource::new("ec2.subnet", "my-subnet")
+    let subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -443,7 +443,7 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
     );
 
     // Schema for ec2.subnet with vpc_id as create-only
-    let subnet_schema = ResourceSchema::new("ec2.subnet")
+    let subnet_schema = ResourceSchema::new("ec2.Subnet")
         .attribute(
             AttributeSchema::new("vpc_id", AttributeType::String)
                 .required()
@@ -452,7 +452,7 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String).required());
 
     let mut schemas = HashMap::new();
-    schemas.insert("ec2.subnet".to_string(), subnet_schema);
+    schemas.insert("ec2.Subnet".to_string(), subnet_schema);
 
     // Build a plan with Replace for VPC (create_before_destroy)
     let mut plan = Plan::new();
@@ -544,15 +544,15 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
 
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let vpc_id = ResourceId::new("ec2.vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.subnet", "my-subnet");
+    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
+    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
     // Unresolved resources (before ref resolution)
-    let vpc = Resource::new("ec2.vpc", "my-vpc")
+    let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
 
-    let subnet = Resource::new("ec2.subnet", "my-subnet")
+    let subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -592,7 +592,7 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
     );
 
     // Schema: vpc_id and availability_zone are both create-only on ec2.subnet
-    let subnet_schema = ResourceSchema::new("ec2.subnet")
+    let subnet_schema = ResourceSchema::new("ec2.Subnet")
         .attribute(
             AttributeSchema::new("vpc_id", AttributeType::String)
                 .required()
@@ -606,7 +606,7 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String).required());
 
     let mut schemas = HashMap::new();
-    schemas.insert("ec2.subnet".to_string(), subnet_schema);
+    schemas.insert("ec2.Subnet".to_string(), subnet_schema);
 
     // Build a plan:
     // - VPC Replace (create_before_destroy) due to cidr_block change
@@ -686,15 +686,15 @@ fn auto_detect_create_before_destroy_when_resource_has_dependents() {
 
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let vpc_id = ResourceId::new("ec2.vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.subnet", "my-subnet");
+    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
+    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
     // Unresolved resources (before ref resolution)
-    let vpc = Resource::new("ec2.vpc", "my-vpc")
+    let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
 
-    let subnet = Resource::new("ec2.subnet", "my-subnet")
+    let subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -729,9 +729,9 @@ fn auto_detect_create_before_destroy_when_resource_has_dependents() {
     );
 
     // Schema: cidr_block is create-only on ec2.vpc
-    let vpc_schema = ResourceSchema::new("ec2.vpc")
+    let vpc_schema = ResourceSchema::new("ec2.Vpc")
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only());
-    let subnet_schema = ResourceSchema::new("ec2.subnet")
+    let subnet_schema = ResourceSchema::new("ec2.Subnet")
         .attribute(
             AttributeSchema::new("vpc_id", AttributeType::String)
                 .required()
@@ -740,8 +740,8 @@ fn auto_detect_create_before_destroy_when_resource_has_dependents() {
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String).required());
 
     let mut schemas = HashMap::new();
-    schemas.insert("ec2.vpc".to_string(), vpc_schema);
-    schemas.insert("ec2.subnet".to_string(), subnet_schema);
+    schemas.insert("ec2.Vpc".to_string(), vpc_schema);
+    schemas.insert("ec2.Subnet".to_string(), subnet_schema);
 
     // Build a plan with Replace for VPC using DEFAULT lifecycle (no explicit CBD)
     let mut plan = Plan::new();
@@ -791,15 +791,15 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
 
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let vpc_id = ResourceId::new("ec2.vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.subnet", "my-subnet");
+    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
+    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
     // Unresolved resources (before ref resolution)
-    let vpc = Resource::new("ec2.vpc", "my-vpc")
+    let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
 
-    let subnet = Resource::new("ec2.subnet", "my-subnet")
+    let subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -836,7 +836,7 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
     );
 
     // Schema: vpc_id is create-only, tags is NOT create-only
-    let subnet_schema = ResourceSchema::new("ec2.subnet")
+    let subnet_schema = ResourceSchema::new("ec2.Subnet")
         .attribute(
             AttributeSchema::new("vpc_id", AttributeType::String)
                 .required()
@@ -846,7 +846,7 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String).required());
 
     let mut schemas = HashMap::new();
-    schemas.insert("ec2.subnet".to_string(), subnet_schema);
+    schemas.insert("ec2.Subnet".to_string(), subnet_schema);
 
     // Build a plan:
     // - VPC Replace (create_before_destroy) due to cidr_block change
@@ -910,14 +910,14 @@ fn cascade_prevent_destroy_blocks_promotion_to_replace() {
 
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let vpc_id = ResourceId::new("ec2.vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.subnet", "my-subnet");
+    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
+    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
-    let vpc = Resource::new("ec2.vpc", "my-vpc")
+    let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
 
-    let mut subnet = Resource::new("ec2.subnet", "my-subnet")
+    let mut subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -952,7 +952,7 @@ fn cascade_prevent_destroy_blocks_promotion_to_replace() {
     );
 
     // Schema: vpc_id is create-only on ec2.subnet
-    let subnet_schema = ResourceSchema::new("ec2.subnet")
+    let subnet_schema = ResourceSchema::new("ec2.Subnet")
         .attribute(
             AttributeSchema::new("vpc_id", AttributeType::String)
                 .required()
@@ -961,7 +961,7 @@ fn cascade_prevent_destroy_blocks_promotion_to_replace() {
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String).required());
 
     let mut schemas = HashMap::new();
-    schemas.insert("ec2.subnet".to_string(), subnet_schema);
+    schemas.insert("ec2.Subnet".to_string(), subnet_schema);
 
     // Build a plan with Replace for VPC (create_before_destroy)
     let mut plan = Plan::new();
@@ -1017,14 +1017,14 @@ fn cascade_prevent_destroy_blocks_merge_upgrade_to_replace() {
 
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let vpc_id = ResourceId::new("ec2.vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.subnet", "my-subnet");
+    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
+    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
-    let vpc = Resource::new("ec2.vpc", "my-vpc")
+    let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
 
-    let mut subnet = Resource::new("ec2.subnet", "my-subnet")
+    let mut subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -1061,7 +1061,7 @@ fn cascade_prevent_destroy_blocks_merge_upgrade_to_replace() {
     );
 
     // Schema: vpc_id is create-only, tags is NOT
-    let subnet_schema = ResourceSchema::new("ec2.subnet")
+    let subnet_schema = ResourceSchema::new("ec2.Subnet")
         .attribute(
             AttributeSchema::new("vpc_id", AttributeType::String)
                 .required()
@@ -1071,7 +1071,7 @@ fn cascade_prevent_destroy_blocks_merge_upgrade_to_replace() {
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String).required());
 
     let mut schemas = HashMap::new();
-    schemas.insert("ec2.subnet".to_string(), subnet_schema);
+    schemas.insert("ec2.Subnet".to_string(), subnet_schema);
 
     // Build a plan with Replace for VPC and Update for subnet (tags changed)
     let mut plan = Plan::new();

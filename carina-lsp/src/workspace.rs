@@ -222,7 +222,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(
             dir.path().join("main.crn"),
-            "aws.s3.bucket {\n  bucket_name = 'test'\n}\n",
+            "aws.s3.Bucket {\n  bucket_name = 'test'\n}\n",
         )
         .unwrap();
 

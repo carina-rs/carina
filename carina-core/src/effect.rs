@@ -195,14 +195,14 @@ mod tests {
 
     #[test]
     fn create_is_mutating() {
-        let resource = Resource::new("s3.bucket", "my-bucket");
+        let resource = Resource::new("s3.Bucket", "my-bucket");
         let effect = Effect::Create(resource);
         assert!(effect.is_mutating());
     }
 
     #[test]
     fn resource_id_returns_correct_id() {
-        let resource = Resource::new("s3.bucket", "my-bucket").with_read_only(true);
+        let resource = Resource::new("s3.Bucket", "my-bucket").with_read_only(true);
         let effect = Effect::Read {
             resource: resource.clone(),
         };
@@ -211,7 +211,7 @@ mod tests {
 
     #[test]
     fn resource_returns_some_for_create() {
-        let resource = Resource::new("s3.bucket", "my-bucket");
+        let resource = Resource::new("s3.Bucket", "my-bucket");
         let effect = Effect::Create(resource.clone());
         assert_eq!(effect.resource().unwrap().id, resource.id);
     }
@@ -250,33 +250,33 @@ mod tests {
         use std::collections::HashMap;
 
         let effects = vec![
-            Effect::Create(Resource::new("s3.bucket", "my-bucket")),
+            Effect::Create(Resource::new("s3.Bucket", "my-bucket")),
             Effect::Read {
-                resource: Resource::new("s3.bucket", "existing").with_read_only(true),
+                resource: Resource::new("s3.Bucket", "existing").with_read_only(true),
             },
             Effect::Update {
-                id: ResourceId::new("s3.bucket", "my-bucket"),
+                id: ResourceId::new("s3.Bucket", "my-bucket"),
                 from: Box::new(State::existing(
-                    ResourceId::new("s3.bucket", "my-bucket"),
+                    ResourceId::new("s3.Bucket", "my-bucket"),
                     HashMap::from([(
                         "versioning".to_string(),
                         Value::String("Disabled".to_string()),
                     )]),
                 )),
-                to: Resource::new("s3.bucket", "my-bucket")
+                to: Resource::new("s3.Bucket", "my-bucket")
                     .with_attribute("versioning", Value::String("Enabled".to_string())),
                 changed_attributes: vec!["versioning".to_string()],
             },
             Effect::Replace {
-                id: ResourceId::new("ec2.vpc", "my-vpc"),
+                id: ResourceId::new("ec2.Vpc", "my-vpc"),
                 from: Box::new(State::existing(
-                    ResourceId::new("ec2.vpc", "my-vpc"),
+                    ResourceId::new("ec2.Vpc", "my-vpc"),
                     HashMap::from([(
                         "cidr_block".to_string(),
                         Value::String("10.0.0.0/16".to_string()),
                     )]),
                 )),
-                to: Resource::new("ec2.vpc", "my-vpc")
+                to: Resource::new("ec2.Vpc", "my-vpc")
                     .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string())),
                 lifecycle: LifecycleConfig::default(),
                 changed_create_only: vec!["cidr_block".to_string()],
@@ -285,7 +285,7 @@ mod tests {
                 cascade_ref_hints: vec![],
             },
             Effect::Delete {
-                id: ResourceId::new("s3.bucket", "old-bucket"),
+                id: ResourceId::new("s3.Bucket", "old-bucket"),
                 identifier: "old-bucket".to_string(),
                 lifecycle: LifecycleConfig::default(),
                 binding: None,

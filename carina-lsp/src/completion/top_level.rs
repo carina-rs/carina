@@ -53,9 +53,9 @@ impl CompletionProvider {
             line_idx < lines.len() && is_after_let_binding(lines[line_idx], prefix_start as usize);
 
         let read_snippet = if after_let_binding {
-            "read ${1:aws.s3.bucket} {\n    name = \"${2:existing-resource}\"\n}"
+            "read ${1:aws.s3.Bucket} {\n    name = \"${2:existing-resource}\"\n}"
         } else {
-            "let ${1:name} = read ${2:aws.s3.bucket} {\n    name = \"${3:existing-resource}\"\n}"
+            "let ${1:name} = read ${2:aws.s3.Bucket} {\n    name = \"${3:existing-resource}\"\n}"
         };
         let let_import_snippet = if after_let_binding {
             "import '${1:./modules/name}'"
@@ -136,7 +136,7 @@ impl CompletionProvider {
             CompletionItem {
                 label: "import".to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
-                insert_text: Some("import {\n    to = ${1:awscc.ec2.vpc} '${2:name}'\n    id = '${3:resource-id}'\n}".to_string()),
+                insert_text: Some("import {\n    to = ${1:awscc.ec2.Vpc} '${2:name}'\n    id = '${3:resource-id}'\n}".to_string()),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Import existing resource into state".to_string()),
                 ..Default::default()
@@ -144,7 +144,7 @@ impl CompletionProvider {
             CompletionItem {
                 label: "removed".to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
-                insert_text: Some("removed {\n    from = ${1:awscc.ec2.vpc} '${2:name}'\n}".to_string()),
+                insert_text: Some("removed {\n    from = ${1:awscc.ec2.Vpc} '${2:name}'\n}".to_string()),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Remove resource from state without destroying".to_string()),
                 ..Default::default()
@@ -152,7 +152,7 @@ impl CompletionProvider {
             CompletionItem {
                 label: "moved".to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
-                insert_text: Some("moved {\n    from = ${1:awscc.ec2.vpc} '${2:old-name}'\n    to   = ${3:awscc.ec2.vpc} '${4:new-name}'\n}".to_string()),
+                insert_text: Some("moved {\n    from = ${1:awscc.ec2.Vpc} '${2:old-name}'\n    to   = ${3:awscc.ec2.Vpc} '${4:new-name}'\n}".to_string()),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Move/rename resource in state".to_string()),
                 ..Default::default()
@@ -293,7 +293,7 @@ impl CompletionProvider {
     /// Extract every `let <name> = <rhs>` from `src`.
     ///
     /// Returns `Vec<(name, rhs)>` where `rhs` is the trimmed text after `=`
-    /// (e.g. `awscc.ec2.vpc { ... }`, `upstream_state { ... }`, `import '...'`).
+    /// (e.g. `awscc.ec2.Vpc { ... }`, `upstream_state { ... }`, `import '...'`).
     /// Callers classify the rhs themselves — `extract_resource_bindings` maps
     /// it to a schema key, the for-iterable handler keys it into a detail
     /// label, etc. Duplicates (same binding name appearing in the buffer
@@ -311,9 +311,9 @@ impl CompletionProvider {
     }
 
     /// Extract resource binding names and their resource types from `src`
-    /// (variables defined with `let binding_name = awscc.ec2.vpc {`).
+    /// (variables defined with `let binding_name = awscc.ec2.Vpc {`).
     /// Returns Vec<(binding_name, resource_type)> where resource_type is the schema key
-    /// (e.g., "awscc.ec2.vpc"). See [`DslSource`] for buffer-vs-directory choice.
+    /// (e.g., "awscc.ec2.Vpc"). See [`DslSource`] for buffer-vs-directory choice.
     pub(super) fn extract_resource_bindings(&self, src: DslSource<'_>) -> Vec<(String, String)> {
         Self::extract_let_bindings(src)
             .into_iter()

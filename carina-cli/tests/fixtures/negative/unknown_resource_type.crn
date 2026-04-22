@@ -5,6 +5,6 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-awscc.ec2.nonexistent_resource {
+awscc.ec2.NonexistentResource {
   name = 'test'
 }

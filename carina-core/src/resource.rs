@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 pub struct ResourceId {
     /// Provider name (e.g., "aws", "awscc")
     pub provider: String,
-    /// Resource type (e.g., "s3.bucket", "ec2.instance")
+    /// Resource type (e.g., "s3.Bucket", "ec2.Instance")
     pub resource_type: String,
     /// Resource name (identifier specified in DSL)
     pub name: String,
@@ -1028,7 +1028,7 @@ mod tests {
 
     #[test]
     fn resource_id_serde_round_trip() {
-        let id = ResourceId::with_provider("awscc", "ec2.vpc", "main-vpc");
+        let id = ResourceId::with_provider("awscc", "ec2.Vpc", "main-vpc");
         let json = serde_json::to_string(&id).unwrap();
         let deserialized: ResourceId = serde_json::from_str(&json).unwrap();
         assert_eq!(id, deserialized);
@@ -1041,7 +1041,7 @@ mod tests {
         attrs.insert("versioning".to_string(), Value::Bool(true));
 
         let state = State::existing(
-            ResourceId::with_provider("aws", "s3.bucket", "my-bucket"),
+            ResourceId::with_provider("aws", "s3.Bucket", "my-bucket"),
             attrs,
         )
         .with_identifier("my-bucket");
@@ -1426,7 +1426,7 @@ mod tests {
 
     #[test]
     fn resource_typed_binding_field() {
-        let resource = Resource::new("s3.bucket", "my-bucket").with_binding("my_bucket");
+        let resource = Resource::new("s3.Bucket", "my-bucket").with_binding("my_bucket");
         assert_eq!(resource.binding, Some("my_bucket".to_string()));
         // binding should NOT be in attributes
         assert!(!resource.attributes.contains_key("_binding"));
@@ -1434,7 +1434,7 @@ mod tests {
 
     #[test]
     fn resource_typed_dependency_bindings_field() {
-        let resource = Resource::new("ec2.subnet", "my-subnet")
+        let resource = Resource::new("ec2.Subnet", "my-subnet")
             .with_dependency_bindings(vec!["vpc".to_string()]);
         assert_eq!(resource.dependency_bindings, vec!["vpc".to_string()]);
         // dependency_bindings should NOT be in attributes
@@ -1454,7 +1454,7 @@ mod tests {
 
     #[test]
     fn resource_default_metadata_fields() {
-        let resource = Resource::new("s3.bucket", "my-bucket");
+        let resource = Resource::new("s3.Bucket", "my-bucket");
         assert_eq!(resource.binding, None);
         assert!(resource.dependency_bindings.is_empty());
         assert!(!resource.is_virtual());
@@ -1462,7 +1462,7 @@ mod tests {
 
     #[test]
     fn resource_kind_enum_real_by_default() {
-        let resource = Resource::new("s3.bucket", "my-bucket");
+        let resource = Resource::new("s3.Bucket", "my-bucket");
         assert_eq!(resource.kind, ResourceKind::Real);
         assert!(!resource.is_virtual());
         assert!(!resource.is_data_source());
@@ -1494,7 +1494,7 @@ mod tests {
 
     #[test]
     fn resource_kind_enum_data_source() {
-        let resource = Resource::new("s3.bucket", "my-bucket").with_kind(ResourceKind::DataSource);
+        let resource = Resource::new("s3.Bucket", "my-bucket").with_kind(ResourceKind::DataSource);
         assert!(resource.is_data_source());
         assert!(!resource.is_virtual());
     }
@@ -1547,7 +1547,7 @@ mod tests {
 
     #[test]
     fn resource_attributes_use_expr_type() {
-        let resource = Resource::new("s3.bucket", "test")
+        let resource = Resource::new("s3.Bucket", "test")
             .with_expr_attribute("name", Expr(Value::String("my-bucket".to_string())))
             .with_expr_attribute(
                 "vpc_id",
@@ -1651,12 +1651,11 @@ mod tests {
     fn resource_module_source_typed_field() {
         // Real resources that belong to modules should use the typed module_source field
         // instead of storing _module/_module_instance as hidden attributes
-        let resource = Resource::new("ec2.security_group", "web_sg").with_module_source(
-            ModuleSource::Module {
+        let resource =
+            Resource::new("ec2.SecurityGroup", "web_sg").with_module_source(ModuleSource::Module {
                 name: "web_tier".to_string(),
                 instance: "web".to_string(),
-            },
-        );
+            });
 
         // Module source info should be in the typed field
         assert_eq!(

@@ -26,7 +26,7 @@ fn init_fails_when_provider_has_no_source() {
   region = awscc.Region.ap_northeast_1
 }
 
-awscc.s3.bucket {
+awscc.s3.Bucket {
   name = 'test'
 }
 "#,

@@ -873,13 +873,13 @@ mod tests {
         let mut parsed = empty_parsed();
 
         // Resource with a binding
-        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc")
+        let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc")
             .with_binding("vpc")
             .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()));
         parsed.resources.push(vpc); // allow: direct — fixture test inspection
 
         // Resource that references the binding
-        let subnet = Resource::with_provider("awscc", "ec2.subnet", "web-subnet").with_attribute(
+        let subnet = Resource::with_provider("awscc", "ec2.Subnet", "web-subnet").with_attribute(
             "vpc_id",
             Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         );
@@ -892,7 +892,7 @@ mod tests {
     fn unused_binding_warns() {
         let mut parsed = empty_parsed();
 
-        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc")
+        let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc")
             .with_binding("vpc")
             .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()));
         parsed.resources.push(vpc); // allow: direct — fixture test inspection
@@ -906,7 +906,7 @@ mod tests {
         let mut parsed = empty_parsed();
 
         // Anonymous resource (no _binding attribute)
-        let bucket = Resource::with_provider("awscc", "s3.bucket", "my-bucket")
+        let bucket = Resource::with_provider("awscc", "s3.Bucket", "my-bucket")
             .with_attribute("bucket_name", Value::String("my-bucket".to_string()));
         parsed.resources.push(bucket); // allow: direct — fixture test inspection
 
@@ -917,7 +917,7 @@ mod tests {
     fn binding_referenced_in_nested_value() {
         let mut parsed = empty_parsed();
 
-        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc").with_binding("vpc");
+        let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc").with_binding("vpc");
         parsed.resources.push(vpc); // allow: direct — fixture test inspection
 
         // Reference inside a Map inside a List
@@ -926,7 +926,7 @@ mod tests {
             "vpc_id".to_string(),
             Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         );
-        let sg = Resource::with_provider("awscc", "ec2.security_group", "web-sg")
+        let sg = Resource::with_provider("awscc", "ec2.SecurityGroup", "web-sg")
             .with_attribute("tags", Value::List(vec![Value::Map(map)]));
         parsed.resources.push(sg); // allow: direct — fixture test inspection
 
@@ -937,7 +937,7 @@ mod tests {
     fn binding_referenced_in_module_call() {
         let mut parsed = empty_parsed();
 
-        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc").with_binding("vpc");
+        let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc").with_binding("vpc");
         parsed.resources.push(vpc); // allow: direct — fixture test inspection
 
         let mut args = HashMap::new();
@@ -958,15 +958,15 @@ mod tests {
     fn multiple_bindings_some_unused() {
         let mut parsed = empty_parsed();
 
-        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc").with_binding("vpc");
+        let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc").with_binding("vpc");
         parsed.resources.push(vpc); // allow: direct — fixture test inspection
 
         let sg =
-            Resource::with_provider("awscc", "ec2.security_group", "web-sg").with_binding("web_sg");
+            Resource::with_provider("awscc", "ec2.SecurityGroup", "web-sg").with_binding("web_sg");
         parsed.resources.push(sg); // allow: direct — fixture test inspection
 
         // Only vpc is referenced
-        let subnet = Resource::with_provider("awscc", "ec2.subnet", "web-subnet").with_attribute(
+        let subnet = Resource::with_provider("awscc", "ec2.Subnet", "web-subnet").with_attribute(
             "vpc_id",
             Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         );
@@ -980,7 +980,7 @@ mod tests {
     fn binding_referenced_in_attributes_not_warned() {
         let mut parsed = empty_parsed();
 
-        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc").with_binding("vpc");
+        let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc").with_binding("vpc");
         parsed.resources.push(vpc); // allow: direct — fixture test inspection
 
         parsed
@@ -1002,7 +1002,7 @@ mod tests {
     fn binding_referenced_in_exports_not_warned() {
         let mut parsed = empty_parsed();
 
-        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc").with_binding("vpc");
+        let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc").with_binding("vpc");
         parsed.resources.push(vpc); // allow: direct — fixture test inspection
 
         parsed.export_params.push(crate::parser::ExportParameter {
@@ -1028,7 +1028,7 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block = "10.0.0.0/16"
 }
 
@@ -1040,7 +1040,7 @@ let igw_attachment = awscc.ec2.vpc_gateway_attachment {
   internet_gateway_id = igw.internet_gateway_id
 }
 
-let rt = awscc.ec2.route_table {
+let rt = awscc.ec2.RouteTable {
   vpc_id = vpc.vpc_id
 }
 
@@ -1087,7 +1087,7 @@ provider awscc {
 let enabled = true
 
 let vpc = if enabled {
-  awscc.ec2.vpc {
+  awscc.ec2.Vpc {
     cidr_block = "10.0.0.0/16"
   }
 }
@@ -1112,7 +1112,7 @@ provider awscc {
 }
 
 let vpcs = for (i, env) in ["dev", "stg"] {
-  awscc.ec2.vpc {
+  awscc.ec2.Vpc {
     cidr_block = cidr_subnet("10.0.0.0/8", 8, i)
   }
 }
@@ -1158,7 +1158,7 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block = "10.0.0.0/16"
 }
 "#;
@@ -1240,12 +1240,12 @@ let vpc = awscc.ec2.vpc {
     fn unknown_binding_reference_reports_error() {
         let mut schemas = HashMap::new();
         schemas.insert(
-            "ec2.subnet".to_string(),
-            make_schema("ec2.subnet", vec![("vpc_id", AttributeType::String)]),
+            "ec2.Subnet".to_string(),
+            make_schema("ec2.Subnet", vec![("vpc_id", AttributeType::String)]),
         );
 
         // Subnet references "vpc" binding which doesn't exist
-        let subnet = Resource::with_provider("awscc", "ec2.subnet", "web-subnet").with_attribute(
+        let subnet = Resource::with_provider("awscc", "ec2.Subnet", "web-subnet").with_attribute(
             "vpc_id",
             Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         );
@@ -1256,7 +1256,7 @@ let vpc = awscc.ec2.vpc {
             validate_resource_ref_types(&parsed, &schemas, &test_schema_key_fn, &HashSet::new());
         assert_eq!(
             result.unwrap_err(),
-            "awscc.ec2.subnet.web-subnet: unknown binding 'vpc' in reference vpc.vpc_id"
+            "awscc.ec2.Subnet.web-subnet: unknown binding 'vpc' in reference vpc.vpc_id"
         );
     }
 
@@ -1264,21 +1264,21 @@ let vpc = awscc.ec2.vpc {
     fn unknown_attribute_reference_reports_error() {
         let mut schemas = HashMap::new();
         schemas.insert(
-            "ec2.vpc".to_string(),
-            make_schema("ec2.vpc", vec![("cidr_block", AttributeType::String)]),
+            "ec2.Vpc".to_string(),
+            make_schema("ec2.Vpc", vec![("cidr_block", AttributeType::String)]),
         );
         schemas.insert(
-            "ec2.subnet".to_string(),
-            make_schema("ec2.subnet", vec![("vpc_id", AttributeType::String)]),
+            "ec2.Subnet".to_string(),
+            make_schema("ec2.Subnet", vec![("vpc_id", AttributeType::String)]),
         );
 
         // VPC resource with binding
-        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc")
+        let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc")
             .with_binding("vpc")
             .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()));
 
         // Subnet references vpc.nonexistent_attr which doesn't exist on the VPC schema
-        let subnet = Resource::with_provider("awscc", "ec2.subnet", "web-subnet").with_attribute(
+        let subnet = Resource::with_provider("awscc", "ec2.Subnet", "web-subnet").with_attribute(
             "vpc_id",
             Value::resource_ref("vpc".to_string(), "nonexistent_attr".to_string(), vec![]),
         );
@@ -1290,7 +1290,7 @@ let vpc = awscc.ec2.vpc {
             validate_resource_ref_types(&parsed, &schemas, &test_schema_key_fn, &HashSet::new());
         assert_eq!(
             result.unwrap_err(),
-            "awscc.ec2.subnet.web-subnet: unknown attribute 'nonexistent_attr' on 'vpc' in reference vpc.nonexistent_attr"
+            "awscc.ec2.Subnet.web-subnet: unknown attribute 'nonexistent_attr' on 'vpc' in reference vpc.nonexistent_attr"
         );
     }
 
@@ -1345,18 +1345,18 @@ let vpc = awscc.ec2.vpc {
     fn unknown_attribute_reference_no_suggestion_when_too_different() {
         let mut schemas = HashMap::new();
         schemas.insert(
-            "ec2.vpc".to_string(),
-            make_schema("ec2.vpc", vec![("cidr_block", AttributeType::String)]),
+            "ec2.Vpc".to_string(),
+            make_schema("ec2.Vpc", vec![("cidr_block", AttributeType::String)]),
         );
         schemas.insert(
-            "ec2.subnet".to_string(),
-            make_schema("ec2.subnet", vec![("vpc_id", AttributeType::String)]),
+            "ec2.Subnet".to_string(),
+            make_schema("ec2.Subnet", vec![("vpc_id", AttributeType::String)]),
         );
 
-        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc").with_binding("vpc");
+        let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc").with_binding("vpc");
 
         // Completely unrelated attribute name - no suggestion expected
-        let subnet = Resource::with_provider("awscc", "ec2.subnet", "web-subnet").with_attribute(
+        let subnet = Resource::with_provider("awscc", "ec2.Subnet", "web-subnet").with_attribute(
             "vpc_id",
             Value::resource_ref(
                 "vpc".to_string(),
@@ -2428,11 +2428,11 @@ let vpc = awscc.ec2.vpc {
 
     /// `validate_resources` must reject a resource whose schema declares an
     /// `exclusive_required` group that is not satisfied — mirrors
-    /// `awscc.ec2.vpc {}` with no cidr_block / ipam pool.
+    /// `awscc.ec2.Vpc {}` with no cidr_block / ipam pool.
     #[test]
     fn validate_resources_rejects_missing_exclusive_required() {
         let schema = make_schema(
-            "ec2.vpc",
+            "ec2.Vpc",
             vec![
                 ("cidr_block", AttributeType::String),
                 ("ipv4_ipam_pool_id", AttributeType::String),
@@ -2441,9 +2441,9 @@ let vpc = awscc.ec2.vpc {
         .exclusive_required(&["cidr_block", "ipv4_ipam_pool_id"]);
 
         let mut schemas = HashMap::new();
-        schemas.insert("ec2.vpc".to_string(), schema);
+        schemas.insert("ec2.Vpc".to_string(), schema);
 
-        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc");
+        let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc");
 
         let mut known = HashSet::new();
         known.insert("awscc".to_string());

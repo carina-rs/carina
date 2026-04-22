@@ -843,7 +843,7 @@ mod tests {
                 "provider awscc {\n  source = 'github.com/carina-rs/carina-provider-awscc'\n}\n",
             ),
             ("block_removed.crn", "# provider block removed\n"),
-            ("main.crn", "awscc.s3.bucket { bucket_name = 'ex' }\n"),
+            ("main.crn", "awscc.s3.Bucket { bucket_name = 'ex' }\n"),
         ] {
             let path = tmp.path().join(name);
             std::fs::write(&path, content).unwrap();

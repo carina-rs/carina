@@ -493,7 +493,7 @@ mod tests {
     #[test]
     fn test_find_list_literal_attrs_detects_list_literal() {
         let source = r#"
-awscc.ec2.security_group {
+awscc.ec2.SecurityGroup {
     group_description = "test"
     security_group_ingress = [{
         ip_protocol = "tcp"
@@ -514,7 +514,7 @@ awscc.ec2.security_group {
     #[test]
     fn test_find_list_literal_attrs_ignores_block_syntax() {
         let source = r#"
-awscc.ec2.security_group {
+awscc.ec2.SecurityGroup {
     group_description = "test"
     security_group_ingress {
         ip_protocol = "tcp"
@@ -536,7 +536,7 @@ awscc.ec2.security_group {
     #[test]
     fn test_find_list_literal_attrs_ignores_non_listed_attrs() {
         let source = r#"
-awscc.ec2.security_group {
+awscc.ec2.SecurityGroup {
     group_description = "test"
     tags = ["a", "b"]
 }
@@ -571,7 +571,7 @@ let igw_attachment = awscc.ec2.vpc_gateway_attachment {
     #[test]
     fn test_find_duplicate_attrs_no_false_positive() {
         let source = r#"
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
     cidr_block = "10.0.0.0/16"
     enable_dns_support = true
 }
@@ -584,11 +584,11 @@ awscc.ec2.vpc {
     fn test_find_duplicate_attrs_different_blocks() {
         // Same attr name in different blocks should NOT be flagged
         let source = r#"
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
     cidr_block = "10.0.0.0/16"
 }
 
-awscc.ec2.subnet {
+awscc.ec2.Subnet {
     cidr_block = "10.0.1.0/24"
 }
 "#;
@@ -602,7 +602,7 @@ awscc.ec2.subnet {
     #[test]
     fn test_find_duplicate_attrs_nested_block() {
         let source = r#"
-awscc.ec2.security_group {
+awscc.ec2.SecurityGroup {
     group_description = "test"
     security_group_ingress {
         ip_protocol = "tcp"
@@ -621,7 +621,7 @@ awscc.ec2.security_group {
         // List literal syntax: attr = [{ ... }]
         // Duplicate within the list literal block should be detected
         let source = r#"
-awscc.ec2.security_group {
+awscc.ec2.SecurityGroup {
     group_description = "test"
     security_group_ingress = [{
         ip_protocol = "tcp"
@@ -644,7 +644,7 @@ awscc.ec2.security_group {
         // group_description in the outer block should not conflict with
         // attrs inside the list literal block after }] closes the inner block
         let source = r#"
-awscc.ec2.security_group {
+awscc.ec2.SecurityGroup {
     group_description = "test"
     security_group_ingress = [{
         ip_protocol = "tcp"
@@ -678,7 +678,7 @@ provider awscc {
 
     #[test]
     fn test_list_struct_attr_names() {
-        let schema = ResourceSchema::new("ec2.security_group")
+        let schema = ResourceSchema::new("ec2.SecurityGroup")
             .attribute(crate::schema::AttributeSchema::new(
                 "security_group_ingress",
                 AttributeType::list(AttributeType::Struct {
@@ -838,7 +838,7 @@ let e = replace("old", "new", str)
 
     #[test]
     fn test_naming_camel_case_warns() {
-        let source = r#"let myVpc = awscc.ec2.vpc { cidr_block = "10.0.0.0/16" }"#;
+        let source = r#"let myVpc = awscc.ec2.Vpc { cidr_block = "10.0.0.0/16" }"#;
         let results = find_non_snake_case_bindings(source);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "myVpc");
@@ -847,7 +847,7 @@ let e = replace("old", "new", str)
 
     #[test]
     fn test_naming_pascal_case_warns() {
-        let source = r#"let MyVpc = awscc.ec2.vpc { cidr_block = "10.0.0.0/16" }"#;
+        let source = r#"let MyVpc = awscc.ec2.Vpc { cidr_block = "10.0.0.0/16" }"#;
         let results = find_non_snake_case_bindings(source);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "MyVpc");
@@ -855,14 +855,14 @@ let e = replace("old", "new", str)
 
     #[test]
     fn test_naming_snake_case_no_warning() {
-        let source = r#"let my_vpc = awscc.ec2.vpc { cidr_block = "10.0.0.0/16" }"#;
+        let source = r#"let my_vpc = awscc.ec2.Vpc { cidr_block = "10.0.0.0/16" }"#;
         let results = find_non_snake_case_bindings(source);
         assert!(results.is_empty(), "snake_case should not warn");
     }
 
     #[test]
     fn test_naming_underscore_prefix_skipped() {
-        let source = r#"let _internal = awscc.ec2.vpc { cidr_block = "10.0.0.0/16" }"#;
+        let source = r#"let _internal = awscc.ec2.Vpc { cidr_block = "10.0.0.0/16" }"#;
         let results = find_non_snake_case_bindings(source);
         assert!(
             results.is_empty(),
@@ -997,7 +997,7 @@ let e = replace("old", "new", str)
 
     #[test]
     fn test_naming_multiple_warnings() {
-        let source = "let myVpc = awscc.ec2.vpc {}\nlet MySubnet = awscc.ec2.subnet {}\nlet good_name = awscc.ec2.igw {}";
+        let source = "let myVpc = awscc.ec2.Vpc {}\nlet MySubnet = awscc.ec2.Subnet {}\nlet good_name = awscc.ec2.igw {}";
         let results = find_non_snake_case_bindings(source);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].name, "myVpc");
@@ -1035,7 +1035,7 @@ tags = {
     fn test_tag_mixed_casing_warns() {
         // Majority is PascalCase (2 vs 1), so snake_case key should be flagged
         let source = r#"
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
     cidr_block = "10.0.0.0/16"
     tags = {
         Name = "my-vpc"

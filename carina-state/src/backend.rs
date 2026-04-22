@@ -156,7 +156,7 @@ pub trait StateBackend: Send + Sync {
         None
     }
 
-    /// Resource type of the storage resource (e.g., "s3.bucket")
+    /// Resource type of the storage resource (e.g., "s3.Bucket")
     fn resource_type(&self) -> Option<&str> {
         None
     }

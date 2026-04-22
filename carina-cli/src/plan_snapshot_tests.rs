@@ -497,7 +497,7 @@ fn unused_let_check_covers_fixtures_without_main_crn() {
     std::fs::write(
         fixture_dir.join("resources.crn"),
         "provider awscc {\n  region = awscc.Region.ap_northeast_1\n}\n\n\
-         let orphan = awscc.ec2.vpc {\n  cidr_block = '10.0.0.0/16'\n}\n",
+         let orphan = awscc.ec2.Vpc {\n  cidr_block = '10.0.0.0/16'\n}\n",
     )
     .unwrap();
 

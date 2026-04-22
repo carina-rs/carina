@@ -96,7 +96,7 @@ impl Provider for TestProvider {
 
 #[tokio::test]
 async fn refresh_pending_states_updates_saved_state_from_provider_read() {
-    let resource = Resource::with_provider("aws", "s3.bucket", "bucket");
+    let resource = Resource::with_provider("aws", "s3.Bucket", "bucket");
     let id = resource.id.clone();
     let identifier = "bucket-123";
 
@@ -125,7 +125,7 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
 
     let mut existing_state = StateFile::new();
     existing_state.upsert_resource(
-        ResourceState::new("s3.bucket", "bucket", "aws")
+        ResourceState::new("s3.Bucket", "bucket", "aws")
             .with_identifier(identifier)
             .with_attribute("status", json!("before")),
     );
@@ -143,7 +143,7 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
     })
     .unwrap();
 
-    let saved_resource = saved.find_resource("aws", "s3.bucket", "bucket").unwrap();
+    let saved_resource = saved.find_resource("aws", "s3.Bucket", "bucket").unwrap();
     assert_eq!(
         saved_resource.attributes.get("status"),
         Some(&json!("after"))
@@ -152,7 +152,7 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
 
 #[tokio::test]
 async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
-    let resource = Resource::with_provider("aws", "s3.bucket", "bucket");
+    let resource = Resource::with_provider("aws", "s3.Bucket", "bucket");
     let id = resource.id.clone();
     let identifier = "bucket-123";
 
@@ -173,7 +173,7 @@ async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
 
     let mut existing_state = StateFile::new();
     existing_state.upsert_resource(
-        ResourceState::new("s3.bucket", "bucket", "aws")
+        ResourceState::new("s3.Bucket", "bucket", "aws")
             .with_identifier(identifier)
             .with_attribute("status", json!("before")),
     );
@@ -191,12 +191,12 @@ async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
     })
     .unwrap();
 
-    assert!(saved.find_resource("aws", "s3.bucket", "bucket").is_none());
+    assert!(saved.find_resource("aws", "s3.Bucket", "bucket").is_none());
 }
 
 #[tokio::test]
 async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refresh_fails() {
-    let resource = Resource::with_provider("aws", "s3.bucket", "bucket");
+    let resource = Resource::with_provider("aws", "s3.Bucket", "bucket");
     let id = resource.id.clone();
     let identifier = "bucket-123";
 
@@ -220,7 +220,7 @@ async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refr
 
     let mut existing_state = StateFile::new();
     existing_state.upsert_resource(
-        ResourceState::new("s3.bucket", "bucket", "aws")
+        ResourceState::new("s3.Bucket", "bucket", "aws")
             .with_identifier(identifier)
             .with_attribute("status", json!("saved")),
     );
@@ -238,7 +238,7 @@ async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refr
     })
     .unwrap();
 
-    let saved_resource = saved.find_resource("aws", "s3.bucket", "bucket").unwrap();
+    let saved_resource = saved.find_resource("aws", "s3.Bucket", "bucket").unwrap();
     assert_eq!(
         saved_resource.attributes.get("status"),
         Some(&json!("saved"))
@@ -251,11 +251,11 @@ fn plan_file_serde_round_trip() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Create(
-        Resource::with_provider("aws", "s3.bucket", "my-bucket")
+        Resource::with_provider("aws", "s3.Bucket", "my-bucket")
             .with_attribute("bucket", Value::String("my-bucket".to_string())),
     ));
     plan.add(Effect::Delete {
-        id: ResourceId::with_provider("aws", "s3.bucket", "old-bucket"),
+        id: ResourceId::with_provider("aws", "s3.Bucket", "old-bucket"),
         identifier: "old-bucket".to_string(),
         lifecycle: LifecycleConfig::default(),
         binding: None,
@@ -263,13 +263,13 @@ fn plan_file_serde_round_trip() {
     });
 
     let sorted_resources = vec![
-        Resource::with_provider("aws", "s3.bucket", "my-bucket")
+        Resource::with_provider("aws", "s3.Bucket", "my-bucket")
             .with_attribute("bucket", Value::String("my-bucket".to_string())),
     ];
 
     let current_states = vec![CurrentStateEntry {
-        id: ResourceId::with_provider("aws", "s3.bucket", "my-bucket"),
-        state: State::not_found(ResourceId::with_provider("aws", "s3.bucket", "my-bucket")),
+        id: ResourceId::with_provider("aws", "s3.Bucket", "my-bucket"),
+        state: State::not_found(ResourceId::with_provider("aws", "s3.Bucket", "my-bucket")),
     }];
 
     let plan_file = PlanFile {
@@ -324,7 +324,7 @@ fn plan_file_serde_round_trip() {
 #[test]
 #[ignore = "requires provider binary for schema-based prefix resolution"]
 fn test_resolve_attr_prefixes_extracts_prefix_and_generates_name() {
-    let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket");
     resource.set_attr(
         "bucket_name_prefix".to_string(),
         Value::String("my-app-".to_string()),
@@ -354,7 +354,7 @@ fn test_resolve_attr_prefixes_extracts_prefix_and_generates_name() {
 #[test]
 fn test_resolve_attr_prefixes_leaves_non_matching_prefix_alone() {
     // If base attr doesn't exist in schema, leave _prefix as-is
-    let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket");
     resource.set_attr(
         "nonexistent_attr_prefix".to_string(),
         Value::String("some-value".to_string()),
@@ -375,7 +375,7 @@ fn test_resolve_attr_prefixes_leaves_non_matching_prefix_alone() {
 #[test]
 #[ignore = "requires provider binary for schema-based prefix resolution"]
 fn test_resolve_attr_prefixes_errors_when_both_prefix_and_attr_specified() {
-    let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket");
     resource.set_attr(
         "bucket_name_prefix".to_string(),
         Value::String("my-app-".to_string()),
@@ -399,7 +399,7 @@ fn test_resolve_attr_prefixes_errors_when_both_prefix_and_attr_specified() {
 #[test]
 #[ignore = "requires provider binary for schema-based prefix resolution"]
 fn test_resolve_attr_prefixes_errors_on_empty_prefix() {
-    let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket");
     resource.set_attr(
         "bucket_name_prefix".to_string(),
         Value::String("".to_string()),
@@ -438,7 +438,7 @@ fn test_resolve_names_handles_block_name_before_prefix() {
 
 #[test]
 fn test_reconcile_prefixed_names_reuses_state_name_when_prefix_matches() {
-    let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket");
     resource
         .prefixes
         .insert("bucket_name".to_string(), "my-app-".to_string());
@@ -448,7 +448,7 @@ fn test_reconcile_prefixed_names_reuses_state_name_when_prefix_matches() {
     );
 
     let mut state_file = StateFile::new();
-    let mut rs = ResourceState::new("s3.bucket", "test-bucket", "awscc");
+    let mut rs = ResourceState::new("s3.Bucket", "test-bucket", "awscc");
     rs.attributes.insert(
         "bucket_name".to_string(),
         serde_json::json!("my-app-existing1"),
@@ -469,7 +469,7 @@ fn test_reconcile_prefixed_names_reuses_state_name_when_prefix_matches() {
 
 #[test]
 fn test_reconcile_prefixed_names_generates_new_name_when_prefix_changes() {
-    let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket");
     resource
         .prefixes
         .insert("bucket_name".to_string(), "new-prefix-".to_string());
@@ -479,7 +479,7 @@ fn test_reconcile_prefixed_names_generates_new_name_when_prefix_changes() {
     );
 
     let mut state_file = StateFile::new();
-    let mut rs = ResourceState::new("s3.bucket", "test-bucket", "awscc");
+    let mut rs = ResourceState::new("s3.Bucket", "test-bucket", "awscc");
     rs.attributes.insert(
         "bucket_name".to_string(),
         serde_json::json!("old-prefix-existing1"),
@@ -500,7 +500,7 @@ fn test_reconcile_prefixed_names_generates_new_name_when_prefix_changes() {
 
 #[test]
 fn test_reconcile_prefixed_names_keeps_generated_name_when_no_state() {
-    let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket");
     resource
         .prefixes
         .insert("bucket_name".to_string(), "my-app-".to_string());
@@ -531,7 +531,7 @@ fn test_detailed_exitcode_no_changes() {
 fn test_detailed_exitcode_with_changes() {
     // A plan with mutating effects means changes -- has_changes should be true
     let mut plan = Plan::new();
-    plan.add(Effect::Create(Resource::new("s3.bucket", "test")));
+    plan.add(Effect::Create(Resource::new("s3.Bucket", "test")));
     let has_changes = plan.mutation_count() > 0;
     assert!(has_changes);
 }
@@ -564,13 +564,13 @@ fn make_awscc_provider(region_dsl: &str) -> ProviderConfig {
 #[ignore = "requires provider binary for identity_attributes"]
 fn test_anonymous_id_different_regions_produce_different_identifiers() {
     // Two anonymous ec2_vpc resources with same cidr_block but different provider regions
-    let mut r1 = Resource::with_provider("awscc", "ec2.vpc", "");
+    let mut r1 = Resource::with_provider("awscc", "ec2.Vpc", "");
     r1.set_attr(
         "cidr_block".to_string(),
         Value::String("10.0.0.0/16".to_string()),
     );
 
-    let mut r2 = Resource::with_provider("awscc", "ec2.vpc", "");
+    let mut r2 = Resource::with_provider("awscc", "ec2.Vpc", "");
     r2.set_attr(
         "cidr_block".to_string(),
         Value::String("10.0.0.0/16".to_string()),
@@ -598,13 +598,13 @@ fn test_anonymous_id_different_regions_produce_different_identifiers() {
 #[ignore = "requires provider binary for identity_attributes"]
 fn test_anonymous_id_same_region_same_create_only_collides() {
     // Two anonymous ec2_vpc resources with same cidr_block and same provider region -> collision
-    let mut r1 = Resource::with_provider("awscc", "ec2.vpc", "");
+    let mut r1 = Resource::with_provider("awscc", "ec2.Vpc", "");
     r1.set_attr(
         "cidr_block".to_string(),
         Value::String("10.0.0.0/16".to_string()),
     );
 
-    let mut r2 = Resource::with_provider("awscc", "ec2.vpc", "");
+    let mut r2 = Resource::with_provider("awscc", "ec2.Vpc", "");
     r2.set_attr(
         "cidr_block".to_string(),
         Value::String("10.0.0.0/16".to_string()),
@@ -621,13 +621,13 @@ fn test_anonymous_id_same_region_same_create_only_collides() {
 #[ignore = "requires provider binary for identity_attributes"]
 fn test_anonymous_id_different_create_only_same_region_no_collision() {
     // Two anonymous ec2_vpc resources with different cidr_block in same provider region -> no collision
-    let mut r1 = Resource::with_provider("awscc", "ec2.vpc", "");
+    let mut r1 = Resource::with_provider("awscc", "ec2.Vpc", "");
     r1.set_attr(
         "cidr_block".to_string(),
         Value::String("10.0.0.0/16".to_string()),
     );
 
-    let mut r2 = Resource::with_provider("awscc", "ec2.vpc", "");
+    let mut r2 = Resource::with_provider("awscc", "ec2.Vpc", "");
     r2.set_attr(
         "cidr_block".to_string(),
         Value::String("10.1.0.0/16".to_string()),
@@ -645,7 +645,7 @@ fn test_anonymous_id_different_create_only_same_region_no_collision() {
 #[test]
 fn test_anonymous_id_named_resources_are_skipped() {
     // Named resources should not be processed by compute_anonymous_identifiers
-    let mut r1 = Resource::with_provider("awscc", "ec2.vpc", "my_vpc");
+    let mut r1 = Resource::with_provider("awscc", "ec2.Vpc", "my_vpc");
     r1.set_attr(
         "cidr_block".to_string(),
         Value::String("10.0.0.0/16".to_string()),
@@ -665,7 +665,7 @@ fn test_find_state_bucket_resource_matching_type() {
         providers: vec![],
         backend: None,
         resources: vec![
-            Resource::with_provider("aws", "s3.bucket", "my-bucket")
+            Resource::with_provider("aws", "s3.Bucket", "my-bucket")
                 .with_attribute("bucket", Value::String("my-bucket".to_string())),
         ],
         variables: HashMap::new(),
@@ -687,7 +687,7 @@ fn test_find_state_bucket_resource_matching_type() {
     // Matching resource type
     assert!(
         parsed
-            .find_resource_by_attr("s3.bucket", "bucket", "my-bucket")
+            .find_resource_by_attr("s3.Bucket", "bucket", "my-bucket")
             .is_some()
     );
 
@@ -701,7 +701,7 @@ fn test_find_state_bucket_resource_matching_type() {
     // Non-matching bucket name
     assert!(
         parsed
-            .find_resource_by_attr("s3.bucket", "bucket", "other-bucket")
+            .find_resource_by_attr("s3.Bucket", "bucket", "other-bucket")
             .is_none()
     );
 }
@@ -742,7 +742,7 @@ fn validate_data_source_with_read_keyword_passes() {
 #[test]
 #[ignore = "requires provider binary for resource type validation"]
 fn validate_regular_resource_without_read_keyword_passes() {
-    let resource = Resource::with_provider("aws", "s3.bucket", "my-bucket")
+    let resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket")
         .with_attribute("bucket", Value::String("my-bucket".to_string()))
         .with_attribute("region", Value::String("ap-northeast-1".to_string()));
     let result = validate_resources(&[resource]);
@@ -757,7 +757,7 @@ fn validate_regular_resource_without_read_keyword_passes() {
 fn destroy_plan_excludes_data_sources() {
     // Simulate the destroy filtering logic: data sources (read_only=true)
     // should be excluded from the destroy candidate list.
-    let managed = Resource::with_provider("awscc", "ec2.vpc", "vpc");
+    let managed = Resource::with_provider("awscc", "ec2.Vpc", "vpc");
     let data_source =
         Resource::with_provider("awscc", "sts.caller_identity", "identity").with_read_only(true);
 
@@ -790,7 +790,7 @@ fn destroy_plan_excludes_data_sources() {
         .collect();
 
     assert_eq!(resources_to_destroy.len(), 1);
-    assert_eq!(resources_to_destroy[0].id.resource_type, "ec2.vpc");
+    assert_eq!(resources_to_destroy[0].id.resource_type, "ec2.Vpc");
 
     // Verify data source is NOT in the destroy list
     assert!(
@@ -809,7 +809,7 @@ fn destroy_plan_excludes_data_sources() {
 fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
     // --- First run (apply) ---
     // 1. Parse: anonymous resource with bucket_name_prefix
-    let mut resource_run1 = Resource::with_provider("awscc", "s3.bucket", "");
+    let mut resource_run1 = Resource::with_provider("awscc", "s3.Bucket", "");
     resource_run1.set_attr(
         "bucket_name_prefix".to_string(),
         Value::String("my-app-".to_string()),
@@ -863,7 +863,7 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
 
     // --- Second run (plan-verify) ---
     // 1. Parse again: same anonymous resource with bucket_name_prefix
-    let mut resource_run2 = Resource::with_provider("awscc", "s3.bucket", "");
+    let mut resource_run2 = Resource::with_provider("awscc", "s3.Bucket", "");
     resource_run2.set_attr(
         "bucket_name_prefix".to_string(),
         Value::String("my-app-".to_string()),
@@ -1116,7 +1116,7 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
 
 #[tokio::test]
 async fn detect_drift_errors_when_resource_missing_from_planned_states() {
-    let resource = Resource::with_provider("aws", "s3.bucket", "my-bucket");
+    let resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket");
     let id = resource.id.clone();
 
     // Provider returns a non-existing state (identifier is None since no planned state)
@@ -1141,7 +1141,7 @@ async fn detect_drift_errors_when_resource_missing_from_planned_states() {
 
 #[tokio::test]
 async fn detect_drift_returns_none_when_no_drift() {
-    let resource = Resource::with_provider("aws", "s3.bucket", "my-bucket");
+    let resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket");
     let id = resource.id.clone();
     let identifier = "my-bucket";
 
@@ -1162,7 +1162,7 @@ async fn detect_drift_returns_none_when_no_drift() {
 
 #[tokio::test]
 async fn detect_drift_returns_messages_when_drift_detected() {
-    let resource = Resource::with_provider("aws", "s3.bucket", "my-bucket");
+    let resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket");
     let id = resource.id.clone();
     let identifier = "my-bucket";
 
@@ -1204,19 +1204,19 @@ fn orphaned_state_resource_produces_delete_effect() {
     // State file has two resources: "keep-bucket" and "removed-bucket"
     let mut state_file = StateFile::new();
     state_file.upsert_resource(
-        ResourceState::new("s3.bucket", "keep-bucket", "aws")
+        ResourceState::new("s3.Bucket", "keep-bucket", "aws")
             .with_identifier("keep-bucket")
             .with_attribute("bucket", json!("keep-bucket")),
     );
     state_file.upsert_resource(
-        ResourceState::new("s3.bucket", "removed-bucket", "aws")
+        ResourceState::new("s3.Bucket", "removed-bucket", "aws")
             .with_identifier("removed-bucket")
             .with_attribute("bucket", json!("removed-bucket")),
     );
 
     // Config only has "keep-bucket" -- "removed-bucket" was deleted from .crn
     let desired = vec![
-        Resource::with_provider("aws", "s3.bucket", "keep-bucket")
+        Resource::with_provider("aws", "s3.Bucket", "keep-bucket")
             .with_attribute("bucket", Value::String("keep-bucket".to_string())),
     ];
 
@@ -1664,7 +1664,7 @@ impl Provider for RenameFailProvider {
 async fn rename_failure_in_create_before_destroy_counts_as_failure() {
     use carina_core::effect::TemporaryName;
 
-    let id = ResourceId::with_provider("awscc", "s3.bucket", "my-bucket");
+    let id = ResourceId::with_provider("awscc", "s3.Bucket", "my-bucket");
 
     let old_state = State::existing(
         id.clone(),
@@ -1675,7 +1675,7 @@ async fn rename_failure_in_create_before_destroy_counts_as_failure() {
     )
     .with_identifier("my-bucket");
 
-    let new_resource = Resource::with_provider("awscc", "s3.bucket", "my-bucket")
+    let new_resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket")
         .with_attribute("bucket_name", Value::String("my-bucket-tmp123".to_string()));
 
     let mut plan = Plan::new();
@@ -1734,15 +1734,15 @@ async fn rename_failure_in_create_before_destroy_counts_as_failure() {
 /// should reference the new (post-replacement) resource ID, not the old one.
 #[tokio::test]
 async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
-    let vpc_id = ResourceId::new("ec2.vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.subnet", "my-subnet");
+    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
+    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
     // --- Unresolved resources (before ref resolution) ---
-    let vpc_unresolved = Resource::new("ec2.vpc", "my-vpc")
+    let vpc_unresolved = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
 
-    let subnet_unresolved = Resource::new("ec2.subnet", "my-subnet")
+    let subnet_unresolved = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -1752,7 +1752,7 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
 
     // --- Resolved resources (after ref resolution with old state) ---
     // The subnet's vpc_id has been eagerly resolved to "vpc-OLD"
-    let subnet_resolved = Resource::new("ec2.subnet", "my-subnet")
+    let subnet_resolved = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute("vpc_id", Value::String("vpc-OLD".to_string()))
         .with_attribute("cidr_block", Value::String("10.1.2.0/24".to_string()));
@@ -1944,12 +1944,12 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
     // State has two resources: "keep-bucket" (in config) and "orphan-bucket" (not in config)
     let mut state = StateFile::new();
     state.upsert_resource(
-        ResourceState::new("s3.bucket", "keep-bucket", "")
+        ResourceState::new("s3.Bucket", "keep-bucket", "")
             .with_identifier("keep-bucket")
             .with_attribute("bucket", json!("keep-bucket")),
     );
     state.upsert_resource(
-        ResourceState::new("s3.bucket", "orphan-bucket", "")
+        ResourceState::new("s3.Bucket", "orphan-bucket", "")
             .with_identifier("orphan-bucket")
             .with_attribute("bucket", json!("orphan-bucket")),
     );
@@ -1961,7 +1961,7 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
         providers: vec![],
         backend: None,
         resources: vec![
-            Resource::new("s3.bucket", "keep-bucket")
+            Resource::new("s3.Bucket", "keep-bucket")
                 .with_attribute("bucket", Value::String("keep-bucket".to_string())),
         ],
         variables: HashMap::new(),
@@ -2000,7 +2000,7 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
     // and the refresh should have visited it
     assert!(
         written
-            .find_resource("", "s3.bucket", "orphan-bucket")
+            .find_resource("", "s3.Bucket", "orphan-bucket")
             .is_none(),
         "Orphaned resource should be removed from state after refresh (issue #879)"
     );
@@ -2120,7 +2120,7 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
     // State file tracks "removed-bucket" with an identifier (implies it existed in infra)
     let mut state_file = StateFile::new();
     state_file.upsert_resource(
-        ResourceState::new("s3.bucket", "removed-bucket", "aws")
+        ResourceState::new("s3.Bucket", "removed-bucket", "aws")
             .with_identifier("removed-bucket")
             .with_attribute("bucket", json!("removed-bucket")),
     );
@@ -2190,13 +2190,13 @@ fn refresh_false_uses_cached_state_from_state_file() {
 
     let mut state_file = StateFile::new();
     state_file.upsert_resource(
-        ResourceState::new("s3.bucket", "my-bucket", "awscc")
+        ResourceState::new("s3.Bucket", "my-bucket", "awscc")
             .with_identifier("my-bucket-id")
             .with_attribute("bucket_name", json!("my-bucket"))
             .with_attribute("region", json!("ap-northeast-1")),
     );
 
-    let mut resource = Resource::with_provider("awscc", "s3.bucket", "my-bucket");
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket");
     resource.set_attr(
         "bucket_name".to_string(),
         Value::String("my-bucket".to_string()),
@@ -2216,7 +2216,7 @@ fn refresh_false_uses_cached_state_from_state_file() {
     }
 
     // Verify state was loaded from state file
-    let id = ResourceId::with_provider("awscc", "s3.bucket", "my-bucket");
+    let id = ResourceId::with_provider("awscc", "s3.Bucket", "my-bucket");
     let cached_state = current_states.get(&id).unwrap();
     assert!(cached_state.exists, "State should exist from state file");
     assert_eq!(
@@ -2260,7 +2260,7 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
 
     let mut state_file = StateFile::new();
     state_file.upsert_resource(
-        ResourceState::new("s3.bucket", "orphaned-bucket", "awscc")
+        ResourceState::new("s3.Bucket", "orphaned-bucket", "awscc")
             .with_identifier("orphaned-bucket-id")
             .with_attribute("bucket_name", json!("orphaned-bucket")),
     );
@@ -2310,7 +2310,7 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
 fn refresh_false_without_state_file_treats_resources_as_new() {
     use carina_core::differ::create_plan;
 
-    let mut resource = Resource::with_provider("awscc", "s3.bucket", "new-bucket");
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "new-bucket");
     resource.set_attr(
         "bucket_name".to_string(),
         Value::String("new-bucket".to_string()),
@@ -2353,7 +2353,7 @@ fn import_effect_preserves_resource_metadata_in_state() {
     // overwrite the ResourceState with a bare ResourceState::new(), stripping
     // lifecycle, prefixes, desired_keys, binding, and dependency_bindings.
 
-    let mut resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc")
+    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc")
         .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()))
         .with_binding("my_vpc_binding");
     resource.lifecycle.force_delete = true;
@@ -2397,7 +2397,7 @@ fn import_effect_preserves_resource_metadata_in_state() {
     })
     .unwrap();
 
-    let saved_resource = saved.find_resource("awscc", "ec2.vpc", "my-vpc").unwrap();
+    let saved_resource = saved.find_resource("awscc", "ec2.Vpc", "my-vpc").unwrap();
 
     // Metadata must survive the import
     assert!(
@@ -2432,7 +2432,7 @@ fn build_state_after_apply_persists_write_only_attributes() {
     use carina_core::schema::{AttributeSchema, AttributeType};
 
     // Set up a resource with a write-only attribute (ipv4_netmask_length)
-    let mut resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc");
+    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc");
     resource.set_attr(
         "cidr_block".to_string(),
         Value::String("10.0.0.0/16".to_string()),
@@ -2457,11 +2457,11 @@ fn build_state_after_apply_persists_write_only_attributes() {
     )]);
 
     // Build schema with write-only attribute.
-    // Schema keys include the provider prefix (e.g., "awscc.ec2.vpc").
+    // Schema keys include the provider prefix (e.g., "awscc.ec2.Vpc").
     let mut schemas = HashMap::new();
     schemas.insert(
-        "awscc.ec2.vpc".to_string(),
-        ResourceSchema::new("ec2.vpc")
+        "awscc.ec2.Vpc".to_string(),
+        ResourceSchema::new("ec2.Vpc")
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
             .attribute(
                 AttributeSchema::new("ipv4_netmask_length", AttributeType::Int).write_only(),
@@ -2481,7 +2481,7 @@ fn build_state_after_apply_persists_write_only_attributes() {
     })
     .unwrap();
 
-    let saved_resource = saved.find_resource("awscc", "ec2.vpc", "my-vpc").unwrap();
+    let saved_resource = saved.find_resource("awscc", "ec2.Vpc", "my-vpc").unwrap();
 
     // The write-only attribute should be persisted from the desired resource
     assert_eq!(
@@ -2507,7 +2507,7 @@ fn build_state_after_apply_write_only_detects_value_change() {
     use carina_core::schema::{AttributeSchema, AttributeType};
 
     // Simulate: user changed ipv4_netmask_length from 16 to 24
-    let mut resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc");
+    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc");
     resource.set_attr(
         "cidr_block".to_string(),
         Value::String("10.0.0.0/24".to_string()),
@@ -2533,7 +2533,7 @@ fn build_state_after_apply_write_only_detects_value_change() {
 
     // Previous state had old write-only value
     let mut existing_state = StateFile::new();
-    let mut old_rs = ResourceState::new("ec2.vpc", "my-vpc", "awscc")
+    let mut old_rs = ResourceState::new("ec2.Vpc", "my-vpc", "awscc")
         .with_identifier("vpc-123")
         .with_attribute("cidr_block".to_string(), json!("10.0.0.0/16"))
         .with_attribute("ipv4_netmask_length".to_string(), json!(16));
@@ -2542,8 +2542,8 @@ fn build_state_after_apply_write_only_detects_value_change() {
 
     let mut schemas = HashMap::new();
     schemas.insert(
-        "awscc.ec2.vpc".to_string(),
-        ResourceSchema::new("ec2.vpc")
+        "awscc.ec2.Vpc".to_string(),
+        ResourceSchema::new("ec2.Vpc")
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
             .attribute(
                 AttributeSchema::new("ipv4_netmask_length", AttributeType::Int).write_only(),
@@ -2563,7 +2563,7 @@ fn build_state_after_apply_write_only_detects_value_change() {
     })
     .unwrap();
 
-    let saved_resource = saved.find_resource("awscc", "ec2.vpc", "my-vpc").unwrap();
+    let saved_resource = saved.find_resource("awscc", "ec2.Vpc", "my-vpc").unwrap();
 
     // The write-only attribute should have the NEW value (24, not 16)
     assert_eq!(

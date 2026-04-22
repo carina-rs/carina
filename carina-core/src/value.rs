@@ -709,7 +709,7 @@ mod tests {
 
     #[test]
     fn test_format_value_dsl_enum_5_part() {
-        let v = Value::String("awscc.ec2.vpc.InstanceTenancy.dedicated".to_string());
+        let v = Value::String("awscc.ec2.Vpc.InstanceTenancy.dedicated".to_string());
         assert_eq!(format_value(&v), "\"dedicated\"");
     }
 
@@ -914,7 +914,7 @@ mod tests {
     #[test]
     fn test_value_to_json_with_context_different_resources_different_hashes() {
         let v = Value::Secret(Box::new(Value::String("my-password".to_string())));
-        let ctx1 = SecretHashContext::new("ec2.vpc", "vpc-1", "password");
+        let ctx1 = SecretHashContext::new("ec2.Vpc", "vpc-1", "password");
         let ctx2 = SecretHashContext::new("rds.db_instance", "my-db", "password");
         let json1 = value_to_json_with_context(&v, Some(&ctx1)).unwrap();
         let json2 = value_to_json_with_context(&v, Some(&ctx2)).unwrap();

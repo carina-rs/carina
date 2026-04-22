@@ -737,7 +737,7 @@ mod tests {
 
 let empty_list = []
 let _ = for unused_var in empty_list {
-    aws.ec2.vpc {
+    aws.ec2.Vpc {
         cidr_block = "10.0.0.0/16"
     }
 }
@@ -832,7 +832,7 @@ let orgs = upstream_state {
         fs::write(
             dir.join("main.crn"),
             r#"for name, account_id in orgs.accounts {
-  aws.s3.bucket {
+  aws.s3.Bucket {
     name = name
   }
 }
@@ -872,12 +872,12 @@ let network = upstream_state {
         fs::write(
             dir.join("main.crn"),
             r#"for name, account_id in orgs.accounts {
-  aws.s3.bucket {
+  aws.s3.Bucket {
     name = name
   }
 }
 
-awscc.ec2.security_group {
+awscc.ec2.SecurityGroup {
   group_description = 'Web SG'
   vpc_id = network.vpc_id
 }
@@ -908,7 +908,7 @@ awscc.ec2.security_group {
         fs::write(
             dir.join("main.crn"),
             r#"for name, account_id in does_not_exist.accounts {
-  aws.s3.bucket {
+  aws.s3.Bucket {
     name = name
   }
 }
@@ -936,7 +936,7 @@ awscc.ec2.security_group {
         fs::write(
             dir2.join("main.crn"),
             r#"for name, account_id in does_not_exist.accounts {
-  aws.s3.bucket {
+  aws.s3.Bucket {
     name = name
   }
 }

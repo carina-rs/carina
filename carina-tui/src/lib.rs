@@ -231,8 +231,8 @@ mod tests {
 
     fn make_app() -> App {
         let mut plan = Plan::new();
-        plan.add(Effect::Create(Resource::new("s3.bucket", "a")));
-        plan.add(Effect::Create(Resource::new("s3.bucket", "b")));
+        plan.add(Effect::Create(Resource::new("s3.Bucket", "a")));
+        plan.add(Effect::Create(Resource::new("s3.Bucket", "b")));
         App::new(&plan, &HashMap::new())
     }
 
@@ -276,13 +276,13 @@ mod tests {
     fn make_search_app() -> App {
         let mut plan = Plan::new();
         plan.add(Effect::Create(
-            Resource::new("s3.bucket", "my-bucket").with_binding("bucket"),
+            Resource::new("s3.Bucket", "my-bucket").with_binding("bucket"),
         ));
         plan.add(Effect::Create(
-            Resource::new("ec2.vpc", "my-vpc").with_binding("vpc"),
+            Resource::new("ec2.Vpc", "my-vpc").with_binding("vpc"),
         ));
         plan.add(Effect::Create(
-            Resource::new("ec2.subnet", "my-subnet")
+            Resource::new("ec2.Subnet", "my-subnet")
                 .with_binding("subnet")
                 .with_attribute(
                     "vpc_id",
@@ -433,10 +433,10 @@ mod tests {
         handle_key(&mut app, KeyCode::Char('u'));
         handle_key(&mut app, KeyCode::Char('b'));
 
-        // Tab should autocomplete "sub" — matches "ec2.subnet" (resource type)
-        // and "subnet" (binding); sorted alphabetically, "ec2.subnet" first
+        // Tab should autocomplete "sub" — matches "ec2.Subnet" (resource type)
+        // and "subnet" (binding); sorted alphabetically, "ec2.Subnet" first
         handle_key(&mut app, KeyCode::Tab);
-        assert_eq!(app.search_query, "ec2.subnet");
+        assert_eq!(app.search_query, "ec2.Subnet");
         assert!(app.search_active);
     }
 
@@ -484,20 +484,20 @@ mod tests {
     fn make_provider_prefixed_app() -> App {
         let mut plan = Plan::new();
         plan.add(Effect::Create(
-            Resource::with_provider("awscc", "ec2.vpc", "my-vpc").with_binding("vpc"),
+            Resource::with_provider("awscc", "ec2.Vpc", "my-vpc").with_binding("vpc"),
         ));
         plan.add(Effect::Create(
-            Resource::with_provider("awscc", "ec2.subnet", "my-subnet").with_binding("subnet"),
+            Resource::with_provider("awscc", "ec2.Subnet", "my-subnet").with_binding("subnet"),
         ));
         plan.add(Effect::Create(
-            Resource::with_provider("awscc", "s3.bucket", "my-bucket").with_binding("bucket"),
+            Resource::with_provider("awscc", "s3.Bucket", "my-bucket").with_binding("bucket"),
         ));
         App::new(&plan, &HashMap::new())
     }
 
     #[test]
     fn tab_complete_with_provider_prefix() {
-        // When resource_type is "awscc.ec2.vpc", typing "ec" then Tab
+        // When resource_type is "awscc.ec2.Vpc", typing "ec" then Tab
         // should complete to the full resource type containing "ec"
         let mut app = make_provider_prefixed_app();
         handle_key(&mut app, KeyCode::Char('/'));

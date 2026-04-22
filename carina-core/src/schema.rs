@@ -804,7 +804,7 @@ pub enum TypeError {
         /// build the error by hand without type context.
         type_name: Option<String>,
         /// Allowed variants in the form the user should type — i.e.
-        /// fully-qualified (`awscc.sso.assignment.TargetType.AWS_ACCOUNT`)
+        /// fully-qualified (`awscc.sso.Assignment.TargetType.AWS_ACCOUNT`)
         /// for namespaced enums, bare (`fast`, `slow`) otherwise.
         expected: Vec<String>,
     },
@@ -2048,7 +2048,7 @@ mod tests {
         let t = AttributeType::StringEnum {
             name: "VersioningStatus".to_string(),
             values: vec!["Enabled".to_string(), "Suspended".to_string()],
-            namespace: Some("aws.s3.bucket".to_string()),
+            namespace: Some("aws.s3.Bucket".to_string()),
             to_dsl: None,
         };
         assert_eq!(t.type_name(), "VersioningStatus");
@@ -2065,7 +2065,7 @@ mod tests {
                 "icmpv6".to_string(),
                 "-1".to_string(),
             ],
-            namespace: Some("awscc.ec2.security_group".to_string()),
+            namespace: Some("awscc.ec2.SecurityGroup".to_string()),
             to_dsl: Some(|s: &str| match s {
                 "-1" => "all".to_string(),
                 _ => s.replace('-', "_"),
@@ -2076,7 +2076,7 @@ mod tests {
         // DSL alias "all" should be accepted
         assert!(
             t.validate(&Value::String(
-                "awscc.ec2.security_group.IpProtocol.all".to_string()
+                "awscc.ec2.SecurityGroup.IpProtocol.all".to_string()
             ))
             .is_ok()
         );
@@ -2154,11 +2154,11 @@ mod tests {
     fn invalid_enum_error_preserves_user_typed_string_literal() {
         // Regression for #2077. A quoted string literal like `target_type = "aaa"`
         // should surface in the error as the typed value, not as the synthesized
-        // namespaced form `awscc.sso.assignment.TargetType.aaa`.
+        // namespaced form `awscc.sso.Assignment.TargetType.aaa`.
         let t = AttributeType::StringEnum {
             name: "TargetType".to_string(),
             values: vec!["AWS_ACCOUNT".to_string()],
-            namespace: Some("awscc.sso.assignment".to_string()),
+            namespace: Some("awscc.sso.Assignment".to_string()),
             to_dsl: None,
         };
         let err = t.validate(&Value::String("aaa".to_string())).unwrap_err();
@@ -2168,7 +2168,7 @@ mod tests {
             "error should quote the user's typed value, got: {msg}"
         );
         assert!(
-            !msg.contains("awscc.sso.assignment.TargetType.aaa"),
+            !msg.contains("awscc.sso.Assignment.TargetType.aaa"),
             "error must not leak the synthesized namespaced form, got: {msg}"
         );
     }
@@ -2182,7 +2182,7 @@ mod tests {
         let t = AttributeType::StringEnum {
             name: "TargetType".to_string(),
             values: vec!["AWS_ACCOUNT".to_string()],
-            namespace: Some("awscc.sso.assignment".to_string()),
+            namespace: Some("awscc.sso.Assignment".to_string()),
             to_dsl: None,
         };
         let err = t.validate(&Value::String("aaa".to_string())).unwrap_err();
@@ -2192,7 +2192,7 @@ mod tests {
             "error should name the enum type, got: {msg}"
         );
         assert!(
-            msg.contains("awscc.sso.assignment.TargetType.AWS_ACCOUNT"),
+            msg.contains("awscc.sso.Assignment.TargetType.AWS_ACCOUNT"),
             "error should list variants in fully-qualified form, got: {msg}"
         );
     }
@@ -2205,7 +2205,7 @@ mod tests {
         let t = AttributeType::StringEnum {
             name: "TargetType".to_string(),
             values: vec!["AWS_ACCOUNT".to_string()],
-            namespace: Some("awscc.sso.assignment".to_string()),
+            namespace: Some("awscc.sso.Assignment".to_string()),
             to_dsl: None,
         };
         let err = t
@@ -2252,7 +2252,7 @@ mod tests {
                 AttributeType::StringEnum {
                     name: "TargetType".to_string(),
                     values: vec!["AWS_ACCOUNT".to_string()],
-                    namespace: Some("awscc.sso.assignment".to_string()),
+                    namespace: Some("awscc.sso.Assignment".to_string()),
                     to_dsl: None,
                 },
             )
@@ -2280,7 +2280,7 @@ mod tests {
             user_typed: "aaa".to_string(),
             attribute: Some("target_type".to_string()),
             type_name: "TargetType".to_string(),
-            expected: vec!["awscc.sso.assignment.TargetType.AWS_ACCOUNT".to_string()],
+            expected: vec!["awscc.sso.Assignment.TargetType.AWS_ACCOUNT".to_string()],
         };
         let msg = err.to_string();
         assert!(
@@ -2296,7 +2296,7 @@ mod tests {
             "message should name attribute and enum type, got: {msg}"
         );
         assert!(
-            msg.contains("awscc.sso.assignment.TargetType.AWS_ACCOUNT"),
+            msg.contains("awscc.sso.Assignment.TargetType.AWS_ACCOUNT"),
             "message should list the valid variants, got: {msg}"
         );
     }
@@ -2310,7 +2310,7 @@ mod tests {
             value: "aaa".to_string(),
             attribute: Some("target_type".to_string()),
             type_name: Some("TargetType".to_string()),
-            expected: vec!["awscc.sso.assignment.TargetType.AWS_ACCOUNT".to_string()],
+            expected: vec!["awscc.sso.Assignment.TargetType.AWS_ACCOUNT".to_string()],
         };
         let reshaped = original.into_string_literal_diagnostic();
         match reshaped {
@@ -2325,7 +2325,7 @@ mod tests {
                 assert_eq!(type_name, "TargetType");
                 assert_eq!(
                     expected,
-                    vec!["awscc.sso.assignment.TargetType.AWS_ACCOUNT".to_string()]
+                    vec!["awscc.sso.Assignment.TargetType.AWS_ACCOUNT".to_string()]
                 );
             }
             other => panic!("expected StringLiteralExpectedEnum, got {other:?}"),
@@ -2359,7 +2359,7 @@ mod tests {
                 AttributeType::StringEnum {
                     name: "TargetType".to_string(),
                     values: vec!["AWS_ACCOUNT".to_string()],
-                    namespace: Some("awscc.sso.assignment".to_string()),
+                    namespace: Some("awscc.sso.Assignment".to_string()),
                     to_dsl: None,
                 },
             )
@@ -2401,7 +2401,7 @@ mod tests {
                 AttributeType::StringEnum {
                     name: "TargetType".to_string(),
                     values: vec!["AWS_ACCOUNT".to_string()],
-                    namespace: Some("awscc.sso.assignment".to_string()),
+                    namespace: Some("awscc.sso.Assignment".to_string()),
                     to_dsl: None,
                 },
             )
@@ -2501,10 +2501,10 @@ mod tests {
         let t = AttributeType::StringEnum {
             name: "TargetType".to_string(),
             values: vec!["AWS_ACCOUNT".to_string()],
-            namespace: Some("awscc.sso.assignment".to_string()),
+            namespace: Some("awscc.sso.Assignment".to_string()),
             to_dsl: None,
         };
-        let input = "awscc.sso.assignment.TargetType.NOT_REAL".to_string();
+        let input = "awscc.sso.Assignment.TargetType.NOT_REAL".to_string();
         let err = t.validate(&Value::String(input.clone())).unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -2522,13 +2522,13 @@ mod tests {
                 "dedicated".to_string(),
                 "host".to_string(),
             ],
-            namespace: Some("awscc.ec2.vpc".to_string()),
+            namespace: Some("awscc.ec2.Vpc".to_string()),
             to_dsl: None,
         };
         // Double-namespace must be rejected
         assert!(
             t.validate(&Value::String(
-                "awscc.ec2.vpc.InstanceTenancy.awscc.ec2.vpc.InstanceTenancy.default".to_string()
+                "awscc.ec2.Vpc.InstanceTenancy.awscc.ec2.Vpc.InstanceTenancy.default".to_string()
             ))
             .is_err()
         );
@@ -3660,15 +3660,15 @@ mod tests {
         );
 
         let mut resources = vec![{
-            let mut r = Resource::new("s3.bucket", "my-bucket");
+            let mut r = Resource::new("s3.Bucket", "my-bucket");
             r.set_attr("lifecycle_configuration".to_string(), Value::Map(inner_map));
             r
         }];
 
         let mut schemas = HashMap::new();
         schemas.insert(
-            "s3.bucket".to_string(),
-            ResourceSchema::new("s3.bucket").attribute(AttributeSchema::new(
+            "s3.Bucket".to_string(),
+            ResourceSchema::new("s3.Bucket").attribute(AttributeSchema::new(
                 "lifecycle_configuration",
                 AttributeType::Struct {
                     name: "LifecycleConfiguration".to_string(),
@@ -3725,15 +3725,15 @@ mod tests {
         );
 
         let mut resources = vec![{
-            let mut r = Resource::new("s3.bucket", "my-bucket");
+            let mut r = Resource::new("s3.Bucket", "my-bucket");
             r.set_attr("lifecycle_configuration".to_string(), Value::Map(inner_map));
             r
         }];
 
         let mut schemas = HashMap::new();
         schemas.insert(
-            "s3.bucket".to_string(),
-            ResourceSchema::new("s3.bucket").attribute(AttributeSchema::new(
+            "s3.Bucket".to_string(),
+            ResourceSchema::new("s3.Bucket").attribute(AttributeSchema::new(
                 "lifecycle_configuration",
                 AttributeType::Struct {
                     name: "LifecycleConfiguration".to_string(),
@@ -3794,15 +3794,15 @@ mod tests {
         );
 
         let mut resources = vec![{
-            let mut r = Resource::new("s3.bucket", "my-bucket");
+            let mut r = Resource::new("s3.Bucket", "my-bucket");
             r.set_attr("lifecycle_configuration".to_string(), Value::Map(inner_map));
             r
         }];
 
         let mut schemas = HashMap::new();
         schemas.insert(
-            "s3.bucket".to_string(),
-            ResourceSchema::new("s3.bucket").attribute(AttributeSchema::new(
+            "s3.Bucket".to_string(),
+            ResourceSchema::new("s3.Bucket").attribute(AttributeSchema::new(
                 "lifecycle_configuration",
                 AttributeType::Struct {
                     name: "LifecycleConfiguration".to_string(),
@@ -3850,7 +3850,7 @@ mod tests {
         // without triggering a false "cannot use both" error.
         // This regression was introduced in PR #913 and fixed in PR #917.
         let mut resources = vec![{
-            let mut r = Resource::new("ec2.security_group", "my-sg");
+            let mut r = Resource::new("ec2.SecurityGroup", "my-sg");
             // Block syntax produces Value::List
             r.set_attr(
                 "ingress".to_string(),
@@ -3865,8 +3865,8 @@ mod tests {
 
         let mut schemas = HashMap::new();
         schemas.insert(
-            "ec2.security_group".to_string(),
-            ResourceSchema::new("ec2.security_group").attribute(
+            "ec2.SecurityGroup".to_string(),
+            ResourceSchema::new("ec2.SecurityGroup").attribute(
                 AttributeSchema::new(
                     "ingress",
                     AttributeType::list(AttributeType::Struct {
@@ -3897,7 +3897,7 @@ mod tests {
         // The key already exists (it IS the canonical key), so the `continue`
         // path handles it. This test verifies all items are preserved.
         let mut resources = vec![{
-            let mut r = Resource::new("ec2.security_group", "my-sg");
+            let mut r = Resource::new("ec2.SecurityGroup", "my-sg");
             r.set_attr(
                 "ingress".to_string(),
                 Value::List(vec![
@@ -3918,8 +3918,8 @@ mod tests {
 
         let mut schemas = HashMap::new();
         schemas.insert(
-            "ec2.security_group".to_string(),
-            ResourceSchema::new("ec2.security_group").attribute(
+            "ec2.SecurityGroup".to_string(),
+            ResourceSchema::new("ec2.SecurityGroup").attribute(
                 AttributeSchema::new(
                     "ingress",
                     AttributeType::list(AttributeType::Struct {
@@ -4029,13 +4029,13 @@ mod tests {
 
     #[test]
     fn test_resource_schema_without_operation_config() {
-        let schema = ResourceSchema::new("ec2.vpc");
+        let schema = ResourceSchema::new("ec2.Vpc");
         assert!(schema.operation_config.is_none());
     }
 
     #[test]
     fn validate_rejects_unknown_attribute() {
-        let schema = ResourceSchema::new("s3.bucket")
+        let schema = ResourceSchema::new("s3.Bucket")
             .attribute(AttributeSchema::new("bucket_name", AttributeType::String));
 
         let mut attrs = HashMap::new();
@@ -4054,7 +4054,7 @@ mod tests {
 
     #[test]
     fn validate_allows_known_attributes_only() {
-        let schema = ResourceSchema::new("s3.bucket")
+        let schema = ResourceSchema::new("s3.Bucket")
             .attribute(AttributeSchema::new("bucket_name", AttributeType::String))
             .attribute(AttributeSchema::new(
                 "tags",
@@ -4073,7 +4073,7 @@ mod tests {
 
     #[test]
     fn validate_unknown_attribute_with_suggestion() {
-        let schema = ResourceSchema::new("s3.bucket")
+        let schema = ResourceSchema::new("s3.Bucket")
             .attribute(AttributeSchema::new("bucket_name", AttributeType::String));
 
         let mut attrs = HashMap::new();
@@ -4097,7 +4097,7 @@ mod tests {
 
     #[test]
     fn validate_accepts_block_name_alias() {
-        let schema = ResourceSchema::new("ec2.security_group").attribute(
+        let schema = ResourceSchema::new("ec2.SecurityGroup").attribute(
             AttributeSchema::new(
                 "ingress_rules",
                 AttributeType::List {
@@ -4119,7 +4119,7 @@ mod tests {
 
     #[test]
     fn validate_skips_internal_attributes() {
-        let schema = ResourceSchema::new("s3.bucket")
+        let schema = ResourceSchema::new("s3.Bucket")
             .attribute(AttributeSchema::new("bucket_name", AttributeType::String));
 
         let mut attrs = HashMap::new();

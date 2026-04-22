@@ -5,6 +5,6 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/33'
 }
