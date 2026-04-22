@@ -26,7 +26,7 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 
   tags = {
@@ -53,7 +53,7 @@ backend s3 {
 When the bucket is auto-created, Carina:
 
 1. Creates the S3 bucket with versioning enabled and public access blocked
-2. Appends an `aws.s3.bucket` resource definition to your `.crn` file
+2. Appends an `aws.s3.Bucket` resource definition to your `.crn` file
 3. Registers the bucket as a **protected resource** in state, preventing it from being accidentally modified or destroyed
 
 `carina plan` shows the upcoming bucket creation as a bootstrap plan before the main resource plan.
@@ -74,11 +74,11 @@ To bring an existing cloud resource under Carina management, use the `import` bl
 
 ```crn
 import {
-  to = awscc.ec2.vpc 'my-vpc'
+  to = awscc.ec2.Vpc 'my-vpc'
   id = 'vpc-0abc123def456'
 }
 
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 
   tags = {
@@ -98,11 +98,11 @@ When you rename a resource or reorganize your code, use the `moved` block to upd
 
 ```crn
 moved {
-  from = awscc.ec2.vpc 'vpc'
-  to   = awscc.ec2.vpc 'main_vpc'
+  from = awscc.ec2.Vpc 'vpc'
+  to   = awscc.ec2.Vpc 'main_vpc'
 }
 
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 
   tags = {
@@ -119,7 +119,7 @@ To stop managing a resource without destroying it in the cloud, use the `removed
 
 ```crn
 removed {
-  from = awscc.ec2.vpc 'main_vpc'
+  from = awscc.ec2.Vpc 'main_vpc'
 }
 ```
 
@@ -134,7 +134,7 @@ let network = upstream_state {
   source = "../network"
 }
 
-awscc.ec2.security_group {
+awscc.ec2.SecurityGroup {
   group_description = 'Web security group'
   vpc_id            = network.vpc_id
 

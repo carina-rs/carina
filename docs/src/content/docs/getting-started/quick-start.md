@@ -21,7 +21,7 @@ provider awscc {
   region  = 'ap-northeast-1'
 }
 
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 
   tags = {

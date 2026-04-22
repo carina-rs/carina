@@ -502,7 +502,7 @@ provider "aws" {
     region = "ap-northeast-1"
 }
 
-aws.s3.bucket {
+aws.s3.Bucket {
     bucket = "carina-wasm-test-bucket"
 }
 ```

@@ -84,7 +84,7 @@ provider awscc {
 When no other resource needs to reference it:
 
 ```crn
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 }
 ```
@@ -94,11 +94,11 @@ awscc.ec2.vpc {
 When you need to reference a resource's attributes:
 
 ```crn
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 }
 
-awscc.ec2.subnet {
+awscc.ec2.Subnet {
   vpc_id     = vpc.vpc_id
   cidr_block = '10.0.1.0/24'
 }
@@ -117,7 +117,7 @@ let caller = read aws.sts.caller_identity {}
 Control resource behavior during updates and deletions:
 
 ```crn
-awscc.s3.bucket {
+awscc.s3.Bucket {
   bucket_name = 'my-bucket'
 
   lifecycle {

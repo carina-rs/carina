@@ -34,7 +34,7 @@ provider aws {
 Anonymous resource (ID derived from `name` attribute):
 
 ```crn
-aws.s3.bucket {
+aws.s3.Bucket {
   name = "my-bucket"
 }
 ```
@@ -42,12 +42,12 @@ aws.s3.bucket {
 Named resource with `let` binding (enables references between resources):
 
 ```crn
-let main_vpc = aws.ec2.vpc {
+let main_vpc = aws.ec2.Vpc {
   name       = "main-vpc"
   cidr_block = "10.0.0.0/16"
 }
 
-aws.ec2.subnet {
+aws.ec2.Subnet {
   name       = "public-subnet"
   vpc_id     = main_vpc.id
   cidr_block = "10.0.1.0/24"

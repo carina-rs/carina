@@ -54,7 +54,7 @@ import { PAGE_TITLE_ID } from '@astrojs/starlight/constants';
         <span class="panel-tab">main.crn</span>
       </div>
       <div class="panel-body">
-        <pre><code><span class="kw">provider</span> <span class="id">aws</span> {'{'}{'\n'}  <span class="attr">region:</span> <span class="enum">aws.Region.ap_northeast_1</span>{'\n'}{'}'}{'\n'}{'\n'}<span class="kw">let</span> <span class="id">vpc</span> = <span class="type">awscc.ec2.vpc</span> {'{'}{'\n'}  <span class="attr">cidr_block:</span> <span class="str">"10.0.0.0/16"</span>{'\n'}  <span class="attr">enable_dns_support:</span> <span class="bool">true</span>{'\n'}{'}'}{'\n'}{'\n'}<span class="type">awscc.ec2.subnet</span> {'{'}{'\n'}  <span class="attr">vpc_id:</span> <span class="id">vpc</span>.vpc_id{'\n'}  <span class="attr">cidr_block:</span> <span class="str">"10.0.1.0/24"</span>{'\n'}{'}'}</code></pre>
+        <pre><code><span class="kw">provider</span> <span class="id">aws</span> {'{'}{'\n'}  <span class="attr">region:</span> <span class="enum">aws.Region.ap_northeast_1</span>{'\n'}{'}'}{'\n'}{'\n'}<span class="kw">let</span> <span class="id">vpc</span> = <span class="type">awscc.ec2.Vpc</span> {'{'}{'\n'}  <span class="attr">cidr_block:</span> <span class="str">"10.0.0.0/16"</span>{'\n'}  <span class="attr">enable_dns_support:</span> <span class="bool">true</span>{'\n'}{'}'}{'\n'}{'\n'}<span class="type">awscc.ec2.Subnet</span> {'{'}{'\n'}  <span class="attr">vpc_id:</span> <span class="id">vpc</span>.vpc_id{'\n'}  <span class="attr">cidr_block:</span> <span class="str">"10.0.1.0/24"</span>{'\n'}{'}'}</code></pre>
       </div>
     </div>
 
@@ -67,7 +67,7 @@ import { PAGE_TITLE_ID } from '@astrojs/starlight/constants';
         <span class="panel-tab-terminal">terminal</span>
       </div>
       <div class="panel-body">
-        <pre><code><span class="prompt">$</span> carina plan main.crn{'\n'}<span class="muted">Planning...</span>{'\n'}{'\n'}<span class="add">+</span> <span class="id">awscc.ec2.vpc</span>{'\n'}  <span class="attr">cidr_block:</span> <span class="str">"10.0.0.0/16"</span>{'\n'}  <span class="attr">enable_dns_support:</span> <span class="bool">true</span>{'\n'}{'\n'}<span class="add">+</span> <span class="id">awscc.ec2.subnet</span>{'\n'}  <span class="attr">vpc_id:</span> <span class="computed">(computed)</span>{'\n'}  <span class="attr">cidr_block:</span> <span class="str">"10.0.1.0/24"</span>{'\n'}{'\n'}<span class="plan-summary">Plan: 2 to create, 0 to update, 0 to delete.</span></code></pre>
+        <pre><code><span class="prompt">$</span> carina plan main.crn{'\n'}<span class="muted">Planning...</span>{'\n'}{'\n'}<span class="add">+</span> <span class="id">awscc.ec2.Vpc</span>{'\n'}  <span class="attr">cidr_block:</span> <span class="str">"10.0.0.0/16"</span>{'\n'}  <span class="attr">enable_dns_support:</span> <span class="bool">true</span>{'\n'}{'\n'}<span class="add">+</span> <span class="id">awscc.ec2.Subnet</span>{'\n'}  <span class="attr">vpc_id:</span> <span class="computed">(computed)</span>{'\n'}  <span class="attr">cidr_block:</span> <span class="str">"10.0.1.0/24"</span>{'\n'}{'\n'}<span class="plan-summary">Plan: 2 to create, 0 to update, 0 to delete.</span></code></pre>
       </div>
     </div>
   </div>

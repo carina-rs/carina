@@ -690,9 +690,9 @@ a type error in `carina validate`.
 **Test**: Manual. In `infra/aws/management/identity-center/`:
 
 ```crn
-awscc.sso.assignment {
+awscc.sso.Assignment {
   target_id   = sso.identity_store_id
-  target_type = awscc.sso.assignment.TargetType.AWS_ACCOUNT
+  target_type = awscc.sso.Assignment.TargetType.AWS_ACCOUNT
   ...
 }
 ```
@@ -700,7 +700,7 @@ awscc.sso.assignment {
 **Expected output**:
 
 ```
-Error: awscc.sso.assignment: cannot assign IdentityStoreId to 'target_id':
+Error: awscc.sso.Assignment: cannot assign IdentityStoreId to 'target_id':
 expected AwsAccountId, got IdentityStoreId (from sso.identity_store_id)
 ```
 

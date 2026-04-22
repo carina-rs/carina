@@ -21,7 +21,7 @@ Carina provides built-in functions for common operations and lets you define you
 Examples:
 
 ```crn
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 
   tags = {
@@ -50,7 +50,7 @@ Examples:
 let parts1 = ['web', 'test']
 let parts2 = ['vpc']
 
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 
   tags = {
@@ -76,7 +76,7 @@ Example:
 
 ```crn
 let vpcs = for (i, env) in ['dev', 'stg'] {
-  awscc.ec2.vpc {
+  awscc.ec2.Vpc {
     cidr_block = cidr_subnet('10.0.0.0/8', 8, i)
     # i=0 -> '10.0.0.0/16', i=1 -> '10.1.0.0/16'
 
@@ -100,11 +100,11 @@ let vpcs = for (i, env) in ['dev', 'stg'] {
 Define reusable logic with the `fn` keyword:
 
 ```crn
-fn tag_name(env: string, service: string): string {
+fn tag_name(env: String, service: String): String {
   join('-', [env, service, 'vpc'])
 }
 
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 
   tags = {
@@ -130,7 +130,7 @@ fn name(param1: type1, param2: type2): return_type {
 Functions can have local `let` bindings before the final expression:
 
 ```crn
-fn subnet_name(env: string, tier: string, index: int): string {
+fn subnet_name(env: String, tier: String, index: Int): String {
   let prefix = join("-", [env, tier])
   "${prefix}-${index}"
 }
@@ -141,7 +141,7 @@ fn subnet_name(env: string, tier: string, index: int): string {
 Parameters can have default values:
 
 ```crn
-fn make_tags(name: string, env: string = 'dev'): map(string) {
+fn make_tags(name: String, env: String = 'dev'): map(string) {
   {
     Name        = name
     Environment = env

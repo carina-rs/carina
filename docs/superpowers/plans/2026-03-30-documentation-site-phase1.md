@@ -338,7 +338,7 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block = "10.0.0.0/16"
   tags = {
     Name = "test-${env}"
@@ -350,7 +350,7 @@ fn tag_name(env: string, service: string): string {
 }
 
 for (i, az) in ["ap-northeast-1a", "ap-northeast-1c"] {
-  awscc.ec2.subnet {
+  awscc.ec2.Subnet {
     vpc_id     = vpc.vpc_id
     cidr_block = cidr_subnet(vpc.cidr_block, 8, i)
   }
@@ -425,7 +425,7 @@ migrate_provider() {
         local RESOURCE_NAME
         RESOURCE_NAME=$(basename "$DOC_FILE" .md)
 
-        # Extract DSL name from first heading (e.g., "# awscc.ec2.vpc" -> "awscc.ec2.vpc")
+        # Extract DSL name from first heading (e.g., "# awscc.ec2.Vpc" -> "awscc.ec2.Vpc")
         local DSL_NAME
         DSL_NAME=$(head -1 "$DOC_FILE" | sed 's/^# *//')
 

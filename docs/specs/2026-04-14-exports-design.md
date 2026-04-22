@@ -12,8 +12,8 @@ Add `exports { }` block to publish named values from a directory for `remote_sta
 
 ```crn
 exports {
-  account_id: string = registry_prod.account_id
-  vpc_id: string = vpc.vpc_id
+  account_id: String = registry_prod.account_id
+  vpc_id: String = vpc.vpc_id
 }
 ```
 

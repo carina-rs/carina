@@ -266,7 +266,7 @@ This is commonly used with `for` expressions to allocate subnets:
 
 ```crn
 let vpcs = for (i, env) in ['dev', 'stg'] {
-  awscc.ec2.vpc {
+  awscc.ec2.Vpc {
     cidr_block = cidr_subnet('10.0.0.0/8', 8, i)
   }
 }
