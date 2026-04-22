@@ -9,16 +9,56 @@ The Carina DSL is a statically-aware language with the following value types.
 
 ### String
 
-Strings are enclosed in double quotes:
+Strings can be enclosed in either single or double quotes. The two forms have
+different semantics, and the recommended style is to pick the form based on
+whether interpolation is needed.
+
+#### Single-Quoted Strings (Literal)
+
+Single quotes produce a literal string. `${...}` inside single quotes is **not**
+interpreted as interpolation — it is kept verbatim.
 
 ```crn
 let name = 'my-vpc'
 let region = 'ap-northeast-1'
+let literal = 'price is ${amount}'   # the six characters ${amount} stay as-is
 ```
+
+The only escape sequences recognized inside single quotes are `\'` (single
+quote) and `\\` (backslash).
+
+#### Double-Quoted Strings (Interpolation)
+
+Double quotes support `${...}` interpolation and the full set of escape
+sequences. Use them whenever you need to embed an expression in a string.
+
+```crn
+let env  = 'prod'
+let name = "vpc-${env}"           # => 'vpc-prod'
+let cidr = "${base_cidr}"         # => value of base_cidr
+let tag  = "${env}-${service}"    # => 'prod-web'
+```
+
+Any expression can appear inside `${}`, including function calls:
+
+```crn
+let tag = "vpc-${join('-', ['prod', 'web'])}"
+```
+
+#### Recommended Style
+
+- **Use single quotes** for literal strings that do not need interpolation
+  (the common case).
+- **Use double quotes** only when you need `${...}` interpolation or an
+  escape sequence that is not supported in single quotes.
+
+Both forms are always valid — this is a style guideline, not a correctness
+requirement. A literal written with double quotes (e.g. `"ap-northeast-1"`)
+is accepted and behaves identically to the single-quoted form.
 
 #### Escape Sequences
 
-Strings support the following escape sequences:
+Double-quoted strings support the following escape sequences:
 
 | Sequence | Meaning |
 |----------|---------|
@@ -29,22 +69,7 @@ Strings support the following escape sequences:
 | `\t` | Tab |
 | `\$` | Literal dollar sign (prevents interpolation) |
 
-#### String Interpolation
-
-Embed expressions inside strings with `${}`:
-
-```crn
-let env = 'prod'
-let name = "vpc-${env}"           # => 'vpc-prod'
-let cidr = "${base_cidr}"         # => value of base_cidr
-let tag = "${env}-${service}"     # => 'prod-web'
-```
-
-Any expression can appear inside `${}`, including function calls:
-
-```crn
-let tag = "vpc-${join("-", ["prod", "web"])}"
-```
+Single-quoted strings recognize only `\'` and `\\`.
 
 ### Int
 
@@ -209,7 +234,7 @@ arguments {
   count     : Int
   ratio     : Float
   enabled   : Bool
-  cidr_block: cidr
+  cidr_block: Ipv4Cidr
   role_arn  : Arn
 }
 ```
@@ -220,9 +245,9 @@ arguments {
 
 ```crn
 arguments {
-  subnet_ids  : list(string)
-  cidr_blocks : list(cidr)
-  tags        : map(string)
+  subnet_ids  : list(String)
+  cidr_blocks : list(Ipv4Cidr)
+  tags        : map(String)
 }
 ```
 
