@@ -11,12 +11,12 @@ Carina provides built-in functions for common operations and lets you define you
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `upper` | `upper(string) -> string` | Converts to uppercase |
-| `lower` | `lower(string) -> string` | Converts to lowercase |
-| `trim` | `trim(string) -> string` | Removes leading/trailing whitespace |
-| `replace` | `replace(search, replacement, string) -> string` | Replaces all occurrences |
-| `split` | `split(separator, string) -> list` | Splits string into a list |
-| `join` | `join(separator, list) -> string` | Joins list elements into a string |
+| `upper` | `upper(string) -> String` | Converts to uppercase |
+| `lower` | `lower(string) -> String` | Converts to lowercase |
+| `trim` | `trim(string) -> String` | Removes leading/trailing whitespace |
+| `replace` | `replace(search, replacement, string) -> String` | Replaces all occurrences |
+| `split` | `split(separator, string) -> list(String)` | Splits string into a list |
+| `join` | `join(separator, list) -> String` | Joins list elements into a string |
 
 Examples:
 
@@ -36,13 +36,13 @@ awscc.ec2.Vpc {
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `length` | `length(list \| map \| string) -> int` | Returns element/character count |
-| `concat` | `concat(items, base_list) -> list` | Appends items to a list |
-| `flatten` | `flatten(list) -> list` | Flattens nested lists by one level |
-| `keys` | `keys(map) -> list` | Returns map keys as a sorted list |
-| `values` | `values(map) -> list` | Returns map values sorted by key |
-| `lookup` | `lookup(map, key, default) -> any` | Looks up a key with a fallback |
-| `map` | `map(accessor, collection) -> list \| map` | Extracts a field from each element |
+| `length` | `length(list \| map \| String) -> Int` | Returns element/character count |
+| `concat` | `concat(items, base_list) -> list(Any)` | Appends items to a list |
+| `flatten` | `flatten(list) -> list(Any)` | Flattens nested lists by one level |
+| `keys` | `keys(map) -> list(String)` | Returns map keys as a sorted list |
+| `values` | `values(map) -> list(Any)` | Returns map values sorted by key |
+| `lookup` | `lookup(map, key, default) -> Any` | Looks up a key with a fallback |
+| `map` | `map(accessor, collection) -> list(Any) \| map(Any)` | Extracts a field from each element |
 
 Examples:
 
@@ -63,14 +63,14 @@ awscc.ec2.Vpc {
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `min` | `min(a, b) -> number` | Returns the smaller value |
-| `max` | `max(a, b) -> number` | Returns the larger value |
+| `min` | `min(a, b) -> Number` | Returns the smaller value |
+| `max` | `max(a, b) -> Number` | Returns the larger value |
 
 ### Network functions
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `cidr_subnet` | `cidr_subnet(prefix, newbits, netnum) -> string` | Calculates a subnet CIDR block |
+| `cidr_subnet` | `cidr_subnet(prefix, newbits, netnum) -> Ipv4Cidr` | Calculates a subnet CIDR block |
 
 Example:
 
@@ -121,8 +121,8 @@ fn name(param1: type1, param2: type2): return_type {
 }
 ```
 
-- **Parameters** can have type annotations (`: string`, `: int`, etc.)
-- **Return type** annotation is optional (`: string`)
+- **Parameters** can have type annotations (`: String`, `: Int`, etc.)
+- **Return type** annotation is optional (`: String`)
 - The function body is a single expression (the return value)
 
 ### Local variables in functions
@@ -141,7 +141,7 @@ fn subnet_name(env: String, tier: String, index: Int): String {
 Parameters can have default values:
 
 ```crn
-fn make_tags(name: String, env: String = 'dev'): map(string) {
+fn make_tags(name: String, env: String = 'dev'): map(String) {
   {
     Name        = name
     Environment = env

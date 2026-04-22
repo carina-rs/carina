@@ -12,7 +12,7 @@ Carina provides built-in functions for string manipulation, list operations, map
 Converts a string to uppercase.
 
 ```
-upper(string: string) -> string
+upper(string: String) -> String
 ```
 
 ```crn
@@ -25,7 +25,7 @@ upper('Hello World')  # => 'HELLO WORLD'
 Converts a string to lowercase.
 
 ```
-lower(string: string) -> string
+lower(string: String) -> String
 ```
 
 ```crn
@@ -38,7 +38,7 @@ lower('Hello World')  # => 'hello world'
 Removes leading and trailing whitespace from a string.
 
 ```
-trim(string: string) -> string
+trim(string: String) -> String
 ```
 
 ```crn
@@ -51,7 +51,7 @@ trim('\n hello \t')  # => 'hello'
 Replaces all occurrences of a search string. Data-last argument order for pipe compatibility.
 
 ```
-replace(search: string, replacement: string, string: string) -> string
+replace(search: String, replacement: String, string: String) -> String
 ```
 
 ```crn
@@ -65,7 +65,7 @@ replace('::', '.', 'foo::bar::baz')   # => 'foo.bar.baz'
 Splits a string into a list using a separator.
 
 ```
-split(separator: string, string: string) -> list
+split(separator: String, string: String) -> list(String)
 ```
 
 ```crn
@@ -79,7 +79,7 @@ split('::', 'a::b::c')   # => ['a', 'b', 'c']
 Joins list elements into a string using a separator.
 
 ```
-join(separator: string, list: list) -> string
+join(separator: String, list: list(String)) -> String
 ```
 
 ```crn
@@ -95,7 +95,7 @@ join(', ', ['hello', 42])     # => 'hello, 42'
 Appends items to a list. Data-last argument order for pipe compatibility. The result is `base_list` followed by `items`.
 
 ```
-concat(items: list, base_list: list) -> list
+concat(items: list(Any), base_list: list(Any)) -> list(Any)
 ```
 
 ```crn
@@ -109,7 +109,7 @@ concat(['c'], ['a', 'b'])        # => ['a', 'b', 'c']
 Flattens nested lists by one level. Non-list elements are kept as-is.
 
 ```
-flatten(list: list) -> list
+flatten(list: list(Any)) -> list(Any)
 ```
 
 ```crn
@@ -129,7 +129,7 @@ flatten([[1, [2, 3]]])  # => [1, [2, 3]]
 Returns the number of elements in a list or map, or the number of characters in a string.
 
 ```
-length(value: list | map | string) -> int
+length(value: list(Any) | map(Any) | String) -> Int
 ```
 
 ```crn
@@ -144,7 +144,7 @@ length([])              # => 0
 Extracts a field from each element of a collection. The accessor must be a dot-prefixed string.
 
 ```
-map(accessor: string, collection: list | map) -> list | map
+map(accessor: String, collection: list(Any) | map(Any)) -> list(Any) | map(Any)
 ```
 
 When applied to a list of maps, returns a list of the extracted values:
@@ -177,7 +177,7 @@ envs |> map('.cidr')  # => { dev = '10.0.0.0/16', stg = '10.1.0.0/16' }
 Returns the keys of a map as a sorted list of strings.
 
 ```
-keys(map: map) -> list
+keys(map: map(Any)) -> list(String)
 ```
 
 ```crn
@@ -190,7 +190,7 @@ keys({})                         # => []
 Returns the values of a map as a list, ordered by sorted keys.
 
 ```
-values(map: map) -> list
+values(map: map(Any)) -> list(Any)
 ```
 
 ```crn
@@ -203,7 +203,7 @@ values({})                         # => []
 Looks up a key in a map, returning a default value if the key is not found.
 
 ```
-lookup(map: map, key: string, default: any) -> any
+lookup(map: map(Any), key: String, default: Any) -> Any
 ```
 
 ```crn
@@ -218,7 +218,7 @@ lookup({ a = 'one', b = 'two' }, 'c', 'default')  # => 'default'
 Returns the smaller of two numbers. If both are integers, returns an integer. If either is a float, returns a float.
 
 ```
-min(a: number, b: number) -> number
+min(a: Number, b: Number) -> Number
 ```
 
 ```crn
@@ -232,7 +232,7 @@ min(1, 2.5)    # => 1.0
 Returns the larger of two numbers. If both are integers, returns an integer. If either is a float, returns a float.
 
 ```
-max(a: number, b: number) -> number
+max(a: Number, b: Number) -> Number
 ```
 
 ```crn
@@ -248,7 +248,7 @@ max(1, 2.5)    # => 2.5
 Calculates a subnet CIDR block within a given IP network address prefix.
 
 ```
-cidr_subnet(prefix: string, newbits: int, netnum: int) -> string
+cidr_subnet(prefix: Ipv4Cidr, newbits: Int, netnum: Int) -> Ipv4Cidr
 ```
 
 - `prefix`: base CIDR string (e.g., `"10.0.0.0/16"`)
@@ -279,7 +279,7 @@ let vpcs = for (i, env) in ['dev', 'stg'] {
 Reads an environment variable. Returns an error if the variable is not set.
 
 ```
-env(name: string) -> string
+env(name: String) -> String
 ```
 
 ```crn
@@ -294,7 +294,7 @@ let db_host = env('DB_HOST')
 Marks a value as secret. The value is sent to the provider but stored only as a SHA256 hash in state. Plan output displays `(secret)` instead of the actual value.
 
 ```
-secret(value: any) -> secret
+secret(value: Any) -> Secret
 ```
 
 ```crn
@@ -308,7 +308,7 @@ awscc.rds.db_instance {
 Decrypts ciphertext using the configured provider's encryption service (e.g., AWS KMS). The key argument is optional when the key identifier is embedded in the ciphertext.
 
 ```
-decrypt(ciphertext: string, key?: string) -> string
+decrypt(ciphertext: String, key?: String) -> String
 ```
 
 ```crn

@@ -105,9 +105,9 @@ arguments {
   count      : Int
   ratio      : Float
   enabled    : Bool
-  subnet_ids : list(string)
-  tags       : map(string)
-  cidr_block : cidr
+  subnet_ids : list(String)
+  tags       : map(String)
+  cidr_block : Ipv4Cidr
   role_arn   : Arn
 }
 ```

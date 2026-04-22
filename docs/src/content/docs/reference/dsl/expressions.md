@@ -263,8 +263,8 @@ fn tag_name(env: String, service: String): String {
 ### Parameters
 
 Function parameters support:
-- Type annotations: `name: string`
-- Default values: `name: string = "default"`
+- Type annotations: `name: String`
+- Default values: `name: String = "default"`
 - No annotation: `name` (any type accepted)
 
 ```crn

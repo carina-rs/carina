@@ -53,7 +53,7 @@ arguments {
 }
 ```
 
-Supported types include `string`, `bool`, `int`, `float`, `list(string)`, `map(string)`, and resource type references like `awscc.ec2.Vpc`.
+Supported types include `String`, `Bool`, `Int`, `Float`, `list(String)`, `map(String)`, and resource type references like `awscc.ec2.Vpc`.
 
 ### Attributes block
 
