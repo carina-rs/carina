@@ -362,6 +362,12 @@ impl SemanticTokensProvider {
         // Resource type: aws.service.resource pattern
         self.find_resource_types(line, &mut tokens);
 
+        // Bare PascalCase type annotations: after a `:` (type position in
+        // arguments/attributes/exports/fn params), tag the following
+        // identifier as TYPE if it starts with an ASCII uppercase letter.
+        // Dotted forms (aws.ec2.Vpc, awscc.ec2.VpcId) are handled elsewhere.
+        self.find_pascal_type_annotations(line, &mut tokens);
+
         // Region patterns from registered providers (e.g., aws.Region.us_east_1)
         for region in &self.region_patterns {
             self.find_and_add_pattern(line, region, 1, &mut tokens);
@@ -462,6 +468,52 @@ impl SemanticTokensProvider {
         tokens.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
 
         tokens
+    }
+
+    /// Tag bare PascalCase identifiers in type-annotation position
+    /// (`ident: PascalCase` or `: PascalCase`) as `TYPE`. Dotted forms
+    /// like `aws.ec2.Vpc` are handled by `find_resource_types`.
+    fn find_pascal_type_annotations(&self, line: &str, tokens: &mut Vec<(u32, u32, u32)>) {
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != b':' {
+                i += 1;
+                continue;
+            }
+            // Skip `::` (not expected in DSL, but be defensive)
+            if i + 1 < bytes.len() && bytes[i + 1] == b':' {
+                i += 2;
+                continue;
+            }
+            // Find the first non-whitespace character after `:`
+            let mut j = i + 1;
+            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                j += 1;
+            }
+            if j >= bytes.len() {
+                break;
+            }
+            // Must start with ASCII uppercase to be PascalCase
+            if !bytes[j].is_ascii_uppercase() {
+                i = j;
+                continue;
+            }
+            // Scan the identifier [A-Za-z0-9_]+
+            let ident_start = j;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            // Reject dotted forms — those are handled by find_resource_types.
+            if j < bytes.len() && bytes[j] == b'.' {
+                i = j;
+                continue;
+            }
+            let length = (j - ident_start) as u32;
+            let start_char = position::byte_offset_to_char_offset(line, ident_start);
+            tokens.push((start_char, length, 1)); // TYPE
+            i = j;
+        }
     }
 
     /// Find resource type patterns like aws.s3.bucket, aws.ec2.vpc
@@ -1170,6 +1222,59 @@ mod tests {
         assert!(
             keyword_tokens.is_empty(),
             "true/false should not emit KEYWORD tokens. Got: {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_tokens_tags_pascal_case_type_annotation() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let line = "    x: AwsAccountId";
+        let tokens = provider.tokenize_line(line, 0);
+
+        // Find a TYPE token covering "AwsAccountId"
+        let expected_start = line.find("AwsAccountId").unwrap() as u32;
+        let expected_len = "AwsAccountId".len() as u32;
+        let ty_tok = tokens
+            .iter()
+            .find(|(start, len, kind)| {
+                *kind == 1 && *start == expected_start && *len == expected_len
+            })
+            .unwrap_or_else(|| {
+                panic!("AwsAccountId should be tagged as TYPE, got tokens: {tokens:?}")
+            });
+        assert_eq!(ty_tok.2, 1, "token kind should be TYPE (1)");
+    }
+
+    #[test]
+    fn semantic_tokens_tags_pascal_case_primitive_in_type_annotation() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let line = "    port: Int";
+        let tokens = provider.tokenize_line(line, 0);
+
+        let expected_start = line.find("Int").unwrap() as u32;
+        assert!(
+            tokens
+                .iter()
+                .any(|(start, len, kind)| *kind == 1 && *start == expected_start && *len == 3),
+            "Int after ':' should be tagged as TYPE, got: {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_tokens_does_not_tag_lowercase_after_colon_as_type() {
+        // A lowercase identifier after `:` is either the old spelling (still
+        // accepted by the parser but not a bare PascalCase type) or a
+        // binding/property name; don't emit a type token for it.
+        let provider = SemanticTokensProvider::new(&[]);
+        let line = "    port: int";
+        let tokens = provider.tokenize_line(line, 0);
+
+        let int_start = line.find("int").unwrap() as u32;
+        assert!(
+            !tokens
+                .iter()
+                .any(|(start, len, kind)| *kind == 1 && *start == int_start && *len == 3),
+            "lowercase 'int' should not be tagged as TYPE, got: {tokens:?}"
         );
     }
 
