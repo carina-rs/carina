@@ -6,9 +6,9 @@ Module: empty_module
 
 === ARGUMENTS ===
 
-  name: string  (required)
+  name: String  (required)
     Resource name prefix
-  env: string = "dev"  
+  env: String = "dev"  
     Environment label
 
 === CREATES ===

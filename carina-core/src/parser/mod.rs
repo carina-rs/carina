@@ -237,10 +237,10 @@ pub enum TypeExpr {
 impl std::fmt::Display for TypeExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TypeExpr::String => write!(f, "string"),
-            TypeExpr::Bool => write!(f, "bool"),
-            TypeExpr::Int => write!(f, "int"),
-            TypeExpr::Float => write!(f, "float"),
+            TypeExpr::String => write!(f, "String"),
+            TypeExpr::Bool => write!(f, "Bool"),
+            TypeExpr::Int => write!(f, "Int"),
+            TypeExpr::Float => write!(f, "Float"),
             TypeExpr::Simple(name) => write!(f, "{}", name),
             TypeExpr::List(inner) => write!(f, "list({})", inner),
             TypeExpr::Map(inner) => write!(f, "map({})", inner),
@@ -5829,7 +5829,7 @@ mod tests {
                 ("value".to_string(), TypeExpr::Int),
             ],
         };
-        assert_eq!(t.to_string(), "struct { name: string, value: int }");
+        assert_eq!(t.to_string(), "struct { name: String, value: Int }");
 
         let empty = TypeExpr::Struct { fields: vec![] };
         assert_eq!(empty.to_string(), "struct {}");
@@ -5940,12 +5940,12 @@ mod tests {
 
     #[test]
     fn type_expr_display_with_ref() {
-        assert_eq!(TypeExpr::String.to_string(), "string");
-        assert_eq!(TypeExpr::Bool.to_string(), "bool");
-        assert_eq!(TypeExpr::Int.to_string(), "int");
+        assert_eq!(TypeExpr::String.to_string(), "String");
+        assert_eq!(TypeExpr::Bool.to_string(), "Bool");
+        assert_eq!(TypeExpr::Int.to_string(), "Int");
         assert_eq!(
             TypeExpr::List(Box::new(TypeExpr::String)).to_string(),
-            "list(string)"
+            "list(String)"
         );
         assert_eq!(
             TypeExpr::Ref(ResourceTypePath::new("aws", "vpc")).to_string(),
@@ -5987,7 +5987,23 @@ mod tests {
 
     #[test]
     fn type_expr_display_float() {
-        assert_eq!(TypeExpr::Float.to_string(), "float");
+        assert_eq!(TypeExpr::Float.to_string(), "Float");
+    }
+
+    #[test]
+    fn type_expr_display_primitives_are_pascal_case() {
+        assert_eq!(TypeExpr::String.to_string(), "String");
+        assert_eq!(TypeExpr::Int.to_string(), "Int");
+        assert_eq!(TypeExpr::Bool.to_string(), "Bool");
+        assert_eq!(TypeExpr::Float.to_string(), "Float");
+        assert_eq!(
+            TypeExpr::List(Box::new(TypeExpr::Int)).to_string(),
+            "list(Int)"
+        );
+        assert_eq!(
+            TypeExpr::Map(Box::new(TypeExpr::String)).to_string(),
+            "map(String)"
+        );
     }
 
     #[test]
@@ -9567,7 +9583,7 @@ aws.s3.bucket {
         let err = parse(input, &ProviderContext::default()).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("expects type 'string'"),
+            msg.contains("expects type 'String'"),
             "Expected type mismatch error, got: {msg}"
         );
     }
@@ -9587,7 +9603,7 @@ aws.s3.bucket {
         let err = parse(input, &ProviderContext::default()).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("expects type 'int'"),
+            msg.contains("expects type 'Int'"),
             "Expected type mismatch error, got: {msg}"
         );
     }
@@ -9645,7 +9661,7 @@ aws.s3.bucket {
         let err = parse(input, &ProviderContext::default()).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("expects type 'bool'"),
+            msg.contains("expects type 'Bool'"),
             "Expected type mismatch error, got: {msg}"
         );
     }

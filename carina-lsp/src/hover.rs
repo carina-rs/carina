@@ -1183,7 +1183,7 @@ awscc.ec2.vpc_gateway_attachment {
             content
         );
         assert!(
-            content.contains("string"),
+            content.contains("String"),
             "Should show type, got:\n{}",
             content
         );
