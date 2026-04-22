@@ -978,10 +978,10 @@ impl CompletionProvider {
 
         // Basic types
         let basic = [
-            ("string", "String type"),
-            ("int", "Integer type"),
-            ("bool", "Boolean type"),
-            ("float", "Float type"),
+            ("String", "String type"),
+            ("Int", "Integer type"),
+            ("Bool", "Boolean type"),
+            ("Float", "Float type"),
         ]
         .iter()
         .map(|(name, detail)| {
@@ -1003,7 +1003,8 @@ impl CompletionProvider {
             .collect()
         };
 
-        // Custom types: built-in types + provider-extracted types (deduplicated)
+        // Custom types: built-in types + provider-extracted types (deduplicated).
+        // Internal registry is snake_case; the LSP surface is PascalCase.
         let builtin_custom = ["ipv4_cidr", "ipv4_address", "ipv6_cidr", "ipv6_address"];
         let mut seen_custom = std::collections::HashSet::new();
         let custom: Vec<CompletionItem> = builtin_custom
@@ -1011,12 +1012,10 @@ impl CompletionProvider {
             .map(|s| s.to_string())
             .chain(self.custom_type_names.iter().cloned())
             .filter(|name| seen_custom.insert(name.clone()))
-            .map(|name| {
-                type_completion_item(
-                    name.clone(),
-                    format!("Custom type: {}", name),
-                    replacement_range,
-                )
+            .map(|snake| {
+                let label = snake_to_pascal(&snake);
+                let detail = format!("Custom type: {label}");
+                type_completion_item(label, detail, replacement_range)
             })
             .collect();
 

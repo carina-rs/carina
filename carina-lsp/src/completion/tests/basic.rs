@@ -730,7 +730,7 @@ fn type_completion_includes_basic_types() {
     let completions = provider.complete(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
-    for basic_type in &["string", "int", "bool", "float"] {
+    for basic_type in &["String", "Int", "Bool", "Float"] {
         assert!(
             labels.contains(basic_type),
             "Type completions should include '{}'. Got: {:?}",
@@ -742,15 +742,15 @@ fn type_completion_includes_basic_types() {
     // Basic types should have TYPE_PARAMETER kind
     let string_completion = completions
         .iter()
-        .find(|c| c.label == "string")
-        .expect("Should have 'string' completion");
+        .find(|c| c.label == "String")
+        .expect("Should have 'String' completion");
     assert_eq!(
         string_completion.kind,
         Some(CompletionItemKind::TYPE_PARAMETER)
     );
 
     // Built-in custom types should always appear (no provider needed)
-    for builtin_custom in &["ipv4_cidr", "ipv4_address", "ipv6_cidr", "ipv6_address"] {
+    for builtin_custom in &["Ipv4Cidr", "Ipv4Address", "Ipv6Cidr", "Ipv6Address"] {
         assert!(
             labels.contains(builtin_custom),
             "Type completions should include built-in custom type '{}'. Got: {:?}",
@@ -758,6 +758,29 @@ fn type_completion_includes_basic_types() {
             labels
         );
     }
+}
+
+#[test]
+fn completion_at_type_position_proposes_pascal_case_primitives() {
+    let provider = test_provider();
+    let doc = create_document("arguments {\nx: ");
+    let position = Position {
+        line: 1,
+        character: 3,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(labels.contains(&"String"), "got: {:?}", labels);
+    assert!(labels.contains(&"Int"), "got: {:?}", labels);
+    assert!(labels.contains(&"Bool"), "got: {:?}", labels);
+    assert!(labels.contains(&"Float"), "got: {:?}", labels);
+    assert!(
+        !labels.contains(&"string"),
+        "lowercase 'string' should no longer appear, got: {:?}",
+        labels
+    );
 }
 
 #[test]
@@ -798,18 +821,18 @@ fn type_completion_includes_custom_types() {
 
     // Custom types from provider validators should appear
     assert!(
-        labels.contains(&"arn"),
-        "Type completions should include 'arn'. Got: {:?}",
+        labels.contains(&"Arn"),
+        "Type completions should include 'Arn'. Got: {:?}",
         labels
     );
     assert!(
-        labels.contains(&"iam_policy_arn"),
-        "Type completions should include 'iam_policy_arn'. Got: {:?}",
+        labels.contains(&"IamPolicyArn"),
+        "Type completions should include 'IamPolicyArn'. Got: {:?}",
         labels
     );
     assert!(
-        labels.contains(&"availability_zone"),
-        "Type completions should include 'availability_zone'. Got: {:?}",
+        labels.contains(&"AvailabilityZone"),
+        "Type completions should include 'AvailabilityZone'. Got: {:?}",
         labels
     );
 }
@@ -827,7 +850,7 @@ fn type_completion_custom_types_inside_list() {
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
-        labels.contains(&"iam_policy_arn"),
+        labels.contains(&"IamPolicyArn"),
         "Custom types should appear inside list(). Got: {:?}",
         labels
     );
@@ -994,8 +1017,8 @@ fn type_completion_inside_list_shows_basic_types() {
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
-        labels.contains(&"string"),
-        "Type completions inside list() should include 'string'. Got: {:?}",
+        labels.contains(&"String"),
+        "Type completions inside list() should include 'String'. Got: {:?}",
         labels
     );
     assert!(
@@ -1018,13 +1041,13 @@ fn type_completion_inside_map_shows_basic_types() {
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
-        labels.contains(&"string"),
-        "Type completions inside map() should include 'string'. Got: {:?}",
+        labels.contains(&"String"),
+        "Type completions inside map() should include 'String'. Got: {:?}",
         labels
     );
     assert!(
-        labels.contains(&"int"),
-        "Type completions inside map() should include 'int'. Got: {:?}",
+        labels.contains(&"Int"),
+        "Type completions inside map() should include 'Int'. Got: {:?}",
         labels
     );
 }
