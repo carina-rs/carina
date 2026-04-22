@@ -4,7 +4,7 @@ expression: strip_ansi(&output)
 ---
 Execution Plan:
 
-  + awscc.ec2.security_group 
+  + awscc.ec2.SecurityGroup 
       group_description: "Web security group"
       tags:
         Name: "web-sg"

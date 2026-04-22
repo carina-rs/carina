@@ -4,11 +4,11 @@ expression: output
 ---
 Execution Plan:
 
-  + awscc.ec2.subnet 
+  + awscc.ec2.Subnet 
       cidr_block: "10.0.1.0/24"
       tags:
         Name: "test-subnet"
       vpc_id: "vpc-0123456789abcdef0"
-  - awscc.ec2.subnet ec2_subnet_aac7c86b
+  - awscc.ec2.Subnet ec2_subnet_aac7c86b
 
 Plan: 1 to add, 0 to change, 1 to destroy.

@@ -4,8 +4,8 @@ expression: output
 ---
 Execution Plan:
 
-  + awscc.ec2.vpc vpc
-        ├─ + awscc.ec2.route_table 
-        └─ + awscc.ec2.subnet (availability_zone: ap-northeast-1a)
+  + awscc.ec2.Vpc vpc
+        ├─ + awscc.ec2.RouteTable 
+        └─ + awscc.ec2.Subnet (availability_zone: ap-northeast-1a)
 
 Plan: 3 to add, 0 to change, 0 to destroy.

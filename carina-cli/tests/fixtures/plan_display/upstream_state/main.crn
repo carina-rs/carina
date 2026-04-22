@@ -8,7 +8,7 @@ let network = upstream_state {
   source = "./network"
 }
 
-awscc.ec2.security_group {
+awscc.ec2.SecurityGroup {
   group_description = 'Web security group'
   vpc_id            = network.vpc.vpc_id
 

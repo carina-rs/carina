@@ -4,7 +4,7 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block           = '10.0.0.0/16'
   enable_dns_support   = true
   enable_dns_hostnames = true
@@ -15,7 +15,7 @@ let vpc = awscc.ec2.vpc {
   }
 }
 
-awscc.ec2.security_group {
+awscc.ec2.SecurityGroup {
   vpc_id            = vpc.vpc_id
   group_description = 'Test security group'
 

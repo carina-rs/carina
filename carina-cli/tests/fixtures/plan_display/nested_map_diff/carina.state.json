@@ -5,7 +5,7 @@
   "carina_version": "0.1.0",
   "resources": [
     {
-      "resource_type": "ec2.vpc",
+      "resource_type": "ec2.Vpc",
       "name": "vpc",
       "provider": "awscc",
       "identifier": "vpc-0123456789abcdef0",
