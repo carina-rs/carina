@@ -1,5 +1,5 @@
 ---
-title: "aws.logs.log_group"
+title: "aws.logs.LogGroup"
 description: "AWS LOGS log_group resource reference"
 ---
 
@@ -58,9 +58,9 @@ The tags for the resource.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `DELIVERY` | `aws.logs.log_group.logGroupClass.DELIVERY` |
-| `INFREQUENT_ACCESS` | `aws.logs.log_group.logGroupClass.INFREQUENT_ACCESS` |
-| `STANDARD` | `aws.logs.log_group.logGroupClass.STANDARD` |
+| `DELIVERY` | `aws.logs.LogGroup.logGroupClass.DELIVERY` |
+| `INFREQUENT_ACCESS` | `aws.logs.LogGroup.logGroupClass.INFREQUENT_ACCESS` |
+| `STANDARD` | `aws.logs.LogGroup.logGroupClass.STANDARD` |
 
 Shorthand formats: `DELIVERY` or `logGroupClass.DELIVERY`
 

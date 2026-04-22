@@ -1,5 +1,5 @@
 ---
-title: "aws.ec2.nat_gateway"
+title: "aws.ec2.NatGateway"
 description: "AWS EC2 nat_gateway resource reference"
 ---
 
@@ -72,8 +72,8 @@ The tags for the resource.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `regional` | `aws.ec2.nat_gateway.AvailabilityMode.regional` |
-| `zonal` | `aws.ec2.nat_gateway.AvailabilityMode.zonal` |
+| `regional` | `aws.ec2.NatGateway.AvailabilityMode.regional` |
+| `zonal` | `aws.ec2.NatGateway.AvailabilityMode.zonal` |
 
 Shorthand formats: `regional` or `AvailabilityMode.regional`
 
@@ -81,8 +81,8 @@ Shorthand formats: `regional` or `AvailabilityMode.regional`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `private` | `aws.ec2.nat_gateway.ConnectivityType.private` |
-| `public` | `aws.ec2.nat_gateway.ConnectivityType.public` |
+| `private` | `aws.ec2.NatGateway.ConnectivityType.private` |
+| `public` | `aws.ec2.NatGateway.ConnectivityType.public` |
 
 Shorthand formats: `private` or `ConnectivityType.private`
 

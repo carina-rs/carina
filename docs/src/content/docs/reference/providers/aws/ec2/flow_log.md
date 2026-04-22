@@ -1,5 +1,5 @@
 ---
-title: "aws.ec2.flow_log"
+title: "aws.ec2.FlowLog"
 description: "AWS EC2 flow_log resource reference"
 ---
 
@@ -86,9 +86,9 @@ The tags for the resource.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `cloud-watch-logs` | `aws.ec2.flow_log.LogDestinationType.cloud_watch_logs` |
-| `kinesis-data-firehose` | `aws.ec2.flow_log.LogDestinationType.kinesis_data_firehose` |
-| `s3` | `aws.ec2.flow_log.LogDestinationType.s3` |
+| `cloud-watch-logs` | `aws.ec2.FlowLog.LogDestinationType.cloud_watch_logs` |
+| `kinesis-data-firehose` | `aws.ec2.FlowLog.LogDestinationType.kinesis_data_firehose` |
+| `s3` | `aws.ec2.FlowLog.LogDestinationType.s3` |
 
 Shorthand formats: `cloud_watch_logs` or `LogDestinationType.cloud_watch_logs`
 
@@ -96,12 +96,12 @@ Shorthand formats: `cloud_watch_logs` or `LogDestinationType.cloud_watch_logs`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `NetworkInterface` | `aws.ec2.flow_log.ResourceType.NetworkInterface` |
-| `RegionalNatGateway` | `aws.ec2.flow_log.ResourceType.RegionalNatGateway` |
-| `Subnet` | `aws.ec2.flow_log.ResourceType.Subnet` |
-| `TransitGateway` | `aws.ec2.flow_log.ResourceType.TransitGateway` |
-| `TransitGatewayAttachment` | `aws.ec2.flow_log.ResourceType.TransitGatewayAttachment` |
-| `VPC` | `aws.ec2.flow_log.ResourceType.VPC` |
+| `NetworkInterface` | `aws.ec2.FlowLog.ResourceType.NetworkInterface` |
+| `RegionalNatGateway` | `aws.ec2.FlowLog.ResourceType.RegionalNatGateway` |
+| `Subnet` | `aws.ec2.FlowLog.ResourceType.Subnet` |
+| `TransitGateway` | `aws.ec2.FlowLog.ResourceType.TransitGateway` |
+| `TransitGatewayAttachment` | `aws.ec2.FlowLog.ResourceType.TransitGatewayAttachment` |
+| `VPC` | `aws.ec2.FlowLog.ResourceType.VPC` |
 
 Shorthand formats: `NetworkInterface` or `ResourceType.NetworkInterface`
 
@@ -109,9 +109,9 @@ Shorthand formats: `NetworkInterface` or `ResourceType.NetworkInterface`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ACCEPT` | `aws.ec2.flow_log.TrafficType.ACCEPT` |
-| `ALL` | `aws.ec2.flow_log.TrafficType.ALL` |
-| `REJECT` | `aws.ec2.flow_log.TrafficType.REJECT` |
+| `ACCEPT` | `aws.ec2.FlowLog.TrafficType.ACCEPT` |
+| `ALL` | `aws.ec2.FlowLog.TrafficType.ALL` |
+| `REJECT` | `aws.ec2.FlowLog.TrafficType.REJECT` |
 
 Shorthand formats: `ACCEPT` or `TrafficType.ACCEPT`
 

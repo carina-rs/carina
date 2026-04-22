@@ -1,5 +1,5 @@
 ---
-title: "aws.ec2.egress_only_internet_gateway"
+title: "aws.ec2.EgressOnlyInternetGateway"
 description: "AWS EC2 egress_only_internet_gateway resource reference"
 ---
 

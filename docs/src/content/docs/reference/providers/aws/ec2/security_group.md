@@ -1,5 +1,5 @@
 ---
-title: "aws.ec2.security_group"
+title: "aws.ec2.SecurityGroup"
 description: "AWS EC2 security_group resource reference"
 ---
 
@@ -11,7 +11,7 @@ Describes a security group.
 ## Example
 
 ```crn
-let vpc = aws.ec2.vpc {
+let vpc = aws.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 
   tags = {
@@ -19,7 +19,7 @@ let vpc = aws.ec2.vpc {
   }
 }
 
-aws.ec2.security_group {
+aws.ec2.SecurityGroup {
   group_name  = 'carina-example-sg'
   description = 'Example security group'
   vpc_id      = vpc.vpc_id

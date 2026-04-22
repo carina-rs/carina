@@ -1,5 +1,5 @@
 ---
-title: "aws.ec2.vpn_gateway"
+title: "aws.ec2.VpnGateway"
 description: "AWS EC2 vpn_gateway resource reference"
 ---
 
@@ -44,7 +44,7 @@ The tags for the resource.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ipsec.1` | `aws.ec2.vpn_gateway.Type.ipsec.1` |
+| `ipsec.1` | `aws.ec2.VpnGateway.Type.ipsec.1` |
 
 Shorthand formats: `ipsec.1` or `Type.ipsec.1`
 

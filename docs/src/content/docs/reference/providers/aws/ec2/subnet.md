@@ -1,5 +1,5 @@
 ---
-title: "aws.ec2.subnet"
+title: "aws.ec2.Subnet"
 description: "AWS EC2 subnet resource reference"
 ---
 
@@ -11,7 +11,7 @@ Describes a subnet.
 ## Example
 
 ```crn
-let vpc = aws.ec2.vpc {
+let vpc = aws.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 
   tags = {
@@ -19,7 +19,7 @@ let vpc = aws.ec2.vpc {
   }
 }
 
-aws.ec2.subnet {
+aws.ec2.Subnet {
   vpc_id            = vpc.vpc_id
   cidr_block        = '10.0.1.0/24'
   availability_zone = aws.AvailabilityZone.ap_northeast_1a

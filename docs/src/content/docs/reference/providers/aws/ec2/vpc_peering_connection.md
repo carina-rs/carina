@@ -1,5 +1,5 @@
 ---
-title: "aws.ec2.vpc_peering_connection"
+title: "aws.ec2.VpcPeeringConnection"
 description: "AWS EC2 vpc_peering_connection resource reference"
 ---
 

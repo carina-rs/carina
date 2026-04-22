@@ -1,5 +1,5 @@
 ---
-title: "aws.organizations.organization"
+title: "aws.organizations.Organization"
 description: "AWS ORGANIZATIONS organization resource reference"
 ---
 
@@ -23,8 +23,8 @@ Specifies the feature set supported by the new organization. Each feature set su
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ALL` | `aws.organizations.organization.FeatureSet.ALL` |
-| `CONSOLIDATED_BILLING` | `aws.organizations.organization.FeatureSet.CONSOLIDATED_BILLING` |
+| `ALL` | `aws.organizations.Organization.FeatureSet.ALL` |
+| `CONSOLIDATED_BILLING` | `aws.organizations.Organization.FeatureSet.CONSOLIDATED_BILLING` |
 
 Shorthand formats: `ALL` or `FeatureSet.ALL`
 

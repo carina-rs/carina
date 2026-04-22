@@ -1,5 +1,5 @@
 ---
-title: "aws.organizations.account"
+title: "aws.organizations.Account"
 description: "AWS ORGANIZATIONS account resource reference"
 ---
 
@@ -51,8 +51,8 @@ The tags for the resource.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ALLOW` | `aws.organizations.account.IamUserAccessToBilling.ALLOW` |
-| `DENY` | `aws.organizations.account.IamUserAccessToBilling.DENY` |
+| `ALLOW` | `aws.organizations.Account.IamUserAccessToBilling.ALLOW` |
+| `DENY` | `aws.organizations.Account.IamUserAccessToBilling.DENY` |
 
 Shorthand formats: `ALLOW` or `IamUserAccessToBilling.ALLOW`
 
@@ -60,8 +60,8 @@ Shorthand formats: `ALLOW` or `IamUserAccessToBilling.ALLOW`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `CREATED` | `aws.organizations.account.JoinedMethod.CREATED` |
-| `INVITED` | `aws.organizations.account.JoinedMethod.INVITED` |
+| `CREATED` | `aws.organizations.Account.JoinedMethod.CREATED` |
+| `INVITED` | `aws.organizations.Account.JoinedMethod.INVITED` |
 
 Shorthand formats: `CREATED` or `JoinedMethod.CREATED`
 
@@ -69,9 +69,9 @@ Shorthand formats: `CREATED` or `JoinedMethod.CREATED`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ACTIVE` | `aws.organizations.account.Status.ACTIVE` |
-| `PENDING_CLOSURE` | `aws.organizations.account.Status.PENDING_CLOSURE` |
-| `SUSPENDED` | `aws.organizations.account.Status.SUSPENDED` |
+| `ACTIVE` | `aws.organizations.Account.Status.ACTIVE` |
+| `PENDING_CLOSURE` | `aws.organizations.Account.Status.PENDING_CLOSURE` |
+| `SUSPENDED` | `aws.organizations.Account.Status.SUSPENDED` |
 
 Shorthand formats: `ACTIVE` or `Status.ACTIVE`
 

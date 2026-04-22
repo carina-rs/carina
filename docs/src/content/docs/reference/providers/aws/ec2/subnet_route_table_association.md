@@ -1,5 +1,5 @@
 ---
-title: "aws.ec2.subnet_route_table_association"
+title: "aws.ec2.SubnetRouteTableAssociation"
 description: "AWS EC2 subnet_route_table_association resource reference"
 ---
 
