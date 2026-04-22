@@ -1498,7 +1498,16 @@ fn parse_type_expr(pair: pest::iterators::Pair<Rule>) -> Result<TypeExpr, ParseE
             "Bool" | "bool" => Ok(TypeExpr::Bool),
             "Int" | "int" => Ok(TypeExpr::Int),
             "Float" | "float" => Ok(TypeExpr::Float),
-            other => Ok(TypeExpr::Simple(other.to_string())),
+            other => {
+                // Transition window: accept PascalCase or snake_case and
+                // canonicalize to snake_case internally.
+                let canonical = if other.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                    pascal_to_snake(other)
+                } else {
+                    other.to_string()
+                };
+                Ok(TypeExpr::Simple(canonical))
+            }
         },
         Rule::type_generic => {
             // Get the full string representation to determine if it's list or map
@@ -8979,6 +8988,30 @@ aws.s3.bucket {
         assert_eq!(result.arguments[1].type_expr, TypeExpr::Int);
         assert_eq!(result.arguments[2].type_expr, TypeExpr::Bool);
         assert_eq!(result.arguments[3].type_expr, TypeExpr::Float);
+    }
+
+    #[test]
+    fn parse_accepts_pascal_case_custom_types() {
+        let input = r#"
+            arguments {
+                id: AwsAccountId
+                cidr: Ipv4Cidr
+                bucket_arn: Arn
+            }
+        "#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(
+            result.arguments[0].type_expr,
+            TypeExpr::Simple("aws_account_id".to_string())
+        );
+        assert_eq!(
+            result.arguments[1].type_expr,
+            TypeExpr::Simple("ipv4_cidr".to_string())
+        );
+        assert_eq!(
+            result.arguments[2].type_expr,
+            TypeExpr::Simple("arn".to_string())
+        );
     }
 
     #[test]
