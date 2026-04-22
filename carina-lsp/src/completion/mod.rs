@@ -359,7 +359,7 @@ impl CompletionProvider {
         }
 
         // Check if we're in a type position inside a fn definition (at top level)
-        // e.g., "fn greet(name: " or "fn greet(name: string): "
+        // e.g., "fn greet(name: " or "fn greet(name: String): "
         if brace_depth == 0 {
             let trimmed_prefix = prefix.trim_start();
             if trimmed_prefix.starts_with("fn ") && prefix.contains(':') {
@@ -728,7 +728,7 @@ enum CompletionContext {
 /// is a bare identifier. Used to enter the upstream_state block context.
 /// Extract the type annotation from a line that opens an `exports`
 /// entry, e.g. `accounts: map(aws_account_id) = { ...` returns
-/// `Some("map(aws_account_id)")`. Returns `None` when the line doesn't
+/// `Some("map(AwsAccountId)")`. Returns `None` when the line doesn't
 /// match the `<name>: <type> =` shape — either because there's no
 /// colon, no equals, or the type portion is empty.
 fn extract_exports_entry_type(line: &str) -> Option<String> {

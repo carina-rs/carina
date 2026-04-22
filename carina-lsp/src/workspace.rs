@@ -438,7 +438,7 @@ mod tests {
         )
         .unwrap();
         // Module has arguments (no provider)
-        fs::write(module.join("main.crn"), "arguments {\n  repo: string\n}\n").unwrap();
+        fs::write(module.join("main.crn"), "arguments {\n  repo: String\n}\n").unwrap();
 
         let import_map = discover_import_map(dir.path());
 

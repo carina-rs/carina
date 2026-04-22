@@ -783,7 +783,7 @@ let e = replace("old", "new", str)
         // `map(aws_account_id)` in a type position is a type annotation, not a
         // function call. Should not trigger pipe-form warning.
         let source = r#"exports {
-  accounts: map(aws_account_id) = {
+  accounts: map(AwsAccountId) = {
     prod = x.y
   }
 }"#;
@@ -798,7 +798,7 @@ let e = replace("old", "new", str)
     #[test]
     fn test_pipe_preferred_type_annotation_list_no_warning() {
         let source = r#"attributes {
-  items: list(string) = ["a", "b"]
+  items: list(String) = ["a", "b"]
 }"#;
         let results = find_pipe_preferred_direct_calls(source);
         // `list` is not in PIPE_PREFERRED_FUNCTIONS, but ensure no regression

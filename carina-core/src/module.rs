@@ -1261,7 +1261,7 @@ mod tests {
         let input = r#"
             arguments {
                 vpc: aws.vpc
-                enable_https: bool = true
+                enable_https: Bool = true
             }
 
             attributes {
@@ -1306,20 +1306,20 @@ mod tests {
 
         let input = r#"
             arguments {
-                enable_https: bool = true
+                enable_https: Bool = true
 
-                vpc_id: string {
+                vpc_id: String {
                     description = "The VPC to deploy into"
                 }
 
-                port: int {
+                port: Int {
                     description = "Web server port"
                     default     = 8080
                 }
             }
 
             attributes {
-                sg_id: string = web_sg.id
+                sg_id: String = web_sg.id
             }
 
             let web_sg = aws.security_group {
@@ -1405,7 +1405,7 @@ mod tests {
         let input = r#"
             arguments {
                 vpc: aws.vpc
-                enable_https: bool = true
+                enable_https: Bool = true
             }
 
             attributes {

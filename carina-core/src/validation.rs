@@ -2370,7 +2370,7 @@ let vpc = awscc.ec2.Vpc {
         );
         assert!(
             result.is_ok(),
-            "map(string) = {{ prod = registry_prod.account_id (String) }} should pass, got: {:?}",
+            "map(String) = {{ prod = registry_prod.account_id (String) }} should pass, got: {:?}",
             result
         );
     }
@@ -2417,7 +2417,7 @@ let vpc = awscc.ec2.Vpc {
         );
         assert!(
             result.is_err(),
-            "map(bool) = {{ prod = registry_prod.account_id }} (String) should be flagged as type mismatch"
+            "map(Bool) = {{ prod = registry_prod.account_id }} (String) should be flagged as type mismatch"
         );
         let err = result.unwrap_err();
         assert!(

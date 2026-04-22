@@ -436,7 +436,7 @@ mod tests {
             &upstream_dir,
             "exports.crn",
             r#"exports {
-                accounts: string = "x"
+                accounts: String = "x"
             }"#,
         );
         let base = tmp.path().join("downstream");
@@ -468,8 +468,8 @@ mod tests {
             &upstream_dir,
             "exports.crn",
             r#"exports {
-                accounts: string = "x"
-                region: string = "ap-northeast-1"
+                accounts: String = "x"
+                region: String = "ap-northeast-1"
             }"#,
         );
         let base = tmp.path().join("downstream");
@@ -494,7 +494,7 @@ mod tests {
             &upstream_dir,
             "main.crn",
             r#"exports {
-                accounts: string = "x"
+                accounts: String = "x"
             }"#,
         );
         let base = tmp.path().join("downstream");
@@ -521,14 +521,14 @@ mod tests {
             &upstream_dir,
             "accounts.crn",
             r#"exports {
-                accounts: string = "x"
+                accounts: String = "x"
             }"#,
         );
         write_crn(
             &upstream_dir,
             "region.crn",
             r#"exports {
-                region: string = "ap-northeast-1"
+                region: String = "ap-northeast-1"
             }"#,
         );
         let base = tmp.path().join("downstream");
@@ -565,8 +565,8 @@ mod tests {
             "exports.crn",
             r#"exports {
                 accounts: struct {
-                    registry_prod: string,
-                    registry_dev:  string,
+                    registry_prod: String,
+                    registry_dev: String,
                 } = {
                     registry_prod = "111111111111"
                     registry_dev  = "222222222222"
@@ -671,7 +671,7 @@ mod tests {
             let orgs = upstream_state { source = "../organizations" }
 
             exports {
-                bad: string = orgs.account
+                bad: String = orgs.account
             }
             "#,
         );
@@ -697,7 +697,7 @@ mod tests {
             let orgs = upstream_state { source = "../organizations" }
 
             exports {
-                good: string = orgs.accounts
+                good: String = orgs.accounts
             }
             "#,
         );
@@ -713,7 +713,7 @@ mod tests {
             let orgs = upstream_state { source = "../organizations" }
 
             exports {
-                x: string = orgs.anything
+                x: String = orgs.anything
             }
             "#,
         );
@@ -734,7 +734,7 @@ mod tests {
             let other = upstream_state { source = "../other" }
 
             exports {
-                x: string = other.foo
+                x: String = other.foo
             }
             "#,
         );

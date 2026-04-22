@@ -732,7 +732,7 @@ mod run_plan_upstream_state_tests {
         fs::write(
             dir_a.join("main.crn"),
             r#"backend local { path = "carina.state.json" }
-exports { region: string = "ap-northeast-1" }"#,
+exports { region: String = "ap-northeast-1" }"#,
         )
         .unwrap();
 

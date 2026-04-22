@@ -131,7 +131,7 @@ macro_rules! register_builtins {
 
 register_builtins! {
     cidr_subnet(cidr_subnet::builtin_cidr_subnet, arity: 3) {
-        signature: "cidr_subnet(prefix: string, newbits: int, netnum: int) -> string",
+        signature: "cidr_subnet(prefix: String, newbits: Int, netnum: Int) -> String",
         description: "Calculates a subnet CIDR block within a given IP network address prefix.",
         return_type: BuiltinReturnType::String,
     },
@@ -141,12 +141,12 @@ register_builtins! {
         return_type: BuiltinReturnType::List,
     },
     decrypt(decrypt::builtin_decrypt, arity: 1) {
-        signature: "decrypt(ciphertext: string, key?: string) -> string",
+        signature: "decrypt(ciphertext: String, key?: String) -> String",
         description: "Decrypts ciphertext using the configured provider's encryption service (e.g., AWS KMS). Key is optional when embedded in ciphertext.",
         return_type: BuiltinReturnType::String,
     },
     env(env::builtin_env, arity: 1) {
-        signature: "env(name: string) -> string",
+        signature: "env(name: String) -> String",
         description: "Reads an environment variable. Errors if the variable is not set.",
         return_type: BuiltinReturnType::String,
     },
@@ -156,7 +156,7 @@ register_builtins! {
         return_type: BuiltinReturnType::List,
     },
     join(join::builtin_join, arity: 2) {
-        signature: "join(separator: string, list: list) -> string",
+        signature: "join(separator: String, list: list) -> String",
         description: "Joins list elements into a string using the separator.",
         return_type: BuiltinReturnType::String,
     },
@@ -166,57 +166,57 @@ register_builtins! {
         return_type: BuiltinReturnType::List,
     },
     length(length::builtin_length, arity: 1) {
-        signature: "length(value: list | map | string) -> int",
+        signature: "length(value: list | map | String) -> Int",
         description: "Returns the number of elements in a list or map, or characters in a string.",
         return_type: BuiltinReturnType::Int,
     },
     lookup(lookup::builtin_lookup, arity: 3) {
-        signature: "lookup(map: map, key: string, default: any) -> any",
+        signature: "lookup(map: map, key: String, default: Any) -> Any",
         description: "Looks up a key in a map, returning the default value if the key is not found.",
         return_type: BuiltinReturnType::Any,
     },
     lower(upper_lower::builtin_lower, arity: 1) {
-        signature: "lower(string: string) -> string",
+        signature: "lower(string: String) -> String",
         description: "Converts a string to lowercase.",
         return_type: BuiltinReturnType::String,
     },
     map(map::builtin_map, arity: 2) {
-        signature: "map(accessor: string, collection: list | map) -> list | map",
+        signature: "map(accessor: String, collection: list | map) -> list | map",
         description: "Extracts a field from each element. Use a dot-prefixed accessor (e.g., \".field_name\"). Pipe form: collection |> map(\".field\").",
         return_type: BuiltinReturnType::Any,
     },
     max(min_max::builtin_max, arity: 2) {
-        signature: "max(a: number, b: number) -> number",
+        signature: "max(a: Number, b: Number) -> Number",
         description: "Returns the maximum of two numbers.",
         return_type: BuiltinReturnType::Any,
     },
     min(min_max::builtin_min, arity: 2) {
-        signature: "min(a: number, b: number) -> number",
+        signature: "min(a: Number, b: Number) -> Number",
         description: "Returns the minimum of two numbers.",
         return_type: BuiltinReturnType::Any,
     },
     replace(replace::builtin_replace, arity: 3) {
-        signature: "replace(search: string, replacement: string, string: string) -> string",
-        description: "Replaces all occurrences of a search string. Data-last: string |> replace(search, replacement).",
+        signature: "replace(search: String, replacement: String, string: String) -> String",
+        description: "Replaces all occurrences of a search string. Data-last: String |> replace(search, replacement).",
         return_type: BuiltinReturnType::String,
     },
     secret(secret::builtin_secret, arity: 1) {
-        signature: "secret(value: any) -> secret",
+        signature: "secret(value: Any) -> Secret",
         description: "Marks a value as secret. The value is sent to the provider but stored only as a SHA256 hash in state.",
         return_type: BuiltinReturnType::Secret,
     },
     split(split::builtin_split, arity: 2) {
-        signature: "split(separator: string, string: string) -> list",
+        signature: "split(separator: String, string: String) -> list",
         description: "Splits a string into a list using the separator.",
         return_type: BuiltinReturnType::List,
     },
     trim(trim::builtin_trim, arity: 1) {
-        signature: "trim(string: string) -> string",
+        signature: "trim(string: String) -> String",
         description: "Removes leading and trailing whitespace from a string.",
         return_type: BuiltinReturnType::String,
     },
     upper(upper_lower::builtin_upper, arity: 1) {
-        signature: "upper(string: string) -> string",
+        signature: "upper(string: String) -> String",
         description: "Converts a string to uppercase.",
         return_type: BuiltinReturnType::String,
     },

@@ -1517,46 +1517,37 @@ fn parse_type_expr(
     config: &ProviderContext,
     warnings: &mut Vec<ParseWarning>,
 ) -> Result<TypeExpr, ParseError> {
+    let _ = warnings;
     let inner = first_inner(pair, "type", "type expression")?;
     match inner.as_rule() {
         Rule::type_simple => {
             let line = inner.as_span().start_pos().line_col().0;
             let text = inner.as_str();
-            let mut warn_deprecated = |new: &str| {
-                warnings.push(ParseWarning {
-                    file: None,
-                    line,
-                    message: format!("deprecated type spelling '{text}'; use '{new}' instead"),
-                });
-            };
             match text {
                 "String" => Ok(TypeExpr::String),
-                "string" => {
-                    warn_deprecated("String");
-                    Ok(TypeExpr::String)
-                }
                 "Bool" => Ok(TypeExpr::Bool),
-                "bool" => {
-                    warn_deprecated("Bool");
-                    Ok(TypeExpr::Bool)
-                }
                 "Int" => Ok(TypeExpr::Int),
-                "int" => {
-                    warn_deprecated("Int");
-                    Ok(TypeExpr::Int)
-                }
                 "Float" => Ok(TypeExpr::Float),
-                "float" => {
-                    warn_deprecated("Float");
-                    Ok(TypeExpr::Float)
-                }
+                // Phase C: the transition window for snake_case primitives
+                // and custom types has closed. The parser accepts only
+                // PascalCase type names (naming-conventions design D1).
+                "string" | "bool" | "int" | "float" => Err(ParseError::InvalidExpression {
+                    line,
+                    message: format!(
+                        "unknown type '{text}'; primitive types are PascalCase — use '{}' instead",
+                        snake_to_pascal(text)
+                    ),
+                }),
                 other if other.chars().next().is_some_and(|c| c.is_ascii_uppercase()) => {
                     Ok(TypeExpr::Simple(pascal_to_snake(other)))
                 }
-                other => {
-                    warn_deprecated(&snake_to_pascal(other));
-                    Ok(TypeExpr::Simple(other.to_string()))
-                }
+                other => Err(ParseError::InvalidExpression {
+                    line,
+                    message: format!(
+                        "unknown type '{other}'; custom types are PascalCase — use '{}' instead",
+                        snake_to_pascal(other)
+                    ),
+                }),
             }
         }
         Rule::type_generic => {
@@ -5643,12 +5634,12 @@ mod tests {
     fn parse_directory_module() {
         let input = r#"
             arguments {
-                vpc_id: string
-                enable_https: bool = true
+                vpc_id: String
+                enable_https: Bool = true
             }
 
             attributes {
-                sg_id: string = web_sg.id
+                sg_id: String = web_sg.id
             }
 
             let web_sg = aws.security_group {
@@ -5703,13 +5694,13 @@ mod tests {
     fn parse_generic_type_expressions() {
         let input = r#"
             arguments {
-                ports: list(int)
-                tags: map(string)
-                cidrs: list(string)
+                ports: list(Int)
+                tags: map(String)
+                cidrs: list(String)
             }
 
             attributes {
-                result: list(string) = items.ids
+                result: list(String) = items.ids
             }
 
             let items = aws.item {
@@ -5743,7 +5734,7 @@ mod tests {
         let input = r#"
             arguments {
                 vpc: aws.vpc
-                enable_https: bool = true
+                enable_https: Bool = true
             }
 
             attributes {
@@ -5786,7 +5777,7 @@ mod tests {
             }
 
             attributes {
-                out: string = sg.name
+                out: String = sg.name
             }
         "#;
 
@@ -5810,8 +5801,8 @@ mod tests {
         let input = r#"
             exports {
                 accounts: struct {
-                    registry_prod: aws_account_id,
-                    registry_dev:  aws_account_id,
+                    registry_prod: AwsAccountId,
+                    registry_dev: AwsAccountId,
                 } = {
                     registry_prod = "111111111111"
                     registry_dev  = "222222222222"
@@ -5842,8 +5833,8 @@ mod tests {
     fn parse_struct_type_nested_in_list_and_map() {
         let input = r#"
             arguments {
-                items: list(struct { name: string, value: int })
-                registry: map(struct { arn: string, id: string })
+                items: list(struct { name: String, value: Int })
+                registry: map(struct { arn: String, id: String })
             }
         "#;
 
@@ -5872,7 +5863,7 @@ mod tests {
     fn parse_struct_type_rejects_duplicate_field_name() {
         let input = r#"
             exports {
-                x: struct { a: string, a: int } = { a = "hi" }
+                x: struct { a: String, a: Int } = { a = "hi" }
             }
         "#;
         let err = parse(input, &ProviderContext::default()).unwrap_err();
@@ -5936,7 +5927,7 @@ mod tests {
             attributes {
                 vpc_id: awscc.ec2.VpcId = vpc.vpc_id
                 security_group = sg.id
-                subnet_ids: list(string) = subnets.ids
+                subnet_ids: list(String) = subnets.ids
             }
 
             let vpc = awscc.ec2.Vpc {
@@ -7485,9 +7476,9 @@ aws.s3.Bucket {
     fn resolve_resource_refs_with_argument_parameters() {
         let input = r#"
             arguments {
-                cidr_block: string
-                subnet_cidr: string
-                az: string
+                cidr_block: String
+                subnet_cidr: String
+                az: String
             }
 
             let vpc = awscc.ec2.Vpc {
@@ -8928,7 +8919,7 @@ aws.s3.Bucket {
     fn parse_arguments_block_form_description_and_default() {
         let input = r#"
             arguments {
-                port: int {
+                port: Int {
                     description = "Web server port"
                     default     = 8080
                 }
@@ -8950,13 +8941,13 @@ aws.s3.Bucket {
     fn parse_arguments_mixed_simple_and_block_form() {
         let input = r#"
             arguments {
-                enable_https: bool = true
+                enable_https: Bool = true
 
                 vpc: awscc.ec2.Vpc {
                     description = "The VPC to deploy into"
                 }
 
-                port: int {
+                port: Int {
                     description = "Web server port"
                     default     = 8080
                 }
@@ -8998,8 +8989,8 @@ aws.s3.Bucket {
     fn parse_arguments_simple_form_has_no_description() {
         let input = r#"
             arguments {
-                vpc_id: string
-                port: int = 8080
+                vpc_id: String
+                port: Int = 8080
             }
         "#;
 
@@ -9030,10 +9021,10 @@ aws.s3.Bucket {
     fn parse_still_accepts_lowercase_primitives_during_transition() {
         let input = r#"
             arguments {
-                a: string
-                b: int
-                c: bool
-                d: float
+                a: String
+                b: Int
+                c: Bool
+                d: Float
             }
         "#;
         let result = parse(input, &ProviderContext::default()).unwrap();
@@ -9119,31 +9110,27 @@ aws.s3.Bucket {
     }
 
     #[test]
-    fn parser_warns_on_lowercase_primitive() {
-        let input = r#"arguments { a: string }"#;
-        let result = parse(input, &ProviderContext::default()).unwrap();
+    fn parser_rejects_lowercase_primitive_after_phase_c() {
+        // Intentionally uses the old snake_case spelling to verify Phase C
+        // rejection, so the type annotation below must NOT be mechanically
+        // rewritten to PascalCase.
+        let input = "arguments { a: string }";
+        let err = parse(input, &ProviderContext::default()).unwrap_err();
+        let msg = format!("{err}");
         assert!(
-            result
-                .warnings
-                .iter()
-                .any(|w| w.message.contains("deprecated type spelling 'string'")
-                    && w.message.contains("'String'")),
-            "expected deprecation warning, got {:?}",
-            result.warnings
+            msg.contains("unknown type 'string'") && msg.contains("'String'"),
+            "expected rejection with hint pointing at 'String', got: {msg}"
         );
     }
 
     #[test]
-    fn parser_warns_on_snake_case_custom_type() {
-        let input = r#"arguments { a: aws_account_id }"#;
-        let result = parse(input, &ProviderContext::default()).unwrap();
+    fn parser_rejects_snake_case_custom_type_after_phase_c() {
+        let input = "arguments { a: aws_account_id }";
+        let err = parse(input, &ProviderContext::default()).unwrap_err();
+        let msg = format!("{err}");
         assert!(
-            result.warnings.iter().any(|w| w
-                .message
-                .contains("deprecated type spelling 'aws_account_id'")
-                && w.message.contains("'AwsAccountId'")),
-            "expected deprecation warning, got {:?}",
-            result.warnings
+            msg.contains("unknown type 'aws_account_id'") && msg.contains("'AwsAccountId'"),
+            "expected rejection with hint pointing at 'AwsAccountId', got: {msg}"
         );
     }
 
@@ -9170,7 +9157,7 @@ aws.s3.Bucket {
     fn parse_arguments_block_form_default_only() {
         let input = r#"
             arguments {
-                port: int {
+                port: Int {
                     default = 8080
                 }
             }
@@ -9187,7 +9174,7 @@ aws.s3.Bucket {
     fn parse_arguments_block_form_empty_block() {
         let input = r#"
             arguments {
-                port: int {}
+                port: Int {}
             }
         "#;
 
@@ -9202,7 +9189,7 @@ aws.s3.Bucket {
     fn parse_arguments_block_form_string_default_not_confused_with_description() {
         let input = r#"
             arguments {
-                name: string {
+                name: String {
                     description = "Name of the resource"
                     default     = "my-resource"
                 }
@@ -9227,7 +9214,7 @@ aws.s3.Bucket {
     fn parse_arguments_block_form_validation_block() {
         let input = r#"
             arguments {
-                port: int {
+                port: Int {
                     description = "Web server port"
                     default     = 8080
                     validation {
@@ -9280,7 +9267,7 @@ aws.s3.Bucket {
     fn parse_arguments_block_form_validate_no_description() {
         let input = r#"
             arguments {
-                count: int {
+                count: Int {
                     validation {
                         condition = count > 0
                     }
@@ -9301,7 +9288,7 @@ aws.s3.Bucket {
     fn parse_arguments_block_form_validate_with_not() {
         let input = r#"
             arguments {
-                enabled: bool {
+                enabled: Bool {
                     validation {
                         condition = !enabled == false
                     }
@@ -9317,7 +9304,7 @@ aws.s3.Bucket {
     fn parse_arguments_block_form_validate_with_or() {
         let input = r#"
             arguments {
-                port: int {
+                port: Int {
                     validation {
                         condition   = port == 80 || port == 443
                         error_message = "Port must be 80 or 443"
@@ -9337,7 +9324,7 @@ aws.s3.Bucket {
     fn parse_arguments_block_form_validate_with_len() {
         let input = r#"
             arguments {
-                name: string {
+                name: String {
                     validation {
                         condition   = len(name) >= 1 && len(name) <= 64
                         error_message = "Name must be between 1 and 64 characters"
@@ -9358,7 +9345,7 @@ aws.s3.Bucket {
     fn parse_arguments_block_form_multiple_validation_blocks() {
         let input = r#"
             arguments {
-                port: int {
+                port: Int {
                     validation {
                         condition   = port >= 1
                         error_message = "Port must be positive"
@@ -9770,7 +9757,7 @@ aws.s3.Bucket {
     #[test]
     fn user_fn_typed_param_string() {
         let input = r#"
-            fn greet(name: string) {
+            fn greet(name: String) {
                 join(" ", ["hello", name])
             }
 
@@ -9790,7 +9777,7 @@ aws.s3.Bucket {
     #[test]
     fn user_fn_typed_param_type_mismatch() {
         let input = r#"
-            fn greet(name: string) {
+            fn greet(name: String) {
                 name
             }
 
@@ -9810,7 +9797,7 @@ aws.s3.Bucket {
     #[test]
     fn user_fn_typed_param_int() {
         let input = r#"
-            fn double(x: int) {
+            fn double(x: Int) {
                 x
             }
 
@@ -9830,7 +9817,7 @@ aws.s3.Bucket {
     #[test]
     fn user_fn_typed_param_with_default() {
         let input = r#"
-            fn tag(env: string, suffix: string = "default") {
+            fn tag(env: String, suffix: String = "default") {
                 join("-", [env, suffix])
             }
 
@@ -9849,7 +9836,7 @@ aws.s3.Bucket {
     #[test]
     fn user_fn_mixed_typed_and_untyped() {
         let input = r#"
-            fn tag(env, suffix: string) {
+            fn tag(env, suffix: String) {
                 join("-", [env, suffix])
             }
 
@@ -9868,7 +9855,7 @@ aws.s3.Bucket {
     #[test]
     fn user_fn_typed_param_bool_mismatch() {
         let input = r#"
-            fn check(flag: bool) {
+            fn check(flag: Bool) {
                 flag
             }
 
@@ -9888,7 +9875,7 @@ aws.s3.Bucket {
     #[test]
     fn user_fn_param_type_stored_in_parsed_file() {
         let input = r#"
-            fn greet(name: string, count: int) {
+            fn greet(name: String, count: Int) {
                 name
             }
         "#;
@@ -9915,7 +9902,7 @@ aws.s3.Bucket {
     #[test]
     fn user_fn_return_type_string() {
         let input = r#"
-            fn greet(name: string): string {
+            fn greet(name: String): String {
                 name
             }
 
@@ -9945,7 +9932,7 @@ aws.s3.Bucket {
     #[test]
     fn user_fn_return_type_mismatch_value() {
         let input = r#"
-            fn bad(): string {
+            fn bad(): String {
                 42
             }
 
@@ -9966,7 +9953,7 @@ aws.s3.Bucket {
     fn parse_custom_schema_type_in_fn_param() {
         // Custom schema types like ipv4_cidr, ipv4_address, arn should be accepted as type annotations
         let input = r#"
-            fn format_cidr(cidr_block: ipv4_cidr) {
+            fn format_cidr(cidr_block: Ipv4Cidr) {
                 cidr_block
             }
         "#;
@@ -9982,7 +9969,7 @@ aws.s3.Bucket {
     #[test]
     fn parse_ipv4_address_type_in_fn_param() {
         let input = r#"
-            fn f(addr: ipv4_address) {
+            fn f(addr: Ipv4Address) {
                 addr
             }
         "#;
@@ -9997,7 +9984,7 @@ aws.s3.Bucket {
     #[test]
     fn parse_arn_type_in_fn_param() {
         let input = r#"
-            fn f(role: arn) {
+            fn f(role: Arn) {
                 role
             }
         "#;
@@ -10012,7 +9999,7 @@ aws.s3.Bucket {
     #[test]
     fn parse_custom_type_in_list_generic() {
         let input = r#"
-            fn f(cidrs: list(ipv4_cidr)) {
+            fn f(cidrs: list(Ipv4Cidr)) {
                 cidrs
             }
         "#;
@@ -10030,8 +10017,8 @@ aws.s3.Bucket {
     fn parse_custom_type_in_module_arguments() {
         let input = r#"
             arguments {
-                vpc_cidr: ipv4_cidr
-                server_ip: ipv4_address
+                vpc_cidr: Ipv4Cidr
+                server_ip: Ipv4Address
             }
 
             awscc.ec2.Vpc {
@@ -10056,7 +10043,7 @@ aws.s3.Bucket {
     fn parse_custom_type_in_attributes() {
         let input = r#"
             attributes {
-                block: ipv4_cidr = vpc.cidr_block
+                block: Ipv4Cidr = vpc.cidr_block
             }
 
             let vpc = awscc.ec2.Vpc {
@@ -10102,7 +10089,7 @@ aws.s3.Bucket {
     #[test]
     fn user_fn_custom_type_cidr_arg_valid() {
         let input = r#"
-            fn f(x: ipv4_cidr) { x }
+            fn f(x: Ipv4Cidr) { x }
 
             let b = aws.s3_bucket {
                 name = f("10.0.0.0/16")
@@ -10115,7 +10102,7 @@ aws.s3.Bucket {
     #[test]
     fn user_fn_custom_type_cidr_arg_invalid() {
         let input = r#"
-            fn f(x: ipv4_cidr) { x }
+            fn f(x: Ipv4Cidr) { x }
 
             let b = aws.s3_bucket {
                 name = f("invalid")
@@ -10132,7 +10119,7 @@ aws.s3.Bucket {
     #[test]
     fn user_fn_custom_type_ipv4_address_arg_valid() {
         let input = r#"
-            fn f(x: ipv4_address) { x }
+            fn f(x: Ipv4Address) { x }
 
             let b = aws.s3_bucket {
                 name = f("10.0.0.1")
@@ -10145,7 +10132,7 @@ aws.s3.Bucket {
     #[test]
     fn user_fn_custom_type_ipv4_address_arg_invalid() {
         let input = r#"
-            fn f(x: ipv4_address) { x }
+            fn f(x: Ipv4Address) { x }
 
             let b = aws.s3_bucket {
                 name = f("invalid")
@@ -10162,7 +10149,7 @@ aws.s3.Bucket {
     #[test]
     fn user_fn_custom_type_ipv6_cidr_arg_valid() {
         let input = r#"
-            fn f(x: ipv6_cidr) { x }
+            fn f(x: Ipv6Cidr) { x }
 
             let b = aws.s3_bucket {
                 name = f("2001:db8::/32")
@@ -10175,7 +10162,7 @@ aws.s3.Bucket {
     #[test]
     fn user_fn_custom_type_ipv6_cidr_arg_invalid() {
         let input = r#"
-            fn f(x: ipv6_cidr) { x }
+            fn f(x: Ipv6Cidr) { x }
 
             let b = aws.s3_bucket {
                 name = f("invalid")
@@ -10192,7 +10179,7 @@ aws.s3.Bucket {
     #[test]
     fn user_fn_custom_type_ipv6_address_arg_valid() {
         let input = r#"
-            fn f(x: ipv6_address) { x }
+            fn f(x: Ipv6Address) { x }
 
             let b = aws.s3_bucket {
                 name = f("2001:db8::1")
@@ -10205,7 +10192,7 @@ aws.s3.Bucket {
     #[test]
     fn user_fn_custom_type_ipv6_address_arg_invalid() {
         let input = r#"
-            fn f(x: ipv6_address) { x }
+            fn f(x: Ipv6Address) { x }
 
             let b = aws.s3_bucket {
                 name = f("invalid")
@@ -10223,7 +10210,7 @@ aws.s3.Bucket {
     fn user_fn_custom_type_arn_arg_accepts_string() {
         // arn format varies too much, just accept any string
         let input = r#"
-            fn f(x: arn) { x }
+            fn f(x: Arn) { x }
 
             let b = aws.s3_bucket {
                 name = f("arn:aws:s3:::my-bucket")
@@ -10237,7 +10224,7 @@ aws.s3.Bucket {
     fn user_fn_custom_type_arg_resource_ref_skipped() {
         // ResourceRef values should be accepted (resolved later)
         let input = r#"
-            fn f(x: ipv4_cidr) { x }
+            fn f(x: Ipv4Cidr) { x }
 
             let vpc = awscc.ec2.Vpc {
                 cidr_block = "10.0.0.0/16"
@@ -10256,7 +10243,7 @@ aws.s3.Bucket {
     #[test]
     fn user_fn_custom_type_return_cidr_valid() {
         let input = r#"
-            fn f(): ipv4_cidr { "10.0.0.0/16" }
+            fn f(): Ipv4Cidr { "10.0.0.0/16" }
 
             let b = aws.s3_bucket {
                 name = f()
@@ -10269,7 +10256,7 @@ aws.s3.Bucket {
     #[test]
     fn user_fn_custom_type_return_cidr_invalid() {
         let input = r#"
-            fn f(): ipv4_cidr { "invalid" }
+            fn f(): Ipv4Cidr { "invalid" }
 
             let b = aws.s3_bucket {
                 name = f()
@@ -10286,7 +10273,7 @@ aws.s3.Bucket {
     #[test]
     fn user_fn_custom_type_return_ipv4_address_invalid() {
         let input = r#"
-            fn f(): ipv4_address { "invalid" }
+            fn f(): Ipv4Address { "invalid" }
 
             let b = aws.s3_bucket {
                 name = f()
@@ -10303,7 +10290,7 @@ aws.s3.Bucket {
     #[test]
     fn user_fn_custom_type_return_ipv6_cidr_invalid() {
         let input = r#"
-            fn f(): ipv6_cidr { "invalid" }
+            fn f(): Ipv6Cidr { "invalid" }
 
             let b = aws.s3_bucket {
                 name = f()
@@ -10320,7 +10307,7 @@ aws.s3.Bucket {
     #[test]
     fn user_fn_custom_type_return_ipv6_address_invalid() {
         let input = r#"
-            fn f(): ipv6_address { "invalid" }
+            fn f(): Ipv6Address { "invalid" }
 
             let b = aws.s3_bucket {
                 name = f()
@@ -10614,8 +10601,8 @@ arguments {
     fn test_parse_require_statement() {
         let input = r#"
             arguments {
-                enable_https: bool = true
-                has_cert: bool = false
+                enable_https: Bool = true
+                has_cert: Bool = false
             }
             require !enable_https || has_cert, "cert is required when HTTPS is enabled"
         "#;
@@ -10636,7 +10623,7 @@ arguments {
     fn test_parse_require_with_len_function() {
         let input = r#"
             arguments {
-                subnet_ids: list(string)
+                subnet_ids: list(String)
             }
             require len(subnet_ids) >= 2, "ALB requires at least two subnets"
         "#;
@@ -10662,7 +10649,7 @@ arguments {
     fn test_parse_require_with_null() {
         let input = r#"
             arguments {
-                cert_arn: string = "default"
+                cert_arn: String = "default"
             }
             require cert_arn != null, "cert_arn must not be null"
         "#;
@@ -10682,9 +10669,9 @@ arguments {
     fn test_parse_multiple_require_statements() {
         let input = r#"
             arguments {
-                min_size: int
-                max_size: int
-                subnet_ids: list(string)
+                min_size: Int
+                max_size: Int
+                subnet_ids: list(String)
             }
             require min_size <= max_size, "min_size must be <= max_size"
             require len(subnet_ids) >= 2, "need at least two subnets"
@@ -10705,7 +10692,7 @@ arguments {
     fn test_parse_require_with_and_operator() {
         let input = r#"
             arguments {
-                port: int = 80
+                port: Int = 80
             }
             require port >= 1 && port <= 65535, "port must be between 1 and 65535"
         "#;
@@ -10723,7 +10710,7 @@ arguments {
         // are not mis-parsed as null_literal
         let input = r#"
             arguments {
-                nullable: bool = true
+                nullable: Bool = true
             }
             require nullable, "must be true"
         "#;
@@ -11081,8 +11068,8 @@ let vpc = awscc.ec2.Vpc {
 }
 
 exports {
-  vpc_id: string = vpc.vpc_id
-  cidr: string = vpc.cidr_block
+  vpc_id: String = vpc.vpc_id
+  cidr: String = vpc.cidr_block
 }
 "#;
         let parsed = parse(input, &ProviderContext::default()).unwrap();
@@ -11104,7 +11091,7 @@ let vpc = awscc.ec2.Vpc {
 }
 
 exports {
-  vpc_ids: list(string) = [
+  vpc_ids: list(String) = [
     vpc.vpc_id,
   ]
 }
@@ -11126,7 +11113,7 @@ let vpc = awscc.ec2.Vpc {
 }
 
 exports {
-  vpc_ids: list(string) = [vpc.vpc_id]
+  vpc_ids: list(String) = [vpc.vpc_id]
 }
 "#
         );

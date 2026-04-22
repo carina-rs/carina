@@ -571,7 +571,7 @@ mod tests {
         fs::create_dir(&upstream_dir).unwrap();
         fs::write(
             upstream_dir.join("exports.crn"),
-            "exports { accounts: string = \"x\" }\n",
+            "exports { accounts: String = \"x\" }\n",
         )
         .unwrap();
         let base = tmp.path().join("downstream");
@@ -580,7 +580,7 @@ mod tests {
             base.join("main.crn"),
             r#"let orgs = upstream_state { source = "../organizations" }
 exports {
-    bad: string = orgs.missing
+    bad: String = orgs.missing
 }
 "#,
         )
