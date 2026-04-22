@@ -8,6 +8,7 @@
     { "include": "#keywords" },
     { "include": "#resource-types" },
     { "include": "#regions" },
+    { "include": "#types" },
     { "include": "#strings" },
     { "include": "#numbers" },
     { "include": "#booleans" },
@@ -62,6 +63,14 @@
         {
           "name": "constant.other.region.carina",
           "match": "\\baws\\.Region\\.[a-z][a-z0-9_]*\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "entity.name.type.carina",
+          "match": "\\b[A-Z][A-Za-z0-9]*\\b"
         }
       ]
     },

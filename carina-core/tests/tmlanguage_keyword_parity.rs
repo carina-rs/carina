@@ -110,6 +110,20 @@ fn tmbundle_grammar_matches_keywords() {
 }
 
 #[test]
+fn tmlanguage_has_pascal_case_type_pattern() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let vscode = fs::read_to_string(manifest_dir.join(VSCODE_GRAMMAR)).unwrap();
+    assert!(
+        vscode.contains("entity.name.type.carina"),
+        "tmLanguage must declare `entity.name.type.carina` scope"
+    );
+    assert!(
+        vscode.contains(r"\\b[A-Z][A-Za-z0-9]*\\b"),
+        "tmLanguage must include a PascalCase match pattern"
+    );
+}
+
+#[test]
 fn vscode_and_tmbundle_grammars_are_byte_identical() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vscode = fs::read(manifest_dir.join(VSCODE_GRAMMAR))
