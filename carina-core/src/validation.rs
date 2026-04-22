@@ -853,6 +853,7 @@ mod tests {
             decryptor: None,
             validators,
             custom_type_validator: None,
+            schema_types: Default::default(),
         }
     }
 

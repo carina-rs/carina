@@ -1158,11 +1158,10 @@ fn parse_arguments_block(
             let name = next_pair(&mut param_inner, "parameter name", "arguments block")?
                 .as_str()
                 .to_string();
-            let type_expr = parse_type_expr(next_pair(
-                &mut param_inner,
-                "type expression",
-                "arguments parameter",
-            )?)?;
+            let type_expr = parse_type_expr(
+                next_pair(&mut param_inner, "type expression", "arguments parameter")?,
+                config,
+            )?;
 
             // Check if the next element is a block form or simple default
             if let Some(next) = param_inner.next() {
@@ -1433,7 +1432,7 @@ fn parse_attributes_block(
             )?;
             let (type_expr, value) = if next.as_rule() == Rule::type_expr {
                 // Has explicit type annotation: name: type = expr
-                let type_expr = Some(parse_type_expr(next)?);
+                let type_expr = Some(parse_type_expr(next, ctx.config)?);
                 let expr = next_pair(&mut param_inner, "value expression", "attributes parameter")?;
                 let value = Some(parse_expression(expr, ctx)?);
                 (type_expr, value)
@@ -1469,7 +1468,7 @@ fn parse_exports_block(
 
             let next = next_pair(&mut param_inner, "type or expression", "exports parameter")?;
             let (type_expr, value) = if next.as_rule() == Rule::type_expr {
-                let type_expr = Some(parse_type_expr(next)?);
+                let type_expr = Some(parse_type_expr(next, ctx.config)?);
                 let expr = next_pair(&mut param_inner, "value expression", "exports parameter")?;
                 let value = Some(parse_expression(expr, ctx)?);
                 (type_expr, value)
@@ -1490,7 +1489,10 @@ fn parse_exports_block(
 }
 
 /// Parse type expression
-fn parse_type_expr(pair: pest::iterators::Pair<Rule>) -> Result<TypeExpr, ParseError> {
+fn parse_type_expr(
+    pair: pest::iterators::Pair<Rule>,
+    config: &ProviderContext,
+) -> Result<TypeExpr, ParseError> {
     let inner = first_inner(pair, "type", "type expression")?;
     match inner.as_rule() {
         Rule::type_simple => match inner.as_str() {
@@ -1516,11 +1518,10 @@ fn parse_type_expr(pair: pest::iterators::Pair<Rule>) -> Result<TypeExpr, ParseE
 
             // Get the inner type expression
             let mut generic_inner = inner.into_inner();
-            let inner_type = parse_type_expr(next_pair(
-                &mut generic_inner,
-                "inner type",
-                "generic type expression",
-            )?)?;
+            let inner_type = parse_type_expr(
+                next_pair(&mut generic_inner, "inner type", "generic type expression")?,
+                config,
+            )?;
 
             if is_list {
                 Ok(TypeExpr::List(Box::new(inner_type)))
@@ -1534,29 +1535,31 @@ fn parse_type_expr(pair: pest::iterators::Pair<Rule>) -> Result<TypeExpr, ParseE
             let path_str = next_pair(&mut ref_inner, "resource type path", "type ref")?.as_str();
             let parts: Vec<&str> = path_str.split('.').collect();
 
-            // Check if the last segment starts with uppercase (PascalCase) → SchemaType
-            if parts.len() >= 3
+            // A 3+ segment path with a PascalCase final segment is ambiguous:
+            // `aws.ec2.Vpc` is a resource kind (Ref), `awscc.ec2.VpcId` is a
+            // schema type. Disambiguate by asking the provider context:
+            // registered schema types become SchemaType, everything else
+            // falls back to Ref.
+            let has_pascal_tail = parts.len() >= 3
                 && parts
                     .last()
-                    .is_some_and(|s| s.starts_with(|c: char| c.is_uppercase()))
-            {
-                let provider = parts[0].to_string();
+                    .is_some_and(|s| s.starts_with(|c: char| c.is_uppercase()));
+            if has_pascal_tail {
+                let provider = parts[0];
                 let path = parts[1..parts.len() - 1].join(".");
-                let type_name = parts.last().unwrap().to_string();
-                Ok(TypeExpr::SchemaType {
-                    provider,
-                    path,
-                    type_name,
-                })
-            } else {
-                let path = ResourceTypePath::parse(path_str).ok_or_else(|| {
-                    ParseError::InvalidResourceType(format!(
-                        "Invalid resource type path: {}",
-                        path_str
-                    ))
-                })?;
-                Ok(TypeExpr::Ref(path))
+                let type_name = parts.last().unwrap();
+                if config.is_schema_type(provider, &path, type_name) {
+                    return Ok(TypeExpr::SchemaType {
+                        provider: provider.to_string(),
+                        path,
+                        type_name: type_name.to_string(),
+                    });
+                }
             }
+            let path = ResourceTypePath::parse(path_str).ok_or_else(|| {
+                ParseError::InvalidResourceType(format!("Invalid resource type path: {}", path_str))
+            })?;
+            Ok(TypeExpr::Ref(path))
         }
         Rule::type_struct => {
             let mut fields: Vec<(String, TypeExpr)> = Vec::new();
@@ -1572,11 +1575,10 @@ fn parse_type_expr(pair: pest::iterators::Pair<Rule>) -> Result<TypeExpr, ParseE
                     let name = next_pair(&mut field_inner, "field name", "struct field")?
                         .as_str()
                         .to_string();
-                    let ty = parse_type_expr(next_pair(
-                        &mut field_inner,
-                        "field type",
-                        "struct field",
-                    )?)?;
+                    let ty = parse_type_expr(
+                        next_pair(&mut field_inner, "field type", "struct field")?,
+                        config,
+                    )?;
                     if fields.iter().any(|(existing, _)| existing == &name) {
                         return Err(ParseError::InvalidResourceType(format!(
                             "struct has duplicate field name '{name}'"
@@ -2938,7 +2940,7 @@ fn parse_fn_def(
                 for remaining in param_inner {
                     match remaining.as_rule() {
                         Rule::type_expr => {
-                            param_type = Some(parse_type_expr(remaining)?);
+                            param_type = Some(parse_type_expr(remaining, ctx.config)?);
                         }
                         _ => {
                             // This is the default expression
@@ -2967,7 +2969,7 @@ fn parse_fn_def(
 
     // Parse optional return type annotation (: type_expr)
     let (return_type, body_pair) = if next_token.as_rule() == Rule::type_expr {
-        let rt = parse_type_expr(next_token)?;
+        let rt = parse_type_expr(next_token, ctx.config)?;
         let bp = next_pair(&mut inner, "fn_body", "fn_def")?;
         (Some(rt), bp)
     } else {
@@ -9015,6 +9017,47 @@ aws.s3.bucket {
     }
 
     #[test]
+    fn parse_three_segment_resource_path_is_ref() {
+        let input = r#"
+            arguments {
+                vpc: aws.ec2.Vpc
+                bucket: aws.s3.Bucket
+            }
+        "#;
+        let result = parse(input, &ProviderContext::default()).unwrap();
+        match &result.arguments[0].type_expr {
+            TypeExpr::Ref(path) => {
+                assert_eq!(path.provider, "aws");
+                assert_eq!(path.resource_type, "ec2.Vpc");
+            }
+            other => panic!("expected Ref, got {other:?}"),
+        }
+        match &result.arguments[1].type_expr {
+            TypeExpr::Ref(path) => {
+                assert_eq!(path.provider, "aws");
+                assert_eq!(path.resource_type, "s3.Bucket");
+            }
+            other => panic!("expected Ref, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_four_segment_path_with_pascal_tail_is_schema_type() {
+        let input = r#"
+            arguments {
+                vpc_id: awscc.ec2.VpcId
+            }
+        "#;
+        let mut ctx = ProviderContext::default();
+        ctx.register_schema_type("awscc", "ec2", "VpcId");
+        let result = parse(input, &ctx).unwrap();
+        assert!(matches!(
+            result.arguments[0].type_expr,
+            TypeExpr::SchemaType { .. }
+        ));
+    }
+
+    #[test]
     fn parse_arguments_block_form_default_only() {
         let input = r#"
             arguments {
@@ -10193,6 +10236,7 @@ aws.s3.bucket {
             })),
             validators: HashMap::new(),
             custom_type_validator: None,
+            schema_types: Default::default(),
         };
 
         // decrypt() in resource attributes is resolved during resolve_resource_refs,
@@ -10251,6 +10295,7 @@ aws.s3.bucket {
             decryptor: None,
             validators,
             custom_type_validator: None,
+            schema_types: Default::default(),
         };
 
         let result = validate_custom_type(
@@ -10291,6 +10336,7 @@ aws.s3.bucket {
             decryptor: None,
             validators,
             custom_type_validator: None,
+            schema_types: Default::default(),
         };
 
         // Test validate_custom_type directly since the grammar may not accept
@@ -10354,7 +10400,9 @@ arguments {
   vpc_id: awscc.ec2.VpcId
 }
 "#;
-        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        let mut ctx = ProviderContext::default();
+        ctx.register_schema_type("awscc", "ec2", "VpcId");
+        let parsed = parse(input, &ctx).unwrap();
         assert_eq!(parsed.arguments.len(), 1);
         let arg = &parsed.arguments[0];
         assert_eq!(arg.name, "vpc_id");
@@ -10389,7 +10437,9 @@ arguments {
   subnet_ids: list(awscc.ec2.SubnetId)
 }
 "#;
-        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        let mut ctx = ProviderContext::default();
+        ctx.register_schema_type("awscc", "ec2", "SubnetId");
+        let parsed = parse(input, &ctx).unwrap();
         assert_eq!(parsed.arguments.len(), 1);
         let arg = &parsed.arguments[0];
         match &arg.type_expr {

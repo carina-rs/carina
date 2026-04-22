@@ -24,6 +24,7 @@ impl TestClient {
                 decryptor: None,
                 validators: HashMap::new(),
                 custom_type_validator: None,
+                schema_types: Default::default(),
             };
             Backend::new(client, provider_context, None)
         });

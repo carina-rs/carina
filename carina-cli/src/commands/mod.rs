@@ -147,6 +147,7 @@ fn enrich_provider_context(
             }
             Ok(())
         })),
+        schema_types: Default::default(),
     }
 }
 

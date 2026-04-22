@@ -3,7 +3,7 @@
 //! `ProviderContext` allows CLI/providers to inject custom type validators
 //! and a decryptor function into the parser without using global mutable state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Signature for a custom type validator function.
 ///
@@ -35,6 +35,40 @@ pub struct ProviderContext {
     /// Factory-based custom type validator that calls through to provider factories
     /// (e.g., WASM plugins) for types not covered by `validators`.
     pub custom_type_validator: Option<CustomTypeValidatorFn>,
+    /// Schema types registered by providers, keyed by
+    /// `(provider, path, type_name)` (e.g., `("awscc", "ec2", "VpcId")`).
+    ///
+    /// Used by the parser to disambiguate 3+ segment paths: without this set,
+    /// both `aws.ec2.Vpc` (resource kind) and `awscc.ec2.VpcId` (schema type)
+    /// look identical. When a triple is present, the parser classifies the
+    /// path as `TypeExpr::SchemaType`; otherwise it falls back to
+    /// `TypeExpr::Ref`.
+    pub schema_types: HashSet<(String, String, String)>,
+}
+
+impl ProviderContext {
+    /// Register `(provider, path, type_name)` as a schema type so the parser
+    /// classifies matching 3+ segment paths as `TypeExpr::SchemaType` rather
+    /// than `TypeExpr::Ref`. Provider crates call this during setup.
+    pub fn register_schema_type(
+        &mut self,
+        provider: impl Into<String>,
+        path: impl Into<String>,
+        type_name: impl Into<String>,
+    ) {
+        self.schema_types
+            .insert((provider.into(), path.into(), type_name.into()));
+    }
+
+    /// Return `true` iff `(provider, path, type_name)` has been registered via
+    /// [`register_schema_type`]. Used by the parser to route 3+ segment paths.
+    pub fn is_schema_type(&self, provider: &str, path: &str, type_name: &str) -> bool {
+        self.schema_types.contains(&(
+            provider.to_string(),
+            path.to_string(),
+            type_name.to_string(),
+        ))
+    }
 }
 
 impl std::fmt::Debug for ProviderContext {
@@ -46,6 +80,7 @@ impl std::fmt::Debug for ProviderContext {
                 "custom_type_validator",
                 &self.custom_type_validator.as_ref().map(|_| "..."),
             )
+            .field("schema_types", &self.schema_types)
             .finish()
     }
 }

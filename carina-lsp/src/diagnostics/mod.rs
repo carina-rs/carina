@@ -84,6 +84,7 @@ impl DiagnosticEngine {
                 }
                 Ok(())
             })),
+            schema_types: Default::default(),
         };
         Self {
             schemas,
