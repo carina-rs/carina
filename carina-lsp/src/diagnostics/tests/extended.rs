@@ -545,7 +545,7 @@ attributes {
 
     let type_diag = diagnostics
         .iter()
-        .find(|d| d.message.contains("expected string, got bool"));
+        .find(|d| d.message.contains("expected String, got bool"));
     assert!(
         type_diag.is_some(),
         "Should warn about type mismatch in attributes block (bool assigned to string). Got diagnostics: {:?}",
@@ -656,7 +656,7 @@ attributes {
 
     let type_diag = diagnostics
         .iter()
-        .find(|d| d.message.contains("expected string, got bool"));
+        .find(|d| d.message.contains("expected String, got bool"));
     assert!(
         type_diag.is_some(),
         "Output block detection should work with simplified condition. Got diagnostics: {:?}",
@@ -1770,11 +1770,11 @@ fn exports_type_warning_survives_formatter_round_trip() {
 
     let before_warning = before
         .iter()
-        .find(|d| d.message.contains("expected bool, got string"))
+        .find(|d| d.message.contains("expected Bool, got string"))
         .map(|d| d.message.clone());
     let after_warning = after
         .iter()
-        .find(|d| d.message.contains("expected bool, got string"))
+        .find(|d| d.message.contains("expected Bool, got string"))
         .map(|d| d.message.clone());
 
     assert_eq!(formatted, "exports {\n  values: list(bool) = ['nope']\n}\n");
@@ -1945,7 +1945,7 @@ fn exports_type_warning_for_literal_mismatch() {
     );
     let warning = diagnostics
         .iter()
-        .find(|d| d.message.contains("expected bool"));
+        .find(|d| d.message.contains("expected Bool"));
     assert!(
         warning.is_some(),
         "Should warn about bool vs string mismatch. Got: {:?}",

@@ -737,19 +737,24 @@ pub fn validate_type_expr_value(
             crate::parser::value_type_name(value)
         )),
         (TypeExpr::Bool, Value::String(s)) => Some(format!(
-            "expected bool, got string \"{}\". Use true or false.",
-            s
+            "expected {type_expr}, got string \"{s}\". Use true or false."
         )),
-        (TypeExpr::Int, Value::String(s)) => Some(format!("expected int, got string \"{}\".", s)),
-        (TypeExpr::Float, Value::String(s)) => {
-            Some(format!("expected float, got string \"{}\".", s))
+        (TypeExpr::Int, Value::String(s)) => {
+            Some(format!("expected {type_expr}, got string \"{s}\"."))
         }
-        (TypeExpr::String, Value::Bool(b)) => Some(format!("expected string, got bool ({}).", b)),
-        (TypeExpr::String, Value::Int(n)) => Some(format!("expected string, got int ({}).", n)),
-        (TypeExpr::String, Value::Float(f)) => Some(format!("expected string, got float ({}).", f)),
-        (TypeExpr::Bool, Value::Int(n)) => Some(format!("expected bool, got int ({}).", n)),
-        (TypeExpr::Int, Value::Bool(b)) => Some(format!("expected int, got bool ({}).", b)),
-        (TypeExpr::Float, Value::Bool(b)) => Some(format!("expected float, got bool ({}).", b)),
+        (TypeExpr::Float, Value::String(s)) => {
+            Some(format!("expected {type_expr}, got string \"{s}\"."))
+        }
+        (TypeExpr::String, Value::Bool(b)) => {
+            Some(format!("expected {type_expr}, got bool ({b})."))
+        }
+        (TypeExpr::String, Value::Int(n)) => Some(format!("expected {type_expr}, got int ({n}).")),
+        (TypeExpr::String, Value::Float(f)) => {
+            Some(format!("expected {type_expr}, got float ({f})."))
+        }
+        (TypeExpr::Bool, Value::Int(n)) => Some(format!("expected {type_expr}, got int ({n}).")),
+        (TypeExpr::Int, Value::Bool(b)) => Some(format!("expected {type_expr}, got bool ({b}).")),
+        (TypeExpr::Float, Value::Bool(b)) => Some(format!("expected {type_expr}, got bool ({b}).")),
         // Schema types are string subtypes — reject non-string values
         (TypeExpr::SchemaType { .. }, Value::Bool(b)) => {
             Some(format!("expected {}, got bool ({}).", type_expr, b))
@@ -1498,6 +1503,34 @@ let vpc = awscc.ec2.vpc {
     // --- validate_type_expr_value tests ---
 
     #[test]
+    fn validate_type_expr_value_error_uses_pascal_case() {
+        let msg = validate_type_expr_value(
+            &TypeExpr::String,
+            &Value::Int(42),
+            &ProviderContext::default(),
+        )
+        .expect("should error");
+        assert!(msg.contains("expected String"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_type_expr_struct_error_uses_pascal_case_in_field_type() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("count".to_string(), Value::String("x".into()));
+        let fields = vec![("count".to_string(), TypeExpr::Int)];
+        let msg = validate_type_expr_value(
+            &TypeExpr::Struct { fields },
+            &Value::Map(map),
+            &ProviderContext::default(),
+        )
+        .expect("should error");
+        assert!(
+            msg.contains("field 'count'") && msg.contains("Int"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
     fn validate_type_expr_value_ipv4_cidr_valid() {
         let result = validate_type_expr_value(
             &TypeExpr::Simple("ipv4_cidr".to_string()),
@@ -1585,7 +1618,7 @@ let vpc = awscc.ec2.vpc {
             &ProviderContext::default(),
         );
         assert!(result.is_some());
-        assert!(result.unwrap().contains("expected bool"));
+        assert!(result.unwrap().contains("expected Bool"));
     }
 
     #[test]
@@ -1596,7 +1629,7 @@ let vpc = awscc.ec2.vpc {
             &ProviderContext::default(),
         );
         assert!(result.is_some());
-        assert!(result.unwrap().contains("expected int"));
+        assert!(result.unwrap().contains("expected Int"));
     }
 
     #[test]
@@ -1607,7 +1640,7 @@ let vpc = awscc.ec2.vpc {
             &ProviderContext::default(),
         );
         assert!(result.is_some());
-        assert!(result.unwrap().contains("expected float"));
+        assert!(result.unwrap().contains("expected Float"));
     }
 
     #[test]
@@ -1643,7 +1676,7 @@ let vpc = awscc.ec2.vpc {
             &ProviderContext::default(),
         );
         assert!(result.is_some());
-        assert!(result.unwrap().contains("expected string, got bool"));
+        assert!(result.unwrap().contains("expected String, got bool"));
     }
 
     #[test]
@@ -1654,7 +1687,7 @@ let vpc = awscc.ec2.vpc {
             &ProviderContext::default(),
         );
         assert!(result.is_some());
-        assert!(result.unwrap().contains("expected string, got int"));
+        assert!(result.unwrap().contains("expected String, got int"));
     }
 
     #[test]
@@ -1665,7 +1698,7 @@ let vpc = awscc.ec2.vpc {
             &ProviderContext::default(),
         );
         assert!(result.is_some());
-        assert!(result.unwrap().contains("expected string, got float"));
+        assert!(result.unwrap().contains("expected String, got float"));
     }
 
     #[test]
@@ -1673,7 +1706,7 @@ let vpc = awscc.ec2.vpc {
         let result =
             validate_type_expr_value(&TypeExpr::Bool, &Value::Int(1), &ProviderContext::default());
         assert!(result.is_some());
-        assert!(result.unwrap().contains("expected bool, got int"));
+        assert!(result.unwrap().contains("expected Bool, got int"));
     }
 
     #[test]
@@ -1684,7 +1717,7 @@ let vpc = awscc.ec2.vpc {
             &ProviderContext::default(),
         );
         assert!(result.is_some());
-        assert!(result.unwrap().contains("expected int, got bool"));
+        assert!(result.unwrap().contains("expected Int, got bool"));
     }
 
     #[test]
@@ -1695,7 +1728,7 @@ let vpc = awscc.ec2.vpc {
             &ProviderContext::default(),
         );
         assert!(result.is_some());
-        assert!(result.unwrap().contains("expected float, got bool"));
+        assert!(result.unwrap().contains("expected Float, got bool"));
     }
 
     #[test]
@@ -2162,7 +2195,7 @@ let vpc = awscc.ec2.vpc {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("export 'flag'"), "err={err}");
-        assert!(err.contains("expected bool"), "err={err}");
+        assert!(err.contains("expected Bool"), "err={err}");
     }
 
     #[test]

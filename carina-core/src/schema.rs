@@ -2430,7 +2430,7 @@ mod tests {
             match v {
                 Value::String(s) if s == "test.r.Mode.fast" => Ok(()),
                 Value::String(s) => Err(format!("invalid Mode '{}': expected fast", s)),
-                _ => Err("expected string".to_string()),
+                _ => Err("expected String".to_string()),
             }
         }
         let schema = ResourceSchema::new("test.r.mode_holder").attribute(
