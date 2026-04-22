@@ -129,6 +129,7 @@ async fn main() {
             decryptor: None,
             validators: HashMap::new(),
             custom_type_validator: None,
+            schema_types: Default::default(),
         };
 
         // Pass factory builder callback — actual WASM loading happens asynchronously

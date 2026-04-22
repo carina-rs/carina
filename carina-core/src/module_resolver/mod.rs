@@ -2534,6 +2534,7 @@ mod tests {
             decryptor: None,
             validators,
             custom_type_validator: None,
+            schema_types: Default::default(),
         };
 
         let mut module = create_test_module();
@@ -2606,6 +2607,7 @@ mod tests {
             decryptor: None,
             validators,
             custom_type_validator: None,
+            schema_types: Default::default(),
         };
 
         let mut module = create_test_module();
