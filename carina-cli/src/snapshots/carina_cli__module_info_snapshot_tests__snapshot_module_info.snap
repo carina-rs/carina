@@ -8,11 +8,11 @@ Module: module_info
 
   vpc_id: awscc.ec2.vpc  (required)
     The VPC to deploy resources into
-  environment: string  (required)
+  environment: String  (required)
     Deployment environment name
-  instance_type: string = "t3.micro"  
+  instance_type: String = "t3.micro"  
     EC2 instance type
-  enable_monitoring: bool = true  
+  enable_monitoring: Bool = true  
 
 === CREATES ===
 

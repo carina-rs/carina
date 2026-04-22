@@ -6,7 +6,7 @@ Module: no_deps
 
 === ARGUMENTS ===
 
-  region: string  (required)
+  region: String  (required)
     AWS region
 
 === CREATES ===

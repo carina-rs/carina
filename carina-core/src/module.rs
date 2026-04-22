@@ -1333,7 +1333,7 @@ mod tests {
         let display = signature.display_with_color(false);
 
         // Simple form has no description line
-        assert!(display.contains("enable_https: bool"));
+        assert!(display.contains("enable_https: Bool"));
         // The line after enable_https should not contain a description
         let lines: Vec<&str> = display.lines().collect();
         let enable_idx = lines
@@ -1348,7 +1348,7 @@ mod tests {
         );
 
         // Block form descriptions are shown on the line after the argument
-        assert!(display.contains("vpc_id: string"));
+        assert!(display.contains("vpc_id: String"));
         let vpc_idx = lines
             .iter()
             .position(|l| l.contains("vpc_id"))
@@ -1359,7 +1359,7 @@ mod tests {
             lines[vpc_idx + 1]
         );
 
-        assert!(display.contains("port: int"));
+        assert!(display.contains("port: Int"));
         let port_idx = lines
             .iter()
             .position(|l| l.contains("port:"))

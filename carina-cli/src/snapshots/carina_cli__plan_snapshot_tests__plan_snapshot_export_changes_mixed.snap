@@ -13,8 +13,8 @@ Execution Plan:
 
 Exports:
 
-  + new_export: string = 'hello'
-  ~ changed: int = 42 → 100
+  + new_export: String = 'hello'
+  ~ changed: Int = 42 → 100
   - obsolete = 'gone'
 
 Plan: 1 to add, 0 to change, 1 to destroy, 3 export change(s).

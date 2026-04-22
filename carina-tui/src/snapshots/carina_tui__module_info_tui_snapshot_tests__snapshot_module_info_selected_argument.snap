@@ -5,7 +5,7 @@ expression: output
 ┌ Module Info: web_tier ───────────────────────────────────────────────────────────────────────────┐
 │=== ARGUMENTS ===  (2 items)                                                                      │
 │  vpc: aws.vpc  (required)                                                                        │
-│  enable_https: bool = true                                                                       │
+│  enable_https: Bool = true                                                                       │
 │=== CREATES ===  (2 resources)                                                                    │
 │  web_sg: aws.security_group                                                                      │
 │  http_rule: aws.security_group.ingress_rule                                                      │
