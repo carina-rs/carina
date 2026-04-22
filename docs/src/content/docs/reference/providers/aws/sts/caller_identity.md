@@ -1,5 +1,5 @@
 ---
-title: "aws.sts.caller_identity"
+title: "aws.sts.CallerIdentity"
 description: "AWS STS caller_identity resource reference"
 ---
 

@@ -1,5 +1,5 @@
 ---
-title: "aws.ec2.vpc_endpoint"
+title: "aws.ec2.VpcEndpoint"
 description: "AWS EC2 vpc_endpoint resource reference"
 ---
 
@@ -100,11 +100,11 @@ The tags for the resource.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `Gateway` | `aws.ec2.vpc_endpoint.VpcEndpointType.Gateway` |
-| `GatewayLoadBalancer` | `aws.ec2.vpc_endpoint.VpcEndpointType.GatewayLoadBalancer` |
-| `Interface` | `aws.ec2.vpc_endpoint.VpcEndpointType.Interface` |
-| `Resource` | `aws.ec2.vpc_endpoint.VpcEndpointType.Resource` |
-| `ServiceNetwork` | `aws.ec2.vpc_endpoint.VpcEndpointType.ServiceNetwork` |
+| `Gateway` | `aws.ec2.VpcEndpoint.VpcEndpointType.Gateway` |
+| `GatewayLoadBalancer` | `aws.ec2.VpcEndpoint.VpcEndpointType.GatewayLoadBalancer` |
+| `Interface` | `aws.ec2.VpcEndpoint.VpcEndpointType.Interface` |
+| `Resource` | `aws.ec2.VpcEndpoint.VpcEndpointType.Resource` |
+| `ServiceNetwork` | `aws.ec2.VpcEndpoint.VpcEndpointType.ServiceNetwork` |
 
 Shorthand formats: `Gateway` or `VpcEndpointType.Gateway`
 

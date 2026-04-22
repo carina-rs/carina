@@ -1,5 +1,5 @@
 ---
-title: "aws.ec2.vpc"
+title: "aws.ec2.Vpc"
 description: "AWS EC2 vpc resource reference"
 ---
 
@@ -11,11 +11,11 @@ Describes a VPC.
 ## Example
 
 ```crn
-aws.ec2.vpc {
+aws.ec2.Vpc {
   cidr_block           = '10.0.0.0/16'
   enable_dns_support   = true
   enable_dns_hostnames = true
-  instance_tenancy     = aws.ec2.vpc.InstanceTenancy.default
+  instance_tenancy     = aws.ec2.Vpc.InstanceTenancy.default
 
   tags = {
     Environment = 'example'
@@ -66,9 +66,9 @@ The tags for the resource.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `dedicated` | `aws.ec2.vpc.InstanceTenancy.dedicated` |
-| `default` | `aws.ec2.vpc.InstanceTenancy.default` |
-| `host` | `aws.ec2.vpc.InstanceTenancy.host` |
+| `dedicated` | `aws.ec2.Vpc.InstanceTenancy.dedicated` |
+| `default` | `aws.ec2.Vpc.InstanceTenancy.default` |
+| `host` | `aws.ec2.Vpc.InstanceTenancy.host` |
 
 Shorthand formats: `dedicated` or `InstanceTenancy.dedicated`
 

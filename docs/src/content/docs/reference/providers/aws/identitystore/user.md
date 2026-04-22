@@ -1,5 +1,5 @@
 ---
-title: "aws.identitystore.user"
+title: "aws.identitystore.User"
 description: "AWS IDENTITYSTORE user resource reference"
 ---
 

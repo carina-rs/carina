@@ -1,5 +1,5 @@
 ---
-title: "aws.ec2.route"
+title: "aws.ec2.Route"
 description: "AWS EC2 route resource reference"
 ---
 
@@ -11,7 +11,7 @@ Describes a route in a route table.
 ## Example
 
 ```crn
-let vpc = aws.ec2.vpc {
+let vpc = aws.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 
   tags = {
@@ -19,7 +19,7 @@ let vpc = aws.ec2.vpc {
   }
 }
 
-let igw = aws.ec2.internet_gateway {
+let igw = aws.ec2.InternetGateway {
   vpc_id = vpc.vpc_id
 
   tags = {
@@ -27,7 +27,7 @@ let igw = aws.ec2.internet_gateway {
   }
 }
 
-let rt = aws.ec2.route_table {
+let rt = aws.ec2.RouteTable {
   vpc_id = vpc.vpc_id
 
   tags = {
@@ -35,7 +35,7 @@ let rt = aws.ec2.route_table {
   }
 }
 
-aws.ec2.route {
+aws.ec2.Route {
   route_table_id         = rt.route_table_id
   destination_cidr_block = '0.0.0.0/0'
   gateway_id             = igw.internet_gateway_id

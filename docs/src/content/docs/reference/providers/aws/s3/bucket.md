@@ -1,5 +1,5 @@
 ---
-title: "aws.s3.bucket"
+title: "aws.s3.Bucket"
 description: "AWS S3 bucket resource reference"
 ---
 
@@ -9,10 +9,10 @@ CloudFormation Type: `AWS::S3::Bucket`
 ## Example
 
 ```crn
-aws.s3.bucket {
+aws.s3.Bucket {
   bucket = 'carina-example-s3-bucket'
 
-  versioning_status = aws.s3.bucket.VersioningStatus.Enabled
+  versioning_status = aws.s3.Bucket.VersioningStatus.Enabled
 
   tags = {
     Environment = 'example'
@@ -110,10 +110,10 @@ The tags for the resource.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `authenticated-read` | `aws.s3.bucket.ACL.authenticated_read` |
-| `private` | `aws.s3.bucket.ACL.private` |
-| `public-read` | `aws.s3.bucket.ACL.public_read` |
-| `public-read-write` | `aws.s3.bucket.ACL.public_read_write` |
+| `authenticated-read` | `aws.s3.Bucket.ACL.authenticated_read` |
+| `private` | `aws.s3.Bucket.ACL.private` |
+| `public-read` | `aws.s3.Bucket.ACL.public_read` |
+| `public-read-write` | `aws.s3.Bucket.ACL.public_read_write` |
 
 Shorthand formats: `authenticated_read` or `ACL.authenticated_read`
 
@@ -121,8 +121,8 @@ Shorthand formats: `authenticated_read` or `ACL.authenticated_read`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `account-regional` | `aws.s3.bucket.BucketNamespace.account_regional` |
-| `global` | `aws.s3.bucket.BucketNamespace.global` |
+| `account-regional` | `aws.s3.Bucket.BucketNamespace.account_regional` |
+| `global` | `aws.s3.Bucket.BucketNamespace.global` |
 
 Shorthand formats: `account_regional` or `BucketNamespace.account_regional`
 
@@ -130,9 +130,9 @@ Shorthand formats: `account_regional` or `BucketNamespace.account_regional`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `BucketOwnerEnforced` | `aws.s3.bucket.ObjectOwnership.BucketOwnerEnforced` |
-| `BucketOwnerPreferred` | `aws.s3.bucket.ObjectOwnership.BucketOwnerPreferred` |
-| `ObjectWriter` | `aws.s3.bucket.ObjectOwnership.ObjectWriter` |
+| `BucketOwnerEnforced` | `aws.s3.Bucket.ObjectOwnership.BucketOwnerEnforced` |
+| `BucketOwnerPreferred` | `aws.s3.Bucket.ObjectOwnership.BucketOwnerPreferred` |
+| `ObjectWriter` | `aws.s3.Bucket.ObjectOwnership.ObjectWriter` |
 
 Shorthand formats: `BucketOwnerEnforced` or `ObjectOwnership.BucketOwnerEnforced`
 
@@ -140,8 +140,8 @@ Shorthand formats: `BucketOwnerEnforced` or `ObjectOwnership.BucketOwnerEnforced
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `Enabled` | `aws.s3.bucket.VersioningStatus.Enabled` |
-| `Suspended` | `aws.s3.bucket.VersioningStatus.Suspended` |
+| `Enabled` | `aws.s3.Bucket.VersioningStatus.Enabled` |
+| `Suspended` | `aws.s3.Bucket.VersioningStatus.Suspended` |
 
 Shorthand formats: `Enabled` or `VersioningStatus.Enabled`
 

@@ -1,5 +1,5 @@
 ---
-title: "aws.iam.role"
+title: "aws.iam.Role"
 description: "AWS IAM role resource reference"
 ---
 

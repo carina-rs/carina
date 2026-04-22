@@ -1,5 +1,5 @@
 ---
-title: "aws.ec2.internet_gateway"
+title: "aws.ec2.InternetGateway"
 description: "AWS EC2 internet_gateway resource reference"
 ---
 
@@ -11,7 +11,7 @@ Describes an internet gateway.
 ## Example
 
 ```crn
-let vpc = aws.ec2.vpc {
+let vpc = aws.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 
   tags = {
@@ -19,7 +19,7 @@ let vpc = aws.ec2.vpc {
   }
 }
 
-aws.ec2.internet_gateway {
+aws.ec2.InternetGateway {
   vpc_id = vpc.vpc_id
 
   tags = {

@@ -1,5 +1,5 @@
 ---
-title: "aws.ec2.vpc_gateway_attachment"
+title: "aws.ec2.VpcGatewayAttachment"
 description: "AWS EC2 vpc_gateway_attachment resource reference"
 ---
 

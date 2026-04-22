@@ -1,5 +1,5 @@
 ---
-title: "aws.ec2.eip"
+title: "aws.ec2.Eip"
 description: "AWS EC2 eip resource reference"
 ---
 
@@ -44,8 +44,8 @@ The tags for the resource.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `standard` | `aws.ec2.eip.Domain.standard` |
-| `vpc` | `aws.ec2.eip.Domain.vpc` |
+| `standard` | `aws.ec2.Eip.Domain.standard` |
+| `vpc` | `aws.ec2.Eip.Domain.vpc` |
 
 Shorthand formats: `standard` or `Domain.standard`
 

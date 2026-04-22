@@ -1,5 +1,5 @@
 ---
-title: "aws.ec2.transit_gateway_attachment"
+title: "aws.ec2.TransitGatewayAttachment"
 description: "AWS EC2 transit_gateway_attachment resource reference"
 ---
 

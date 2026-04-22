@@ -1,5 +1,5 @@
 ---
-title: "aws.ec2.security_group_egress"
+title: "aws.ec2.SecurityGroupEgress"
 description: "AWS EC2 security_group_egress resource reference"
 ---
 
@@ -11,7 +11,7 @@ Describes a security group rule.
 ## Example
 
 ```crn
-let vpc = aws.ec2.vpc {
+let vpc = aws.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 
   tags = {
@@ -19,7 +19,7 @@ let vpc = aws.ec2.vpc {
   }
 }
 
-let sg = aws.ec2.security_group {
+let sg = aws.ec2.SecurityGroup {
   group_name  = 'carina-example-sg-egress'
   description = 'SG for egress rule example'
   vpc_id      = vpc.vpc_id
@@ -29,7 +29,7 @@ let sg = aws.ec2.security_group {
   }
 }
 
-aws.ec2.security_group_egress {
+aws.ec2.SecurityGroupEgress {
   group_id    = sg.group_id
   description = 'Allow HTTPS outbound'
   ip_protocol = tcp
@@ -124,12 +124,12 @@ The ID of the destination security group.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `tcp` | `aws.ec2.security_group_egress.IpProtocol.tcp` |
-| `udp` | `aws.ec2.security_group_egress.IpProtocol.udp` |
-| `icmp` | `aws.ec2.security_group_egress.IpProtocol.icmp` |
-| `icmpv6` | `aws.ec2.security_group_egress.IpProtocol.icmpv6` |
-| `-1` | `aws.ec2.security_group_egress.IpProtocol.all` |
-| `all` | `aws.ec2.security_group_egress.IpProtocol.all` |
+| `tcp` | `aws.ec2.SecurityGroupEgress.IpProtocol.tcp` |
+| `udp` | `aws.ec2.SecurityGroupEgress.IpProtocol.udp` |
+| `icmp` | `aws.ec2.SecurityGroupEgress.IpProtocol.icmp` |
+| `icmpv6` | `aws.ec2.SecurityGroupEgress.IpProtocol.icmpv6` |
+| `-1` | `aws.ec2.SecurityGroupEgress.IpProtocol.all` |
+| `all` | `aws.ec2.SecurityGroupEgress.IpProtocol.all` |
 
 Shorthand formats: `tcp` or `IpProtocol.tcp`
 

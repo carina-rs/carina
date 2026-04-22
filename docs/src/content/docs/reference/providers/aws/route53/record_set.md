@@ -1,5 +1,5 @@
 ---
-title: "aws.route53.record_set"
+title: "aws.route53.RecordSet"
 description: "AWS ROUTE53 record_set resource reference"
 ---
 
@@ -58,23 +58,23 @@ The ID of the hosted zone that contains this record set.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `A` | `aws.route53.record_set.Type.A` |
-| `AAAA` | `aws.route53.record_set.Type.AAAA` |
-| `CAA` | `aws.route53.record_set.Type.CAA` |
-| `CNAME` | `aws.route53.record_set.Type.CNAME` |
-| `DS` | `aws.route53.record_set.Type.DS` |
-| `HTTPS` | `aws.route53.record_set.Type.HTTPS` |
-| `MX` | `aws.route53.record_set.Type.MX` |
-| `NAPTR` | `aws.route53.record_set.Type.NAPTR` |
-| `NS` | `aws.route53.record_set.Type.NS` |
-| `PTR` | `aws.route53.record_set.Type.PTR` |
-| `SOA` | `aws.route53.record_set.Type.SOA` |
-| `SPF` | `aws.route53.record_set.Type.SPF` |
-| `SRV` | `aws.route53.record_set.Type.SRV` |
-| `SSHFP` | `aws.route53.record_set.Type.SSHFP` |
-| `SVCB` | `aws.route53.record_set.Type.SVCB` |
-| `TLSA` | `aws.route53.record_set.Type.TLSA` |
-| `TXT` | `aws.route53.record_set.Type.TXT` |
+| `A` | `aws.route53.RecordSet.Type.A` |
+| `AAAA` | `aws.route53.RecordSet.Type.AAAA` |
+| `CAA` | `aws.route53.RecordSet.Type.CAA` |
+| `CNAME` | `aws.route53.RecordSet.Type.CNAME` |
+| `DS` | `aws.route53.RecordSet.Type.DS` |
+| `HTTPS` | `aws.route53.RecordSet.Type.HTTPS` |
+| `MX` | `aws.route53.RecordSet.Type.MX` |
+| `NAPTR` | `aws.route53.RecordSet.Type.NAPTR` |
+| `NS` | `aws.route53.RecordSet.Type.NS` |
+| `PTR` | `aws.route53.RecordSet.Type.PTR` |
+| `SOA` | `aws.route53.RecordSet.Type.SOA` |
+| `SPF` | `aws.route53.RecordSet.Type.SPF` |
+| `SRV` | `aws.route53.RecordSet.Type.SRV` |
+| `SSHFP` | `aws.route53.RecordSet.Type.SSHFP` |
+| `SVCB` | `aws.route53.RecordSet.Type.SVCB` |
+| `TLSA` | `aws.route53.RecordSet.Type.TLSA` |
+| `TXT` | `aws.route53.RecordSet.Type.TXT` |
 
 Shorthand formats: `A` or `Type.A`
 

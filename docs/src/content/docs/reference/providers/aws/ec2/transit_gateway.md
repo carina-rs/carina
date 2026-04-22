@@ -1,5 +1,5 @@
 ---
-title: "aws.ec2.transit_gateway"
+title: "aws.ec2.TransitGateway"
 description: "AWS EC2 transit_gateway resource reference"
 ---
 
