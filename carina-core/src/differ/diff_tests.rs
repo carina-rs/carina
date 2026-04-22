@@ -235,7 +235,7 @@ fn read_only_resource_always_generates_read_effect() {
 #[test]
 fn no_false_update_without_name_attribute() {
     // Simulate AWSCC resource: desired has cidr_block but no "name"
-    let desired = Resource::new("ec2.vpc", "vpc")
+    let desired = Resource::new("ec2.Vpc", "vpc")
         .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()));
 
     // Current state from provider read also has cidr_block but no "name"
@@ -244,7 +244,7 @@ fn no_false_update_without_name_attribute() {
         "cidr_block".to_string(),
         Value::String("10.0.0.0/16".to_string()),
     );
-    let current = State::existing(ResourceId::new("ec2.vpc", "vpc"), attrs);
+    let current = State::existing(ResourceId::new("ec2.Vpc", "vpc"), attrs);
 
     let result = diff(&desired, &current, None, None, None);
     assert!(
@@ -259,7 +259,7 @@ fn replace_when_create_only_attr_changed() {
     use crate::schema::{AttributeSchema, AttributeType};
 
     let resources = vec![
-        Resource::new("ec2.vpc", "my-vpc")
+        Resource::new("ec2.Vpc", "my-vpc")
             .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string())),
     ];
 
@@ -270,15 +270,15 @@ fn replace_when_create_only_attr_changed() {
         Value::String("10.0.0.0/16".to_string()),
     );
     current_states.insert(
-        ResourceId::new("ec2.vpc", "my-vpc"),
-        State::existing(ResourceId::new("ec2.vpc", "my-vpc"), attrs),
+        ResourceId::new("ec2.Vpc", "my-vpc"),
+        State::existing(ResourceId::new("ec2.Vpc", "my-vpc"), attrs),
     );
 
     // Build schema with cidr_block marked as create-only
     let mut schemas = HashMap::new();
     schemas.insert(
-        "ec2.vpc".to_string(),
-        crate::schema::ResourceSchema::new("ec2.vpc")
+        "ec2.Vpc".to_string(),
+        crate::schema::ResourceSchema::new("ec2.Vpc")
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
     );
 
@@ -309,22 +309,22 @@ fn normal_update_when_non_create_only_attr_changed() {
     use crate::schema::{AttributeSchema, AttributeType};
 
     let resources = vec![
-        Resource::new("ec2.vpc", "my-vpc").with_attribute("enable_dns_support", Value::Bool(true)),
+        Resource::new("ec2.Vpc", "my-vpc").with_attribute("enable_dns_support", Value::Bool(true)),
     ];
 
     let mut current_states = HashMap::new();
     let mut attrs = HashMap::new();
     attrs.insert("enable_dns_support".to_string(), Value::Bool(false));
     current_states.insert(
-        ResourceId::new("ec2.vpc", "my-vpc"),
-        State::existing(ResourceId::new("ec2.vpc", "my-vpc"), attrs),
+        ResourceId::new("ec2.Vpc", "my-vpc"),
+        State::existing(ResourceId::new("ec2.Vpc", "my-vpc"), attrs),
     );
 
     // cidr_block is create-only, but enable_dns_support is not
     let mut schemas = HashMap::new();
     schemas.insert(
-        "ec2.vpc".to_string(),
-        crate::schema::ResourceSchema::new("ec2.vpc")
+        "ec2.Vpc".to_string(),
+        crate::schema::ResourceSchema::new("ec2.Vpc")
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only())
             .attribute(AttributeSchema::new(
                 "enable_dns_support",
@@ -416,7 +416,7 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
     use crate::schema::{AttributeSchema, AttributeType};
 
     let resources = vec![
-        Resource::new("ec2.vpc", "my-vpc")
+        Resource::new("ec2.Vpc", "my-vpc")
             .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()))
             .with_attribute("enable_dns_support", Value::Bool(true)),
     ];
@@ -429,14 +429,14 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
     );
     attrs.insert("enable_dns_support".to_string(), Value::Bool(false));
     current_states.insert(
-        ResourceId::new("ec2.vpc", "my-vpc"),
-        State::existing(ResourceId::new("ec2.vpc", "my-vpc"), attrs),
+        ResourceId::new("ec2.Vpc", "my-vpc"),
+        State::existing(ResourceId::new("ec2.Vpc", "my-vpc"), attrs),
     );
 
     let mut schemas = HashMap::new();
     schemas.insert(
-        "ec2.vpc".to_string(),
-        crate::schema::ResourceSchema::new("ec2.vpc")
+        "ec2.Vpc".to_string(),
+        crate::schema::ResourceSchema::new("ec2.Vpc")
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only())
             .attribute(AttributeSchema::new(
                 "enable_dns_support",
@@ -470,7 +470,7 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
 fn replace_carries_create_before_destroy_lifecycle() {
     use crate::schema::{AttributeSchema, AttributeType};
 
-    let mut resource = Resource::new("ec2.vpc", "my-vpc")
+    let mut resource = Resource::new("ec2.Vpc", "my-vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
     resource.lifecycle.create_before_destroy = true;
 
@@ -483,14 +483,14 @@ fn replace_carries_create_before_destroy_lifecycle() {
         Value::String("10.0.0.0/16".to_string()),
     );
     current_states.insert(
-        ResourceId::new("ec2.vpc", "my-vpc"),
-        State::existing(ResourceId::new("ec2.vpc", "my-vpc"), attrs),
+        ResourceId::new("ec2.Vpc", "my-vpc"),
+        State::existing(ResourceId::new("ec2.Vpc", "my-vpc"), attrs),
     );
 
     let mut schemas = HashMap::new();
     schemas.insert(
-        "ec2.vpc".to_string(),
-        crate::schema::ResourceSchema::new("ec2.vpc")
+        "ec2.Vpc".to_string(),
+        crate::schema::ResourceSchema::new("ec2.Vpc")
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
     );
 
@@ -559,10 +559,10 @@ fn diff_no_change_when_list_of_maps_reordered() {
 fn replace_with_provider_prefixed_schema_key() {
     use crate::schema::{AttributeSchema, AttributeType};
 
-    // In production, schemas are keyed by "awscc.ec2.vpc" but resource_type is "ec2.vpc"
+    // In production, schemas are keyed by "awscc.ec2.Vpc" but resource_type is "ec2.Vpc"
     // The resource must have provider set so the generic lookup works
     let resources = vec![
-        Resource::with_provider("awscc", "ec2.vpc", "my-vpc")
+        Resource::with_provider("awscc", "ec2.Vpc", "my-vpc")
             .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string())),
     ];
 
@@ -573,9 +573,9 @@ fn replace_with_provider_prefixed_schema_key() {
         Value::String("10.0.0.0/16".to_string()),
     );
     current_states.insert(
-        ResourceId::with_provider("awscc", "ec2.vpc", "my-vpc"),
+        ResourceId::with_provider("awscc", "ec2.Vpc", "my-vpc"),
         State::existing(
-            ResourceId::with_provider("awscc", "ec2.vpc", "my-vpc"),
+            ResourceId::with_provider("awscc", "ec2.Vpc", "my-vpc"),
             attrs,
         ),
     );
@@ -583,8 +583,8 @@ fn replace_with_provider_prefixed_schema_key() {
     // Schema keyed with provider prefix (as in production)
     let mut schemas = HashMap::new();
     schemas.insert(
-        "awscc.ec2.vpc".to_string(),
-        crate::schema::ResourceSchema::new("awscc.ec2.vpc")
+        "awscc.ec2.Vpc".to_string(),
+        crate::schema::ResourceSchema::new("awscc.ec2.Vpc")
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
     );
 
@@ -610,7 +610,7 @@ fn replace_with_provider_prefixed_schema_key() {
 /// current (AWS) returns 3, saved state has 3. Should be NoChange.
 #[test]
 fn diff_no_change_when_struct_has_extra_fields_with_saved() {
-    let desired = Resource::new("ec2.subnet", "test-subnet").with_attribute(
+    let desired = Resource::new("ec2.Subnet", "test-subnet").with_attribute(
         "private_dns_name_options_on_launch",
         Value::Map(HashMap::from([
             (
@@ -641,7 +641,7 @@ fn diff_no_change_when_struct_has_extra_fields_with_saved() {
             ),
         ])),
     )]);
-    let current = State::existing(ResourceId::new("ec2.subnet", "test-subnet"), current_attrs);
+    let current = State::existing(ResourceId::new("ec2.Subnet", "test-subnet"), current_attrs);
 
     let saved = HashMap::from([
         (
@@ -673,7 +673,7 @@ fn diff_no_change_when_struct_has_extra_fields_with_saved() {
 /// When an unmanaged field drifts externally, diff should still detect the change.
 #[test]
 fn diff_detects_drift_on_unmanaged_field() {
-    let desired = Resource::new("ec2.subnet", "test-subnet").with_attribute(
+    let desired = Resource::new("ec2.Subnet", "test-subnet").with_attribute(
         "private_dns_name_options_on_launch",
         Value::Map(HashMap::from([
             (
@@ -705,7 +705,7 @@ fn diff_detects_drift_on_unmanaged_field() {
             ),
         ])),
     )]);
-    let current = State::existing(ResourceId::new("ec2.subnet", "test-subnet"), current_attrs);
+    let current = State::existing(ResourceId::new("ec2.Subnet", "test-subnet"), current_attrs);
 
     let saved = HashMap::from([
         (
@@ -739,7 +739,7 @@ fn diff_detects_drift_on_unmanaged_field() {
 /// After merge + semantic comparison, this should be NoChange.
 #[test]
 fn diff_no_change_when_bare_struct_with_extra_fields() {
-    let desired = Resource::new("ec2.subnet", "test-subnet").with_attribute(
+    let desired = Resource::new("ec2.Subnet", "test-subnet").with_attribute(
         "private_dns_name_options_on_launch",
         Value::Map(HashMap::from([
             (
@@ -771,7 +771,7 @@ fn diff_no_change_when_bare_struct_with_extra_fields() {
             ),
         ])),
     )]);
-    let current = State::existing(ResourceId::new("ec2.subnet", "test-subnet"), current_attrs);
+    let current = State::existing(ResourceId::new("ec2.Subnet", "test-subnet"), current_attrs);
 
     // Saved state has the same Map with extra fields
     let saved_map = HashMap::from([(
@@ -806,7 +806,7 @@ fn diff_works_without_saved_state() {
     // Desired has 2 fields, current has 3 (extra field). Without saved state,
     // this should still be NoChange because find_changed_attributes only checks
     // desired keys against current (not the other direction).
-    let desired = Resource::new("ec2.subnet", "test-subnet").with_attribute(
+    let desired = Resource::new("ec2.Subnet", "test-subnet").with_attribute(
         "opts",
         Value::Map(HashMap::from([
             ("a".to_string(), Value::Int(1)),
@@ -822,7 +822,7 @@ fn diff_works_without_saved_state() {
             ("c".to_string(), Value::Int(3)),
         ])),
     )]);
-    let current = State::existing(ResourceId::new("ec2.subnet", "test-subnet"), current_attrs);
+    let current = State::existing(ResourceId::new("ec2.Subnet", "test-subnet"), current_attrs);
 
     // Without saved state, the map comparison uses semantically_equal which
     // checks both key count AND values. Since desired map has 2 keys and current
@@ -898,7 +898,7 @@ fn orphan_delete_preserves_binding_and_dependencies() {
 /// namespaced enum values that differ from alias-resolved values.
 ///
 /// Scenario: After apply, the state file stores ip_protocol values in
-/// namespaced format (e.g., "awscc.ec2.security_group.IpProtocol.tcp"),
+/// namespaced format (e.g., "awscc.ec2.SecurityGroup.IpProtocol.tcp"),
 /// while plan-time alias resolution converts "all" to "-1".
 /// The differ should see no changes when comparing merged-desired vs current.
 #[test]
@@ -923,7 +923,7 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
                         "-1".to_string(),
                         "all".to_string(),
                     ],
-                    namespace: Some("awscc.ec2.security_group".to_string()),
+                    namespace: Some("awscc.ec2.SecurityGroup".to_string()),
                     to_dsl: Some(|s: &str| match s {
                         "-1" => "all".to_string(),
                         _ => s.to_string(),
@@ -933,7 +933,7 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
             StructField::new("to_port", AttributeType::Int),
         ],
     };
-    let schema = ResourceSchema::new("awscc.ec2.security_group").attribute(
+    let schema = ResourceSchema::new("awscc.ec2.SecurityGroup").attribute(
         crate::schema::AttributeSchema::new(
             "security_group_egress",
             AttributeType::unordered_list(egress_struct),
@@ -942,13 +942,13 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
 
     // Desired state (post-normalization, post-alias-resolution)
     // "all" -> "-1" (alias resolved), "tcp" stays as namespaced identifier
-    let desired = Resource::with_provider("awscc", "ec2.security_group", "test-sg").with_attribute(
+    let desired = Resource::with_provider("awscc", "ec2.SecurityGroup", "test-sg").with_attribute(
         "security_group_egress",
         Value::List(vec![
             Value::Map(HashMap::from([
                 (
                     "ip_protocol".to_string(),
-                    Value::String("awscc.ec2.security_group.IpProtocol.tcp".to_string()),
+                    Value::String("awscc.ec2.SecurityGroup.IpProtocol.tcp".to_string()),
                 ),
                 ("from_port".to_string(), Value::Int(443)),
                 ("to_port".to_string(), Value::Int(443)),
@@ -983,7 +983,7 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
             Value::Map(HashMap::from([
                 (
                     "ip_protocol".to_string(),
-                    Value::String("awscc.ec2.security_group.IpProtocol.tcp".to_string()),
+                    Value::String("awscc.ec2.SecurityGroup.IpProtocol.tcp".to_string()),
                 ),
                 ("from_port".to_string(), Value::Int(443)),
                 ("to_port".to_string(), Value::Int(443)),
@@ -1012,7 +1012,7 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
         ]),
     )]);
     let current = State::existing(
-        ResourceId::with_provider("awscc", "ec2.security_group", "test-sg"),
+        ResourceId::with_provider("awscc", "ec2.SecurityGroup", "test-sg"),
         current_attrs,
     );
 
@@ -1024,7 +1024,7 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
             Value::Map(HashMap::from([
                 (
                     "ip_protocol".to_string(),
-                    Value::String("awscc.ec2.security_group.IpProtocol.tcp".to_string()),
+                    Value::String("awscc.ec2.SecurityGroup.IpProtocol.tcp".to_string()),
                 ),
                 ("from_port".to_string(), Value::Int(443)),
                 ("to_port".to_string(), Value::Int(443)),
@@ -1040,7 +1040,7 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
             Value::Map(HashMap::from([
                 (
                     "ip_protocol".to_string(),
-                    Value::String("awscc.ec2.security_group.IpProtocol.all".to_string()),
+                    Value::String("awscc.ec2.SecurityGroup.IpProtocol.all".to_string()),
                 ),
                 ("from_port".to_string(), Value::Int(-1)),
                 ("to_port".to_string(), Value::Int(-1)),
@@ -1085,7 +1085,7 @@ fn diff_false_positive_when_ordered_true_for_struct_list() {
     };
 
     // Bug: ordered: true causes positional comparison of struct list items
-    let schema_ordered = ResourceSchema::new("awscc.ec2.security_group").attribute(
+    let schema_ordered = ResourceSchema::new("awscc.ec2.SecurityGroup").attribute(
         crate::schema::AttributeSchema::new(
             "security_group_egress",
             AttributeType::List {
@@ -1120,12 +1120,12 @@ fn diff_false_positive_when_ordered_true_for_struct_list() {
         ("to_port".to_string(), Value::Int(-1)),
     ]));
 
-    let desired = Resource::with_provider("awscc", "ec2.security_group", "test-sg").with_attribute(
+    let desired = Resource::with_provider("awscc", "ec2.SecurityGroup", "test-sg").with_attribute(
         "security_group_egress",
         Value::List(vec![item_a.clone(), item_b.clone()]),
     );
     let current = State::existing(
-        ResourceId::with_provider("awscc", "ec2.security_group", "test-sg"),
+        ResourceId::with_provider("awscc", "ec2.SecurityGroup", "test-sg"),
         HashMap::from([(
             "security_group_egress".to_string(),
             // AWS returns items in reversed order
@@ -1142,7 +1142,7 @@ fn diff_false_positive_when_ordered_true_for_struct_list() {
     );
 
     // With ordered: false (unordered_list), differ correctly sees no change
-    let schema_unordered = ResourceSchema::new("awscc.ec2.security_group").attribute(
+    let schema_unordered = ResourceSchema::new("awscc.ec2.SecurityGroup").attribute(
         crate::schema::AttributeSchema::new(
             "security_group_egress",
             AttributeType::unordered_list(egress_struct),

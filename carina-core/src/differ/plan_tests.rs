@@ -5,7 +5,7 @@ use crate::resource::ResourceKind;
 fn create_before_destroy_generates_temporary_name_for_name_attribute() {
     use crate::schema::{AttributeSchema, AttributeType};
 
-    let mut resource = Resource::new("s3.bucket", "my-bucket")
+    let mut resource = Resource::new("s3.Bucket", "my-bucket")
         .with_attribute("bucket_name", Value::String("my-bucket".to_string()))
         .with_attribute("object_lock_enabled", Value::Bool(true));
     resource.lifecycle.create_before_destroy = true;
@@ -20,14 +20,14 @@ fn create_before_destroy_generates_temporary_name_for_name_attribute() {
     );
     attrs.insert("object_lock_enabled".to_string(), Value::Bool(false));
     current_states.insert(
-        ResourceId::new("s3.bucket", "my-bucket"),
-        State::existing(ResourceId::new("s3.bucket", "my-bucket"), attrs),
+        ResourceId::new("s3.Bucket", "my-bucket"),
+        State::existing(ResourceId::new("s3.Bucket", "my-bucket"), attrs),
     );
 
     let mut schemas = HashMap::new();
     schemas.insert(
-        "s3.bucket".to_string(),
-        ResourceSchema::new("s3.bucket")
+        "s3.Bucket".to_string(),
+        ResourceSchema::new("s3.Bucket")
             .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only())
             .attribute(
                 AttributeSchema::new("object_lock_enabled", AttributeType::Bool).create_only(),
@@ -77,7 +77,7 @@ fn create_before_destroy_generates_temporary_name_for_name_attribute() {
 fn create_before_destroy_generates_temporary_name_with_can_rename() {
     use crate::schema::{AttributeSchema, AttributeType};
 
-    let mut resource = Resource::new("logs.log_group", "my-log-group")
+    let mut resource = Resource::new("logs.LogGroup", "my-log-group")
         .with_attribute(
             "log_group_name".to_string(),
             Value::String("my-log-group".to_string()),
@@ -98,14 +98,14 @@ fn create_before_destroy_generates_temporary_name_with_can_rename() {
         Value::String("old-key".to_string()),
     );
     current_states.insert(
-        ResourceId::new("logs.log_group", "my-log-group"),
-        State::existing(ResourceId::new("logs.log_group", "my-log-group"), attrs),
+        ResourceId::new("logs.LogGroup", "my-log-group"),
+        State::existing(ResourceId::new("logs.LogGroup", "my-log-group"), attrs),
     );
 
     let mut schemas = HashMap::new();
     schemas.insert(
-        "logs.log_group".to_string(),
-        ResourceSchema::new("logs.log_group")
+        "logs.LogGroup".to_string(),
+        ResourceSchema::new("logs.LogGroup")
             .attribute(
                 // log_group_name is NOT create-only in this test (can be renamed)
                 AttributeSchema::new("log_group_name", AttributeType::String),
@@ -143,7 +143,7 @@ fn no_temporary_name_without_create_before_destroy() {
 
     // Default lifecycle (create_before_destroy = false)
     let resources = vec![
-        Resource::new("s3.bucket", "my-bucket")
+        Resource::new("s3.Bucket", "my-bucket")
             .with_attribute("bucket_name", Value::String("my-bucket".to_string()))
             .with_attribute("object_lock_enabled", Value::Bool(true)),
     ];
@@ -156,14 +156,14 @@ fn no_temporary_name_without_create_before_destroy() {
     );
     attrs.insert("object_lock_enabled".to_string(), Value::Bool(false));
     current_states.insert(
-        ResourceId::new("s3.bucket", "my-bucket"),
-        State::existing(ResourceId::new("s3.bucket", "my-bucket"), attrs),
+        ResourceId::new("s3.Bucket", "my-bucket"),
+        State::existing(ResourceId::new("s3.Bucket", "my-bucket"), attrs),
     );
 
     let mut schemas = HashMap::new();
     schemas.insert(
-        "s3.bucket".to_string(),
-        ResourceSchema::new("s3.bucket")
+        "s3.Bucket".to_string(),
+        ResourceSchema::new("s3.Bucket")
             .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only())
             .attribute(
                 AttributeSchema::new("object_lock_enabled", AttributeType::Bool).create_only(),
@@ -197,7 +197,7 @@ fn no_temporary_name_without_create_before_destroy() {
 fn no_temporary_name_when_name_prefix_is_used() {
     use crate::schema::{AttributeSchema, AttributeType};
 
-    let mut resource = Resource::new("s3.bucket", "my-bucket")
+    let mut resource = Resource::new("s3.Bucket", "my-bucket")
         .with_attribute("bucket_name", Value::String("my-app-abc12345".to_string()))
         .with_attribute("object_lock_enabled", Value::Bool(true));
     resource.lifecycle.create_before_destroy = true;
@@ -216,14 +216,14 @@ fn no_temporary_name_when_name_prefix_is_used() {
     );
     attrs.insert("object_lock_enabled".to_string(), Value::Bool(false));
     current_states.insert(
-        ResourceId::new("s3.bucket", "my-bucket"),
-        State::existing(ResourceId::new("s3.bucket", "my-bucket"), attrs),
+        ResourceId::new("s3.Bucket", "my-bucket"),
+        State::existing(ResourceId::new("s3.Bucket", "my-bucket"), attrs),
     );
 
     let mut schemas = HashMap::new();
     schemas.insert(
-        "s3.bucket".to_string(),
-        ResourceSchema::new("s3.bucket")
+        "s3.Bucket".to_string(),
+        ResourceSchema::new("s3.Bucket")
             .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only())
             .attribute(
                 AttributeSchema::new("object_lock_enabled", AttributeType::Bool).create_only(),
@@ -257,7 +257,7 @@ fn no_temporary_name_when_name_prefix_is_used() {
 fn no_temporary_name_without_name_attribute_in_schema() {
     use crate::schema::{AttributeSchema, AttributeType};
 
-    let mut resource = Resource::new("ec2.vpc", "my-vpc")
+    let mut resource = Resource::new("ec2.Vpc", "my-vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
     resource.lifecycle.create_before_destroy = true;
 
@@ -270,14 +270,14 @@ fn no_temporary_name_without_name_attribute_in_schema() {
         Value::String("10.0.0.0/16".to_string()),
     );
     current_states.insert(
-        ResourceId::new("ec2.vpc", "my-vpc"),
-        State::existing(ResourceId::new("ec2.vpc", "my-vpc"), attrs),
+        ResourceId::new("ec2.Vpc", "my-vpc"),
+        State::existing(ResourceId::new("ec2.Vpc", "my-vpc"), attrs),
     );
 
     let mut schemas = HashMap::new();
     schemas.insert(
-        "ec2.vpc".to_string(),
-        ResourceSchema::new("ec2.vpc")
+        "ec2.Vpc".to_string(),
+        ResourceSchema::new("ec2.Vpc")
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
         // No name_attribute set
     );
@@ -310,7 +310,7 @@ fn no_temporary_name_when_name_attribute_changes() {
 
     // name_attribute itself changed: old-bucket → new-bucket
     // No temporary name needed since names are already different
-    let mut resource = Resource::new("s3.bucket", "my-bucket")
+    let mut resource = Resource::new("s3.Bucket", "my-bucket")
         .with_attribute("bucket_name", Value::String("new-bucket".to_string()))
         .with_attribute("object_lock_enabled", Value::Bool(true));
     resource.lifecycle.create_before_destroy = true;
@@ -325,14 +325,14 @@ fn no_temporary_name_when_name_attribute_changes() {
     );
     attrs.insert("object_lock_enabled".to_string(), Value::Bool(true));
     current_states.insert(
-        ResourceId::new("s3.bucket", "my-bucket"),
-        State::existing(ResourceId::new("s3.bucket", "my-bucket"), attrs),
+        ResourceId::new("s3.Bucket", "my-bucket"),
+        State::existing(ResourceId::new("s3.Bucket", "my-bucket"), attrs),
     );
 
     let mut schemas = HashMap::new();
     schemas.insert(
-        "s3.bucket".to_string(),
-        ResourceSchema::new("s3.bucket")
+        "s3.Bucket".to_string(),
+        ResourceSchema::new("s3.Bucket")
             .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only())
             .attribute(
                 AttributeSchema::new("object_lock_enabled", AttributeType::Bool).create_only(),
@@ -365,7 +365,7 @@ fn no_temporary_name_when_name_attribute_changes() {
 #[test]
 fn diff_detects_attribute_removal_with_prev_desired_keys() {
     // User previously had "region" and "tags" in .crn, now only has "region"
-    let desired = Resource::new("s3.bucket", "test")
+    let desired = Resource::new("s3.Bucket", "test")
         .with_attribute("region", Value::String("ap-northeast-1".to_string()));
 
     let mut current_attrs = HashMap::new();
@@ -380,7 +380,7 @@ fn diff_detects_attribute_removal_with_prev_desired_keys() {
             Value::String("test".to_string()),
         )])),
     );
-    let current = State::existing(ResourceId::new("s3.bucket", "test"), current_attrs);
+    let current = State::existing(ResourceId::new("s3.Bucket", "test"), current_attrs);
 
     // Previous desired state had both "region" and "tags"
     let prev_keys = vec!["region".to_string(), "tags".to_string()];
@@ -404,7 +404,7 @@ fn diff_detects_attribute_removal_with_prev_desired_keys() {
 fn diff_ignores_attributes_not_in_prev_desired_keys() {
     // Current state has "arn" and "region" from provider, but user only ever
     // specified "region" — "arn" was never in prev_desired_keys
-    let desired = Resource::new("s3.bucket", "test");
+    let desired = Resource::new("s3.Bucket", "test");
 
     let mut current_attrs = HashMap::new();
     current_attrs.insert(
@@ -415,7 +415,7 @@ fn diff_ignores_attributes_not_in_prev_desired_keys() {
         "arn".to_string(),
         Value::String("arn:aws:s3:::test".to_string()),
     );
-    let current = State::existing(ResourceId::new("s3.bucket", "test"), current_attrs);
+    let current = State::existing(ResourceId::new("s3.Bucket", "test"), current_attrs);
 
     // User previously only specified "region", not "arn"
     let prev_keys = vec!["region".to_string()];
@@ -441,7 +441,7 @@ fn diff_ignores_attributes_not_in_prev_desired_keys() {
 #[test]
 fn diff_no_change_without_prev_desired_keys() {
     // Without prev_desired_keys, removed attributes should NOT be detected
-    let desired = Resource::new("s3.bucket", "test")
+    let desired = Resource::new("s3.Bucket", "test")
         .with_attribute("region", Value::String("ap-northeast-1".to_string()));
 
     let mut current_attrs = HashMap::new();
@@ -456,7 +456,7 @@ fn diff_no_change_without_prev_desired_keys() {
             Value::String("test".to_string()),
         )])),
     );
-    let current = State::existing(ResourceId::new("s3.bucket", "test"), current_attrs);
+    let current = State::existing(ResourceId::new("s3.Bucket", "test"), current_attrs);
 
     let result = diff(&desired, &current, None, None, None);
     assert!(
@@ -471,7 +471,7 @@ fn create_plan_detects_attribute_removal() {
     // Resource in .crn has no "tags", but current state (from AWS) has tags.
     // prev_desired_keys indicates user previously had "region" and "tags".
     let resources = vec![
-        Resource::new("s3.bucket", "test")
+        Resource::new("s3.Bucket", "test")
             .with_attribute("region", Value::String("ap-northeast-1".to_string())),
     ];
 
@@ -489,13 +489,13 @@ fn create_plan_detects_attribute_removal() {
         )])),
     );
     current_states.insert(
-        ResourceId::new("s3.bucket", "test"),
-        State::existing(ResourceId::new("s3.bucket", "test"), attrs),
+        ResourceId::new("s3.Bucket", "test"),
+        State::existing(ResourceId::new("s3.Bucket", "test"), attrs),
     );
 
     let mut prev_desired_keys = HashMap::new();
     prev_desired_keys.insert(
-        ResourceId::new("s3.bucket", "test"),
+        ResourceId::new("s3.Bucket", "test"),
         vec!["region".to_string(), "tags".to_string()],
     );
 
@@ -523,7 +523,7 @@ fn create_plan_filters_non_removable_attribute_removal() {
     // When schema is available, only removable attributes should trigger removal.
     // "region" is not removable, "tags" is removable.
     let resources = vec![
-        Resource::new("s3.bucket", "test")
+        Resource::new("s3.Bucket", "test")
             .with_attribute("region", Value::String("ap-northeast-1".to_string())),
     ];
 
@@ -541,13 +541,13 @@ fn create_plan_filters_non_removable_attribute_removal() {
         )])),
     );
     current_states.insert(
-        ResourceId::new("s3.bucket", "test"),
-        State::existing(ResourceId::new("s3.bucket", "test"), attrs),
+        ResourceId::new("s3.Bucket", "test"),
+        State::existing(ResourceId::new("s3.Bucket", "test"), attrs),
     );
 
     let mut prev_desired_keys = HashMap::new();
     prev_desired_keys.insert(
-        ResourceId::new("s3.bucket", "test"),
+        ResourceId::new("s3.Bucket", "test"),
         vec!["region".to_string(), "tags".to_string()],
     );
 
@@ -555,8 +555,8 @@ fn create_plan_filters_non_removable_attribute_removal() {
     // region is explicitly non-removable (provider-inherited)
     let mut schemas = HashMap::new();
     schemas.insert(
-        "s3.bucket".to_string(),
-        ResourceSchema::new("s3.bucket")
+        "s3.Bucket".to_string(),
+        ResourceSchema::new("s3.Bucket")
             .attribute(AttributeSchema::new("region", AttributeType::String).non_removable())
             .attribute(AttributeSchema::new(
                 "tags",
@@ -598,7 +598,7 @@ fn create_plan_skips_update_when_only_non_removable_removal() {
     // When the only "change" is a non-removable attribute removal,
     // the plan should have no effects (no spurious Update).
     let resources = vec![
-        Resource::new("s3.bucket", "test")
+        Resource::new("s3.Bucket", "test")
             .with_attribute("bucket", Value::String("my-bucket".to_string())),
     ];
 
@@ -610,21 +610,21 @@ fn create_plan_skips_update_when_only_non_removable_removal() {
         Value::String("ap-northeast-1".to_string()),
     );
     current_states.insert(
-        ResourceId::new("s3.bucket", "test"),
-        State::existing(ResourceId::new("s3.bucket", "test"), attrs),
+        ResourceId::new("s3.Bucket", "test"),
+        State::existing(ResourceId::new("s3.Bucket", "test"), attrs),
     );
 
     let mut prev_desired_keys = HashMap::new();
     prev_desired_keys.insert(
-        ResourceId::new("s3.bucket", "test"),
+        ResourceId::new("s3.Bucket", "test"),
         vec!["bucket".to_string(), "region".to_string()],
     );
 
     // Schema: region is explicitly non-removable, bucket is required
     let mut schemas = HashMap::new();
     schemas.insert(
-        "s3.bucket".to_string(),
-        ResourceSchema::new("s3.bucket")
+        "s3.Bucket".to_string(),
+        ResourceSchema::new("s3.Bucket")
             .attribute(AttributeSchema::new("bucket", AttributeType::String).required())
             .attribute(AttributeSchema::new("region", AttributeType::String).non_removable()),
     );
@@ -649,7 +649,7 @@ fn create_plan_skips_update_when_only_non_removable_removal() {
 #[test]
 fn diff_skips_internal_attributes_in_removal_detection() {
     // prev_desired_keys includes "_internal" but it should be skipped
-    let desired = Resource::new("s3.bucket", "test")
+    let desired = Resource::new("s3.Bucket", "test")
         .with_attribute("region", Value::String("ap-northeast-1".to_string()));
 
     let mut current_attrs = HashMap::new();
@@ -661,7 +661,7 @@ fn diff_skips_internal_attributes_in_removal_detection() {
         "_internal".to_string(),
         Value::String("something".to_string()),
     );
-    let current = State::existing(ResourceId::new("s3.bucket", "test"), current_attrs);
+    let current = State::existing(ResourceId::new("s3.Bucket", "test"), current_attrs);
 
     let prev_keys = vec!["region".to_string(), "_internal".to_string()];
 
@@ -686,14 +686,14 @@ fn prevent_destroy_blocks_delete_for_orphaned_resource() {
         Value::String("10.0.0.0/16".to_string()),
     );
     current_states.insert(
-        ResourceId::new("ec2.vpc", "my-vpc"),
-        State::existing(ResourceId::new("ec2.vpc", "my-vpc"), attrs),
+        ResourceId::new("ec2.Vpc", "my-vpc"),
+        State::existing(ResourceId::new("ec2.Vpc", "my-vpc"), attrs),
     );
 
     // Lifecycle from state says prevent_destroy
     let mut lifecycles = HashMap::new();
     lifecycles.insert(
-        ResourceId::new("ec2.vpc", "my-vpc"),
+        ResourceId::new("ec2.Vpc", "my-vpc"),
         LifecycleConfig {
             prevent_destroy: true,
             ..Default::default()
@@ -727,7 +727,7 @@ fn prevent_destroy_blocks_delete_for_orphaned_resource() {
     );
     assert_eq!(
         plan.errors()[0].resource_id,
-        ResourceId::new("ec2.vpc", "my-vpc")
+        ResourceId::new("ec2.Vpc", "my-vpc")
     );
 }
 
@@ -737,7 +737,7 @@ fn prevent_destroy_blocks_replace() {
 
     // Resource with prevent_destroy that has a create-only attribute change
     // (which would normally trigger a Replace)
-    let mut resource = Resource::new("ec2.vpc", "my-vpc")
+    let mut resource = Resource::new("ec2.Vpc", "my-vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
     resource.lifecycle.prevent_destroy = true;
 
@@ -750,14 +750,14 @@ fn prevent_destroy_blocks_replace() {
         Value::String("10.0.0.0/16".to_string()),
     );
     current_states.insert(
-        ResourceId::new("ec2.vpc", "my-vpc"),
-        State::existing(ResourceId::new("ec2.vpc", "my-vpc"), attrs),
+        ResourceId::new("ec2.Vpc", "my-vpc"),
+        State::existing(ResourceId::new("ec2.Vpc", "my-vpc"), attrs),
     );
 
     let mut schemas = HashMap::new();
     schemas.insert(
-        "ec2.vpc".to_string(),
-        ResourceSchema::new("ec2.vpc")
+        "ec2.Vpc".to_string(),
+        ResourceSchema::new("ec2.Vpc")
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
     );
 
@@ -795,7 +795,7 @@ fn prevent_destroy_blocks_replace() {
 fn prevent_destroy_does_not_block_update() {
     // Resource with prevent_destroy that has a normal (non-create-only) attribute change
     // Updates don't destroy the resource, so they should be allowed
-    let mut resource = Resource::new("s3.bucket", "my-bucket")
+    let mut resource = Resource::new("s3.Bucket", "my-bucket")
         .with_attribute("versioning", Value::String("Enabled".to_string()));
     resource.lifecycle.prevent_destroy = true;
 
@@ -808,8 +808,8 @@ fn prevent_destroy_does_not_block_update() {
         Value::String("Disabled".to_string()),
     );
     current_states.insert(
-        ResourceId::new("s3.bucket", "my-bucket"),
-        State::existing(ResourceId::new("s3.bucket", "my-bucket"), attrs),
+        ResourceId::new("s3.Bucket", "my-bucket"),
+        State::existing(ResourceId::new("s3.Bucket", "my-bucket"), attrs),
     );
 
     let plan = create_plan(
@@ -841,7 +841,7 @@ fn prevent_destroy_does_not_block_update() {
 fn prevent_destroy_does_not_block_create() {
     // Resource with prevent_destroy that doesn't exist yet
     // Creates don't destroy anything, so they should be allowed
-    let mut resource = Resource::new("s3.bucket", "my-bucket")
+    let mut resource = Resource::new("s3.Bucket", "my-bucket")
         .with_attribute("bucket", Value::String("my-bucket".to_string()));
     resource.lifecycle.prevent_destroy = true;
 
@@ -882,8 +882,8 @@ fn without_prevent_destroy_delete_works_normally() {
         Value::String("10.0.0.0/16".to_string()),
     );
     current_states.insert(
-        ResourceId::new("ec2.vpc", "my-vpc"),
-        State::existing(ResourceId::new("ec2.vpc", "my-vpc"), attrs),
+        ResourceId::new("ec2.Vpc", "my-vpc"),
+        State::existing(ResourceId::new("ec2.Vpc", "my-vpc"), attrs),
     );
 
     let plan = create_plan(
@@ -918,8 +918,8 @@ fn prevent_destroy_collects_multiple_errors() {
         Value::String("10.0.0.0/16".to_string()),
     );
     current_states.insert(
-        ResourceId::new("ec2.vpc", "vpc-1"),
-        State::existing(ResourceId::new("ec2.vpc", "vpc-1"), attrs1),
+        ResourceId::new("ec2.Vpc", "vpc-1"),
+        State::existing(ResourceId::new("ec2.Vpc", "vpc-1"), attrs1),
     );
     let mut attrs2 = HashMap::new();
     attrs2.insert(
@@ -927,20 +927,20 @@ fn prevent_destroy_collects_multiple_errors() {
         Value::String("10.1.0.0/16".to_string()),
     );
     current_states.insert(
-        ResourceId::new("ec2.vpc", "vpc-2"),
-        State::existing(ResourceId::new("ec2.vpc", "vpc-2"), attrs2),
+        ResourceId::new("ec2.Vpc", "vpc-2"),
+        State::existing(ResourceId::new("ec2.Vpc", "vpc-2"), attrs2),
     );
 
     let mut lifecycles = HashMap::new();
     lifecycles.insert(
-        ResourceId::new("ec2.vpc", "vpc-1"),
+        ResourceId::new("ec2.Vpc", "vpc-1"),
         LifecycleConfig {
             prevent_destroy: true,
             ..Default::default()
         },
     );
     lifecycles.insert(
-        ResourceId::new("ec2.vpc", "vpc-2"),
+        ResourceId::new("ec2.Vpc", "vpc-2"),
         LifecycleConfig {
             prevent_destroy: true,
             ..Default::default()
@@ -978,7 +978,7 @@ fn virtual_resources_are_skipped_in_plan() {
         Value::String("sg-123".to_string()),
     );
 
-    let real_resource = Resource::new("ec2.security_group", "sg")
+    let real_resource = Resource::new("ec2.SecurityGroup", "sg")
         .with_attribute("group_name", Value::String("my-sg".to_string()));
 
     let resources = vec![virtual_resource, real_resource];
@@ -997,6 +997,6 @@ fn virtual_resources_are_skipped_in_plan() {
     assert_eq!(plan.effects().len(), 1);
     assert_eq!(
         plan.effects()[0].resource_id(),
-        &ResourceId::new("ec2.security_group", "sg")
+        &ResourceId::new("ec2.SecurityGroup", "sg")
     );
 }

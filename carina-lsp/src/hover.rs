@@ -585,7 +585,7 @@ impl HoverProvider {
                 "## provider\n\nDefines a provider block with configuration.\n\n```carina\nprovider aws {\n    region = aws.Region.ap_northeast_1\n}\n```",
             ),
             "let" => Some(
-                "## let\n\nDefines a named resource or variable binding.\n\n```carina\nlet my_bucket = aws.s3.bucket {\n    name = \"my-bucket\"\n    region = aws.Region.ap_northeast_1\n}\n```",
+                "## let\n\nDefines a named resource or variable binding.\n\n```carina\nlet my_bucket = aws.s3.Bucket {\n    name = \"my-bucket\"\n    region = aws.Region.ap_northeast_1\n}\n```",
             ),
             "attributes" => Some(
                 "## attributes\n\nDefines module attribute values that can be referenced by the caller.\n\n```carina\nattributes {\n    bucket_name: String = my_bucket.name\n}\n```",
@@ -600,7 +600,7 @@ impl HoverProvider {
                 "## backend\n\nConfigures the state backend for storing resource state.\n\n```carina\nbackend s3 {\n    bucket = \"my-carina-state\"\n    key    = \"prod/carina.crnstate\"\n    region = aws.Region.ap_northeast_1\n}\n```",
             ),
             "read" => Some(
-                "## read\n\nReads an existing resource as a data source without managing it.\n\n```carina\nlet my_vpc = read aws.ec2.vpc {\n    name = \"existing-vpc\"\n}\n```",
+                "## read\n\nReads an existing resource as a data source without managing it.\n\n```carina\nlet my_vpc = read aws.ec2.Vpc {\n    name = \"existing-vpc\"\n}\n```",
             ),
             _ => None,
         }
@@ -743,9 +743,9 @@ mod tests {
         // Full description with a markdown link (no truncation)
         let desc = "Specifies a virtual private cloud (VPC). To add an IPv6 CIDR block to the VPC, see [AWS::EC2::VPCCidrBlock](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-vpccidrblock.html).";
 
-        let provider = create_hover_provider_with_description("ec2.vpc", desc);
-        let schema = provider.schemas.get("ec2.vpc").unwrap();
-        let hover = provider.schema_hover("ec2.vpc", schema).unwrap();
+        let provider = create_hover_provider_with_description("ec2.Vpc", desc);
+        let schema = provider.schemas.get("ec2.Vpc").unwrap();
+        let hover = provider.schema_hover("ec2.Vpc", schema).unwrap();
 
         let content = match &hover.contents {
             HoverContents::Markup(m) => &m.value,
@@ -941,11 +941,11 @@ awscc.ec2.vpc_gateway_attachment {
         );
         schemas.insert("awscc.organizations.account".to_string(), account_schema);
 
-        // `awscc.sso.assignment` intentionally has NO `account_id`.
-        let assignment_schema = ResourceSchema::new("awscc.sso.assignment").attribute(
+        // `awscc.sso.Assignment` intentionally has NO `account_id`.
+        let assignment_schema = ResourceSchema::new("awscc.sso.Assignment").attribute(
             AttributeSchema::new("target_id", AttributeType::String).with_description("Target id."),
         );
-        schemas.insert("awscc.sso.assignment".to_string(), assignment_schema);
+        schemas.insert("awscc.sso.Assignment".to_string(), assignment_schema);
 
         let provider = HoverProvider::new(Arc::new(schemas), vec![]);
 
@@ -953,7 +953,7 @@ awscc.ec2.vpc_gateway_attachment {
         // an attribute value inside an sso.assignment block.
         let doc = Document::new(
             r#"for _, account_id in orgs.accounts {
-    awscc.sso.assignment {
+    awscc.sso.Assignment {
         target_id = account_id
     }
 }
@@ -1083,7 +1083,7 @@ awscc.ec2.vpc_gateway_attachment {
         let arg = ArgumentParameter {
             name: "vpc".to_string(),
             type_expr: TypeExpr::Ref(carina_core::parser::ResourceTypePath::new(
-                "awscc", "ec2.vpc",
+                "awscc", "ec2.Vpc",
             )),
             default: None,
             description: Some("The VPC to deploy into".to_string()),
@@ -1110,7 +1110,7 @@ awscc.ec2.vpc_gateway_attachment {
             content
         );
         assert!(
-            content.contains("awscc.ec2.vpc"),
+            content.contains("awscc.ec2.Vpc"),
             "Should show type, got:\n{}",
             content
         );

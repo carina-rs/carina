@@ -2100,7 +2100,7 @@ mod tests {
 
     #[test]
     fn test_format_normalizes_indentation() {
-        let input = "aws.s3.bucket {\n    name = \"test\"\n}";
+        let input = "aws.s3.Bucket {\n    name = \"test\"\n}";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
 
@@ -2155,7 +2155,7 @@ mod tests {
 
     #[test]
     fn test_format_aligns_attributes() {
-        let input = "aws.s3.bucket {\nname = \"test\"\nversioning = true\n}";
+        let input = "aws.s3.Bucket {\nname = \"test\"\nversioning = true\n}";
         let config = FormatConfig {
             align_attributes: true,
             ..Default::default()
@@ -2187,11 +2187,11 @@ mod tests {
 
     #[test]
     fn test_format_let_binding() {
-        let input = "let bucket=aws.s3.bucket {\nname=\"test\"\n}";
+        let input = "let bucket=aws.s3.Bucket {\nname=\"test\"\n}";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
 
-        assert!(result.contains("let bucket = aws.s3.bucket {"));
+        assert!(result.contains("let bucket = aws.s3.Bucket {"));
     }
 
     #[test]
@@ -2207,7 +2207,7 @@ mod tests {
 
     #[test]
     fn test_format_map() {
-        let input = "awscc.ec2.vpc {\ntags = {Environment=\"dev\"Project=\"test\"}\n}";
+        let input = "awscc.ec2.Vpc {\ntags = {Environment=\"dev\"Project=\"test\"}\n}";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
 
@@ -2236,7 +2236,7 @@ mod tests {
 
     #[test]
     fn test_format_map_aligns_entries() {
-        let input = "awscc.ec2.vpc {\ntags = {Environment=\"dev\"\nProject=\"test\"}\n}";
+        let input = "awscc.ec2.Vpc {\ntags = {Environment=\"dev\"\nProject=\"test\"}\n}";
         let config = FormatConfig {
             align_attributes: true,
             ..Default::default()
@@ -2261,7 +2261,7 @@ mod tests {
 
     #[test]
     fn test_format_map_idempotent() {
-        let input = "awscc.ec2.vpc {\n  tags = {\n    Environment = \"dev\"\n    Project = \"test\"\n  }\n}\n";
+        let input = "awscc.ec2.Vpc {\n  tags = {\n    Environment = \"dev\"\n    Project = \"test\"\n  }\n}\n";
         let config = FormatConfig::default();
 
         let first = format(input, &config).unwrap();
@@ -2272,7 +2272,7 @@ mod tests {
 
     #[test]
     fn test_format_preserves_blank_lines_between_attributes() {
-        let input = "awscc.ec2.vpc {\n  name = \"test\"\n  cidr = \"10.0.0.0/16\"\n\n  tags = {\n    Env = \"dev\"\n  }\n}\n";
+        let input = "awscc.ec2.Vpc {\n  name = \"test\"\n  cidr = \"10.0.0.0/16\"\n\n  tags = {\n    Env = \"dev\"\n  }\n}\n";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
 
@@ -2296,7 +2296,7 @@ mod tests {
 
     #[test]
     fn test_format_blank_lines_idempotent() {
-        let input = "awscc.ec2.vpc {\n  name = \"test\"\n\n  tags = {\n    Env = \"dev\"\n  }\n}\n";
+        let input = "awscc.ec2.Vpc {\n  name = \"test\"\n\n  tags = {\n    Env = \"dev\"\n  }\n}\n";
         let config = FormatConfig::default();
 
         let first = format(input, &config).unwrap();
@@ -2310,7 +2310,7 @@ mod tests {
         // Attributes before blank line should be aligned together
         // Attributes after blank line should be aligned separately
         let input =
-            "awscc.ec2.vpc {\nenable_dns_hostnames = true\nname = \"test\"\n\ntags = {}\n}\n";
+            "awscc.ec2.Vpc {\nenable_dns_hostnames = true\nname = \"test\"\n\ntags = {}\n}\n";
         let config = FormatConfig {
             align_attributes: true,
             ..Default::default()
@@ -2378,12 +2378,12 @@ mod tests {
     #[test]
     fn test_format_nonempty_block_remains_multiline() {
         // Non-empty blocks should remain multi-line
-        let input = "awscc.ec2.vpc {\n  cidr_block = \"10.0.0.0/16\"\n}\n";
+        let input = "awscc.ec2.Vpc {\n  cidr_block = \"10.0.0.0/16\"\n}\n";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
 
         assert_eq!(
-            result, "awscc.ec2.vpc {\n  cidr_block = '10.0.0.0/16'\n}\n",
+            result, "awscc.ec2.Vpc {\n  cidr_block = '10.0.0.0/16'\n}\n",
             "Non-empty block should remain multi-line, got: {:?}",
             result
         );
@@ -2407,7 +2407,7 @@ mod tests {
 
     #[test]
     fn test_format_nested_block() {
-        let input = r#"awscc.ec2.security_group {
+        let input = r#"awscc.ec2.SecurityGroup {
   vpc_id = "vpc-123"
 
   security_group_ingress {
@@ -2491,7 +2491,7 @@ mod tests {
     #[test]
     fn test_convert_list_literal_to_block_syntax_multiple_items() {
         // Multiple items in `= [{...}, {...}]` should become multiple blocks
-        let input = r#"awscc.s3.bucket {
+        let input = r#"awscc.s3.Bucket {
   lifecycle_configuration = {
     rules = [{
       id     = "expire-old-objects"
@@ -2503,7 +2503,7 @@ mod tests {
   }
 }
 "#;
-        let expected = "awscc.s3.bucket {\n  lifecycle_configuration = {\n    rule {\n      id     = 'expire-old-objects'\n      status = 'Enabled'\n    }\n    rule {\n      id     = 'transition-to-glacier'\n      status = 'Enabled'\n    }\n  }\n}\n";
+        let expected = "awscc.s3.Bucket {\n  lifecycle_configuration = {\n    rule {\n      id     = 'expire-old-objects'\n      status = 'Enabled'\n    }\n    rule {\n      id     = 'transition-to-glacier'\n      status = 'Enabled'\n    }\n  }\n}\n";
         let config = FormatConfig::default();
         let block_names: std::collections::HashMap<String, String> =
             [("rules".to_string(), "rule".to_string())]
@@ -2521,7 +2521,7 @@ mod tests {
     #[test]
     fn test_convert_list_literal_to_block_syntax_nested() {
         // Nested `= [{...}]` within a map should also be converted
-        let input = r#"awscc.s3.bucket {
+        let input = r#"awscc.s3.Bucket {
   bucket_encryption = {
     server_side_encryption_configuration = [{
       bucket_key_enabled                = true
@@ -2532,7 +2532,7 @@ mod tests {
   }
 }
 "#;
-        let expected = "awscc.s3.bucket {\n  bucket_encryption = {\n    server_side_encryption_configuration {\n      bucket_key_enabled                = true\n      server_side_encryption_by_default = {\n        sse_algorithm = 'AES256'\n      }\n    }\n  }\n}\n";
+        let expected = "awscc.s3.Bucket {\n  bucket_encryption = {\n    server_side_encryption_configuration {\n      bucket_key_enabled                = true\n      server_side_encryption_by_default = {\n        sse_algorithm = 'AES256'\n      }\n    }\n  }\n}\n";
         let config = FormatConfig::default();
         let block_names: std::collections::HashMap<String, String> = [(
             "server_side_encryption_configuration".to_string(),
@@ -2628,7 +2628,7 @@ mod tests {
 
     #[test]
     fn test_format_for_expression() {
-        let input = "let subnets = for subnet in subnets {\n  awscc.ec2.subnet {\n    cidr_block = subnet.cidr\n  }\n}\n";
+        let input = "let subnets = for subnet in subnets {\n  awscc.ec2.Subnet {\n    cidr_block = subnet.cidr\n  }\n}\n";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
         assert!(
@@ -2637,7 +2637,7 @@ mod tests {
             result
         );
         assert!(
-            result.contains("awscc.ec2.subnet"),
+            result.contains("awscc.ec2.Subnet"),
             "Expected resource in for body:\n{}",
             result
         );
@@ -2645,11 +2645,11 @@ mod tests {
 
     #[test]
     fn test_format_read_resource_expr() {
-        let input = "let vpc = read awscc.ec2.vpc {\n  vpc_id = \"vpc-123\"\n}\n";
+        let input = "let vpc = read awscc.ec2.Vpc {\n  vpc_id = \"vpc-123\"\n}\n";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
         assert!(
-            result.contains("read awscc.ec2.vpc"),
+            result.contains("read awscc.ec2.Vpc"),
             "Expected read resource expr in:\n{}",
             result
         );
@@ -2671,7 +2671,7 @@ mod tests {
     fn issue_1177_blank_lines_around_map_attributes() {
         // Map block attributes should have blank lines before and after,
         // and alignment should reset at blank line boundaries.
-        let input = r#"awscc.ec2.vpc {
+        let input = r#"awscc.ec2.Vpc {
   cidr_block = "10.0.0.0/16"
   tags = {
     Name        = "test"
@@ -2685,7 +2685,7 @@ mod tests {
         };
         let result = format(input, &config).unwrap();
 
-        let expected = "awscc.ec2.vpc {\n  cidr_block = '10.0.0.0/16'\n\n  tags = {\n    Name        = 'test'\n    Environment = 'dev'\n  }\n}\n";
+        let expected = "awscc.ec2.Vpc {\n  cidr_block = '10.0.0.0/16'\n\n  tags = {\n    Name        = 'test'\n    Environment = 'dev'\n  }\n}\n";
         assert_eq!(result, expected, "Expected blank line before map attribute");
     }
 
@@ -2693,7 +2693,7 @@ mod tests {
     fn issue_1177_blank_lines_around_map_alignment_reset() {
         // Alignment should reset across blank line boundaries,
         // so `tags` should NOT be padded to match `cidr_block`.
-        let input = r#"awscc.ec2.vpc {
+        let input = r#"awscc.ec2.Vpc {
   cidr_block = "10.0.0.0/16"
   tags       = {
     Name = "test"
@@ -2709,7 +2709,7 @@ mod tests {
 
         // tags should be in its own group (no padding)
         // enable_dns should be in its own group (no padding)
-        let expected = "awscc.ec2.vpc {\n  cidr_block = '10.0.0.0/16'\n\n  tags = {\n    Name = 'test'\n  }\n\n  enable_dns = true\n}\n";
+        let expected = "awscc.ec2.Vpc {\n  cidr_block = '10.0.0.0/16'\n\n  tags = {\n    Name = 'test'\n  }\n\n  enable_dns = true\n}\n";
         assert_eq!(
             result, expected,
             "Alignment should reset at blank line boundaries"
@@ -2719,7 +2719,7 @@ mod tests {
     #[test]
     fn issue_1177_map_first_attribute_no_leading_blank_line() {
         // If map attribute is the first attribute, no leading blank line
-        let input = r#"awscc.ec2.vpc {
+        let input = r#"awscc.ec2.Vpc {
   tags = {
     Name = "test"
   }
@@ -2732,7 +2732,7 @@ mod tests {
         };
         let result = format(input, &config).unwrap();
 
-        let expected = "awscc.ec2.vpc {\n  tags = {\n    Name = 'test'\n  }\n\n  cidr_block = '10.0.0.0/16'\n}\n";
+        let expected = "awscc.ec2.Vpc {\n  tags = {\n    Name = 'test'\n  }\n\n  cidr_block = '10.0.0.0/16'\n}\n";
         assert_eq!(
             result, expected,
             "No leading blank line when map is first attribute"
@@ -2742,7 +2742,7 @@ mod tests {
     #[test]
     fn issue_1177_map_last_attribute_no_trailing_blank_line() {
         // If map attribute is the last attribute, no trailing blank line
-        let input = r#"awscc.ec2.vpc {
+        let input = r#"awscc.ec2.Vpc {
   cidr_block = "10.0.0.0/16"
   tags = {
     Name = "test"
@@ -2755,7 +2755,7 @@ mod tests {
         };
         let result = format(input, &config).unwrap();
 
-        let expected = "awscc.ec2.vpc {\n  cidr_block = '10.0.0.0/16'\n\n  tags = {\n    Name = 'test'\n  }\n}\n";
+        let expected = "awscc.ec2.Vpc {\n  cidr_block = '10.0.0.0/16'\n\n  tags = {\n    Name = 'test'\n  }\n}\n";
         assert_eq!(
             result, expected,
             "No trailing blank line when map is last attribute"
@@ -2765,7 +2765,7 @@ mod tests {
     #[test]
     fn issue_1177_empty_map_no_blank_lines() {
         // Empty maps should NOT trigger blank line insertion
-        let input = r#"awscc.ec2.vpc {
+        let input = r#"awscc.ec2.Vpc {
   cidr_block = "10.0.0.0/16"
   tags       = {}
   enable_dns = true
@@ -2777,14 +2777,14 @@ mod tests {
         };
         let result = format(input, &config).unwrap();
 
-        let expected = "awscc.ec2.vpc {\n  cidr_block = '10.0.0.0/16'\n  tags       = {}\n  enable_dns = true\n}\n";
+        let expected = "awscc.ec2.Vpc {\n  cidr_block = '10.0.0.0/16'\n  tags       = {}\n  enable_dns = true\n}\n";
         assert_eq!(result, expected, "Empty maps should not get blank lines");
     }
 
     #[test]
     fn issue_1177_idempotent() {
         // Formatting should be idempotent
-        let input = r#"awscc.ec2.vpc {
+        let input = r#"awscc.ec2.Vpc {
   cidr_block = "10.0.0.0/16"
   tags = {
     Name        = "test"
@@ -2805,7 +2805,7 @@ mod tests {
     #[test]
     fn format_arguments_param_block_form() {
         let input = r#"arguments {
-  vpc: awscc.ec2.vpc {
+  vpc: awscc.ec2.Vpc {
     description = "The VPC to deploy into"
   }
   port: int {
@@ -2816,7 +2816,7 @@ mod tests {
 "#;
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
-        let expected = "arguments {\n  vpc: awscc.ec2.vpc {\n    description = 'The VPC to deploy into'\n  }\n  port: int {\n    description = 'Web server port'\n    default     = 8080\n  }\n}\n";
+        let expected = "arguments {\n  vpc: awscc.ec2.Vpc {\n    description = 'The VPC to deploy into'\n  }\n  port: int {\n    description = 'Web server port'\n    default     = 8080\n  }\n}\n";
         assert_eq!(result, expected);
     }
 
@@ -2824,7 +2824,7 @@ mod tests {
     fn format_arguments_mixed_simple_and_block_form() {
         let input = r#"arguments {
   enable_https: bool = true
-  vpc: awscc.ec2.vpc {
+  vpc: awscc.ec2.Vpc {
     description = "The VPC to deploy into"
   }
   port: int {
@@ -2835,14 +2835,14 @@ mod tests {
 "#;
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
-        let expected = "arguments {\n  enable_https: bool = true\n  vpc: awscc.ec2.vpc {\n    description = 'The VPC to deploy into'\n  }\n  port: int {\n    description = 'Web server port'\n    default     = 8080\n  }\n}\n";
+        let expected = "arguments {\n  enable_https: bool = true\n  vpc: awscc.ec2.Vpc {\n    description = 'The VPC to deploy into'\n  }\n  port: int {\n    description = 'Web server port'\n    default     = 8080\n  }\n}\n";
         assert_eq!(result, expected);
     }
 
     #[test]
     fn format_arguments_block_form_idempotent() {
         let input = r#"arguments {
-  vpc: awscc.ec2.vpc {
+  vpc: awscc.ec2.Vpc {
     description = "The VPC"
   }
   port: int {
@@ -2862,7 +2862,7 @@ mod tests {
         let input = r#"arguments {
   short: bool = true
   longer_name: string = "hello"
-  vpc: awscc.ec2.vpc {
+  vpc: awscc.ec2.Vpc {
     description = "The VPC"
   }
 }
@@ -2871,7 +2871,7 @@ mod tests {
             align_attributes: true,
             ..Default::default()
         };
-        let expected = "arguments {\n  short      : bool = true\n  longer_name: string = 'hello'\n  vpc: awscc.ec2.vpc {\n    description = 'The VPC'\n  }\n}\n";
+        let expected = "arguments {\n  short      : bool = true\n  longer_name: string = 'hello'\n  vpc: awscc.ec2.Vpc {\n    description = 'The VPC'\n  }\n}\n";
         let result = format(input, &config).unwrap();
         assert_eq!(result, expected);
     }
@@ -2945,8 +2945,8 @@ mod tests {
     #[test]
     fn format_fn_def_with_resource_type_param() {
         let config = FormatConfig::default();
-        let input = "fn make(vpc:awscc.ec2.vpc,cidr:string) {\n  vpc\n}\n";
-        let expected = "fn make(vpc: awscc.ec2.vpc, cidr: string) {\n  vpc\n}\n";
+        let input = "fn make(vpc:awscc.ec2.Vpc,cidr:string) {\n  vpc\n}\n";
+        let expected = "fn make(vpc: awscc.ec2.Vpc, cidr: string) {\n  vpc\n}\n";
         let result = format(input, &config).unwrap();
         assert_eq!(result, expected);
     }
@@ -2972,8 +2972,8 @@ mod tests {
     #[test]
     fn format_fn_def_with_resource_return_type() {
         let config = FormatConfig::default();
-        let input = "fn make():awscc.ec2.vpc {\n  awscc.ec2.vpc {\n    cidr_block = \"10.0.0.0/16\"\n  }\n}\n";
-        let expected = "fn make(): awscc.ec2.vpc {\n  awscc.ec2.vpc {\n    cidr_block = '10.0.0.0/16'\n  }\n}\n";
+        let input = "fn make():awscc.ec2.Vpc {\n  awscc.ec2.Vpc {\n    cidr_block = \"10.0.0.0/16\"\n  }\n}\n";
+        let expected = "fn make(): awscc.ec2.Vpc {\n  awscc.ec2.Vpc {\n    cidr_block = '10.0.0.0/16'\n  }\n}\n";
         let result = format(input, &config).unwrap();
         assert_eq!(result, expected);
     }
@@ -3035,7 +3035,7 @@ require   port >= 1 && port <= 65535  , "port must be valid"
 
     #[test]
     fn format_heredoc_preserved() {
-        let input = "aws.iam.role {\n  name   = \"my-role\"\n  policy = <<EOT\n{\n  \"Version\": \"2012-10-17\"\n}\nEOT\n}\n";
+        let input = "aws.iam.Role {\n  name   = \"my-role\"\n  policy = <<EOT\n{\n  \"Version\": \"2012-10-17\"\n}\nEOT\n}\n";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
         // name should be normalized to single quotes
@@ -3060,7 +3060,7 @@ require   port >= 1 && port <= 65535  , "port must be valid"
     #[test]
     fn format_heredoc_idempotent() {
         // Formatting a file with heredoc should be idempotent (formatting twice gives same result)
-        let input = "aws.iam.role {\n  name   = \"my-role\"\n  policy = <<EOT\n{\n  \"Version\": \"2012-10-17\"\n}\nEOT\n}\n";
+        let input = "aws.iam.Role {\n  name   = \"my-role\"\n  policy = <<EOT\n{\n  \"Version\": \"2012-10-17\"\n}\nEOT\n}\n";
         let config = FormatConfig::default();
         let first = format(input, &config).unwrap();
         let second = format(&first, &config).unwrap();
@@ -3069,7 +3069,7 @@ require   port >= 1 && port <= 65535  , "port must be valid"
 
     #[test]
     fn test_format_normalizes_double_to_single_quotes() {
-        let input = "aws.s3.bucket {\n  name = \"my-bucket\"\n}\n";
+        let input = "aws.s3.Bucket {\n  name = \"my-bucket\"\n}\n";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
         assert!(
@@ -3081,7 +3081,7 @@ require   port >= 1 && port <= 65535  , "port must be valid"
 
     #[test]
     fn test_format_preserves_double_quotes_for_interpolation() {
-        let input = "aws.s3.bucket {\n  name = \"vpc-${env}\"\n}\n";
+        let input = "aws.s3.Bucket {\n  name = \"vpc-${env}\"\n}\n";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
         assert!(
@@ -3093,7 +3093,7 @@ require   port >= 1 && port <= 65535  , "port must be valid"
 
     #[test]
     fn test_format_preserves_single_quotes() {
-        let input = "aws.s3.bucket {\n  name = 'my-bucket'\n}\n";
+        let input = "aws.s3.Bucket {\n  name = 'my-bucket'\n}\n";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
         assert!(
@@ -3105,7 +3105,7 @@ require   port >= 1 && port <= 65535  , "port must be valid"
 
     #[test]
     fn test_format_normalizes_quotes_in_list() {
-        let input = "aws.s3.bucket {\n  tags = [\"a\", \"b\"]\n}\n";
+        let input = "aws.s3.Bucket {\n  tags = [\"a\", \"b\"]\n}\n";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
         assert!(
@@ -3117,7 +3117,7 @@ require   port >= 1 && port <= 65535  , "port must be valid"
 
     #[test]
     fn test_format_preserves_double_quotes_with_single_quote_char() {
-        let input = "aws.s3.bucket {\n  name = \"it's\"\n}\n";
+        let input = "aws.s3.Bucket {\n  name = \"it's\"\n}\n";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
         assert!(
@@ -3141,7 +3141,7 @@ require   port >= 1 && port <= 65535  , "port must be valid"
 
     #[test]
     fn test_format_quote_normalization_idempotent() {
-        let input = "aws.s3.bucket {\n  name = \"my-bucket\"\n  tag  = \"vpc-${env}\"\n}\n";
+        let input = "aws.s3.Bucket {\n  name = \"my-bucket\"\n  tag  = \"vpc-${env}\"\n}\n";
         let config = FormatConfig::default();
         let first = format(input, &config).unwrap();
         let second = format(&first, &config).unwrap();
@@ -3163,7 +3163,7 @@ require   port >= 1 && port <= 65535  , "port must be valid"
 
     #[test]
     fn test_format_quoted_attribute_key_in_block() {
-        let input = "aws.iam.role {\n  name = 'test'\n  'aws:condition' = 'value'\n}\n";
+        let input = "aws.iam.Role {\n  name = 'test'\n  'aws:condition' = 'value'\n}\n";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
         assert!(
@@ -3229,7 +3229,7 @@ require   port >= 1 && port <= 65535  , "port must be valid"
     #[test]
     fn test_format_for_binding_discard_pattern() {
         let input =
-            "for _, account_id in orgs {\n  aws.s3.bucket {\n    name = account_id\n  }\n}\n";
+            "for _, account_id in orgs {\n  aws.s3.Bucket {\n    name = account_id\n  }\n}\n";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
         assert!(
@@ -3242,7 +3242,7 @@ require   port >= 1 && port <= 65535  , "port must be valid"
     /// Idempotence for both constructs above.
     #[test]
     fn test_format_upstream_state_and_for_discard_idempotent() {
-        let input = "let orgs = upstream_state {\n  source = '../organizations'\n}\n\nfor _, account_id in orgs {\n  aws.s3.bucket {\n    name = account_id\n  }\n}\n";
+        let input = "let orgs = upstream_state {\n  source = '../organizations'\n}\n\nfor _, account_id in orgs {\n  aws.s3.Bucket {\n    name = account_id\n  }\n}\n";
         let config = FormatConfig::default();
         let first = format(input, &config).unwrap();
         let second = format(&first, &config).unwrap();

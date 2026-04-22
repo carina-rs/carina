@@ -13,11 +13,11 @@ fn top_level_completion_replaces_prefix() {
 
     let completions = provider.complete(&doc, position, None);
 
-    // Find the aws.s3.bucket completion
+    // Find the aws.s3.Bucket completion
     let s3_completion = completions
         .iter()
-        .find(|c| c.label == "aws.s3.bucket")
-        .expect("Should have aws.s3.bucket completion");
+        .find(|c| c.label == "aws.s3.Bucket")
+        .expect("Should have aws.s3.Bucket completion");
 
     // Verify it uses text_edit, not insert_text
     assert!(
@@ -33,8 +33,8 @@ fn top_level_completion_replaces_prefix() {
         );
         assert_eq!(edit.range.end.character, 5, "Should replace up to cursor");
         assert!(
-            edit.new_text.starts_with("aws.s3.bucket"),
-            "new_text should start with aws.s3.bucket"
+            edit.new_text.starts_with("aws.s3.Bucket"),
+            "new_text should start with aws.s3.Bucket"
         );
     } else {
         panic!("Expected CompletionTextEdit::Edit");
@@ -54,11 +54,11 @@ fn top_level_completion_with_leading_whitespace() {
 
     let completions = provider.complete(&doc, position, None);
 
-    // Find the aws.ec2.vpc completion
+    // Find the aws.ec2.Vpc completion
     let vpc_completion = completions
         .iter()
-        .find(|c| c.label == "aws.ec2.vpc")
-        .expect("Should have aws.ec2.vpc completion");
+        .find(|c| c.label == "aws.ec2.Vpc")
+        .expect("Should have aws.ec2.Vpc completion");
 
     if let Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) = &vpc_completion.text_edit {
         // Should replace from column 4 (after whitespace) to cursor at 9
@@ -85,11 +85,11 @@ fn top_level_completion_at_line_start() {
 
     let completions = provider.complete(&doc, position, None);
 
-    // Find the aws.ec2.vpc completion (should still be offered)
-    let vpc_completion = completions.iter().find(|c| c.label == "aws.ec2.vpc");
+    // Find the aws.ec2.Vpc completion (should still be offered)
+    let vpc_completion = completions.iter().find(|c| c.label == "aws.ec2.Vpc");
     assert!(
         vpc_completion.is_some(),
-        "Should offer aws.ec2.vpc completion"
+        "Should offer aws.ec2.Vpc completion"
     );
 
     if let Some(c) = vpc_completion
@@ -121,12 +121,12 @@ fn module_parameter_completion_with_directory_module() {
     // Create main.crn with argument parameters
     let module_content = r#"
 arguments {
-vpc: aws.ec2.vpc
+vpc: aws.ec2.Vpc
 cidr_blocks: list(cidr)
 enable_https: bool = true
 }
 
-let web_sg = aws.ec2.security_group {
+let web_sg = aws.ec2.SecurityGroup {
 name = "web-sg"
 }
 "#;
@@ -188,7 +188,7 @@ web_tier {
 fn instance_tenancy_completion_for_aws_vpc() {
     let provider = test_provider();
     let doc = create_document(
-        r#"aws.ec2.vpc {
+        r#"aws.ec2.Vpc {
 name = "my-vpc"
 instance_tenancy =
 }"#,
@@ -204,18 +204,18 @@ instance_tenancy =
     // Should have namespaced instance_tenancy completions
     let default_completion = completions
         .iter()
-        .find(|c| c.label == "aws.ec2.vpc.InstanceTenancy.default");
+        .find(|c| c.label == "aws.ec2.Vpc.InstanceTenancy.default");
     assert!(
         default_completion.is_some(),
-        "Should have 'aws.ec2.vpc.InstanceTenancy.default' completion"
+        "Should have 'aws.ec2.Vpc.InstanceTenancy.default' completion"
     );
 
     let dedicated_completion = completions
         .iter()
-        .find(|c| c.label == "aws.ec2.vpc.InstanceTenancy.dedicated");
+        .find(|c| c.label == "aws.ec2.Vpc.InstanceTenancy.dedicated");
     assert!(
         dedicated_completion.is_some(),
-        "Should have 'aws.ec2.vpc.InstanceTenancy.dedicated' completion"
+        "Should have 'aws.ec2.Vpc.InstanceTenancy.dedicated' completion"
     );
 }
 
@@ -228,7 +228,7 @@ instance_tenancy =
 fn string_enum_completion_for_aws_s3_bucket_versioning_status() {
     let provider = test_provider();
     let doc = create_document(
-        r#"aws.s3.bucket {
+        r#"aws.s3.Bucket {
 versioning_status =
 }"#,
     );
@@ -242,13 +242,13 @@ versioning_status =
     assert!(
         completions
             .iter()
-            .any(|c| c.label == "aws.s3.bucket.VersioningStatus.Enabled"),
+            .any(|c| c.label == "aws.s3.Bucket.VersioningStatus.Enabled"),
         "Should complete namespaced enum values from StringEnum schema metadata"
     );
     assert!(
         completions
             .iter()
-            .any(|c| c.label == "aws.s3.bucket.VersioningStatus.Suspended"),
+            .any(|c| c.label == "aws.s3.Bucket.VersioningStatus.Suspended"),
         "Should include all enum variants"
     );
 }
@@ -288,7 +288,7 @@ address_family =
 fn versioning_status_completion_for_s3_bucket() {
     let provider = test_provider();
     let doc = create_document(
-        r#"aws.s3.bucket {
+        r#"aws.s3.Bucket {
 name = "my-bucket"
 
 }"#,
@@ -314,7 +314,7 @@ name = "my-bucket"
 fn struct_field_completion_inside_nested_block() {
     let provider = test_provider();
     let doc = create_document(
-        r#"awscc.ec2.security_group {
+        r#"awscc.ec2.SecurityGroup {
 group_description = "test"
 security_group_ingress {
 
@@ -403,7 +403,7 @@ destination_options {
 fn struct_field_completion_inside_second_repeated_block() {
     let provider = test_provider();
     let doc = create_document(
-        r#"awscc.ec2.security_group {
+        r#"awscc.ec2.SecurityGroup {
 group_description = "test"
 security_group_ingress {
     ip_protocol = "tcp"
@@ -442,7 +442,7 @@ security_group_ingress {
 #[ignore = "requires provider schemas"]
 fn context_detection_returns_struct_context() {
     let provider = test_provider();
-    let text = r#"awscc.ec2.security_group {
+    let text = r#"awscc.ec2.SecurityGroup {
 group_description = "test"
 security_group_ingress {
 
@@ -462,7 +462,7 @@ security_group_ingress {
             CompletionContext::InsideStructBlock {
                 ref resource_type,
                 ref attr_path,
-            } if resource_type == "awscc.ec2.security_group" && attr_path == &["security_group_ingress".to_string()]
+            } if resource_type == "awscc.ec2.SecurityGroup" && attr_path == &["security_group_ingress".to_string()]
         ),
         "Should detect InsideStructBlock context, got: {:?}",
         context
@@ -500,11 +500,11 @@ fn type_completion_uses_text_edit_to_replace_from_colon() {
 
     let completions = provider.complete(&doc, position, None);
 
-    // Find any ref type completion (e.g., aws.s3.bucket)
+    // Find any ref type completion (e.g., aws.s3.Bucket)
     let s3_completion = completions
         .iter()
-        .find(|c| c.label == "aws.s3.bucket")
-        .expect("Should have aws.s3.bucket type completion");
+        .find(|c| c.label == "aws.s3.Bucket")
+        .expect("Should have aws.s3.Bucket type completion");
 
     // Must use text_edit (not insert_text) to avoid duplication with dotted identifiers
     assert!(
@@ -523,7 +523,7 @@ fn type_completion_uses_text_edit_to_replace_from_colon() {
             "Should replace up to cursor position"
         );
         assert_eq!(
-            edit.new_text, "aws.s3.bucket",
+            edit.new_text, "aws.s3.Bucket",
             "Insert text should be the resource type"
         );
     } else {
@@ -546,8 +546,8 @@ fn type_completion_with_empty_type() {
 
     let s3_completion = completions
         .iter()
-        .find(|c| c.label == "aws.s3.bucket")
-        .expect("Should have aws.s3.bucket type completion");
+        .find(|c| c.label == "aws.s3.Bucket")
+        .expect("Should have aws.s3.Bucket type completion");
 
     if let Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) = &s3_completion.text_edit {
         assert_eq!(
@@ -559,7 +559,7 @@ fn type_completion_with_empty_type() {
             "Should replace up to cursor position"
         );
         assert_eq!(
-            edit.new_text, "aws.s3.bucket",
+            edit.new_text, "aws.s3.Bucket",
             "Insert text should be the resource type"
         );
     } else {
@@ -935,7 +935,7 @@ fn string_enum_completion_derives_namespace_from_resource_type() {
     // fully-qualified identifiers.
     let provider = test_provider_with_nameless_enum();
     let doc = create_document(
-        r#"awscc.s3.bucket {
+        r#"awscc.s3.Bucket {
 versioning_status =
 }"#,
     );
@@ -949,12 +949,12 @@ versioning_status =
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
-        labels.contains(&"awscc.s3.bucket.VersioningStatus.Enabled"),
+        labels.contains(&"awscc.s3.Bucket.VersioningStatus.Enabled"),
         "expected fully-qualified enum identifier; got: {:?}",
         labels
     );
     assert!(
-        labels.contains(&"awscc.s3.bucket.VersioningStatus.Suspended"),
+        labels.contains(&"awscc.s3.Bucket.VersioningStatus.Suspended"),
         "expected all enum variants in fully-qualified form; got: {:?}",
         labels
     );
@@ -978,7 +978,7 @@ fn string_enum_completion_in_struct_derives_namespace() {
     // and emits the fully-qualified form.
     let provider = test_provider_with_nameless_enum();
     let doc = create_document(
-        r#"awscc.s3.bucket {
+        r#"awscc.s3.Bucket {
 versioning_configuration {
     status =
 }
@@ -993,7 +993,7 @@ versioning_configuration {
 
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
-        labels.contains(&"awscc.s3.bucket.VersioningStatus.Enabled"),
+        labels.contains(&"awscc.s3.Bucket.VersioningStatus.Enabled"),
         "expected fully-qualified enum identifier inside struct; got: {:?}",
         labels
     );
@@ -1170,7 +1170,7 @@ fn string_enum_completion_inside_for_loop_body() {
     let doc = create_document(
         r#"let items = [1, 2]
 for item in items {
-  awscc.s3.bucket {
+  awscc.s3.Bucket {
     versioning_status =
   }
 }
@@ -1186,12 +1186,12 @@ for item in items {
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
-        labels.contains(&"awscc.s3.bucket.VersioningStatus.Enabled"),
+        labels.contains(&"awscc.s3.Bucket.VersioningStatus.Enabled"),
         "StringEnum 'Enabled' must still be offered (fully-qualified) inside a for body. Got: {:?}",
         labels
     );
     assert!(
-        labels.contains(&"awscc.s3.bucket.VersioningStatus.Suspended"),
+        labels.contains(&"awscc.s3.Bucket.VersioningStatus.Suspended"),
         "StringEnum 'Suspended' must still be offered (fully-qualified) inside a for body. Got: {:?}",
         labels
     );
@@ -1215,7 +1215,7 @@ fn string_enum_completion_inside_nested_for_loop_body() {
     let doc = create_document(
         r#"for a in [1] {
   for b in [2] {
-    awscc.s3.bucket {
+    awscc.s3.Bucket {
       versioning_status =
     }
   }
@@ -1232,7 +1232,7 @@ fn string_enum_completion_inside_nested_for_loop_body() {
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
-        labels.contains(&"awscc.s3.bucket.VersioningStatus.Enabled"),
+        labels.contains(&"awscc.s3.Bucket.VersioningStatus.Enabled"),
         "Enum candidate (fully-qualified) must reach nested for body. Got: {:?}",
         labels
     );

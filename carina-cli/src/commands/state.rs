@@ -1076,7 +1076,7 @@ mod tests {
         let state = load_fixture_state();
         let found = find_resource_by_query(&state, "vpc").unwrap();
         assert_eq!(found.name, "my-vpc");
-        assert_eq!(found.resource_type, "ec2.vpc");
+        assert_eq!(found.resource_type, "ec2.Vpc");
     }
 
     #[test]
@@ -1084,7 +1084,7 @@ mod tests {
         let state = load_fixture_state();
         // "main-rt" has no binding, so lookup by name should work
         let found = find_resource_by_query(&state, "main-rt").unwrap();
-        assert_eq!(found.resource_type, "ec2.route_table");
+        assert_eq!(found.resource_type, "ec2.RouteTable");
     }
 
     #[test]
@@ -1096,16 +1096,16 @@ mod tests {
     #[test]
     fn binding_takes_precedence_over_name() {
         let mut state = StateFile::new();
-        let mut rs1 = ResourceState::new("ec2.vpc", "vpc", "awscc");
+        let mut rs1 = ResourceState::new("ec2.Vpc", "vpc", "awscc");
         rs1.binding = Some("my_vpc".to_string());
-        let mut rs2 = ResourceState::new("ec2.subnet", "my_vpc", "awscc");
+        let mut rs2 = ResourceState::new("ec2.Subnet", "my_vpc", "awscc");
         rs2.binding = None;
         state.upsert_resource(rs1);
         state.upsert_resource(rs2);
 
         let found = find_resource_by_query(&state, "my_vpc").unwrap();
         // Should find the one with binding="my_vpc", not name="my_vpc"
-        assert_eq!(found.resource_type, "ec2.vpc");
+        assert_eq!(found.resource_type, "ec2.Vpc");
     }
 
     // --- format_raw_value tests ---

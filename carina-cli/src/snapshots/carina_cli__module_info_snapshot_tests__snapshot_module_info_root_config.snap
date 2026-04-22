@@ -10,5 +10,5 @@ File: root_config
 
 === CREATES ===
 
-  vpc: awscc.ec2.vpc
-    └── subnet: awscc.ec2.subnet
+  vpc: awscc.ec2.Vpc
+    └── subnet: awscc.ec2.Subnet

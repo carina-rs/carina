@@ -668,7 +668,7 @@ mod tests {
               region = awscc.Region.ap_northeast_1
             }
 
-            let vpc = awscc.ec2.vpc {
+            let vpc = awscc.ec2.Vpc {
               cidr_block = "10.0.0.0/16"
             }
 
@@ -679,7 +679,7 @@ mod tests {
               internet_gateway_id = igw.internet_gateway_id
             }
 
-            let rt = awscc.ec2.route_table {
+            let rt = awscc.ec2.RouteTable {
               vpc_id = vpc.vpc_id
             }
 
@@ -743,11 +743,11 @@ mod tests {
               region = awscc.Region.ap_northeast_1
             }
 
-            let vpc = awscc.ec2.vpc {
+            let vpc = awscc.ec2.Vpc {
               cidr_block = "10.0.0.0/16"
             }
 
-            let subnet = awscc.ec2.subnet {
+            let subnet = awscc.ec2.Subnet {
               vpc_id            = vpc.vpc_id
               cidr_block        = "10.0.1.0/24"
               availability_zone = "ap-northeast-1a"
@@ -763,7 +763,7 @@ mod tests {
               subnet_ids         = [subnet.subnet_id]
             }
 
-            let rt = awscc.ec2.route_table {
+            let rt = awscc.ec2.RouteTable {
               vpc_id = vpc.vpc_id
             }
 

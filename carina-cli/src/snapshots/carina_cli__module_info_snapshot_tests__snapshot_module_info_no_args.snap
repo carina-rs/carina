@@ -10,8 +10,8 @@ Module: no_args
 
 === CREATES ===
 
-  my_bucket: awscc.s3.bucket
+  my_bucket: awscc.s3.Bucket
 
 === ATTRIBUTES ===
 
-  bucket_arn: awscc.s3.bucket
+  bucket_arn: awscc.s3.Bucket

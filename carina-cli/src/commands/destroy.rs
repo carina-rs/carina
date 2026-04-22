@@ -1116,12 +1116,12 @@ mod tests {
         let mut state = carina_state::StateFile::new();
         state
             .resources
-            .push(ResourceState::new("ec2.vpc", "main", "awscc"));
+            .push(ResourceState::new("ec2.Vpc", "main", "awscc"));
         state
             .exports
             .insert("vpc_id".to_string(), serde_json::json!("vpc-12345"));
 
-        let destroyed = vec![ResourceId::with_provider("awscc", "ec2.vpc", "main")];
+        let destroyed = vec![ResourceId::with_provider("awscc", "ec2.Vpc", "main")];
         apply_destroy_to_state(&mut state, &destroyed);
 
         assert!(state.resources.is_empty(), "resource should be removed");
@@ -1130,7 +1130,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_deletion_succeeds_when_resource_disappears() {
-        let id = ResourceId::new("s3.bucket", "test");
+        let id = ResourceId::new("s3.Bucket", "test");
         let provider = SequenceProvider::new(vec![Ok(State::not_found(id.clone()))]);
 
         let result = wait_for_deletion(
@@ -1147,7 +1147,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_deletion_returns_read_error_on_provider_error() {
-        let id = ResourceId::new("s3.bucket", "test");
+        let id = ResourceId::new("s3.Bucket", "test");
         let provider = SequenceProvider::new(vec![Err(ProviderError::new("auth expired"))]);
 
         let result = wait_for_deletion(
@@ -1175,7 +1175,7 @@ mod tests {
         // Previously, Err(_) from provider.read() was treated as successful
         // deletion, causing live infrastructure to be orphaned while the user
         // was told it was destroyed.
-        let id = ResourceId::new("s3.bucket", "test");
+        let id = ResourceId::new("s3.Bucket", "test");
         let provider = SequenceProvider::new(vec![Err(ProviderError::new("network timeout"))]);
 
         let result = wait_for_deletion(
@@ -1193,7 +1193,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_deletion_times_out_when_resource_keeps_existing() {
-        let id = ResourceId::new("s3.bucket", "test");
+        let id = ResourceId::new("s3.Bucket", "test");
         let existing_state = State::existing(id.clone(), HashMap::new());
         let provider = SequenceProvider::new(vec![
             Ok(existing_state.clone()),
@@ -1216,7 +1216,7 @@ mod tests {
     #[tokio::test]
     async fn wait_for_deletion_succeeds_after_transient_exists() {
         // Resource exists on first poll, then disappears on second.
-        let id = ResourceId::new("s3.bucket", "test");
+        let id = ResourceId::new("s3.Bucket", "test");
         let existing_state = State::existing(id.clone(), HashMap::new());
         let provider =
             SequenceProvider::new(vec![Ok(existing_state), Ok(State::not_found(id.clone()))]);

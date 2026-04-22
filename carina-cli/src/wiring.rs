@@ -1175,7 +1175,7 @@ pub fn add_state_block_effects(
             StateBlock::Import { to, id } => {
                 // Try exact match first; fall back to matching against anonymous
                 // resources via the schema's name_attribute. This lets users write
-                // `to = awscc.s3.bucket 'carina-rs-state'` without needing the
+                // `to = awscc.s3.Bucket 'carina-rs-state'` without needing the
                 // auto-generated hash name.
                 let effective_to = resolve_import_target(to, plan, state_file, schemas);
 
@@ -1250,7 +1250,7 @@ pub fn add_state_block_effects(
 /// 1. Anonymous resources in the plan's Create effects (pre-apply case)
 /// 2. Resources in the state file (already-imported case)
 ///
-/// This lets users write `to = awscc.s3.bucket 'carina-rs-state'` without needing
+/// This lets users write `to = awscc.s3.Bucket 'carina-rs-state'` without needing
 /// the auto-generated hash name, matching against `bucket_name = 'carina-rs-state'`.
 fn resolve_import_target(
     to: &ResourceId,
@@ -1547,11 +1547,11 @@ mod tests {
     #[ignore = "requires provider binary for enum alias resolution"]
     fn test_resolve_enum_aliases_in_struct_field() {
         // Aliases within struct fields (maps inside lists) should also be resolved
-        let mut resource = Resource::with_provider("awscc", "ec2.security_group", "test-sg");
+        let mut resource = Resource::with_provider("awscc", "ec2.SecurityGroup", "test-sg");
         let mut egress_map = HashMap::new();
         egress_map.insert(
             "ip_protocol".to_string(),
-            Value::String("awscc.ec2.security_group.IpProtocol.all".to_string()),
+            Value::String("awscc.ec2.SecurityGroup.IpProtocol.all".to_string()),
         );
         egress_map.insert(
             "cidr_ip".to_string(),
@@ -1589,7 +1589,7 @@ mod tests {
     ///
     /// When state contains raw AWS enum values (e.g., "default") and desired
     /// resources have been normalized to DSL enum format (e.g.,
-    /// "awscc.ec2.vpc.InstanceTenancy.default"), the differ would see a false
+    /// "awscc.ec2.Vpc.InstanceTenancy.default"), the differ would see a false
     /// diff unless normalize_state is also applied to current states.
     ///
     /// Both the plan path (wiring.rs) and the apply path (apply.rs) must call
@@ -1605,10 +1605,10 @@ mod tests {
         let ctx = WiringContext::new(vec![]);
 
         // Desired resource with normalized DSL enum value (after normalize_desired)
-        let mut resource = Resource::with_provider("awscc", "ec2.vpc", "test-vpc");
+        let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "test-vpc");
         resource.set_attr(
             "instance_tenancy".to_string(),
-            Value::String("awscc.ec2.vpc.InstanceTenancy.default".to_string()),
+            Value::String("awscc.ec2.Vpc.InstanceTenancy.default".to_string()),
         );
 
         // State with raw AWS value (as returned by provider.read())
@@ -1680,15 +1680,15 @@ mod tests {
 
         // Build a minimal schema that has a "tags" attribute.
         // merge_default_tags checks for the presence of "tags" in the schema.
-        let schema = ResourceSchema::new("awscc.s3.bucket").attribute(AttributeSchema::new(
+        let schema = ResourceSchema::new("awscc.s3.Bucket").attribute(AttributeSchema::new(
             "tags",
             AttributeType::map(AttributeType::String),
         ));
         let mut schemas: HashMap<String, ResourceSchema> = HashMap::new();
-        schemas.insert("awscc.s3.bucket".to_string(), schema);
+        schemas.insert("awscc.s3.Bucket".to_string(), schema);
 
         // Desired resource without explicit tags
-        let resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
+        let resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket");
 
         // State already has the default tags (from a previous apply)
         let id = resource.id.clone();
@@ -1770,7 +1770,7 @@ mod tests {
     #[test]
     fn test_resolve_enum_aliases_non_enum_values_unchanged() {
         // Non-DSL-enum strings should not be affected
-        let mut resource = Resource::with_provider("awscc", "ec2.security_group", "test-sg");
+        let mut resource = Resource::with_provider("awscc", "ec2.SecurityGroup", "test-sg");
         resource.set_attr(
             "group_description".to_string(),
             Value::String("My security group".to_string()),
@@ -1799,12 +1799,12 @@ mod tests {
 
         // Schema with name_attribute = "bucket_name"
         let bucket_schema =
-            ResourceSchema::new("awscc.s3.bucket").with_name_attribute("bucket_name");
+            ResourceSchema::new("awscc.s3.Bucket").with_name_attribute("bucket_name");
         let mut schemas = HashMap::new();
-        schemas.insert("awscc.s3.bucket".to_string(), bucket_schema);
+        schemas.insert("awscc.s3.Bucket".to_string(), bucket_schema);
 
         // Anonymous resource with hash name but bucket_name = "carina-rs-state"
-        let mut resource = Resource::with_provider("awscc", "s3.bucket", "s3_bucket_1d43a664");
+        let mut resource = Resource::with_provider("awscc", "s3.Bucket", "s3_bucket_1d43a664");
         resource.set_attr(
             "bucket_name".to_string(),
             Value::String("carina-rs-state".to_string()),
@@ -1814,7 +1814,7 @@ mod tests {
 
         // Import block with the logical name (not the hash)
         let state_blocks = vec![StateBlock::Import {
-            to: ResourceId::with_provider("awscc", "s3.bucket", "carina-rs-state"),
+            to: ResourceId::with_provider("awscc", "s3.Bucket", "carina-rs-state"),
             id: "carina-rs-state".to_string(),
         }];
 
@@ -1847,13 +1847,13 @@ mod tests {
         use carina_state::state::{ResourceState, StateFile};
 
         let bucket_schema =
-            ResourceSchema::new("awscc.s3.bucket").with_name_attribute("bucket_name");
+            ResourceSchema::new("awscc.s3.Bucket").with_name_attribute("bucket_name");
         let mut schemas = HashMap::new();
-        schemas.insert("awscc.s3.bucket".to_string(), bucket_schema);
+        schemas.insert("awscc.s3.Bucket".to_string(), bucket_schema);
 
         // State has the resource under its anonymous hash name
         let mut state_file = StateFile::new();
-        let mut rs = ResourceState::new("s3.bucket", "s3_bucket_1d43a664", "awscc");
+        let mut rs = ResourceState::new("s3.Bucket", "s3_bucket_1d43a664", "awscc");
         rs.attributes.insert(
             "bucket_name".to_string(),
             serde_json::Value::String("carina-rs-state".to_string()),
@@ -1862,7 +1862,7 @@ mod tests {
 
         let mut plan = Plan::new();
         let state_blocks = vec![StateBlock::Import {
-            to: ResourceId::with_provider("awscc", "s3.bucket", "carina-rs-state"),
+            to: ResourceId::with_provider("awscc", "s3.Bucket", "carina-rs-state"),
             id: "carina-rs-state".to_string(),
         }];
 
@@ -1888,7 +1888,7 @@ mod tests {
         let identity_store_id = "d-9067c29a4b";
 
         // Managed resource with a binding — phase 1 would have refreshed it.
-        let mut sso = Resource::with_provider("awscc", "sso.instance", "carina-rs");
+        let mut sso = Resource::with_provider("awscc", "sso.Instance", "carina-rs");
         sso.binding = Some("sso".to_string());
 
         // Data source referencing `sso.identity_store_id`.

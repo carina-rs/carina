@@ -355,7 +355,7 @@ pub fn check_and_migrate_bytes(bytes: &[u8]) -> Result<StateFile, BackendError> 
 /// State of a single managed resource
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceState {
-    /// Resource type (e.g., "s3.bucket", "ec2.vpc")
+    /// Resource type (e.g., "s3.Bucket", "ec2.Vpc")
     pub resource_type: String,
     /// Resource name (from the `name` attribute in DSL)
     pub name: String,
@@ -577,14 +577,14 @@ mod tests {
     fn test_state_file_upsert_resource() {
         let mut state = StateFile::new();
 
-        let resource1 = ResourceState::new("s3.bucket", "my-bucket", "aws")
+        let resource1 = ResourceState::new("s3.Bucket", "my-bucket", "aws")
             .with_attribute("region".to_string(), serde_json::json!("ap-northeast-1"));
 
         state.upsert_resource(resource1);
         assert_eq!(state.resources.len(), 1);
 
         // Update the same resource
-        let resource2 = ResourceState::new("s3.bucket", "my-bucket", "aws")
+        let resource2 = ResourceState::new("s3.Bucket", "my-bucket", "aws")
             .with_attribute("region".to_string(), serde_json::json!("us-west-2"));
 
         state.upsert_resource(resource2);
@@ -599,29 +599,29 @@ mod tests {
     fn test_state_file_remove_resource() {
         let mut state = StateFile::new();
 
-        let resource = ResourceState::new("s3.bucket", "my-bucket", "aws");
+        let resource = ResourceState::new("s3.Bucket", "my-bucket", "aws");
         state.upsert_resource(resource);
         assert_eq!(state.resources.len(), 1);
 
-        let removed = state.remove_resource("aws", "s3.bucket", "my-bucket");
+        let removed = state.remove_resource("aws", "s3.Bucket", "my-bucket");
         assert!(removed.is_some());
         assert_eq!(state.resources.len(), 0);
 
         // Removing non-existent resource returns None
-        let removed = state.remove_resource("aws", "s3.bucket", "other-bucket");
+        let removed = state.remove_resource("aws", "s3.Bucket", "other-bucket");
         assert!(removed.is_none());
     }
 
     #[test]
     fn test_resource_state_protected() {
-        let resource = ResourceState::new("s3.bucket", "state-bucket", "aws").with_protected(true);
+        let resource = ResourceState::new("s3.Bucket", "state-bucket", "aws").with_protected(true);
         assert!(resource.protected);
     }
 
     #[test]
     fn test_state_file_serialization() {
         let mut state = StateFile::new();
-        let resource = ResourceState::new("s3.bucket", "my-bucket", "aws")
+        let resource = ResourceState::new("s3.Bucket", "my-bucket", "aws")
             .with_attribute("region".to_string(), serde_json::json!("ap-northeast-1"))
             .with_attribute("versioning".to_string(), serde_json::json!("Enabled"));
 
@@ -638,7 +638,7 @@ mod tests {
 
     #[test]
     fn test_resource_state_prefixes_serialization() {
-        let mut resource = ResourceState::new("s3.bucket", "test-bucket", "awscc").with_attribute(
+        let mut resource = ResourceState::new("s3.Bucket", "test-bucket", "awscc").with_attribute(
             "bucket_name".to_string(),
             serde_json::json!("my-app-abcd1234"),
         );
@@ -660,11 +660,11 @@ mod tests {
         use carina_core::resource::Resource;
 
         let mut state = StateFile::new();
-        let rs = ResourceState::new("s3.bucket", "my-bucket", "awscc")
+        let rs = ResourceState::new("s3.Bucket", "my-bucket", "awscc")
             .with_identifier("my-bucket-abcd1234");
         state.upsert_resource(rs);
 
-        let resource = Resource::with_provider("awscc", "s3.bucket", "my-bucket");
+        let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket");
         assert_eq!(
             state.get_identifier_for_resource(&resource),
             Some("my-bucket-abcd1234".to_string())
@@ -676,7 +676,7 @@ mod tests {
         use carina_core::resource::Resource;
 
         let state = StateFile::new();
-        let resource = Resource::with_provider("awscc", "s3.bucket", "my-bucket");
+        let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket");
         assert_eq!(state.get_identifier_for_resource(&resource), None);
     }
 
@@ -685,12 +685,12 @@ mod tests {
         use carina_core::resource::ResourceId;
 
         let mut state = StateFile::new();
-        let mut rs = ResourceState::new("s3.bucket", "my-bucket", "awscc");
+        let mut rs = ResourceState::new("s3.Bucket", "my-bucket", "awscc");
         rs.lifecycle.force_delete = true;
         state.upsert_resource(rs);
 
         let lifecycles = state.build_lifecycles();
-        let id = ResourceId::with_provider("awscc", "s3.bucket", "my-bucket");
+        let id = ResourceId::with_provider("awscc", "s3.Bucket", "my-bucket");
         assert!(lifecycles.get(&id).unwrap().force_delete);
     }
 
@@ -699,12 +699,12 @@ mod tests {
         use carina_core::resource::{ResourceId, Value};
 
         let mut state = StateFile::new();
-        let rs = ResourceState::new("s3.bucket", "my-bucket", "awscc")
+        let rs = ResourceState::new("s3.Bucket", "my-bucket", "awscc")
             .with_attribute("region".to_string(), serde_json::json!("ap-northeast-1"));
         state.upsert_resource(rs);
 
         let saved = state.build_saved_attrs();
-        let id = ResourceId::with_provider("awscc", "s3.bucket", "my-bucket");
+        let id = ResourceId::with_provider("awscc", "s3.Bucket", "my-bucket");
         let attrs = saved.get(&id).unwrap();
         assert_eq!(
             attrs.get("region"),
@@ -715,7 +715,7 @@ mod tests {
     #[test]
     fn test_resource_state_serialization_with_binding_and_deps() {
         let json = r#"{
-            "resource_type": "s3.bucket",
+            "resource_type": "s3.Bucket",
             "name": "my-bucket",
             "provider": "aws",
             "attributes": {"region": "ap-northeast-1"},
@@ -737,7 +737,7 @@ mod tests {
     fn test_resource_state_deserialization_without_v3_fields() {
         // v2 state files don't have binding or dependency_bindings fields
         let json = r#"{
-            "resource_type": "s3.bucket",
+            "resource_type": "s3.Bucket",
             "name": "my-bucket",
             "provider": "aws",
             "attributes": {"region": "ap-northeast-1"},
@@ -758,7 +758,7 @@ mod tests {
     fn test_from_provider_state() {
         use carina_core::resource::{Resource, State as ProviderState, Value};
 
-        let mut resource = Resource::with_provider("awscc", "s3.bucket", "my-bucket");
+        let mut resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket");
         resource.lifecycle.force_delete = true;
         resource
             .prefixes
@@ -777,7 +777,7 @@ mod tests {
             dependency_bindings: Vec::new(),
         };
 
-        let existing = ResourceState::new("s3.bucket", "my-bucket", "awscc").with_protected(true);
+        let existing = ResourceState::new("s3.Bucket", "my-bucket", "awscc").with_protected(true);
 
         let rs = ResourceState::from_provider_state(&resource, &provider_state, Some(&existing))
             .unwrap();
@@ -796,7 +796,7 @@ mod tests {
     fn test_from_provider_state_without_existing() {
         use carina_core::resource::{Resource, State as ProviderState, Value};
 
-        let resource = Resource::with_provider("aws", "s3.bucket", "test");
+        let resource = Resource::with_provider("aws", "s3.Bucket", "test");
         let provider_state = ProviderState {
             id: resource.id.clone(),
             identifier: Some("test-id".to_string()),
@@ -820,9 +820,9 @@ mod tests {
 
         // Store two resources with the same resource_type and name but different providers
         let aws_resource =
-            ResourceState::new("s3.bucket", "main", "aws").with_identifier("aws-bucket-id");
+            ResourceState::new("s3.Bucket", "main", "aws").with_identifier("aws-bucket-id");
         let awscc_resource =
-            ResourceState::new("s3.bucket", "main", "awscc").with_identifier("awscc-bucket-id");
+            ResourceState::new("s3.Bucket", "main", "awscc").with_identifier("awscc-bucket-id");
 
         state.upsert_resource(aws_resource);
         state.upsert_resource(awscc_resource);
@@ -831,20 +831,20 @@ mod tests {
         assert_eq!(state.resources.len(), 2);
 
         // find_resource should return the correct one for each provider
-        let found_aws = state.find_resource("aws", "s3.bucket", "main").unwrap();
+        let found_aws = state.find_resource("aws", "s3.Bucket", "main").unwrap();
         assert_eq!(found_aws.identifier, Some("aws-bucket-id".to_string()));
 
-        let found_awscc = state.find_resource("awscc", "s3.bucket", "main").unwrap();
+        let found_awscc = state.find_resource("awscc", "s3.Bucket", "main").unwrap();
         assert_eq!(found_awscc.identifier, Some("awscc-bucket-id".to_string()));
 
         // get_identifier_for_resource should return provider-scoped identifiers
-        let aws_res = Resource::with_provider("aws", "s3.bucket", "main");
+        let aws_res = Resource::with_provider("aws", "s3.Bucket", "main");
         assert_eq!(
             state.get_identifier_for_resource(&aws_res),
             Some("aws-bucket-id".to_string())
         );
 
-        let awscc_res = Resource::with_provider("awscc", "s3.bucket", "main");
+        let awscc_res = Resource::with_provider("awscc", "s3.Bucket", "main");
         assert_eq!(
             state.get_identifier_for_resource(&awscc_res),
             Some("awscc-bucket-id".to_string())
@@ -852,33 +852,33 @@ mod tests {
 
         // Upsert should only update the matching provider's entry
         let updated_aws =
-            ResourceState::new("s3.bucket", "main", "aws").with_identifier("aws-bucket-id-v2");
+            ResourceState::new("s3.Bucket", "main", "aws").with_identifier("aws-bucket-id-v2");
         state.upsert_resource(updated_aws);
         assert_eq!(state.resources.len(), 2);
         assert_eq!(
             state
-                .find_resource("aws", "s3.bucket", "main")
+                .find_resource("aws", "s3.Bucket", "main")
                 .unwrap()
                 .identifier,
             Some("aws-bucket-id-v2".to_string())
         );
         assert_eq!(
             state
-                .find_resource("awscc", "s3.bucket", "main")
+                .find_resource("awscc", "s3.Bucket", "main")
                 .unwrap()
                 .identifier,
             Some("awscc-bucket-id".to_string())
         );
 
         // remove_resource should only remove the matching provider's entry
-        let removed = state.remove_resource("aws", "s3.bucket", "main");
+        let removed = state.remove_resource("aws", "s3.Bucket", "main");
         assert!(removed.is_some());
         assert_eq!(removed.unwrap().provider, "aws");
         assert_eq!(state.resources.len(), 1);
 
         // The awscc entry should still exist
-        assert!(state.find_resource("awscc", "s3.bucket", "main").is_some());
-        assert!(state.find_resource("aws", "s3.bucket", "main").is_none());
+        assert!(state.find_resource("awscc", "s3.Bucket", "main").is_some());
+        assert!(state.find_resource("aws", "s3.Bucket", "main").is_none());
     }
 
     #[test]
@@ -886,16 +886,16 @@ mod tests {
         use carina_core::resource::ResourceId;
 
         let mut state = StateFile::new();
-        let mut aws_rs = ResourceState::new("s3.bucket", "main", "aws");
+        let mut aws_rs = ResourceState::new("s3.Bucket", "main", "aws");
         aws_rs.lifecycle.force_delete = true;
-        let awscc_rs = ResourceState::new("s3.bucket", "main", "awscc");
+        let awscc_rs = ResourceState::new("s3.Bucket", "main", "awscc");
 
         state.upsert_resource(aws_rs);
         state.upsert_resource(awscc_rs);
 
         let lifecycles = state.build_lifecycles();
-        let aws_id = ResourceId::with_provider("aws", "s3.bucket", "main");
-        let awscc_id = ResourceId::with_provider("awscc", "s3.bucket", "main");
+        let aws_id = ResourceId::with_provider("aws", "s3.Bucket", "main");
+        let awscc_id = ResourceId::with_provider("awscc", "s3.Bucket", "main");
 
         assert!(lifecycles.get(&aws_id).unwrap().force_delete);
         assert!(!lifecycles.get(&awscc_id).unwrap().force_delete);
@@ -906,17 +906,17 @@ mod tests {
         use carina_core::resource::{ResourceId, Value};
 
         let mut state = StateFile::new();
-        let aws_rs = ResourceState::new("s3.bucket", "main", "aws")
+        let aws_rs = ResourceState::new("s3.Bucket", "main", "aws")
             .with_attribute("region".to_string(), serde_json::json!("us-east-1"));
-        let awscc_rs = ResourceState::new("s3.bucket", "main", "awscc")
+        let awscc_rs = ResourceState::new("s3.Bucket", "main", "awscc")
             .with_attribute("region".to_string(), serde_json::json!("ap-northeast-1"));
 
         state.upsert_resource(aws_rs);
         state.upsert_resource(awscc_rs);
 
         let saved = state.build_saved_attrs();
-        let aws_id = ResourceId::with_provider("aws", "s3.bucket", "main");
-        let awscc_id = ResourceId::with_provider("awscc", "s3.bucket", "main");
+        let aws_id = ResourceId::with_provider("aws", "s3.Bucket", "main");
+        let awscc_id = ResourceId::with_provider("awscc", "s3.Bucket", "main");
 
         assert_eq!(
             saved.get(&aws_id).unwrap().get("region"),
@@ -934,12 +934,12 @@ mod tests {
 
         let mut state = StateFile::new();
         state.upsert_resource(
-            ResourceState::new("s3.bucket", "my-bucket", "awscc")
+            ResourceState::new("s3.Bucket", "my-bucket", "awscc")
                 .with_identifier("my-bucket-id")
                 .with_attribute("region".to_string(), serde_json::json!("ap-northeast-1")),
         );
 
-        let resource = Resource::with_provider("awscc", "s3.bucket", "my-bucket");
+        let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket");
         let result = state.build_state_for_resource(&resource);
 
         assert!(result.exists);
@@ -954,7 +954,7 @@ mod tests {
     fn test_build_state_for_resource_not_found() {
         let state = StateFile::new();
         let resource =
-            carina_core::resource::Resource::with_provider("awscc", "s3.bucket", "missing");
+            carina_core::resource::Resource::with_provider("awscc", "s3.Bucket", "missing");
         let result = state.build_state_for_resource(&resource);
 
         assert!(!result.exists);
@@ -967,12 +967,12 @@ mod tests {
         let mut state = StateFile::new();
         // Resource in state but without identifier (not yet created)
         state.upsert_resource(
-            ResourceState::new("s3.bucket", "pending", "awscc")
+            ResourceState::new("s3.Bucket", "pending", "awscc")
                 .with_attribute("region".to_string(), serde_json::json!("us-east-1")),
         );
 
         let resource =
-            carina_core::resource::Resource::with_provider("awscc", "s3.bucket", "pending");
+            carina_core::resource::Resource::with_provider("awscc", "s3.Bucket", "pending");
         let result = state.build_state_for_resource(&resource);
 
         assert!(!result.exists);
@@ -983,7 +983,7 @@ mod tests {
     fn test_from_provider_state_stores_binding_and_dependencies() {
         use carina_core::resource::{Resource, State as ProviderState, Value};
 
-        let mut resource = Resource::with_provider("awscc", "ec2.subnet", "my-subnet");
+        let mut resource = Resource::with_provider("awscc", "ec2.Subnet", "my-subnet");
         resource.binding = Some("my_subnet".to_string());
         resource.set_attr(
             "vpc_id".to_string(),
@@ -1010,7 +1010,7 @@ mod tests {
         use carina_core::resource::{ResourceId, Value};
 
         let mut state = StateFile::new();
-        let mut rs = ResourceState::new("ec2.subnet", "orphan-subnet", "awscc")
+        let mut rs = ResourceState::new("ec2.Subnet", "orphan-subnet", "awscc")
             .with_identifier("subnet-123");
         rs.binding = Some("my_subnet".to_string());
         rs.dependency_bindings = vec!["my_vpc".to_string()];
@@ -1019,7 +1019,7 @@ mod tests {
         let desired_ids = std::collections::HashSet::new();
         let orphans = state.build_orphan_states(&desired_ids);
 
-        let id = ResourceId::with_provider("awscc", "ec2.subnet", "orphan-subnet");
+        let id = ResourceId::with_provider("awscc", "ec2.Subnet", "orphan-subnet");
         let orphan_state = orphans.get(&id).unwrap();
         assert!(orphan_state.exists);
         assert_eq!(
@@ -1033,7 +1033,7 @@ mod tests {
         use carina_core::resource::ResourceId;
 
         let mut state = StateFile::new();
-        let mut rs = ResourceState::new("ec2.subnet", "orphan-subnet", "awscc")
+        let mut rs = ResourceState::new("ec2.Subnet", "orphan-subnet", "awscc")
             .with_identifier("subnet-123");
         rs.binding = Some("my_subnet".to_string());
         rs.dependency_bindings = vec!["my_vpc".to_string()];
@@ -1042,7 +1042,7 @@ mod tests {
         let desired_ids = std::collections::HashSet::new();
         let deps = state.build_orphan_dependencies(&desired_ids);
 
-        let id = ResourceId::with_provider("awscc", "ec2.subnet", "orphan-subnet");
+        let id = ResourceId::with_provider("awscc", "ec2.Subnet", "orphan-subnet");
         assert_eq!(deps.get(&id).unwrap(), &vec!["my_vpc".to_string()]);
     }
 
@@ -1058,11 +1058,11 @@ mod tests {
 
         let mut state = StateFile::new();
         let mut rs =
-            ResourceState::new("ec2.subnet", "kept-subnet", "awscc").with_identifier("subnet-456");
+            ResourceState::new("ec2.Subnet", "kept-subnet", "awscc").with_identifier("subnet-456");
         rs.dependency_bindings = vec!["my_vpc".to_string()];
         state.upsert_resource(rs);
 
-        let id = ResourceId::with_provider("awscc", "ec2.subnet", "kept-subnet");
+        let id = ResourceId::with_provider("awscc", "ec2.Subnet", "kept-subnet");
         let mut desired_ids = std::collections::HashSet::new();
         desired_ids.insert(id.clone());
 
@@ -1168,7 +1168,7 @@ mod tests {
         use carina_core::resource::{Resource, State as ProviderState, Value};
 
         // Simulate a VPC resource with a write-only attribute (ipv4_netmask_length)
-        let mut resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc");
+        let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc");
         resource.set_attr(
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
@@ -1214,7 +1214,7 @@ mod tests {
         use carina_core::resource::{Resource, State as ProviderState, Value};
 
         // Resource without write-only attribute specified
-        let mut resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc");
+        let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc");
         resource.set_attr(
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
@@ -1249,7 +1249,7 @@ mod tests {
         use carina_core::resource::{Resource, State as ProviderState, Value};
 
         // Resource with a write-only attribute
-        let mut resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc");
+        let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc");
         resource.set_attr(
             "some_attr".to_string(),
             Value::String("desired".to_string()),
@@ -1285,7 +1285,7 @@ mod tests {
 
     #[test]
     fn test_write_only_attributes_serialization() {
-        let mut rs = ResourceState::new("ec2.vpc", "my-vpc", "awscc")
+        let mut rs = ResourceState::new("ec2.Vpc", "my-vpc", "awscc")
             .with_identifier("vpc-123")
             .with_attribute("cidr_block".to_string(), serde_json::json!("10.0.0.0/16"))
             .with_attribute("ipv4_netmask_length".to_string(), serde_json::json!(16));
@@ -1306,7 +1306,7 @@ mod tests {
 
     #[test]
     fn test_write_only_attributes_omitted_when_empty() {
-        let rs = ResourceState::new("s3.bucket", "my-bucket", "awscc");
+        let rs = ResourceState::new("s3.Bucket", "my-bucket", "awscc");
         let json = serde_json::to_string(&rs).unwrap();
 
         // write_only_attributes should not appear in JSON when empty
@@ -1367,7 +1367,7 @@ mod tests {
         use carina_core::value::SECRET_PREFIX;
         use std::collections::HashMap as StdHashMap;
 
-        let mut resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc");
+        let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc");
         let mut tags_map = StdHashMap::new();
         tags_map.insert("Name".to_string(), Value::String("test".to_string()));
         tags_map.insert(
@@ -1422,7 +1422,7 @@ mod tests {
         use std::collections::HashMap as StdHashMap;
 
         // User specifies only SecretTag in tags
-        let mut resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc");
+        let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc");
         let mut tags_map = StdHashMap::new();
         tags_map.insert(
             "SecretTag".to_string(),
@@ -1550,7 +1550,7 @@ mod tests {
         let mut state = StateFile::new();
         // Add a resource with a binding — should NOT appear in remote bindings
         state.resources.push(ResourceState {
-            resource_type: "ec2.vpc".to_string(),
+            resource_type: "ec2.Vpc".to_string(),
             name: "vpc_123".to_string(),
             provider: "awscc".to_string(),
             identifier: Some("vpc-123".to_string()),

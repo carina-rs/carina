@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn test_resource_schema_without_operation_config() {
-        let json = r#"{"resource_type":"ec2.vpc","attributes":{}}"#;
+        let json = r#"{"resource_type":"ec2.Vpc","attributes":{}}"#;
         let schema: ResourceSchema = serde_json::from_str(json).unwrap();
         assert!(schema.operation_config.is_none());
     }

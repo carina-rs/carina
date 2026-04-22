@@ -1,7 +1,7 @@
 attributes {
-  bucket_arn: awscc.s3.bucket = my_bucket.arn
+  bucket_arn: awscc.s3.Bucket = my_bucket.arn
 }
 
-let my_bucket = awscc.s3.bucket {
+let my_bucket = awscc.s3.Bucket {
   bucket_name = 'static-assets'
 }

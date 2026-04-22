@@ -11,10 +11,10 @@ Module: no_deps
 
 === CREATES ===
 
-  logs_bucket: awscc.s3.bucket
-  event_queue: awscc.sqs.queue
+  logs_bucket: awscc.s3.Bucket
+  event_queue: awscc.sqs.Queue
 
 === ATTRIBUTES ===
 
-  bucket_id: awscc.s3.bucket
-  queue_url: awscc.sqs.queue
+  bucket_id: awscc.s3.Bucket
+  queue_url: awscc.sqs.Queue

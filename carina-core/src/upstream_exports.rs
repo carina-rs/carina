@@ -60,7 +60,7 @@ impl std::error::Error for UpstreamResolveError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamFieldError {
     /// Where in the downstream project the bad reference appears
-    /// (e.g. `"aws.s3.bucket.main attribute `name`"`).
+    /// (e.g. `"aws.s3.Bucket.main attribute `name`"`).
     pub location: String,
     pub binding: String,
     pub field: String,
@@ -770,7 +770,7 @@ mod tests {
             let orgs = upstream_state { source = "../organizations" }
 
             for name, _ in orgs.accounts {
-                awscc.ec2.vpc {
+                awscc.ec2.Vpc {
                     name = name
                     cidr_block = orgs.NONEXISTENT
                 }
@@ -793,7 +793,7 @@ mod tests {
             r#"
             let orgs = upstream_state { source = "../organizations" }
             for name, _ in orgs.accounts {
-                aws.s3.bucket {
+                aws.s3.Bucket {
                     name = orgs.missing
                 }
             }
@@ -813,7 +813,7 @@ mod tests {
             let orgs = upstream_state { source = "../organizations" }
 
             for name, _ in orgs.account {
-                awscc.ec2.vpc {
+                awscc.ec2.Vpc {
                     name = name
                     cidr_block = '10.0.0.0/16'
                 }

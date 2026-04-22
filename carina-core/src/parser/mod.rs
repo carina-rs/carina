@@ -131,7 +131,7 @@ pub struct DeferredForExpression {
     pub line: usize,
     /// The for-expression header, e.g., `for account_id in orgs.accounts`.
     pub header: String,
-    /// The provider-qualified resource type the loop body would produce (e.g., `awscc.sso.assignment`).
+    /// The provider-qualified resource type the loop body would produce (e.g., `awscc.sso.Assignment`).
     pub resource_type: String,
     /// Attribute template: key → value (concrete values are resolved;
     /// loop-bound variables remain as `ResourceRef` or placeholder strings).
@@ -2822,7 +2822,7 @@ fn parse_provider_block(
     })
 }
 
-/// Split a namespaced identifier (e.g., "awscc.ec2.vpc") into (provider, resource_type)
+/// Split a namespaced identifier (e.g., "awscc.ec2.Vpc") into (provider, resource_type)
 fn split_namespaced_id(namespaced: &str) -> (String, String) {
     let parts: Vec<&str> = namespaced.split('.').collect();
     if parts.len() >= 2 {
@@ -5486,7 +5486,7 @@ mod tests {
         // When a bare identifier is not a known variable or binding,
         // it becomes a String for later schema validation (enum resolution)
         let input = r#"
-            let vpc = awscc.ec2.vpc {
+            let vpc = awscc.ec2.Vpc {
                 instance_tenancy = dedicated
             }
         "#;
@@ -5939,7 +5939,7 @@ mod tests {
                 subnet_ids: list(string) = subnets.ids
             }
 
-            let vpc = awscc.ec2.vpc {
+            let vpc = awscc.ec2.Vpc {
                 cidr_block = "10.0.0.0/16"
             }
 
@@ -6131,7 +6131,7 @@ mod tests {
                 versioning = "Enabled"
             }
 
-            aws.ec2.vpc {
+            aws.ec2.Vpc {
                 name       = "main-vpc"
                 cidr_block = "10.0.0.0/16"
             }
@@ -6266,7 +6266,7 @@ mod tests {
     #[test]
     fn anonymous_resource_no_spurious_name_attribute() {
         let input = r#"
-            awscc.ec2.vpc {
+            awscc.ec2.Vpc {
                 cidr_block = "10.0.0.0/16"
             }
         "#;
@@ -6289,7 +6289,7 @@ mod tests {
     #[test]
     fn let_bound_resource_no_spurious_name_attribute() {
         let input = r#"
-            let vpc = awscc.ec2.vpc {
+            let vpc = awscc.ec2.Vpc {
                 cidr_block = "10.0.0.0/16"
             }
         "#;
@@ -6310,7 +6310,7 @@ mod tests {
     #[test]
     fn parse_lifecycle_create_before_destroy() {
         let input = r#"
-            let vpc = awscc.ec2.vpc {
+            let vpc = awscc.ec2.Vpc {
                 cidr_block = "10.0.0.0/16"
                 lifecycle {
                     create_before_destroy = true
@@ -6509,7 +6509,7 @@ mod tests {
     fn parse_nested_block_in_map() {
         // Test nested block inside map value: attr = { block { ... } }
         let input = r#"
-            let role = aws.iam.role {
+            let role = aws.iam.Role {
                 policy_document = {
                     statement {
                         effect = "Allow"
@@ -6543,10 +6543,10 @@ mod tests {
     #[test]
     fn test_find_resource_by_attr() {
         let input = r#"
-            aws.s3.bucket {
+            aws.s3.Bucket {
                 bucket = "my-bucket"
             }
-            aws.s3.bucket {
+            aws.s3.Bucket {
                 bucket = "other-bucket"
             }
         "#;
@@ -6554,22 +6554,22 @@ mod tests {
 
         assert!(
             parsed
-                .find_resource_by_attr("s3.bucket", "bucket", "my-bucket")
+                .find_resource_by_attr("s3.Bucket", "bucket", "my-bucket")
                 .is_some()
         );
         assert!(
             parsed
-                .find_resource_by_attr("s3.bucket", "bucket", "other-bucket")
+                .find_resource_by_attr("s3.Bucket", "bucket", "other-bucket")
                 .is_some()
         );
         assert!(
             parsed
-                .find_resource_by_attr("s3.bucket", "bucket", "no-such")
+                .find_resource_by_attr("s3.Bucket", "bucket", "no-such")
                 .is_none()
         );
         assert!(
             parsed
-                .find_resource_by_attr("ec2.vpc", "bucket", "my-bucket")
+                .find_resource_by_attr("ec2.Vpc", "bucket", "my-bucket")
                 .is_none()
         );
     }
@@ -6582,7 +6582,7 @@ provider aws {
     region = aws.Region.ap_northeast_1
 }
 
-aws.s3.bucket {
+aws.s3.Bucket {
     name = "test"
     count = 99999999999999999999
 }
@@ -6916,12 +6916,12 @@ aws.s3.bucket {
         // Issue #866: Forward references should be resolved as ResourceRef,
         // not silently left as a plain string.
         let input = r#"
-            let subnet = awscc.ec2.subnet {
+            let subnet = awscc.ec2.Subnet {
                 vpc_id     = vpc.vpc_id
                 cidr_block = "10.0.1.0/24"
             }
 
-            let vpc = awscc.ec2.vpc {
+            let vpc = awscc.ec2.Vpc {
                 cidr_block = "10.0.0.0/16"
             }
         "#;
@@ -6947,12 +6947,12 @@ aws.s3.bucket {
     fn forward_reference_resolve_works() {
         // Issue #866: parse_and_resolve should work with forward references
         let input = r#"
-            let subnet = awscc.ec2.subnet {
+            let subnet = awscc.ec2.Subnet {
                 vpc_id     = vpc.vpc_id
                 cidr_block = "10.0.1.0/24"
             }
 
-            let vpc = awscc.ec2.vpc {
+            let vpc = awscc.ec2.Vpc {
                 cidr_block = "10.0.0.0/16"
             }
         "#;
@@ -6970,12 +6970,12 @@ aws.s3.bucket {
     fn forward_reference_unused_binding_detection() {
         // Forward-referenced bindings should be detected as used
         let input = r#"
-            let subnet = awscc.ec2.subnet {
+            let subnet = awscc.ec2.Subnet {
                 vpc_id     = vpc.vpc_id
                 cidr_block = "10.0.1.0/24"
             }
 
-            let vpc = awscc.ec2.vpc {
+            let vpc = awscc.ec2.Vpc {
                 cidr_block = "10.0.0.0/16"
             }
         "#;
@@ -6994,13 +6994,13 @@ aws.s3.bucket {
     fn forward_reference_in_nested_value() {
         // Forward references inside list/map values should also be resolved
         let input = r#"
-            let subnet = awscc.ec2.subnet {
+            let subnet = awscc.ec2.Subnet {
                 vpc_id     = vpc.vpc_id
                 cidr_block = "10.0.1.0/24"
                 tags = [{ vpc_ref = vpc.vpc_id }]
             }
 
-            let vpc = awscc.ec2.vpc {
+            let vpc = awscc.ec2.Vpc {
                 cidr_block = "10.0.0.0/16"
             }
         "#;
@@ -7032,12 +7032,12 @@ aws.s3.bucket {
         // Issue #1259: Chained forward references like "later.attr.nested" should
         // be resolved to ResourceRef with field_path, not left as a plain string.
         let input = r#"
-            let subnet = awscc.ec2.subnet {
+            let subnet = awscc.ec2.Subnet {
                 vpc_id     = vpc.encryption_specification.status
                 cidr_block = "10.0.1.0/24"
             }
 
-            let vpc = awscc.ec2.vpc {
+            let vpc = awscc.ec2.Vpc {
                 cidr_block = "10.0.0.0/16"
             }
         "#;
@@ -7060,12 +7060,12 @@ aws.s3.bucket {
         // Issue #1259: Deep chained forward references like "later.attr.deep.nested"
         // should be resolved to ResourceRef with multiple field_path entries.
         let input = r#"
-            let subnet = awscc.ec2.subnet {
+            let subnet = awscc.ec2.Subnet {
                 vpc_id     = vpc.config.deep.nested
                 cidr_block = "10.0.1.0/24"
             }
 
-            let vpc = awscc.ec2.vpc {
+            let vpc = awscc.ec2.Vpc {
                 cidr_block = "10.0.0.0/16"
             }
         "#;
@@ -7088,11 +7088,11 @@ aws.s3.bucket {
         // Issue #915: Duplicate let bindings should produce an error,
         // not silently overwrite the first binding.
         let input = r#"
-            let rt = awscc.ec2.route_table {
+            let rt = awscc.ec2.RouteTable {
                 vpc_id = "vpc-123"
             }
 
-            let rt = awscc.ec2.route_table {
+            let rt = awscc.ec2.RouteTable {
                 vpc_id = "vpc-456"
             }
         "#;
@@ -7157,11 +7157,11 @@ aws.s3.bucket {
     fn distinct_let_bindings_are_accepted() {
         // Sanity check: different binding names should work fine
         let input = r#"
-            let rt1 = awscc.ec2.route_table {
+            let rt1 = awscc.ec2.RouteTable {
                 vpc_id = "vpc-123"
             }
 
-            let rt2 = awscc.ec2.route_table {
+            let rt2 = awscc.ec2.RouteTable {
                 vpc_id = "vpc-456"
             }
         "#;
@@ -7206,7 +7206,7 @@ aws.s3.bucket {
     #[test]
     fn parse_slash_slash_comment_inline() {
         let input = r#"
-            let vpc = awscc.ec2.vpc {
+            let vpc = awscc.ec2.Vpc {
                 cidr_block = "10.0.0.0/16"  // inline comment
             }
         "#;
@@ -7224,7 +7224,7 @@ aws.s3.bucket {
         let input = r#"
             # shell-style comment
             // C-style comment
-            let vpc = awscc.ec2.vpc {
+            let vpc = awscc.ec2.Vpc {
                 cidr_block = "10.0.0.0/16"  // inline C-style
                 tags = { Name = "main" }    # inline shell-style
             }
@@ -7289,7 +7289,7 @@ aws.s3.bucket {
     #[test]
     fn parse_block_comment_inline() {
         let input = r#"
-            let vpc = awscc.ec2.vpc {
+            let vpc = awscc.ec2.Vpc {
                 cidr_block = /* inline block comment */ "10.0.0.0/16"
             }
         "#;
@@ -7308,7 +7308,7 @@ aws.s3.bucket {
             # shell-style comment
             // C-style comment
             /* block comment */
-            let vpc = awscc.ec2.vpc {
+            let vpc = awscc.ec2.Vpc {
                 cidr_block = "10.0.0.0/16"  // inline C-style
                 tags = { Name = "main" }    # inline shell-style
             }
@@ -7490,18 +7490,18 @@ aws.s3.bucket {
                 az: string
             }
 
-            let vpc = awscc.ec2.vpc {
+            let vpc = awscc.ec2.Vpc {
                 cidr_block = cidr_block
             }
 
-            let subnet = awscc.ec2.subnet {
+            let subnet = awscc.ec2.Subnet {
                 vpc_id = vpc.vpc_id
                 cidr_block = subnet_cidr
                 availability_zone = az
             }
 
             attributes {
-                vpc_id: awscc.ec2.vpc = vpc.vpc_id
+                vpc_id: awscc.ec2.Vpc = vpc.vpc_id
             }
         "#;
 
@@ -7547,7 +7547,7 @@ aws.s3.bucket {
                 vpc = "vpc-123"
             }
 
-            let sg = awscc.ec2.security_group {
+            let sg = awscc.ec2.SecurityGroup {
                 group_description = "test"
                 group_name = web.security_group
             }
@@ -7569,7 +7569,7 @@ aws.s3.bucket {
     fn parse_string_interpolation_simple() {
         let input = r#"
             let env = "prod"
-            let vpc = aws.ec2.vpc {
+            let vpc = aws.ec2.Vpc {
                 name = "vpc-${env}"
             }
         "#;
@@ -7590,7 +7590,7 @@ aws.s3.bucket {
         let input = r#"
             let env = "prod"
             let region = "us-east-1"
-            let vpc = aws.ec2.vpc {
+            let vpc = aws.ec2.Vpc {
                 name = "vpc-${env}-${region}"
             }
         "#;
@@ -7611,10 +7611,10 @@ aws.s3.bucket {
     #[test]
     fn parse_string_interpolation_with_resource_ref() {
         let input = r#"
-            let vpc = aws.ec2.vpc {
+            let vpc = aws.ec2.Vpc {
                 cidr_block = "10.0.0.0/16"
             }
-            let subnet = aws.ec2.subnet {
+            let subnet = aws.ec2.Subnet {
                 name = "subnet-${vpc.vpc_id}"
             }
         "#;
@@ -7638,7 +7638,7 @@ aws.s3.bucket {
     fn parse_string_no_interpolation() {
         // Strings without ${} should remain as plain Value::String
         let input = r#"
-            let vpc = aws.ec2.vpc {
+            let vpc = aws.ec2.Vpc {
                 name = "my-vpc"
             }
         "#;
@@ -7655,7 +7655,7 @@ aws.s3.bucket {
     fn parse_string_dollar_without_brace() {
         // A $ not followed by { should be literal
         let input = r#"
-            let vpc = aws.ec2.vpc {
+            let vpc = aws.ec2.Vpc {
                 name = "price$100"
             }
         "#;
@@ -7672,7 +7672,7 @@ aws.s3.bucket {
     fn parse_string_escaped_interpolation() {
         // \${ should be literal ${
         let input = r#"
-            let vpc = aws.ec2.vpc {
+            let vpc = aws.ec2.Vpc {
                 name = "literal\${expr}"
             }
         "#;
@@ -7688,7 +7688,7 @@ aws.s3.bucket {
     #[test]
     fn parse_string_interpolation_with_bool() {
         let input = r#"
-            let vpc = aws.ec2.vpc {
+            let vpc = aws.ec2.Vpc {
                 name = "enabled-${true}"
             }
         "#;
@@ -7707,7 +7707,7 @@ aws.s3.bucket {
     #[test]
     fn parse_string_interpolation_with_number() {
         let input = r#"
-            let vpc = aws.ec2.vpc {
+            let vpc = aws.ec2.Vpc {
                 name = "port-${8080}"
             }
         "#;
@@ -7728,7 +7728,7 @@ aws.s3.bucket {
         // String with only interpolation, no literal parts
         let input = r#"
             let name = "prod"
-            let vpc = aws.ec2.vpc {
+            let vpc = aws.ec2.Vpc {
                 tag = "${name}"
             }
         "#;
@@ -7746,7 +7746,7 @@ aws.s3.bucket {
     #[test]
     fn parse_local_let_binding_in_resource_block() {
         let input = r#"
-            let subnet = awscc.ec2.subnet {
+            let subnet = awscc.ec2.Subnet {
                 let name = "my-subnet"
                 cidr_block = "10.0.1.0/24"
                 tag_name = name
@@ -7774,7 +7774,7 @@ aws.s3.bucket {
     fn parse_local_let_binding_with_interpolation() {
         let input = r#"
             let env = "prod"
-            let subnet = awscc.ec2.subnet {
+            let subnet = awscc.ec2.Subnet {
                 let name = "app-${env}"
                 cidr_block = "10.0.1.0/24"
                 tag_name = name
@@ -7797,7 +7797,7 @@ aws.s3.bucket {
     #[test]
     fn parse_local_let_binding_chain() {
         let input = r#"
-            let subnet = awscc.ec2.subnet {
+            let subnet = awscc.ec2.Subnet {
                 let prefix = "app"
                 let name = "${prefix}-subnet"
                 cidr_block = "10.0.1.0/24"
@@ -7825,7 +7825,7 @@ aws.s3.bucket {
     #[test]
     fn parse_local_let_binding_with_function_call() {
         let input = r#"
-            let subnet = awscc.ec2.subnet {
+            let subnet = awscc.ec2.Subnet {
                 let name = "my-subnet"
                 cidr_block = "10.0.1.0/24"
                 tag_name = upper(name)
@@ -7848,7 +7848,7 @@ aws.s3.bucket {
     #[test]
     fn parse_local_let_binding_in_anonymous_resource() {
         let input = r#"
-            awscc.ec2.subnet {
+            awscc.ec2.Subnet {
                 let name = "my-subnet"
                 cidr_block = "10.0.1.0/24"
                 tag_name = name
@@ -7869,7 +7869,7 @@ aws.s3.bucket {
     #[test]
     fn parse_local_let_binding_in_nested_block() {
         let input = r#"
-            let subnet = awscc.ec2.subnet {
+            let subnet = awscc.ec2.Subnet {
                 let env = "prod"
                 cidr_block = "10.0.1.0/24"
                 tags {
@@ -7897,7 +7897,7 @@ aws.s3.bucket {
     fn parse_for_expression_over_list() {
         let input = r#"
             let subnets = for az in ["ap-northeast-1a", "ap-northeast-1c"] {
-                awscc.ec2.subnet {
+                awscc.ec2.Subnet {
                     availability_zone = az
                 }
             }
@@ -7926,7 +7926,7 @@ aws.s3.bucket {
     fn parse_for_expression_with_index() {
         let input = r#"
             let subnets = for (i, az) in ["ap-northeast-1a", "ap-northeast-1c"] {
-                awscc.ec2.subnet {
+                awscc.ec2.Subnet {
                     availability_zone = az
                     cidr_block = cidr_subnet("10.0.0.0/16", 8, i)
                 }
@@ -7962,7 +7962,7 @@ aws.s3.bucket {
             }
 
             let networks = for name, cidr in cidrs {
-                awscc.ec2.vpc {
+                awscc.ec2.Vpc {
                     cidr_block = cidr
                 }
             }
@@ -7986,7 +7986,7 @@ aws.s3.bucket {
         let input = r#"
             let subnets = for (i, az) in ["ap-northeast-1a", "ap-northeast-1c"] {
                 let cidr = cidr_subnet("10.0.0.0/16", 8, i)
-                awscc.ec2.subnet {
+                awscc.ec2.Subnet {
                     cidr_block = cidr
                     availability_zone = az
                 }
@@ -8102,11 +8102,11 @@ aws.s3.bucket {
     fn test_chained_field_access_two_levels() {
         // a.b.c should parse as ResourceRef with binding_name="a", attribute_name="b", field_path=["c"]
         let input = r#"
-            let vpc = awscc.ec2.vpc {
+            let vpc = awscc.ec2.Vpc {
                 name = "test-vpc"
             }
 
-            awscc.ec2.subnet {
+            awscc.ec2.Subnet {
                 name = "test-subnet"
                 vpc_id = vpc.network.vpc_id
             }
@@ -8132,11 +8132,11 @@ aws.s3.bucket {
     fn test_chained_field_access_three_levels() {
         // a.b.c.d should parse as ResourceRef with binding_name="a", attribute_name="b", field_path=["c", "d"]
         let input = r#"
-            let web = awscc.ec2.vpc {
+            let web = awscc.ec2.Vpc {
                 name = "test"
             }
 
-            awscc.ec2.subnet {
+            awscc.ec2.Subnet {
                 name = "test-subnet"
                 vpc_id = web.output.network.vpc_id
             }
@@ -8163,12 +8163,12 @@ aws.s3.bucket {
         // subnets[0].subnet_id should parse as ResourceRef with binding_name="subnets[0]"
         let input = r#"
             let subnets = for az in ["ap-northeast-1a", "ap-northeast-1c"] {
-                awscc.ec2.subnet {
+                awscc.ec2.Subnet {
                     availability_zone = az
                 }
             }
 
-            awscc.ec2.route_table {
+            awscc.ec2.RouteTable {
                 name = "test"
                 subnet_id = subnets[0].subnet_id
             }
@@ -8200,12 +8200,12 @@ aws.s3.bucket {
             }
 
             let networks = for name, cidr in cidrs {
-                awscc.ec2.vpc {
+                awscc.ec2.Vpc {
                     cidr_block = cidr
                 }
             }
 
-            awscc.ec2.subnet {
+            awscc.ec2.Subnet {
                 name = "test"
                 vpc_id = networks["prod"].vpc_id
             }
@@ -8237,12 +8237,12 @@ aws.s3.bucket {
             }
 
             let webs = for name, cidr in cidrs {
-                awscc.ec2.vpc {
+                awscc.ec2.Vpc {
                     cidr_block = cidr
                 }
             }
 
-            awscc.ec2.subnet {
+            awscc.ec2.Subnet {
                 name = "test"
                 sg_id = webs["prod"].security_group.id
             }
@@ -8268,7 +8268,7 @@ aws.s3.bucket {
     fn parse_import_block() {
         let input = r#"
             import {
-                to = awscc.ec2.vpc "main-vpc"
+                to = awscc.ec2.Vpc "main-vpc"
                 id = "vpc-0abc123def456"
             }
         "#;
@@ -8278,7 +8278,7 @@ aws.s3.bucket {
         match &result.state_blocks[0] {
             StateBlock::Import { to, id } => {
                 assert_eq!(to.provider, "awscc");
-                assert_eq!(to.resource_type, "ec2.vpc");
+                assert_eq!(to.resource_type, "ec2.Vpc");
                 assert_eq!(to.name, "main-vpc");
                 assert_eq!(id, "vpc-0abc123def456");
             }
@@ -8290,7 +8290,7 @@ aws.s3.bucket {
     fn parse_removed_block() {
         let input = r#"
             removed {
-                from = awscc.ec2.vpc "legacy-vpc"
+                from = awscc.ec2.Vpc "legacy-vpc"
             }
         "#;
 
@@ -8299,7 +8299,7 @@ aws.s3.bucket {
         match &result.state_blocks[0] {
             StateBlock::Removed { from } => {
                 assert_eq!(from.provider, "awscc");
-                assert_eq!(from.resource_type, "ec2.vpc");
+                assert_eq!(from.resource_type, "ec2.Vpc");
                 assert_eq!(from.name, "legacy-vpc");
             }
             other => panic!("Expected Removed, got {:?}", other),
@@ -8310,8 +8310,8 @@ aws.s3.bucket {
     fn parse_moved_block() {
         let input = r#"
             moved {
-                from = awscc.ec2.subnet "old-name"
-                to   = awscc.ec2.subnet "new-name"
+                from = awscc.ec2.Subnet "old-name"
+                to   = awscc.ec2.Subnet "new-name"
             }
         "#;
 
@@ -8320,10 +8320,10 @@ aws.s3.bucket {
         match &result.state_blocks[0] {
             StateBlock::Moved { from, to } => {
                 assert_eq!(from.provider, "awscc");
-                assert_eq!(from.resource_type, "ec2.subnet");
+                assert_eq!(from.resource_type, "ec2.Subnet");
                 assert_eq!(from.name, "old-name");
                 assert_eq!(to.provider, "awscc");
-                assert_eq!(to.resource_type, "ec2.subnet");
+                assert_eq!(to.resource_type, "ec2.Subnet");
                 assert_eq!(to.name, "new-name");
             }
             other => panic!("Expected Moved, got {:?}", other),
@@ -8339,7 +8339,7 @@ aws.s3.bucket {
             }
 
             let resources = for key in keys(tags) {
-                awscc.ec2.subnet {
+                awscc.ec2.Subnet {
                     name = key
                 }
             }
@@ -8369,7 +8369,7 @@ aws.s3.bucket {
             }
 
             let networks = for cidr in values(cidrs) {
-                awscc.ec2.vpc {
+                awscc.ec2.Vpc {
                     cidr_block = cidr
                 }
             }
@@ -8392,7 +8392,7 @@ aws.s3.bucket {
     fn parse_for_expression_with_concat_function_call() {
         let input = r#"
             let networks = for cidr in concat(["10.0.0.0/16"], ["10.1.0.0/16"]) {
-                awscc.ec2.vpc {
+                awscc.ec2.Vpc {
                     cidr_block = cidr
                 }
             }
@@ -8416,12 +8416,12 @@ aws.s3.bucket {
     fn parse_for_expression_with_runtime_function_call_errors() {
         // Function call with runtime-dependent args (ResourceRef) should error
         let input = r#"
-            let vpc = awscc.ec2.vpc {
+            let vpc = awscc.ec2.Vpc {
                 name = "test"
             }
 
             let subnets = for key in keys(vpc.tags) {
-                awscc.ec2.subnet {
+                awscc.ec2.Subnet {
                     name = key
                 }
             }
@@ -8476,11 +8476,11 @@ aws.s3.bucket {
     fn parse_if_else_true_uses_if_branch() {
         let input = r#"
             let vpc = if true {
-                awscc.ec2.vpc {
+                awscc.ec2.Vpc {
                     cidr_block = "10.0.0.0/16"
                 }
             } else {
-                awscc.ec2.vpc {
+                awscc.ec2.Vpc {
                     cidr_block = "172.16.0.0/16"
                 }
             }
@@ -8498,11 +8498,11 @@ aws.s3.bucket {
     fn parse_if_else_false_uses_else_branch() {
         let input = r#"
             let vpc = if false {
-                awscc.ec2.vpc {
+                awscc.ec2.Vpc {
                     cidr_block = "10.0.0.0/16"
                 }
             } else {
-                awscc.ec2.vpc {
+                awscc.ec2.Vpc {
                     cidr_block = "172.16.0.0/16"
                 }
             }
@@ -8537,7 +8537,7 @@ aws.s3.bucket {
                 "t3.micro"
             }
 
-            awscc.ec2.instance {
+            awscc.ec2.Instance {
                 instance_type = instance_type
             }
         "#;
@@ -8558,7 +8558,7 @@ aws.s3.bucket {
                 "t3.micro"
             }
 
-            awscc.ec2.instance {
+            awscc.ec2.Instance {
                 instance_type = instance_type
             }
         "#;
@@ -8609,7 +8609,7 @@ aws.s3.bucket {
     #[test]
     fn parse_if_resource_ref_condition_errors() {
         let input = r#"
-            let vpc = awscc.ec2.vpc {
+            let vpc = awscc.ec2.Vpc {
                 cidr_block = "10.0.0.0/16"
             }
 
@@ -8683,7 +8683,7 @@ aws.s3.bucket {
         let input = r#"
             let is_production = true
 
-            awscc.ec2.vpc {
+            awscc.ec2.Vpc {
                 cidr_block = if is_production { "10.0.0.0/16" } else { "172.16.0.0/16" }
             }
         "#;
@@ -8701,7 +8701,7 @@ aws.s3.bucket {
         let input = r#"
             let is_production = false
 
-            awscc.ec2.vpc {
+            awscc.ec2.Vpc {
                 cidr_block = if is_production { "10.0.0.0/16" } else { "172.16.0.0/16" }
             }
         "#;
@@ -8718,7 +8718,7 @@ aws.s3.bucket {
     fn parse_if_value_expr_no_else_true() {
         // When condition is true and no else, the value is used
         let input = r#"
-            awscc.ec2.vpc {
+            awscc.ec2.Vpc {
                 cidr_block = if true { "10.0.0.0/16" }
             }
         "#;
@@ -8735,7 +8735,7 @@ aws.s3.bucket {
     fn parse_if_value_expr_no_else_false_errors() {
         // When condition is false and no else, it's an error in value position
         let input = r#"
-            awscc.ec2.vpc {
+            awscc.ec2.Vpc {
                 cidr_block = if false { "10.0.0.0/16" }
             }
         "#;
@@ -8754,7 +8754,7 @@ aws.s3.bucket {
     fn parse_top_level_for_expression() {
         let input = r#"
             for az in ["ap-northeast-1a", "ap-northeast-1c"] {
-                awscc.ec2.subnet {
+                awscc.ec2.Subnet {
                     availability_zone = az
                 }
             }
@@ -8797,12 +8797,12 @@ aws.s3.bucket {
     fn parse_top_level_multiple_for_no_collision() {
         let input = r#"
             for az in ["a", "b"] {
-                awscc.ec2.subnet {
+                awscc.ec2.Subnet {
                     availability_zone = az
                 }
             }
             for name in ["web", "api"] {
-                awscc.ec2.security_group {
+                awscc.ec2.SecurityGroup {
                     group_name = name
                 }
             }
@@ -8828,7 +8828,7 @@ aws.s3.bucket {
         let input = r#"
             let azs = ["ap-northeast-1a", "ap-northeast-1c"]
             for az in azs {
-                awscc.ec2.subnet {
+                awscc.ec2.Subnet {
                     availability_zone = az
                 }
             }
@@ -8853,7 +8853,7 @@ aws.s3.bucket {
                 source = "../orgs"
             }
             for acct in orgs.accounts {
-                awscc.sso.assignment {
+                awscc.sso.Assignment {
                     target_id = acct
                 }
             }
@@ -8869,7 +8869,7 @@ aws.s3.bucket {
     fn parse_top_level_for_literal_list_uses_counter_fallback() {
         let input = r#"
             for az in ["a", "b"] {
-                awscc.ec2.subnet {
+                awscc.ec2.Subnet {
                     availability_zone = az
                 }
             }
@@ -8904,7 +8904,7 @@ aws.s3.bucket {
     fn parse_arguments_block_form_description_only() {
         let input = r#"
             arguments {
-                vpc: awscc.ec2.vpc {
+                vpc: awscc.ec2.Vpc {
                     description = "The VPC to deploy into"
                 }
             }
@@ -8915,7 +8915,7 @@ aws.s3.bucket {
         assert_eq!(result.arguments[0].name, "vpc");
         assert_eq!(
             result.arguments[0].type_expr,
-            TypeExpr::Ref(ResourceTypePath::new("awscc", "ec2.vpc"))
+            TypeExpr::Ref(ResourceTypePath::new("awscc", "ec2.Vpc"))
         );
         assert!(result.arguments[0].default.is_none());
         assert_eq!(
@@ -8952,7 +8952,7 @@ aws.s3.bucket {
             arguments {
                 enable_https: bool = true
 
-                vpc: awscc.ec2.vpc {
+                vpc: awscc.ec2.Vpc {
                     description = "The VPC to deploy into"
                 }
 
@@ -8976,7 +8976,7 @@ aws.s3.bucket {
         assert_eq!(result.arguments[1].name, "vpc");
         assert_eq!(
             result.arguments[1].type_expr,
-            TypeExpr::Ref(ResourceTypePath::new("awscc", "ec2.vpc"))
+            TypeExpr::Ref(ResourceTypePath::new("awscc", "ec2.Vpc"))
         );
         assert!(result.arguments[1].default.is_none());
         assert_eq!(
@@ -9391,7 +9391,7 @@ aws.s3.bucket {
                 region = aws.Region.ap_northeast_1
             }
 
-            aws.s3.bucket {
+            aws.s3.Bucket {
                 name = env("CARINA_TEST_NONEXISTENT_VAR_12345")
             }
         "#;
@@ -9417,7 +9417,7 @@ aws.s3.bucket {
                 region = aws.Region.ap_northeast_1
             }
 
-            aws.s3.bucket {
+            aws.s3.Bucket {
                 name = join("-", ["a", "b", "c"])
             }
         "#;
@@ -10034,7 +10034,7 @@ aws.s3.bucket {
                 server_ip: ipv4_address
             }
 
-            awscc.ec2.vpc {
+            awscc.ec2.Vpc {
                 name       = "test"
                 cidr_block = vpc_cidr
             }
@@ -10059,7 +10059,7 @@ aws.s3.bucket {
                 block: ipv4_cidr = vpc.cidr_block
             }
 
-            let vpc = awscc.ec2.vpc {
+            let vpc = awscc.ec2.Vpc {
                 name       = "test"
                 cidr_block = "10.0.0.0/16"
             }
@@ -10239,7 +10239,7 @@ aws.s3.bucket {
         let input = r#"
             fn f(x: ipv4_cidr) { x }
 
-            let vpc = awscc.ec2.vpc {
+            let vpc = awscc.ec2.Vpc {
                 cidr_block = "10.0.0.0/16"
             }
 
@@ -10590,7 +10590,7 @@ arguments {
                 source = "../network"
             }
 
-            let web_sg = awscc.ec2.security_group {
+            let web_sg = awscc.ec2.SecurityGroup {
                 name = "web-sg"
                 vpc_id = network.vpc.vpc_id
             }
@@ -10860,7 +10860,7 @@ arguments {
     #[test]
     fn parse_single_quoted_string_literal() {
         let input = r#"
-            let vpc = aws.ec2.vpc {
+            let vpc = aws.ec2.Vpc {
                 name = 'my-vpc'
             }
         "#;
@@ -10878,7 +10878,7 @@ arguments {
         // Single-quoted strings should NOT support interpolation — ${...} is literal
         let input = r#"
             let env = "prod"
-            let vpc = aws.ec2.vpc {
+            let vpc = aws.ec2.Vpc {
                 name = 'vpc-${env}'
             }
         "#;
@@ -10895,7 +10895,7 @@ arguments {
     #[test]
     fn parse_single_quoted_string_escape_sequences() {
         let input = r#"
-            let vpc = aws.ec2.vpc {
+            let vpc = aws.ec2.Vpc {
                 name = 'it\'s a test'
             }
         "#;
@@ -10930,7 +10930,7 @@ arguments {
     #[test]
     fn parse_heredoc_basic() {
         let input = r#"
-            aws.iam.role {
+            aws.iam.Role {
                 name = "my-role"
                 policy = <<EOT
 {
@@ -10952,7 +10952,7 @@ EOT
     #[test]
     fn parse_heredoc_indented() {
         // <<- strips common leading whitespace
-        let input = "aws.iam.role {\n    name = \"my-role\"\n    policy = <<-EOT\n        line1\n        line2\n        line3\n    EOT\n}\n";
+        let input = "aws.iam.Role {\n    name = \"my-role\"\n    policy = <<-EOT\n        line1\n        line2\n        line3\n    EOT\n}\n";
         let result = parse(input, &ProviderContext::default()).unwrap();
         let resource = &result.resources[0];
         assert_eq!(
@@ -10963,7 +10963,7 @@ EOT
 
     #[test]
     fn parse_heredoc_empty() {
-        let input = "aws.iam.role {\n    name = \"my-role\"\n    policy = <<EOT\nEOT\n}\n";
+        let input = "aws.iam.Role {\n    name = \"my-role\"\n    policy = <<EOT\nEOT\n}\n";
         let result = parse(input, &ProviderContext::default()).unwrap();
         let resource = &result.resources[0];
         assert_eq!(
@@ -11054,7 +11054,7 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 }
 
@@ -11076,7 +11076,7 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 }
 
@@ -11099,7 +11099,7 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 }
 
@@ -11121,7 +11121,7 @@ exports {
   region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 }
 
@@ -11140,11 +11140,11 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 }
 
-awscc.ec2.subnet {
+awscc.ec2.Subnet {
   cidr_block = vpc.missing_attr ?? '10.0.1.0/24'
 }
 "#;
@@ -11153,7 +11153,7 @@ awscc.ec2.subnet {
         let subnet = parsed
             .resources
             .iter()
-            .find(|r| r.id.resource_type == "ec2.subnet")
+            .find(|r| r.id.resource_type == "ec2.Subnet")
             .unwrap();
         let cidr = subnet.get_attr("cidr_block");
         // At parse time, vpc.missing_attr is still a ResourceRef (not resolved), so ?? kicks in
@@ -11188,7 +11188,7 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 }
 "#;
@@ -11213,7 +11213,7 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
   cidr_block = '10.1.0.0/16' ?? '10.0.0.0/16'
 }
 "#;
@@ -11241,13 +11241,13 @@ awscc.ec2.vpc {
             }
 
             for name, _ in orgs.accounts {
-                awscc.ec2.vpc {
+                awscc.ec2.Vpc {
                     name = name
                     cidr_block = '10.0.0.0/16'
                 }
             }
 
-            awscc.ec2.security_group {
+            awscc.ec2.SecurityGroup {
                 group_description = "Web SG"
                 vpc_id = network.vpc_id
             }
@@ -11285,7 +11285,7 @@ awscc.ec2.vpc {
             }
 
             for account_id in orgs.accounts {
-                awscc.sso.assignment {
+                awscc.sso.Assignment {
                     instance_arn = 'arn:aws:sso:::instance/ssoins-12345'
                     target_id = account_id
                     target_type = 'AWS_ACCOUNT'
@@ -11333,7 +11333,7 @@ awscc.ec2.vpc {
 
         // Verify the expanded resources have substituted values
         let r0 = &parsed.resources[0];
-        assert_eq!(r0.id.resource_type, "sso.assignment");
+        assert_eq!(r0.id.resource_type, "sso.Assignment");
         let target_id_0 = r0.get_attr("target_id");
         assert_eq!(
             target_id_0,
@@ -11357,7 +11357,7 @@ awscc.ec2.vpc {
             }
 
             for account_id in orgs.accounts {
-                awscc.sso.assignment {
+                awscc.sso.Assignment {
                     target_id = account_id
                 }
             }
@@ -11389,7 +11389,7 @@ awscc.ec2.vpc {
             }
 
             for name, account_id in orgs.accounts {
-                awscc.sso.assignment {
+                awscc.sso.Assignment {
                     target_id = account_id
                     target_name = name
                 }
@@ -11445,7 +11445,7 @@ awscc.ec2.vpc {
             }
 
             for (i, account_id) in orgs.accounts {
-                awscc.sso.assignment {
+                awscc.sso.Assignment {
                     target_id = account_id
                     position = i
                 }
@@ -11499,7 +11499,7 @@ awscc.ec2.vpc {
             }
 
             for account_id in orgs.accounts {
-                awscc.sso.assignment {
+                awscc.sso.Assignment {
                     target_id = account_id
                     label = "acct-${account_id}"
                 }
@@ -11559,7 +11559,7 @@ awscc.ec2.vpc {
             }
 
             for account_id in orgs.accounts {
-                awscc.sso.assignment {
+                awscc.sso.Assignment {
                     target_id = account_id
                 }
             }
@@ -11605,7 +11605,7 @@ awscc.ec2.vpc {
             }
 
             for name, account_id in orgs.accounts {
-                awscc.sso.assignment {
+                awscc.sso.Assignment {
                     target_id = account_id
                 }
             }
@@ -11942,7 +11942,7 @@ awscc.ec2.vpc {
         // `for _ in xs` should parse — the loop variable is intentionally unused.
         let input = r#"
             for _ in [1, 2, 3] {
-                awscc.ec2.vpc {
+                awscc.ec2.Vpc {
                     cidr_block = '10.0.0.0/16'
                 }
             }
@@ -11961,7 +11961,7 @@ awscc.ec2.vpc {
         let input = r#"
             let things = { a = 1, b = 2 }
             for _, value in things {
-                awscc.ec2.vpc {
+                awscc.ec2.Vpc {
                     cidr_block = '10.0.0.0/16'
                 }
             }
@@ -11979,7 +11979,7 @@ awscc.ec2.vpc {
         let input = r#"
             let things = { a = 1, b = 2 }
             for key, _ in things {
-                awscc.ec2.vpc {
+                awscc.ec2.Vpc {
                     cidr_block = '10.0.0.0/16'
                 }
             }
@@ -11996,7 +11996,7 @@ awscc.ec2.vpc {
     fn for_discard_pattern_indexed_parses() {
         let input = r#"
             for (_, item) in [1, 2, 3] {
-                awscc.ec2.vpc {
+                awscc.ec2.Vpc {
                     cidr_block = '10.0.0.0/16'
                 }
             }
@@ -12015,7 +12015,7 @@ awscc.ec2.vpc {
         // discard marker. This mirrors `let _ = expr`.
         let input = r#"
             for _, v in { a = 1 } {
-                awscc.ec2.vpc {
+                awscc.ec2.Vpc {
                     name = _
                     cidr_block = '10.0.0.0/16'
                 }
@@ -12034,7 +12034,7 @@ awscc.ec2.vpc {
         // Simple-form loop variable never referenced inside the body — warn.
         let input = r#"
             for item in [1, 2, 3] {
-                awscc.ec2.vpc {
+                awscc.ec2.Vpc {
                     cidr_block = '10.0.0.0/16'
                 }
             }
@@ -12058,7 +12058,7 @@ awscc.ec2.vpc {
         // Binding is referenced in body — no warning.
         let input = r#"
             for item in [1, 2, 3] {
-                awscc.ec2.vpc {
+                awscc.ec2.Vpc {
                     name = item
                     cidr_block = '10.0.0.0/16'
                 }
@@ -12081,7 +12081,7 @@ awscc.ec2.vpc {
         let input = r#"
             let things = { a = 1, b = 2 }
             for name, account_id in things {
-                awscc.ec2.vpc {
+                awscc.ec2.Vpc {
                     cidr_block = account_id
                 }
             }
@@ -12116,7 +12116,7 @@ awscc.ec2.vpc {
         let input = r#"
             let things = { a = 1, b = 2 }
             for _, account_id in things {
-                awscc.ec2.vpc {
+                awscc.ec2.Vpc {
                     cidr_block = account_id
                 }
             }
@@ -12167,7 +12167,7 @@ awscc.ec2.vpc {
             }
 
             let c = aws.sso_admin.principal_assignment {
-                target_type = awscc.sso.assignment.TargetType.AWS_ACCOUNT
+                target_type = awscc.sso.Assignment.TargetType.AWS_ACCOUNT
             }
         "#;
         let parsed = parse(input, &ProviderContext::default()).unwrap();
@@ -12211,7 +12211,7 @@ awscc.ec2.vpc {
         // with the block name and its per-occurrence index, matching how the
         // schema validator walks list-of-struct values.
         let input = r#"
-            let sg = aws.ec2.security_group {
+            let sg = aws.ec2.SecurityGroup {
                 name = "sg-1"
                 rules {
                     protocol = "tcp"
@@ -12221,7 +12221,7 @@ awscc.ec2.vpc {
         let parsed = parse(input, &ProviderContext::default()).unwrap();
 
         let expected = StringLiteralPath {
-            resource_id: ResourceId::with_provider("aws", "ec2.security_group", "sg"),
+            resource_id: ResourceId::with_provider("aws", "ec2.SecurityGroup", "sg"),
             attribute_chain: vec!["rules".to_string(), "0".to_string(), "protocol".to_string()],
         };
         assert!(

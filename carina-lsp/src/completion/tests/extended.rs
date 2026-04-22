@@ -361,13 +361,13 @@ fn nested_struct_completions_via_block_name_in_path() {
 #[ignore = "requires provider schemas"]
 fn type_based_completion_for_route_table_id() {
     // When editing `route_table_id = ` inside an ec2.route block,
-    // and there's a `let rt = awscc.ec2.route_table { ... }` binding,
+    // and there's a `let rt = awscc.ec2.RouteTable { ... }` binding,
     // completion should suggest `rt.route_table_id` because:
     // - route_table_id in ec2.route has type Custom("RouteTableId")
     // - ec2.route_table has attribute route_table_id with type Custom("RouteTableId")
     let provider = test_provider();
     let doc = create_document(
-        r#"let rt = awscc.ec2.route_table {
+        r#"let rt = awscc.ec2.RouteTable {
     vpc_id = "vpc-123"
 }
 
@@ -396,17 +396,17 @@ awscc.ec2.route {
 #[ignore = "requires provider schemas"]
 fn type_based_completion_for_vpc_id() {
     // When editing `vpc_id = ` inside an ec2.subnet block,
-    // and there's a `let vpc = awscc.ec2.vpc { ... }` binding,
+    // and there's a `let vpc = awscc.ec2.Vpc { ... }` binding,
     // completion should suggest `vpc.vpc_id` because:
     // - vpc_id in ec2.subnet has type Custom("VpcId")
     // - ec2.vpc has attribute vpc_id with type Custom("VpcId")
     let provider = test_provider();
     let doc = create_document(
-        r#"let vpc = awscc.ec2.vpc {
+        r#"let vpc = awscc.ec2.Vpc {
     cidr_block = "10.0.0.0/16"
 }
 
-awscc.ec2.subnet {
+awscc.ec2.Subnet {
     vpc_id =
 }"#,
     );
@@ -431,17 +431,17 @@ awscc.ec2.subnet {
 #[ignore = "requires provider schemas"]
 fn type_based_completion_does_not_suggest_wrong_type() {
     // When editing `vpc_id = ` inside an ec2.subnet block,
-    // a `let rt = awscc.ec2.route_table` binding should NOT be suggested
+    // a `let rt = awscc.ec2.RouteTable` binding should NOT be suggested
     // because route_table has no attribute of type VpcId that matches.
     // (route_table does have vpc_id, but the test verifies that rt is not
     // suggested with the wrong attribute like rt.route_table_id)
     let provider = test_provider();
     let doc = create_document(
-        r#"let rt = awscc.ec2.route_table {
+        r#"let rt = awscc.ec2.RouteTable {
     vpc_id = "vpc-123"
 }
 
-awscc.ec2.subnet {
+awscc.ec2.Subnet {
     vpc_id =
 }"#,
     );
@@ -477,7 +477,7 @@ fn type_based_completion_does_not_suggest_region_or_boolean() {
     // This is the catch-all fix from #906.
     let provider = test_provider();
     let doc = create_document(
-        r#"let rt = awscc.ec2.route_table {
+        r#"let rt = awscc.ec2.RouteTable {
     vpc_id = "vpc-123"
 }
 
@@ -520,7 +520,7 @@ fn readonly_attributes_excluded_from_resource_block_completions() {
     // Read-only attributes (e.g., vpc_id, arn) should NOT appear as completion
     // candidates inside a resource block, since users cannot set them.
     let provider = test_provider();
-    let completions = provider.attribute_completions_for_type("awscc.ec2.vpc");
+    let completions = provider.attribute_completions_for_type("awscc.ec2.Vpc");
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     // vpc_id is read-only on ec2.vpc — should NOT be suggested
@@ -545,11 +545,11 @@ fn readonly_attributes_still_available_for_value_references() {
     // (e.g., `vpc_id = vpc.vpc_id` on the right-hand side of `=`).
     let provider = test_provider();
     let doc = create_document(
-        r#"let vpc = awscc.ec2.vpc {
+        r#"let vpc = awscc.ec2.Vpc {
     cidr_block = "10.0.0.0/16"
 }
 
-awscc.ec2.subnet {
+awscc.ec2.Subnet {
     vpc_id =
 }"#,
     );
@@ -614,7 +614,7 @@ let igw_attachment = awscc.ec2.vpc_gateway_attachment {
 fn builtin_function_completions_in_value_position() {
     let provider = test_provider();
     let doc = create_document(
-        r#"awscc.ec2.vpc {
+        r#"awscc.ec2.Vpc {
     cidr_block =
 }"#,
     );
@@ -1916,7 +1916,7 @@ exports {
 fn builtin_functions_filtered_out_for_custom_semantic_value_position() {
     let provider = test_provider_with_custom_semantic_attr();
     let doc = create_document(
-        r#"awscc.sso.assignment {
+        r#"awscc.sso.Assignment {
   target_id = 
 }
 "#,
@@ -1956,8 +1956,8 @@ fn builtin_functions_filtered_out_for_custom_semantic_value_position() {
 fn namespaced_enum_tail_tokens_do_not_leak_into_sibling_value_position() {
     let provider = test_provider_with_custom_semantic_attr();
     let doc = create_document(
-        r#"awscc.sso.assignment {
-  principal_type = awscc.sso.assignment.PrincipalType.GROUP
+        r#"awscc.sso.Assignment {
+  principal_type = awscc.sso.Assignment.PrincipalType.GROUP
   target_id = 
 }
 "#,
@@ -1981,14 +1981,14 @@ fn namespaced_enum_tail_tokens_do_not_leak_into_sibling_value_position() {
 }
 
 /// Namespaced `StringEnum` completions must offer the fully-qualified
-/// form (`awscc.sso.assignment.PrincipalType.GROUP`), not the bare tail
+/// form (`awscc.sso.Assignment.PrincipalType.GROUP`), not the bare tail
 /// (`GROUP`). The bare form is accepted by the DSL resolver but causes
 /// the sibling-attribute leak exercised above.
 #[test]
 fn namespaced_enum_completions_offer_full_form_not_bare_tail() {
     let provider = test_provider_with_custom_semantic_attr();
     let doc = create_document(
-        r#"awscc.sso.assignment {
+        r#"awscc.sso.Assignment {
   principal_type = 
 }
 "#,
@@ -2002,8 +2002,8 @@ fn namespaced_enum_completions_offer_full_form_not_bare_tail() {
     assert!(
         labels
             .iter()
-            .any(|l| l.contains("awscc.sso.assignment.PrincipalType.GROUP")),
-        "expected fully-qualified 'awscc.sso.assignment.PrincipalType.GROUP' completion, got: {:?}",
+            .any(|l| l.contains("awscc.sso.Assignment.PrincipalType.GROUP")),
+        "expected fully-qualified 'awscc.sso.Assignment.PrincipalType.GROUP' completion, got: {:?}",
         labels
     );
     assert!(
@@ -2056,7 +2056,7 @@ fn for_loop_binding_not_offered_at_incompatible_enum_attribute() {
         "exports {\n  accounts: map(aws_account_id) = \"x\"\n}\n",
         r#"let orgs = upstream_state { source = '../organizations' }
 for _, account_id in orgs.accounts {
-  awscc.sso.assignment {
+  awscc.sso.Assignment {
     principal_type =
   }
 }
@@ -2087,7 +2087,7 @@ fn for_loop_binding_offered_at_matching_custom_attribute() {
         "exports {\n  accounts: map(aws_account_id) = \"x\"\n}\n",
         r#"let orgs = upstream_state { source = '../organizations' }
 for _, account_id in orgs.accounts {
-  awscc.sso.assignment {
+  awscc.sso.Assignment {
     target_id =
   }
 }
@@ -2116,7 +2116,7 @@ fn for_loop_binding_without_resolvable_iterable_falls_back_to_unconditional() {
     let provider = test_provider_with_custom_semantic_attr();
     let doc = create_document(
         r#"for _, account_id in unknown_source.accounts {
-  awscc.sso.assignment {
+  awscc.sso.Assignment {
     principal_type =
   }
 }
@@ -2557,10 +2557,10 @@ let attach = awscc.organizations.policy_target_attachment {
 fn argument_parameters_include_sibling_file_args() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
     use std::collections::HashMap;
-    let schema = ResourceSchema::new("awscc.s3.bucket")
+    let schema = ResourceSchema::new("awscc.s3.Bucket")
         .attribute(AttributeSchema::new("name", AttributeType::String));
     let mut schemas = HashMap::new();
-    schemas.insert("awscc.s3.bucket".to_string(), schema);
+    schemas.insert("awscc.s3.Bucket".to_string(), schema);
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![]);
 
@@ -2572,7 +2572,7 @@ fn argument_parameters_include_sibling_file_args() {
     )
     .unwrap();
     let main_src = "\
-let b = awscc.s3.bucket {
+let b = awscc.s3.Bucket {
   name =
 }
 ";

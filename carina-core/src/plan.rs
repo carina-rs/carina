@@ -410,10 +410,10 @@ mod tests {
     #[test]
     fn plan_summary() {
         let mut plan = Plan::new();
-        plan.add(Effect::Create(Resource::new("s3.bucket", "a")));
-        plan.add(Effect::Create(Resource::new("s3.bucket", "b")));
+        plan.add(Effect::Create(Resource::new("s3.Bucket", "a")));
+        plan.add(Effect::Create(Resource::new("s3.Bucket", "b")));
         plan.add(Effect::Delete {
-            id: crate::resource::ResourceId::new("s3.bucket", "c"),
+            id: crate::resource::ResourceId::new("s3.Bucket", "c"),
             identifier: String::new(),
             lifecycle: crate::resource::LifecycleConfig::default(),
             binding: None,
@@ -490,18 +490,18 @@ mod tests {
         let mut plan = Plan::new();
 
         // A Replace effect with one cascading update
-        let from = State::not_found(ResourceId::new("ec2.vpc", "vpc")).with_identifier("vpc-123");
-        let to = Resource::new("ec2.vpc", "vpc");
+        let from = State::not_found(ResourceId::new("ec2.Vpc", "vpc")).with_identifier("vpc-123");
+        let to = Resource::new("ec2.Vpc", "vpc");
         let cascading = CascadingUpdate {
-            id: ResourceId::new("ec2.subnet", "subnet"),
+            id: ResourceId::new("ec2.Subnet", "subnet"),
             from: Box::new(
-                State::not_found(ResourceId::new("ec2.subnet", "subnet"))
+                State::not_found(ResourceId::new("ec2.Subnet", "subnet"))
                     .with_identifier("subnet-123"),
             ),
-            to: Resource::new("ec2.subnet", "subnet"),
+            to: Resource::new("ec2.Subnet", "subnet"),
         };
         plan.add(Effect::Replace {
-            id: ResourceId::new("ec2.vpc", "vpc"),
+            id: ResourceId::new("ec2.Vpc", "vpc"),
             from: Box::new(from),
             to,
             lifecycle: LifecycleConfig::default(),
@@ -526,18 +526,18 @@ mod tests {
 
         let mut plan = Plan::new();
 
-        let from = State::not_found(ResourceId::new("ec2.vpc", "vpc")).with_identifier("vpc-123");
-        let to = Resource::new("ec2.vpc", "vpc");
+        let from = State::not_found(ResourceId::new("ec2.Vpc", "vpc")).with_identifier("vpc-123");
+        let to = Resource::new("ec2.Vpc", "vpc");
         let cascading = CascadingUpdate {
-            id: ResourceId::new("ec2.subnet", "subnet"),
+            id: ResourceId::new("ec2.Subnet", "subnet"),
             from: Box::new(
-                State::not_found(ResourceId::new("ec2.subnet", "subnet"))
+                State::not_found(ResourceId::new("ec2.Subnet", "subnet"))
                     .with_identifier("subnet-123"),
             ),
-            to: Resource::new("ec2.subnet", "subnet"),
+            to: Resource::new("ec2.Subnet", "subnet"),
         };
         plan.add(Effect::Replace {
-            id: ResourceId::new("ec2.vpc", "vpc"),
+            id: ResourceId::new("ec2.Vpc", "vpc"),
             from: Box::new(from),
             to,
             lifecycle: LifecycleConfig::default(),
@@ -565,9 +565,9 @@ mod tests {
         use crate::resource::ResourceId;
 
         let mut plan = Plan::new();
-        plan.add(Effect::Create(Resource::new("s3.bucket", "a")));
+        plan.add(Effect::Create(Resource::new("s3.Bucket", "a")));
         plan.add(Effect::Delete {
-            id: ResourceId::new("s3.bucket", "b"),
+            id: ResourceId::new("s3.Bucket", "b"),
             identifier: "b-id".to_string(),
             lifecycle: crate::resource::LifecycleConfig::default(),
             binding: None,

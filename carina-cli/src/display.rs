@@ -1904,11 +1904,11 @@ mod tests {
     fn test_siblings_sorted_by_resource_type_and_binding() {
         // VPC is root. Under it: 2 subnets and 2 route tables, added in
         // interleaved order to expose HashMap non-determinism.
-        let vpc = make_resource("ec2.vpc", "vpc", "vpc", &[]);
-        let rt_b = make_resource("ec2.route_table", "rt_b", "rt_b", &["vpc"]);
-        let subnet_b = make_resource("ec2.subnet", "subnet_b", "subnet_b", &["vpc"]);
-        let rt_a = make_resource("ec2.route_table", "rt_a", "rt_a", &["vpc"]);
-        let subnet_a = make_resource("ec2.subnet", "subnet_a", "subnet_a", &["vpc"]);
+        let vpc = make_resource("ec2.Vpc", "vpc", "vpc", &[]);
+        let rt_b = make_resource("ec2.RouteTable", "rt_b", "rt_b", &["vpc"]);
+        let subnet_b = make_resource("ec2.Subnet", "subnet_b", "subnet_b", &["vpc"]);
+        let rt_a = make_resource("ec2.RouteTable", "rt_a", "rt_a", &["vpc"]);
+        let subnet_a = make_resource("ec2.Subnet", "subnet_a", "subnet_a", &["vpc"]);
 
         let mut plan = Plan::new();
         plan.add(Effect::Create(vpc));
@@ -1939,10 +1939,10 @@ mod tests {
         // Expected: sorted by (resource_type, binding_name)
         // ec2.route_table comes before ec2.subnet alphabetically
         let expected = vec![
-            ("ec2.route_table".to_string(), "rt_a".to_string()),
-            ("ec2.route_table".to_string(), "rt_b".to_string()),
-            ("ec2.subnet".to_string(), "subnet_a".to_string()),
-            ("ec2.subnet".to_string(), "subnet_b".to_string()),
+            ("ec2.RouteTable".to_string(), "rt_a".to_string()),
+            ("ec2.RouteTable".to_string(), "rt_b".to_string()),
+            ("ec2.Subnet".to_string(), "subnet_a".to_string()),
+            ("ec2.Subnet".to_string(), "subnet_b".to_string()),
         ];
 
         assert_eq!(
@@ -1969,8 +1969,8 @@ mod tests {
     /// under the most ancestral dependency.
     #[test]
     fn test_parent_selection_prefers_most_ancestral_dependency() {
-        let vpc = make_resource("ec2.vpc", "vpc", "vpc", &[]);
-        let sg = make_resource("ec2.security_group", "sg", "sg", &["vpc"]);
+        let vpc = make_resource("ec2.Vpc", "vpc", "vpc", &[]);
+        let sg = make_resource("ec2.SecurityGroup", "sg", "sg", &["vpc"]);
         let endpoint = make_resource("ec2.vpc_endpoint", "endpoint", "endpoint", &["vpc", "sg"]);
 
         let mut plan = Plan::new();
@@ -2044,8 +2044,8 @@ mod tests {
     ///           so only vpc is a root.
     #[test]
     fn test_referenced_resource_without_deps_should_not_be_root() {
-        let vpc = make_resource("ec2.vpc", "vpc", "vpc", &[]);
-        let rt = make_resource("ec2.route_table", "rt", "rt", &["vpc"]);
+        let vpc = make_resource("ec2.Vpc", "vpc", "vpc", &[]);
+        let rt = make_resource("ec2.RouteTable", "rt", "rt", &["vpc"]);
         let igw = make_resource("ec2.internet_gateway", "igw", "igw", &[]);
         let route = make_resource("ec2.route", "route", "route", &["rt", "igw"]);
         let igw_attachment = make_resource(
@@ -2089,8 +2089,8 @@ mod tests {
     /// IGW should be nested under igw_attachment (depth 1), not route (depth 2).
     #[test]
     fn test_dependency_free_resource_nested_under_shallowest_referencing_resource() {
-        let vpc = make_resource("ec2.vpc", "vpc", "vpc", &[]);
-        let rt = make_resource("ec2.route_table", "rt", "rt", &["vpc"]);
+        let vpc = make_resource("ec2.Vpc", "vpc", "vpc", &[]);
+        let rt = make_resource("ec2.RouteTable", "rt", "rt", &["vpc"]);
         let igw = make_resource("ec2.internet_gateway", "igw", "igw", &[]);
         let route = make_resource("ec2.route", "route", "route", &["rt", "igw"]);
         let igw_attachment = make_resource(
@@ -2287,11 +2287,11 @@ mod tests {
     /// Test that has_binding correctly detects bound vs anonymous resources.
     #[test]
     fn test_has_binding() {
-        let mut bound = Resource::new("ec2.vpc", "vpc");
+        let mut bound = Resource::new("ec2.Vpc", "vpc");
         bound.binding = Some("vpc".to_string());
         assert!(has_binding(&bound));
 
-        let anonymous = Resource::new("ec2.vpc", "hash123");
+        let anonymous = Resource::new("ec2.Vpc", "hash123");
         assert!(!has_binding(&anonymous));
     }
 
@@ -2299,7 +2299,7 @@ mod tests {
     /// parenthesized hints for anonymous resources.
     #[test]
     fn test_format_compact_name_bound_resource() {
-        let mut r = Resource::new("ec2.vpc", "vpc");
+        let mut r = Resource::new("ec2.Vpc", "vpc");
         r.binding = Some("vpc".to_string());
         // For bound resources, should show name as plain identifier (no quotes)
         let result = format_compact_name(&r, "vpc", None);
@@ -2334,8 +2334,8 @@ mod tests {
     /// print attribute lines.
     #[test]
     fn test_print_plan_compact_does_not_panic() {
-        let vpc = make_resource("ec2.vpc", "vpc", "vpc", &[]);
-        let rt = make_resource("ec2.route_table", "rt", "rt", &["vpc"]);
+        let vpc = make_resource("ec2.Vpc", "vpc", "vpc", &[]);
+        let rt = make_resource("ec2.RouteTable", "rt", "rt", &["vpc"]);
         let mut plan = Plan::new();
         plan.add(Effect::Create(vpc));
         plan.add(Effect::Create(rt));
@@ -2437,7 +2437,7 @@ mod tests {
     /// Test that extract_compact_hint resolves DSL enum identifiers.
     #[test]
     fn test_extract_compact_hint_resolves_dsl_enum() {
-        let mut r = Resource::new("ec2.subnet", "hash_enum");
+        let mut r = Resource::new("ec2.Subnet", "hash_enum");
         r.set_attr(
             "availability_zone".to_string(),
             Value::String("awscc.AvailabilityZone.ap_northeast_1a".to_string()),
@@ -2456,7 +2456,7 @@ mod tests {
     /// Test that extract_compact_hint skips _-prefixed attributes.
     #[test]
     fn test_extract_compact_hint_skips_internal_attributes() {
-        let mut r = Resource::new("ec2.vpc", "hash_internal");
+        let mut r = Resource::new("ec2.Vpc", "hash_internal");
         r.binding = Some("vpc".to_string());
         r.set_attr("_hash".to_string(), Value::String("abc123".to_string()));
 
@@ -2470,18 +2470,18 @@ mod tests {
 
         // Build a Replace effect with a cascading update that changes vpc_id
         let vpc_from = State::existing(
-            ResourceId::new("ec2.vpc", "vpc"),
+            ResourceId::new("ec2.Vpc", "vpc"),
             HashMap::from([(
                 "cidr_block".to_string(),
                 Value::String("10.0.0.0/16".to_string()),
             )]),
         );
-        let vpc_to = Resource::new("ec2.vpc", "vpc")
+        let vpc_to = Resource::new("ec2.Vpc", "vpc")
             .with_binding("vpc")
             .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
 
         let subnet_from = State::existing(
-            ResourceId::new("ec2.subnet", "subnet"),
+            ResourceId::new("ec2.Subnet", "subnet"),
             HashMap::from([
                 (
                     "vpc_id".to_string(),
@@ -2493,7 +2493,7 @@ mod tests {
                 ),
             ]),
         );
-        let subnet_to = Resource::new("ec2.subnet", "subnet")
+        let subnet_to = Resource::new("ec2.Subnet", "subnet")
             .with_attribute(
                 "vpc_id",
                 Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
@@ -2501,7 +2501,7 @@ mod tests {
             .with_attribute("cidr_block", Value::String("10.0.1.0/24".to_string()));
 
         let replace_effect = Effect::Replace {
-            id: ResourceId::new("ec2.vpc", "vpc"),
+            id: ResourceId::new("ec2.Vpc", "vpc"),
             from: Box::new(vpc_from),
             to: vpc_to,
             lifecycle: LifecycleConfig {
@@ -2510,7 +2510,7 @@ mod tests {
             },
             changed_create_only: vec!["cidr_block".to_string()],
             cascading_updates: vec![CascadingUpdate {
-                id: ResourceId::new("ec2.subnet", "subnet"),
+                id: ResourceId::new("ec2.Subnet", "subnet"),
                 from: Box::new(subnet_from),
                 to: subnet_to,
             }],
@@ -2538,9 +2538,9 @@ mod tests {
         use std::collections::HashMap;
 
         let cascade = CascadingUpdate {
-            id: ResourceId::new("ec2.subnet", "subnet"),
+            id: ResourceId::new("ec2.Subnet", "subnet"),
             from: Box::new(State::existing(
-                ResourceId::new("ec2.subnet", "subnet"),
+                ResourceId::new("ec2.Subnet", "subnet"),
                 HashMap::from([
                     (
                         "vpc_id".to_string(),
@@ -2552,7 +2552,7 @@ mod tests {
                     ),
                 ]),
             )),
-            to: Resource::new("ec2.subnet", "subnet")
+            to: Resource::new("ec2.Subnet", "subnet")
                 .with_attribute(
                     "vpc_id",
                     Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
@@ -2706,9 +2706,9 @@ mod tests {
         use std::collections::HashMap;
 
         let cascade = CascadingUpdate {
-            id: ResourceId::new("ec2.subnet", "subnet"),
+            id: ResourceId::new("ec2.Subnet", "subnet"),
             from: Box::new(State::existing(
-                ResourceId::new("ec2.subnet", "subnet"),
+                ResourceId::new("ec2.Subnet", "subnet"),
                 HashMap::from([
                     (
                         "vpc_id".to_string(),
@@ -2724,7 +2724,7 @@ mod tests {
                     ),
                 ]),
             )),
-            to: Resource::new("ec2.subnet", "subnet")
+            to: Resource::new("ec2.Subnet", "subnet")
                 .with_attribute(
                     "vpc_id",
                     Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
@@ -2767,15 +2767,15 @@ mod tests {
         use std::collections::HashMap;
 
         let cascade = CascadingUpdate {
-            id: ResourceId::new("ec2.instance", "instance"),
+            id: ResourceId::new("ec2.Instance", "instance"),
             from: Box::new(State::existing(
-                ResourceId::new("ec2.instance", "instance"),
+                ResourceId::new("ec2.Instance", "instance"),
                 HashMap::from([(
                     "security_group_ids".to_string(),
                     Value::List(vec![Value::String("sg-old123".to_string())]),
                 )]),
             )),
-            to: Resource::new("ec2.instance", "instance").with_attribute(
+            to: Resource::new("ec2.Instance", "instance").with_attribute(
                 "security_group_ids",
                 Value::List(vec![Value::resource_ref(
                     "sg".to_string(),
@@ -2822,9 +2822,9 @@ mod tests {
     #[test]
     fn test_mixed_plan_tree_with_delete_effect() {
         // VPC: Update effect (has `to` resource with binding)
-        let vpc_to = make_resource("ec2.vpc", "vpc", "vpc", &[]);
+        let vpc_to = make_resource("ec2.Vpc", "vpc", "vpc", &[]);
         let vpc_from = State::existing(
-            ResourceId::new("ec2.vpc", "vpc"),
+            ResourceId::new("ec2.Vpc", "vpc"),
             HashMap::from([(
                 "cidr_block".to_string(),
                 Value::String("10.0.0.0/16".to_string()),
@@ -2832,9 +2832,9 @@ mod tests {
         );
 
         // SG: Replace effect (has `to` resource that depends on VPC)
-        let sg_to = make_resource("ec2.security_group", "sg", "sg", &["vpc"]);
+        let sg_to = make_resource("ec2.SecurityGroup", "sg", "sg", &["vpc"]);
         let sg_from = State::existing(
-            ResourceId::new("ec2.security_group", "sg"),
+            ResourceId::new("ec2.SecurityGroup", "sg"),
             HashMap::from([(
                 "ref_vpc".to_string(),
                 Value::String("vpc-old123".to_string()),
@@ -2844,7 +2844,7 @@ mod tests {
         // Subnet: Delete effect (only has id and identifier — no resource, no deps)
         // In the original DSL, subnet depends on VPC, but Delete loses that info.
         let subnet_delete = Effect::Delete {
-            id: ResourceId::new("ec2.subnet", "subnet"),
+            id: ResourceId::new("ec2.Subnet", "subnet"),
             identifier: "subnet-12345".to_string(),
             lifecycle: LifecycleConfig::default(),
             binding: Some("subnet".to_string()),
@@ -2853,13 +2853,13 @@ mod tests {
 
         let mut plan = Plan::new();
         plan.add(Effect::Update {
-            id: ResourceId::new("ec2.vpc", "vpc"),
+            id: ResourceId::new("ec2.Vpc", "vpc"),
             from: Box::new(vpc_from),
             to: vpc_to,
             changed_attributes: vec!["cidr_block".to_string()],
         });
         plan.add(Effect::Replace {
-            id: ResourceId::new("ec2.security_group", "sg"),
+            id: ResourceId::new("ec2.SecurityGroup", "sg"),
             from: Box::new(sg_from),
             to: sg_to,
             lifecycle: LifecycleConfig::default(),
@@ -2921,9 +2921,9 @@ mod tests {
     #[test]
     fn test_resolved_ref_loses_dependency_for_tree_nesting() {
         // VPC: Update effect (tags changed)
-        let vpc_to = make_resource("ec2.vpc", "vpc", "vpc", &[]);
+        let vpc_to = make_resource("ec2.Vpc", "vpc", "vpc", &[]);
         let vpc_from = State::existing(
-            ResourceId::new("ec2.vpc", "vpc"),
+            ResourceId::new("ec2.Vpc", "vpc"),
             HashMap::from([(
                 "cidr_block".to_string(),
                 Value::String("10.0.0.0/16".to_string()),
@@ -2933,7 +2933,7 @@ mod tests {
         // SG: Create effect with RESOLVED ref (string instead of ResourceRef).
         // This is what happens after resolve_refs_with_state() runs:
         // vpc_id = vpc.vpc_id becomes vpc_id = "vpc-0123456789abcdef0"
-        let mut sg = Resource::new("ec2.security_group", "sg");
+        let mut sg = Resource::new("ec2.SecurityGroup", "sg");
         sg.binding = Some("sg".to_string());
         // This is the resolved value — a plain string, NOT a ResourceRef
         sg.set_attr(
@@ -2950,7 +2950,7 @@ mod tests {
 
         let mut plan = Plan::new();
         plan.add(Effect::Update {
-            id: ResourceId::new("ec2.vpc", "vpc"),
+            id: ResourceId::new("ec2.Vpc", "vpc"),
             from: Box::new(vpc_from),
             to: vpc_to,
             changed_attributes: vec!["tags".to_string()],
@@ -2987,19 +2987,19 @@ mod tests {
     #[test]
     fn format_effect_delete_uses_binding_name() {
         let effect = Effect::Delete {
-            id: ResourceId::with_provider("awscc", "ec2.vpc", "ec2_vpc_fb75c929"),
+            id: ResourceId::with_provider("awscc", "ec2.Vpc", "ec2_vpc_fb75c929"),
             identifier: "vpc-12345".to_string(),
             lifecycle: LifecycleConfig::default(),
             binding: Some("my_vpc".to_string()),
             dependencies: HashSet::new(),
         };
-        assert_eq!(format_effect(&effect), "Delete awscc.ec2.vpc.my_vpc");
+        assert_eq!(format_effect(&effect), "Delete awscc.ec2.Vpc.my_vpc");
     }
 
     #[test]
     fn format_effect_delete_falls_back_to_id_name() {
         let effect = Effect::Delete {
-            id: ResourceId::with_provider("awscc", "ec2.vpc", "ec2_vpc_fb75c929"),
+            id: ResourceId::with_provider("awscc", "ec2.Vpc", "ec2_vpc_fb75c929"),
             identifier: "vpc-12345".to_string(),
             lifecycle: LifecycleConfig::default(),
             binding: None,
@@ -3007,7 +3007,7 @@ mod tests {
         };
         assert_eq!(
             format_effect(&effect),
-            "Delete awscc.ec2.vpc.ec2_vpc_fb75c929"
+            "Delete awscc.ec2.Vpc.ec2_vpc_fb75c929"
         );
     }
 

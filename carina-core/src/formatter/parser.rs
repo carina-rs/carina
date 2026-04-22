@@ -74,7 +74,7 @@ mod tests {
         // but the main grammar also allows nested_block (identifier ~ "{" ~ ... ~ "}").
         // This affects files that use nested block syntax for List<Struct> fields
         // like security_group_ingress, lifecycle, etc.
-        let input = r#"awscc.ec2.security_group {
+        let input = r#"awscc.ec2.SecurityGroup {
   vpc_id = "vpc-123"
 
   security_group_ingress {
@@ -124,7 +124,7 @@ mod tests {
     fn issue_904_lifecycle_block_in_anonymous_resource() {
         // lifecycle { ... } is a nested block inside a resource body.
         // Without nested_block support in block_content, this fails.
-        let input = r#"awscc.s3.bucket {
+        let input = r#"awscc.s3.Bucket {
   bucket_name_prefix = "test-"
 
   lifecycle {
@@ -163,7 +163,7 @@ mod tests {
     fn issue_904_multiple_nested_blocks_same_name() {
         // Multiple nested blocks with the same name (e.g., repeated ingress rules)
         // should be parsed as a list of blocks.
-        let input = r#"awscc.ec2.security_group {
+        let input = r#"awscc.ec2.SecurityGroup {
   group_description = "test"
 
   security_group_ingress {
@@ -217,7 +217,7 @@ mod tests {
     fn issue_1175_for_expression() {
         // for expressions should parse
         let input = r#"let subnets = for subnet in subnets {
-  awscc.ec2.subnet {
+  awscc.ec2.Subnet {
     vpc_id = vpc.vpc_id
     cidr_block = subnet.cidr
   }
@@ -234,7 +234,7 @@ mod tests {
     #[test]
     fn issue_1175_for_indexed_binding() {
         let input = r#"let items = for (i, x) in list {
-  awscc.ec2.subnet {
+  awscc.ec2.Subnet {
     name = x
   }
 }
@@ -250,7 +250,7 @@ mod tests {
     #[test]
     fn issue_1175_for_map_binding() {
         let input = r#"let items = for k, v in tags {
-  awscc.ec2.subnet {
+  awscc.ec2.Subnet {
     name = k
   }
 }
@@ -265,7 +265,7 @@ mod tests {
 
     #[test]
     fn issue_1175_read_resource_expr() {
-        let input = r#"let vpc = read awscc.ec2.vpc {
+        let input = r#"let vpc = read awscc.ec2.Vpc {
   vpc_id = "vpc-123"
 }
 "#;

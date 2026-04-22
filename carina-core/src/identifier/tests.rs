@@ -3,9 +3,9 @@ use crate::resource::Resource;
 use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
 fn make_s3_bucket_schema() -> (String, ResourceSchema) {
-    let schema = ResourceSchema::new("awscc.s3.bucket")
+    let schema = ResourceSchema::new("awscc.s3.Bucket")
         .attribute(AttributeSchema::new("bucket_name", AttributeType::String));
-    ("awscc.s3.bucket".to_string(), schema)
+    ("awscc.s3.Bucket".to_string(), schema)
 }
 
 fn schema_key_fn(resource: &Resource) -> String {
@@ -25,7 +25,7 @@ fn test_generate_random_suffix_format() {
 
 #[test]
 fn test_resolve_attr_prefixes_extracts_prefix_and_generates_name() {
-    let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket");
     resource.set_attr(
         "bucket_name_prefix".to_string(),
         Value::String("my-app-".to_string()),
@@ -56,7 +56,7 @@ fn test_resolve_attr_prefixes_extracts_prefix_and_generates_name() {
 
 #[test]
 fn test_resolve_attr_prefixes_leaves_non_matching_prefix_alone() {
-    let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket");
     resource.set_attr(
         "nonexistent_attr_prefix".to_string(),
         Value::String("some-value".to_string()),
@@ -78,7 +78,7 @@ fn test_resolve_attr_prefixes_leaves_non_matching_prefix_alone() {
 
 #[test]
 fn test_resolve_attr_prefixes_errors_when_both_prefix_and_attr_specified() {
-    let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket");
     resource.set_attr(
         "bucket_name_prefix".to_string(),
         Value::String("my-app-".to_string()),
@@ -98,7 +98,7 @@ fn test_resolve_attr_prefixes_errors_when_both_prefix_and_attr_specified() {
 
 #[test]
 fn test_resolve_attr_prefixes_errors_on_empty_prefix() {
-    let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket");
     resource.set_attr(
         "bucket_name_prefix".to_string(),
         Value::String("".to_string()),
@@ -114,7 +114,7 @@ fn test_resolve_attr_prefixes_errors_on_empty_prefix() {
 
 #[test]
 fn test_reconcile_prefixed_names_reuses_state_name_when_prefix_matches() {
-    let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket");
     resource
         .prefixes
         .insert("bucket_name".to_string(), "my-app-".to_string());
@@ -144,7 +144,7 @@ fn test_reconcile_prefixed_names_reuses_state_name_when_prefix_matches() {
 
 #[test]
 fn test_reconcile_prefixed_names_generates_new_name_when_prefix_changes() {
-    let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket");
     resource
         .prefixes
         .insert("bucket_name".to_string(), "new-prefix-".to_string());
@@ -177,7 +177,7 @@ fn test_reconcile_prefixed_names_generates_new_name_when_prefix_changes() {
 
 #[test]
 fn test_reconcile_prefixed_names_keeps_generated_name_when_no_state() {
-    let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket");
     resource
         .prefixes
         .insert("bucket_name".to_string(), "my-app-".to_string());
@@ -364,13 +364,13 @@ fn test_reconcile_anonymous_id_no_match_when_all_same() {
 fn test_reconcile_anonymous_id_single_create_only_no_reconcile() {
     // With only one create-only property, changing it means ALL changed,
     // so no reconciliation (matched=0 or mismatched=0)
-    let schema = ResourceSchema::new("awscc.ec2.vpc")
+    let schema = ResourceSchema::new("awscc.ec2.Vpc")
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only());
-    let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.vpc".to_string(), schema)]
+    let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.Vpc".to_string(), schema)]
         .into_iter()
         .collect();
 
-    let mut resource = Resource::with_provider("awscc", "ec2.vpc", "ec2_vpc_aabbccdd");
+    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "ec2_vpc_aabbccdd");
     resource.set_attr(
         "cidr_block".to_string(),
         Value::String("10.1.0.0/16".to_string()),
@@ -1201,14 +1201,14 @@ fn test_compute_anonymous_id_uses_simhash_for_no_create_only() {
 fn test_compute_anonymous_id_simhash_vs_create_only_hash_independent() {
     // Resources with create-only properties use standard hash,
     // resources without use SimHash. Verify both work side by side.
-    let schema_with_co = ResourceSchema::new("awscc.ec2.vpc")
+    let schema_with_co = ResourceSchema::new("awscc.ec2.Vpc")
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only())
         .attribute(AttributeSchema::new("tag_name", AttributeType::String));
     let schema_without_co = ResourceSchema::new("awscc.ec2.eip")
         .attribute(AttributeSchema::new("domain", AttributeType::String))
         .attribute(AttributeSchema::new("tag_name", AttributeType::String));
     let schemas: HashMap<String, ResourceSchema> = vec![
-        ("awscc.ec2.vpc".to_string(), schema_with_co),
+        ("awscc.ec2.Vpc".to_string(), schema_with_co),
         ("awscc.ec2.eip".to_string(), schema_without_co),
     ]
     .into_iter()
@@ -1223,7 +1223,7 @@ fn test_compute_anonymous_id_simhash_vs_create_only_hash_independent() {
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
-    let mut vpc = Resource::with_provider("awscc", "ec2.vpc", "");
+    let mut vpc = Resource::with_provider("awscc", "ec2.Vpc", "");
     vpc.set_attr(
         "cidr_block".to_string(),
         Value::String("10.0.0.0/16".to_string()),
@@ -1305,9 +1305,9 @@ fn test_compute_anonymous_id_stable_with_prefixed_create_only_attribute() {
     // When a create-only attribute has a prefix (e.g., bucket_name_prefix),
     // the anonymous identifier should be based on the prefix, not the
     // randomly generated name. This ensures the hash is stable across runs.
-    let schema = ResourceSchema::new("awscc.s3.bucket")
+    let schema = ResourceSchema::new("awscc.s3.Bucket")
         .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only());
-    let schemas: HashMap<String, ResourceSchema> = vec![("awscc.s3.bucket".to_string(), schema)]
+    let schemas: HashMap<String, ResourceSchema> = vec![("awscc.s3.Bucket".to_string(), schema)]
         .into_iter()
         .collect();
     let providers = vec![ProviderConfig {
@@ -1322,7 +1322,7 @@ fn test_compute_anonymous_id_stable_with_prefixed_create_only_attribute() {
 
     // Simulate two runs with different random suffixes but same prefix
     let make_resource = |generated_name: &str| {
-        let mut r = Resource::with_provider("awscc", "s3.bucket", "");
+        let mut r = Resource::with_provider("awscc", "s3.Bucket", "");
         r.set_attr(
             "bucket_name".to_string(),
             Value::String(generated_name.to_string()),
@@ -1349,9 +1349,9 @@ fn test_compute_anonymous_id_stable_with_prefixed_create_only_attribute() {
 #[test]
 fn test_compute_anonymous_id_different_prefix_produces_different_id() {
     // Different prefixes should produce different anonymous identifiers
-    let schema = ResourceSchema::new("awscc.s3.bucket")
+    let schema = ResourceSchema::new("awscc.s3.Bucket")
         .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only());
-    let schemas: HashMap<String, ResourceSchema> = vec![("awscc.s3.bucket".to_string(), schema)]
+    let schemas: HashMap<String, ResourceSchema> = vec![("awscc.s3.Bucket".to_string(), schema)]
         .into_iter()
         .collect();
     let providers = vec![ProviderConfig {
@@ -1365,7 +1365,7 @@ fn test_compute_anonymous_id_different_prefix_produces_different_id() {
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
     let make_resource = |prefix: &str, generated_name: &str| {
-        let mut r = Resource::with_provider("awscc", "s3.bucket", "");
+        let mut r = Resource::with_provider("awscc", "s3.Bucket", "");
         r.set_attr(
             "bucket_name".to_string(),
             Value::String(generated_name.to_string()),
@@ -1712,9 +1712,9 @@ fn test_reconcile_does_not_swap_named_resources_with_overlapping_create_only() {
 }
 
 fn make_sso_instance_schema() -> (String, ResourceSchema) {
-    let schema = ResourceSchema::new("awscc.sso.instance")
+    let schema = ResourceSchema::new("awscc.sso.Instance")
         .attribute(AttributeSchema::new("name", AttributeType::String).create_only());
-    ("awscc.sso.instance".to_string(), schema)
+    ("awscc.sso.Instance".to_string(), schema)
 }
 
 #[test]
@@ -1726,7 +1726,7 @@ fn test_detect_rename_unique_match_by_create_only_attrs() {
     let (key, schema) = make_sso_instance_schema();
     let schemas: HashMap<String, ResourceSchema> = vec![(key, schema)].into_iter().collect();
 
-    let mut resource = Resource::with_provider("awscc", "sso.instance", "sso");
+    let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso");
     resource.binding = Some("sso".to_string());
     resource.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
     let resources = vec![resource];
@@ -1758,7 +1758,7 @@ fn test_detect_rename_skips_when_binding_already_in_state() {
     let (key, schema) = make_sso_instance_schema();
     let schemas: HashMap<String, ResourceSchema> = vec![(key, schema)].into_iter().collect();
 
-    let mut resource = Resource::with_provider("awscc", "sso.instance", "sso");
+    let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso");
     resource.binding = Some("sso".to_string());
     resource.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
     let resources = vec![resource];
@@ -1787,7 +1787,7 @@ fn test_detect_rename_ignores_anonymous_resources() {
     let (key, schema) = make_sso_instance_schema();
     let schemas: HashMap<String, ResourceSchema> = vec![(key, schema)].into_iter().collect();
 
-    let mut resource = Resource::with_provider("awscc", "sso.instance", "sso_instance_new");
+    let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso_instance_new");
     // No binding set
     resource.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
     let resources = vec![resource];
@@ -1816,7 +1816,7 @@ fn test_detect_rename_skips_ambiguous_matches() {
     let (key, schema) = make_sso_instance_schema();
     let schemas: HashMap<String, ResourceSchema> = vec![(key, schema)].into_iter().collect();
 
-    let mut resource = Resource::with_provider("awscc", "sso.instance", "sso");
+    let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso");
     resource.binding = Some("sso".to_string());
     resource.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
     let resources = vec![resource];
@@ -1854,7 +1854,7 @@ fn test_detect_rename_ignores_non_hash_state_names() {
     let (key, schema) = make_sso_instance_schema();
     let schemas: HashMap<String, ResourceSchema> = vec![(key, schema)].into_iter().collect();
 
-    let mut resource = Resource::with_provider("awscc", "sso.instance", "sso");
+    let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso");
     resource.binding = Some("sso".to_string());
     resource.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
     let resources = vec![resource];
@@ -1877,17 +1877,17 @@ fn test_detect_rename_ignores_non_hash_state_names() {
     assert!(renames.is_empty());
 }
 
-/// Schema with NO create-only attributes — like `awscc.sso.instance`.
+/// Schema with NO create-only attributes — like `awscc.sso.Instance`.
 fn make_sso_instance_schema_no_create_only() -> (String, ResourceSchema) {
-    let schema = ResourceSchema::new("awscc.sso.instance")
+    let schema = ResourceSchema::new("awscc.sso.Instance")
         .attribute(AttributeSchema::new("name", AttributeType::String));
-    ("awscc.sso.instance".to_string(), schema)
+    ("awscc.sso.Instance".to_string(), schema)
 }
 
 #[test]
 fn test_detect_rename_no_create_only_matches_by_simhash() {
     // Regression test for carina#1670:
-    // Schema has no create-only attrs (e.g. awscc.sso.instance). The
+    // Schema has no create-only attrs (e.g. awscc.sso.Instance). The
     // anonymous → let-bound rename must still be detected so `carina plan`
     // shows a Move rather than Delete+Create, which would destroy the
     // Identity Center instance and all of its users/groups.
@@ -1898,7 +1898,7 @@ fn test_detect_rename_no_create_only_matches_by_simhash() {
 
     // Step 1: generate the anonymous ID the previous `apply` would have
     // written to state, using the same inputs and the same code path.
-    let mut anon = Resource::with_provider("awscc", "sso.instance", "");
+    let mut anon = Resource::with_provider("awscc", "sso.Instance", "");
     anon.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
     let mut anon_vec = vec![anon];
     compute_anonymous_identifiers(
@@ -1916,7 +1916,7 @@ fn test_detect_rename_no_create_only_matches_by_simhash() {
     );
 
     // Step 2: user wraps the same resource in a `let` binding.
-    let mut let_bound = Resource::with_provider("awscc", "sso.instance", "sso");
+    let mut let_bound = Resource::with_provider("awscc", "sso.Instance", "sso");
     let_bound.binding = Some("sso".to_string());
     let_bound.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
     let resources = vec![let_bound];
@@ -1954,7 +1954,7 @@ fn test_detect_rename_no_create_only_skips_when_attributes_differ_too_much() {
     let identity_fn = |_: &str| -> Vec<String> { Vec::new() };
 
     // Anonymous snapshot with many attributes.
-    let mut anon = Resource::with_provider("awscc", "sso.instance", "");
+    let mut anon = Resource::with_provider("awscc", "sso.Instance", "");
     anon.set_attr("name".to_string(), Value::String("old-name".to_string()));
     let mut tags = std::collections::HashMap::new();
     tags.insert("k1".to_string(), Value::String("v1".to_string()));
@@ -1972,7 +1972,7 @@ fn test_detect_rename_no_create_only_skips_when_attributes_differ_too_much() {
     let anonymous_name = anon_vec[0].id.name.clone();
 
     // Let-bound resource with wildly different attributes.
-    let mut let_bound = Resource::with_provider("awscc", "sso.instance", "sso");
+    let mut let_bound = Resource::with_provider("awscc", "sso.Instance", "sso");
     let_bound.binding = Some("sso".to_string());
     let_bound.set_attr(
         "name".to_string(),
@@ -2016,7 +2016,7 @@ fn test_detect_rename_no_create_only_picks_closest_among_multiple_candidates() {
     let identity_fn = |_: &str| -> Vec<String> { Vec::new() };
 
     // Compute the exact-match name.
-    let mut anon = Resource::with_provider("awscc", "sso.instance", "");
+    let mut anon = Resource::with_provider("awscc", "sso.Instance", "");
     anon.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
     let mut anon_vec = vec![anon];
     compute_anonymous_identifiers(
@@ -2051,7 +2051,7 @@ fn test_detect_rename_no_create_only_picks_closest_among_multiple_candidates() {
         },
     ];
 
-    let mut let_bound = Resource::with_provider("awscc", "sso.instance", "sso");
+    let mut let_bound = Resource::with_provider("awscc", "sso.Instance", "sso");
     let_bound.binding = Some("sso".to_string());
     let_bound.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
     let resources = vec![let_bound];
@@ -2082,7 +2082,7 @@ fn test_detect_rename_no_create_only_skips_8_char_hash_entries() {
     let providers: Vec<ProviderConfig> = Vec::new();
     let identity_fn = |_: &str| -> Vec<String> { Vec::new() };
 
-    let mut let_bound = Resource::with_provider("awscc", "sso.instance", "sso");
+    let mut let_bound = Resource::with_provider("awscc", "sso.Instance", "sso");
     let_bound.binding = Some("sso".to_string());
     let_bound.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
     let resources = vec![let_bound];
@@ -2118,7 +2118,7 @@ fn test_detect_rename_no_create_only_skips_when_two_orphans_tie_on_distance() {
     let identity_fn = |_: &str| -> Vec<String> { Vec::new() };
 
     // Compute the target SimHash.
-    let mut anon = Resource::with_provider("awscc", "sso.instance", "");
+    let mut anon = Resource::with_provider("awscc", "sso.Instance", "");
     anon.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
     let mut anon_vec = vec![anon];
     compute_anonymous_identifiers(
@@ -2143,7 +2143,7 @@ fn test_detect_rename_no_create_only_skips_when_two_orphans_tie_on_distance() {
         },
     ];
 
-    let mut let_bound = Resource::with_provider("awscc", "sso.instance", "sso");
+    let mut let_bound = Resource::with_provider("awscc", "sso.Instance", "sso");
     let_bound.binding = Some("sso".to_string());
     let_bound.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
     let resources = vec![let_bound];

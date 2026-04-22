@@ -652,7 +652,7 @@ pub fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateFile, Ap
             &resource.id.name,
         );
         // Collect write-only attribute names from the schema for this resource type.
-        // Schema keys include the provider prefix (e.g., "awscc.ec2.vpc"), so we must
+        // Schema keys include the provider prefix (e.g., "awscc.ec2.Vpc"), so we must
         // construct the key the same way as schema_key_for_resource().
         let schema_key = if resource.id.provider.is_empty() {
             resource.id.resource_type.clone()
@@ -1892,20 +1892,20 @@ mod tests {
 
     #[test]
     fn build_state_after_apply_finds_write_only_with_provider_prefix() {
-        // The schema map is keyed by provider-prefixed names (e.g., "awscc.ec2.vpc"),
-        // but the buggy code used resource.id.resource_type (e.g., "ec2.vpc") for lookup.
+        // The schema map is keyed by provider-prefixed names (e.g., "awscc.ec2.Vpc"),
+        // but the buggy code used resource.id.resource_type (e.g., "ec2.Vpc") for lookup.
         // This test verifies that write-only attributes are found when the schema key
         // includes the provider prefix.
         let mut schemas = HashMap::new();
-        let schema = ResourceSchema::new("ec2.vpc")
+        let schema = ResourceSchema::new("ec2.Vpc")
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
             .attribute(
                 AttributeSchema::new("ipv4_netmask_length", AttributeType::Int).write_only(),
             );
         // Schema is registered with provider-prefixed key
-        schemas.insert("awscc.ec2.vpc".to_string(), schema);
+        schemas.insert("awscc.ec2.Vpc".to_string(), schema);
 
-        let mut resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc");
+        let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc");
         resource.set_attr(
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
@@ -1948,7 +1948,7 @@ mod tests {
 
         // The write-only attribute should be merged from the desired resource into state
         let saved = result
-            .find_resource("awscc", "ec2.vpc", "my-vpc")
+            .find_resource("awscc", "ec2.Vpc", "my-vpc")
             .expect("resource should exist in state");
         assert_eq!(
             saved.attributes.get("ipv4_netmask_length"),

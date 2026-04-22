@@ -1080,7 +1080,7 @@ mod tests {
     #[test]
     fn tree_connector_root_has_no_prefix() {
         let mut plan = Plan::new();
-        plan.add(Effect::Create(Resource::new("s3.bucket", "my-bucket")));
+        plan.add(Effect::Create(Resource::new("s3.Bucket", "my-bucket")));
         let app = App::new(&plan, &std::collections::HashMap::new());
         assert_eq!(build_tree_connector(0, &app), "");
     }
@@ -1089,12 +1089,12 @@ mod tests {
     fn tree_connector_single_child() {
         let mut plan = Plan::new();
         plan.add(Effect::Create(
-            Resource::new("ec2.vpc", "my-vpc")
+            Resource::new("ec2.Vpc", "my-vpc")
                 .with_binding("vpc")
                 .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string())),
         ));
         plan.add(Effect::Create(
-            Resource::new("ec2.subnet", "my-subnet")
+            Resource::new("ec2.Subnet", "my-subnet")
                 .with_binding("subnet")
                 .with_attribute(
                     "vpc_id",
@@ -1112,10 +1112,10 @@ mod tests {
     fn tree_connector_multiple_children() {
         let mut plan = Plan::new();
         plan.add(Effect::Create(
-            Resource::new("ec2.vpc", "my-vpc").with_binding("vpc"),
+            Resource::new("ec2.Vpc", "my-vpc").with_binding("vpc"),
         ));
         plan.add(Effect::Create(
-            Resource::new("ec2.subnet", "subnet-a")
+            Resource::new("ec2.Subnet", "subnet-a")
                 .with_binding("subnet_a")
                 .with_attribute(
                     "vpc_id",
@@ -1123,7 +1123,7 @@ mod tests {
                 ),
         ));
         plan.add(Effect::Create(
-            Resource::new("ec2.subnet", "subnet-b")
+            Resource::new("ec2.Subnet", "subnet-b")
                 .with_binding("subnet_b")
                 .with_attribute(
                     "vpc_id",

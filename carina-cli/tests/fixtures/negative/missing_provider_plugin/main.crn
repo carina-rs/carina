@@ -6,6 +6,6 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-awscc.s3.bucket {
+awscc.s3.Bucket {
   bucket_name = 'test-bucket'
 }

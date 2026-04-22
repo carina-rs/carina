@@ -1,7 +1,7 @@
 let inner = import '../inner_module'
 
 arguments {
-  cidr_block: string
+  cidr_block: String
 }
 
 attributes {

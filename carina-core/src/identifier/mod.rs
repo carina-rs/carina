@@ -435,12 +435,18 @@ pub fn compute_anonymous_identifiers(
             format!("{:08x}", hasher.finish() & 0xFFFFFFFF)
         };
 
-        // Build identifier: resource_type_hash (e.g., ec2_vpc_a3f2b1c8)
-        let identifier = format!(
-            "{}_{}",
-            resource.id.resource_type.replace('.', "_"),
-            hash_str
-        );
+        // Build identifier: resource_type_hash (e.g., ec2_vpc_a3f2b1c8). The
+        // resource_type segments carry PascalCase for the final type name
+        // (e.g., "ec2.Vpc"); identifier names are snake_case values per the
+        // naming-conventions rule, so lower each segment before joining.
+        let type_snake = resource
+            .id
+            .resource_type
+            .split('.')
+            .map(crate::parser::pascal_to_snake)
+            .collect::<Vec<_>>()
+            .join("_");
+        let identifier = format!("{}_{}", type_snake, hash_str);
 
         computed.push((idx, identifier));
     }
@@ -608,7 +614,7 @@ pub fn reconcile_anonymous_identifiers(
 /// preserving the same create-only attributes, the old state entry (with a
 /// hash-derived name) doesn't match the new binding name. Without this
 /// detection the differ treats the change as delete + create, which for
-/// destructive resources (e.g., `awscc.sso.instance`) can wipe out live data.
+/// destructive resources (e.g., `awscc.sso.Instance`) can wipe out live data.
 ///
 /// Returns a list of `(old_anonymous_name, new_binding_name)` pairs for each
 /// matched rename. Callers should transfer state entries from the old name to
@@ -620,7 +626,7 @@ pub fn reconcile_anonymous_identifiers(
 /// 3. For resources whose schema has create-only attributes: there must be
 ///    exactly one orphaned anonymous state entry whose create-only attribute
 ///    values all match the new resource (ambiguous matches are skipped)
-/// 4. For resources with no create-only attributes (e.g., `awscc.sso.instance`):
+/// 4. For resources with no create-only attributes (e.g., `awscc.sso.Instance`):
 ///    fall back to SimHash Hamming-distance matching, using the same SimHash
 ///    that `compute_anonymous_identifiers` would have produced. This requires
 ///    `providers` and `identity_attributes_fn` so identity values (e.g.,

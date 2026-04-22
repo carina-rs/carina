@@ -9,7 +9,7 @@ use tower_lsp::lsp_types::{SemanticToken, SemanticTokenType, SemanticTokensLegen
 /// legend only to keep the indices of later entries stable.
 pub const TOKEN_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::KEYWORD,  // 0: (unused — kept for index stability)
-    SemanticTokenType::TYPE,     // 1: aws.s3.bucket, aws.ec2.vpc, aws.Region.*
+    SemanticTokenType::TYPE,     // 1: aws.s3.Bucket, aws.ec2.Vpc, aws.Region.*
     SemanticTokenType::VARIABLE, // 2: variable names
     SemanticTokenType::PROPERTY, // 3: attribute names (name, region, etc.)
     SemanticTokenType::STRING,   // 4: string literals
@@ -516,7 +516,7 @@ impl SemanticTokensProvider {
         }
     }
 
-    /// Find resource type patterns like aws.s3.bucket, aws.ec2.vpc
+    /// Find resource type patterns like aws.s3.Bucket, aws.ec2.Vpc
     fn find_resource_types(&self, line: &str, tokens: &mut Vec<(u32, u32, u32)>) {
         let chars: Vec<char> = line.chars().collect();
         let mut i = 0;
@@ -572,7 +572,7 @@ impl SemanticTokensProvider {
             parts.push(current_part);
         }
 
-        // Must have at least 3 parts: provider.service.resource (e.g., aws.ec2.vpc, awscc.ec2.vpc)
+        // Must have at least 3 parts: provider.service.resource (e.g., aws.ec2.Vpc, awscc.ec2.Vpc)
         if parts.len() >= 2 && parts.len() <= 3 {
             // Exclude enum patterns like aws.Region, aws.Protocol (2nd part starts with uppercase)
             if parts.len() == 2 && parts[1].starts_with(|c: char| c.is_uppercase()) {
@@ -631,28 +631,28 @@ mod tests {
     #[test]
     fn test_resource_type_at_line_start() {
         let provider = SemanticTokensProvider::new(&[]);
-        let tokens = provider.tokenize("aws.s3.bucket {");
+        let tokens = provider.tokenize("aws.s3.Bucket {");
 
-        // Should have at least one TYPE token for aws.s3.bucket
+        // Should have at least one TYPE token for aws.s3.Bucket
         let type_tokens: Vec<_> = tokens.iter().filter(|t| t.token_type == 1).collect();
-        assert!(!type_tokens.is_empty(), "Should find aws.s3.bucket as TYPE");
+        assert!(!type_tokens.is_empty(), "Should find aws.s3.Bucket as TYPE");
     }
 
     #[test]
     fn test_resource_type_after_let() {
         let provider = SemanticTokensProvider::new(&[]);
-        let tokens = provider.tokenize("let bucket = aws.s3.bucket {");
+        let tokens = provider.tokenize("let bucket = aws.s3.Bucket {");
 
-        // Should have TYPE token for aws.s3.bucket
+        // Should have TYPE token for aws.s3.Bucket
         let type_tokens: Vec<_> = tokens.iter().filter(|t| t.token_type == 1).collect();
-        assert!(!type_tokens.is_empty(), "Should find aws.s3.bucket as TYPE");
+        assert!(!type_tokens.is_empty(), "Should find aws.s3.Bucket as TYPE");
     }
 
     #[test]
     fn test_find_resource_types_directly() {
         let provider = SemanticTokensProvider::new(&[]);
         let mut tokens = Vec::new();
-        provider.find_resource_types("aws.s3.bucket {", &mut tokens);
+        provider.find_resource_types("aws.s3.Bucket {", &mut tokens);
 
         assert_eq!(tokens.len(), 1, "Should find one resource type");
         assert_eq!(
@@ -665,17 +665,17 @@ mod tests {
     #[test]
     fn test_tokenize_line_resource_type() {
         let provider = SemanticTokensProvider::new(&[]);
-        let line_tokens = provider.tokenize_line("aws.s3.bucket {", 0);
+        let line_tokens = provider.tokenize_line("aws.s3.Bucket {", 0);
 
         println!("Line tokens: {:?}", line_tokens);
 
-        // Check that aws.s3.bucket is in the tokens as TYPE (1)
+        // Check that aws.s3.Bucket is in the tokens as TYPE (1)
         let has_resource_type = line_tokens
             .iter()
             .any(|(start, len, typ)| *start == 0 && *len == 13 && *typ == 1);
         assert!(
             has_resource_type,
-            "Should have aws.s3.bucket as TYPE at position 0. Got: {:?}",
+            "Should have aws.s3.Bucket as TYPE at position 0. Got: {:?}",
             line_tokens
         );
     }
@@ -714,7 +714,7 @@ mod tests {
     #[test]
     fn test_tokenize_full_file() {
         let provider = SemanticTokensProvider::new(&[]);
-        let content = "aws.s3.bucket {\n    name = \"test\"\n}";
+        let content = "aws.s3.Bucket {\n    name = \"test\"\n}";
         let tokens = provider.tokenize(content);
 
         println!("Full tokenize result:");
@@ -725,7 +725,7 @@ mod tests {
             );
         }
 
-        // First token should be aws.s3.bucket (TYPE = 1)
+        // First token should be aws.s3.Bucket (TYPE = 1)
         assert!(!tokens.is_empty(), "Should have tokens");
         let first = &tokens[0];
         assert_eq!(
@@ -735,7 +735,7 @@ mod tests {
         );
         assert_eq!(
             first.length, 13,
-            "First token length should be 13 (aws.s3.bucket)"
+            "First token length should be 13 (aws.s3.Bucket)"
         );
     }
 
@@ -845,7 +845,7 @@ mod tests {
     fn test_non_ascii_full_tokenize() {
         let provider = SemanticTokensProvider::new(&[]);
         // Full file with mixed ASCII and non-ASCII
-        let content = "// 日本語コメント\naws.s3.bucket {\n    name = \"テスト\"\n}";
+        let content = "// 日本語コメント\naws.s3.Bucket {\n    name = \"テスト\"\n}";
         // Should not panic
         let tokens = provider.tokenize(content);
         assert!(!tokens.is_empty(), "Should produce tokens");
@@ -950,7 +950,7 @@ mod tests {
         // adding new token patterns in the future could create such overlaps, and the
         // dedup must handle them correctly.
         let mut tokens: Vec<(u32, u32, u32)> = vec![
-            (0, 13, 1), // TYPE token: e.g., aws.s3.bucket
+            (0, 13, 1), // TYPE token: e.g., aws.s3.Bucket
             (0, 3, 0),  // KEYWORD token at same position but different length/type
             (5, 4, 3),  // PROPERTY token
             (5, 4, 3),  // Exact duplicate of above - should be removed
@@ -1031,7 +1031,7 @@ mod tests {
     fn test_let_binding_with_extra_whitespace() {
         let provider = SemanticTokensProvider::new(&[]);
         // Double space after "let" - the variable name should still be highlighted
-        let tokens = provider.tokenize_line("let  x = aws.s3.bucket {", 0);
+        let tokens = provider.tokenize_line("let  x = aws.s3.Bucket {", 0);
 
         // Should have VARIABLE token for "x"
         let var_token = tokens.iter().find(|(_, _, typ)| *typ == 2);
@@ -1052,7 +1052,7 @@ mod tests {
     fn test_let_binding_with_multiple_extra_spaces() {
         let provider = SemanticTokensProvider::new(&[]);
         // Multiple spaces after "let"
-        let tokens = provider.tokenize_line("let    bucket = aws.s3.bucket {", 0);
+        let tokens = provider.tokenize_line("let    bucket = aws.s3.Bucket {", 0);
 
         let var_token = tokens.iter().find(|(_, _, typ)| *typ == 2);
         assert!(

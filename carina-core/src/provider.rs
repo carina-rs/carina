@@ -154,7 +154,7 @@ pub trait ProviderNormalizer: Send + Sync {
     ///
     /// Converts raw values in current state (e.g., `"ap-northeast-1a"`) to
     /// the same DSL enum format that `normalize_desired` produces
-    /// (e.g., `"awscc.ec2.subnet.AvailabilityZone.ap_northeast_1a"`).
+    /// (e.g., `"awscc.ec2.Subnet.AvailabilityZone.ap_northeast_1a"`).
     /// This prevents false diffs when state stores raw AWS values but
     /// desired state has been normalized.
     /// Default implementation is a no-op.
@@ -959,7 +959,7 @@ mod tests {
     #[test]
     fn provider_error_display_with_resource_id_and_cause() {
         let cause = std::io::Error::other("timeout");
-        let id = ResourceId::new("s3.bucket", "my-bucket");
+        let id = ResourceId::new("s3.Bucket", "my-bucket");
         let err = ProviderError::new("Failed to read")
             .with_cause(cause)
             .for_resource(id);
@@ -970,7 +970,7 @@ mod tests {
             display
         );
         assert!(
-            display.contains("s3.bucket"),
+            display.contains("s3.Bucket"),
             "Display should include resource type, got: {}",
             display
         );
@@ -1203,10 +1203,10 @@ mod tests {
         let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(MockProviderFactory)];
 
         // Resource with id.provider set but NO _provider attribute
-        let resource = Resource::with_provider("mock", "s3.bucket", "my-bucket");
+        let resource = Resource::with_provider("mock", "s3.Bucket", "my-bucket");
         assert!(!resource.attributes.contains_key("_provider"));
 
         let key = schema_key_for_resource(&factories, &resource);
-        assert_eq!(key, "mock.s3.bucket");
+        assert_eq!(key, "mock.s3.Bucket");
     }
 }

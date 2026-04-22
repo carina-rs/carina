@@ -997,7 +997,7 @@ mod tests {
             providers: vec![],
             resources: vec![
                 Resource {
-                    id: ResourceId::new("ec2.vpc", "main_vpc"),
+                    id: ResourceId::new("ec2.Vpc", "main_vpc"),
                     attributes: {
                         let mut attrs = HashMap::new();
                         attrs.insert(
@@ -1014,7 +1014,7 @@ mod tests {
                     module_source: None,
                 },
                 Resource {
-                    id: ResourceId::new("ec2.subnet", "sub"),
+                    id: ResourceId::new("ec2.Subnet", "sub"),
                     attributes: {
                         let mut attrs = HashMap::new();
                         attrs.insert(
@@ -1470,7 +1470,7 @@ mod tests {
         ParsedFile {
             providers: vec![],
             resources: vec![Resource {
-                id: ResourceId::new("ec2.vpc", "vpc"),
+                id: ResourceId::new("ec2.Vpc", "vpc"),
                 attributes: {
                     let mut attrs = HashMap::new();
                     attrs.insert(
@@ -1605,12 +1605,12 @@ mod tests {
             .collect();
 
         assert!(
-            resource_types.iter().any(|t| t.contains("vpc")),
+            resource_types.iter().any(|t| t.ends_with(".Vpc")),
             "Should contain VPC resource from inner module, got: {:?}",
             resource_types
         );
         assert!(
-            resource_types.iter().any(|t| t.contains("security_group")),
+            resource_types.iter().any(|t| t.ends_with(".SecurityGroup")),
             "Should contain security group from outer module, got: {:?}",
             resource_types
         );
@@ -1639,7 +1639,7 @@ mod tests {
             .collect();
 
         assert!(
-            resource_types.iter().any(|t| t.contains("vpc")),
+            resource_types.iter().any(|t| t.ends_with(".Vpc")),
             "Should contain VPC resource from inner module (3 levels deep), got: {:?}",
             resource_types
         );

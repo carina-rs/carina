@@ -152,10 +152,10 @@ pub(super) fn test_provider_with_enum_and_regions() -> CompletionProvider {
         namespace: None,
         to_dsl: None,
     };
-    let schema = ResourceSchema::new("awscc.s3.bucket")
+    let schema = ResourceSchema::new("awscc.s3.Bucket")
         .attribute(AttributeSchema::new("versioning_status", status_enum));
     let mut schemas = HashMap::new();
-    schemas.insert("awscc.s3.bucket".to_string(), schema);
+    schemas.insert("awscc.s3.Bucket".to_string(), schema);
 
     let region_completions: Vec<CompletionValue> = vec![
         CompletionValue {
@@ -192,7 +192,7 @@ pub(super) fn test_provider_with_nameless_enum() -> CompletionProvider {
         fields: vec![StructField::new("status", status_enum.clone())],
     };
 
-    let schema = ResourceSchema::new("awscc.s3.bucket")
+    let schema = ResourceSchema::new("awscc.s3.Bucket")
         .attribute(AttributeSchema::new("versioning_status", status_enum))
         .attribute(AttributeSchema::new(
             "versioning_configuration",
@@ -200,7 +200,7 @@ pub(super) fn test_provider_with_nameless_enum() -> CompletionProvider {
         ));
 
     let mut schemas = HashMap::new();
-    schemas.insert("awscc.s3.bucket".to_string(), schema);
+    schemas.insert("awscc.s3.Bucket".to_string(), schema);
 
     CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![])
 }
@@ -225,14 +225,14 @@ pub(super) fn test_provider_with_custom_semantic_attr() -> CompletionProvider {
     let principal_type = AttributeType::StringEnum {
         name: "PrincipalType".to_string(),
         values: vec!["GROUP".to_string(), "USER".to_string()],
-        namespace: Some("awscc.sso.assignment".to_string()),
+        namespace: Some("awscc.sso.Assignment".to_string()),
         to_dsl: None,
     };
-    let schema = ResourceSchema::new("awscc.sso.assignment")
+    let schema = ResourceSchema::new("awscc.sso.Assignment")
         .attribute(AttributeSchema::new("principal_type", principal_type))
         .attribute(AttributeSchema::new("target_id", account_id));
 
     let mut schemas = HashMap::new();
-    schemas.insert("awscc.sso.assignment".to_string(), schema);
+    schemas.insert("awscc.sso.Assignment".to_string(), schema);
     CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![])
 }

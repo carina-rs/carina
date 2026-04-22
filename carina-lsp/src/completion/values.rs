@@ -942,7 +942,7 @@ impl CompletionProvider {
         text: &str,
     ) -> Vec<CompletionItem> {
         // Calculate the replacement range: from right after ":" to the cursor position.
-        // This ensures dotted identifiers like "aws.ec2.vpc" are replaced correctly
+        // This ensures dotted identifiers like "aws.ec2.Vpc" are replaced correctly
         // without duplication from LSP word-boundary-based insertion.
         let lines: Vec<&str> = text.lines().collect();
         let line_idx = position.line as usize;

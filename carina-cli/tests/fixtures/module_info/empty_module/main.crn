@@ -1,8 +1,8 @@
 arguments {
-  name: string {
+  name: String {
     description = 'Resource name prefix'
   }
-  env: string {
+  env: String {
     description = 'Environment label'
     default     = 'dev'
   }

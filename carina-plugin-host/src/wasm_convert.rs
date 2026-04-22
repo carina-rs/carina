@@ -529,10 +529,10 @@ mod tests {
 
     #[test]
     fn test_resource_id_roundtrip() {
-        let core = CoreResourceId::with_provider("aws", "s3.bucket", "my-bucket");
+        let core = CoreResourceId::with_provider("aws", "s3.Bucket", "my-bucket");
         let wit = core_to_wit_resource_id(&core);
         assert_eq!(wit.provider, "aws");
-        assert_eq!(wit.resource_type, "s3.bucket");
+        assert_eq!(wit.resource_type, "s3.Bucket");
         assert_eq!(wit.name, "my-bucket");
         let back = wit_to_core_resource_id(&wit);
         assert_eq!(core, back);
@@ -542,7 +542,7 @@ mod tests {
 
     #[test]
     fn test_state_roundtrip() {
-        let id = CoreResourceId::with_provider("aws", "s3.bucket", "my-bucket");
+        let id = CoreResourceId::with_provider("aws", "s3.Bucket", "my-bucket");
         let mut attrs = HashMap::new();
         attrs.insert("name".into(), CoreValue::String("my-bucket".into()));
         attrs.insert("region".into(), CoreValue::String("us-east-1".into()));
@@ -558,7 +558,7 @@ mod tests {
 
     #[test]
     fn test_state_with_identifier_roundtrip() {
-        let id = CoreResourceId::with_provider("aws", "ec2.vpc", "main");
+        let id = CoreResourceId::with_provider("aws", "ec2.Vpc", "main");
         let attrs = HashMap::from([("cidr".into(), CoreValue::String("10.0.0.0/16".into()))]);
         let core = CoreState::existing(id.clone(), attrs).with_identifier("vpc-12345");
 
@@ -588,7 +588,7 @@ mod tests {
 
     #[test]
     fn test_resource_roundtrip() {
-        let mut resource = CoreResource::with_provider("aws", "s3.bucket", "my-bucket");
+        let mut resource = CoreResource::with_provider("aws", "s3.Bucket", "my-bucket");
         resource.attributes = HashMap::from([
             ("name".into(), Expr(CoreValue::String("my-bucket".into()))),
             ("region".into(), Expr(CoreValue::String("us-east-1".into()))),
@@ -596,7 +596,7 @@ mod tests {
 
         let wit = core_to_wit_resource(&resource);
         assert_eq!(wit.id.provider, "aws");
-        assert_eq!(wit.id.resource_type, "s3.bucket");
+        assert_eq!(wit.id.resource_type, "s3.Bucket");
         assert_eq!(wit.id.name, "my-bucket");
 
         let back = wit_to_core_resource(&wit);
@@ -623,7 +623,7 @@ mod tests {
 
     #[test]
     fn test_json_to_provider_error_valid() {
-        let json = r#"{"message":"something failed","resource_id":{"provider":"aws","resource_type":"s3.bucket","name":"test"},"is_timeout":true}"#;
+        let json = r#"{"message":"something failed","resource_id":{"provider":"aws","resource_type":"s3.Bucket","name":"test"},"is_timeout":true}"#;
         let err = json_to_provider_error(json);
         assert_eq!(err.message, "something failed");
         assert!(err.is_timeout);
@@ -667,7 +667,7 @@ mod tests {
     fn test_json_to_schemas_with_complex_attributes() {
         let json = r#"[
           {
-            "resource_type": "ec2.security_group",
+            "resource_type": "ec2.SecurityGroup",
             "description": "EC2 Security Group",
             "data_source": false,
             "name_attribute": "group_name",
@@ -751,7 +751,7 @@ mod tests {
         assert_eq!(schemas.len(), 1);
 
         let schema = &schemas[0];
-        assert_eq!(schema.resource_type, "ec2.security_group");
+        assert_eq!(schema.resource_type, "ec2.SecurityGroup");
         assert_eq!(schema.description.as_deref(), Some("EC2 Security Group"));
         assert!(!schema.data_source);
         assert_eq!(schema.name_attribute.as_deref(), Some("group_name"));
@@ -877,7 +877,7 @@ mod tests {
     #[test]
     fn test_proto_schema_with_tags_validator_reconstructed() {
         let proto_schema = proto::ResourceSchema {
-            resource_type: "awscc.s3.bucket".to_string(),
+            resource_type: "awscc.s3.Bucket".to_string(),
             attributes: HashMap::new(),
             description: None,
             data_source: false,
@@ -894,7 +894,7 @@ mod tests {
     #[test]
     fn test_proto_schema_without_validators_has_no_validator() {
         let proto_schema = proto::ResourceSchema {
-            resource_type: "awscc.s3.bucket".to_string(),
+            resource_type: "awscc.s3.Bucket".to_string(),
             attributes: HashMap::new(),
             description: None,
             data_source: false,
@@ -913,7 +913,7 @@ mod tests {
         // Declarative exclusive_required must survive the proto boundary so
         // WASM providers can express `oneOf` constraints as data.
         let proto_schema = proto::ResourceSchema {
-            resource_type: "awscc.ec2.vpc".to_string(),
+            resource_type: "awscc.ec2.Vpc".to_string(),
             attributes: HashMap::new(),
             description: None,
             data_source: false,
@@ -951,7 +951,7 @@ mod tests {
         // The plugin host receives schemas as JSON. Confirm the new field
         // is preserved through full JSON round-trip (guest -> host).
         let proto_schema = proto::ResourceSchema {
-            resource_type: "awscc.ec2.vpc".to_string(),
+            resource_type: "awscc.ec2.Vpc".to_string(),
             attributes: HashMap::new(),
             description: None,
             data_source: false,
@@ -973,7 +973,7 @@ mod tests {
     #[test]
     fn test_tags_validator_detects_key_value_pattern() {
         let proto_schema = proto::ResourceSchema {
-            resource_type: "awscc.s3.bucket".to_string(),
+            resource_type: "awscc.s3.Bucket".to_string(),
             attributes: HashMap::new(),
             description: None,
             data_source: false,

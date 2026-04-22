@@ -388,17 +388,17 @@ mod tests {
 
     #[test]
     fn parse_resource_id_with_prefix_name() {
-        let id = parse_resource_id_string("awscc.s3.bucket.carina-acc-test-abc123");
+        let id = parse_resource_id_string("awscc.s3.Bucket.carina-acc-test-abc123");
         assert_eq!(id.provider, "awscc");
-        assert_eq!(id.resource_type, "s3.bucket");
+        assert_eq!(id.resource_type, "s3.Bucket");
         assert_eq!(id.name, "carina-acc-test-abc123");
     }
 
     #[test]
     fn parse_resource_id_aws_provider() {
-        let id = parse_resource_id_string("aws.s3.bucket.my-bucket");
+        let id = parse_resource_id_string("aws.s3.Bucket.my-bucket");
         assert_eq!(id.provider, "aws");
-        assert_eq!(id.resource_type, "s3.bucket");
+        assert_eq!(id.resource_type, "s3.Bucket");
         assert_eq!(id.name, "my-bucket");
     }
 

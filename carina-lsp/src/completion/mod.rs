@@ -208,7 +208,7 @@ impl CompletionProvider {
             // can see through it.
             let is_for_header = trimmed.starts_with("for ") && trimmed.ends_with('{');
 
-            // Look for resource type declaration: "aws.ec2.vpc {" or "let x = aws.ec2.vpc {"
+            // Look for resource type declaration: "aws.ec2.Vpc {" or "let x = aws.ec2.Vpc {"
             // Accept at depth == 0 (top level) or at depth == for_body_depth
             // (directly inside a `for` body, which is semantically top-level
             // for the purpose of resolving the enclosing resource type).
@@ -471,8 +471,8 @@ impl CompletionProvider {
             .any(|name| line.starts_with(&format!("{}.", name)))
     }
 
-    /// Extract resource type from a line like "aws.ec2.vpc {" or "let x = aws.ec2.vpc {"
-    /// Returns the resource type (e.g., "aws.ec2.vpc") for schema lookups
+    /// Extract resource type from a line like "aws.ec2.Vpc {" or "let x = aws.ec2.Vpc {"
+    /// Returns the resource type (e.g., "aws.ec2.Vpc") for schema lookups
     fn extract_resource_type(&self, line: &str) -> Option<String> {
         let trimmed = line.trim();
 

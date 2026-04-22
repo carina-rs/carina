@@ -9,7 +9,7 @@ fn unknown_field_in_struct_block() {
 region = awscc.Region.ap_northeast_1
 }
 
-let sg = awscc.ec2.security_group {
+let sg = awscc.ec2.SecurityGroup {
 group_description = "Test security group"
 security_group_ingress {
     ip_protocol = "tcp"
@@ -39,7 +39,7 @@ fn type_mismatch_in_struct_field() {
 region = awscc.Region.ap_northeast_1
 }
 
-let sg = awscc.ec2.security_group {
+let sg = awscc.ec2.SecurityGroup {
 group_description = "Test security group"
 security_group_ingress {
     ip_protocol = "tcp"
@@ -71,11 +71,11 @@ fn resource_ref_type_mismatch() {
 region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
 cidr_block = "10.0.0.0/16"
 }
 
-let vpc2 = awscc.ec2.vpc {
+let vpc2 = awscc.ec2.Vpc {
 ipv4_ipam_pool_id = vpc.vpc_id
 }"#,
     );
@@ -102,11 +102,11 @@ fn resource_ref_compatible_type() {
 region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
 cidr_block = "10.0.0.0/16"
 }
 
-let subnet = awscc.ec2.subnet {
+let subnet = awscc.ec2.Subnet {
 vpc_id = vpc.vpc_id
 cidr_block = "10.0.1.0/24"
 }"#,
@@ -133,7 +133,7 @@ fn unknown_field_in_second_repeated_block() {
 region = awscc.Region.ap_northeast_1
 }
 
-let sg = awscc.ec2.security_group {
+let sg = awscc.ec2.SecurityGroup {
 group_description = "Test security group"
 security_group_ingress {
     ip_protocol = "tcp"
@@ -181,13 +181,13 @@ fn block_syntax_rejected_for_bare_struct() {
 region = aws.Region.ap_northeast_1
 }
 
-aws.ec2.subnet {
+aws.ec2.Subnet {
 name = "my-subnet"
 vpc_id = "vpc-123"
 cidr_block = "10.0.1.0/24"
 
 private_dns_name_options_on_launch {
-    hostname_type = aws.ec2.subnet.HostnameType.resource_name
+    hostname_type = aws.ec2.Subnet.HostnameType.resource_name
 }
 }"#,
     );
@@ -220,17 +220,17 @@ fn block_syntax_rejected_for_bare_struct_multiple_blocks() {
 region = aws.Region.ap_northeast_1
 }
 
-aws.ec2.subnet {
+aws.ec2.Subnet {
 name = "my-subnet"
 vpc_id = "vpc-123"
 cidr_block = "10.0.1.0/24"
 
 private_dns_name_options_on_launch {
-    hostname_type = aws.ec2.subnet.HostnameType.resource_name
+    hostname_type = aws.ec2.Subnet.HostnameType.resource_name
 }
 
 private_dns_name_options_on_launch {
-    hostname_type = aws.ec2.subnet.HostnameType.ip_name
+    hostname_type = aws.ec2.Subnet.HostnameType.ip_name
 }
 }"#,
     );
@@ -260,7 +260,7 @@ fn lint_list_literal_for_list_struct() {
 region = awscc.Region.ap_northeast_1
 }
 
-let sg = awscc.ec2.security_group {
+let sg = awscc.ec2.SecurityGroup {
 group_description = "Test security group"
 security_group_ingress = [{
     ip_protocol = "tcp"
@@ -295,7 +295,7 @@ fn lint_block_syntax_no_warning() {
 region = awscc.Region.ap_northeast_1
 }
 
-let sg = awscc.ec2.security_group {
+let sg = awscc.ec2.SecurityGroup {
 group_description = "Test security group"
 security_group_ingress {
     ip_protocol = "tcp"
@@ -327,7 +327,7 @@ fn lint_string_attr_no_warning() {
 region = awscc.Region.ap_northeast_1
 }
 
-let sg = awscc.ec2.security_group {
+let sg = awscc.ec2.SecurityGroup {
 group_description = "Test security group"
 }"#,
     );
@@ -399,7 +399,7 @@ fn regular_resource_without_read_no_data_source_error() {
 region = aws.Region.ap_northeast_1
 }
 
-let bucket = aws.s3.bucket {
+let bucket = aws.s3.Bucket {
 name = "my-bucket"
 }"#,
     );
@@ -423,7 +423,7 @@ fn detect_provider_aws_resource_independent_of_factory_order() {
 region = aws.Region.ap_northeast_1
 }
 
-let bucket = aws.s3.bucket {
+let bucket = aws.s3.Bucket {
 name = "my-bucket"
 }"#,
     );
@@ -439,7 +439,7 @@ name = "my-bucket"
 
     assert_eq!(
         messages_normal, messages_reversed,
-        "aws.s3.bucket diagnostics should not depend on factory order.\n\
+        "aws.s3.Bucket diagnostics should not depend on factory order.\n\
          Normal: {:?}\n\
          Reversed: {:?}",
         messages_normal, messages_reversed
@@ -453,7 +453,7 @@ fn detect_provider_awscc_resource_independent_of_factory_order() {
 region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
 cidr_block = "10.0.0.0/16"
 }"#,
     );
@@ -469,7 +469,7 @@ cidr_block = "10.0.0.0/16"
 
     assert_eq!(
         messages_normal, messages_reversed,
-        "awscc.ec2.vpc diagnostics should not depend on factory order.\n\
+        "awscc.ec2.Vpc diagnostics should not depend on factory order.\n\
          Normal: {:?}\n\
          Reversed: {:?}",
         messages_normal, messages_reversed
@@ -488,7 +488,7 @@ fn detect_provider_anonymous_resource_independent_of_factory_order() {
 region = aws.Region.ap_northeast_1
 }
 
-aws.s3.bucket {
+aws.s3.Bucket {
 name = "test-bucket"
 }"#,
     );
@@ -551,7 +551,7 @@ fn no_duplicate_warning_for_unique_attrs() {
 region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
     cidr_block = "10.0.0.0/16"
 }"#,
     );
@@ -637,7 +637,7 @@ fn unused_for_binding_emits_lsp_diagnostic() {
         r#"let things = { a = 1, b = 2 }
 
 for name, account_id in things {
-  awscc.ec2.vpc {
+  awscc.ec2.Vpc {
     cidr_block = account_id
   }
 }
@@ -667,7 +667,7 @@ fn used_for_binding_no_lsp_diagnostic() {
         r#"let things = { a = 1, b = 2 }
 
 for key, value in things {
-  awscc.ec2.vpc {
+  awscc.ec2.Vpc {
     name = key
     cidr_block = value
   }
@@ -696,7 +696,7 @@ fn upstream_state_warning_not_in_lsp() {
   source = "../network"
 }
 
-awscc.ec2.security_group {
+awscc.ec2.SecurityGroup {
   group_description = "Web SG"
   vpc_id = network.vpc_id
 }
