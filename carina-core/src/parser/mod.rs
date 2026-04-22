@@ -3281,6 +3281,27 @@ pub fn pascal_to_snake(s: &str) -> String {
     result
 }
 
+/// Convert snake_case to PascalCase (e.g., "vpc_id" → "VpcId", "aws_account_id" → "AwsAccountId").
+///
+/// Acronyms are treated as regular words (`iam_policy_arn` → `IamPolicyArn`,
+/// `ipv4_cidr` → `Ipv4Cidr`) so that the result matches `semantic_name` values
+/// already produced by `pascal_to_snake` and is a round-trip inverse for them.
+pub fn snake_to_pascal(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut capitalize_next = true;
+    for c in s.chars() {
+        if c == '_' {
+            capitalize_next = true;
+        } else if capitalize_next {
+            result.push(c.to_ascii_uppercase());
+            capitalize_next = false;
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 /// Return a human-readable type name for a Value
 pub(crate) fn value_type_name(value: &Value) -> &'static str {
     match value {
@@ -10208,6 +10229,26 @@ aws.s3.bucket {
         );
         assert_eq!(super::pascal_to_snake("Arn"), "arn");
         assert_eq!(super::pascal_to_snake("IamRoleArn"), "iam_role_arn");
+    }
+
+    #[test]
+    fn snake_to_pascal_conversion() {
+        use super::snake_to_pascal;
+        assert_eq!(snake_to_pascal("vpc_id"), "VpcId");
+        assert_eq!(snake_to_pascal("aws_account_id"), "AwsAccountId");
+        assert_eq!(snake_to_pascal("iam_policy_arn"), "IamPolicyArn");
+        assert_eq!(snake_to_pascal("ipv4_cidr"), "Ipv4Cidr");
+        assert_eq!(snake_to_pascal("arn"), "Arn");
+        assert_eq!(snake_to_pascal("kms_key_arn"), "KmsKeyArn");
+        for name in [
+            "vpc_id",
+            "aws_account_id",
+            "iam_policy_arn",
+            "ipv4_cidr",
+            "arn",
+        ] {
+            assert_eq!(pascal_to_snake(&snake_to_pascal(name)), name);
+        }
     }
 
     #[test]

@@ -7,6 +7,7 @@ use tower_lsp::lsp_types::{
 };
 
 use carina_core::builtins;
+use carina_core::parser::snake_to_pascal;
 use carina_core::schema::AttributeType;
 
 use super::{CompletionProvider, DslSource};
@@ -1317,22 +1318,6 @@ fn is_valid_custom_name(s: &str) -> bool {
     !s.is_empty()
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         && s.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
-}
-
-fn snake_to_pascal(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut next_upper = true;
-    for ch in s.chars() {
-        if ch == '_' {
-            next_upper = true;
-        } else if next_upper {
-            out.extend(ch.to_uppercase());
-            next_upper = false;
-        } else {
-            out.push(ch);
-        }
-    }
-    out
 }
 
 fn noop_validate(_v: &carina_core::resource::Value) -> Result<(), String> {
