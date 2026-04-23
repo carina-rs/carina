@@ -142,8 +142,8 @@ let vpc = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 }
 
-# Module import binding
-let network = import './modules/network'
+# Module use binding
+let network = use { source = './modules/network' }
 ```
 
 Upstream state is bound with `let <binding> = upstream_state { source = "..." }`. See [Upstream State](/reference/dsl/syntax/#upstream-state) for details.

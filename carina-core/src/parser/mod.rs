@@ -381,9 +381,9 @@ pub enum StateBlock {
     },
 }
 
-/// Import statement
+/// Module `use` statement (previously `import`).
 #[derive(Debug, Clone)]
-pub struct ImportStatement {
+pub struct UseStatement {
     pub path: String,
     pub alias: String,
 }
@@ -502,8 +502,8 @@ pub struct ParsedFile {
     pub providers: Vec<ProviderConfig>,
     pub resources: Vec<Resource>,
     pub variables: HashMap<String, Value>,
-    /// Import statements
-    pub imports: Vec<ImportStatement>,
+    /// Module `use` statements
+    pub uses: Vec<UseStatement>,
     /// Module calls (instantiations)
     pub module_calls: Vec<ModuleCall>,
     /// Top-level argument parameters (directory-based module style)
@@ -927,7 +927,7 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
     let mut ctx = ParseContext::new(config);
     let mut providers = Vec::new();
     let mut resources = Vec::new();
-    let mut imports = Vec::new();
+    let mut uses = Vec::new();
     let mut module_calls = Vec::new();
     let mut arguments = Vec::new();
     let mut attribute_params = Vec::new();
@@ -1101,10 +1101,10 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
                                     ctx.set_resource_binding(name.clone(), placeholder);
                                     upstream_states.push(ctx.upstream_states[&name].clone());
                                 }
-                                if let Some(import) = maybe_import {
+                                if let Some(use_stmt) = maybe_import {
                                     ctx.imported_modules
-                                        .insert(import.alias.clone(), import.path.clone());
-                                    imports.push(import);
+                                        .insert(use_stmt.alias.clone(), use_stmt.path.clone());
+                                    uses.push(use_stmt);
                                 }
                             }
                             Rule::module_call => {
@@ -1146,7 +1146,7 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
         providers,
         resources,
         variables: ctx.variables,
-        imports,
+        uses,
         module_calls,
         arguments,
         attribute_params,
@@ -1634,15 +1634,55 @@ fn parse_type_expr(
     }
 }
 
-/// Parse import expression (RHS of `let name = import "path"`)
-fn parse_import_expr(
+/// Parse import expression (RHS of `let name = use { source = "path" }`)
+fn parse_use_expr(
     pair: pest::iterators::Pair<Rule>,
     binding_name: &str,
-) -> Result<ImportStatement, ParseError> {
-    let mut inner = pair.into_inner();
-    let path = parse_string(next_pair(&mut inner, "import path", "import expression")?);
+    ctx: &ParseContext,
+) -> Result<UseStatement, ParseError> {
+    let span = pair.as_span();
+    let line = span.start_pos().line_col().0;
+    let mut source: Option<String> = None;
 
-    Ok(ImportStatement {
+    for attr in pair.into_inner() {
+        if attr.as_rule() != Rule::attribute {
+            continue;
+        }
+        let attr_span = attr.as_span();
+        let attr_line = attr_span.start_pos().line_col().0;
+        let mut attr_inner = attr.into_inner();
+        let key = next_pair(&mut attr_inner, "attribute name", "use expression")?
+            .as_str()
+            .to_string();
+        let value_pair = next_pair(&mut attr_inner, "attribute value", "use expression")?;
+        if key != "source" {
+            return Err(ParseError::InvalidExpression {
+                line: attr_line,
+                message: format!("`use` block only accepts a `source` attribute, got `{key}`"),
+            });
+        }
+        let value = parse_expression(value_pair, ctx)?;
+        let Value::String(path) = value else {
+            return Err(ParseError::InvalidExpression {
+                line: attr_line,
+                message: "`use` block `source` must be a string literal".to_string(),
+            });
+        };
+        if source.is_some() {
+            return Err(ParseError::InvalidExpression {
+                line: attr_line,
+                message: "`use` block has more than one `source` attribute".to_string(),
+            });
+        }
+        source = Some(path);
+    }
+
+    let path = source.ok_or_else(|| ParseError::InvalidExpression {
+        line,
+        message: "`use` block must have a `source` attribute".to_string(),
+    })?;
+
+    Ok(UseStatement {
         path,
         alias: binding_name.to_string(),
     })
@@ -1688,13 +1728,8 @@ fn parse_module_call(
     })
 }
 
-/// Result of parsing the RHS of a let binding: (value, resources, module_calls, import)
-type LetBindingRhs = (
-    Value,
-    Vec<Resource>,
-    Vec<ModuleCall>,
-    Option<ImportStatement>,
-);
+/// Result of parsing the RHS of a let binding: (value, resources, module_calls, use_statement)
+type LetBindingRhs = (Value, Vec<Resource>, Vec<ModuleCall>, Option<UseStatement>);
 
 /// Extended parse_let_binding that also handles module calls, imports, and for expressions.
 ///
@@ -1711,7 +1746,7 @@ fn parse_let_binding_extended(
         Value,
         Vec<Resource>,
         Vec<ModuleCall>,
-        Option<ImportStatement>,
+        Option<UseStatement>,
         bool,
     ),
     ParseError,
@@ -1934,10 +1969,10 @@ fn parse_primary_with_resource_or_module(
             let ref_value = Value::String(format!("${{{}}}", binding_name));
             Ok((ref_value, vec![resource], vec![], None))
         }
-        Rule::import_expr => {
-            let import = parse_import_expr(inner, binding_name)?;
-            let value = Value::String(format!("${{import:{}}}", import.path));
-            Ok((value, vec![], vec![], Some(import)))
+        Rule::use_expr => {
+            let use_stmt = parse_use_expr(inner, binding_name, ctx)?;
+            let value = Value::String(format!("${{use:{}}}", use_stmt.path));
+            Ok((value, vec![], vec![], Some(use_stmt)))
         }
         Rule::for_expr => {
             let (resources, module_calls) = parse_for_expr(inner, ctx, binding_name)?;
@@ -4661,33 +4696,6 @@ fn parse_string_value(
     }
 }
 
-/// Parse a string rule for use in non-expression contexts (e.g., import paths).
-/// This only handles plain strings without interpolation.
-fn parse_string(pair: pest::iterators::Pair<Rule>) -> String {
-    // string = single_quoted_string | double_quoted_string
-    let inner_pair = pair.into_inner().next().unwrap();
-
-    if inner_pair.as_rule() == Rule::single_quoted_string {
-        return inner_pair
-            .into_inner()
-            .next()
-            .map(|p| unescape_single_quoted(p.as_str()))
-            .unwrap_or_default();
-    }
-
-    // Double-quoted string
-    let mut result = String::new();
-    for part in inner_pair.into_inner() {
-        if part.as_rule() == Rule::string_part
-            && let Some(inner) = part.into_inner().next()
-            && inner.as_rule() == Rule::string_literal
-        {
-            result.push_str(&unescape_string(inner.as_str()));
-        }
-    }
-    result
-}
-
 /// Handle escape sequences in string literals
 fn unescape_string(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
@@ -4975,7 +4983,7 @@ pub fn collect_known_bindings_merged(parsed: &ParsedFile) -> std::collections::H
             .filter_map(|c| c.binding_name.as_deref()),
     );
     known.extend(parsed.upstream_states.iter().map(|u| u.binding.as_str()));
-    known.extend(parsed.imports.iter().map(|i| i.alias.as_str()));
+    known.extend(parsed.uses.iter().map(|i| i.alias.as_str()));
     known.extend(parsed.user_functions.keys().map(String::as_str));
     known.extend(parsed.variables.keys().map(String::as_str));
     known.extend(parsed.structural_bindings.iter().map(String::as_str));
@@ -5679,15 +5687,43 @@ mod tests {
     }
 
     #[test]
-    fn parse_import_expression() {
+    fn parse_use_expression() {
         let input = r#"
-            let web_tier = import "./modules/web_tier.crn"
+            let web_tier = use { source = "./modules/web_tier" }
         "#;
 
         let result = parse(input, &ProviderContext::default()).unwrap();
-        assert_eq!(result.imports.len(), 1);
-        assert_eq!(result.imports[0].path, "./modules/web_tier.crn");
-        assert_eq!(result.imports[0].alias, "web_tier");
+        assert_eq!(result.uses.len(), 1);
+        assert_eq!(result.uses[0].path, "./modules/web_tier");
+        assert_eq!(result.uses[0].alias, "web_tier");
+    }
+
+    #[test]
+    fn parse_use_expression_requires_source() {
+        let input = r#"
+            let web_tier = use { }
+        "#;
+
+        let err = parse(input, &ProviderContext::default()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("source"),
+            "error should mention missing source, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_use_expression_rejects_unknown_attribute() {
+        let input = r#"
+            let web_tier = use { source = "./x", bogus = "y" }
+        "#;
+
+        let err = parse(input, &ProviderContext::default()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("bogus"),
+            "error should mention unexpected attribute, got: {msg}"
+        );
     }
 
     #[test]
@@ -7508,7 +7544,7 @@ aws.s3.Bucket {
     #[test]
     fn parse_let_binding_module_call() {
         let input = r#"
-            let web_tier = import "./modules/web_tier"
+            let web_tier = use { source = "./modules/web_tier" }
 
             let web = web_tier {
                 vpc = "vpc-123"
@@ -7532,7 +7568,7 @@ aws.s3.Bucket {
         // After `let web = web_tier { ... }`, `web.security_group` should
         // resolve as ResourceRef.
         let input = r#"
-            let web_tier = import "./modules/web_tier"
+            let web_tier = use { source = "./modules/web_tier" }
 
             let web = web_tier {
                 vpc = "vpc-123"
@@ -8000,7 +8036,7 @@ aws.s3.Bucket {
     #[test]
     fn parse_for_expression_with_module_call() {
         let input = r#"
-            let web = import "modules/web"
+            let web = use { source = "modules/web" }
 
             let envs = {
                 prod    = "10.0.0.0/16"
@@ -8057,7 +8093,7 @@ aws.s3.Bucket {
     #[test]
     fn parse_for_expression_with_module_call_over_list() {
         let input = r#"
-            let web = import "modules/web"
+            let web = use { source = "modules/web" }
 
             let webs = for cidr in ["10.0.0.0/16", "10.1.0.0/16"] {
                 web { vpc_cidr = cidr }
@@ -8624,7 +8660,7 @@ aws.s3.Bucket {
     #[test]
     fn parse_if_with_module_call() {
         let input = r#"
-            let web = import "modules/web"
+            let web = use { source = "modules/web" }
 
             let monitoring = if true {
                 web { vpc_id = "vpc-123" }
@@ -8639,7 +8675,7 @@ aws.s3.Bucket {
     #[test]
     fn parse_if_false_with_module_call() {
         let input = r#"
-            let web = import "modules/web"
+            let web = use { source = "modules/web" }
 
             let monitoring = if false {
                 web { vpc_id = "vpc-123" }

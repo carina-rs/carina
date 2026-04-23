@@ -1,6 +1,6 @@
 ---
 title: Modules
-description: Module definition, arguments, attributes, import syntax, directory modules, and module resolution in the Carina DSL.
+description: Module definition, arguments, attributes, use syntax, directory modules, and module resolution in the Carina DSL.
 ---
 
 Modules are reusable units of Carina configuration. A module defines a set of resources along with input parameters (`arguments`) and output values (`attributes`).
@@ -153,12 +153,12 @@ attributes {
 }
 ```
 
-## Importing Modules
+## Loading Modules
 
-Use `import` to load a module, then call it by name with arguments:
+Use `use { source = '...' }` to load a module, then call it by name with arguments:
 
 ```crn
-let network = import './modules/network'
+let network = use { source = './modules/network' }
 
 network {
   cidr_block  = '10.0.0.0/16'
@@ -172,7 +172,7 @@ network {
 When a module call is bound with `let`, its `attributes` values can be accessed with dot notation:
 
 ```crn
-let network = import './modules/network'
+let network = use { source = './modules/network' }
 
 let net = network {
   cidr_block  = '10.0.0.0/16'
@@ -200,32 +200,32 @@ modules/network/
   exports.crn
 ```
 
-Single-file imports (`import "./modules/network.crn"`) are **not supported**:
+Single-file sources (`use { source = "./modules/network.crn" }`) are **not supported**:
 the loader returns `NotADirectory` for any path that is not a directory.
 If your module is currently a single `.crn` file, move it into a directory of
 its own.
 
 ## Module Resolution
 
-Import paths are resolved relative to the file containing the `import`
+`source` paths are resolved relative to the file containing the `use`
 statement and must point at a directory:
 
 ```crn
-# From project/main.crn, imports every .crn file under project/modules/network/
-let network = import './modules/network'
+# From project/main.crn, loads every .crn file under project/modules/network/
+let network = use { source = './modules/network' }
 
 # Relative path from current file
-let helper = import '../shared/helper'
+let helper = use { source = '../shared/helper' }
 ```
 
 ## Nested Modules
 
-Modules can import and use other modules:
+Modules can load and use other modules:
 
 ```crn
 # modules/network_with_rt/main.crn
 
-let network = import '../network'
+let network = use { source = '../network' }
 
 arguments {
   cidr_block : String
@@ -258,7 +258,7 @@ attributes {
 Modules can be used inside `for` expressions to create multiple instances:
 
 ```crn
-let network = import './modules/network'
+let network = use { source = './modules/network' }
 
 let cidrs = {
   dev = '10.0.0.0/16'

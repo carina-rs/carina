@@ -578,7 +578,7 @@ pub fn validate_module_calls(
     config: &carina_core::parser::ProviderContext,
 ) -> Vec<AppError> {
     let mut imported_modules = HashMap::new();
-    for import in &parsed.imports {
+    for import in &parsed.uses {
         let module_path = base_dir.join(&import.path);
         if let Some(module_parsed) = module_resolver::load_module(&module_path) {
             imported_modules.insert(import.alias.clone(), module_parsed.arguments);
@@ -598,7 +598,7 @@ pub fn validate_module_attribute_param_types(
     base_dir: &Path,
 ) -> Vec<AppError> {
     let mut errors = Vec::new();
-    for import in &parsed.imports {
+    for import in &parsed.uses {
         let module_path = base_dir.join(&import.path);
         let Some(module_parsed) = module_resolver::load_module(&module_path) else {
             continue;

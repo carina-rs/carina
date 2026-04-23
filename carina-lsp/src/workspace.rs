@@ -121,7 +121,7 @@ fn discover_imports_recursive(dir: &Path, result: &mut HashMap<PathBuf, Vec<Path
             let ctx = ProviderContext::default();
             if let Ok(parsed) = parser::parse(&content, &ctx) {
                 let caller_dir = path.parent().unwrap_or(dir);
-                for import in &parsed.imports {
+                for import in &parsed.uses {
                     let module_path = caller_dir.join(&import.path);
                     // Resolve to canonical directory (strip .crn extension, handle dirs)
                     let module_dir = if module_path.is_dir() {
@@ -434,7 +434,7 @@ mod tests {
         // Caller imports the module
         fs::write(
             caller.join("main.crn"),
-            "let github = import '../../modules/github-oidc'\n",
+            "let github = use { source = '../../modules/github-oidc' }\n",
         )
         .unwrap();
         // Module has arguments (no provider)

@@ -823,7 +823,7 @@ mod tests {
             providers: Vec::new(),
             resources: Vec::new(),
             variables: HashMap::new(),
-            imports: Vec::new(),
+            uses: Vec::new(),
             module_calls: Vec::new(),
             arguments: Vec::new(),
             attribute_params: Vec::new(),

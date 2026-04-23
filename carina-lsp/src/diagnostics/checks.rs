@@ -584,7 +584,7 @@ impl DiagnosticEngine {
         // Build a map of imported modules: alias -> argument parameters
         let mut imported_modules: HashMap<String, Vec<ArgumentParameter>> = HashMap::new();
 
-        for import in &parsed.imports {
+        for import in &parsed.uses {
             let module_path = base_path.join(&import.path);
             if let Some(module_parsed) = carina_core::module_resolver::load_module(&module_path) {
                 imported_modules.insert(import.alias.clone(), module_parsed.arguments);

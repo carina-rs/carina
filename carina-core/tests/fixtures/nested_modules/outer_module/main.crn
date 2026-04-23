@@ -1,4 +1,4 @@
-let inner = import '../inner_module'
+let inner = use { source = '../inner_module' }
 
 arguments {
   cidr_block: String

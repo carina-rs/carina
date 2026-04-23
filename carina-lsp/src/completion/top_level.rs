@@ -57,10 +57,10 @@ impl CompletionProvider {
         } else {
             "let ${1:name} = read ${2:aws.s3.Bucket} {\n    name = \"${3:existing-resource}\"\n}"
         };
-        let let_import_snippet = if after_let_binding {
-            "import '${1:./modules/name}'"
+        let let_use_snippet = if after_let_binding {
+            "use {\n    source = '${1:./modules/name}'\n}"
         } else {
-            "let ${1:module_name} = import '${2:./modules/name}'"
+            "let ${1:module_name} = use {\n    source = '${2:./modules/name}'\n}"
         };
         let upstream_state_snippet = if after_let_binding {
             "upstream_state {\n    source = '${1:../other-project}'\n}"
@@ -126,11 +126,11 @@ impl CompletionProvider {
                 ..Default::default()
             },
             CompletionItem {
-                label: "let import".to_string(),
+                label: "let use".to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
-                insert_text: Some(let_import_snippet.to_string()),
+                insert_text: Some(let_use_snippet.to_string()),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
-                detail: Some("Import a module".to_string()),
+                detail: Some("Load a module from a directory".to_string()),
                 ..Default::default()
             },
             CompletionItem {
@@ -183,12 +183,12 @@ impl CompletionProvider {
             },
         ];
 
-        // Generate module binding completions from import statements
-        // e.g., "let github = import '...'" → suggest "github" with call scaffold
+        // Generate module binding completions from `use` statements
+        // e.g., "let github = use { source = '...' }" → suggest "github" with call scaffold
         for line in lines.iter() {
             if let Some((binding, after_eq)) = crate::let_parse::parse_let_header(line)
                 && binding != "_"
-                && after_eq.starts_with("import ")
+                && (after_eq.starts_with("use ") || after_eq.starts_with("use{"))
             {
                 let snippet = self.build_module_call_snippet(binding, after_eq, base_path);
                 completions.push(CompletionItem {
@@ -384,21 +384,14 @@ impl CompletionProvider {
         }
     }
 
-    /// Find the import path for a given module name from let import bindings
+    /// Find the module `source` path for a given module binding from `let name = use { source = '...' }`.
     pub(super) fn find_module_import_path(&self, module_name: &str, text: &str) -> Option<String> {
         for line in text.lines() {
             if let Some((alias, after_eq)) = crate::let_parse::parse_let_header(line)
                 && alias == module_name
-                && let Some(import_rest) = after_eq.strip_prefix("import ")
+                && let Some(path) = extract_use_source_path(after_eq)
             {
-                let import_rest = import_rest.trim();
-                if let Some(path_start) = import_rest.find(['"', '\''])
-                    && let Some(quote) = import_rest[path_start..].chars().next()
-                    && let Some(path_end) = import_rest[path_start + 1..].find(quote)
-                {
-                    let path = &import_rest[path_start + 1..path_start + 1 + path_end];
-                    return Some(path.to_string());
-                }
+                return Some(path);
             }
         }
         None
@@ -414,21 +407,10 @@ impl CompletionProvider {
         after_eq: &str,
         base_path: Option<&Path>,
     ) -> String {
-        // Extract import path from "import 'path'" or "import \"path\""
-        let import_path = after_eq
-            .strip_prefix("import ")
-            .and_then(|s| {
-                s.trim()
-                    .strip_prefix('\'')
-                    .and_then(|s| s.strip_suffix('\''))
-            })
-            .or_else(|| {
-                after_eq
-                    .strip_prefix("import ")
-                    .and_then(|s| s.trim().strip_prefix('"').and_then(|s| s.strip_suffix('"')))
-            });
+        // Extract source path from "use { source = 'path' }" or with double quotes.
+        let import_path = extract_use_source_path(after_eq);
 
-        if let Some(path) = import_path
+        if let Some(path) = import_path.as_deref()
             && let Some(base) = base_path
             && let Some(parsed) = carina_core::module_resolver::load_module(&base.join(path))
             && !parsed.arguments.is_empty()
@@ -451,7 +433,31 @@ impl CompletionProvider {
         // Fallback: simple scaffold
         format!("{} {{\n  ${{1}}\n}}", binding)
     }
+}
 
+/// Extract the `source` path from a `let` RHS of the shape `use { source = 'path' }`
+/// (or with double quotes). Returns `None` if `after_eq` doesn't look like a `use` block
+/// or if the `source` value can't be parsed.
+pub(super) fn extract_use_source_path(after_eq: &str) -> Option<String> {
+    let trimmed = after_eq.trim_start();
+    let rest = trimmed
+        .strip_prefix("use ")
+        .or_else(|| trimmed.strip_prefix("use{"))
+        .map(|s| s.trim_start_matches('{').trim_start())?;
+
+    let idx = rest.find("source")?;
+    let after = rest[idx + "source".len()..].trim_start();
+    let after = after.strip_prefix('=')?.trim_start();
+    let quote = after.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let body = &after[1..];
+    let end = body.find(quote)?;
+    Some(body[..end].to_string())
+}
+
+impl CompletionProvider {
     /// Generate import path completions from filesystem.
     ///
     /// Lists directories and `.crn` files relative to the base_path,

@@ -217,8 +217,6 @@ pub fn find_non_snake_case_bindings(source: &str) -> Vec<NamingWarning> {
             extract_binding_name(rest).into_iter().collect()
         } else if let Some(rest) = trimmed.strip_prefix("for ") {
             extract_for_binding_names(rest)
-        } else if let Some(rest) = trimmed.strip_prefix("import ") {
-            extract_binding_name(rest).into_iter().collect()
         } else {
             Vec::new()
         };
@@ -971,16 +969,16 @@ let e = replace("old", "new", str)
     }
 
     #[test]
-    fn test_naming_import_binding_warns() {
-        let source = r#"import myModule = "./modules/web""#;
+    fn test_naming_use_binding_warns() {
+        let source = r#"let myModule = use { source = "./modules/web" }"#;
         let results = find_non_snake_case_bindings(source);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "myModule");
     }
 
     #[test]
-    fn test_naming_import_snake_case_no_warning() {
-        let source = r#"import web_tier = "./modules/web""#;
+    fn test_naming_use_snake_case_no_warning() {
+        let source = r#"let web_tier = use { source = "./modules/web" }"#;
         let results = find_non_snake_case_bindings(source);
         assert!(results.is_empty());
     }

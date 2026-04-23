@@ -1,4 +1,4 @@
-let outer = import 'outer_module'
+let outer = use { source = 'outer_module' }
 
 let web = outer {
   cidr_block = '10.0.0.0/16'

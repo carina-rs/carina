@@ -343,6 +343,8 @@ impl SemanticTokensProvider {
             && !trimmed.starts_with("arguments{")
             && !trimmed.starts_with("import ")
             && !trimmed.starts_with("import{")
+            && !trimmed.starts_with("use ")
+            && !trimmed.starts_with("use{")
             && !trimmed.starts_with("removed ")
             && !trimmed.starts_with("removed{")
             && !trimmed.starts_with("moved ")
@@ -868,15 +870,15 @@ mod tests {
     }
 
     #[test]
-    fn test_import_let_binding_variable_highlighted() {
+    fn test_use_let_binding_variable_highlighted() {
         let provider = SemanticTokensProvider::new(&[]);
-        let tokens = provider.tokenize_line("let web = import \"./modules/web.crn\"", 0);
+        let tokens = provider.tokenize_line("let web = use { source = \"./modules/web\" }", 0);
         // The module alias `web` is still emitted as VARIABLE even though `let`
         // itself is handled by the TextMate grammar (see #1948).
         let var_token = tokens.iter().find(|(_, _, typ)| *typ == 2);
         assert!(
             var_token.is_some(),
-            "Should highlight module alias as VARIABLE in let import. Got: {:?}",
+            "Should highlight module alias as VARIABLE in let use. Got: {:?}",
             tokens
         );
     }
@@ -1198,7 +1200,7 @@ mod tests {
             "} else { aws.s3_bucket { name = \"y\" } }",
             "require !empty(name), \"must be set\"",
             "let r = read aws.s3_bucket { name = \"x\" }",
-            "let m = import \"./modules/web\"",
+            "let m = use { source = \"./modules/web\" }",
             r#"let subnets = for az in ["a", "b"] { aws.s3_bucket { name = az } }"#,
             "let x = if cond { aws.s3_bucket { name = \"y\" } }",
         ];

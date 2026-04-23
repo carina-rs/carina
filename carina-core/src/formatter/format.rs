@@ -145,7 +145,7 @@ impl Formatter {
 
     fn format_node(&mut self, node: &CstNode) {
         match node.kind {
-            NodeKind::ImportExpr => self.format_import_expr(node),
+            NodeKind::UseExpr => self.format_use_expr(node),
             NodeKind::BackendBlock => self.format_backend_block(node),
             NodeKind::ProviderBlock => self.format_provider_block(node),
             NodeKind::ArgumentsBlock => self.format_arguments_block(node),
@@ -192,20 +192,9 @@ impl Formatter {
         }
     }
 
-    fn format_import_expr(&mut self, node: &CstNode) {
-        self.write("import ");
-
-        for child in &node.children {
-            if let CstChild::Token(token) = child {
-                if token.text == "import" {
-                    continue;
-                }
-                if token.text.starts_with('"') || token.text.starts_with('\'') {
-                    self.write_token(&token.text);
-                    break;
-                }
-            }
-        }
+    fn format_use_expr(&mut self, node: &CstNode) {
+        self.write("use");
+        self.format_block_body_tail(node);
     }
 
     fn format_backend_block(&mut self, node: &CstNode) {
@@ -3128,13 +3117,13 @@ require   port >= 1 && port <= 65535  , "port must be valid"
     }
 
     #[test]
-    fn test_format_normalizes_import_path_quotes() {
-        let input = "let m = import \"./modules/web\"\n";
+    fn test_format_normalizes_use_source_quotes() {
+        let input = "let m = use { source = \"./modules/web\" }\n";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
         assert!(
-            result.contains("import './modules/web'"),
-            "Import path should be normalized to single quotes. Got:\n{}",
+            result.contains("source = './modules/web'"),
+            "`source` path should be normalized to single quotes. Got:\n{}",
             result
         );
     }

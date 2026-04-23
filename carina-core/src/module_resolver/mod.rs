@@ -17,7 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::parser::{
-    ImportStatement, ModuleCall, ParseError, ParsedFile, ProviderContext, TypeExpr,
+    ModuleCall, ParseError, ParsedFile, ProviderContext, TypeExpr, UseStatement,
     validate_custom_type,
 };
 use crate::resource::{Expr, LifecycleConfig, Resource, ResourceId, ResourceKind, Value};
@@ -205,7 +205,7 @@ impl<'cfg> ModuleResolver<'cfg> {
     }
 
     /// Process imports and store imported modules
-    pub fn process_imports(&mut self, imports: &[ImportStatement]) -> Result<(), ModuleError> {
+    pub fn process_imports(&mut self, imports: &[UseStatement]) -> Result<(), ModuleError> {
         for import in imports {
             let module = self.load_module(&import.path)?;
             self.imported_modules.insert(import.alias.clone(), module);
@@ -223,7 +223,7 @@ impl<'cfg> ModuleResolver<'cfg> {
         parsed: &mut ParsedFile,
         base_dir: &Path,
     ) -> Result<(), ModuleError> {
-        if parsed.imports.is_empty() || parsed.module_calls.is_empty() {
+        if parsed.uses.is_empty() || parsed.module_calls.is_empty() {
             return Ok(());
         }
 
@@ -232,7 +232,7 @@ impl<'cfg> ModuleResolver<'cfg> {
         let original_imported = std::mem::take(&mut self.imported_modules);
 
         // Process the module's own imports
-        let imports = parsed.imports.clone();
+        let imports = parsed.uses.clone();
         let result = self.process_imports(&imports);
 
         if let Err(e) = result {
@@ -584,7 +584,7 @@ pub fn resolve_modules_with_config(
     let mut resolver = ModuleResolver::with_config(base_dir, config);
 
     // Process imports
-    resolver.process_imports(&parsed.imports)?;
+    resolver.process_imports(&parsed.uses)?;
 
     // Expand module calls
     for call in &parsed.module_calls {
@@ -886,7 +886,7 @@ mod tests {
                 module_source: None,
             }],
             variables: HashMap::new(),
-            imports: vec![],
+            uses: vec![],
             module_calls: vec![],
             arguments: vec![
                 ArgumentParameter {
@@ -1032,7 +1032,7 @@ mod tests {
                 },
             ],
             variables: HashMap::new(),
-            imports: vec![],
+            uses: vec![],
             module_calls: vec![],
             arguments: vec![ArgumentParameter {
                 name: "cidr".to_string(),
@@ -1158,7 +1158,7 @@ mod tests {
                 module_source: None,
             }],
             variables: HashMap::new(),
-            imports: vec![],
+            uses: vec![],
             module_calls: vec![],
             arguments: vec![],
             attribute_params: vec![AttributeParameter {
@@ -1502,7 +1502,7 @@ mod tests {
                 module_source: None,
             }],
             variables: HashMap::new(),
-            imports: vec![],
+            uses: vec![],
             module_calls: vec![],
             arguments: vec![
                 ArgumentParameter {
@@ -1815,7 +1815,7 @@ mod tests {
             providers: vec![],
             resources: vec![],
             variables: HashMap::new(),
-            imports: vec![],
+            uses: vec![],
             module_calls: vec![],
             arguments: vec![ArgumentParameter {
                 name: "port".to_string(),
@@ -1995,7 +1995,7 @@ mod tests {
             providers: vec![],
             resources: vec![],
             variables: HashMap::new(),
-            imports: vec![],
+            uses: vec![],
             module_calls: vec![],
             arguments: vec![ArgumentParameter {
                 name: "count".to_string(),
@@ -2058,7 +2058,7 @@ mod tests {
             providers: vec![],
             resources: vec![],
             variables: HashMap::new(),
-            imports: vec![],
+            uses: vec![],
             module_calls: vec![],
             arguments: vec![ArgumentParameter {
                 name: "tags".to_string(),
@@ -2138,7 +2138,7 @@ mod tests {
             providers: vec![],
             resources: vec![],
             variables: HashMap::new(),
-            imports: vec![],
+            uses: vec![],
             module_calls: vec![],
             arguments: vec![
                 ArgumentParameter {
@@ -2214,7 +2214,7 @@ mod tests {
             providers: vec![],
             resources: vec![],
             variables: HashMap::new(),
-            imports: vec![],
+            uses: vec![],
             module_calls: vec![],
             arguments: vec![
                 ArgumentParameter {
@@ -2288,7 +2288,7 @@ mod tests {
             providers: vec![],
             resources: vec![],
             variables: HashMap::new(),
-            imports: vec![],
+            uses: vec![],
             module_calls: vec![],
             arguments: vec![ArgumentParameter {
                 name: "subnet_ids".to_string(),
@@ -2375,7 +2375,7 @@ mod tests {
             providers: vec![],
             resources: vec![],
             variables: HashMap::new(),
-            imports: vec![],
+            uses: vec![],
             module_calls: vec![],
             arguments: vec![
                 ArgumentParameter {

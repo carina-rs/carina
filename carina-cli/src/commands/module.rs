@@ -38,13 +38,13 @@ pub fn run_module_command(
 fn run_module_list(path: &Path, provider_context: &ProviderContext) -> Result<(), AppError> {
     let config =
         config_loader::load_configuration_with_config(&path.to_path_buf(), provider_context)?;
-    let output = format_module_list(&config.parsed.imports);
+    let output = format_module_list(&config.parsed.uses);
     print!("{output}");
     Ok(())
 }
 
 /// Format the module list output as a string.
-pub fn format_module_list(imports: &[carina_core::parser::ImportStatement]) -> String {
+pub fn format_module_list(imports: &[carina_core::parser::UseStatement]) -> String {
     if imports.is_empty() {
         return "No modules imported.\n".to_string();
     }

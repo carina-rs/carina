@@ -84,7 +84,7 @@ pub fn load_configuration_with_config(
                     unresolved_merged.providers.extend(unresolved.providers);
                     unresolved_merged.resources.extend(unresolved.resources);
                     unresolved_merged.variables.extend(unresolved.variables);
-                    unresolved_merged.imports.extend(unresolved.imports);
+                    unresolved_merged.uses.extend(unresolved.uses);
                     unresolved_merged
                         .module_calls
                         .extend(unresolved.module_calls);
@@ -116,7 +116,7 @@ pub fn load_configuration_with_config(
                     merged.providers.extend(parsed.providers);
                     merged.resources.extend(parsed.resources);
                     merged.variables.extend(parsed.variables);
-                    merged.imports.extend(parsed.imports);
+                    merged.uses.extend(parsed.uses);
                     merged.module_calls.extend(parsed.module_calls);
                     merged.arguments.extend(parsed.arguments);
                     merged.attribute_params.extend(parsed.attribute_params);
@@ -272,7 +272,7 @@ pub(crate) fn merge_parsed_file(target: &mut ParsedFile, source: ParsedFile) {
     target.providers.extend(source.providers);
     target.resources.extend(source.resources);
     target.variables.extend(source.variables);
-    target.imports.extend(source.imports);
+    target.uses.extend(source.uses);
     target.module_calls.extend(source.module_calls);
     target.arguments.extend(source.arguments);
     target.attribute_params.extend(source.attribute_params);

@@ -66,7 +66,7 @@ impl<'a> CstBuilder<'a> {
                 let inner = pair.into_inner().next()?;
                 self.build_child(inner)
             }
-            Rule::import_expr => Some(CstChild::Node(self.build_node(NodeKind::ImportExpr, pair))),
+            Rule::use_expr => Some(CstChild::Node(self.build_node(NodeKind::UseExpr, pair))),
             Rule::backend_block => Some(CstChild::Node(
                 self.build_node(NodeKind::BackendBlock, pair),
             )),
@@ -262,6 +262,7 @@ impl<'a> CstBuilder<'a> {
 
             // Keywords
             Rule::kw_import => Some(CstChild::Token(Token::new("import".to_string(), span))),
+            Rule::kw_use => Some(CstChild::Token(Token::new("use".to_string(), span))),
             Rule::kw_backend => Some(CstChild::Token(Token::new("backend".to_string(), span))),
             Rule::kw_provider => Some(CstChild::Token(Token::new("provider".to_string(), span))),
             Rule::kw_let => Some(CstChild::Token(Token::new("let".to_string(), span))),

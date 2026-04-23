@@ -133,7 +133,7 @@ name = "web-sg"
     fs::write(module_dir.join("main.crn"), module_content).expect("Failed to write module file");
 
     // Create main file that imports the module
-    let main_content = r#"let web_tier = import "./modules/web_tier"
+    let main_content = r#"let web_tier = use { source = "./modules/web_tier" }
 
 web_tier {
 
@@ -1055,7 +1055,7 @@ fn type_completion_inside_map_shows_basic_types() {
 #[test]
 fn module_binding_completion_at_top_level() {
     let provider = test_provider();
-    let doc = create_document("let github = import './modules/github-oidc'\n\ng");
+    let doc = create_document("let github = use { source = './modules/github-oidc' }\n\ng");
     let position = Position {
         line: 2,
         character: 1,
@@ -1086,7 +1086,7 @@ fn module_call_scaffolding_includes_arguments() {
     .unwrap();
 
     let provider = test_provider();
-    let doc = create_document("let web = import './modules/web'\n\nw");
+    let doc = create_document("let web = use { source = './modules/web' }\n\nw");
     let position = Position {
         line: 2,
         character: 1,
@@ -1332,10 +1332,11 @@ fn import_path_completion_lists_directories_only() {
     std::fs::create_dir_all(modules_dir.join("shared")).unwrap();
 
     let provider = test_provider();
-    let doc = create_document("let web = import './modules/");
+    let source = "let web = use { source = './modules/";
+    let doc = create_document(source);
     let position = Position {
         line: 0,
-        character: 28,
+        character: source.chars().count() as u32,
     };
 
     let completions = provider.complete(&doc, position, Some(tmp.path()));

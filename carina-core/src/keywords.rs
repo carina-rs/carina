@@ -16,7 +16,7 @@ pub enum KeywordKind {
     Declaration,
     /// Control flow: `for`, `in`, `if`, `else`.
     Control,
-    /// Prefix / non-block keywords: `import`, `require`, `read`.
+    /// Prefix / non-block keywords: `use`, `import`, `require`, `read`.
     Other,
     /// Null literal.
     NullLiteral,
@@ -41,6 +41,7 @@ pub const KEYWORDS: &[(&str, KeywordKind)] = &[
     ("import", KeywordKind::Other),
     ("read", KeywordKind::Other),
     ("require", KeywordKind::Other),
+    ("use", KeywordKind::Other),
     ("null", KeywordKind::NullLiteral),
 ];
 

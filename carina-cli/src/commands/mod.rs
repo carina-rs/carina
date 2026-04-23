@@ -482,7 +482,7 @@ mod tests {
             providers: vec![],
             resources: vec![],
             variables: HashMap::new(),
-            imports: vec![],
+            uses: vec![],
             module_calls: vec![],
             arguments: vec![],
             attribute_params: vec![],
