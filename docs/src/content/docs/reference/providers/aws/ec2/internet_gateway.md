@@ -30,6 +30,13 @@ aws.ec2.InternetGateway {
 
 ## Argument Reference
 
+### `vpc_id`
+
+- **Type:** VpcId
+- **Required:** No
+
+The ID of the VPC to attach the internet gateway to. The provider attaches the IGW after creation and detaches before deletion.
+
 ### `tags`
 
 - **Type:** Map
