@@ -38,6 +38,13 @@ Use this parameter to specify the log group class for this log group. There are 
 
 A name for the log group.
 
+### `retention_in_days`
+
+- **Type:** Int
+- **Required:** No
+
+The number of days to retain the log events in the log group. If unset, events never expire. The provider applies changes via PutRetentionPolicy / DeleteRetentionPolicy.
+
 ### `tags`
 
 - **Type:** Map
