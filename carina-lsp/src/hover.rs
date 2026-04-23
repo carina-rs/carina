@@ -249,7 +249,7 @@ impl HoverProvider {
         let parsed = doc.parsed()?;
 
         // Check if this word is a module alias (defined by an import)
-        let import = parsed.imports.iter().find(|imp| imp.alias == word)?;
+        let import = parsed.uses.iter().find(|imp| imp.alias == word)?;
 
         // Load the module to get its definition
         let module_path = base_path.join(&import.path);
@@ -313,7 +313,7 @@ impl HoverProvider {
         let module_name = self.find_enclosing_module_call_name(doc, position)?;
 
         // Find the import for this module
-        let import = parsed.imports.iter().find(|imp| imp.alias == module_name)?;
+        let import = parsed.uses.iter().find(|imp| imp.alias == module_name)?;
 
         // Load the module to get argument definitions
         let module_path = base_path.join(&import.path);
@@ -593,8 +593,11 @@ impl HoverProvider {
             "arguments" => Some(
                 "## arguments\n\nDefines module argument parameters that must be provided by the caller.\n\n```carina\narguments {\n    env: String\n    region: String\n}\n```",
             ),
+            "use" => Some(
+                "## use\n\nLoads a Carina module from the `source` directory.\n\n```carina\nlet network = use { source = \"./modules/network\" }\n```",
+            ),
             "import" => Some(
-                "## import\n\nImports a module from a file or directory.\n\n```carina\nlet network = import \"./modules/network\"\n```",
+                "## import\n\nAdopts an existing cloud resource into Carina's state.\n\n```carina\nimport {\n    to = awscc.ec2.Vpc 'imported_vpc'\n    id = 'vpc-0123456789abcdef0'\n}\n```",
             ),
             "backend" => Some(
                 "## backend\n\nConfigures the state backend for storing resource state.\n\n```carina\nbackend s3 {\n    bucket = \"my-carina-state\"\n    key    = \"prod/carina.crnstate\"\n    region = aws.Region.ap_northeast_1\n}\n```",
@@ -840,6 +843,13 @@ mod tests {
         assert!(HoverProvider::keyword_description("import").is_some());
         let desc = HoverProvider::keyword_description("import").unwrap();
         assert!(desc.contains("import"));
+    }
+
+    #[test]
+    fn test_keyword_hover_use() {
+        assert!(HoverProvider::keyword_description("use").is_some());
+        let desc = HoverProvider::keyword_description("use").unwrap();
+        assert!(desc.contains("use"));
     }
 
     #[test]

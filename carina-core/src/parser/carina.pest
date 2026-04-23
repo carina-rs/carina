@@ -100,8 +100,10 @@ type_struct = { "struct" ~ "{" ~ struct_field_list? ~ "}" }
 struct_field_list = { struct_field ~ ("," ~ struct_field)* ~ ","? }
 struct_field = { identifier ~ ":" ~ type_expr }
 
-// Import expression: import "path" (used in let binding RHS)
-import_expr = { "import" ~ string }
+// Use expression: use { source = "<path>" }
+// Loads a Carina module from the given source directory.
+// Used as the RHS of a `let` binding: `let network = use { source = "./modules/network" }`.
+use_expr = { "use" ~ "{" ~ attribute* ~ "}" }
 
 // Backend block: backend s3 { bucket = "...", key = "...", ... }
 backend_block = {
@@ -197,7 +199,7 @@ primary = {
     read_resource_expr   // Must come before resource_expr for "read aws..." parsing
   | upstream_state_expr  // Must come before module_call so "upstream_state { ... }" is not parsed as a module call
   | resource_expr
-  | import_expr          // Must come before variable_ref since "import" is an identifier
+  | use_expr             // Must come before module_call so "use { ... }" is not parsed as a module call
   | for_expr             // Must come before module_call so "for" is not parsed as module name
   | if_expr              // Must come before module_call so "if" is not parsed as module name
   | module_call          // Must come before variable_ref so "name { ... }" is parsed as module call

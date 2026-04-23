@@ -243,7 +243,7 @@ let web_sg = aws.security_group {
 **Using modules**:
 
 ```hcl
-let web_tier = import './modules/web_tier'
+let web_tier = use { source = './modules/web_tier' }
 
 let main_vpc = aws.vpc {
   name       = 'main-vpc'

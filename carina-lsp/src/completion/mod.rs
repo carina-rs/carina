@@ -152,19 +152,40 @@ impl CompletionProvider {
             }
         }
 
-        // Check if cursor is inside an import path string
-        // e.g., let x = import './modules/|'
-        if let Some(import_pos) = prefix.find("import ") {
-            let after_import = &prefix[import_pos + 7..];
-            let trimmed = after_import.trim_start();
-            if (trimmed.starts_with('\'') || trimmed.starts_with('"'))
-                && !trimmed[1..].contains(trimmed.chars().next().unwrap())
-            {
-                // Inside an unclosed quote after "import"
-                let partial_path = &trimmed[1..]; // strip opening quote
-                return CompletionContext::InsideImportPath {
-                    partial_path: partial_path.to_string(),
-                };
+        // Check if cursor is inside a `use { source = '<cursor>' }` path string.
+        // The enclosing block must be `use { ... }` — for `upstream_state { source = ... }`
+        // a separate completion handler takes over (see `upstream_state_source_completions`).
+        if let Some(src_idx) = prefix.rfind("source") {
+            let before_source = &prefix[..src_idx];
+            let in_use_block = before_source
+                .rfind("use")
+                .map(|use_idx| {
+                    // Require a `use` keyword followed by `{` before the current `source =`,
+                    // and make sure no `upstream_state` keyword intervenes between them.
+                    let between = &before_source[use_idx..];
+                    between.contains('{')
+                        && !between.contains("upstream_state")
+                        && (use_idx == 0
+                            || !before_source[..use_idx]
+                                .chars()
+                                .next_back()
+                                .is_some_and(|c| c.is_alphanumeric() || c == '_'))
+                })
+                .unwrap_or(false);
+            if in_use_block {
+                let after_src = prefix[src_idx + "source".len()..].trim_start();
+                if let Some(rest) = after_src.strip_prefix('=') {
+                    let rest = rest.trim_start();
+                    if let Some(quote) = rest.chars().next()
+                        && (quote == '\'' || quote == '"')
+                        && !rest[1..].contains(quote)
+                    {
+                        let partial_path = &rest[1..];
+                        return CompletionContext::InsideImportPath {
+                            partial_path: partial_path.to_string(),
+                        };
+                    }
+                }
             }
         }
 

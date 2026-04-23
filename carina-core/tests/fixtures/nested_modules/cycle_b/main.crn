@@ -1,4 +1,4 @@
-let a = import '../cycle_a'
+let a = use { source = '../cycle_a' }
 
 arguments {
   value: String

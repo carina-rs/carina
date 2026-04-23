@@ -1137,9 +1137,9 @@ fn read_snippet_after_let_binding_omits_let() {
 }
 
 #[test]
-fn let_import_snippet_after_let_binding_omits_let() {
+fn let_use_snippet_after_let_binding_omits_let() {
     let provider = test_provider();
-    let text = "let m = i";
+    let text = "let m = u";
     let completions = provider.top_level_completions(
         Position {
             line: 0,
@@ -1148,16 +1148,16 @@ fn let_import_snippet_after_let_binding_omits_let() {
         text,
         None,
     );
-    let item = find_completion(&completions, "let import");
+    let item = find_completion(&completions, "let use");
     let snippet = item.insert_text.as_deref().unwrap_or("");
     assert!(
         !snippet.contains("let "),
-        "After existing `let <name> =`, `let import` snippet must not re-emit `let `. Got: {:?}",
+        "After existing `let <name> =`, `let use` snippet must not re-emit `let `. Got: {:?}",
         snippet
     );
     assert!(
-        snippet.starts_with("import "),
-        "Snippet should start directly with `import `. Got: {:?}",
+        snippet.starts_with("use "),
+        "Snippet should start directly with `use `. Got: {:?}",
         snippet
     );
 }
@@ -1345,8 +1345,8 @@ fn top_level_snippets_use_single_quotes() {
     let cases = [
         ("", "upstream_state"),
         ("let orgs = u", "upstream_state"),
-        ("", "let import"),
-        ("let m = i", "let import"),
+        ("", "let use"),
+        ("let m = u", "let use"),
         ("", "import"),
         ("", "removed"),
         ("", "moved"),
@@ -1500,7 +1500,7 @@ fn for_iterable_position_suggests_module_call_binding() {
     // A module call binding (`let x = mymod { ... }`) must also appear.
     let provider = test_provider();
     let source = "\
-import './mods' as mymod
+let mymod = use { source = './mods' }
 let inst = mymod { foo = 1 }
 for name, _ in i";
     let doc = create_document(source);

@@ -1,9 +1,9 @@
 ---
 title: "Using Modules"
-description: "Learn how to organize Carina infrastructure code into reusable modules with arguments, attributes, directory modules, and nested module imports."
+description: "Learn how to organize Carina infrastructure code into reusable modules with arguments, attributes, directory modules, and nested module loading."
 ---
 
-Modules let you group related resources into reusable units. A module defines its inputs with `arguments`, its outputs with `attributes`, and can be imported and called from any `.crn` file.
+Modules let you group related resources into reusable units. A module defines its inputs with `arguments`, its outputs with `attributes`, and can be loaded with `use` and called from any `.crn` file.
 
 ## Creating a module
 
@@ -68,16 +68,16 @@ attributes {
 
 Each attribute has a name, an optional type annotation, and a value expression.
 
-## Importing and calling a module
+## Loading and calling a module
 
-From your root configuration, import the module and call it with arguments:
+From your root configuration, load the module with `use` and call it with arguments:
 
 ```crn
 provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let network = import './modules/network'
+let network = use { source = './modules/network' }
 
 network {
   cidr_block  = '10.0.0.0/16'
@@ -86,14 +86,14 @@ network {
 }
 ```
 
-The `import` expression loads the module and binds it to a name. You then call the module like a function, passing its arguments as a block.
+The `use` expression loads the module from its `source` directory and binds it to a name. You then call the module like a function, passing its arguments as a block.
 
 ## Accessing module attributes
 
 To use a module's output attributes, bind the module call with `let`:
 
 ```crn
-let network = import './modules/network'
+let network = use { source = './modules/network' }
 
 let net = network {
   cidr_block  = '10.0.0.0/16'
@@ -119,20 +119,20 @@ A module can be either:
 
 Directory modules are useful when a module grows large or needs helper files. The entry point is always `main.crn` inside the directory.
 
-Both forms are imported the same way:
+Both forms are loaded the same way:
 
 ```crn
-let network = import './modules/network'
+let network = use { source = './modules/network' }
 ```
 
 ## Nested modules
 
-A module can import other modules. This lets you compose infrastructure from smaller building blocks.
+A module can load other modules. This lets you compose infrastructure from smaller building blocks.
 
-For example, `modules/network_with_rt/main.crn` can import the network module:
+For example, `modules/network_with_rt/main.crn` can load the network module:
 
 ```crn
-let network = import '../network'
+let network = use { source = '../network' }
 
 arguments {
   cidr_block : String
@@ -160,14 +160,14 @@ attributes {
 }
 ```
 
-Import paths are relative to the module file's location.
+`source` paths are relative to the module file's location.
 
 ## Using modules with `for` expressions
 
 Modules can be called inside `for` expressions to create multiple instances:
 
 ```crn
-let vpc_mod = import './modules/vpc_only'
+let vpc_mod = use { source = './modules/vpc_only' }
 
 let cidrs = {
   dev = '10.0.0.0/16'
@@ -192,6 +192,6 @@ Use the CLI to inspect a module's structure:
 # Show module arguments, attributes, and dependencies
 carina module info modules/network
 
-# List all imported modules in a configuration
+# List all modules loaded in a configuration
 carina module list
 ```

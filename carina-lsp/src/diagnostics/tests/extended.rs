@@ -2916,7 +2916,7 @@ fn import_binding_in_sibling_file_is_not_undefined() {
     std::fs::create_dir(&base).unwrap();
     std::fs::write(
         base.join("imports.crn"),
-        "let vpc_mod = import '../modules/vpc'\n",
+        "let vpc_mod = use { source = '../modules/vpc' }\n",
     )
     .unwrap();
     let main = "awscc.ec2.Vpc {\n  name = vpc_mod.name\n}\n";

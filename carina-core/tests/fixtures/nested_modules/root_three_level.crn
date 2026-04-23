@@ -1,4 +1,4 @@
-let mid = import 'middle_module'
+let mid = use { source = 'middle_module' }
 
 let infra = mid {
   cidr_block = '10.0.0.0/16'

@@ -1,3 +1,3 @@
-let web_tier = import './modules/web_tier'
+let web_tier = use { source = './modules/web_tier' }
 
-let network = import './modules/network'
+let network = use { source = './modules/network' }

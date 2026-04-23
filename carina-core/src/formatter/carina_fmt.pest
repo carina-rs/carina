@@ -231,8 +231,11 @@ function_call = {
     identifier ~ open_paren ~ (trivia* ~ expression ~ (trivia* ~ comma ~ trivia* ~ expression)*)? ~ trivia* ~ close_paren
 }
 
-// Import expression: import "path" (used in let binding RHS)
-import_expr = { kw_import ~ trivia+ ~ string }
+// Use expression: use { source = "path" } (used in let binding RHS)
+// Mirrors carina.pest:14 upstream_state_expr shape.
+use_expr = {
+    kw_use ~ trivia* ~ open_brace ~ block_content* ~ close_brace
+}
 
 // Upstream state expression: upstream_state { source = '..' }
 // Used as the RHS of a `let` binding — mirrors carina.pest:14.
@@ -245,7 +248,7 @@ primary = {
     read_resource_expr
   | upstream_state_expr
   | resource_expr
-  | import_expr
+  | use_expr
   | for_expr
   | if_expr
   | function_call
@@ -362,6 +365,7 @@ compose_op = { ">>" }
 kw_provider = { "provider" }
 kw_backend = { "backend" }
 kw_import = { "import" }
+kw_use = { "use" }
 kw_let = { "let" }
 kw_arguments = { "arguments" }
 kw_attributes = { "attributes" }

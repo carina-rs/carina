@@ -200,7 +200,7 @@ pub fn run_lint(path: &PathBuf, provider_context: &ProviderContext) -> Result<()
 /// Walk every imported module directory referenced by `parsed.module_calls`
 /// and yield each `.crn` file's tag keys paired with the file path.
 ///
-/// Keys off `parsed.imports` (alias → path) rather than `module_calls.module_name`:
+/// Keys off `parsed.uses` (alias → path) rather than `module_calls.module_name`:
 /// the alias need not match the last component of the import path (e.g.
 /// `import net = './modules/network'` uses alias `net` but dir `network`).
 /// Modules are directory-scoped (#1997), so only directory imports that are
@@ -216,7 +216,7 @@ fn collect_tag_keys_from_modules(
         .collect();
 
     let mut out = Vec::new();
-    for import in &parsed.imports {
+    for import in &parsed.uses {
         if !aliases_used.contains(import.alias.as_str()) {
             continue;
         }
@@ -242,14 +242,14 @@ fn collect_tag_keys_from_modules(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carina_core::parser::{ImportStatement, ModuleCall, ParsedFile};
+    use carina_core::parser::{ModuleCall, ParsedFile, UseStatement};
 
-    /// Build a minimal ParsedFile with the given imports and module-call aliases.
-    fn parsed_with_imports(imports: Vec<(&str, &str)>, calls: Vec<&str>) -> ParsedFile {
+    /// Build a minimal ParsedFile with the given uses and module-call aliases.
+    fn parsed_with_uses(uses: Vec<(&str, &str)>, calls: Vec<&str>) -> ParsedFile {
         ParsedFile {
-            imports: imports
+            uses: uses
                 .into_iter()
-                .map(|(alias, path)| ImportStatement {
+                .map(|(alias, path)| UseStatement {
                     alias: alias.to_string(),
                     path: path.to_string(),
                 })
@@ -279,7 +279,7 @@ mod tests {
         )
         .unwrap();
 
-        let parsed = parsed_with_imports(
+        let parsed = parsed_with_uses(
             vec![("net", "./modules/network")],
             vec!["net"], // alias differs from last path component
         );
@@ -306,7 +306,7 @@ mod tests {
         )
         .unwrap();
 
-        let parsed = parsed_with_imports(vec![("unused", "./unused")], vec![]); // no call
+        let parsed = parsed_with_uses(vec![("unused", "./unused")], vec![]); // no call
 
         let results = collect_tag_keys_from_modules(&parsed, tmp.path());
         assert!(

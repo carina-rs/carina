@@ -42,7 +42,7 @@
         },
         {
           "name": "keyword.other.carina",
-          "match": "\\b(import|require|read)\\b"
+          "match": "\\b(use|import|require|read)\\b"
         },
         {
           "name": "constant.language.null.carina",

@@ -77,6 +77,7 @@ The following statements are valid at the top level of a `.crn` file:
 | `arguments` | Declare module input parameters |
 | `attributes` | Define module output values (for callers who bind the module with `let`) |
 | `exports` | Define values published to upstream-state consumers |
+| `use` (in `let` RHS) | Load a module from a directory (`let m = use { source = '...' }`) |
 
 ## Provider Block
 
@@ -295,6 +296,23 @@ awscc.ec2.SecurityGroup {
 ```
 
 `source` is required and points at the upstream project's directory. The path is resolved relative to the enclosing `.crn` file's directory. Carina loads the upstream's configuration, resolves its backend, reads its state, and exposes the values published by its `exports` block through the declared binding.
+
+## External References at a Glance
+
+Carina has four constructs for pulling data or declarations in from outside the current file. They look different because they do different things; the table below shows the split on *when* the data is fetched, *what* is fetched, and *from where*:
+
+| Construct | When | What | From |
+|---|---|---|---|
+| `let m = use { source = '...' }` | parse time | DSL source (a module) | local directory |
+| `let x = read <type> { }` | plan time | current cloud state | Cloud API (data source) |
+| `import { to = ..., id = ... }` | apply time | an existing cloud resource, adopted into state | Cloud API + state backend |
+| `let x = upstream_state { source = '...' }` | plan time | another Carina project's `exports` | state backend |
+
+The shape differences track these semantic differences:
+
+- `use` and `upstream_state` both name an external location via a `source` attribute and share their shape accordingly.
+- `read` leads with the resource type because the type is the primary piece of information for a live data-source read.
+- `import` is a top-level state-manipulation block parallel to `moved` / `removed`, not a `let`-RHS expression.
 
 ## Comments
 

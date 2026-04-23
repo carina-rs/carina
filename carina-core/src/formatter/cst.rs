@@ -58,7 +58,7 @@ impl Token {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeKind {
     File,
-    ImportExpr,
+    UseExpr,
     BackendBlock,
     ProviderBlock,
     ArgumentsBlock,

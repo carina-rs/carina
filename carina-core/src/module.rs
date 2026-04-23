@@ -350,7 +350,7 @@ impl RootConfigSignature {
     pub fn from_parsed_file(parsed: &ParsedFile, file_name: &str) -> Self {
         // Build imports
         let imports: Vec<ImportInfo> = parsed
-            .imports
+            .uses
             .iter()
             .map(|i| ImportInfo {
                 path: i.path.clone(),

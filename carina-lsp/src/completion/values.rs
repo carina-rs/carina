@@ -589,8 +589,8 @@ impl CompletionProvider {
         for (name, rhs) in Self::extract_let_bindings(src) {
             let detail = if rhs.starts_with("upstream_state") {
                 "upstream_state binding"
-            } else if rhs.starts_with("import ") {
-                "module import"
+            } else if rhs.starts_with("use ") || rhs.starts_with("use{") {
+                "module use"
             } else {
                 "binding"
             };
