@@ -75,7 +75,8 @@ The following statements are valid at the top level of a `.crn` file:
 | `fn` | Define a reusable function |
 | `require` | Assert a condition with an error message |
 | `arguments` | Declare module input parameters |
-| `attributes` | Declare module output values |
+| `attributes` | Define module output values (for callers who bind the module with `let`) |
+| `exports` | Define values published to upstream-state consumers |
 
 ## Provider Block
 

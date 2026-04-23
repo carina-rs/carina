@@ -5,6 +5,25 @@ description: Module definition, arguments, attributes, import syntax, directory 
 
 Modules are reusable units of Carina configuration. A module defines a set of resources along with input parameters (`arguments`) and output values (`attributes`).
 
+## Block Roles at a Glance
+
+A directory of `.crn` files may contain three interface-like blocks. They share a similar surface — `name: Type = expr` — but play different roles, and the `=` part means something different in each:
+
+| Block | Role | `=` expr means | Who consumes it |
+|---|---|---|---|
+| `arguments` | declare inputs | **optional default** for the parameter | callers of the module (`module { name = value }`) |
+| `attributes` | define module outputs | **required value** for the output | callers who bind the module (`let m = module { ... }; m.foo`) |
+| `exports` | define upstream-state outputs | **required value** for the export | other projects referencing this directory via `upstream_state` |
+
+The blocks fall into two groups by role:
+
+- **Declaration side** (`arguments`): the type annotation is required and load-bearing; `= expr` is an optional fallback when the caller omits the argument.
+- **Definition side** (`attributes`, `exports`): the value expression is required and load-bearing; the type annotation is an optional extra.
+
+Because `description` and `validation` are input-side concerns (documenting what callers should pass, and checking what they did pass), they are available on `arguments` entries through the block form but are deliberately absent from `attributes` and `exports`. Outputs are values produced internally from bindings the module already controls, so there is nothing to validate and no caller-facing documentation to attach beyond the type.
+
+`attributes` and `exports` share their body grammar but are intentionally kept separate because their consumers are different: `attributes` is the interface a module presents to its direct caller, while `exports` is the interface a directory presents to other projects through `upstream_state`.
+
 ## Module Structure
 
 A module is a directory containing one or more `.crn` files that together declare `arguments` and `attributes` blocks. Carina merges every `.crn` file in the directory as peers; there is no privileged filename like `main.crn`.
