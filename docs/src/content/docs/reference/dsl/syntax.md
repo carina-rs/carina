@@ -38,6 +38,25 @@ awscc.ec2.InternetGateway {
 }
 ```
 
+## Top-Level Construct Shapes
+
+Carina's top-level constructs come in two shapes, chosen by two independent questions:
+
+1. **Does the block's body schema depend on a kind label?** The attributes valid inside `provider awscc { ... }` differ from those inside `provider aws { ... }`, and similarly for backend kinds. When the schema varies by kind, the construct carries a kind label (`provider <kind>`, `backend <kind>`).
+2. **Does the construct produce a value that other code references by name?** When multiple named instances are useful, the construct is written as an expression on the right-hand side of a `let` binding, and the binding name on the left is how the value is referenced later.
+
+The two questions are orthogonal:
+
+| | kind label needed | kind label not needed |
+|---|---|---|
+| **singleton / not named-referenced** | `provider awscc { ... }`, `backend s3 { ... }` | — |
+| **named reference** | (future: named provider instances) | `let orgs = upstream_state { ... }` |
+
+- `provider` / `backend` carry kind labels because the body schema is kind-specific; they are statements today because one instance per project is sufficient in the common case.
+- `upstream_state` has no kind label because there is only one kind of upstream (a sibling directory); it is an expression because projects typically reference several named upstreams.
+
+When reading an unfamiliar top-level construct, work out which row and column of the table it sits in — that tells you whether to expect a kind label and whether to expect a `let` binding on the left.
+
 ## Statements
 
 The following statements are valid at the top level of a `.crn` file:
