@@ -10,7 +10,7 @@ Show an execution plan without applying changes. The plan compares the desired s
 carina plan [OPTIONS] [PATH]
 ```
 
-**PATH** defaults to `.` (current directory). It can be a `.crn` file or a directory containing `.crn` files.
+**PATH** defaults to `.` (current directory). It must be a directory containing one or more `.crn` files — single-file paths are rejected.
 
 ## Flags
 
@@ -75,10 +75,10 @@ Plan from the current directory:
 carina plan
 ```
 
-Plan a specific file with compact output:
+Plan a specific directory with compact output:
 
 ```bash
-carina plan --detail=none infra.crn
+carina plan --detail=none path/to/config
 ```
 
 Save a plan for later apply:

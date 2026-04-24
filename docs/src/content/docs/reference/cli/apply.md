@@ -10,7 +10,7 @@ Apply changes to reach the desired infrastructure state. Carina generates a plan
 carina apply [OPTIONS] [PATH]
 ```
 
-**PATH** defaults to `.` (current directory). It can be a `.crn` file, a directory containing `.crn` files, or a saved plan JSON file.
+**PATH** defaults to `.` (current directory). It must be either a directory containing one or more `.crn` files, or a saved plan JSON file (any path ending in `.json` is treated as a saved plan).
 
 ## Flags
 

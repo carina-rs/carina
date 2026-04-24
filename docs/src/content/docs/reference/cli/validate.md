@@ -10,7 +10,7 @@ Validate the configuration file without communicating with cloud providers. This
 carina validate [PATH]
 ```
 
-**PATH** defaults to `.` (current directory). It can be a `.crn` file or a directory containing `.crn` files.
+**PATH** defaults to `.` (current directory). It must be a directory containing one or more `.crn` files — single-file paths are rejected.
 
 ## What It Checks
 
@@ -86,8 +86,8 @@ Validate the current directory:
 carina validate
 ```
 
-Validate a specific file:
+Validate a specific directory:
 
 ```bash
-carina validate infra.crn
+carina validate path/to/config
 ```

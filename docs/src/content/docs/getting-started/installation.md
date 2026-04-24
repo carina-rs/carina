@@ -17,8 +17,8 @@ Download pre-built binaries from [GitHub Releases](https://github.com/carina-rs/
 
 ```bash
 # macOS (Apple Silicon)
-curl -LO https://github.com/carina-rs/carina/releases/latest/download/carina-0.3.0-macos-aarch64.tar.gz
-tar xzf carina-0.3.0-macos-aarch64.tar.gz
+curl -LO https://github.com/carina-rs/carina/releases/latest/download/carina-0.4.0-macos-aarch64.tar.gz
+tar xzf carina-0.4.0-macos-aarch64.tar.gz
 sudo mv carina carina-lsp /usr/local/bin/
 ```
 
@@ -48,9 +48,9 @@ Carina uses WASM-based provider plugins. When you specify a `source` and `versio
 
 ```crn
 provider awscc {
-    source = 'github.com/carina-rs/carina-provider-awscc'
-    version = '0.3.0'
-    region = 'ap-northeast-1'
+    source  = 'github.com/carina-rs/carina-provider-awscc'
+    version = '0.5.0'
+    region  = awscc.Region.ap_northeast_1
 }
 ```
 

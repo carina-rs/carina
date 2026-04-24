@@ -7,9 +7,9 @@ Modules let you group related resources into reusable units. A module defines it
 
 ## Creating a module
 
-A module is a `.crn` file (or a directory containing `main.crn`) that declares `arguments` and optionally `attributes`.
+A module is a directory containing one or more `.crn` files. Every `.crn` file in the directory is merged together — no filename (including `main.crn`) is privileged. Single-file modules are not supported; always point `use` at a directory.
 
-Create a file at `modules/network/main.crn`:
+Create a file at `modules/network/main.crn` (the filename is up to you):
 
 ```crn
 arguments {
@@ -110,16 +110,18 @@ awscc.ec2.RouteTable {
 
 The `net.vpc_id` reference accesses the `vpc_id` attribute declared in the module's `attributes` block.
 
-## Directory modules
+## Splitting a module across multiple files
 
-A module can be either:
+Every `.crn` file in a module directory is merged as a peer, so you can split a module across files however you like. A common convention is:
 
-- **A single file**: `modules/network.crn`
-- **A directory**: `modules/network/main.crn`
+```
+modules/network/
+  main.crn          # resources
+  arguments.crn     # arguments block
+  attributes.crn    # attributes block
+```
 
-Directory modules are useful when a module grows large or needs helper files. The entry point is always `main.crn` inside the directory.
-
-Both forms are loaded the same way:
+The filenames are arbitrary — `main.crn` is a convention, not a requirement. Load the module by pointing `use` at the directory:
 
 ```crn
 let network = use { source = './modules/network' }
