@@ -152,43 +152,6 @@ impl CompletionProvider {
             }
         }
 
-        // Check if cursor is inside a `use { source = '<cursor>' }` path string.
-        // The enclosing block must be `use { ... }` — for `upstream_state { source = ... }`
-        // a separate completion handler takes over (see `upstream_state_source_completions`).
-        if let Some(src_idx) = prefix.rfind("source") {
-            let before_source = &prefix[..src_idx];
-            let in_use_block = before_source
-                .rfind("use")
-                .map(|use_idx| {
-                    // Require a `use` keyword followed by `{` before the current `source =`,
-                    // and make sure no `upstream_state` keyword intervenes between them.
-                    let between = &before_source[use_idx..];
-                    between.contains('{')
-                        && !between.contains("upstream_state")
-                        && (use_idx == 0
-                            || !before_source[..use_idx]
-                                .chars()
-                                .next_back()
-                                .is_some_and(|c| c.is_alphanumeric() || c == '_'))
-                })
-                .unwrap_or(false);
-            if in_use_block {
-                let after_src = prefix[src_idx + "source".len()..].trim_start();
-                if let Some(rest) = after_src.strip_prefix('=') {
-                    let rest = rest.trim_start();
-                    if let Some(quote) = rest.chars().next()
-                        && (quote == '\'' || quote == '"')
-                        && !rest[1..].contains(quote)
-                    {
-                        let partial_path = &rest[1..];
-                        return CompletionContext::InsideImportPath {
-                            partial_path: partial_path.to_string(),
-                        };
-                    }
-                }
-            }
-        }
-
         // Check if we're in a type position after ":" in arguments/attributes blocks.
         // e.g., "vpc: aws." or "vpc: " — detect by checking if the line has a colon
         // but no equals sign, and we're inside arguments/attributes blocks.
@@ -203,6 +166,7 @@ impl CompletionProvider {
         let mut in_args_or_attrs_block = false;
         let mut in_exports_block = false;
         let mut in_upstream_state_block = false;
+        let mut in_use_block = false;
         // Type annotation of the most recent `<name>: <type> = ...` entry
         // inside an `exports { ... }` block. Recorded at brace_depth 1 and
         // consulted when the cursor lands inside that entry's value
@@ -268,6 +232,10 @@ impl CompletionProvider {
                 module_name = None;
             } else if brace_depth == 0 && is_let_upstream_state_line(trimmed) {
                 in_upstream_state_block = true;
+                resource_type.clear();
+                module_name = None;
+            } else if brace_depth == 0 && is_let_use_line(trimmed) {
+                in_use_block = true;
                 resource_type.clear();
                 module_name = None;
             } else if brace_depth == 0
@@ -344,6 +312,7 @@ impl CompletionProvider {
                         in_args_or_attrs_block = false;
                         in_exports_block = false;
                         in_upstream_state_block = false;
+                        in_use_block = false;
                         exports_entry_type = None;
                         nested_block_names.clear();
                     } else if brace_depth == 1 && in_exports_block {
@@ -432,6 +401,20 @@ impl CompletionProvider {
             && let Some(partial) = extract_upstream_source_partial(&prefix)
         {
             return CompletionContext::InsideUpstreamStateSource {
+                partial_path: partial,
+            };
+        }
+
+        // Check if cursor is inside `source = '...'` within a `use` block.
+        // Unlike `upstream_state` (where `source = '...'` almost always sits
+        // on its own line), a `use` block is frequently written in-line as
+        // `let x = use { source = '<cursor>` — so we have to search the full
+        // prefix, not just its trimmed start, for the attribute.
+        if in_use_block
+            && brace_depth > 0
+            && let Some(partial) = extract_source_partial_anywhere(&prefix)
+        {
+            return CompletionContext::InsideImportPath {
                 partial_path: partial,
             };
         }
@@ -775,6 +758,22 @@ fn is_let_upstream_state_line(trimmed: &str) -> bool {
     next.starts_with('{') || next.is_empty()
 }
 
+fn is_let_use_line(trimmed: &str) -> bool {
+    let Some((_, rhs)) = crate::let_parse::parse_let_header(trimmed) else {
+        return false;
+    };
+    let Some(rest) = rhs.strip_prefix("use") else {
+        return false;
+    };
+    // Must be followed by whitespace or `{` to ensure it's the keyword, not a
+    // longer identifier starting with `use` (e.g. `user_data`). For such
+    // identifiers the continuation after stripping `use` starts with an
+    // identifier character (`r` for `user_data`), so `trim_start` preserves
+    // it and neither `starts_with('{')` nor `is_empty()` matches.
+    let next = rest.trim_start();
+    next.starts_with('{') || next.is_empty()
+}
+
 /// If the cursor sits at the iterable position of a `for <pat> in <partial>`
 /// header — i.e. after the `in` keyword and inside (possibly empty) identifier
 /// characters — return the partial identifier typed so far. A `.` in the
@@ -920,7 +919,40 @@ fn find_source_in_line(segment: &str) -> Option<String> {
 /// `None`.
 fn extract_upstream_source_partial(prefix: &str) -> Option<String> {
     let trimmed = prefix.trim_start();
-    let rest = trimmed.strip_prefix("source")?;
+    parse_source_partial_from(trimmed)
+}
+
+/// Same as `extract_upstream_source_partial`, but searches for the last
+/// occurrence of `source = '…` / `source = "…` anywhere within `prefix`
+/// (not just at its trimmed start). Needed for single-line shapes like
+/// `let x = use { source = '<cursor>` where the prefix carries the full
+/// let header, not just the attribute.
+fn extract_source_partial_anywhere(prefix: &str) -> Option<String> {
+    let mut search_from = prefix.len();
+    while let Some(idx) = prefix[..search_from].rfind("source") {
+        // Treat only the source keyword as a standalone identifier — reject
+        // matches where it's a suffix of a longer identifier like `my_source`.
+        let boundary_ok = idx == 0
+            || !prefix[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if boundary_ok && let Some(partial) = parse_source_partial_from(&prefix[idx..]) {
+            return Some(partial);
+        }
+        if idx == 0 {
+            break;
+        }
+        search_from = idx;
+    }
+    None
+}
+
+/// Parse `source = '<partial>` (or with `"`) starting exactly at `s`.
+/// Used by both [`extract_upstream_source_partial`] and
+/// [`extract_source_partial_anywhere`].
+fn parse_source_partial_from(s: &str) -> Option<String> {
+    let rest = s.strip_prefix("source")?;
     let rest = rest.trim_start().strip_prefix('=')?.trim_start();
     let (quote, rest) = if let Some(r) = rest.strip_prefix('\'') {
         ('\'', r)
@@ -935,7 +967,9 @@ fn extract_upstream_source_partial(prefix: &str) -> Option<String> {
 
 #[cfg(test)]
 mod helper_tests {
-    use super::extract_upstream_source_partial;
+    use super::{
+        extract_source_partial_anywhere, extract_upstream_source_partial, is_let_use_line,
+    };
 
     #[test]
     fn single_quote_unclosed_returns_partial() {
@@ -973,5 +1007,54 @@ mod helper_tests {
         assert_eq!(extract_upstream_source_partial("source"), None);
         assert_eq!(extract_upstream_source_partial("source ="), None);
         assert_eq!(extract_upstream_source_partial("source = ../x"), None);
+    }
+
+    #[test]
+    fn anywhere_finds_partial_after_let_header() {
+        // Single-line `let x = use { source = '../x` shape: the attribute
+        // sits after the `let` / `use` / `{` tokens on the same line.
+        assert_eq!(
+            extract_source_partial_anywhere("let x = use { source = './modules/"),
+            Some("./modules/".to_string())
+        );
+        assert_eq!(
+            extract_source_partial_anywhere("let x = use { source = \"./modules/"),
+            Some("./modules/".to_string())
+        );
+    }
+
+    #[test]
+    fn anywhere_respects_identifier_boundary() {
+        // `my_source` ends in `source` but is a different identifier — must
+        // not be matched.
+        assert_eq!(
+            extract_source_partial_anywhere("let x = use { my_source = './m/"),
+            None
+        );
+    }
+
+    #[test]
+    fn anywhere_returns_none_when_quote_is_closed() {
+        assert_eq!(
+            extract_source_partial_anywhere("let x = use { source = './m' }"),
+            None
+        );
+    }
+
+    #[test]
+    fn is_let_use_accepts_common_shapes() {
+        assert!(is_let_use_line("let x = use { source = './m' }"));
+        assert!(is_let_use_line("let x = use {"));
+        assert!(is_let_use_line("let x = use{"));
+    }
+
+    #[test]
+    fn is_let_use_rejects_near_misses() {
+        // A longer identifier starting with `use` must not be mistaken for
+        // the keyword.
+        assert!(!is_let_use_line("let x = user_data"));
+        // `read`, `upstream_state`, etc. live on other let RHS shapes.
+        assert!(!is_let_use_line("let x = read awscc.ec2.Vpc { }"));
+        assert!(!is_let_use_line("let x = upstream_state { source = '..' }"));
     }
 }

@@ -457,6 +457,27 @@ pub(super) fn extract_use_source_path(after_eq: &str) -> Option<String> {
     Some(body[..end].to_string())
 }
 
+/// Build a navigation-anchor `CompletionItem` for `./` or `../`.
+///
+/// The `label` and `insert_text` are the same literal text — the LSP
+/// client replaces the current path "word" with this. Triggers a follow-up
+/// suggest so the user immediately sees the resolved directory's entries.
+fn path_anchor(text: &str) -> CompletionItem {
+    CompletionItem {
+        label: text.to_string(),
+        kind: Some(CompletionItemKind::FOLDER),
+        insert_text: Some(text.to_string()),
+        detail: Some("Relative path".to_string()),
+        sort_text: Some(format!("0_{}", text)),
+        command: Some(Command {
+            title: "Trigger Suggest".to_string(),
+            command: "editor.action.triggerSuggest".to_string(),
+            arguments: None,
+        }),
+        ..Default::default()
+    }
+}
+
 impl CompletionProvider {
     /// Generate import path completions from filesystem.
     ///
@@ -472,6 +493,23 @@ impl CompletionProvider {
             None => return vec![],
         };
 
+        let mut completions = Vec::new();
+
+        // Navigation anchors. A user typing `'|`, `'.|`, or `'..|` is starting
+        // to build a relative path — offer `./` and `../` so the list is
+        // never empty even when the current dir has no module subdirs (the
+        // common case for leaf config dirs like `infra/aws/management/github-oidc/`).
+        // Once the partial contains a `/` the user has committed to a
+        // direction and wants entries from the resolved dir, not anchors.
+        if !partial_path.contains('/') {
+            if partial_path.is_empty() || "./".starts_with(partial_path) {
+                completions.push(path_anchor("./"));
+            }
+            if partial_path.is_empty() || "../".starts_with(partial_path) {
+                completions.push(path_anchor("../"));
+            }
+        }
+
         // Split partial_path into directory prefix and filename prefix
         let (dir_part, name_prefix) = if let Some(last_slash) = partial_path.rfind('/') {
             (
@@ -485,10 +523,8 @@ impl CompletionProvider {
         let search_dir = base.join(dir_part);
         let entries = match std::fs::read_dir(&search_dir) {
             Ok(entries) => entries,
-            Err(_) => return vec![],
+            Err(_) => return completions,
         };
-
-        let mut completions = Vec::new();
 
         for entry in entries.flatten() {
             let file_name = entry.file_name();

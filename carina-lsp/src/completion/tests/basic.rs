@@ -1353,3 +1353,262 @@ fn import_path_completion_lists_directories_only() {
         labels
     );
 }
+
+/// Regression for #2196.
+///
+/// When the user starts typing a path with just `.`, we used to return zero
+/// completions because `.` was treated as a filename prefix and the hidden
+/// filter at the top of `import_path_completions` rejected every matching
+/// entry (`.`, `..`, `.something`). The fix offers `./` and `../` as
+/// navigation anchors so the user can start walking the tree.
+#[test]
+fn import_path_completion_offers_dot_anchors_for_partial_dot() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Leaf dir with no sibling module dirs — mirrors infra/aws/management/github-oidc/.
+    let leaf = tmp.path().join("leaf");
+    std::fs::create_dir_all(&leaf).unwrap();
+
+    let provider = test_provider();
+    let source = "let web = use { source = '.";
+    let doc = create_document(source);
+    let position = Position {
+        line: 0,
+        character: source.chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&leaf));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"./"),
+        "Should offer './' anchor for partial '.'. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"../"),
+        "Should offer '../' anchor for partial '.'. Got: {:?}",
+        labels
+    );
+}
+
+/// Regression for #2196.
+///
+/// Empty partial (`source = '|'`) must still give the user an entry point
+/// when the current directory has no module subdirs. The anchors `./` and
+/// `../` are that entry point.
+#[test]
+fn import_path_completion_offers_dot_anchors_for_empty_partial() {
+    let tmp = tempfile::tempdir().unwrap();
+    let leaf = tmp.path().join("leaf");
+    std::fs::create_dir_all(&leaf).unwrap();
+
+    let provider = test_provider();
+    let source = "let web = use { source = '";
+    let doc = create_document(source);
+    let position = Position {
+        line: 0,
+        character: source.chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&leaf));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"./"),
+        "Should offer './' anchor for empty partial. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"../"),
+        "Should offer '../' anchor for empty partial. Got: {:?}",
+        labels
+    );
+}
+
+/// Regression for #2196.
+///
+/// Partial `..` is the user starting to type `../`. Same anchor behavior as
+/// `.` — must not get eaten by the hidden-file filter.
+#[test]
+fn import_path_completion_offers_dot_anchors_for_partial_double_dot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let leaf = tmp.path().join("leaf");
+    std::fs::create_dir_all(&leaf).unwrap();
+
+    let provider = test_provider();
+    let source = "let web = use { source = '..";
+    let doc = create_document(source);
+    let position = Position {
+        line: 0,
+        character: source.chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&leaf));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"../"),
+        "Should offer '../' anchor for partial '..'. Got: {:?}",
+        labels
+    );
+}
+
+/// Regression for #2196.
+///
+/// Once the user has committed to a direction (`../`), the anchors should
+/// NOT keep showing up — the user wants the contents of the parent dir,
+/// not more navigation markers.
+#[test]
+fn import_path_completion_does_not_offer_anchors_after_slash() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Structure:
+    //   tmp/leaf/           (base_path — no siblings of its own)
+    //   tmp/sibling_a/
+    //   tmp/sibling_b/
+    let leaf = tmp.path().join("leaf");
+    std::fs::create_dir_all(&leaf).unwrap();
+    std::fs::create_dir_all(tmp.path().join("sibling_a")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("sibling_b")).unwrap();
+
+    let provider = test_provider();
+    let source = "let web = use { source = '../";
+    let doc = create_document(source);
+    let position = Position {
+        line: 0,
+        character: source.chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&leaf));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"sibling_a/"),
+        "Should list sibling_a/ from parent dir. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"sibling_b/"),
+        "Should list sibling_b/ from parent dir. Got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.contains(&"./"),
+        "Should NOT offer './' anchor when partial already ends with '/'. Got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.contains(&"../"),
+        "Should NOT offer '../' anchor when partial already ends with '/'. Got: {:?}",
+        labels
+    );
+}
+
+/// Regression guard for #2196: at `'../` the completion must list entries
+/// of the parent directory, not be empty. Mirrors the real
+/// `infra/aws/management/github-oidc/main.crn` case where the user needs
+/// to walk out of the leaf dir to reach `modules/`.
+#[test]
+fn use_source_path_completion_lists_parent_at_double_dot_slash() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Structure:
+    //   tmp/leaf/             <- base_path (opened .crn lives here)
+    //   tmp/sibling_alpha/
+    //   tmp/sibling_beta/
+    let leaf = tmp.path().join("leaf");
+    std::fs::create_dir_all(&leaf).unwrap();
+    std::fs::create_dir_all(tmp.path().join("sibling_alpha")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("sibling_beta")).unwrap();
+
+    let provider = test_provider();
+    // Multi-line mid-typing shape — exactly what the editor sends.
+    let source = "let x = use {\n  source = '../";
+    let doc = create_document(source);
+    let last_line = source.lines().next_back().unwrap_or("");
+    let position = Position {
+        line: 1,
+        character: last_line.chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&leaf));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"sibling_alpha/"),
+        "Should list 'sibling_alpha/' from parent at '../'. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"sibling_beta/"),
+        "Should list 'sibling_beta/' from parent at '../'. Got: {:?}",
+        labels
+    );
+}
+
+/// Regression guard for #2196: path completion inside `use { source = '...' }`
+/// must work when `use {` and the `source` attribute are on separate lines.
+/// This is the real shape users type in practice; the single-line form was
+/// covered by `import_path_completion_lists_directories_only` but the
+/// multi-line shape broke after the `import` → `use` rename (#2186).
+#[test]
+fn use_source_path_completion_works_multiline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let modules_dir = tmp.path().join("modules");
+    std::fs::create_dir_all(modules_dir.join("network")).unwrap();
+    std::fs::create_dir_all(modules_dir.join("shared")).unwrap();
+
+    let provider = test_provider();
+    // Realistic multi-line shape — `use {` on line 0, `source = '...` on line 1.
+    let source = "let net = use {\n  source = './modules/";
+    let doc = create_document(source);
+    let last_line = source.lines().next_back().unwrap_or("");
+    let position = Position {
+        line: 1,
+        character: last_line.chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(tmp.path()));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"network/"),
+        "Should suggest 'network/' directory under './modules/'. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"shared/"),
+        "Should suggest 'shared/' directory under './modules/'. Got: {:?}",
+        labels
+    );
+}
+
+/// Regression guard for #2196: same multi-line shape, but with the `}` on a
+/// trailing line already present in the buffer (as it would be in a real
+/// editor that auto-closes the brace). `get_completion_context` must stop
+/// walking at the cursor line; trailing `}` after that must not affect
+/// `in_use_block` state.
+#[test]
+fn use_source_path_completion_works_multiline_with_trailing_brace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let modules_dir = tmp.path().join("modules");
+    std::fs::create_dir_all(modules_dir.join("network")).unwrap();
+
+    let provider = test_provider();
+    let source = "let net = use {\n  source = './modules/\n}";
+    let doc = create_document(source);
+    // Cursor sits at the end of line 1 (the `source = '...` line), BEFORE
+    // the trailing brace on line 2.
+    let second_line = source.lines().nth(1).unwrap_or("");
+    let position = Position {
+        line: 1,
+        character: second_line.chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(tmp.path()));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"network/"),
+        "Should suggest 'network/' directory even when buffer has a trailing `}}`. Got: {:?}",
+        labels
+    );
+}
