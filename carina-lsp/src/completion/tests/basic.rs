@@ -1503,6 +1503,47 @@ fn import_path_completion_does_not_offer_anchors_after_slash() {
     );
 }
 
+/// Regression guard for #2196: at `'../` the completion must list entries
+/// of the parent directory, not be empty. Mirrors the real
+/// `infra/aws/management/github-oidc/main.crn` case where the user needs
+/// to walk out of the leaf dir to reach `modules/`.
+#[test]
+fn use_source_path_completion_lists_parent_at_double_dot_slash() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Structure:
+    //   tmp/leaf/             <- base_path (opened .crn lives here)
+    //   tmp/sibling_alpha/
+    //   tmp/sibling_beta/
+    let leaf = tmp.path().join("leaf");
+    std::fs::create_dir_all(&leaf).unwrap();
+    std::fs::create_dir_all(tmp.path().join("sibling_alpha")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("sibling_beta")).unwrap();
+
+    let provider = test_provider();
+    // Multi-line mid-typing shape — exactly what the editor sends.
+    let source = "let x = use {\n  source = '../";
+    let doc = create_document(source);
+    let last_line = source.lines().next_back().unwrap_or("");
+    let position = Position {
+        line: 1,
+        character: last_line.chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&leaf));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"sibling_alpha/"),
+        "Should list 'sibling_alpha/' from parent at '../'. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"sibling_beta/"),
+        "Should list 'sibling_beta/' from parent at '../'. Got: {:?}",
+        labels
+    );
+}
+
 /// Regression guard for #2196: path completion inside `use { source = '...' }`
 /// must work when `use {` and the `source` attribute are on separate lines.
 /// This is the real shape users type in practice; the single-line form was

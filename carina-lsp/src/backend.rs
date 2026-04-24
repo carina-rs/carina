@@ -354,6 +354,11 @@ impl LanguageServer for Backend {
                         ".".to_string(),
                         "=".to_string(),
                         " ".to_string(),
+                        // `/` re-triggers path completion inside `use { source = '...' }`
+                        // so typing `../` fetches the parent dir's entries without
+                        // requiring a manual Ctrl-Space. Harmless outside import paths:
+                        // other contexts return nothing for a bare `/`.
+                        "/".to_string(),
                     ]),
                     ..Default::default()
                 }),
