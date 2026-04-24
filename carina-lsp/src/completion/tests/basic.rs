@@ -1353,3 +1353,152 @@ fn import_path_completion_lists_directories_only() {
         labels
     );
 }
+
+/// Regression for #2196.
+///
+/// When the user starts typing a path with just `.`, we used to return zero
+/// completions because `.` was treated as a filename prefix and the hidden
+/// filter at the top of `import_path_completions` rejected every matching
+/// entry (`.`, `..`, `.something`). The fix offers `./` and `../` as
+/// navigation anchors so the user can start walking the tree.
+#[test]
+fn import_path_completion_offers_dot_anchors_for_partial_dot() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Leaf dir with no sibling module dirs — mirrors infra/aws/management/github-oidc/.
+    let leaf = tmp.path().join("leaf");
+    std::fs::create_dir_all(&leaf).unwrap();
+
+    let provider = test_provider();
+    let source = "let web = use { source = '.";
+    let doc = create_document(source);
+    let position = Position {
+        line: 0,
+        character: source.chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&leaf));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"./"),
+        "Should offer './' anchor for partial '.'. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"../"),
+        "Should offer '../' anchor for partial '.'. Got: {:?}",
+        labels
+    );
+}
+
+/// Regression for #2196.
+///
+/// Empty partial (`source = '|'`) must still give the user an entry point
+/// when the current directory has no module subdirs. The anchors `./` and
+/// `../` are that entry point.
+#[test]
+fn import_path_completion_offers_dot_anchors_for_empty_partial() {
+    let tmp = tempfile::tempdir().unwrap();
+    let leaf = tmp.path().join("leaf");
+    std::fs::create_dir_all(&leaf).unwrap();
+
+    let provider = test_provider();
+    let source = "let web = use { source = '";
+    let doc = create_document(source);
+    let position = Position {
+        line: 0,
+        character: source.chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&leaf));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"./"),
+        "Should offer './' anchor for empty partial. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"../"),
+        "Should offer '../' anchor for empty partial. Got: {:?}",
+        labels
+    );
+}
+
+/// Regression for #2196.
+///
+/// Partial `..` is the user starting to type `../`. Same anchor behavior as
+/// `.` — must not get eaten by the hidden-file filter.
+#[test]
+fn import_path_completion_offers_dot_anchors_for_partial_double_dot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let leaf = tmp.path().join("leaf");
+    std::fs::create_dir_all(&leaf).unwrap();
+
+    let provider = test_provider();
+    let source = "let web = use { source = '..";
+    let doc = create_document(source);
+    let position = Position {
+        line: 0,
+        character: source.chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&leaf));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"../"),
+        "Should offer '../' anchor for partial '..'. Got: {:?}",
+        labels
+    );
+}
+
+/// Regression for #2196.
+///
+/// Once the user has committed to a direction (`../`), the anchors should
+/// NOT keep showing up — the user wants the contents of the parent dir,
+/// not more navigation markers.
+#[test]
+fn import_path_completion_does_not_offer_anchors_after_slash() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Structure:
+    //   tmp/leaf/           (base_path — no siblings of its own)
+    //   tmp/sibling_a/
+    //   tmp/sibling_b/
+    let leaf = tmp.path().join("leaf");
+    std::fs::create_dir_all(&leaf).unwrap();
+    std::fs::create_dir_all(tmp.path().join("sibling_a")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("sibling_b")).unwrap();
+
+    let provider = test_provider();
+    let source = "let web = use { source = '../";
+    let doc = create_document(source);
+    let position = Position {
+        line: 0,
+        character: source.chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&leaf));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"sibling_a/"),
+        "Should list sibling_a/ from parent dir. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"sibling_b/"),
+        "Should list sibling_b/ from parent dir. Got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.contains(&"./"),
+        "Should NOT offer './' anchor when partial already ends with '/'. Got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.contains(&"../"),
+        "Should NOT offer '../' anchor when partial already ends with '/'. Got: {:?}",
+        labels
+    );
+}

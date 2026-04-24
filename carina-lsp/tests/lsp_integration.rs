@@ -450,3 +450,73 @@ awscc.ec2.vpc_gateway_attachment {
 
     client.shutdown().await;
 }
+
+/// Regression for #2196.
+///
+/// End-to-end test: a leaf config dir (mirror of
+/// `infra/aws/management/github-oidc/` — multi-file, no sibling module
+/// dirs) asks for completion inside `use { source = '.|' }`. The LSP
+/// must return the `./` and `../` navigation anchors so the user has
+/// a starting point; prior to the fix this call returned an empty list.
+#[tokio::test]
+async fn test_use_source_path_completion_offers_anchors_in_leaf_dir() {
+    let mut client = TestClient::new().await;
+    client.initialize().await;
+
+    // Mirror the real infra shape: a leaf config dir with main/providers/backend,
+    // no `modules/` subtree of its own.
+    let tmp = tempfile::tempdir().unwrap();
+    let leaf = tmp.path().join("leaf");
+    std::fs::create_dir_all(&leaf).unwrap();
+    std::fs::write(
+        leaf.join("providers.crn"),
+        "provider aws {\n  region = \"us-east-1\"\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        leaf.join("backend.crn"),
+        "backend {\n  type = \"local\"\n}\n",
+    )
+    .unwrap();
+
+    // main.crn has a `use` with an opening partial — cursor after the `.`.
+    // Written as a single line on purpose: the multi-line shape currently
+    // has a separate context-detection bug (the `source = ...` line has no
+    // `use` keyword on the same line, so `determine_context` falls through
+    // before the anchor logic can run). That bug is out of scope for this
+    // fix — this test covers the empty-candidate bug only.
+    let main_text = "let shared = use { source = '.' }\n";
+    let main_path = leaf.join("main.crn");
+    std::fs::write(&main_path, main_text).unwrap();
+
+    let uri = format!("file://{}", main_path.display());
+    client.open_document(&uri, main_text).await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Cursor on line 0, right after the `.` inside the single quotes.
+    // "let shared = use { source = '" has 29 chars, `.` is at col 29,
+    // so cursor sits at col 30.
+    let response = client._request_completion(&uri, 0, 30).await;
+
+    let items = response["result"]
+        .as_array()
+        .expect("Completion result should be an array");
+    let labels: Vec<&str> = items
+        .iter()
+        .filter_map(|item| item["label"].as_str())
+        .collect();
+
+    assert!(
+        labels.contains(&"./"),
+        "Should offer './' anchor. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"../"),
+        "Should offer '../' anchor. Got: {:?}",
+        labels
+    );
+
+    client.shutdown().await;
+}
