@@ -853,6 +853,66 @@ fn upstream_state_block_completes_source_attribute() {
     );
 }
 
+/// Regression for #2200. Same shape as `upstream_state`: a `use { ... }`
+/// block has exactly one legal attribute name (`source`), and that's what
+/// the LSP must offer at the attribute-name position. Previously the code
+/// fell through to `InsideResourceBlock` with an empty resource_type and
+/// returned nothing.
+#[test]
+fn use_block_completes_source_attribute() {
+    let provider = test_provider();
+    let doc = create_document(
+        r#"let mod = use {
+
+}"#,
+    );
+    // Cursor on the empty line inside the block
+    let position = Position {
+        line: 1,
+        character: 0,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"source"),
+        "use block should offer 'source' attribute. Got: {:?}",
+        labels
+    );
+    assert_eq!(
+        labels.len(),
+        1,
+        "use block has exactly one attribute; no other candidates should leak in. Got: {:?}",
+        labels
+    );
+}
+
+/// Regression for #2200. The in-line shape (`let m = use { |`) must behave
+/// the same as the multi-line shape above — same single `source` candidate,
+/// no fallthrough noise.
+#[test]
+fn use_block_completes_source_attribute_single_line() {
+    let provider = test_provider();
+    let source = "let mod = use { ";
+    let doc = create_document(source);
+    let position = Position {
+        line: 0,
+        character: source.chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"source"),
+        "use block (single-line) should offer 'source'. Got: {:?}",
+        labels
+    );
+    assert_eq!(
+        labels.len(),
+        1,
+        "use block has exactly one attribute. Got: {:?}",
+        labels
+    );
+}
+
 #[test]
 fn struct_field_completion_with_assignment_syntax() {
     // Bug #1627: `outer = {` (assignment syntax) was not detected as nested struct block
