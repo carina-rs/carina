@@ -1353,3 +1353,40 @@ fn import_path_completion_lists_directories_only() {
         labels
     );
 }
+
+/// Regression guard for #2196: path completion inside `use { source = '...' }`
+/// must work when `use {` and the `source` attribute are on separate lines.
+/// This is the real shape users type in practice; the single-line form was
+/// covered by `import_path_completion_lists_directories_only` but the
+/// multi-line shape broke after the `import` → `use` rename (#2186).
+#[test]
+fn use_source_path_completion_works_multiline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let modules_dir = tmp.path().join("modules");
+    std::fs::create_dir_all(modules_dir.join("network")).unwrap();
+    std::fs::create_dir_all(modules_dir.join("shared")).unwrap();
+
+    let provider = test_provider();
+    // Realistic multi-line shape — `use {` on line 0, `source = '...` on line 1.
+    let source = "let net = use {\n  source = './modules/";
+    let doc = create_document(source);
+    let last_line = source.lines().next_back().unwrap_or("");
+    let position = Position {
+        line: 1,
+        character: last_line.chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(tmp.path()));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"network/"),
+        "Should suggest 'network/' directory under './modules/'. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"shared/"),
+        "Should suggest 'shared/' directory under './modules/'. Got: {:?}",
+        labels
+    );
+}
