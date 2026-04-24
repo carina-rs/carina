@@ -155,7 +155,7 @@ pub fn reconcile_prefixed_names(
 ///
 /// Unlike `format!("{:?}", value)`, this ensures Map entries are sorted by key,
 /// so the output is consistent across runs (HashMap iteration order is random).
-fn deterministic_value_string(value: &Value) -> String {
+pub(crate) fn deterministic_value_string(value: &Value) -> String {
     match value {
         Value::String(s) => format!("String({:?})", s),
         Value::Int(i) => format!("Int({})", i),

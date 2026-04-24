@@ -245,11 +245,7 @@ impl<'cfg> ModuleResolver<'cfg> {
         // Expand the module's own module_calls
         let module_calls = parsed.module_calls.clone();
         for call in &module_calls {
-            let instance_prefix = call
-                .binding_name
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| call.module_name.clone());
+            let instance_prefix = instance_prefix_for_call(call);
 
             match self.expand_module_call(call, &instance_prefix) {
                 Ok(expanded) => parsed.resources.extend(expanded), // allow: direct — module expansion, handled separately
@@ -570,6 +566,29 @@ fn rewrite_intra_module_refs(
     }
 }
 
+/// Compute the instance prefix for a module call. Named calls use the
+/// binding name; anonymous calls get `<module>_<8hex>` hashed from
+/// arguments — same convention as anonymous ordinary resources.
+fn instance_prefix_for_call(call: &ModuleCall) -> String {
+    use std::hash::{Hash, Hasher};
+
+    if let Some(name) = &call.binding_name {
+        return name.clone();
+    }
+
+    let mut sorted: Vec<(&String, &Value)> = call.arguments.iter().collect();
+    sorted.sort_by_key(|(k, _)| *k);
+
+    let mut hasher = std::hash::DefaultHasher::new();
+    call.module_name.hash(&mut hasher);
+    for (k, v) in &sorted {
+        k.hash(&mut hasher);
+        crate::identifier::deterministic_value_string(v).hash(&mut hasher);
+    }
+    let hash = hasher.finish() & 0xFFFFFFFF;
+    format!("{}_{:08x}", call.module_name, hash)
+}
+
 /// Resolve all modules in a parsed file
 pub fn resolve_modules(parsed: &mut ParsedFile, base_dir: &Path) -> Result<(), ModuleError> {
     resolve_modules_with_config(parsed, base_dir, &ProviderContext::default())
@@ -588,12 +607,7 @@ pub fn resolve_modules_with_config(
 
     // Expand module calls
     for call in &parsed.module_calls {
-        let instance_prefix = call
-            .binding_name
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| call.module_name.clone());
-
+        let instance_prefix = instance_prefix_for_call(call);
         let expanded = resolver.expand_module_call(call, &instance_prefix)?;
         parsed.resources.extend(expanded); // allow: direct — module expansion, handled separately
     }
@@ -1251,6 +1265,212 @@ mod tests {
         // Only real resources, no virtual
         let virtual_count = expanded.iter().filter(|r| r.is_virtual()).count();
         assert_eq!(virtual_count, 0);
+    }
+
+    /// Regression fixtures for #2197. Writes a minimal `modules/thing` module
+    /// (one `awscc.iam.Role` whose `role_name` comes from a `name` argument)
+    /// and a `root/main.crn` with the caller-supplied body; returns the parsed
+    /// root with modules already resolved.
+    fn resolve_thing_fixture(root_body: &str) -> ParsedFile {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let module_dir = tmp.path().join("modules/thing");
+        fs::create_dir_all(&module_dir).unwrap();
+        fs::write(
+            module_dir.join("main.crn"),
+            r#"
+arguments {
+  name: String
+}
+
+let role = awscc.iam.Role {
+  role_name = name
+  assume_role_policy_document = {}
+}
+"#,
+        )
+        .unwrap();
+
+        let root_dir = tmp.path().join("root");
+        fs::create_dir_all(&root_dir).unwrap();
+        fs::write(root_dir.join("main.crn"), root_body).unwrap();
+
+        let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
+        let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+        resolve_modules(&mut parsed, &root_dir).expect("resolve_modules should succeed");
+        parsed
+    }
+
+    fn role_names(parsed: &ParsedFile) -> HashSet<String> {
+        parsed
+            .resources
+            .iter()
+            .filter(|r| r.id.resource_type == "iam.Role")
+            .filter_map(|r| match r.get_attr("role_name")? {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_anonymous_module_calls_get_distinct_prefixes() {
+        let call_a = ModuleCall {
+            module_name: "github".to_string(),
+            binding_name: None,
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert(
+                    "github_repo".to_string(),
+                    Value::String("carina-rs/infra".to_string()),
+                );
+                args.insert(
+                    "role_name".to_string(),
+                    Value::String("github-actions-carina".to_string()),
+                );
+                args
+            },
+        };
+        let call_b = ModuleCall {
+            module_name: "github".to_string(),
+            binding_name: None,
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert(
+                    "github_repo".to_string(),
+                    Value::String("carina-rs/infra2".to_string()),
+                );
+                args.insert(
+                    "role_name".to_string(),
+                    Value::String("github-actions-carina-2".to_string()),
+                );
+                args
+            },
+        };
+
+        let prefix_a = instance_prefix_for_call(&call_a);
+        let prefix_b = instance_prefix_for_call(&call_b);
+
+        assert_ne!(
+            prefix_a, prefix_b,
+            "anonymous calls with distinct args must produce distinct prefixes"
+        );
+        assert!(
+            prefix_a.starts_with("github_"),
+            "prefix should be `<module>_<hash>`, got {prefix_a}"
+        );
+        assert!(
+            prefix_b.starts_with("github_"),
+            "prefix should be `<module>_<hash>`, got {prefix_b}"
+        );
+    }
+
+    // Synthetic prefix must be stable — resource addresses (and therefore
+    // state keys) depend on it. Build two separate calls with identical
+    // content to guard against any identity-based shortcut.
+    #[test]
+    fn test_anonymous_module_call_prefix_is_stable() {
+        let build = || ModuleCall {
+            module_name: "github".to_string(),
+            binding_name: None,
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert(
+                    "github_repo".to_string(),
+                    Value::String("carina-rs/infra".to_string()),
+                );
+                args.insert(
+                    "role_name".to_string(),
+                    Value::String("github-actions-carina".to_string()),
+                );
+                args
+            },
+        };
+
+        assert_eq!(
+            instance_prefix_for_call(&build()),
+            instance_prefix_for_call(&build()),
+            "synthetic prefix must be deterministic for equal inputs"
+        );
+    }
+
+    #[test]
+    fn test_named_module_call_uses_binding_name() {
+        let call = ModuleCall {
+            module_name: "github".to_string(),
+            binding_name: Some("prod".to_string()),
+            arguments: HashMap::new(),
+        };
+        assert_eq!(instance_prefix_for_call(&call), "prod");
+    }
+
+    #[test]
+    fn test_anonymous_module_calls_expand_into_distinct_instances() {
+        let parsed = resolve_thing_fixture(
+            r#"
+let thing = use { source = '../modules/thing' }
+
+thing { name = 'alpha' }
+thing { name = 'beta'  }
+"#,
+        );
+
+        let role_addresses: HashSet<&String> = parsed
+            .resources
+            .iter()
+            .filter(|r| r.id.resource_type == "iam.Role")
+            .map(|r| &r.id.name)
+            .collect();
+        assert_eq!(
+            role_addresses.len(),
+            2,
+            "expanded resource addresses must be distinct, got {:?}",
+            role_addresses,
+        );
+
+        assert_eq!(
+            role_names(&parsed),
+            ["alpha".to_string(), "beta".to_string()]
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            "both role_name values must survive expansion",
+        );
+    }
+
+    #[test]
+    fn test_mixed_named_and_anonymous_module_calls_coexist() {
+        let parsed = resolve_thing_fixture(
+            r#"
+let thing = use { source = '../modules/thing' }
+
+let named = thing { name = 'named-call' }
+thing              { name = 'anon-call'  }
+"#,
+        );
+
+        assert_eq!(
+            role_names(&parsed),
+            ["named-call".to_string(), "anon-call".to_string()]
+                .into_iter()
+                .collect::<HashSet<_>>(),
+        );
+
+        // Named call keeps its binding-name prefix; anonymous call gets the
+        // synthetic `<module>_<hash>` prefix.
+        let addrs: Vec<&str> = parsed
+            .resources
+            .iter()
+            .map(|r| r.id.name.as_str())
+            .collect();
+        assert!(
+            addrs.iter().any(|n| n.starts_with("named.")),
+            "expected a resource with `named.` prefix, got {:?}",
+            addrs,
+        );
+        assert!(
+            addrs.iter().any(|n| n.starts_with("thing_")),
+            "expected a resource with `thing_<hash>` prefix, got {:?}",
+            addrs,
+        );
     }
 
     #[test]
