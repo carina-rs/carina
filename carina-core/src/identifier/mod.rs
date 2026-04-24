@@ -219,14 +219,14 @@ fn deterministic_value_string(value: &Value) -> String {
 /// Maximum Hamming distance (out of 64 bits) for SimHash-based reconciliation.
 /// Two identifiers with distance below this threshold are considered the "same resource"
 /// with modified attributes.
-const SIMHASH_HAMMING_THRESHOLD: u32 = 20;
+pub(crate) const SIMHASH_HAMMING_THRESHOLD: u32 = 20;
 
 /// Flatten a Value into individual SimHash features.
 ///
 /// Map values are expanded so each entry becomes a separate feature (e.g., `tags.Environment`),
 /// allowing SimHash to produce close hashes when only one map entry changes.
 /// Non-map values use `deterministic_value_string` as the feature value.
-fn flatten_value_for_simhash(
+pub(crate) fn flatten_value_for_simhash(
     prefix: &str,
     value: &Value,
     out: &mut std::collections::BTreeMap<String, String>,
@@ -255,7 +255,7 @@ fn flatten_value_for_simhash(
 /// SimHash is a locality-sensitive hash: changing one attribute flips only a few bits,
 /// so similar inputs produce similar hashes. This enables similarity-based reconciliation
 /// using Hamming distance on the identifier alone.
-fn compute_simhash<K: std::fmt::Display>(
+pub(crate) fn compute_simhash<K: std::fmt::Display>(
     attributes: &std::collections::BTreeMap<K, String>,
 ) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -287,7 +287,7 @@ fn compute_simhash<K: std::fmt::Display>(
 ///
 /// Supports both 8 hex chars (standard hash, u32) and 16 hex chars (SimHash, u64).
 /// Identifier format: `{resource_type}_{hex}` (e.g., `ec2_eip_a3f2b1c8d79f1524`).
-fn extract_hash_from_identifier(identifier: &str) -> Option<u64> {
+pub(crate) fn extract_hash_from_identifier(identifier: &str) -> Option<u64> {
     let hex_part = identifier.rsplit('_').next()?;
     match hex_part.len() {
         16 => u64::from_str_radix(hex_part, 16).ok(),
