@@ -21,6 +21,7 @@
 - Carina の backend/arguments の文法と実装
 - Carina のモジュール文法 (`use` 式)
 - Carina の `AttributeType` と JSON 表現
+- Carina の unknown 値の扱い (式木保持、resolver 挙動、`deferred_for_expressions`)
 
 ### 未検証の可能性が高いもの
 
@@ -151,7 +152,53 @@ resource "aws_s3_bucket_policy" "bar" {
 
 HCL 単独ではなく、Terraform 実行モデルとの協調問題。
 
-**Carina の対応**: Parse → Resolve → Differ の単一パス構造で時間的分離が薄い。ただし「リソース作成後にしか決まらない値」は本質的制約として残る。Carina が unknown を型で扱っているかは未確認。
+#### Terraform の扱い
+
+- unknown 値は cty.Value に**unknownフラグ**を立てて持ち運ぶ
+- msgpack シリアライズ時は専用の ext type (`0xd4 0x00 0x00`)
+- 伝播: unknown を含む式は原則 unknown を伝播 (例: `"prefix-${unknown}"` → unknown)
+- `count`/`for_each` の値は graph 構築時点で確定必須 → unknown ならエラー
+- Terraform 1.6+ の **refinements** で「unknown だが nonnull」「unknown だが長さ既知」等の部分情報を保持可能に (依存グラフベースの実行モデルの制約を型システム側で緩和する方向)
+
+#### Carina の扱い (実装確認済み)
+
+**`Value` enum に `Unknown` バリアントは存在しない** (`carina-core/src/resource.rs:173-216`)。代わりに **未解決の式を式木として保持** する設計:
+
+```rust
+pub enum Value {
+    String, Int, Float, Bool, List, Map,
+    ResourceRef { path },         // 未解決参照
+    Interpolation(parts),         // 部分未解決の文字列
+    FunctionCall { name, args },  // 部分未解決の関数呼び出し
+    Secret, Closure,
+}
+```
+
+resolver (`carina-core/src/resolver.rs`) の挙動 (実装確認):
+
+- **`ResourceRef`**: state から解決できれば具体値に置換、できなければ Ref のまま (`return Ok(value.clone())`)
+- **`Interpolation`**: 全パーツが解決できれば String に連結、未解決パーツが残れば `Interpolation` のまま
+- **`FunctionCall`**: 全引数が解決できれば即評価、未解決引数が残れば `FunctionCall` のまま (部分評価)
+
+`for` 式が未解決な iterable を持つ場合は `DeferredForExpression` として `deferred_for_expressions` に退避 (`carina-core/src/parser/mod.rs:531`)。`expand_deferred_for_expressions()` で **upstream_state (他プロジェクトの state)** から解決できれば展開、できなければ deferred のまま plan 表示に回される (`carina-cli/src/display.rs:248-251`)。これは Terraform の `count value depends on resource attributes...` エラーに対する Carina の答えで、**エラーにせず deferred として次のフェーズに送る**設計。
+
+#### 構造的な違い: 「値 + フラグ」vs「式木そのまま」
+
+| | Terraform | Carina |
+|---|---|---|
+| unknown の表現 | cty.Value + unknownフラグ | 未解決式木 (ResourceRef/Interpolation/FunctionCall) を保持 |
+| 部分情報 | refinements (1.6+): nonnull/長さ/prefix 等 | 式木に含まれる情報そのまま (依存先・関数適用が値自体に残る) |
+| unknown 値への関数適用 | unknown を伝播 | `FunctionCall` として式木保持 (遅延評価) |
+| for/count に unknown | graph 構築エラー | `deferred_for_expressions` に退避、plan に「deferred」として表示 |
+| シリアライゼーション | msgpack ext type | JSON の各 variant (`ResourceRef`, `Interpolation`, `FunctionCall`) |
+
+Carina のアプローチは **partial evaluation / symbolic execution** に近い。式木をまるごと保持するので、後から解決できれば評価できる。refinements のような別機構は持たないが、式木自体が情報を保持するため必要性が下がる (トレードオフとしてシリアライゼーションは複雑化)。
+
+#### 残る本質的な制約
+
+- リソース作成前に決まらない値はどう足掻いても解決時まで unknown (物理的制約)
+- deferred な for-expression を**同プロジェクト内の未 apply リソース出力**で解決できるか、apply 時にインクリメンタル展開されるかは**未確認**
+- CDK/Pulumi との比較 (Token / `Output<T>`) についての記述は**ソース確認していない AI 出力**なので注意
 
 ### 2-5. 文字列補間の痕跡 (歴史的経緯)
 
