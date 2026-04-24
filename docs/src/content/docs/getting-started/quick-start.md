@@ -17,8 +17,8 @@ mkdir my-infra && cd my-infra
 // main.crn
 provider awscc {
   source  = 'github.com/carina-rs/carina-provider-awscc'
-  version = '0.3.0'
-  region  = 'ap-northeast-1'
+  version = '0.5.0'
+  region  = awscc.Region.ap_northeast_1
 }
 
 awscc.ec2.Vpc {
@@ -30,7 +30,7 @@ awscc.ec2.Vpc {
 }
 ```
 
-Replace the `source` path with the actual path to your built WASM provider plugin.
+Carina downloads the WASM provider plugin from the release matching `version` (or use `revision = 'main'` to track the latest commit). The plugin is cached under `.carina/providers/`.
 
 ## Validate
 

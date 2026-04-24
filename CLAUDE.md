@@ -133,11 +133,11 @@ Provider repositories depend on this repo's crates via `git` dependencies.
 
 - **carina-core**: Core library with parser, types, and traits. No AWS dependencies.
 - **carina-cli**: Binary that wires everything together.
-- **carina-aws-types**: AWS-specific type definitions shared by providers.
 - **carina-plugin-host**: WASM plugin host for loading provider plugins.
 - **carina-plugin-sdk**: SDK for building WASM provider plugins.
 - **carina-provider-mock**: Mock provider for testing.
 - **carina-provider-protocol**: Protocol definitions for provider communication.
+- **carina-provider-resolver**: Resolves and loads provider plugins for the CLI.
 - **carina-state**: State management.
 - **carina-lsp**: Language Server Protocol implementation.
 - **carina-tui**: Terminal UI for plan display.
@@ -186,7 +186,7 @@ Resource types in DSL use dot notation (`s3.bucket`, `ec2.vpc`). When mapping be
 ### Validation Formats
 
 - **Region**: Accepts both DSL format (`aws.Region.ap_northeast_1`) and AWS string format (`"ap-northeast-1"`). Validation normalizes both to AWS format for comparison.
-- **S3 Versioning**: Uses enum `.enabled`/`.suspended` in DSL (AWS SDK returns PascalCase `Enabled`/`Suspended`, normalized to snake_case DSL values).
+- **S3 Versioning**: Uses enum `aws.s3.VersioningStatus.Enabled` / `aws.s3.VersioningStatus.Suspended` in DSL (PascalCase matches the AWS SDK representation).
 
 ### Namespaced Enum Identifiers
 
@@ -203,7 +203,7 @@ Enum values use namespaced identifiers like `aws.s3.Bucket.VersioningStatus.enab
    resource.chars().all(|c| c.is_lowercase() || c.is_ascii_digit() || c == '_')
    ```
 
-2. **Update `is_dsl_enum_format()` in `carina-core/src/utils.rs`** for new patterns (e.g., 4-part identifiers like `provider.resource.TypeName.value`)
+2. **Update `is_dsl_enum_format()` in `carina-core/src/utils.rs`** for new patterns. It currently handles 2-part (`TypeName.value`), 3-part (`provider.TypeName.value`), 4-part (`provider.resource.TypeName.value`), and 5-part (`provider.service.resource.TypeName.value`) identifiers. If you introduce a new shape, add it there alongside the existing arms.
 
 3. **Plan display should not quote namespaced identifiers** - They are identifiers, not strings
 

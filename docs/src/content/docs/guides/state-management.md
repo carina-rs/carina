@@ -146,7 +146,7 @@ awscc.ec2.SecurityGroup {
 
 The `upstream_state` expression points at an upstream project's directory. Carina loads that directory's configuration, resolves its backend, reads its state, and exposes the upstream's `exports` through the `let`-bound name. In this example, `network.vpc_id` references the `vpc_id` value published by the `../network` project's `exports` block.
 
-`source` is required and resolved relative to the enclosing `.crn` file's directory. The upstream directory must contain a valid Carina configuration (a `main.crn` or flat `*.crn` files) with an `exports` block that publishes the values consumers need.
+`source` is required and resolved relative to the enclosing `.crn` file's directory. The upstream directory must contain a valid Carina configuration (one or more `.crn` files — no filename is privileged) with an `exports` block that publishes the values consumers need.
 
 ## State CLI commands
 

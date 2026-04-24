@@ -67,8 +67,10 @@ aws.security_group.ingress_rule {
 
 ### 2. Validate
 
+Point `carina` at the directory containing your `.crn` files (all `.crn` files in that directory are merged):
+
 ```bash
-$ carina validate main.crn
+$ carina validate .
 Validating...
 ✓ 3 resources validated successfully.
   • vpc.main-vpc
@@ -79,7 +81,7 @@ Validating...
 ### 3. Plan
 
 ```bash
-$ carina plan main.crn
+$ carina plan .
 Execution Plan:
 
   + vpc
@@ -98,7 +100,7 @@ Plan: 3 to add, 0 to change, 0 to destroy.
 ### 4. Apply
 
 ```bash
-$ carina apply main.crn
+$ carina apply .
 Applying changes...
 
   ✓ Create vpc.main-vpc
@@ -327,25 +329,32 @@ carina/
 │   │   ├── plan.rs          # Plan (collection of Effects)
 │   │   ├── resource.rs      # Resource and State types
 │   │   ├── provider.rs      # Provider trait
-│   │   ├── differ.rs        # State comparison
+│   │   ├── differ/          # State comparison
 │   │   ├── parser/          # DSL parser (pest-based)
 │   │   ├── schema.rs        # Type validation (generic types only)
 │   │   ├── module.rs        # Module signature and dependency graph
-│   │   ├── module_resolver.rs # Module import and expansion
+│   │   ├── module_resolver/ # Module import and expansion
 │   │   └── formatter/       # Code formatter
 │   └── ...
 ├── carina-plugin-host/      # WASM plugin host for provider plugins
 ├── carina-plugin-sdk/       # SDK for building WASM provider plugins
 ├── carina-provider-mock/    # Mock provider for testing
 ├── carina-provider-protocol/ # Protocol definitions for provider communication
+├── carina-provider-resolver/ # Resolves and loads provider plugins
 ├── carina-state/            # State management
 │   └── src/backends/        # State backends (S3, etc.)
-└── carina-lsp/              # Language Server Protocol implementation
+├── carina-lsp/              # Language Server Protocol implementation
+└── carina-tui/              # Terminal UI for plan display
 ```
 
 ## AWS Provider
 
-The AWS provider requires valid AWS credentials. Configure via:
+AWS providers are distributed as separate repositories under [carina-rs](https://github.com/carina-rs) and loaded as WASM plugins by the core runtime:
+
+- [carina-provider-aws](https://github.com/carina-rs/carina-provider-aws) — AWS provider (Smithy-based codegen)
+- [carina-provider-awscc](https://github.com/carina-rs/carina-provider-awscc) — AWS Cloud Control provider
+
+Configure valid AWS credentials via:
 
 - Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
 - AWS credentials file (`~/.aws/credentials`)
@@ -354,7 +363,7 @@ The AWS provider requires valid AWS credentials. Configure via:
 ### Using with aws-vault
 
 ```bash
-aws-vault exec myprofile -- carina apply main.crn
+aws-vault exec myprofile -- carina apply .
 ```
 
 ## Commands
@@ -385,7 +394,7 @@ $ carina fmt --diff
 Remove all resources defined in a configuration:
 
 ```bash
-$ carina destroy main.crn
+$ carina destroy .
 Destroy Plan:
 
   - security_group.ingress_rule.http
