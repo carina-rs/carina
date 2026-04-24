@@ -43,7 +43,8 @@
     },
     "configurationDefaults": {
       "[carina]": {
-        "editor.formatOnSave": true
+        "editor.formatOnSave": true,
+        "editor.wordBasedSuggestions": "off"
       }
     }
   },
