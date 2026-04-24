@@ -678,6 +678,19 @@ impl CompletionProvider {
         }]
     }
 
+    /// Sole attribute of a `use { ... }` block. Mirrors the
+    /// `upstream_state` version, which has the same `source = '...'` shape.
+    pub(super) fn use_block_completions(&self) -> Vec<CompletionItem> {
+        vec![CompletionItem {
+            label: "source".to_string(),
+            kind: Some(CompletionItemKind::PROPERTY),
+            detail: Some("Module directory path".to_string()),
+            insert_text: Some("source = '$0'".to_string()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            ..Default::default()
+        }]
+    }
+
     /// Suggest sibling (and uncle/grand-uncle) directories that look like carina
     /// projects, for use as the `source` attribute of an `upstream_state` block.
     pub(super) fn upstream_state_source_completions(

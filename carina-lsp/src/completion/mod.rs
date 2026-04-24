@@ -76,6 +76,7 @@ impl CompletionProvider {
                 self.attribute_completions_for_type(&resource_type)
             }
             CompletionContext::InsideUpstreamStateBlock => self.upstream_state_block_completions(),
+            CompletionContext::InsideUseBlock => self.use_block_completions(),
             CompletionContext::InsideModuleCall { module_name } => {
                 self.module_parameter_completions(&module_name, &text, base_path)
             }
@@ -419,6 +420,17 @@ impl CompletionProvider {
             };
         }
 
+        // Attribute-name position inside a `use { ... }` block. The sole
+        // valid attribute is `source`. Handled before the generic
+        // `contains('=')` fallback so the in-line shape
+        // `let x = use { <cursor>` — whose prefix still contains the
+        // binding's own `=` — doesn't get routed to value-position
+        // builtins. The `source = '...'` value position is already caught
+        // by the `InsideImportPath` branch above.
+        if in_use_block && brace_depth > 0 {
+            return CompletionContext::InsideUseBlock;
+        }
+
         // Check if we're after an equals sign (value position) inside a block
         if brace_depth > 0 && prefix.contains('=') {
             let after_eq = prefix.split('=').next_back().unwrap_or("").trim();
@@ -678,6 +690,7 @@ enum CompletionContext {
         resource_type: String,
     },
     InsideUpstreamStateBlock,
+    InsideUseBlock,
     InsideModuleCall {
         module_name: String,
     },
