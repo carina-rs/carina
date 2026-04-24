@@ -450,3 +450,57 @@ awscc.ec2.vpc_gateway_attachment {
 
     client.shutdown().await;
 }
+
+/// End-to-end regression guard for #2196: a full LSP session where the
+/// editor opens a `.crn` with a multi-line `use { source = '…' }` and
+/// requests completion at the cursor inside `source`. Exercises the real
+/// JSON-RPC path, not only the internal `CompletionProvider::complete`.
+#[tokio::test]
+async fn test_use_source_path_completion_multiline() {
+    // Lay out a real workspace on disk so the LSP can walk it from the
+    // opened document's directory.
+    let tmp = tempfile::tempdir().unwrap();
+    let modules_dir = tmp.path().join("modules");
+    std::fs::create_dir_all(modules_dir.join("network")).unwrap();
+    std::fs::create_dir_all(modules_dir.join("shared")).unwrap();
+
+    let crn_path = tmp.path().join("main.crn");
+    let text = "let network = use {\n  source = './modules/\n}";
+    std::fs::write(&crn_path, text).unwrap();
+
+    let mut client = TestClient::new().await;
+    client.initialize().await;
+
+    let uri = format!("file://{}", crn_path.display());
+    client.open_document(&uri, text).await;
+
+    // Small delay to let the server process didOpen.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Cursor at the end of the `source = './modules/` line (line 1).
+    let second_line = text.lines().nth(1).unwrap();
+    let character = second_line.chars().count() as u32;
+    let response = client._request_completion(&uri, 1, character).await;
+
+    let items = response["result"]
+        .as_array()
+        .expect("Completion result should be an array");
+
+    let labels: Vec<&str> = items
+        .iter()
+        .filter_map(|item| item["label"].as_str())
+        .collect();
+
+    assert!(
+        labels.contains(&"network/"),
+        "Should suggest 'network/' directory from './modules/'. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"shared/"),
+        "Should suggest 'shared/' directory from './modules/'. Got: {:?}",
+        labels
+    );
+
+    client.shutdown().await;
+}

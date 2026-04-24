@@ -1390,3 +1390,35 @@ fn use_source_path_completion_works_multiline() {
         labels
     );
 }
+
+/// Regression guard for #2196: same multi-line shape, but with the `}` on a
+/// trailing line already present in the buffer (as it would be in a real
+/// editor that auto-closes the brace). `get_completion_context` must stop
+/// walking at the cursor line; trailing `}` after that must not affect
+/// `in_use_block` state.
+#[test]
+fn use_source_path_completion_works_multiline_with_trailing_brace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let modules_dir = tmp.path().join("modules");
+    std::fs::create_dir_all(modules_dir.join("network")).unwrap();
+
+    let provider = test_provider();
+    let source = "let net = use {\n  source = './modules/\n}";
+    let doc = create_document(source);
+    // Cursor sits at the end of line 1 (the `source = '...` line), BEFORE
+    // the trailing brace on line 2.
+    let second_line = source.lines().nth(1).unwrap_or("");
+    let position = Position {
+        line: 1,
+        character: second_line.chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(tmp.path()));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"network/"),
+        "Should suggest 'network/' directory even when buffer has a trailing `}}`. Got: {:?}",
+        labels
+    );
+}
