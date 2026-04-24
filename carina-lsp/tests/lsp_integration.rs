@@ -451,7 +451,7 @@ awscc.ec2.vpc_gateway_attachment {
     client.shutdown().await;
 }
 
-/// Regression for #2196.
+/// Regression for #2196 (empty-candidate side).
 ///
 /// End-to-end test: a leaf config dir (mirror of
 /// `infra/aws/management/github-oidc/` — multi-file, no sibling module
@@ -479,12 +479,10 @@ async fn test_use_source_path_completion_offers_anchors_in_leaf_dir() {
     )
     .unwrap();
 
-    // main.crn has a `use` with an opening partial — cursor after the `.`.
-    // Written as a single line on purpose: the multi-line shape currently
-    // has a separate context-detection bug (the `source = ...` line has no
-    // `use` keyword on the same line, so `determine_context` falls through
-    // before the anchor logic can run). That bug is out of scope for this
-    // fix — this test covers the empty-candidate bug only.
+    // Single-line shape here — the multi-line context-detection fix is
+    // exercised separately by `test_use_source_path_completion_multiline`
+    // below. This test's job is to prove that once the right context is
+    // detected, the anchors are actually emitted.
     let main_text = "let shared = use { source = '.' }\n";
     let main_path = leaf.join("main.crn");
     std::fs::write(&main_path, main_text).unwrap();
@@ -515,6 +513,61 @@ async fn test_use_source_path_completion_offers_anchors_in_leaf_dir() {
     assert!(
         labels.contains(&"../"),
         "Should offer '../' anchor. Got: {:?}",
+        labels
+    );
+
+    client.shutdown().await;
+}
+
+/// End-to-end regression guard for #2196 (context-detection side): a full
+/// LSP session where the editor opens a `.crn` with a multi-line
+/// `use { source = '…' }` and requests completion at the cursor inside
+/// `source`. Exercises the real JSON-RPC path, not only the internal
+/// `CompletionProvider::complete`.
+#[tokio::test]
+async fn test_use_source_path_completion_multiline() {
+    // Lay out a real workspace on disk so the LSP can walk it from the
+    // opened document's directory.
+    let tmp = tempfile::tempdir().unwrap();
+    let modules_dir = tmp.path().join("modules");
+    std::fs::create_dir_all(modules_dir.join("network")).unwrap();
+    std::fs::create_dir_all(modules_dir.join("shared")).unwrap();
+
+    let crn_path = tmp.path().join("main.crn");
+    let text = "let network = use {\n  source = './modules/\n}";
+    std::fs::write(&crn_path, text).unwrap();
+
+    let mut client = TestClient::new().await;
+    client.initialize().await;
+
+    let uri = format!("file://{}", crn_path.display());
+    client.open_document(&uri, text).await;
+
+    // Small delay to let the server process didOpen.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Cursor at the end of the `source = './modules/` line (line 1).
+    let second_line = text.lines().nth(1).unwrap();
+    let character = second_line.chars().count() as u32;
+    let response = client._request_completion(&uri, 1, character).await;
+
+    let items = response["result"]
+        .as_array()
+        .expect("Completion result should be an array");
+
+    let labels: Vec<&str> = items
+        .iter()
+        .filter_map(|item| item["label"].as_str())
+        .collect();
+
+    assert!(
+        labels.contains(&"network/"),
+        "Should suggest 'network/' directory from './modules/'. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"shared/"),
+        "Should suggest 'shared/' directory from './modules/'. Got: {:?}",
         labels
     );
 
