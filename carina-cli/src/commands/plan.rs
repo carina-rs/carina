@@ -210,6 +210,15 @@ pub async fn run_plan(
     let wiring = WiringContext::new(factories);
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
     if let Some(sf) = state_file.as_ref() {
+        carina_core::module_resolver::reconcile_anonymous_module_instances(
+            &mut parsed.resources,
+            &|provider, resource_type| {
+                sf.resources_by_type(provider, resource_type)
+                    .into_iter()
+                    .map(|r| r.name.clone())
+                    .collect()
+            },
+        );
         reconcile_anonymous_identifiers_with_ctx(&wiring, &mut parsed.resources, sf);
     }
     apply_name_overrides(&mut parsed.resources, &state_file);

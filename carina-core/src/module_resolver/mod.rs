@@ -245,11 +245,7 @@ impl<'cfg> ModuleResolver<'cfg> {
         // Expand the module's own module_calls
         let module_calls = parsed.module_calls.clone();
         for call in &module_calls {
-            let instance_prefix = call
-                .binding_name
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| call.module_name.clone());
+            let instance_prefix = instance_prefix_for_call(call);
 
             match self.expand_module_call(call, &instance_prefix) {
                 Ok(expanded) => parsed.resources.extend(expanded), // allow: direct — module expansion, handled separately
@@ -570,6 +566,30 @@ fn rewrite_intra_module_refs(
     }
 }
 
+/// Compute the instance prefix for a module call. Named calls use the
+/// binding name; anonymous calls get `<module>_<16hex>` where the hex is a
+/// SimHash of the call's module name + flattened arguments.
+///
+/// SimHash is locality-sensitive, so editing one argument flips only a few
+/// bits — `reconcile_anonymous_module_instances` can then find the matching
+/// state entry by Hamming distance and preserve the resource address across
+/// argument edits.
+pub fn instance_prefix_for_call(call: &ModuleCall) -> String {
+    use std::collections::BTreeMap;
+
+    if let Some(name) = &call.binding_name {
+        return name.clone();
+    }
+
+    let mut features: BTreeMap<String, String> = BTreeMap::new();
+    features.insert("_module".to_string(), call.module_name.clone());
+    for (k, v) in &call.arguments {
+        crate::identifier::flatten_value_for_simhash(k, v, &mut features);
+    }
+    let simhash = crate::identifier::compute_simhash(&features);
+    format!("{}_{:016x}", call.module_name, simhash)
+}
+
 /// Resolve all modules in a parsed file
 pub fn resolve_modules(parsed: &mut ParsedFile, base_dir: &Path) -> Result<(), ModuleError> {
     resolve_modules_with_config(parsed, base_dir, &ProviderContext::default())
@@ -588,17 +608,259 @@ pub fn resolve_modules_with_config(
 
     // Expand module calls
     for call in &parsed.module_calls {
-        let instance_prefix = call
-            .binding_name
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| call.module_name.clone());
-
+        let instance_prefix = instance_prefix_for_call(call);
         let expanded = resolver.expand_module_call(call, &instance_prefix)?;
         parsed.resources.extend(expanded); // allow: direct — module expansion, handled separately
     }
 
     Ok(())
+}
+
+/// Split a module-instance prefix into `(module_name, simhash)` when the
+/// tail looks like a 16-hex SimHash. Returns `None` for non-synthetic prefixes
+/// (user-written binding names, pre-SimHash state formats, etc.).
+fn parse_synthetic_instance_prefix(prefix: &str) -> Option<(&str, u64)> {
+    let (module, hex) = prefix.rsplit_once('_')?;
+    if hex.len() != 16 {
+        return None;
+    }
+    let simhash = u64::from_str_radix(hex, 16).ok()?;
+    if module.is_empty() {
+        return None;
+    }
+    Some((module, simhash))
+}
+
+/// Split a resource name into `(instance_prefix, rest)` at the first `.`, or
+/// return `None` if it has no dot (no module instance prefix at all).
+fn split_instance_prefix(name: &str) -> Option<(&str, &str)> {
+    name.split_once('.')
+}
+
+/// Reconcile anonymous module-instance prefixes with existing state.
+///
+/// When a user edits an argument of an anonymous module call, its SimHash
+/// prefix shifts a few bits. The expanded resources therefore live under a
+/// new address (e.g. `thing_ab12….role` → `thing_cd34….role`) and would
+/// otherwise look like destroy + create to the differ. This pass detects the
+/// case by Hamming-distance matching: for each current DSL instance prefix
+/// whose address is absent from state, find a state-only prefix for the same
+/// module within `SIMHASH_HAMMING_THRESHOLD` bits; if exactly one candidate
+/// qualifies, rewrite the current resources to use the state address.
+///
+/// `find_state_names_by_type` returns every state resource name for a given
+/// `(provider, resource_type)` — the reconciler uses them to discover which
+/// instance prefixes already exist in state.
+pub fn reconcile_anonymous_module_instances(
+    resources: &mut [Resource],
+    find_state_names_by_type: &dyn Fn(&str, &str) -> Vec<String>,
+) {
+    use std::collections::HashMap;
+
+    // Collect current (provider, resource_type) pairs that appear in the
+    // expanded DSL — we'll query state for matching entries.
+    let mut touched_types: HashMap<(String, String), Vec<usize>> = HashMap::new();
+    for (idx, r) in resources.iter().enumerate() {
+        if split_instance_prefix(&r.id.name).is_none() {
+            continue;
+        }
+        touched_types
+            .entry((r.id.provider.clone(), r.id.resource_type.clone()))
+            .or_default()
+            .push(idx);
+    }
+
+    if touched_types.is_empty() {
+        return;
+    }
+
+    // (module_name, simhash) → set of resource names currently using it.
+    // Used to skip prefixes that already line up with state exactly.
+    let mut current_names_by_prefix: HashMap<(String, u64), Vec<String>> = HashMap::new();
+    for r in resources.iter() {
+        let Some((prefix, _)) = split_instance_prefix(&r.id.name) else {
+            continue;
+        };
+        let Some((module, simhash)) = parse_synthetic_instance_prefix(prefix) else {
+            continue;
+        };
+        current_names_by_prefix
+            .entry((module.to_string(), simhash))
+            .or_default()
+            .push(r.id.name.clone());
+    }
+
+    // For each touched (provider, type), build the set of state prefixes and
+    // decide orphan prefixes per module.
+    let mut prefix_remap: HashMap<(String, u64), u64> = HashMap::new();
+
+    // Accumulate state SimHash values per module name to pool across all
+    // resource types of a given module.
+    let mut state_hashes_by_module: HashMap<String, Vec<u64>> = HashMap::new();
+    let mut state_fully_matches_current: HashMap<(String, u64), bool> = HashMap::new();
+
+    for (provider, resource_type) in touched_types.keys() {
+        let state_names = find_state_names_by_type(provider, resource_type);
+        for name in state_names {
+            let Some((prefix, _)) = split_instance_prefix(&name) else {
+                continue;
+            };
+            let Some((module, simhash)) = parse_synthetic_instance_prefix(prefix) else {
+                continue;
+            };
+            let key = (module.to_string(), simhash);
+            let already_in_current = current_names_by_prefix.contains_key(&key);
+            if already_in_current {
+                state_fully_matches_current.insert(key.clone(), true);
+            } else {
+                state_hashes_by_module
+                    .entry(module.to_string())
+                    .or_default()
+                    .push(simhash);
+            }
+        }
+    }
+
+    // For each current DSL prefix that has no matching state prefix, find the
+    // closest orphan state prefix for the same module.
+    for (module, current_hash) in current_names_by_prefix.keys() {
+        if state_fully_matches_current.contains_key(&(module.clone(), *current_hash)) {
+            continue;
+        }
+        let Some(candidates) = state_hashes_by_module.get(module) else {
+            continue;
+        };
+
+        let mut best: Option<(u64, u32)> = None;
+        let mut best_is_unique = true;
+        for &state_hash in candidates {
+            let distance = (current_hash ^ state_hash).count_ones();
+            if distance >= crate::identifier::SIMHASH_HAMMING_THRESHOLD {
+                continue;
+            }
+            match best {
+                None => best = Some((state_hash, distance)),
+                Some((_, prev_distance)) => {
+                    if distance < prev_distance {
+                        best = Some((state_hash, distance));
+                        best_is_unique = true;
+                    } else if distance == prev_distance {
+                        best_is_unique = false;
+                    }
+                }
+            }
+        }
+
+        if let Some((state_hash, _)) = best
+            && best_is_unique
+        {
+            prefix_remap.insert((module.clone(), *current_hash), state_hash);
+        }
+    }
+
+    if prefix_remap.is_empty() {
+        return;
+    }
+
+    // Apply remaps: rewrite `id.name` and `binding` for every resource whose
+    // instance prefix is in the remap table.
+    for r in resources.iter_mut() {
+        let Some((prefix, rest)) = split_instance_prefix(&r.id.name) else {
+            continue;
+        };
+        let Some((module, simhash)) = parse_synthetic_instance_prefix(prefix) else {
+            continue;
+        };
+        if let Some(&target) = prefix_remap.get(&(module.to_string(), simhash)) {
+            let new_prefix = format!("{}_{:016x}", module, target);
+            let new_name = format!("{}.{}", new_prefix, rest);
+            r.id = ResourceId::with_provider(&r.id.provider, &r.id.resource_type, new_name.clone());
+            if let Some(ref binding) = r.binding
+                && let Some((_, binding_rest)) = split_instance_prefix(binding)
+            {
+                r.binding = Some(format!("{}.{}", new_prefix, binding_rest));
+            }
+            if let Some(crate::resource::ModuleSource::Module { name, instance: _ }) =
+                &r.module_source
+            {
+                r.module_source = Some(crate::resource::ModuleSource::Module {
+                    name: name.clone(),
+                    instance: new_prefix.clone(),
+                });
+            }
+        }
+    }
+
+    // After remapping resource names, intra-module ResourceRefs also point at
+    // bindings with the old prefix. Walk every value and rewrite those.
+    for r in resources.iter_mut() {
+        let mut replacements = Vec::new();
+        for (key, expr) in r.attributes.iter() {
+            let rewritten = rewrite_ref_prefixes(&expr.0, &prefix_remap);
+            if rewritten != expr.0 {
+                replacements.push((key.clone(), rewritten));
+            }
+        }
+        for (key, new_value) in replacements {
+            r.set_attr(key, new_value);
+        }
+    }
+}
+
+fn rewrite_ref_prefixes(
+    value: &Value,
+    remap: &std::collections::HashMap<(String, u64), u64>,
+) -> Value {
+    match value {
+        Value::ResourceRef { path } => {
+            let binding = path.binding();
+            if let Some((prefix, rest)) = binding.split_once('.')
+                && let Some((module, simhash)) = parse_synthetic_instance_prefix(prefix)
+                && let Some(&target) = remap.get(&(module.to_string(), simhash))
+            {
+                let new_binding = format!("{}_{:016x}.{}", module, target, rest);
+                return Value::resource_ref(
+                    new_binding,
+                    path.attribute().to_string(),
+                    path.field_path().into_iter().map(String::from).collect(),
+                );
+            }
+            value.clone()
+        }
+        Value::List(items) => Value::List(
+            items
+                .iter()
+                .map(|v| rewrite_ref_prefixes(v, remap))
+                .collect(),
+        ),
+        Value::Map(map) => Value::Map(
+            map.iter()
+                .map(|(k, v)| (k.clone(), rewrite_ref_prefixes(v, remap)))
+                .collect(),
+        ),
+        Value::Interpolation(parts) => {
+            use crate::resource::InterpolationPart;
+            Value::Interpolation(
+                parts
+                    .iter()
+                    .map(|p| match p {
+                        InterpolationPart::Literal(s) => InterpolationPart::Literal(s.clone()),
+                        InterpolationPart::Expr(v) => {
+                            InterpolationPart::Expr(rewrite_ref_prefixes(v, remap))
+                        }
+                    })
+                    .collect(),
+            )
+        }
+        Value::FunctionCall { name, args } => Value::FunctionCall {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|v| rewrite_ref_prefixes(v, remap))
+                .collect(),
+        },
+        _ => value.clone(),
+    }
 }
 
 /// Get parsed file info for display (supports both module definitions and root configs)
@@ -1251,6 +1513,326 @@ mod tests {
         // Only real resources, no virtual
         let virtual_count = expanded.iter().filter(|r| r.is_virtual()).count();
         assert_eq!(virtual_count, 0);
+    }
+
+    /// Regression fixtures for #2197. Writes a minimal `modules/thing` module
+    /// (one `awscc.iam.Role` whose `role_name` comes from a `name` argument)
+    /// and a `root/main.crn` with the caller-supplied body; returns the parsed
+    /// root with modules already resolved.
+    fn resolve_thing_fixture(root_body: &str) -> ParsedFile {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let module_dir = tmp.path().join("modules/thing");
+        fs::create_dir_all(&module_dir).unwrap();
+        fs::write(
+            module_dir.join("main.crn"),
+            r#"
+arguments {
+  name: String
+}
+
+let role = awscc.iam.Role {
+  role_name = name
+  assume_role_policy_document = {}
+}
+"#,
+        )
+        .unwrap();
+
+        let root_dir = tmp.path().join("root");
+        fs::create_dir_all(&root_dir).unwrap();
+        fs::write(root_dir.join("main.crn"), root_body).unwrap();
+
+        let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
+        let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+        resolve_modules(&mut parsed, &root_dir).expect("resolve_modules should succeed");
+        parsed
+    }
+
+    fn role_names(parsed: &ParsedFile) -> HashSet<String> {
+        parsed
+            .resources
+            .iter()
+            .filter(|r| r.id.resource_type == "iam.Role")
+            .filter_map(|r| match r.get_attr("role_name")? {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_anonymous_module_calls_get_distinct_prefixes() {
+        let call_a = ModuleCall {
+            module_name: "github".to_string(),
+            binding_name: None,
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert(
+                    "github_repo".to_string(),
+                    Value::String("carina-rs/infra".to_string()),
+                );
+                args
+            },
+        };
+        let call_b = ModuleCall {
+            module_name: "github".to_string(),
+            binding_name: None,
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert(
+                    "github_repo".to_string(),
+                    Value::String("carina-rs/other".to_string()),
+                );
+                args
+            },
+        };
+
+        let a = instance_prefix_for_call(&call_a);
+        let b = instance_prefix_for_call(&call_b);
+        assert_ne!(a, b);
+        assert!(
+            a.starts_with("github_"),
+            "expected `github_<16hex>`, got {a}"
+        );
+        assert_eq!(
+            a.len(),
+            "github_".len() + 16,
+            "expected 16 hex chars in {a}"
+        );
+    }
+
+    // SimHash is locality-sensitive: editing one argument must flip only a few
+    // bits so reconciliation can find the state entry. Assert the Hamming
+    // distance is below the reconciliation threshold.
+    #[test]
+    fn test_anonymous_module_call_prefix_is_locality_sensitive() {
+        let make = |repo: &str| ModuleCall {
+            module_name: "github".to_string(),
+            binding_name: None,
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert("github_repo".to_string(), Value::String(repo.to_string()));
+                args.insert(
+                    "role_name".to_string(),
+                    Value::String("github-actions".to_string()),
+                );
+                args.insert(
+                    "managed_policy_arns".to_string(),
+                    Value::List(vec![Value::String(
+                        "arn:aws:iam::aws:policy/AdministratorAccess".to_string(),
+                    )]),
+                );
+                args
+            },
+        };
+
+        let a = instance_prefix_for_call(&make("carina-rs/infra"));
+        let b = instance_prefix_for_call(&make("carina-rs/other"));
+        let parse = |p: &str| parse_synthetic_instance_prefix(p).unwrap().1;
+        let distance = (parse(&a) ^ parse(&b)).count_ones();
+        assert!(
+            distance < crate::identifier::SIMHASH_HAMMING_THRESHOLD,
+            "small edit should stay inside the reconciliation threshold, got distance {distance}",
+        );
+    }
+
+    #[test]
+    fn test_named_module_call_uses_binding_name() {
+        let call = ModuleCall {
+            module_name: "github".to_string(),
+            binding_name: Some("prod".to_string()),
+            arguments: HashMap::new(),
+        };
+        assert_eq!(instance_prefix_for_call(&call), "prod");
+    }
+
+    #[test]
+    fn test_anonymous_module_calls_expand_into_distinct_instances() {
+        let parsed = resolve_thing_fixture(
+            r#"
+let thing = use { source = '../modules/thing' }
+
+thing { name = 'alpha' }
+thing { name = 'beta'  }
+"#,
+        );
+
+        let role_addresses: HashSet<&String> = parsed
+            .resources
+            .iter()
+            .filter(|r| r.id.resource_type == "iam.Role")
+            .map(|r| &r.id.name)
+            .collect();
+        assert_eq!(role_addresses.len(), 2, "got {:?}", role_addresses);
+
+        assert_eq!(
+            role_names(&parsed),
+            ["alpha".to_string(), "beta".to_string()]
+                .into_iter()
+                .collect::<HashSet<_>>(),
+        );
+    }
+
+    #[test]
+    fn test_mixed_named_and_anonymous_module_calls_coexist() {
+        let parsed = resolve_thing_fixture(
+            r#"
+let thing = use { source = '../modules/thing' }
+
+let named = thing { name = 'named-call' }
+thing              { name = 'anon-call'  }
+"#,
+        );
+
+        assert_eq!(
+            role_names(&parsed),
+            ["named-call".to_string(), "anon-call".to_string()]
+                .into_iter()
+                .collect::<HashSet<_>>(),
+        );
+
+        let addrs: Vec<&str> = parsed
+            .resources
+            .iter()
+            .map(|r| r.id.name.as_str())
+            .collect();
+        assert!(addrs.iter().any(|n| n.starts_with("named.")), "{:?}", addrs);
+        assert!(addrs.iter().any(|n| n.starts_with("thing_")), "{:?}", addrs);
+    }
+
+    // Reconciliation: an argument edit moves the SimHash prefix by a few bits;
+    // if the old prefix is in state and the new one is not, the reconciler
+    // must rewrite the expanded resources to use the state address.
+    #[test]
+    fn test_reconcile_anonymous_module_instances_remaps_close_prefix() {
+        let mut parsed = resolve_thing_fixture(
+            r#"
+let thing = use { source = '../modules/thing' }
+
+thing { name = 'after-edit' }
+"#,
+        );
+
+        let before: Vec<String> = parsed
+            .resources
+            .iter()
+            .filter(|r| r.id.resource_type == "iam.Role")
+            .map(|r| r.id.name.clone())
+            .collect();
+        assert_eq!(before.len(), 1);
+        let (new_prefix, _) = before[0].split_once('.').unwrap();
+        let (module, new_hash) = parse_synthetic_instance_prefix(new_prefix).unwrap();
+        assert_eq!(module, "thing");
+
+        // Fabricate a state entry whose SimHash is within threshold of the
+        // current one (flip one bit).
+        let state_hash = new_hash ^ 1;
+        let state_name = format!("thing_{:016x}.role", state_hash);
+        let state_lookup = |_: &str, _: &str| vec![state_name.clone()];
+
+        reconcile_anonymous_module_instances(&mut parsed.resources, &state_lookup);
+
+        let after: Vec<String> = parsed
+            .resources
+            .iter()
+            .filter(|r| r.id.resource_type == "iam.Role")
+            .map(|r| r.id.name.clone())
+            .collect();
+        assert_eq!(
+            after,
+            vec![state_name.clone()],
+            "expected prefix to be remapped to state's",
+        );
+        let role = parsed
+            .resources
+            .iter()
+            .find(|r| r.id.resource_type == "iam.Role")
+            .unwrap();
+        assert_eq!(
+            role.binding.as_deref(),
+            Some(format!("thing_{:016x}.role", state_hash).as_str()),
+            "binding should be remapped too",
+        );
+    }
+
+    // Reconciliation must not cross module names: a `foo_<hash>` state entry
+    // has nothing to do with a current `bar_<hash>` DSL instance.
+    #[test]
+    fn test_reconcile_anonymous_module_instances_ignores_other_modules() {
+        let mut parsed = resolve_thing_fixture(
+            r#"
+let thing = use { source = '../modules/thing' }
+
+thing { name = 'a' }
+"#,
+        );
+
+        let before_name: String = parsed
+            .resources
+            .iter()
+            .find(|r| r.id.resource_type == "iam.Role")
+            .unwrap()
+            .id
+            .name
+            .clone();
+
+        // State entry uses a different module name.
+        let state_lookup = |_: &str, _: &str| vec!["other_0000000000000001.role".to_string()];
+        reconcile_anonymous_module_instances(&mut parsed.resources, &state_lookup);
+
+        let after_name = parsed
+            .resources
+            .iter()
+            .find(|r| r.id.resource_type == "iam.Role")
+            .unwrap()
+            .id
+            .name
+            .clone();
+        assert_eq!(before_name, after_name);
+    }
+
+    // Reconciliation must not run when there are multiple candidate state
+    // prefixes within threshold — ambiguity means we can't tell which is the
+    // "same instance."
+    #[test]
+    fn test_reconcile_anonymous_module_instances_skips_ambiguous() {
+        let mut parsed = resolve_thing_fixture(
+            r#"
+let thing = use { source = '../modules/thing' }
+
+thing { name = 'a' }
+"#,
+        );
+
+        let before_name = parsed
+            .resources
+            .iter()
+            .find(|r| r.id.resource_type == "iam.Role")
+            .unwrap()
+            .id
+            .name
+            .clone();
+        let (prefix, _) = before_name.split_once('.').unwrap();
+        let (_, cur_hash) = parse_synthetic_instance_prefix(prefix).unwrap();
+
+        // Two state entries at the same Hamming distance — ambiguous.
+        let state_lookup = move |_: &str, _: &str| {
+            vec![
+                format!("thing_{:016x}.role", cur_hash ^ 0b1),
+                format!("thing_{:016x}.role", cur_hash ^ 0b10),
+            ]
+        };
+        reconcile_anonymous_module_instances(&mut parsed.resources, &state_lookup);
+
+        let after_name = parsed
+            .resources
+            .iter()
+            .find(|r| r.id.resource_type == "iam.Role")
+            .unwrap()
+            .id
+            .name
+            .clone();
+        assert_eq!(before_name, after_name, "ambiguous match must not remap");
     }
 
     #[test]
