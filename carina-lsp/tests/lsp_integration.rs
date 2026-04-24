@@ -479,11 +479,12 @@ async fn test_use_source_path_completion_offers_anchors_in_leaf_dir() {
     )
     .unwrap();
 
-    // Single-line shape here — the multi-line context-detection fix is
-    // exercised separately by `test_use_source_path_completion_multiline`
-    // below. This test's job is to prove that once the right context is
-    // detected, the anchors are actually emitted.
-    let main_text = "let shared = use { source = '.' }\n";
+    // Multi-line shape — mirrors what the user types. The opening quote
+    // has no matching closing quote yet (this is the normal mid-typing
+    // state); the context detector expects that. A closed `'...'` shape
+    // is also handled elsewhere in the code path but isn't what we
+    // exercise here.
+    let main_text = "let shared = use {\n  source = '.";
     let main_path = leaf.join("main.crn");
     std::fs::write(&main_path, main_text).unwrap();
 
@@ -492,10 +493,10 @@ async fn test_use_source_path_completion_offers_anchors_in_leaf_dir() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Cursor on line 0, right after the `.` inside the single quotes.
-    // "let shared = use { source = '" has 29 chars, `.` is at col 29,
-    // so cursor sits at col 30.
-    let response = client._request_completion(&uri, 0, 30).await;
+    // Cursor at end of line 1 (after the `.`).
+    let last_line = main_text.lines().next_back().unwrap();
+    let character = last_line.chars().count() as u32;
+    let response = client._request_completion(&uri, 1, character).await;
 
     let items = response["result"]
         .as_array()
