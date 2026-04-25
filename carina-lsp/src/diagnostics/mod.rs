@@ -167,6 +167,12 @@ impl DiagnosticEngine {
             // Check provider in module
             diagnostics.extend(self.check_provider_in_module(doc, parsed));
 
+            // Check arguments in root. The "is this a root config?"
+            // signal — a sibling `backend` block — can live in another
+            // .crn file in the same directory, so the check needs the
+            // merged directory parse when available (#2198).
+            diagnostics.extend(self.check_arguments_in_root(doc, parsed, merged.as_ref()));
+
             // Check provider region
             diagnostics.extend(self.check_provider_region(doc, parsed));
 

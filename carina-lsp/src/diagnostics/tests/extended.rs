@@ -761,6 +761,105 @@ awscc.ec2.Vpc {
 }
 
 #[test]
+fn arguments_with_backend_emits_error() {
+    // Issue #2198. `arguments` is a module-input declaration. A `backend`
+    // block is root-only, so the combination is unambiguously a misplaced
+    // `arguments` block in a root configuration.
+    let engine = test_engine();
+    let doc = create_document(
+        r#"arguments {
+    state_path: String = "state.json"
+}
+
+backend local {
+    path = arguments.state_path
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let arguments_diag = diagnostics.iter().find(|d| {
+        d.message
+            .contains("arguments blocks are only valid inside module definitions")
+    });
+    assert!(
+        arguments_diag.is_some(),
+        "Should error about arguments block in root config. Got diagnostics: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    let diag = arguments_diag.unwrap();
+    assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
+}
+
+#[test]
+fn arguments_with_sibling_backend_emits_error() {
+    // Issue #2198 repro shape: arguments live in main.crn, backend lives
+    // in backend.crn. The directory-scoped parse must merge them and the
+    // diagnostic must still fire — single-file inspection would miss it.
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().to_path_buf();
+    std::fs::write(
+        base.join("main.crn"),
+        r#"arguments {
+    state_path: String = "state.json"
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        base.join("backend.crn"),
+        r#"backend local {
+    path = arguments.state_path
+}
+"#,
+    )
+    .unwrap();
+
+    let engine = test_engine();
+    let buffer = std::fs::read_to_string(base.join("main.crn")).unwrap();
+    let doc = create_document(&buffer);
+    let diagnostics = engine.analyze_with_filename(&doc, Some("main.crn"), Some(&base));
+
+    assert!(
+        diagnostics.iter().any(|d| d
+            .message
+            .contains("arguments blocks are only valid inside module definitions")),
+        "Should error about arguments block when sibling file declares a backend. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn arguments_without_backend_no_error() {
+    // A directory with only `arguments` (no `backend`/`provider`) is
+    // indistinguishable from a module being authored, so the LSP must
+    // not flag it. The CLI's root-config check at validate time still
+    // catches the case where such a directory is loaded as a root.
+    let engine = test_engine();
+    let doc = create_document(
+        r#"arguments {
+    vpc_cidr: String
+}
+
+awscc.ec2.Vpc {
+    cidr_block = args.vpc_cidr
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let arguments_diag = diagnostics.iter().find(|d| {
+        d.message
+            .contains("arguments blocks are only valid inside module definitions")
+    });
+    assert!(
+        arguments_diag.is_none(),
+        "Should NOT flag arguments block when no backend is present. Got diagnostics: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn provider_without_module_markers_no_error() {
     let engine = test_engine();
     let doc = create_document(

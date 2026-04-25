@@ -470,6 +470,22 @@ pub fn is_string_compatible_type(attr_type: &AttributeType) -> bool {
     }
 }
 
+/// Check that a root configuration does not contain `arguments` blocks.
+///
+/// `arguments` is a module-input declaration: it belongs on the module side
+/// of a module boundary and is paired with `use` on the caller side. In a
+/// root configuration there is no caller to pass values, so the block has
+/// no meaning — its `default` would silently become a de-facto root
+/// variable, which is not a documented feature (issue #2198).
+pub fn validate_no_arguments_in_root(parsed: &ParsedFile) -> Result<(), String> {
+    if !parsed.arguments.is_empty() {
+        return Err(
+            "arguments blocks are only valid inside module definitions, not in root configurations.".to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Check that a module file does not contain provider blocks.
 ///
 /// Provider configuration should only be defined at the root configuration level,
@@ -1497,6 +1513,34 @@ let vpc = awscc.ec2.Vpc {
         });
 
         let result = validate_no_provider_in_module(&parsed);
+        assert!(result.is_ok());
+    }
+
+    // --- validate_no_arguments_in_root tests ---
+
+    #[test]
+    fn arguments_in_root_errors() {
+        let mut parsed = empty_parsed();
+        parsed.arguments.push(crate::parser::ArgumentParameter {
+            name: "state_path".to_string(),
+            type_expr: TypeExpr::String,
+            default: Some(Value::String("state.json".to_string())),
+            description: None,
+            validations: Vec::new(),
+        });
+
+        let result = validate_no_arguments_in_root(&parsed);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "arguments blocks are only valid inside module definitions, not in root configurations."
+        );
+    }
+
+    #[test]
+    fn empty_arguments_in_root_ok() {
+        let parsed = empty_parsed();
+        let result = validate_no_arguments_in_root(&parsed);
         assert!(result.is_ok());
     }
 

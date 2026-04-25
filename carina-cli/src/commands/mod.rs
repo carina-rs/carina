@@ -197,6 +197,14 @@ pub fn validate_and_resolve_errors(
 
     let mut errors: Vec<AppError> = Vec::new();
 
+    // `arguments` is a module-input declaration; the CLI only ever feeds
+    // root configurations into this function (modules go through
+    // `module_resolver::load_module`), so any `arguments` block reaching
+    // here is misplaced (#2198).
+    if let Err(msg) = carina_core::validation::validate_no_arguments_in_root(parsed) {
+        errors.push(AppError::Validation(msg));
+    }
+
     // Check for declared providers whose plugins failed to load.
     if !skip_resource_validation {
         for provider in &parsed.providers {

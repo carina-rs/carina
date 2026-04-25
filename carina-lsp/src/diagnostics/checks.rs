@@ -167,6 +167,58 @@ fn is_dot_notation_ref(s: &str) -> bool {
 }
 
 impl DiagnosticEngine {
+    /// Flag `arguments` blocks placed in a root configuration.
+    ///
+    /// `arguments` is a module-input declaration; it has no caller in a
+    /// root config. Without a `use` site to feed values, its `default`
+    /// would silently become a de-facto root variable (issue #2198).
+    /// A `backend` block is a root-only construct, so its presence next
+    /// to `arguments` — possibly in a sibling `.crn` file — is an
+    /// unambiguous signal that this directory is being authored as a
+    /// root configuration. `merged` (the directory-scoped parse) takes
+    /// precedence so the signal can come from a sibling file.
+    pub(super) fn check_arguments_in_root(
+        &self,
+        doc: &Document,
+        parsed: &ParsedFile,
+        merged: Option<&ParsedFile>,
+    ) -> Vec<Diagnostic> {
+        let backend_present = merged
+            .map(|m| m.backend.is_some())
+            .unwrap_or_else(|| parsed.backend.is_some());
+        if parsed.arguments.is_empty() || !backend_present {
+            return Vec::new();
+        }
+
+        let mut diagnostics = Vec::new();
+        let text = doc.text();
+
+        for (line_idx, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+            // Match the `arguments` keyword as a token, not a prefix —
+            // `arguments_foo` (an unrelated identifier) must not match.
+            let after_keyword = trimmed.strip_prefix("arguments");
+            let is_keyword_block = after_keyword
+                .is_some_and(|rest| rest.starts_with('{') || rest.starts_with(char::is_whitespace));
+            if is_keyword_block && trimmed.contains('{') {
+                let col = position::leading_whitespace_chars(line);
+                let end_col = trimmed
+                    .find('{')
+                    .map(|p| col + p as u32)
+                    .unwrap_or(col + trimmed.len() as u32);
+                diagnostics.push(carina_diagnostic(
+                    line_idx as u32,
+                    col,
+                    end_col,
+                    DiagnosticSeverity::ERROR,
+                    "arguments blocks are only valid inside module definitions, not in root configurations.".to_string(),
+                ));
+            }
+        }
+
+        diagnostics
+    }
+
     /// Check that provider blocks are not defined inside modules.
     pub(super) fn check_provider_in_module(
         &self,

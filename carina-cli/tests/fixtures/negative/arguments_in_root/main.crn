@@ -1,0 +1,13 @@
+# Negative test: arguments block placed in a root configuration.
+# `arguments` is a module-input declaration; root configs have no caller
+# to pass values, so its `default` would silently become a de-facto root
+# variable. Reject the configuration with a clear diagnostic instead
+# (issue #2198).
+
+arguments {
+  state_path: String = "state.json"
+}
+
+backend local {
+  path = arguments.state_path
+}

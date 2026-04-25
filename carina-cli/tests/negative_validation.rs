@@ -100,6 +100,18 @@ fn missing_provider_plugin() {
 }
 
 #[test]
+fn arguments_block_rejected_in_root() {
+    // Issue #2198. An `arguments` block belongs on the module side of a
+    // module boundary; placing it in a root configuration silently turns
+    // its `default` values into a de-facto root variable. Reject it with
+    // a clear diagnostic instead.
+    assert_validate_fails(
+        "arguments_in_root",
+        "arguments blocks are only valid inside module definitions",
+    );
+}
+
+#[test]
 fn validate_reports_multiple_static_errors_in_one_pass() {
     // Regression for #2102. Independent static errors in the same project
     // must all surface in a single `carina validate` run so the user fixes
