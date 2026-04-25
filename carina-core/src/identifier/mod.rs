@@ -221,6 +221,39 @@ fn deterministic_value_string(value: &Value) -> String {
 /// with modified attributes.
 pub(crate) const SIMHASH_HAMMING_THRESHOLD: u32 = 20;
 
+/// Find the unique candidate closest (by Hamming distance) to `target` SimHash
+/// among `candidates`, below `SIMHASH_HAMMING_THRESHOLD`. Returns `None` when
+/// no candidate qualifies, or when two or more candidates tie at the minimum
+/// distance — the latter is an ambiguous match the caller should refuse to
+/// commit to (rebinding to the wrong state entry would silently corrupt
+/// addresses).
+pub(crate) fn closest_unique_simhash_match<C: Copy>(
+    target: u64,
+    candidates: impl IntoIterator<Item = C>,
+    hash_of: impl Fn(C) -> u64,
+) -> Option<C> {
+    let mut best: Option<(C, u32)> = None;
+    let mut unique = true;
+    for c in candidates {
+        let distance = (target ^ hash_of(c)).count_ones();
+        if distance >= SIMHASH_HAMMING_THRESHOLD {
+            continue;
+        }
+        match best {
+            None => best = Some((c, distance)),
+            Some((_, prev)) => {
+                if distance < prev {
+                    best = Some((c, distance));
+                    unique = true;
+                } else if distance == prev {
+                    unique = false;
+                }
+            }
+        }
+    }
+    best.and_then(|(c, _)| if unique { Some(c) } else { None })
+}
+
 /// Flatten a Value into individual SimHash features.
 ///
 /// Map values are expanded so each entry becomes a separate feature (e.g., `tags.Environment`),
@@ -725,36 +758,18 @@ pub fn detect_anonymous_to_named_renames(
             // entry closest to the computed SimHash; tie → ambiguous, skip.
             let resource_hash =
                 compute_resource_simhash(resource, providers, identity_attributes_fn);
-            let mut best: Option<(&str, u32)> = None;
-            let mut best_unique = true;
-            for entry in &state_entries {
-                if used_in_dsl.contains(&entry.name) {
-                    continue;
-                }
+            let candidates = state_entries
+                .iter()
+                .filter(|e| !used_in_dsl.contains(&e.name))
                 // Only consider state entries written via the SimHash path
                 // (16-hex suffix). 8-hex entries come from the create-only
                 // hash scheme and are meaningless to XOR with a 64-bit SimHash.
-                if entry.name.rsplit('_').next().map(str::len) != Some(16) {
-                    continue;
-                }
-                let Some(state_hash) = extract_hash_from_identifier(&entry.name) else {
-                    continue;
-                };
-                let distance = (resource_hash ^ state_hash).count_ones();
-                if distance >= SIMHASH_HAMMING_THRESHOLD {
-                    continue;
-                }
-                match best {
-                    None => best = Some((&entry.name, distance)),
-                    Some((_, d)) if distance < d => {
-                        best = Some((&entry.name, distance));
-                        best_unique = true;
-                    }
-                    Some((_, d)) if distance == d => best_unique = false,
-                    _ => {}
-                }
-            }
-            best.and_then(|(name, _)| if best_unique { Some(name) } else { None })
+                .filter(|e| e.name.rsplit('_').next().map(str::len) == Some(16))
+                .filter_map(|e| {
+                    extract_hash_from_identifier(&e.name).map(|h| (e.name.as_str(), h))
+                });
+            closest_unique_simhash_match(resource_hash, candidates, |(_, h)| h)
+                .map(|(name, _)| name)
         };
 
         if let Some(name) = matched_name {

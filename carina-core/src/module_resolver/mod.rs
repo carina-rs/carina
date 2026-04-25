@@ -655,28 +655,26 @@ pub fn reconcile_anonymous_module_instances(
     resources: &mut [Resource],
     find_state_names_by_type: &dyn Fn(&str, &str) -> Vec<String>,
 ) {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     // Collect current (provider, resource_type) pairs that appear in the
     // expanded DSL — we'll query state for matching entries.
-    let mut touched_types: HashMap<(String, String), Vec<usize>> = HashMap::new();
-    for (idx, r) in resources.iter().enumerate() {
+    let mut touched_types: HashSet<(String, String)> = HashSet::new();
+    for r in resources.iter() {
         if split_instance_prefix(&r.id.name).is_none() {
             continue;
         }
-        touched_types
-            .entry((r.id.provider.clone(), r.id.resource_type.clone()))
-            .or_default()
-            .push(idx);
+        touched_types.insert((r.id.provider.clone(), r.id.resource_type.clone()));
     }
 
     if touched_types.is_empty() {
         return;
     }
 
-    // (module_name, simhash) → set of resource names currently using it.
-    // Used to skip prefixes that already line up with state exactly.
-    let mut current_names_by_prefix: HashMap<(String, u64), Vec<String>> = HashMap::new();
+    // Current DSL synthetic prefixes per module — only one entry per
+    // distinct prefix (a multi-resource module instance shares one prefix
+    // across all of its resources).
+    let mut current_synthetic_by_module: HashMap<String, HashSet<u64>> = HashMap::new();
     for r in resources.iter() {
         let Some((prefix, _)) = split_instance_prefix(&r.id.name) else {
             continue;
@@ -684,77 +682,64 @@ pub fn reconcile_anonymous_module_instances(
         let Some((module, simhash)) = parse_synthetic_instance_prefix(prefix) else {
             continue;
         };
-        current_names_by_prefix
-            .entry((module.to_string(), simhash))
+        current_synthetic_by_module
+            .entry(module.to_string())
             .or_default()
-            .push(r.id.name.clone());
+            .insert(simhash);
     }
 
-    // For each touched (provider, type), build the set of state prefixes and
-    // decide orphan prefixes per module.
-    let mut prefix_remap: HashMap<(String, u64), u64> = HashMap::new();
+    // State synthetic prefixes per module. Use a set so a multi-resource
+    // module instance — which contributes one state entry per resource
+    // type, all under the same prefix — collapses to one candidate. With a
+    // Vec the same hash would appear N times and the Hamming-distance
+    // search below would mistake duplicates for ambiguous candidates and
+    // refuse to remap (#2211).
+    let mut state_synthetic_by_module: HashMap<String, HashSet<u64>> = HashMap::new();
 
-    // Accumulate state SimHash values per module name to pool across all
-    // resource types of a given module.
-    let mut state_hashes_by_module: HashMap<String, Vec<u64>> = HashMap::new();
-    let mut state_fully_matches_current: HashMap<(String, u64), bool> = HashMap::new();
-
-    for (provider, resource_type) in touched_types.keys() {
-        let state_names = find_state_names_by_type(provider, resource_type);
-        for name in state_names {
+    for (provider, resource_type) in &touched_types {
+        for name in find_state_names_by_type(provider, resource_type) {
             let Some((prefix, _)) = split_instance_prefix(&name) else {
                 continue;
             };
             let Some((module, simhash)) = parse_synthetic_instance_prefix(prefix) else {
                 continue;
             };
-            let key = (module.to_string(), simhash);
-            let already_in_current = current_names_by_prefix.contains_key(&key);
-            if already_in_current {
-                state_fully_matches_current.insert(key.clone(), true);
-            } else {
-                state_hashes_by_module
-                    .entry(module.to_string())
-                    .or_default()
-                    .push(simhash);
-            }
+            state_synthetic_by_module
+                .entry(module.to_string())
+                .or_default()
+                .insert(simhash);
         }
     }
 
     // For each current DSL prefix that has no matching state prefix, find the
-    // closest orphan state prefix for the same module.
-    for (module, current_hash) in current_names_by_prefix.keys() {
-        if state_fully_matches_current.contains_key(&(module.clone(), *current_hash)) {
-            continue;
-        }
-        let Some(candidates) = state_hashes_by_module.get(module) else {
+    // closest orphan state prefix for the same module. Candidate state hashes
+    // exclude any prefix already used by a current DSL instance — without
+    // that filter, two distinct anonymous calls could collapse onto the same
+    // state entry when only one of them existed before.
+    let mut prefix_remap: HashMap<(String, u64), u64> = HashMap::new();
+    for (module, current_hashes) in &current_synthetic_by_module {
+        let Some(state_hashes) = state_synthetic_by_module.get(module) else {
             continue;
         };
-
-        let mut best: Option<(u64, u32)> = None;
-        let mut best_is_unique = true;
-        for &state_hash in candidates {
-            let distance = (current_hash ^ state_hash).count_ones();
-            if distance >= crate::identifier::SIMHASH_HAMMING_THRESHOLD {
+        let orphan_state_hashes: Vec<u64> = state_hashes
+            .iter()
+            .copied()
+            .filter(|h| !current_hashes.contains(h))
+            .collect();
+        if orphan_state_hashes.is_empty() {
+            continue;
+        }
+        for current_hash in current_hashes {
+            if state_hashes.contains(current_hash) {
                 continue;
             }
-            match best {
-                None => best = Some((state_hash, distance)),
-                Some((_, prev_distance)) => {
-                    if distance < prev_distance {
-                        best = Some((state_hash, distance));
-                        best_is_unique = true;
-                    } else if distance == prev_distance {
-                        best_is_unique = false;
-                    }
-                }
+            if let Some(state_hash) = crate::identifier::closest_unique_simhash_match(
+                *current_hash,
+                orphan_state_hashes.iter().copied(),
+                |h| h,
+            ) {
+                prefix_remap.insert((module.clone(), *current_hash), state_hash);
             }
-        }
-
-        if let Some((state_hash, _)) = best
-            && best_is_unique
-        {
-            prefix_remap.insert((module.clone(), *current_hash), state_hash);
         }
     }
 
@@ -1791,6 +1776,98 @@ thing { name = 'a' }
         assert_eq!(before_name, after_name);
     }
 
+    // Regression for #2211: a single anonymous module instance whose module
+    // expands to multiple resource types means the same state prefix shows up
+    // once per resource type when `find_state_names_by_type` is queried per
+    // (provider, type). The reconciler must treat repeated identical hashes
+    // as the same candidate, not as multiple ambiguous candidates.
+    #[test]
+    fn test_reconcile_anonymous_module_instances_dedups_state_prefixes_across_types() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let module_dir = tmp.path().join("modules/thing");
+        fs::create_dir_all(&module_dir).unwrap();
+        fs::write(
+            module_dir.join("main.crn"),
+            r#"
+arguments {
+  name: String
+}
+
+let provider_res = awscc.iam.OidcProvider {
+  url             = 'https://example.com'
+  client_id_list  = ['x']
+  thumbprint_list = ['y']
+}
+
+let role = awscc.iam.Role {
+  role_name = name
+  assume_role_policy_document = {}
+}
+"#,
+        )
+        .unwrap();
+
+        let root_dir = tmp.path().join("root");
+        fs::create_dir_all(&root_dir).unwrap();
+        fs::write(
+            root_dir.join("main.crn"),
+            r#"
+let thing = use { source = '../modules/thing' }
+
+thing { name = 'after-edit' }
+"#,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
+        let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+        resolve_modules(&mut parsed, &root_dir).expect("resolve_modules should succeed");
+
+        // Discover the new prefix from the parsed Role.
+        let role_name_before = parsed
+            .resources
+            .iter()
+            .find(|r| r.id.resource_type == "iam.Role")
+            .unwrap()
+            .id
+            .name
+            .clone();
+        let (new_prefix, _) = role_name_before.split_once('.').unwrap();
+        let (_, new_hash) = parse_synthetic_instance_prefix(new_prefix).unwrap();
+
+        // State holds the *same* instance prefix at two resource types, one
+        // bit away from the current SimHash — i.e. a small argument edit.
+        let state_hash = new_hash ^ 1;
+        let state_lookup = move |_: &str, resource_type: &str| match resource_type {
+            "iam.OidcProvider" => vec![format!("thing_{:016x}.provider_res", state_hash)],
+            "iam.Role" => vec![format!("thing_{:016x}.role", state_hash)],
+            _ => vec![],
+        };
+
+        reconcile_anonymous_module_instances(&mut parsed.resources, &state_lookup);
+
+        let role_after = parsed
+            .resources
+            .iter()
+            .find(|r| r.id.resource_type == "iam.Role")
+            .unwrap();
+        assert_eq!(
+            role_after.id.name,
+            format!("thing_{:016x}.role", state_hash),
+            "Role address must be remapped to the state prefix",
+        );
+        let provider_after = parsed
+            .resources
+            .iter()
+            .find(|r| r.id.resource_type == "iam.OidcProvider")
+            .unwrap();
+        assert_eq!(
+            provider_after.id.name,
+            format!("thing_{:016x}.provider_res", state_hash),
+            "OidcProvider address must be remapped to the state prefix",
+        );
+    }
+
     // Reconciliation must not run when there are multiple candidate state
     // prefixes within threshold — ambiguity means we can't tell which is the
     // "same instance."
@@ -1833,6 +1910,51 @@ thing { name = 'a' }
             .name
             .clone();
         assert_eq!(before_name, after_name, "ambiguous match must not remap");
+    }
+
+    // When state holds prefix A and the DSL has both A (unchanged) and a new
+    // A' (a new anonymous call with similar args), A' must not be remapped
+    // onto A — they are two distinct instances even though their SimHashes
+    // are close. State prefixes already in use by current DSL must not serve
+    // as remap candidates.
+    #[test]
+    fn test_reconcile_anonymous_module_instances_does_not_steal_in_use_prefix() {
+        let mut parsed = resolve_thing_fixture(
+            r#"
+let thing = use { source = '../modules/thing' }
+
+thing { name = 'unchanged' }
+thing { name = 'unchanged-but-different' }
+"#,
+        );
+
+        let prefixes_before: HashSet<String> = parsed
+            .resources
+            .iter()
+            .filter(|r| r.id.resource_type == "iam.Role")
+            .map(|r| r.id.name.split_once('.').unwrap().0.to_string())
+            .collect();
+        assert_eq!(prefixes_before.len(), 2);
+        let mut iter = prefixes_before.iter();
+        let first = iter.next().unwrap().clone();
+        let _second = iter.next().unwrap().clone();
+
+        // State only holds the *first* prefix. The reconciler must not
+        // remap the second instance onto it.
+        let first_clone = first.clone();
+        let state_lookup = move |_: &str, _: &str| vec![format!("{}.role", first_clone)];
+        reconcile_anonymous_module_instances(&mut parsed.resources, &state_lookup);
+
+        let prefixes_after: HashSet<String> = parsed
+            .resources
+            .iter()
+            .filter(|r| r.id.resource_type == "iam.Role")
+            .map(|r| r.id.name.split_once('.').unwrap().0.to_string())
+            .collect();
+        assert_eq!(
+            prefixes_after, prefixes_before,
+            "in-use state prefix must not be reassigned to a different DSL instance",
+        );
     }
 
     #[test]
