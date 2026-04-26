@@ -138,9 +138,14 @@ moved_from_attr = { "from" ~ "=" ~ resource_address }
 moved_to_attr = { "to" ~ "=" ~ resource_address }
 
 // Module call: module_name { key = value, ... }
+// `use` is reserved: it can only appear as the RHS of a top-level `let`
+// binding (see `let_binding`). Without this guard, `use { ... }` would
+// silently parse as a `module_call` named "use" once `use_expr` was
+// removed from `primary` (issue #2233).
 module_call = {
-    identifier ~ "{" ~ module_call_arg* ~ "}"
+    !use_keyword ~ identifier ~ "{" ~ module_call_arg* ~ "}"
 }
+use_keyword = @{ "use" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 // Module call argument: key = value
 module_call_arg = { identifier ~ "=" ~ expression }
@@ -155,7 +160,10 @@ provider_block = {
 
 // Variable/resource definition: let name = value
 // discard_pattern allows `let _ = expr` to suppress unused binding warnings
-let_binding = { "let" ~ (discard_pattern | identifier) ~ "=" ~ expression }
+// `use_expr` is allowed only here (not in `expression`/`primary`) because it is
+// not a value: it is a meta-statement handled specially by the let-binding
+// evaluator. See issue #2233.
+let_binding = { "let" ~ (discard_pattern | identifier) ~ "=" ~ (use_expr | expression) }
 discard_pattern = @{ "_" }
 
 // Block content: a local let binding, an attribute (key = value), or a nested block (key { ... })
@@ -195,11 +203,14 @@ compose_expr = { primary ~ (">>" ~ primary)* }
 function_call = { identifier ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
 
 // Primary value
+// Note: `use_expr` is intentionally NOT a primary. It is a meta-statement,
+// not a value, and is only valid as the RHS of a top-level `let` binding
+// (see `let_binding`). Allowing it here would let it parse silently in
+// positions the evaluator cannot handle (issue #2233).
 primary = {
     read_resource_expr   // Must come before resource_expr for "read aws..." parsing
   | upstream_state_expr  // Must come before module_call so "upstream_state { ... }" is not parsed as a module call
   | resource_expr
-  | use_expr             // Must come before module_call so "use { ... }" is not parsed as a module call
   | for_expr             // Must come before module_call so "for" is not parsed as module name
   | if_expr              // Must come before module_call so "if" is not parsed as module name
   | module_call          // Must come before variable_ref so "name { ... }" is parsed as module call

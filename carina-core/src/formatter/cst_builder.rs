@@ -336,6 +336,10 @@ impl<'a> CstBuilder<'a> {
             // / `block_comment` branches above emit the actual trivia. This
             // arm exists only so the exhaustive match compiles.
             Rule::comment => None,
+
+            // `use_keyword` is a negative-predicate helper used inside
+            // `module_call`; it never produces a child node here.
+            Rule::use_keyword => None,
         }
     }
 
