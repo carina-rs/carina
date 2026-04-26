@@ -138,6 +138,25 @@ awscc.ec2.SecurityGroup {
 
 少なくとも `let` 束縛可能な値という水準では一級化されている。ただし関数の引数/戻り値として渡せるか、データ構造に入れられるか、動的に選択できるかなどは現時点でユースケースが想定されておらず、**どこまで一級市民として機能するかは未検証**。
 
+> **訂正 (2026-04-26 追記)**
+>
+> 上記 §2-3 の主張は、後続の検証 (公式ドキュメント・ソース確認) で **両者ともに部分的に不正確**と判明した。
+>
+> **Terraform 側の訂正**:
+> `module.<NAME>` は実際には**値**である (公式ドキュメント [`expressions/references`](https://developer.hashicorp.com/terraform/language/expressions/references) で「`module.<MODULE NAME>` is a value representing the results of a `module` block」と明記)。`for_each` なしなら object、`for_each` 付きなら map of objects、`count` 付きなら list of objects。`locals { my_mod = module.network }` も書ける。
+>
+> 不正確なのは「値ではない」ではなく、**module の identity (どの `source` を instantiate するか) が静的にしか決められない**点。`source` 引数はリテラル文字列のみで、resource/data の出力で動的に選ぶことはできない (公式ドキュメント [`block/module`](https://developer.hashicorp.com/terraform/language/block/module) 明記)。OpenTofu 1.8+ の early evaluation でも static にしか解決できない (tfvars/env/リテラル由来の変数のみ)。
+>
+> したがって正確な定式化は「`module` は値だが、**module の identity は静的にしか決められない**」。
+>
+> **Carina 側の訂正**:
+> 「`use { source = "..." }` 式がモジュール値を返す」という主張も、実装確認の結果**評価モデル上は値ではない**と判明した。`use` 式は `Value::Module` のような値型を持たず、`Value::String("${use:...}")` という参照文字列に変換され、モジュールレベルのメタデータ (`uses: Vec<UseStatement>`) として保持される。`let` 束縛だけが特別扱い (`parse_let_binding_rhs` 内で個別処理) されており、関数引数/list/map/動的選択/exports 等の他の位置に書いても評価器が `use_expr` を処理せずエラーになる (`carina-core/src/parser/mod.rs` の `parse_primary_value` に `use_expr` のマッチアームがない)。
+>
+> 当初は構文上 primary に含まれていて受理されるが評価で落ちるという grammar/evaluator のドリフト状態だったが、[carina#2233](https://github.com/carina-rs/carina/issues/2233) (2026-04-26 close) で **grammar の方を tighten する方向で解決**: `use_expr` の文法的位置自体が `let` 束縛 RHS に制限された。したがって現状の Carina module は「`let` 束縛変数経由の参照のみ可能」という形に整理されている。
+>
+> **比較の含意**:
+> Terraform / Carina ともに「module を値として扱える範囲」と「module の identity を動的に決められる範囲」は別物で、両者をまとめて「値か否か」で語ったのが §2-3 の誤りだった。詳細な比較整理は別途 private な探索ノートで継続中。
+
 ### 2-4. unknown値 / 2パス評価 (言語+実行協調)
 
 plan 時未知の値 (`(known after apply)`) の扱いが言語仕様として明示されず、ユーザーがエラーで学ぶ。
