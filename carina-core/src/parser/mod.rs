@@ -616,7 +616,7 @@ impl ParsedFile {
                     for (i, item) in items.iter().enumerate() {
                         let address = format!("{}[{}]", deferred.binding_name, i);
                         let mut resource = deferred.template_resource.clone();
-                        resource.id.name = address.clone();
+                        resource.id.set_name(address.clone());
                         resource.binding = Some(address);
                         for (_k, expr) in resource.attributes.iter_mut() {
                             substitute_placeholder(&mut expr.0, None, None, item);
@@ -630,7 +630,7 @@ impl ParsedFile {
                     for (i, item) in items.iter().enumerate() {
                         let address = format!("{}[{}]", deferred.binding_name, i);
                         let mut resource = deferred.template_resource.clone();
-                        resource.id.name = address.clone();
+                        resource.id.set_name(address.clone());
                         resource.binding = Some(address);
                         for (_k, expr) in resource.attributes.iter_mut() {
                             substitute_placeholder(&mut expr.0, Some(i as i64), None, item);
@@ -647,7 +647,7 @@ impl ParsedFile {
                         let val = &map[key];
                         let address = format!("{}[\"{}\"]", deferred.binding_name, key);
                         let mut resource = deferred.template_resource.clone();
-                        resource.id.name = address.clone();
+                        resource.id.set_name(address.clone());
                         resource.binding = Some(address);
                         for (_k, expr) in resource.attributes.iter_mut() {
                             substitute_placeholder(&mut expr.0, None, Some(key), val);
@@ -5230,7 +5230,7 @@ mod tests {
 
         let resource = &result.resources[0];
         assert_eq!(resource.id.resource_type, "s3_bucket");
-        assert_eq!(resource.id.name, "my_bucket"); // binding name becomes the resource ID
+        assert_eq!(resource.id.name_str(), "my_bucket"); // binding name becomes the resource ID
         assert_eq!(
             resource.get_attr("name"),
             Some(&Value::String("my-bucket".to_string()))
@@ -5255,8 +5255,8 @@ mod tests {
 
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 2);
-        assert_eq!(result.resources[0].id.name, "logs"); // binding name becomes the resource ID
-        assert_eq!(result.resources[1].id.name, "data");
+        assert_eq!(result.resources[0].id.name_str(), "logs"); // binding name becomes the resource ID
+        assert_eq!(result.resources[1].id.name_str(), "data");
     }
 
     #[test]
@@ -5366,7 +5366,7 @@ mod tests {
 
         let resource = &result.resources[0];
         assert_eq!(resource.id.resource_type, "s3_bucket");
-        assert_eq!(resource.id.name, ""); // anonymous resources get empty name (computed later)
+        assert_eq!(resource.id.name_str(), ""); // anonymous resources get empty name (computed later)
     }
 
     #[test]
@@ -5385,8 +5385,8 @@ mod tests {
 
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 2);
-        assert_eq!(result.resources[0].id.name, ""); // anonymous gets empty name
-        assert_eq!(result.resources[1].id.name, "named"); // binding name becomes the resource ID
+        assert_eq!(result.resources[0].id.name_str(), ""); // anonymous gets empty name
+        assert_eq!(result.resources[1].id.name_str(), "named"); // binding name becomes the resource ID
     }
 
     #[test]
@@ -5400,7 +5400,7 @@ mod tests {
         let result = parse(input, &ProviderContext::default());
         assert!(result.is_ok());
         let parsed = result.unwrap();
-        assert_eq!(parsed.resources[0].id.name, ""); // empty name, computed later
+        assert_eq!(parsed.resources[0].id.name_str(), ""); // empty name, computed later
     }
 
     #[test]
@@ -6258,7 +6258,7 @@ mod tests {
 
         let resource = &result.resources[0];
         assert_eq!(resource.id.resource_type, "s3_bucket");
-        assert_eq!(resource.id.name, "existing"); // binding name becomes the resource ID
+        assert_eq!(resource.id.name_str(), "existing"); // binding name becomes the resource ID
         assert!(resource.is_data_source());
         assert_eq!(resource.get_attr("_data_source"), Some(&Value::Bool(true)));
     }
@@ -6274,7 +6274,7 @@ mod tests {
         let result = parse(input, &ProviderContext::default());
         assert!(result.is_ok());
         let parsed = result.unwrap();
-        assert_eq!(parsed.resources[0].id.name, "existing"); // binding name
+        assert_eq!(parsed.resources[0].id.name_str(), "existing"); // binding name
     }
 
     #[test]
@@ -6296,11 +6296,11 @@ mod tests {
 
         // First resource is read-only (data source)
         assert!(result.resources[0].is_data_source());
-        assert_eq!(result.resources[0].id.name, "existing_bucket"); // binding name
+        assert_eq!(result.resources[0].id.name_str(), "existing_bucket"); // binding name
 
         // Second resource is a regular resource
         assert!(!result.resources[1].is_data_source());
-        assert_eq!(result.resources[1].id.name, "new_bucket"); // binding name
+        assert_eq!(result.resources[1].id.name_str(), "new_bucket"); // binding name
     }
 
     #[test]
@@ -6369,7 +6369,7 @@ mod tests {
         assert_eq!(result.resources.len(), 1);
 
         let resource = &result.resources[0];
-        assert_eq!(resource.id.name, ""); // anonymous → empty name
+        assert_eq!(resource.id.name_str(), ""); // anonymous → empty name
         // "name" must NOT appear in attributes unless the user explicitly wrote it
         assert!(
             !resource.attributes.contains_key("name"),
@@ -6392,7 +6392,7 @@ mod tests {
         assert_eq!(result.resources.len(), 1);
 
         let resource = &result.resources[0];
-        assert_eq!(resource.id.name, "vpc"); // binding name → resource name
+        assert_eq!(resource.id.name_str(), "vpc"); // binding name → resource name
         // "name" must NOT appear in attributes (it's only the id.name, not an attribute)
         assert!(
             !resource.attributes.contains_key("name"),
@@ -8002,8 +8002,8 @@ aws.s3.Bucket {
         assert_eq!(result.resources.len(), 2);
 
         // Resources should be addressed as subnets[0] and subnets[1]
-        assert_eq!(result.resources[0].id.name, "subnets[0]");
-        assert_eq!(result.resources[1].id.name, "subnets[1]");
+        assert_eq!(result.resources[0].id.name_str(), "subnets[0]");
+        assert_eq!(result.resources[1].id.name_str(), "subnets[1]");
 
         // Each resource should have the loop variable substituted
         assert_eq!(
@@ -8030,8 +8030,8 @@ aws.s3.Bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 2);
 
-        assert_eq!(result.resources[0].id.name, "subnets[0]");
-        assert_eq!(result.resources[1].id.name, "subnets[1]");
+        assert_eq!(result.resources[0].id.name_str(), "subnets[0]");
+        assert_eq!(result.resources[1].id.name_str(), "subnets[1]");
 
         // Check index variable is substituted
         if let Some(Value::FunctionCall { args, .. }) = result.resources[0].get_attr("cidr_block") {
@@ -8373,7 +8373,7 @@ aws.s3.Bucket {
             StateBlock::Import { to, id } => {
                 assert_eq!(to.provider, "awscc");
                 assert_eq!(to.resource_type, "ec2.Vpc");
-                assert_eq!(to.name, "main-vpc");
+                assert_eq!(to.name_str(), "main-vpc");
                 assert_eq!(id, "vpc-0abc123def456");
             }
             other => panic!("Expected Import, got {:?}", other),
@@ -8394,7 +8394,7 @@ aws.s3.Bucket {
             StateBlock::Removed { from } => {
                 assert_eq!(from.provider, "awscc");
                 assert_eq!(from.resource_type, "ec2.Vpc");
-                assert_eq!(from.name, "legacy-vpc");
+                assert_eq!(from.name_str(), "legacy-vpc");
             }
             other => panic!("Expected Removed, got {:?}", other),
         }
@@ -8415,10 +8415,10 @@ aws.s3.Bucket {
             StateBlock::Moved { from, to } => {
                 assert_eq!(from.provider, "awscc");
                 assert_eq!(from.resource_type, "ec2.Subnet");
-                assert_eq!(from.name, "old-name");
+                assert_eq!(from.name_str(), "old-name");
                 assert_eq!(to.provider, "awscc");
                 assert_eq!(to.resource_type, "ec2.Subnet");
-                assert_eq!(to.name, "new-name");
+                assert_eq!(to.name_str(), "new-name");
             }
             other => panic!("Expected Moved, got {:?}", other),
         }
@@ -8442,8 +8442,8 @@ aws.s3.Bucket {
         let result = parse(input, &ProviderContext::default()).unwrap();
         // keys({Name = "web", Env = "prod"}) should evaluate to ["Env", "Name"] (sorted)
         assert_eq!(result.resources.len(), 2);
-        assert_eq!(result.resources[0].id.name, "resources[0]");
-        assert_eq!(result.resources[1].id.name, "resources[1]");
+        assert_eq!(result.resources[0].id.name_str(), "resources[0]");
+        assert_eq!(result.resources[1].id.name_str(), "resources[1]");
         assert_eq!(
             result.resources[0].get_attr("name"),
             Some(&Value::String("Env".to_string()))
@@ -8545,7 +8545,7 @@ aws.s3.Bucket {
 
         let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
-        assert_eq!(result.resources[0].id.name, "alarm");
+        assert_eq!(result.resources[0].id.name_str(), "alarm");
         assert_eq!(
             result.resources[0].get_attr("alarm_name"),
             Some(&Value::String("cpu-high".to_string()))

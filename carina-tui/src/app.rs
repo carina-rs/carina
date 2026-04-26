@@ -644,7 +644,9 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
 
             let name_part = if has_binding {
                 // For bound resources, show the binding name
-                r.binding.clone().unwrap_or_else(|| r.id.name.clone())
+                r.binding
+                    .clone()
+                    .unwrap_or_else(|| r.id.name_str().to_string())
             } else {
                 // For anonymous resources, try to extract a compact hint
                 let parent_binding = nodes[idx].parent.and_then(|p_idx| {
@@ -667,7 +669,7 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
                 if let Some(hint) = extract_compact_hint(r, parent_binding.as_deref()) {
                     format!("({})", hint)
                 } else {
-                    r.id.name.clone()
+                    r.id.name_str().to_string()
                 }
             };
 
@@ -677,7 +679,7 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
         } else if let Effect::Delete { id, .. } = effect {
             let display_type = id.display_type();
             nodes[idx].resource_type = display_type.clone();
-            nodes[idx].name_part = id.name.clone();
+            nodes[idx].name_part = id.name_str().to_string();
             nodes[idx].effect_label = format!("{} {}", display_type, id.name);
         }
     }
@@ -690,7 +692,7 @@ fn effect_to_node(effect: &Effect, schemas: Option<&HashMap<String, ResourceSche
         Effect::Read { resource } => TreeNode {
             effect_label: format!("{}", resource.id),
             resource_type: resource.id.display_type(),
-            name_part: resource.id.name.clone(),
+            name_part: resource.id.name_str().to_string(),
             symbol: "<=".to_string(),
             kind: EffectKind::Read,
             detail_rows,
@@ -701,7 +703,7 @@ fn effect_to_node(effect: &Effect, schemas: Option<&HashMap<String, ResourceSche
         Effect::Create(resource) => TreeNode {
             effect_label: format!("{}", resource.id),
             resource_type: resource.id.display_type(),
-            name_part: resource.id.name.clone(),
+            name_part: resource.id.name_str().to_string(),
             symbol: "+".to_string(),
             kind: EffectKind::Create,
             detail_rows,
@@ -712,7 +714,7 @@ fn effect_to_node(effect: &Effect, schemas: Option<&HashMap<String, ResourceSche
         Effect::Update { id, .. } => TreeNode {
             effect_label: format!("{}", id),
             resource_type: id.display_type(),
-            name_part: id.name.clone(),
+            name_part: id.name_str().to_string(),
             symbol: "~".to_string(),
             kind: EffectKind::Update,
             detail_rows,
@@ -729,7 +731,7 @@ fn effect_to_node(effect: &Effect, schemas: Option<&HashMap<String, ResourceSche
             TreeNode {
                 effect_label: format!("{}", id),
                 resource_type: id.display_type(),
-                name_part: id.name.clone(),
+                name_part: id.name_str().to_string(),
                 symbol,
                 kind: EffectKind::Replace,
                 detail_rows,
@@ -753,7 +755,7 @@ fn effect_to_node(effect: &Effect, schemas: Option<&HashMap<String, ResourceSche
             TreeNode {
                 effect_label: format!("{}", id),
                 resource_type: id.display_type(),
-                name_part: id.name.clone(),
+                name_part: id.name_str().to_string(),
                 symbol: "-".to_string(),
                 kind: EffectKind::Delete,
                 detail_rows: rows,
@@ -765,7 +767,7 @@ fn effect_to_node(effect: &Effect, schemas: Option<&HashMap<String, ResourceSche
         Effect::Import { id, .. } => TreeNode {
             effect_label: format!("{}", id),
             resource_type: id.display_type(),
-            name_part: id.name.clone(),
+            name_part: id.name_str().to_string(),
             symbol: "<-".to_string(),
             kind: EffectKind::Read,
             detail_rows,
@@ -776,7 +778,7 @@ fn effect_to_node(effect: &Effect, schemas: Option<&HashMap<String, ResourceSche
         Effect::Remove { id } => TreeNode {
             effect_label: format!("{}", id),
             resource_type: id.display_type(),
-            name_part: id.name.clone(),
+            name_part: id.name_str().to_string(),
             symbol: "x".to_string(),
             kind: EffectKind::Delete,
             detail_rows,
@@ -787,7 +789,7 @@ fn effect_to_node(effect: &Effect, schemas: Option<&HashMap<String, ResourceSche
         Effect::Move { from, to } => TreeNode {
             effect_label: format!("{} -> {}", from, to),
             resource_type: to.display_type(),
-            name_part: to.name.clone(),
+            name_part: to.name_str().to_string(),
             symbol: "->".to_string(),
             kind: EffectKind::Update,
             detail_rows,

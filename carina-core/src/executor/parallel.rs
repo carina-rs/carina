@@ -38,7 +38,7 @@ pub(super) fn build_dependency_map(
         if let Effect::Delete { id, binding, .. } = effect
             && binding.is_none()
         {
-            name_to_delete_idx.insert(id.name.clone(), idx);
+            name_to_delete_idx.insert(id.name_str().to_string(), idx);
         }
     }
 

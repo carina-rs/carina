@@ -329,7 +329,7 @@ pub(super) fn find_changed_attributes(
 
         // Build secret hash context from resource ID and attribute key
         let secret_ctx =
-            resource_id.map(|id| SecretHashContext::new(id.display_type(), &id.name, key));
+            resource_id.map(|id| SecretHashContext::new(id.display_type(), id.name_str(), key));
 
         let is_equal = match saved.and_then(|s| s.get(key)) {
             Some(saved_value) => {

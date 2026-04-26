@@ -1013,7 +1013,7 @@ mod tests {
 
             fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
                 let id = resource.id.clone();
-                let name = resource.id.name.clone();
+                let name = resource.id.name_str().to_string();
                 let delay = self.delays.get(&name).copied().unwrap_or(Duration::ZERO);
                 let log = self.call_log.clone();
                 Box::pin(async move {

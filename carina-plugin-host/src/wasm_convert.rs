@@ -147,7 +147,7 @@ pub fn core_to_wit_resource_id(id: &CoreResourceId) -> wit::ResourceId {
     wit::ResourceId {
         provider: id.provider.clone(),
         resource_type: id.resource_type.clone(),
-        name: id.name.clone(),
+        name: id.name_str().to_string(),
     }
 }
 
@@ -188,7 +188,8 @@ pub fn core_to_wit_resource(resource: &CoreResource) -> wit::ResourceDef {
 
 pub fn wit_to_core_resource(resource: &wit::ResourceDef) -> CoreResource {
     let id = wit_to_core_resource_id(&resource.id);
-    let mut core_resource = CoreResource::with_provider(&id.provider, &id.resource_type, &id.name);
+    let mut core_resource =
+        CoreResource::with_provider(&id.provider, &id.resource_type, id.name_str());
     core_resource.attributes = resource
         .attributes
         .iter()

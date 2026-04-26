@@ -115,7 +115,7 @@ impl StateFile {
         if let Some(resource_state) = self.find_resource(
             &resource.id.provider,
             &resource.id.resource_type,
-            &resource.id.name,
+            resource.id.name_str(),
         ) {
             return resource_state.identifier.clone();
         }
@@ -165,7 +165,7 @@ impl StateFile {
         let rs = self.find_resource(
             &resource.id.provider,
             &resource.id.resource_type,
-            &resource.id.name,
+            resource.id.name_str(),
         );
         if let Some(identifier) = rs.and_then(|r| r.identifier.as_deref()) {
             let attrs: HashMap<String, Value> = rs
@@ -499,7 +499,7 @@ impl ResourceState {
     ) -> Result<Self, String> {
         let mut rs = Self::new(
             &resource.id.resource_type,
-            &resource.id.name,
+            resource.id.name_str(),
             resource.id.provider.clone(),
         );
         rs.identifier = state.identifier.clone();
@@ -514,7 +514,8 @@ impl ResourceState {
         // the provider-returned structure to preserve extra keys from the provider.
         for (k, v) in &resource.attributes {
             if contains_secret(v) {
-                let ctx = SecretHashContext::new(resource.id.display_type(), &resource.id.name, k);
+                let ctx =
+                    SecretHashContext::new(resource.id.display_type(), resource.id.name_str(), k);
                 if let Some(provider_json) = rs.attributes.get(k).cloned() {
                     rs.attributes.insert(
                         k.clone(),

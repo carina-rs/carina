@@ -391,7 +391,7 @@ impl<'cfg> ModuleResolver<'cfg> {
             let mut new_resource = resource.clone();
 
             // Prefix the resource name with instance path (dot-separated)
-            let new_name = format!("{}.{}", instance_prefix, new_resource.id.name);
+            let new_name = format!("{}.{}", instance_prefix, new_resource.id.name_str());
             new_resource.id = ResourceId::with_provider(
                 &new_resource.id.provider,
                 &new_resource.id.resource_type,
@@ -661,7 +661,7 @@ pub fn reconcile_anonymous_module_instances(
     // expanded DSL — we'll query state for matching entries.
     let mut touched_types: HashSet<(String, String)> = HashSet::new();
     for r in resources.iter() {
-        if split_instance_prefix(&r.id.name).is_none() {
+        if split_instance_prefix(r.id.name_str()).is_none() {
             continue;
         }
         touched_types.insert((r.id.provider.clone(), r.id.resource_type.clone()));
@@ -676,7 +676,7 @@ pub fn reconcile_anonymous_module_instances(
     // across all of its resources).
     let mut current_synthetic_by_module: HashMap<String, HashSet<u64>> = HashMap::new();
     for r in resources.iter() {
-        let Some((prefix, _)) = split_instance_prefix(&r.id.name) else {
+        let Some((prefix, _)) = split_instance_prefix(r.id.name_str()) else {
             continue;
         };
         let Some((module, simhash)) = parse_synthetic_instance_prefix(prefix) else {
@@ -750,7 +750,7 @@ pub fn reconcile_anonymous_module_instances(
     // Apply remaps: rewrite `id.name` and `binding` for every resource whose
     // instance prefix is in the remap table.
     for r in resources.iter_mut() {
-        let Some((prefix, rest)) = split_instance_prefix(&r.id.name) else {
+        let Some((prefix, rest)) = split_instance_prefix(r.id.name_str()) else {
             continue;
         };
         let Some((module, simhash)) = parse_synthetic_instance_prefix(prefix) else {
@@ -1221,7 +1221,7 @@ mod tests {
         assert_eq!(expanded.len(), 1);
 
         let sg = &expanded[0];
-        assert_eq!(sg.id.name, "my_instance.sg");
+        assert_eq!(sg.id.name_str(), "my_instance.sg");
         assert_eq!(
             sg.get_attr("vpc_id"),
             Some(&Value::String("vpc-456".to_string()))
@@ -1376,8 +1376,8 @@ mod tests {
         );
 
         // Resource names should also be distinct (dot notation)
-        assert_eq!(expanded_a[0].id.name, "prod.main_vpc");
-        assert_eq!(expanded_b[0].id.name, "staging.main_vpc");
+        assert_eq!(expanded_a[0].id.name_str(), "prod.main_vpc");
+        assert_eq!(expanded_b[0].id.name_str(), "staging.main_vpc");
     }
 
     /// Module with an attributes block that exposes a security_group binding.
@@ -1642,11 +1642,11 @@ thing { name = 'beta'  }
 "#,
         );
 
-        let role_addresses: HashSet<&String> = parsed
+        let role_addresses: HashSet<String> = parsed
             .resources
             .iter()
             .filter(|r| r.id.resource_type == "iam.Role")
-            .map(|r| &r.id.name)
+            .map(|r| r.id.name_str().to_string())
             .collect();
         assert_eq!(role_addresses.len(), 2, "got {:?}", role_addresses);
 
@@ -1702,7 +1702,7 @@ thing { name = 'after-edit' }
             .resources
             .iter()
             .filter(|r| r.id.resource_type == "iam.Role")
-            .map(|r| r.id.name.clone())
+            .map(|r| r.id.name_str().to_string())
             .collect();
         assert_eq!(before.len(), 1);
         let (new_prefix, _) = before[0].split_once('.').unwrap();
@@ -1721,7 +1721,7 @@ thing { name = 'after-edit' }
             .resources
             .iter()
             .filter(|r| r.id.resource_type == "iam.Role")
-            .map(|r| r.id.name.clone())
+            .map(|r| r.id.name_str().to_string())
             .collect();
         assert_eq!(
             after,
@@ -1758,8 +1758,8 @@ thing { name = 'a' }
             .find(|r| r.id.resource_type == "iam.Role")
             .unwrap()
             .id
-            .name
-            .clone();
+            .name_str()
+            .to_string();
 
         // State entry uses a different module name.
         let state_lookup = |_: &str, _: &str| vec!["other_0000000000000001.role".to_string()];
@@ -1771,8 +1771,8 @@ thing { name = 'a' }
             .find(|r| r.id.resource_type == "iam.Role")
             .unwrap()
             .id
-            .name
-            .clone();
+            .name_str()
+            .to_string();
         assert_eq!(before_name, after_name);
     }
 
@@ -1830,8 +1830,8 @@ thing { name = 'after-edit' }
             .find(|r| r.id.resource_type == "iam.Role")
             .unwrap()
             .id
-            .name
-            .clone();
+            .name_str()
+            .to_string();
         let (new_prefix, _) = role_name_before.split_once('.').unwrap();
         let (_, new_hash) = parse_synthetic_instance_prefix(new_prefix).unwrap();
 
@@ -1852,7 +1852,7 @@ thing { name = 'after-edit' }
             .find(|r| r.id.resource_type == "iam.Role")
             .unwrap();
         assert_eq!(
-            role_after.id.name,
+            role_after.id.name_str(),
             format!("thing_{:016x}.role", state_hash),
             "Role address must be remapped to the state prefix",
         );
@@ -1862,7 +1862,7 @@ thing { name = 'after-edit' }
             .find(|r| r.id.resource_type == "iam.OidcProvider")
             .unwrap();
         assert_eq!(
-            provider_after.id.name,
+            provider_after.id.name_str(),
             format!("thing_{:016x}.provider_res", state_hash),
             "OidcProvider address must be remapped to the state prefix",
         );
@@ -1887,8 +1887,8 @@ thing { name = 'a' }
             .find(|r| r.id.resource_type == "iam.Role")
             .unwrap()
             .id
-            .name
-            .clone();
+            .name_str()
+            .to_string();
         let (prefix, _) = before_name.split_once('.').unwrap();
         let (_, cur_hash) = parse_synthetic_instance_prefix(prefix).unwrap();
 
@@ -1907,8 +1907,8 @@ thing { name = 'a' }
             .find(|r| r.id.resource_type == "iam.Role")
             .unwrap()
             .id
-            .name
-            .clone();
+            .name_str()
+            .to_string();
         assert_eq!(before_name, after_name, "ambiguous match must not remap");
     }
 
@@ -1932,7 +1932,7 @@ thing { name = 'unchanged-but-different' }
             .resources
             .iter()
             .filter(|r| r.id.resource_type == "iam.Role")
-            .map(|r| r.id.name.split_once('.').unwrap().0.to_string())
+            .map(|r| r.id.name_str().split_once('.').unwrap().0.to_string())
             .collect();
         assert_eq!(prefixes_before.len(), 2);
         let mut iter = prefixes_before.iter();
@@ -1949,7 +1949,7 @@ thing { name = 'unchanged-but-different' }
             .resources
             .iter()
             .filter(|r| r.id.resource_type == "iam.Role")
-            .map(|r| r.id.name.split_once('.').unwrap().0.to_string())
+            .map(|r| r.id.name_str().split_once('.').unwrap().0.to_string())
             .collect();
         assert_eq!(
             prefixes_after, prefixes_before,
@@ -2000,7 +2000,7 @@ thing { name = 'unchanged-but-different' }
 
         let sg = &expanded[0];
         // Resource name should use dot notation, not underscore
-        assert_eq!(sg.id.name, "my_instance.sg");
+        assert_eq!(sg.id.name_str(), "my_instance.sg");
     }
 
     #[test]
@@ -2025,8 +2025,8 @@ thing { name = 'unchanged-but-different' }
         let expanded = resolver.expand_module_call(&call, "prod").unwrap();
 
         // Resource names should use dot notation
-        assert_eq!(expanded[0].id.name, "prod.main_vpc");
-        assert_eq!(expanded[1].id.name, "prod.sub");
+        assert_eq!(expanded[0].id.name_str(), "prod.main_vpc");
+        assert_eq!(expanded[1].id.name_str(), "prod.sub");
 
         // binding should use dot notation
         assert_eq!(expanded[0].binding, Some("prod.vpc".to_string()));

@@ -122,7 +122,7 @@ pub fn reconcile_prefixed_names(
         let state_info = find_state(
             &resource.id.provider,
             &resource.id.resource_type,
-            &resource.id.name,
+            resource.id.name_str(),
         );
         let state_info = match state_info {
             Some(si) => si,
@@ -391,7 +391,7 @@ pub fn compute_anonymous_identifiers(
     let mut computed: Vec<(usize, String)> = Vec::new();
 
     for (idx, resource) in resources.iter().enumerate() {
-        if !resource.id.name.is_empty() {
+        if !resource.id.name.is_pending() {
             continue;
         }
 
@@ -535,7 +535,7 @@ pub fn reconcile_anonymous_identifiers(
     find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
 ) {
     for resource in resources.iter_mut() {
-        if resource.id.name.is_empty() {
+        if resource.id.name.is_pending() {
             continue;
         }
 
@@ -555,7 +555,10 @@ pub fn reconcile_anonymous_identifiers(
         let state_entries = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
 
         // If the resource's name already exists in state, no reconciliation is needed.
-        if state_entries.iter().any(|e| e.name == resource.id.name) {
+        if state_entries
+            .iter()
+            .any(|e| e.name == resource.id.name_str())
+        {
             continue;
         }
 
@@ -570,13 +573,13 @@ pub fn reconcile_anonymous_identifiers(
         if create_only_attrs.is_empty() || resource_co_values.is_empty() {
             // No create-only properties or none set: use SimHash-based Hamming distance
             // matching to find the closest state entry.
-            let Some(resource_hash) = extract_hash_from_identifier(&resource.id.name) else {
+            let Some(resource_hash) = extract_hash_from_identifier(resource.id.name_str()) else {
                 continue;
             };
 
             let mut best_match: Option<(&str, u32)> = None;
             for entry in &state_entries {
-                if entry.name == resource.id.name {
+                if entry.name == resource.id.name_str() {
                     continue;
                 }
                 let Some(state_hash) = extract_hash_from_identifier(&entry.name) else {
@@ -605,7 +608,7 @@ pub fn reconcile_anonymous_identifiers(
         // reconciliation to avoid rebinding to the wrong state entry.
         let mut partial_matches: Vec<&str> = Vec::new();
         for entry in &state_entries {
-            if entry.name == resource.id.name {
+            if entry.name == resource.id.name_str() {
                 // Same identifier, no reconciliation needed
                 continue;
             }
@@ -686,7 +689,7 @@ pub fn detect_anonymous_to_named_renames(
         used_names
             .entry(key)
             .or_default()
-            .insert(resource.id.name.clone());
+            .insert(resource.id.name_str().to_string());
     }
 
     let mut renames: Vec<(ResourceId, ResourceId)> = Vec::new();
@@ -705,7 +708,10 @@ pub fn detect_anonymous_to_named_renames(
         let state_entries = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
 
         // Skip if the binding name already exists in state — nothing to rename.
-        if state_entries.iter().any(|e| e.name == resource.id.name) {
+        if state_entries
+            .iter()
+            .any(|e| e.name == resource.id.name_str())
+        {
             continue;
         }
 

@@ -385,7 +385,7 @@ pub fn cascade_dependent_updates(
         let key = resource
             .binding
             .clone()
-            .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name));
+            .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name_str()));
         binding_to_unresolved.insert(key, resource);
     }
 
@@ -461,7 +461,7 @@ pub fn cascade_dependent_updates(
         for dep in &deps {
             if replaced_bindings.contains(dep) {
                 let binding = resource.binding.clone().unwrap_or_else(|| {
-                    format!("{}:{}", resource.id.resource_type, resource.id.name)
+                    format!("{}:{}", resource.id.resource_type, resource.id.name_str())
                 });
                 dependents_of_replaced
                     .entry(dep.clone())

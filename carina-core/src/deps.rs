@@ -116,10 +116,9 @@ fn topological_sort(resources: &[Resource], depth_presort: bool) -> Result<Vec<R
 
         let mut depth_visiting: HashSet<String> = HashSet::new();
         for resource in resources {
-            let binding = resource
-                .binding
-                .clone()
-                .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name));
+            let binding = resource.binding.clone().unwrap_or_else(|| {
+                format!("{}:{}", resource.id.resource_type, resource.id.name_str())
+            });
             compute_depth(
                 &binding,
                 &binding_to_resource,
@@ -137,11 +136,11 @@ fn topological_sort(resources: &[Resource], depth_presort: bool) -> Result<Vec<R
             let a_binding = a
                 .binding
                 .clone()
-                .unwrap_or_else(|| format!("{}:{}", a.id.resource_type, a.id.name));
+                .unwrap_or_else(|| format!("{}:{}", a.id.resource_type, a.id.name_str()));
             let b_binding = b
                 .binding
                 .clone()
-                .unwrap_or_else(|| format!("{}:{}", b.id.resource_type, b.id.name));
+                .unwrap_or_else(|| format!("{}:{}", b.id.resource_type, b.id.name_str()));
             let a_depth = depth_cache.get(&a_binding).copied().unwrap_or(0);
             let b_depth = depth_cache.get(&b_binding).copied().unwrap_or(0);
             a_depth.cmp(&b_depth) // Ascending: shallower first
@@ -163,7 +162,7 @@ fn topological_sort(resources: &[Resource], depth_presort: bool) -> Result<Vec<R
         let binding_name = resource
             .binding
             .clone()
-            .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name));
+            .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name_str()));
 
         if visited.contains(&binding_name) {
             return Ok(());
@@ -217,7 +216,7 @@ pub fn build_dependents_map(resources: &[&Resource]) -> HashMap<String, HashSet<
         let binding = resource
             .binding
             .clone()
-            .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name));
+            .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name_str()));
 
         let deps = get_resource_dependencies(resource);
         for dep in deps {
@@ -698,7 +697,7 @@ mod tests {
             .map(|r| {
                 r.binding
                     .clone()
-                    .unwrap_or_else(|| format!("{}:{}", r.id.resource_type, r.id.name))
+                    .unwrap_or_else(|| format!("{}:{}", r.id.resource_type, r.id.name_str()))
             })
             .collect();
 
@@ -782,7 +781,7 @@ mod tests {
             .map(|r| {
                 r.binding
                     .clone()
-                    .unwrap_or_else(|| format!("{}:{}", r.id.resource_type, r.id.name))
+                    .unwrap_or_else(|| format!("{}:{}", r.id.resource_type, r.id.name_str()))
             })
             .collect();
 

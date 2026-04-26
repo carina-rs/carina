@@ -672,7 +672,7 @@ fn secret_with_context_no_change_when_hash_matches() {
     let resource_id = ResourceId::with_provider("awscc", "rds.db_instance", "my-db");
     let ctx = SecretHashContext::new(
         resource_id.display_type(),
-        &resource_id.name,
+        resource_id.name_str(),
         "master_password",
     );
 
@@ -701,7 +701,7 @@ fn secret_with_context_detects_change() {
     let resource_id = ResourceId::with_provider("awscc", "rds.db_instance", "my-db");
     let ctx = SecretHashContext::new(
         resource_id.display_type(),
-        &resource_id.name,
+        resource_id.name_str(),
         "master_password",
     );
 

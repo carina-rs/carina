@@ -834,7 +834,7 @@ pub async fn create_plan_from_parsed_with_upstream(
                     .iter()
                     .filter_map(|r| {
                         let rs =
-                            sf.find_resource(&r.id.provider, &r.id.resource_type, &r.id.name)?;
+                            sf.find_resource(&r.id.provider, &r.id.resource_type, r.id.name_str())?;
                         if rs.dependency_bindings.is_empty() {
                             None
                         } else {
@@ -1109,7 +1109,7 @@ pub fn materialize_moved_states(
     for block in state_blocks {
         if let StateBlock::Moved { from, to } = block {
             let old_in_state = state_file.as_ref().is_some_and(|sf| {
-                sf.find_resource(&from.provider, &from.resource_type, &from.name)
+                sf.find_resource(&from.provider, &from.resource_type, from.name_str())
                     .is_some()
             });
             if old_in_state {
@@ -1184,7 +1184,7 @@ pub fn add_state_block_effects(
                     sf.find_resource(
                         &effective_to.provider,
                         &effective_to.resource_type,
-                        &effective_to.name,
+                        effective_to.name_str(),
                     )
                     .is_some()
                 });
@@ -1199,7 +1199,7 @@ pub fn add_state_block_effects(
             StateBlock::Removed { from } => {
                 // Skip if resource is not in state
                 let in_state = state_file.as_ref().is_some_and(|sf| {
-                    sf.find_resource(&from.provider, &from.resource_type, &from.name)
+                    sf.find_resource(&from.provider, &from.resource_type, from.name_str())
                         .is_some()
                 });
                 if in_state {
@@ -1279,7 +1279,7 @@ fn resolve_import_target(
         }
         if let Some(attr) = name_attr
             && let Some(Value::String(s)) = resource.get_attr(attr)
-            && s == &to.name
+            && s == to.name_str()
         {
             fallback_id = Some(resource.id.clone());
         }
@@ -1294,7 +1294,7 @@ fn resolve_import_target(
     {
         for rs in sf.resources_by_type(&to.provider, &to.resource_type) {
             if let Some(serde_json::Value::String(s)) = rs.attributes.get(attr)
-                && s == &to.name
+                && s == to.name_str()
             {
                 return ResourceId::with_provider(&rs.provider, &rs.resource_type, &rs.name);
             }
@@ -1830,7 +1830,8 @@ mod tests {
         match &effects[0] {
             Effect::Import { id, identifier } => {
                 assert_eq!(
-                    id.name, "s3_bucket_1d43a664",
+                    id.name_str(),
+                    "s3_bucket_1d43a664",
                     "Import should target the anonymous hash name"
                 );
                 assert_eq!(identifier, "carina-rs-state");

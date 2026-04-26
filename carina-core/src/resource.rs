@@ -5,6 +5,72 @@ use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 
+/// The `name` portion of a `ResourceId`.
+///
+/// Anonymous resources start out as `Pending` because the parser sees
+/// the resource block before it has extracted the `name` attribute.
+/// A later post-processing pass converts `Pending` to `Bound(name)`
+/// once the attribute has been read. Encoding this transient state in
+/// the type makes it impossible to confuse "anonymous, ID not yet
+/// assigned" with "actual ID is the empty string" (#2225).
+///
+/// On disk the variant is collapsed to a plain JSON string for
+/// backward compatibility with v5 state files: `Pending` round-trips
+/// through `""`, `Bound(s)` through `s`. The discriminant is
+/// reconstructed on deserialization.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ResourceName {
+    /// An identifier already extracted (from a `let` binding or the
+    /// `name` attribute of an anonymous resource).
+    Bound(String),
+    /// An anonymous resource whose `name` attribute has not yet been
+    /// promoted to the `ResourceId`. Must be replaced with `Bound`
+    /// before the value can flow to plan generation, state, or
+    /// providers.
+    Pending,
+}
+
+impl ResourceName {
+    /// True when this `ResourceName` has not yet been bound to a
+    /// concrete identifier.
+    pub fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending)
+    }
+
+    /// Borrow the bound identifier as a `&str`. `Pending` returns the
+    /// empty string — sites that need to distinguish must `match` on
+    /// the variant directly.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Bound(s) => s,
+            Self::Pending => "",
+        }
+    }
+}
+
+impl std::fmt::Display for ResourceName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for ResourceName {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ResourceName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(if s.is_empty() {
+            Self::Pending
+        } else {
+            Self::Bound(s)
+        })
+    }
+}
+
 /// Unique identifier for a resource
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ResourceId {
@@ -12,8 +78,13 @@ pub struct ResourceId {
     pub provider: String,
     /// Resource type (e.g., "s3.Bucket", "ec2.Instance")
     pub resource_type: String,
-    /// Resource name (identifier specified in DSL)
-    pub name: String,
+    /// Resource name (identifier specified in DSL).
+    ///
+    /// `Pending` means the resource is anonymous and the `name`
+    /// attribute has not yet been promoted into the `ResourceId`.
+    /// All downstream consumers (state, plan, providers) require
+    /// `Bound`.
+    pub name: ResourceName,
 }
 
 impl ResourceId {
@@ -21,7 +92,7 @@ impl ResourceId {
         Self {
             provider: String::new(),
             resource_type: resource_type.into(),
-            name: name.into(),
+            name: ResourceName::from_string(name.into()),
         }
     }
 
@@ -33,8 +104,21 @@ impl ResourceId {
         Self {
             provider: provider.into(),
             resource_type: resource_type.into(),
-            name: name.into(),
+            name: ResourceName::from_string(name.into()),
         }
+    }
+
+    /// Borrow the resolved identifier as `&str`. `Pending` returns
+    /// the empty string; sites that distinguish should `match` on
+    /// `self.name` directly.
+    pub fn name_str(&self) -> &str {
+        self.name.as_str()
+    }
+
+    /// Set the resource's name, replacing any existing `Pending` or
+    /// `Bound` variant with `Bound(name)`.
+    pub fn set_name(&mut self, name: impl Into<String>) {
+        self.name = ResourceName::Bound(name.into());
     }
 
     /// Returns the display type including provider prefix if available
@@ -43,6 +127,20 @@ impl ResourceId {
             self.resource_type.clone()
         } else {
             format!("{}.{}", self.provider, self.resource_type)
+        }
+    }
+}
+
+impl ResourceName {
+    /// Convert a string into a `ResourceName`. Empty input becomes
+    /// `Pending`; any other input becomes `Bound`. Used by
+    /// `ResourceId::new` / `with_provider` to keep the legacy
+    /// `String` constructors compatible.
+    fn from_string(s: String) -> Self {
+        if s.is_empty() {
+            Self::Pending
+        } else {
+            Self::Bound(s)
         }
     }
 }
@@ -1039,6 +1137,74 @@ mod tests {
         let json = serde_json::to_string(&id).unwrap();
         let deserialized: ResourceId = serde_json::from_str(&json).unwrap();
         assert_eq!(id, deserialized);
+    }
+
+    // The "anonymous, awaiting `name` extraction" state is type-distinct
+    // from a bound name, so the parser cannot accidentally produce a
+    // `ResourceId` whose `name` is the empty string and have it be
+    // mistaken for a valid identifier (#2225).
+
+    #[test]
+    fn resource_name_pending_is_distinct_from_bound_empty() {
+        let pending = ResourceName::Pending;
+        let bound_empty = ResourceName::Bound(String::new());
+        assert_ne!(pending, bound_empty);
+        assert!(pending.is_pending());
+        assert!(!bound_empty.is_pending());
+    }
+
+    #[test]
+    fn resource_id_pending_serde_round_trips_as_empty_string() {
+        // V5 state files persist `name` as a plain JSON string. To preserve
+        // backward compatibility, ResourceName::Pending serializes to "" and
+        // deserializes from "" — round-trip is exact.
+        let id = ResourceId {
+            provider: "aws".to_string(),
+            resource_type: "ec2.Subnet".to_string(),
+            name: ResourceName::Pending,
+        };
+        let json = serde_json::to_string(&id).unwrap();
+        assert!(json.contains("\"name\":\"\""), "got: {json}");
+        let deserialized: ResourceId = serde_json::from_str(&json).unwrap();
+        assert_eq!(id, deserialized);
+        assert!(deserialized.name.is_pending());
+    }
+
+    #[test]
+    fn resource_id_bound_serde_round_trips_as_string() {
+        let id = ResourceId::with_provider("aws", "ec2.Subnet", "my-subnet");
+        let json = serde_json::to_string(&id).unwrap();
+        assert!(json.contains("\"name\":\"my-subnet\""), "got: {json}");
+        let deserialized: ResourceId = serde_json::from_str(&json).unwrap();
+        assert_eq!(id, deserialized);
+        match deserialized.name {
+            ResourceName::Bound(s) => assert_eq!(s, "my-subnet"),
+            _ => panic!("expected Bound"),
+        }
+    }
+
+    /// The AC test from #2225: lookups keyed by `ResourceId` must remain
+    /// valid across the name-resolution pass. This is achieved by ensuring
+    /// that the parser starts with `Pending`, then any rename to `Bound`
+    /// also propagates to sibling structures (StringLiteralPath etc.).
+    /// We assert that two different mutation paths produce equal IDs.
+    #[test]
+    fn resource_id_rename_pending_to_bound() {
+        let mut id = ResourceId {
+            provider: "aws".to_string(),
+            resource_type: "ec2.Subnet".to_string(),
+            name: ResourceName::Pending,
+        };
+        // The post-pass converts Pending → Bound with the extracted name.
+        id.set_name("app-subnet".to_string());
+        match &id.name {
+            ResourceName::Bound(s) => assert_eq!(s, "app-subnet"),
+            _ => panic!("expected Bound after set_name"),
+        }
+        // After renaming, the same string can produce an equal ResourceId
+        // from any other code path (e.g. building a key for a sibling map).
+        let constructed = ResourceId::with_provider("aws", "ec2.Subnet", "app-subnet");
+        assert_eq!(id, constructed);
     }
 
     #[test]
