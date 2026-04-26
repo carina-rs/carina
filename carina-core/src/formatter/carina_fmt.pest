@@ -37,9 +37,12 @@ anonymous_resource = {
 }
 
 // Module call: module_name { key = value, ... }
+// Mirrors carina.pest: `use` is reserved (only valid as a let-binding RHS),
+// so it cannot be a module-call identifier (issue #2233).
 module_call = {
-    identifier ~ trivia* ~ open_brace ~ block_content* ~ close_brace
+    !use_keyword ~ identifier ~ trivia* ~ open_brace ~ block_content* ~ close_brace
 }
+use_keyword = @{ "use" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 // Provider block: provider aws { ... }
 provider_block = {
@@ -193,7 +196,7 @@ fn_local_let = { kw_let ~ trivia+ ~ identifier ~ trivia* ~ equals ~ trivia* ~ ex
 // discard_pattern allows `let _ = expr` to suppress unused binding warnings
 discard_pattern = @{ "_" }
 let_binding = {
-    kw_let ~ trivia+ ~ (discard_pattern | identifier) ~ trivia* ~ equals ~ trivia* ~ expression
+    kw_let ~ trivia+ ~ (discard_pattern | identifier) ~ trivia* ~ equals ~ trivia* ~ (use_expr | expression)
 }
 
 // Block content: local let bindings, attributes, trivia, nested blocks, or nested elements
@@ -244,11 +247,12 @@ upstream_state_expr = {
 }
 
 // Primary value
+// `use_expr` is intentionally NOT here — mirrors carina.pest. It is only
+// valid as the RHS of a let binding (see `let_binding`). Issue #2233.
 primary = {
     read_resource_expr
   | upstream_state_expr
   | resource_expr
-  | use_expr
   | for_expr
   | if_expr
   | function_call

@@ -1755,14 +1755,23 @@ fn parse_let_binding_extended(
     let name = next_pair(&mut inner, "binding name", "let binding")?
         .as_str()
         .to_string();
-    let expr_pair = next_pair(&mut inner, "expression", "let binding")?;
+    let rhs_pair = next_pair(&mut inner, "expression", "let binding")?;
+
+    // `use` is the only meta-statement allowed as a let-binding RHS. The
+    // grammar permits it here and only here (see carina.pest); everywhere
+    // else it is a parse error.
+    if rhs_pair.as_rule() == Rule::use_expr {
+        let use_stmt = parse_use_expr(rhs_pair, &name, ctx)?;
+        let value = Value::String(format!("${{use:{}}}", use_stmt.path));
+        return Ok((name, value, vec![], vec![], Some(use_stmt), false));
+    }
 
     // Detect if the RHS is a structurally-required expression (if/for/read)
-    let is_structural = detect_structural_rhs(&expr_pair);
+    let is_structural = detect_structural_rhs(&rhs_pair);
 
-    // Check if it's a module call, resource expression, import, or for expression
+    // Check if it's a module call, resource expression, or for expression
     let (value, expanded_resources, module_calls, maybe_import) =
-        parse_expression_with_resource_or_module(expr_pair, ctx, &name)?;
+        parse_expression_with_resource_or_module(rhs_pair, ctx, &name)?;
 
     Ok((
         name,
@@ -1968,11 +1977,6 @@ fn parse_primary_with_resource_or_module(
             let resource = parse_resource_expr(inner, ctx, binding_name)?;
             let ref_value = Value::String(format!("${{{}}}", binding_name));
             Ok((ref_value, vec![resource], vec![], None))
-        }
-        Rule::use_expr => {
-            let use_stmt = parse_use_expr(inner, binding_name, ctx)?;
-            let value = Value::String(format!("${{use:{}}}", use_stmt.path));
-            Ok((value, vec![], vec![], Some(use_stmt)))
         }
         Rule::for_expr => {
             let (resources, module_calls) = parse_for_expr(inner, ctx, binding_name)?;
@@ -5723,6 +5727,70 @@ mod tests {
         assert!(
             msg.contains("bogus"),
             "error should mention unexpected attribute, got: {msg}"
+        );
+    }
+
+    // The `use` expression is only valid as a top-level `let` binding RHS.
+    // The grammar previously accepted it in any primary-value position, which
+    // produced silent evaluator failures (issue #2233). These tests pin the
+    // grammar boundary: any non-let-RHS position must be a parse error.
+
+    #[test]
+    fn parse_use_expression_rejected_as_module_call_argument() {
+        let input = r#"
+            some_module {
+              network = use { source = "./modules/network" }
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default());
+        assert!(
+            result.is_err(),
+            "use expression as module-call argument must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_use_expression_rejected_in_list() {
+        let input = r#"
+            let mods = [use { source = "./modules/a" }]
+        "#;
+
+        let result = parse(input, &ProviderContext::default());
+        assert!(
+            result.is_err(),
+            "use expression inside a list must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_use_expression_rejected_in_if_branch() {
+        let input = r#"
+            let net = if true { use { source = "./a" } } else { use { source = "./b" } }
+        "#;
+
+        let result = parse(input, &ProviderContext::default());
+        assert!(
+            result.is_err(),
+            "use expression inside an if branch must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_use_expression_rejected_in_local_let() {
+        // `local_binding` (block-scoped `let`) goes through `parse_expression`,
+        // which has no `use_expr` handling. Must be a parse error, not silent failure.
+        let input = r#"
+            aws.s3.bucket {
+              name = "my-bucket"
+              let mod_x = use { source = "./modules/x" }
+            }
+        "#;
+
+        let result = parse(input, &ProviderContext::default());
+        assert!(
+            result.is_err(),
+            "use expression inside a local let binding must be rejected, got: {result:?}"
         );
     }
 
