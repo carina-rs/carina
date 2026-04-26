@@ -553,6 +553,28 @@ impl AttributeType {
     /// 6. non-Custom source → Custom sink: NG (source has no proof of
     ///    satisfying the sink's semantic/pattern/length).
     /// 7. Otherwise: same primitive type names.
+    ///
+    /// # Conservative pattern/length policy
+    ///
+    /// Pattern compatibility is decided by **literal string equality**,
+    /// not by regex-language containment. Two `pattern: Some(...)` values
+    /// that describe the same regex language but differ by a single
+    /// character are still considered incompatible. Proving regex
+    /// containment in the general case is undecidable for arbitrary
+    /// PCRE-style patterns, so we err toward false negatives (a few
+    /// rejected refs the user must split with an explicit cast) over
+    /// false positives (assignment that compiles but fails at apply time).
+    ///
+    /// Length compatibility is a strict subset check: `sink.min ≤
+    /// source.min` and `source.max ≤ sink.max`, treating absent bounds
+    /// as unbounded on that side. A source with `length: None` cannot
+    /// satisfy a sink with `length: Some(...)` — the source carries no
+    /// proof of its values' length range. Likewise for `pattern: None`
+    /// against `pattern: Some(_)`.
+    ///
+    /// **Do not loosen these checks** without a concrete plan to track
+    /// regex-containment proofs through the type system. Loosening here
+    /// re-introduces the silent-false-positive class that #2218 closed.
     pub fn is_assignable_to(&self, sink: &AttributeType) -> bool {
         use AttributeType::*;
         if let Union(members) = sink {
@@ -4293,6 +4315,134 @@ mod tests {
         let int_custom = make_custom("Port", AttributeType::Int);
         let string_custom = make_custom("VpcId", AttributeType::String);
         assert!(!int_custom.is_assignable_to(&string_custom));
+    }
+
+    // -- Custom-pattern and Custom-length assignability matrix (#2218) --
+    //
+    // The rules `is_assignable_to` enforces for `Custom { pattern, length, .. }`:
+    //
+    // - pattern: differing literal strings are conservatively *incompatible*
+    //   (we cannot prove a regex is a refinement of another by string compare,
+    //   so we err on the side of rejecting). `None` on the sink means "no
+    //   pattern constraint" and admits any source pattern (or none). `None`
+    //   on the source against a `Some` sink is rejected — the source has no
+    //   proof its values match the sink's pattern.
+    // - length: source ⊆ sink (sink.min ≤ source.min AND source.max ≤ sink.max,
+    //   missing bounds treated as unbounded on that side). `None` on the sink
+    //   admits any source length; `None` on the source against a `Some` sink
+    //   is rejected — the source has no proof its values fit the sink range.
+
+    fn make_custom_anon_pattern_and_len(
+        pattern: Option<&str>,
+        length: Option<(Option<u64>, Option<u64>)>,
+    ) -> AttributeType {
+        AttributeType::Custom {
+            semantic_name: None,
+            base: Box::new(AttributeType::String),
+            pattern: pattern.map(str::to_string),
+            length,
+            validate: |_| Ok(()),
+            namespace: None,
+            to_dsl: None,
+        }
+    }
+
+    #[test]
+    fn assignable_anon_pattern_equal_strings_compatible() {
+        let a = make_custom_anon_pattern_and_len(Some("^a+$"), None);
+        let b = make_custom_anon_pattern_and_len(Some("^a+$"), None);
+        assert!(a.is_assignable_to(&b));
+    }
+
+    #[test]
+    fn assignable_anon_pattern_differing_strings_incompatible() {
+        // Even if both regexes might describe overlapping languages, the
+        // implementation does not prove containment — differing pattern
+        // strings are conservatively rejected.
+        let a = make_custom_anon_pattern_and_len(Some("^a+$"), None);
+        let b = make_custom_anon_pattern_and_len(Some("^a*$"), None);
+        assert!(!a.is_assignable_to(&b));
+        assert!(!b.is_assignable_to(&a));
+    }
+
+    #[test]
+    fn assignable_anon_pattern_source_none_sink_some_rejected() {
+        // Source has no pattern; sink demands one — source has no proof
+        // its values match the sink's pattern.
+        let source = make_custom_anon_pattern_and_len(None, None);
+        let sink = make_custom_anon_pattern_and_len(Some("^x+$"), None);
+        assert!(!source.is_assignable_to(&sink));
+    }
+
+    #[test]
+    fn assignable_anon_pattern_source_some_sink_none_compatible() {
+        // Sink has no pattern constraint — any source pattern is fine.
+        let source = make_custom_anon_pattern_and_len(Some("^x+$"), None);
+        let sink = make_custom_anon_pattern_and_len(None, None);
+        assert!(source.is_assignable_to(&sink));
+    }
+
+    #[test]
+    fn assignable_anon_length_source_narrower_compatible() {
+        // Source length range ⊂ sink range → compatible.
+        let source = make_custom_anon_pattern_and_len(None, Some((Some(20), Some(30))));
+        let sink = make_custom_anon_pattern_and_len(None, Some((Some(10), Some(40))));
+        assert!(source.is_assignable_to(&sink));
+    }
+
+    #[test]
+    fn assignable_anon_length_source_wider_min_rejected() {
+        // Source min < sink min → values shorter than sink allows could leak through.
+        let source = make_custom_anon_pattern_and_len(None, Some((Some(5), Some(40))));
+        let sink = make_custom_anon_pattern_and_len(None, Some((Some(10), Some(40))));
+        assert!(!source.is_assignable_to(&sink));
+    }
+
+    #[test]
+    fn assignable_anon_length_source_wider_max_rejected() {
+        // Source max > sink max → values longer than sink allows could leak through.
+        let source = make_custom_anon_pattern_and_len(None, Some((Some(10), Some(50))));
+        let sink = make_custom_anon_pattern_and_len(None, Some((Some(10), Some(40))));
+        assert!(!source.is_assignable_to(&sink));
+    }
+
+    #[test]
+    fn assignable_anon_length_source_unbounded_max_against_bounded_sink_rejected() {
+        // Source has no upper bound; sink does → source could exceed sink max.
+        let source = make_custom_anon_pattern_and_len(None, Some((Some(10), None)));
+        let sink = make_custom_anon_pattern_and_len(None, Some((Some(10), Some(40))));
+        assert!(!source.is_assignable_to(&sink));
+    }
+
+    #[test]
+    fn assignable_anon_length_source_unbounded_min_against_bounded_sink_rejected() {
+        // Source has no lower bound; sink does → source could fall below sink min.
+        let source = make_custom_anon_pattern_and_len(None, Some((None, Some(40))));
+        let sink = make_custom_anon_pattern_and_len(None, Some((Some(10), Some(40))));
+        assert!(!source.is_assignable_to(&sink));
+    }
+
+    #[test]
+    fn assignable_anon_length_source_none_sink_some_rejected() {
+        // Source has no length constraint at all; sink does → no proof.
+        let source = make_custom_anon_pattern_and_len(None, None);
+        let sink = make_custom_anon_pattern_and_len(None, Some((Some(10), Some(40))));
+        assert!(!source.is_assignable_to(&sink));
+    }
+
+    #[test]
+    fn assignable_anon_length_source_some_sink_none_compatible() {
+        // Sink has no length constraint — any source length is fine.
+        let source = make_custom_anon_pattern_and_len(None, Some((Some(10), Some(40))));
+        let sink = make_custom_anon_pattern_and_len(None, None);
+        assert!(source.is_assignable_to(&sink));
+    }
+
+    #[test]
+    fn assignable_anon_length_both_none_compatible() {
+        let source = make_custom_anon_pattern_and_len(None, None);
+        let sink = make_custom_anon_pattern_and_len(None, None);
+        assert!(source.is_assignable_to(&sink));
     }
 
     #[test]
