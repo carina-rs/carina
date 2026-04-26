@@ -470,6 +470,28 @@ pub fn is_string_compatible_type(attr_type: &AttributeType) -> bool {
     }
 }
 
+/// Check that a root configuration does not contain `arguments` blocks.
+///
+/// `arguments` is a module-input declaration: it belongs on the module side
+/// of a module boundary and is paired with `use` on the caller side. In a
+/// root configuration there is no caller to pass values, so the block has
+/// no meaning — its `default` would silently become a de-facto root
+/// variable, which is not a documented feature (issue #2198).
+///
+/// A directory loaded via the CLI may be either a root config or a module
+/// the user is validating in isolation. We only flag the misplaced block
+/// when a `backend` or `provider` block is also present, since both are
+/// root-only constructs and unambiguously identify a root configuration.
+pub fn validate_no_arguments_in_root(parsed: &ParsedFile) -> Result<(), String> {
+    let is_root = parsed.backend.is_some() || !parsed.providers.is_empty();
+    if !parsed.arguments.is_empty() && is_root {
+        return Err(
+            "arguments blocks are only valid inside module definitions, not in root configurations.".to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Check that a module file does not contain provider blocks.
 ///
 /// Provider configuration should only be defined at the root configuration level,
@@ -1497,6 +1519,74 @@ let vpc = awscc.ec2.Vpc {
         });
 
         let result = validate_no_provider_in_module(&parsed);
+        assert!(result.is_ok());
+    }
+
+    // --- validate_no_arguments_in_root tests ---
+
+    fn argument_param(name: &str) -> crate::parser::ArgumentParameter {
+        crate::parser::ArgumentParameter {
+            name: name.to_string(),
+            type_expr: TypeExpr::String,
+            default: None,
+            description: None,
+            validations: Vec::new(),
+        }
+    }
+
+    fn provider(name: &str) -> crate::parser::ProviderConfig {
+        crate::parser::ProviderConfig {
+            name: name.to_string(),
+            attributes: HashMap::new(),
+            default_tags: HashMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+        }
+    }
+
+    #[test]
+    fn arguments_with_backend_errors() {
+        let mut parsed = empty_parsed();
+        parsed.arguments.push(argument_param("state_path"));
+        parsed.backend = Some(crate::parser::BackendConfig {
+            backend_type: "local".to_string(),
+            attributes: HashMap::new(),
+        });
+
+        let result = validate_no_arguments_in_root(&parsed);
+        assert_eq!(
+            result.unwrap_err(),
+            "arguments blocks are only valid inside module definitions, not in root configurations."
+        );
+    }
+
+    #[test]
+    fn arguments_with_provider_errors() {
+        let mut parsed = empty_parsed();
+        parsed.arguments.push(argument_param("vpc_cidr"));
+        parsed.providers.push(provider("aws"));
+
+        let result = validate_no_arguments_in_root(&parsed);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn arguments_alone_is_ok() {
+        // A directory with only `arguments` looks like a module the user
+        // is validating in isolation; we cannot prove it is a root, so
+        // do not flag it (issue #2198).
+        let mut parsed = empty_parsed();
+        parsed.arguments.push(argument_param("vpc_cidr"));
+
+        let result = validate_no_arguments_in_root(&parsed);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn empty_arguments_in_root_ok() {
+        let parsed = empty_parsed();
+        let result = validate_no_arguments_in_root(&parsed);
         assert!(result.is_ok());
     }
 

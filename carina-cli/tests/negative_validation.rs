@@ -15,6 +15,13 @@ fn carina_validate(fixture: &str) -> std::process::Output {
         .expect("failed to execute carina")
 }
 
+fn carina_validate_path(path: &std::path::Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_carina"))
+        .args(["validate", path.to_str().unwrap()])
+        .output()
+        .expect("failed to execute carina")
+}
+
 fn assert_validate_fails(fixture: &str, expected_substring: &str) {
     let output = carina_validate(fixture);
     assert!(
@@ -97,6 +104,45 @@ fn invalid_region() {
 #[test]
 fn missing_provider_plugin() {
     assert_validate_fails("missing_provider_plugin", "has no source configured");
+}
+
+#[test]
+fn arguments_block_rejected_in_root() {
+    // Issue #2198. An `arguments` block belongs on the module side of a
+    // module boundary; placing it in a root configuration silently turns
+    // its `default` values into a de-facto root variable. Reject it with
+    // a clear diagnostic instead.
+    assert_validate_fails(
+        "arguments_in_root",
+        "arguments blocks are only valid inside module definitions",
+    );
+}
+
+#[test]
+fn module_directory_validates_directly() {
+    // Issue #2198 follow-up. A directory written as a module (only
+    // `arguments` and resources, no `backend` / `provider`) must still
+    // pass `carina validate <module-dir>` — users do that to check
+    // module syntax in isolation. Without root markers we cannot prove
+    // the directory is a root, so the rejection must not fire.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let module = tmp.path();
+    std::fs::write(
+        module.join("main.crn"),
+        r#"arguments {
+  vpc_cidr: String
+}
+"#,
+    )
+    .unwrap();
+
+    let output = carina_validate_path(module);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("arguments blocks are only valid"),
+        "module directory must not be rejected as misplaced root arguments.\nstdout: {stdout}\nstderr: {stderr}",
+    );
 }
 
 #[test]
