@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -1161,7 +1161,7 @@ async fn run_apply_locked(
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
     // Pre-build dependency_bindings from state file so we can restore them
     // after refresh. Provider.read() doesn't know about this metadata (#1565).
-    let saved_dep_bindings: HashMap<ResourceId, Vec<String>> = state_file
+    let saved_dep_bindings: HashMap<ResourceId, BTreeSet<String>> = state_file
         .as_ref()
         .map(|sf| {
             sorted_resources
@@ -1212,7 +1212,7 @@ async fn run_apply_locked(
     // Refresh orphaned resources (#844, #1685). Must run before the
     // rename transfer below so old-name entries are present for
     // `apply_anonymous_to_named_renames` to transfer.
-    let mut orphan_dependencies: HashMap<ResourceId, Vec<String>> = HashMap::new();
+    let mut orphan_dependencies: HashMap<ResourceId, BTreeSet<String>> = HashMap::new();
     if let Some(sf) = state_file.as_ref() {
         let desired_ids: HashSet<ResourceId> =
             sorted_resources.iter().map(|r| r.id.clone()).collect();

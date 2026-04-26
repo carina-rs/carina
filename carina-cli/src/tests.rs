@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -2452,7 +2452,7 @@ fn build_state_after_apply_persists_write_only_attributes() {
                 Value::String("10.0.0.0/16".to_string()),
             )]),
             exists: true,
-            dependency_bindings: Vec::new(),
+            dependency_bindings: BTreeSet::new(),
         },
     )]);
 
@@ -2527,7 +2527,7 @@ fn build_state_after_apply_write_only_detects_value_change() {
                 Value::String("10.0.0.0/24".to_string()),
             )]),
             exists: true,
-            dependency_bindings: Vec::new(),
+            dependency_bindings: BTreeSet::new(),
         },
     )]);
 

@@ -7,7 +7,7 @@ use carina_core::value::{
     value_to_json,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::backend::BackendError;
 
@@ -227,7 +227,7 @@ impl StateFile {
     pub fn build_orphan_dependencies(
         &self,
         desired_ids: &std::collections::HashSet<ResourceId>,
-    ) -> HashMap<ResourceId, Vec<String>> {
+    ) -> HashMap<ResourceId, BTreeSet<String>> {
         let mut result = HashMap::new();
         for rs in &self.resources {
             let id = ResourceId::with_provider(&rs.provider, &rs.resource_type, &rs.name);
@@ -391,8 +391,13 @@ pub struct ResourceState {
     pub binding: Option<String>,
     /// Binding names of resources this resource depends on (via ResourceRef).
     /// Stored so orphan Delete effects can have tree structure.
+    ///
+    /// Set semantics (BTreeSet) — see Resource::dependency_bindings (#2228).
+    /// Old state files persisted as JSON arrays continue to deserialize
+    /// (serde transparently coerces array → BTreeSet, deduping any
+    /// duplicates and re-serializing in sorted order on next write).
     #[serde(default)]
-    pub dependency_bindings: Vec<String>,
+    pub dependency_bindings: BTreeSet<String>,
     /// Attribute names that are write-only (not returned by the provider API).
     /// Their values are persisted from the user's desired state so that changes
     /// to write-only attributes can be detected on subsequent plans.
@@ -419,7 +424,7 @@ impl ResourceState {
             name_overrides: HashMap::new(),
             desired_keys: Vec::new(),
             binding: None,
-            dependency_bindings: Vec::new(),
+            dependency_bindings: BTreeSet::new(),
             write_only_attributes: Vec::new(),
         }
     }
@@ -539,12 +544,11 @@ impl ResourceState {
         rs.desired_keys.sort();
         // Store binding name for tree structure in orphan Delete effects
         rs.binding = resource.binding.clone();
-        // Store dependency bindings for tree structure in orphan Delete effects
+        // Store dependency bindings for tree structure in orphan Delete effects.
+        // BTreeSet gives us dedup and sorted iteration for free (#2228).
         let deps = get_resource_dependencies(resource);
         if !deps.is_empty() {
-            let mut dep_list: Vec<String> = deps.into_iter().collect();
-            dep_list.sort();
-            rs.dependency_bindings = dep_list;
+            rs.dependency_bindings = deps.into_iter().collect();
         }
         Ok(rs)
     }
@@ -730,7 +734,10 @@ mod tests {
 
         let deserialized: ResourceState = serde_json::from_str(json).unwrap();
         assert_eq!(deserialized.binding, Some("my_bucket".to_string()));
-        assert_eq!(deserialized.dependency_bindings, vec!["vpc", "subnet"]);
+        assert_eq!(
+            deserialized.dependency_bindings,
+            BTreeSet::from(["vpc".to_string(), "subnet".to_string()])
+        );
     }
 
     #[test]
@@ -774,7 +781,7 @@ mod tests {
             .into_iter()
             .collect(),
             exists: true,
-            dependency_bindings: Vec::new(),
+            dependency_bindings: BTreeSet::new(),
         };
 
         let existing = ResourceState::new("s3.Bucket", "my-bucket", "awscc").with_protected(true);
@@ -804,7 +811,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             exists: true,
-            dependency_bindings: Vec::new(),
+            dependency_bindings: BTreeSet::new(),
         };
 
         let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -997,12 +1004,15 @@ mod tests {
                 .into_iter()
                 .collect(),
             exists: true,
-            dependency_bindings: Vec::new(),
+            dependency_bindings: BTreeSet::new(),
         };
 
         let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
         assert_eq!(rs.binding, Some("my_subnet".to_string()));
-        assert_eq!(rs.dependency_bindings, vec!["my_vpc".to_string()]);
+        assert_eq!(
+            rs.dependency_bindings,
+            BTreeSet::from(["my_vpc".to_string()])
+        );
     }
 
     #[test]
@@ -1013,7 +1023,7 @@ mod tests {
         let mut rs = ResourceState::new("ec2.Subnet", "orphan-subnet", "awscc")
             .with_identifier("subnet-123");
         rs.binding = Some("my_subnet".to_string());
-        rs.dependency_bindings = vec!["my_vpc".to_string()];
+        rs.dependency_bindings = BTreeSet::from(["my_vpc".to_string()]);
         state.upsert_resource(rs);
 
         let desired_ids = std::collections::HashSet::new();
@@ -1036,14 +1046,17 @@ mod tests {
         let mut rs = ResourceState::new("ec2.Subnet", "orphan-subnet", "awscc")
             .with_identifier("subnet-123");
         rs.binding = Some("my_subnet".to_string());
-        rs.dependency_bindings = vec!["my_vpc".to_string()];
+        rs.dependency_bindings = BTreeSet::from(["my_vpc".to_string()]);
         state.upsert_resource(rs);
 
         let desired_ids = std::collections::HashSet::new();
         let deps = state.build_orphan_dependencies(&desired_ids);
 
         let id = ResourceId::with_provider("awscc", "ec2.Subnet", "orphan-subnet");
-        assert_eq!(deps.get(&id).unwrap(), &vec!["my_vpc".to_string()]);
+        assert_eq!(
+            deps.get(&id).unwrap(),
+            &BTreeSet::from(["my_vpc".to_string()])
+        );
     }
 
     #[test]
@@ -1059,7 +1072,7 @@ mod tests {
         let mut state = StateFile::new();
         let mut rs =
             ResourceState::new("ec2.Subnet", "kept-subnet", "awscc").with_identifier("subnet-456");
-        rs.dependency_bindings = vec!["my_vpc".to_string()];
+        rs.dependency_bindings = BTreeSet::from(["my_vpc".to_string()]);
         state.upsert_resource(rs);
 
         let id = ResourceId::with_provider("awscc", "ec2.Subnet", "kept-subnet");
@@ -1186,7 +1199,7 @@ mod tests {
             .into_iter()
             .collect(),
             exists: true,
-            dependency_bindings: Vec::new(),
+            dependency_bindings: BTreeSet::new(),
         };
 
         let mut rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1230,7 +1243,7 @@ mod tests {
             .into_iter()
             .collect(),
             exists: true,
-            dependency_bindings: Vec::new(),
+            dependency_bindings: BTreeSet::new(),
         };
 
         let mut rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1266,7 +1279,7 @@ mod tests {
             .into_iter()
             .collect(),
             exists: true,
-            dependency_bindings: Vec::new(),
+            dependency_bindings: BTreeSet::new(),
         };
 
         let mut rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1338,7 +1351,7 @@ mod tests {
             .into_iter()
             .collect(),
             exists: true,
-            dependency_bindings: Vec::new(),
+            dependency_bindings: BTreeSet::new(),
         };
 
         let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1390,7 +1403,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             exists: true,
-            dependency_bindings: Vec::new(),
+            dependency_bindings: BTreeSet::new(),
         };
 
         let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1449,7 +1462,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             exists: true,
-            dependency_bindings: Vec::new(),
+            dependency_bindings: BTreeSet::new(),
         };
 
         let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1504,7 +1517,7 @@ mod tests {
             .into_iter()
             .collect(),
             exists: true,
-            dependency_bindings: Vec::new(),
+            dependency_bindings: BTreeSet::new(),
         };
 
         let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1564,7 +1577,7 @@ mod tests {
             name_overrides: HashMap::new(),
             desired_keys: vec![],
             binding: Some("vpc".to_string()),
-            dependency_bindings: vec![],
+            dependency_bindings: BTreeSet::new(),
             write_only_attributes: vec![],
         });
         let bindings = state.build_remote_bindings();

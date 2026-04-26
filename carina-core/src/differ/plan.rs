@@ -1,6 +1,6 @@
 //! Plan generation from diffs and cascading update logic.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::deps::get_resource_dependencies;
 use crate::effect::{CascadingUpdate, Effect, TemporaryName};
@@ -156,7 +156,7 @@ pub fn create_plan(
     schemas: &HashMap<String, ResourceSchema>,
     saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
     prev_desired_keys: &HashMap<ResourceId, Vec<String>>,
-    orphan_dependencies: &HashMap<ResourceId, Vec<String>>,
+    orphan_dependencies: &HashMap<ResourceId, BTreeSet<String>>,
 ) -> Plan {
     let mut plan = Plan::new();
 
@@ -338,7 +338,7 @@ pub fn create_plan(
                     lifecycle: lifecycle.clone(),
                     prefixes: HashMap::new(),
                     binding: None,
-                    dependency_bindings: Vec::new(),
+                    dependency_bindings: BTreeSet::new(),
                     module_source: None,
                 };
                 get_resource_dependencies(&temp_resource)

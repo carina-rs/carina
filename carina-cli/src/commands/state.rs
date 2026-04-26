@@ -1391,6 +1391,9 @@ mod tests {
 
         // subnet depends on vpc
         let subnet_resource = plan.effects()[1].resource().unwrap();
-        assert_eq!(subnet_resource.dependency_bindings, vec!["vpc".to_string()]);
+        assert_eq!(
+            subnet_resource.dependency_bindings,
+            std::collections::BTreeSet::from(["vpc".to_string()])
+        );
     }
 }

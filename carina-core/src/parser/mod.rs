@@ -13,7 +13,7 @@ use crate::schema::{
 use crate::version_constraint::VersionConstraint;
 use pest::Parser;
 use pest_derive::Parser;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 #[derive(Parser)]
 #[grammar = "parser/carina.pest"]
@@ -3756,7 +3756,7 @@ fn parse_anonymous_resource(
         lifecycle,
         prefixes: HashMap::new(),
         binding: None,
-        dependency_bindings: Vec::new(),
+        dependency_bindings: BTreeSet::new(),
         module_source: None,
     })
 }
@@ -4147,7 +4147,7 @@ fn parse_resource_expr(
         lifecycle,
         prefixes: HashMap::new(),
         binding: Some(binding_name.to_string()),
-        dependency_bindings: Vec::new(),
+        dependency_bindings: BTreeSet::new(),
         module_source: None,
     })
 }
@@ -4197,7 +4197,7 @@ fn parse_read_resource_expr(
         lifecycle,
         prefixes: HashMap::new(),
         binding: Some(binding_name.to_string()),
-        dependency_bindings: Vec::new(),
+        dependency_bindings: BTreeSet::new(),
         module_source: None,
     })
 }
@@ -4903,8 +4903,7 @@ pub fn resolve_resource_refs_with_config(
     for resource in &mut parsed.resources {
         let deps = crate::deps::get_resource_dependencies(resource);
         if !deps.is_empty() {
-            let dep_list: Vec<String> = deps.into_iter().collect();
-            resource.dependency_bindings = dep_list;
+            resource.dependency_bindings = deps.into_iter().collect();
         }
     }
 
