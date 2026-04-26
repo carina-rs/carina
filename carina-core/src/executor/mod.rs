@@ -557,7 +557,7 @@ mod tests {
             State::existing(subnet_id.clone(), HashMap::new()).with_identifier("subnet-old");
         let mut subnet_to = Resource::new("test", "subnet");
         subnet_to.binding = Some("subnet".to_string());
-        subnet_to.dependency_bindings = vec!["vpc".to_string()];
+        subnet_to.dependency_bindings = std::collections::BTreeSet::from(["vpc".to_string()]);
 
         let cbd_lifecycle = LifecycleConfig {
             create_before_destroy: true,
@@ -634,7 +634,7 @@ mod tests {
             State::existing(subnet_id.clone(), HashMap::new()).with_identifier("subnet-old");
         let mut subnet_to = Resource::new("test", "subnet");
         subnet_to.binding = Some("subnet".to_string());
-        subnet_to.dependency_bindings = vec!["vpc".to_string()];
+        subnet_to.dependency_bindings = std::collections::BTreeSet::from(["vpc".to_string()]);
 
         let dbd_lifecycle = LifecycleConfig::default();
 
@@ -913,8 +913,11 @@ mod tests {
         // tgw_attach depends on tgw, vpc, subnet
         let mut tgw_attach = Resource::new("ec2.transit_gateway_attachment", "tgw_attach");
         tgw_attach.binding = Some("tgw_attach".to_string());
-        tgw_attach.dependency_bindings =
-            vec!["tgw".to_string(), "vpc".to_string(), "subnet".to_string()];
+        tgw_attach.dependency_bindings = std::collections::BTreeSet::from([
+            "tgw".to_string(),
+            "vpc".to_string(),
+            "subnet".to_string(),
+        ]);
 
         // route depends on rt and tgw_attach (but after partial resolution,
         // transit_gateway_id points to ResourceRef { binding: "tgw" })
@@ -923,7 +926,8 @@ mod tests {
             "transit_gateway_id".to_string(),
             Value::resource_ref("tgw".to_string(), "id".to_string(), vec![]),
         );
-        route.dependency_bindings = vec!["rt".to_string(), "tgw_attach".to_string()];
+        route.dependency_bindings =
+            std::collections::BTreeSet::from(["rt".to_string(), "tgw_attach".to_string()]);
 
         // Other resources
         let mut vpc = Resource::new("ec2.Vpc", "vpc");
@@ -934,11 +938,11 @@ mod tests {
 
         let mut subnet = Resource::new("ec2.Subnet", "subnet");
         subnet.binding = Some("subnet".to_string());
-        subnet.dependency_bindings = vec!["vpc".to_string()];
+        subnet.dependency_bindings = std::collections::BTreeSet::from(["vpc".to_string()]);
 
         let mut rt = Resource::new("ec2.RouteTable", "rt");
         rt.binding = Some("rt".to_string());
-        rt.dependency_bindings = vec!["vpc".to_string()];
+        rt.dependency_bindings = std::collections::BTreeSet::from(["vpc".to_string()]);
 
         let mut plan = Plan::new();
         plan.add(Effect::Create(vpc)); // idx 0
@@ -1333,7 +1337,7 @@ mod tests {
             Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         );
         subnet.set_attr("cidr_block", Value::String("10.0.1.0/24".to_string()));
-        subnet.dependency_bindings = vec!["vpc".to_string()];
+        subnet.dependency_bindings = std::collections::BTreeSet::from(["vpc".to_string()]);
         let subnet_id = subnet.id.clone();
 
         let mut plan = Plan::new();
@@ -1509,11 +1513,11 @@ mod tests {
         // from: depends on tgw_a (recorded in state's dependency_bindings)
         let attachment_from = State::existing(attachment_id.clone(), HashMap::new())
             .with_identifier("attach-old")
-            .with_dependency_bindings(vec!["tgw_a".to_string()]);
+            .with_dependency_bindings(std::collections::BTreeSet::from(["tgw_a".to_string()]));
         // to: depends on tgw_b (different TGW — dependency changed)
         let mut attachment_to = Resource::new("test", "attachment");
         attachment_to.binding = Some("attachment".to_string());
-        attachment_to.dependency_bindings = vec!["tgw_b".to_string()];
+        attachment_to.dependency_bindings = std::collections::BTreeSet::from(["tgw_b".to_string()]);
 
         let cbd_lifecycle = LifecycleConfig {
             create_before_destroy: true,
@@ -1599,10 +1603,10 @@ mod tests {
         // attachment Replace (CBD): from depends on tgw_a (state-recorded)
         let attachment_from = State::existing(attachment_id.clone(), HashMap::new())
             .with_identifier("attach-old")
-            .with_dependency_bindings(vec!["tgw_a".to_string()]);
+            .with_dependency_bindings(std::collections::BTreeSet::from(["tgw_a".to_string()]));
         let mut attachment_to = Resource::new("test", "attachment");
         attachment_to.binding = Some("attachment".to_string());
-        attachment_to.dependency_bindings = vec!["tgw_b".to_string()];
+        attachment_to.dependency_bindings = std::collections::BTreeSet::from(["tgw_b".to_string()]);
 
         let cbd_lifecycle = LifecycleConfig {
             create_before_destroy: true,

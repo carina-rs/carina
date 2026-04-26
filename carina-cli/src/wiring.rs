@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -827,7 +827,7 @@ pub async fn create_plan_from_parsed_with_upstream(
         // Pre-build a map of dependency_bindings from the state file so we can
         // restore them after refresh. Provider.read() returns fresh attributes but
         // doesn't know about dependency_bindings (carina-only metadata).
-        let saved_dep_bindings: HashMap<ResourceId, Vec<String>> = state_file
+        let saved_dep_bindings: HashMap<ResourceId, BTreeSet<String>> = state_file
             .as_ref()
             .map(|sf| {
                 sorted_resources

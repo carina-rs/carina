@@ -41,8 +41,7 @@ pub fn resolve_refs_with_state_and_remote(
     for resource in resources.iter_mut() {
         let deps = get_resource_dependencies(resource);
         if !deps.is_empty() {
-            let dep_list: Vec<String> = deps.into_iter().collect();
-            resource.dependency_bindings = dep_list;
+            resource.dependency_bindings = deps.into_iter().collect();
         }
     }
 
@@ -406,7 +405,7 @@ mod tests {
                 attributes: vec![("vpc_id".to_string(), Value::String("vpc-abc".to_string()))]
                     .into_iter()
                     .collect(),
-                dependency_bindings: Vec::new(),
+                dependency_bindings: std::collections::BTreeSet::new(),
             },
         );
 

@@ -338,7 +338,8 @@ mod tests {
             Value::resource_ref("rt", "route_table_id", vec![]),
         );
         // dependency_bindings was saved before resolution with the CORRECT deps
-        resource.dependency_bindings = vec!["rt".to_string(), "tgw_attach".to_string()];
+        resource.dependency_bindings =
+            std::collections::BTreeSet::from(["rt".to_string(), "tgw_attach".to_string()]);
 
         let deps = get_resource_dependencies(&resource);
         // Must include "tgw_attach" from dependency_bindings

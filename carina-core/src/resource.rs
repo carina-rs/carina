@@ -1,6 +1,6 @@
 //! Resource - Representing resources and their state
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
@@ -812,9 +812,14 @@ pub struct Resource {
     /// Binding name from `let` bindings in DSL (e.g., `let vpc = ...`)
     #[serde(default)]
     pub binding: Option<String>,
-    /// Binding names of resources this resource depends on (via ResourceRef)
+    /// Binding names of resources this resource depends on (via ResourceRef).
+    ///
+    /// Set semantics (BTreeSet): the same binding referenced multiple times
+    /// in the resource's attributes contributes a single entry, and
+    /// iteration is alphabetically sorted so consumers (plan display,
+    /// state files) see a deterministic order. See #2228.
     #[serde(default)]
-    pub dependency_bindings: Vec<String>,
+    pub dependency_bindings: BTreeSet<String>,
     /// Module source info for resources that belong to a module
     #[serde(default)]
     pub module_source: Option<ModuleSource>,
@@ -829,7 +834,7 @@ impl Resource {
             lifecycle: LifecycleConfig::default(),
             prefixes: HashMap::new(),
             binding: None,
-            dependency_bindings: Vec::new(),
+            dependency_bindings: BTreeSet::new(),
             module_source: None,
         }
     }
@@ -846,7 +851,7 @@ impl Resource {
             lifecycle: LifecycleConfig::default(),
             prefixes: HashMap::new(),
             binding: None,
-            dependency_bindings: Vec::new(),
+            dependency_bindings: BTreeSet::new(),
             module_source: None,
         }
     }
@@ -906,7 +911,7 @@ impl Resource {
         self
     }
 
-    pub fn with_dependency_bindings(mut self, deps: Vec<String>) -> Self {
+    pub fn with_dependency_bindings(mut self, deps: BTreeSet<String>) -> Self {
         self.dependency_bindings = deps;
         self
     }
@@ -942,7 +947,9 @@ pub struct State {
     pub exists: bool,
     /// Binding names this resource depended on when it was last applied.
     /// Used by the executor to determine delete ordering during replace operations.
-    pub dependency_bindings: Vec<String>,
+    ///
+    /// Set semantics (BTreeSet) — see Resource::dependency_bindings (#2228).
+    pub dependency_bindings: BTreeSet<String>,
 }
 
 impl State {
@@ -952,7 +959,7 @@ impl State {
             identifier: None,
             attributes: HashMap::new(),
             exists: false,
-            dependency_bindings: Vec::new(),
+            dependency_bindings: BTreeSet::new(),
         }
     }
 
@@ -962,7 +969,7 @@ impl State {
             identifier: None,
             attributes,
             exists: true,
-            dependency_bindings: Vec::new(),
+            dependency_bindings: BTreeSet::new(),
         }
     }
 
@@ -971,7 +978,7 @@ impl State {
         self
     }
 
-    pub fn with_dependency_bindings(mut self, deps: Vec<String>) -> Self {
+    pub fn with_dependency_bindings(mut self, deps: BTreeSet<String>) -> Self {
         self.dependency_bindings = deps;
         self
     }
@@ -1435,10 +1442,46 @@ mod tests {
     #[test]
     fn resource_typed_dependency_bindings_field() {
         let resource = Resource::new("ec2.Subnet", "my-subnet")
-            .with_dependency_bindings(vec!["vpc".to_string()]);
-        assert_eq!(resource.dependency_bindings, vec!["vpc".to_string()]);
+            .with_dependency_bindings(["vpc".to_string()].into_iter().collect());
+        assert!(resource.dependency_bindings.contains("vpc"));
+        assert_eq!(resource.dependency_bindings.len(), 1);
         // dependency_bindings should NOT be in attributes
         assert!(!resource.attributes.contains_key("_dependency_bindings"));
+    }
+
+    /// Set semantics: assigning the same binding twice yields exactly one
+    /// entry (#2228).
+    #[test]
+    fn resource_dependency_bindings_dedup_on_duplicate_insert() {
+        let mut resource = Resource::new("ec2.Subnet", "my-subnet");
+        resource.dependency_bindings.insert("vpc".to_string());
+        resource.dependency_bindings.insert("vpc".to_string());
+        assert_eq!(resource.dependency_bindings.len(), 1);
+        assert!(resource.dependency_bindings.contains("vpc"));
+    }
+
+    /// Iteration order is deterministic (sorted) regardless of insertion
+    /// order (#2228).
+    #[test]
+    fn resource_dependency_bindings_iteration_is_sorted() {
+        let mut resource = Resource::new("ec2.Route", "my-route");
+        resource.dependency_bindings.insert("rt".to_string());
+        resource
+            .dependency_bindings
+            .insert("tgw_attach".to_string());
+        resource.dependency_bindings.insert("vpc".to_string());
+        let order: Vec<&String> = resource.dependency_bindings.iter().collect();
+        assert_eq!(order, vec!["rt", "tgw_attach", "vpc"]);
+    }
+
+    /// State-struct dependency_bindings has the same Set semantics so
+    /// that delete-ordering metadata is also dedup'd and stable (#2228).
+    #[test]
+    fn state_dependency_bindings_dedup_on_duplicate_insert() {
+        let mut state = State::not_found(ResourceId::new("ec2.Subnet", "my-subnet"));
+        state.dependency_bindings.insert("vpc".to_string());
+        state.dependency_bindings.insert("vpc".to_string());
+        assert_eq!(state.dependency_bindings.len(), 1);
     }
 
     #[test]

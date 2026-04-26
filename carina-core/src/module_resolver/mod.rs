@@ -12,7 +12,7 @@
 
 mod validation;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -453,7 +453,7 @@ impl<'cfg> ModuleResolver<'cfg> {
                 lifecycle: LifecycleConfig::default(),
                 prefixes: HashMap::new(),
                 binding: Some(binding_name.clone()),
-                dependency_bindings: Vec::new(),
+                dependency_bindings: BTreeSet::new(),
                 module_source: None,
             };
             expanded_resources.push(virtual_resource);
@@ -1129,7 +1129,7 @@ mod tests {
                 lifecycle: LifecycleConfig::default(),
                 prefixes: HashMap::new(),
                 binding: None,
-                dependency_bindings: Vec::new(),
+                dependency_bindings: BTreeSet::new(),
                 module_source: None,
             }],
             variables: HashMap::new(),
@@ -1257,7 +1257,7 @@ mod tests {
                     lifecycle: LifecycleConfig::default(),
                     prefixes: HashMap::new(),
                     binding: Some("vpc".to_string()),
-                    dependency_bindings: Vec::new(),
+                    dependency_bindings: BTreeSet::new(),
                     module_source: None,
                 },
                 Resource {
@@ -1274,7 +1274,7 @@ mod tests {
                     lifecycle: LifecycleConfig::default(),
                     prefixes: HashMap::new(),
                     binding: Some("subnet".to_string()),
-                    dependency_bindings: Vec::new(),
+                    dependency_bindings: BTreeSet::new(),
                     module_source: None,
                 },
             ],
@@ -1401,7 +1401,7 @@ mod tests {
                 lifecycle: LifecycleConfig::default(),
                 prefixes: HashMap::new(),
                 binding: Some("sg".to_string()),
-                dependency_bindings: Vec::new(),
+                dependency_bindings: BTreeSet::new(),
                 module_source: None,
             }],
             variables: HashMap::new(),
@@ -2202,7 +2202,7 @@ thing { name = 'unchanged-but-different' }
                 lifecycle: LifecycleConfig::default(),
                 prefixes: HashMap::new(),
                 binding: Some("vpc".to_string()),
-                dependency_bindings: Vec::new(),
+                dependency_bindings: BTreeSet::new(),
                 module_source: None,
             }],
             variables: HashMap::new(),

@@ -2946,7 +2946,7 @@ mod tests {
         );
         // _dependency_bindings is saved by resolve_refs_with_state() before
         // ResourceRef values are resolved to strings.
-        sg.dependency_bindings = vec!["vpc".to_string()];
+        sg.dependency_bindings = std::collections::BTreeSet::from(["vpc".to_string()]);
 
         let mut plan = Plan::new();
         plan.add(Effect::Update {
