@@ -172,21 +172,22 @@ impl DiagnosticEngine {
     /// `arguments` is a module-input declaration; it has no caller in a
     /// root config. Without a `use` site to feed values, its `default`
     /// would silently become a de-facto root variable (issue #2198).
-    /// A `backend` block is a root-only construct, so its presence next
-    /// to `arguments` — possibly in a sibling `.crn` file — is an
-    /// unambiguous signal that this directory is being authored as a
-    /// root configuration. `merged` (the directory-scoped parse) takes
-    /// precedence so the signal can come from a sibling file.
+    /// `backend` and `provider` blocks are root-only constructs, so the
+    /// presence of either next to `arguments` — possibly in a sibling
+    /// `.crn` file — unambiguously identifies a root configuration. The
+    /// merged directory parse takes precedence so the signal can come
+    /// from a sibling file.
     pub(super) fn check_arguments_in_root(
         &self,
         doc: &Document,
         parsed: &ParsedFile,
         merged: Option<&ParsedFile>,
     ) -> Vec<Diagnostic> {
-        let backend_present = merged
-            .map(|m| m.backend.is_some())
-            .unwrap_or_else(|| parsed.backend.is_some());
-        if parsed.arguments.is_empty() || !backend_present {
+        let is_root = match merged {
+            Some(m) => m.backend.is_some() || !m.providers.is_empty(),
+            None => parsed.backend.is_some() || !parsed.providers.is_empty(),
+        };
+        if parsed.arguments.is_empty() || !is_root {
             return Vec::new();
         }
 
