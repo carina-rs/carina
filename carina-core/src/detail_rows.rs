@@ -618,7 +618,7 @@ fn build_replace_rows(
 
             updates.push(CascadingUpdateIR {
                 display_type: cascade.id.display_type(),
-                name: cascade.id.name.clone(),
+                name: cascade.id.name_str().to_string(),
                 changed_attrs,
             });
         }

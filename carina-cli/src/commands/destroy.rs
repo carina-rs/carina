@@ -470,10 +470,9 @@ async fn run_destroy_locked(
                 binding: resource.binding.clone(),
                 dependencies,
             };
-            let binding = resource
-                .binding
-                .clone()
-                .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name));
+            let binding = resource.binding.clone().unwrap_or_else(|| {
+                format!("{}:{}", resource.id.resource_type, resource.id.name_str())
+            });
             (binding, identifier, effect)
         })
         .collect();
@@ -921,7 +920,7 @@ async fn run_destroy_locked(
 /// clear any exports (since exports reference attributes of destroyed resources).
 fn apply_destroy_to_state(state: &mut carina_state::StateFile, destroyed_ids: &[ResourceId]) {
     for id in destroyed_ids {
-        state.remove_resource(&id.provider, &id.resource_type, &id.name);
+        state.remove_resource(&id.provider, &id.resource_type, id.name_str());
     }
     state.exports.clear();
 }
@@ -933,7 +932,7 @@ fn apply_destroy_to_state(state: &mut carina_state::StateFile, destroyed_ids: &[
 /// and tree display work correctly.
 fn build_orphan_resource(sf: &carina_state::StateFile, id: &ResourceId) -> Resource {
     let rs = sf
-        .find_resource(&id.provider, &id.resource_type, &id.name)
+        .find_resource(&id.provider, &id.resource_type, id.name_str())
         .expect("orphan must exist in state file");
     let attributes: HashMap<String, Value> = rs
         .attributes

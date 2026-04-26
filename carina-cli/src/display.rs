@@ -432,7 +432,7 @@ impl<'a> TreeRenderContext<'a> {
         match effect {
             Effect::Create(r) => {
                 if self.detail == DetailLevel::None {
-                    let name_part = format_compact_name(r, &r.id.name, parent_binding);
+                    let name_part = format_compact_name(r, r.id.name_str(), parent_binding);
                     writeln!(
                         self.out,
                         "{}{}{} {} {}",
@@ -451,7 +451,7 @@ impl<'a> TreeRenderContext<'a> {
                         connector,
                         colored_symbol,
                         r.id.display_type().cyan().bold(),
-                        r.id.name.white().bold()
+                        r.id.name_str().white().bold()
                     )
                     .unwrap();
                 }
@@ -462,7 +462,7 @@ impl<'a> TreeRenderContext<'a> {
                     .get(id)
                     .map(|from| format!(" (moved from: {}.{})", from.display_type(), from.name));
                 if self.detail == DetailLevel::None {
-                    let name_part = format_compact_name(to, &id.name, parent_binding);
+                    let name_part = format_compact_name(to, id.name_str(), parent_binding);
                     writeln!(
                         self.out,
                         "{}{}{} {} {}{}",
@@ -482,7 +482,7 @@ impl<'a> TreeRenderContext<'a> {
                         connector,
                         colored_symbol,
                         id.display_type().cyan().bold(),
-                        id.name.yellow().bold(),
+                        id.name_str().yellow().bold(),
                         moved_note.as_deref().unwrap_or("").yellow()
                     )
                     .unwrap();
@@ -501,7 +501,7 @@ impl<'a> TreeRenderContext<'a> {
                     .get(id)
                     .map(|from| format!(" (moved from: {}.{})", from.display_type(), from.name));
                 if self.detail == DetailLevel::None {
-                    let name_part = format_compact_name(to, &id.name, parent_binding);
+                    let name_part = format_compact_name(to, id.name_str(), parent_binding);
                     writeln!(
                         self.out,
                         "{}{}{} {} {} {}{}",
@@ -522,7 +522,7 @@ impl<'a> TreeRenderContext<'a> {
                         connector,
                         colored_symbol,
                         id.display_type().cyan().bold(),
-                        id.name.magenta().bold(),
+                        id.name_str().magenta().bold(),
                         replace_note.magenta(),
                         moved_note.as_deref().unwrap_or("").magenta()
                     )
@@ -530,7 +530,7 @@ impl<'a> TreeRenderContext<'a> {
                 }
             }
             Effect::Delete { id, binding, .. } => {
-                let display_name = binding.as_deref().unwrap_or(&id.name);
+                let display_name = binding.as_deref().unwrap_or(id.name_str());
                 writeln!(
                     self.out,
                     "{}{}{} {} {}",
@@ -545,7 +545,7 @@ impl<'a> TreeRenderContext<'a> {
             Effect::Read { resource } => {
                 if self.detail == DetailLevel::None {
                     let name_part =
-                        format_compact_name(resource, &resource.id.name, parent_binding);
+                        format_compact_name(resource, resource.id.name_str(), parent_binding);
                     writeln!(
                         self.out,
                         "{}{}{} {} {} {}",
@@ -565,7 +565,7 @@ impl<'a> TreeRenderContext<'a> {
                         connector,
                         colored_symbol,
                         resource.id.display_type().cyan().bold(),
-                        resource.id.name.cyan().bold(),
+                        resource.id.name_str().cyan().bold(),
                         "(data source)".dimmed()
                     )
                     .unwrap();
@@ -579,7 +579,7 @@ impl<'a> TreeRenderContext<'a> {
                     connector,
                     colored_symbol,
                     id.display_type().cyan().bold(),
-                    id.name.cyan().bold(),
+                    id.name_str().cyan().bold(),
                     format!("(import: {})", identifier).dimmed()
                 )
                 .unwrap();
@@ -592,7 +592,7 @@ impl<'a> TreeRenderContext<'a> {
                     connector,
                     colored_symbol,
                     id.display_type().cyan().bold(),
-                    id.name.red().bold(),
+                    id.name_str().red().bold(),
                     "(remove from state)".dimmed()
                 )
                 .unwrap();
@@ -611,7 +611,7 @@ impl<'a> TreeRenderContext<'a> {
                     connector,
                     colored_symbol,
                     to.display_type().cyan().bold(),
-                    to.name.yellow().bold(),
+                    to.name_str().yellow().bold(),
                     format!("(moved from: {})", from).dimmed()
                 )
                 .unwrap();
@@ -1360,7 +1360,7 @@ pub fn format_effect(effect: &Effect) -> String {
             }
         }
         Effect::Delete { id, binding, .. } => {
-            let display_name = binding.as_deref().unwrap_or(&id.name);
+            let display_name = binding.as_deref().unwrap_or(id.name_str());
             format!("Delete {}.{}", id.display_type(), display_name)
         }
         Effect::Read { resource } => {

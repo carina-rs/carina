@@ -649,7 +649,7 @@ pub fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateFile, Ap
         let existing = state.find_resource(
             &resource.id.provider,
             &resource.id.resource_type,
-            &resource.id.name,
+            resource.id.name_str(),
         );
         // Collect write-only attribute names from the schema for this resource type.
         // Schema keys include the provider prefix (e.g., "awscc.ec2.Vpc"), so we must
@@ -695,7 +695,7 @@ pub fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateFile, Ap
                 state.remove_resource(
                     &resource.id.provider,
                     &resource.id.resource_type,
-                    &resource.id.name,
+                    resource.id.name_str(),
                 );
             }
         }
@@ -704,7 +704,7 @@ pub fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateFile, Ap
     for effect in plan.effects() {
         match effect {
             Effect::Delete { id, .. } if successfully_deleted.contains(id) => {
-                state.remove_resource(&id.provider, &id.resource_type, &id.name);
+                state.remove_resource(&id.provider, &id.resource_type, id.name_str());
             }
             Effect::Import { .. } => {
                 // Already handled in the sorted_resources loop above via applied_states.
@@ -712,19 +712,19 @@ pub fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateFile, Ap
                 // desired_keys, binding, dependency_bindings) with bare defaults.
             }
             Effect::Remove { id } => {
-                state.remove_resource(&id.provider, &id.resource_type, &id.name);
+                state.remove_resource(&id.provider, &id.resource_type, id.name_str());
             }
             Effect::Move { from, to } => {
                 // Move: update the resource's identity in state
                 if let Some(existing) = state
-                    .find_resource(&from.provider, &from.resource_type, &from.name)
+                    .find_resource(&from.provider, &from.resource_type, from.name_str())
                     .cloned()
                 {
-                    state.remove_resource(&from.provider, &from.resource_type, &from.name);
+                    state.remove_resource(&from.provider, &from.resource_type, from.name_str());
                     let mut moved_resource = existing;
                     moved_resource.provider = to.provider.clone();
                     moved_resource.resource_type = to.resource_type.clone();
-                    moved_resource.name = to.name.clone();
+                    moved_resource.name = to.name_str().to_string();
                     state.upsert_resource(moved_resource);
                 }
             }
@@ -1167,7 +1167,8 @@ async fn run_apply_locked(
             sorted_resources
                 .iter()
                 .filter_map(|r| {
-                    let rs = sf.find_resource(&r.id.provider, &r.id.resource_type, &r.id.name)?;
+                    let rs =
+                        sf.find_resource(&r.id.provider, &r.id.resource_type, r.id.name_str())?;
                     if rs.dependency_bindings.is_empty() {
                         None
                     } else {

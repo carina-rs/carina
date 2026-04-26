@@ -437,7 +437,7 @@ fn collect_unused_let_bindings_in_fixtures(
             .iter()
             .filter_map(|sb| {
                 if let carina_core::parser::StateBlock::Moved { to, .. } = sb {
-                    Some(to.name.clone())
+                    Some(to.name_str().to_string())
                 } else {
                     None
                 }

@@ -786,7 +786,7 @@ fn diff_display_update_resource(
     updated_count: &mut u32,
     unchanged_count: &mut u32,
 ) -> Result<(), AppError> {
-    let existing = state.find_resource(&id.provider, &id.resource_type, &id.name);
+    let existing = state.find_resource(&id.provider, &id.resource_type, id.name_str());
     let existing_rs = match existing {
         Some(rs) => rs,
         None => return Ok(()),
@@ -875,15 +875,16 @@ fn diff_display_update_resource(
         let res = match resource {
             Some(r) => r,
             None => {
-                owned_resource = Resource::with_provider(&id.provider, &id.resource_type, &id.name);
+                owned_resource =
+                    Resource::with_provider(&id.provider, &id.resource_type, id.name_str());
                 &owned_resource
             }
         };
-        let existing_rs = state.find_resource(&id.provider, &id.resource_type, &id.name);
+        let existing_rs = state.find_resource(&id.provider, &id.resource_type, id.name_str());
         let resource_state = ResourceState::from_provider_state(res, fresh_state, existing_rs)?;
         state.upsert_resource(resource_state);
     } else {
-        state.remove_resource(&id.provider, &id.resource_type, &id.name);
+        state.remove_resource(&id.provider, &id.resource_type, id.name_str());
     }
 
     Ok(())

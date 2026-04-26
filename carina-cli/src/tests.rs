@@ -588,10 +588,13 @@ fn test_anonymous_id_different_regions_produce_different_identifiers() {
     compute_anonymous_identifiers(&mut resources_west, &providers_west).unwrap();
 
     // Both should have identifiers assigned
-    assert!(!resources_east[0].id.name.is_empty());
-    assert!(!resources_west[0].id.name.is_empty());
+    assert!(!resources_east[0].id.name_str().is_empty());
+    assert!(!resources_west[0].id.name_str().is_empty());
     // They must be different because providers have different regions
-    assert_ne!(resources_east[0].id.name, resources_west[0].id.name);
+    assert_ne!(
+        resources_east[0].id.name_str(),
+        resources_west[0].id.name_str()
+    );
 }
 
 #[test]
@@ -637,9 +640,9 @@ fn test_anonymous_id_different_create_only_same_region_no_collision() {
     let mut resources = vec![r1, r2];
     compute_anonymous_identifiers(&mut resources, &providers).unwrap();
 
-    assert!(!resources[0].id.name.is_empty());
-    assert!(!resources[1].id.name.is_empty());
-    assert_ne!(resources[0].id.name, resources[1].id.name);
+    assert!(!resources[0].id.name_str().is_empty());
+    assert!(!resources[1].id.name_str().is_empty());
+    assert_ne!(resources[0].id.name_str(), resources[1].id.name_str());
 }
 
 #[test]
@@ -656,7 +659,7 @@ fn test_anonymous_id_named_resources_are_skipped() {
     compute_anonymous_identifiers(&mut resources, &providers).unwrap();
 
     // Name should remain unchanged
-    assert_eq!(resources[0].id.name, "my_vpc");
+    assert_eq!(resources[0].id.name_str(), "my_vpc");
 }
 
 #[test]
@@ -837,7 +840,7 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
 
     // 3. compute_anonymous_identifiers
     compute_anonymous_identifiers(&mut resources_run1, &providers).unwrap();
-    let run1_name = resources_run1[0].id.name.clone();
+    let run1_name = resources_run1[0].id.name_str().to_string();
     assert!(
         !run1_name.is_empty(),
         "Anonymous identifier should be assigned"
@@ -877,7 +880,7 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
 
     // 3. compute_anonymous_identifiers - should produce SAME identifier
     compute_anonymous_identifiers(&mut resources_run2, &providers).unwrap();
-    let run2_name = resources_run2[0].id.name.clone();
+    let run2_name = resources_run2[0].id.name_str().to_string();
 
     assert_eq!(
         run1_name, run2_name,
@@ -937,7 +940,7 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
     let mut resources_run1 = vec![resource_run1];
     resolve_names(&mut resources_run1).unwrap();
     compute_anonymous_identifiers(&mut resources_run1, &providers).unwrap();
-    let run1_name = resources_run1[0].id.name.clone();
+    let run1_name = resources_run1[0].id.name_str().to_string();
 
     // Simulate state after apply
     let run1_role_name = match resources_run1[0].get_attr("role_name") {
@@ -991,7 +994,7 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
     let mut resources_run2 = vec![resource_run2];
     resolve_names(&mut resources_run2).unwrap();
     compute_anonymous_identifiers(&mut resources_run2, &providers).unwrap();
-    let run2_name = resources_run2[0].id.name.clone();
+    let run2_name = resources_run2[0].id.name_str().to_string();
 
     assert_eq!(
         run1_name, run2_name,
@@ -1051,7 +1054,7 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
 
     let mut resources_run1 = vec![resource_run1];
     compute_anonymous_identifiers(&mut resources_run1, &providers).unwrap();
-    let run1_name = resources_run1[0].id.name.clone();
+    let run1_name = resources_run1[0].id.name_str().to_string();
 
     // Simulate state after apply
     let applied_state = State::existing(resources_run1[0].id.clone(), HashMap::new())
@@ -1099,7 +1102,7 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
 
     let mut resources_run2 = vec![resource_run2];
     compute_anonymous_identifiers(&mut resources_run2, &providers).unwrap();
-    let run2_name = resources_run2[0].id.name.clone();
+    let run2_name = resources_run2[0].id.name_str().to_string();
 
     assert_eq!(
         run1_name, run2_name,
@@ -1274,7 +1277,7 @@ fn orphaned_state_resource_produces_delete_effect() {
 
     match &delete_effects[0] {
         Effect::Delete { id, identifier, .. } => {
-            assert_eq!(id.name, "removed-bucket");
+            assert_eq!(id.name_str(), "removed-bucket");
             assert_eq!(identifier, "removed-bucket");
         }
         _ => unreachable!(),
