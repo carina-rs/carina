@@ -810,4 +810,140 @@ mod tests {
         assert_eq!(convert_region_value("us-east-1"), "us-east-1");
         assert_eq!(convert_region_value("eu-west-1"), "eu-west-1");
     }
+
+    // Table-driven coverage for #2221. The per-case tests above each pin one
+    // shape; these tables enumerate the cross-cutting dimensions that no
+    // single per-case test exercises together: dotted values at sub-5-part
+    // shapes, digits-only values, hyphen-bearing segments, and digit-bearing
+    // resource segments beyond the `s3`/`ec2` already covered. When a new
+    // namespaced-identifier shape lands (e.g. #2213), append rows here.
+
+    #[test]
+    fn extract_enum_value_with_values_table() {
+        let cases: &[(&str, &[&str], &str)] = &[
+            // Dotted value at sub-5-part shapes (5-part is already pinned by
+            // test_extract_enum_value_with_values_dotted).
+            ("ipsec.1", &["ipsec.1"], "ipsec.1"),
+            ("Type.ipsec.1", &["ipsec.1"], "ipsec.1"),
+            ("aws.Type.ipsec.1", &["ipsec.1"], "ipsec.1"),
+            ("aws.ec2.Type.ipsec.1", &["ipsec.1"], "ipsec.1"),
+            ("aws.ec2.Volume.Iops.100", &["100", "200"], "100"),
+            ("Iops.1", &["1"], "1"),
+            (
+                "aws.Region.ap_northeast_1",
+                &["ap_northeast_1"],
+                "ap_northeast_1",
+            ),
+            ("aws.ec2.Volume.Type.gp2", &["gp2", "gp3"], "gp2"),
+            ("aws.ec2.Volume.Type.gp_2", &["gp_2"], "gp_2"),
+            ("aws.route53.RecordType.A", &["A", "AAAA", "CNAME"], "A"),
+            (
+                "awscc.route53.HostedZone.RecordType.AAAA",
+                &["A", "AAAA"],
+                "AAAA",
+            ),
+            ("aws.ec2.Volume.Type.io1", &["io1", "io2"], "io1"),
+            // TypeName whose lowercased form is also a valid value: the
+            // function must skip the TypeName segment and return the trailing
+            // value, not the type name itself.
+            ("Default.default", &["default", "other"], "default"),
+        ];
+        for (input, valid, expected) in cases {
+            assert_eq!(
+                extract_enum_value_with_values(input, valid),
+                *expected,
+                "input={input:?} valid={valid:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn is_dsl_enum_format_table() {
+        let cases: &[(&str, bool)] = &[
+            ("Type.gp2", true),
+            ("Iops.100", true),
+            ("region.ap_northeast_1", false),
+            ("AWS.Region.ap_northeast_1", false),
+            ("aws.route53.RecordType.A", true),
+            ("aws.s-3.VersioningStatus.Enabled", false),
+            ("awscc.route53.HostedZone.RecordType.A", true),
+            ("awscc.ec2.ipam_pool.AddressFamily.IPv4", true),
+            ("awscc.ec2.vpn_gateway.Type.ipsec.1", true),
+            ("some.random.string", false),
+            ("a.b.c.d.e.f", false),
+            ("aws.s3.versioningstatus.Enabled", false),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(is_dsl_enum_format(input), *expected, "input={input:?}");
+        }
+    }
+
+    #[test]
+    fn convert_enum_value_table() {
+        let cases: &[(&str, &str)] = &[
+            ("Type.gp2", "gp2"),
+            ("Iops.100", "100"),
+            ("aws.Region.ap_northeast_1", "ap_northeast_1"),
+            ("aws.route53.RecordType.AAAA", "AAAA"),
+            ("aws.ec2.Volume.Iops.100", "100"),
+            ("awscc.ec2.vpn_gateway.Type.ipsec.1", "ipsec.1"),
+            ("awscc.ec2.Vpc.InstanceTenancy.default", "default"),
+            ("TargetType.AWS_ACCOUNT", "AWS_ACCOUNT"),
+            ("awscc.sso.Assignment.TargetType.AWS_ACCOUNT", "AWS_ACCOUNT"),
+            ("eu-west-1", "eu-west-1"),
+            ("region.us_east_1", "region.us_east_1"),
+            ("Enabled", "Enabled"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(convert_enum_value(input), *expected, "input={input:?}");
+        }
+    }
+
+    #[test]
+    fn validate_enum_namespace_table() {
+        let cases: &[(&str, &str, &str, bool)] = &[
+            ("Enabled", "VersioningStatus", "aws.s3.Bucket", true),
+            ("100", "Iops", "aws.ec2.Volume", true),
+            ("Iops.100", "Iops", "aws.ec2.Volume", true),
+            ("Iops.100", "Tenancy", "aws.ec2.Volume", false),
+            ("aws.Region.ap_northeast_1", "Region", "aws", true),
+            ("gcp.Region.ap_northeast_1", "Region", "aws", false),
+            (
+                "aws.s3.VersioningStatus.Enabled",
+                "VersioningStatus",
+                "aws.s3",
+                true,
+            ),
+            (
+                "awscc.ec2.Vpc.InstanceTenancy.default",
+                "InstanceTenancy",
+                "awscc.ec2.Vpc",
+                true,
+            ),
+            // Dotted values like `ipsec.1` blow the strict part-count rule —
+            // callers must strip them before validating.
+            (
+                "awscc.ec2.vpn_gateway.Type.ipsec.1",
+                "Type",
+                "awscc.ec2.vpn_gateway",
+                false,
+            ),
+            ("aws.Region.aws.Region.us_west_2", "Region", "aws", false),
+            ("foo.bar.baz.ap_northeast_1", "Region", "aws", false),
+            (
+                "awscc.route53.HostedZone.RecordType.A",
+                "RecordType",
+                "awscc.route53.HostedZone",
+                true,
+            ),
+        ];
+        for (input, type_name, namespace, ok) in cases {
+            let result = validate_enum_namespace(input, type_name, namespace);
+            assert_eq!(
+                result.is_ok(),
+                *ok,
+                "input={input:?} type_name={type_name:?} ns={namespace:?} got={result:?}",
+            );
+        }
+    }
 }
