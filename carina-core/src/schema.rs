@@ -163,39 +163,11 @@ impl AttributeType {
         }
     }
 
-    fn resolve_enum_input(
-        name: &str,
-        namespace: Option<&str>,
-        value: &Value,
-    ) -> Result<Value, TypeError> {
+    fn resolve_enum_input(name: &str, namespace: Option<&str>, value: &Value) -> Value {
         if matches!(value, Value::ResourceRef { .. }) {
-            return Ok(value.clone());
+            return value.clone();
         }
-
-        match value {
-            Value::String(s) if !s.contains('.') => {
-                // Bare identifier like "dedicated"
-                let expanded = match namespace {
-                    Some(ns) => format!("{}.{}.{}", ns, name, s),
-                    None => s.clone(),
-                };
-                Ok(Value::String(expanded))
-            }
-            Value::String(s) if s.split('.').count() == 2 => {
-                // Two-part identifier like "InstanceTenancy.dedicated"
-                if let Some((ident, member)) = s.split_once('.') {
-                    let expanded = match namespace {
-                        Some(ns) if ident == name => format!("{}.{}.{}", ns, ident, member),
-                        Some(_) => s.clone(),
-                        None => s.clone(),
-                    };
-                    Ok(Value::String(expanded))
-                } else {
-                    Ok(value.clone())
-                }
-            }
-            other => Ok(other.clone()),
-        }
+        crate::utils::expand_enum_shorthand(value, name, namespace)
     }
 
     pub fn string_enum_parts(&self) -> Option<StringEnumParts<'_>> {
@@ -262,7 +234,7 @@ impl AttributeType {
                 if matches!(v, Value::Interpolation(_)) {
                     return Ok(());
                 }
-                let resolved_value = Self::resolve_enum_input(name, namespace.as_deref(), v)?;
+                let resolved_value = Self::resolve_enum_input(name, namespace.as_deref(), v);
                 if matches!(resolved_value, Value::ResourceRef { .. }) {
                     return Ok(());
                 }
@@ -378,7 +350,7 @@ impl AttributeType {
                 }
                 let name_for_resolve = semantic_name.as_deref().unwrap_or("");
                 let resolved_value =
-                    Self::resolve_enum_input(name_for_resolve, namespace.as_deref(), v)?;
+                    Self::resolve_enum_input(name_for_resolve, namespace.as_deref(), v);
                 validate(&resolved_value)
                     .map_err(|msg| TypeError::ValidationFailed { message: msg })
             }
