@@ -466,32 +466,11 @@ impl DiagnosticEngine {
                                     let name = semantic_name.as_deref().unwrap_or("");
                                     // Handle bare/shorthand enum identifiers by expanding to full namespace format.
                                     // These are String values like "dedicated" or "InstanceTenancy.dedicated".
-                                    let resolved_value = match value {
-                                        Value::String(s) if !s.contains('.') => {
-                                            // Bare identifier: "dedicated" -> namespace.TypeName.dedicated
-                                            let expanded = match namespace {
-                                                Some(ns) => format!("{}.{}.{}", ns, name, s),
-                                                None => s.clone(),
-                                            };
-                                            Value::String(expanded)
-                                        }
-                                        Value::String(s) if s.split('.').count() == 2 => {
-                                            // Two-part: "InstanceTenancy.dedicated" -> namespace.InstanceTenancy.dedicated
-                                            if let Some((ident, member)) = s.split_once('.') {
-                                                let expanded = match namespace {
-                                                    Some(ns) if ident == name => {
-                                                        format!("{}.{}.{}", ns, ident, member)
-                                                    }
-                                                    Some(_ns) => s.clone(),
-                                                    None => s.clone(),
-                                                };
-                                                Value::String(expanded)
-                                            } else {
-                                                value.clone()
-                                            }
-                                        }
-                                        _ => value.clone(),
-                                    };
+                                    let resolved_value = carina_core::utils::expand_enum_shorthand(
+                                        value,
+                                        name,
+                                        namespace.as_deref(),
+                                    );
 
                                     // Use schema's validate function for all Custom types
                                     validate(&resolved_value).err().map(|inner_msg| {

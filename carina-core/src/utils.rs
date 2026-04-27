@@ -203,6 +203,42 @@ fn is_intermediate_segment(s: &str) -> bool {
     snake || pascal
 }
 
+/// Expand a user-written enum value into its fully-qualified DSL form.
+///
+/// Accepts the three input shapes the DSL allows for `StringEnum` and
+/// enum-like `Custom` attributes:
+///
+/// - bare member (`dedicated`) → `<namespace>.<name>.dedicated`
+/// - `TypeName.member` shorthand (`InstanceTenancy.dedicated`) →
+///   `<namespace>.<name>.dedicated`, only when `TypeName == name`
+/// - any other input (already-qualified, foreign type name, missing
+///   namespace, non-string) → returned unchanged
+///
+/// Used by both `AttributeType::resolve_value` and the LSP diagnostic
+/// pipeline so the two paths cannot drift.
+pub fn expand_enum_shorthand(value: &Value, name: &str, namespace: Option<&str>) -> Value {
+    match value {
+        Value::String(s) if !s.contains('.') => match namespace {
+            Some(ns) => Value::String(format!("{}.{}.{}", ns, name, s)),
+            None => value.clone(),
+        },
+        Value::String(s) => {
+            if let Some(NamespacedId::TypeQualified {
+                type_name: ident,
+                value: member,
+            }) = NamespacedId::parse(s)
+                && let Some(ns) = namespace
+                && ident == name
+            {
+                Value::String(format!("{}.{}.{}", ns, ident, member))
+            } else {
+                value.clone()
+            }
+        }
+        other => other.clone(),
+    }
+}
+
 /// A `TypeName` segment — first char uppercase ASCII.
 fn is_type_name_segment(s: &str) -> bool {
     s.chars().next().is_some_and(|c| c.is_ascii_uppercase())
@@ -1035,6 +1071,73 @@ mod tests {
                 *ok,
                 "input={input:?} type_name={type_name:?} ns={namespace:?} got={result:?}",
             );
+        }
+    }
+
+    // expand_enum_shorthand pins the contract that `schema.rs` and the LSP
+    // `diagnostics` module both rely on. The helper exists specifically so
+    // those two paths cannot drift; each row here is a behaviour the unified
+    // function must keep on both sides.
+    #[test]
+    fn expand_enum_shorthand_table() {
+        // (input, name, namespace, expected_output_string_or_passthrough)
+        // `None` for namespace means "no namespace" — bare and 2-part inputs
+        // pass through unchanged.
+        let cases: &[(Value, &str, Option<&str>, Value)] = &[
+            // bare member + namespace → fully qualified
+            (
+                Value::String("dedicated".into()),
+                "InstanceTenancy",
+                Some("awscc.ec2.Vpc"),
+                Value::String("awscc.ec2.Vpc.InstanceTenancy.dedicated".into()),
+            ),
+            // bare member, no namespace → passthrough
+            (
+                Value::String("dedicated".into()),
+                "InstanceTenancy",
+                None,
+                Value::String("dedicated".into()),
+            ),
+            // TypeName.member matching `name` → fully qualified
+            (
+                Value::String("InstanceTenancy.dedicated".into()),
+                "InstanceTenancy",
+                Some("awscc.ec2.Vpc"),
+                Value::String("awscc.ec2.Vpc.InstanceTenancy.dedicated".into()),
+            ),
+            // TypeName.member with foreign type name → passthrough
+            (
+                Value::String("Tenancy.dedicated".into()),
+                "InstanceTenancy",
+                Some("awscc.ec2.Vpc"),
+                Value::String("Tenancy.dedicated".into()),
+            ),
+            // Already-fully-qualified → passthrough (parser returns
+            // `FullyQualified`, helper only acts on `TypeQualified`)
+            (
+                Value::String("awscc.ec2.Vpc.InstanceTenancy.dedicated".into()),
+                "InstanceTenancy",
+                Some("awscc.ec2.Vpc"),
+                Value::String("awscc.ec2.Vpc.InstanceTenancy.dedicated".into()),
+            ),
+            // Lowercase first segment → not a TypeName; passthrough
+            (
+                Value::String("instanceTenancy.dedicated".into()),
+                "InstanceTenancy",
+                Some("awscc.ec2.Vpc"),
+                Value::String("instanceTenancy.dedicated".into()),
+            ),
+            // Non-string → passthrough
+            (
+                Value::Bool(true),
+                "Whatever",
+                Some("aws"),
+                Value::Bool(true),
+            ),
+        ];
+        for (input, name, ns, expected) in cases {
+            let actual = expand_enum_shorthand(input, name, *ns);
+            assert_eq!(actual, *expected, "input={input:?} name={name:?} ns={ns:?}",);
         }
     }
 }
