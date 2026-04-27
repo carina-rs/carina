@@ -203,7 +203,14 @@ Enum values use namespaced identifiers like `aws.s3.Bucket.VersioningStatus.enab
    resource.chars().all(|c| c.is_lowercase() || c.is_ascii_digit() || c == '_')
    ```
 
-2. **Update `is_dsl_enum_format()` in `carina-core/src/utils.rs`** for new patterns. It currently handles 2-part (`TypeName.value`), 3-part (`provider.TypeName.value`), 4-part (`provider.resource.TypeName.value`), and 5-part (`provider.service.resource.TypeName.value`) identifiers. If you introduce a new shape, add it there alongside the existing arms.
+2. **Update `NamespacedId::parse` in `carina-core/src/utils.rs`** for new
+   patterns. It is the single source of truth for the 2/3/4/5-part shapes
+   and the four sibling utilities (`is_dsl_enum_format`,
+   `convert_enum_value`, `extract_enum_value_with_values`,
+   `validate_enum_namespace`) all delegate to it. **TypeName is pinned at
+   index 3 for 5+ part inputs** so PascalCase resource segments (`Vpc`)
+   parse correctly and dotted values (`ipsec.1`) flow into the trailing
+   slice — preserve this invariant when adding shapes.
 
 3. **Plan display should not quote namespaced identifiers** - They are identifiers, not strings
 

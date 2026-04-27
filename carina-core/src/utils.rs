@@ -3,6 +3,211 @@
 use crate::resource::Value;
 use crate::schema::NamespacedEnumParts;
 
+/// A namespaced DSL enum identifier, parsed once and reused.
+///
+/// The DSL accepts enum values in four shapes:
+///
+/// - `value` (no dots, e.g. `Enabled`, `ipsec.1` when treated atomically)
+/// - `TypeName.value` (2-part, e.g. `Region.ap_northeast_1`)
+/// - `provider.TypeName.value` (3-part, e.g. `aws.Region.ap_northeast_1`)
+/// - `provider.<segments…>.TypeName.value` (4+ part, e.g.
+///   `aws.s3.VersioningStatus.Enabled`,
+///   `awscc.ec2.Vpc.InstanceTenancy.default`,
+///   `awscc.ec2.vpn_gateway.Type.ipsec.1` — the trailing value may itself
+///   contain dots).
+///
+/// `NamespacedId::parse` is the single source of truth for these shapes.
+/// Adding a new shape (or relaxing a segment-character rule) means editing
+/// this one parser instead of every utility that consumes identifiers.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NamespacedId<'a> {
+    /// `TypeName.value`
+    TypeQualified { type_name: &'a str, value: &'a str },
+    /// `provider.TypeName.value`
+    ProviderQualified {
+        provider: &'a str,
+        type_name: &'a str,
+        value: &'a str,
+    },
+    /// `provider.<segments…>.TypeName.value`
+    ///
+    /// `segments_str` is the dot-joined slice between `provider` and
+    /// `type_name` (e.g. `s3`, or `ec2.Vpc`). Stored as one borrowed slice
+    /// so `parse` does not have to allocate a `Vec` for the segment list.
+    /// `value` is the rest of the string after `TypeName.` and may itself
+    /// contain dots.
+    FullyQualified {
+        provider: &'a str,
+        segments_str: &'a str,
+        type_name: &'a str,
+        value: &'a str,
+    },
+}
+
+impl<'a> NamespacedId<'a> {
+    /// Parse a namespaced identifier. Returns `None` for inputs that don't
+    /// match any DSL enum shape (no dots, lowercase TypeName position,
+    /// invalid segment characters, etc.).
+    pub fn parse(s: &'a str) -> Option<Self> {
+        let parts: Vec<&'a str> = s.split('.').collect();
+        match parts.len() {
+            0 | 1 => None,
+            2 => {
+                let (type_name, value) = (parts[0], parts[1]);
+                if !is_type_name_segment(type_name) {
+                    return None;
+                }
+                Some(Self::TypeQualified { type_name, value })
+            }
+            3 => {
+                let (provider, type_name, value) = (parts[0], parts[1], parts[2]);
+                if !is_provider_segment(provider) || !is_type_name_segment(type_name) {
+                    return None;
+                }
+                Some(Self::ProviderQualified {
+                    provider,
+                    type_name,
+                    value,
+                })
+            }
+            4 => {
+                let (provider, seg, type_name, value) = (parts[0], parts[1], parts[2], parts[3]);
+                if !is_provider_segment(provider)
+                    || !is_intermediate_segment(seg)
+                    || !is_type_name_segment(type_name)
+                {
+                    return None;
+                }
+                Some(Self::FullyQualified {
+                    provider,
+                    segments_str: seg,
+                    type_name,
+                    value,
+                })
+            }
+            // 5+ parts: provider.<service>.<resource>.TypeName.value, where
+            // value may itself contain dots (e.g. `ipsec.1`). TypeName is
+            // pinned at index 3 so that PascalCase resource segments
+            // (`Vpc`, `Volume`) parse correctly and dotted values flow into
+            // the trailing slice instead of being mistaken for TypeNames.
+            _ => {
+                let (provider, service, resource, type_name) =
+                    (parts[0], parts[1], parts[2], parts[3]);
+                if !is_provider_segment(provider)
+                    || !is_service_segment(service)
+                    || !is_intermediate_segment(resource)
+                    || !is_type_name_segment(type_name)
+                {
+                    return None;
+                }
+                // Slice both `segments_str` and `value` directly out of `s`
+                // so the parse keeps a single allocation (just `parts`).
+                let segments_start = provider.len() + 1;
+                let segments_end = segments_start + service.len() + 1 + resource.len();
+                let value_start = segments_end + 1 + type_name.len() + 1;
+                Some(Self::FullyQualified {
+                    provider,
+                    segments_str: &s[segments_start..segments_end],
+                    type_name,
+                    value: &s[value_start..],
+                })
+            }
+        }
+    }
+
+    /// The trailing enum value, regardless of shape.
+    pub fn value(&self) -> &'a str {
+        match self {
+            Self::TypeQualified { value, .. }
+            | Self::ProviderQualified { value, .. }
+            | Self::FullyQualified { value, .. } => value,
+        }
+    }
+
+    /// The `TypeName` segment.
+    pub fn type_name(&self) -> &'a str {
+        match self {
+            Self::TypeQualified { type_name, .. }
+            | Self::ProviderQualified { type_name, .. }
+            | Self::FullyQualified { type_name, .. } => type_name,
+        }
+    }
+
+    /// True iff the identifier matches the expected `<namespace>.<TypeName>`
+    /// prefix exactly. `expected_ns` is the dot-joined namespace (e.g. `aws`
+    /// for a 3-part input, `aws.s3.Bucket` for a 5-part input); the part
+    /// count must be `expected_ns.split('.').count() + 2`. 2-part
+    /// `TypeName.value` inputs match when `type_name == expected_type`,
+    /// regardless of the namespace.
+    pub fn matches_namespace(&self, expected_ns: &str, expected_type: &str) -> bool {
+        match self {
+            Self::TypeQualified { type_name, .. } => *type_name == expected_type,
+            Self::ProviderQualified {
+                provider,
+                type_name,
+                ..
+            } => {
+                // 3-part inputs only match a 1-segment namespace; reject
+                // multi-segment expectations to keep this method honest if
+                // ever called outside `validate_enum_namespace`.
+                *type_name == expected_type
+                    && !expected_ns.contains('.')
+                    && expected_ns == *provider
+            }
+            Self::FullyQualified {
+                provider,
+                segments_str,
+                type_name,
+                ..
+            } => {
+                if *type_name != expected_type {
+                    return false;
+                }
+                let mut iter = expected_ns.split('.');
+                let Some(expected_provider) = iter.next() else {
+                    return false;
+                };
+                if expected_provider != *provider {
+                    return false;
+                }
+                // Compare the remainder of `expected_ns` against
+                // `segments_str` as raw string slices — no per-call Vec.
+                iter.eq(segments_str.split('.'))
+            }
+        }
+    }
+}
+
+/// A `provider` segment — lowercase ASCII only.
+fn is_provider_segment(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase())
+}
+
+/// A `service` segment (5+ part shape, sits at index 1) — lowercase ASCII
+/// or digits; mirrors the original `is_dsl_enum_format` rule.
+fn is_service_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
+/// A segment that sits between `provider` and `TypeName` — accepts the
+/// snake_case form (`s3`, `vpn_gateway`, `ipam_pool`) and the PascalCase
+/// resource form (`Vpc`, `HostedZone`).
+fn is_intermediate_segment(s: &str) -> bool {
+    let snake = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    let pascal = s.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && s.chars().all(|c| c.is_ascii_alphanumeric());
+    snake || pascal
+}
+
+/// A `TypeName` segment — first char uppercase ASCII.
+fn is_type_name_segment(s: &str) -> bool {
+    s.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+}
+
 /// Extract the last dot-separated part from a namespaced identifier.
 /// Returns the original string if no dots are present.
 ///
@@ -54,37 +259,31 @@ pub fn extract_enum_value_with_values<'a>(s: &'a str, valid_values: &[&str]) -> 
     if !s.contains('.') {
         return s;
     }
-    // First, check if the entire string directly matches a valid value (e.g., "ipsec.1").
-    // This handles cases where the value contains dots but is not a namespaced identifier.
+    // Whole input may itself be a raw enum value containing a dot
+    // (e.g. `ipsec.1` with no namespace prefix).
     if valid_values.iter().any(|v| v.eq_ignore_ascii_case(s)) {
         return s;
     }
-    // Try each possible split point after a dot, from earliest to latest.
-    // The value portion is everything after the namespace prefix and type name.
-    // For "awscc.ec2.vpn_gateway.Type.ipsec.1", we try:
-    //   "ec2.vpn_gateway.Type.ipsec.1", "vpn_gateway.Type.ipsec.1", "Type.ipsec.1",
-    //   "ipsec.1", "1"
-    // We want the earliest match against valid_values, but we need at least
-    // a namespace prefix, so we check suffixes that could be the value part.
-    // The value is after the TypeName part. Since TypeName starts with uppercase,
-    // find the TypeName position and take everything after it.
+    // Walk uppercase-led segments from earliest to latest and check the
+    // tail against valid_values. The earliest match wins so dotted values
+    // like `ipsec.1` are recovered intact. Skip the very last segment —
+    // there must be at least one segment after the candidate TypeName.
     let parts: Vec<&str> = s.split('.').collect();
-    // Find the TypeName part (starts with uppercase) to determine where the value begins
-    for (i, part) in parts.iter().enumerate() {
-        if part.chars().next().is_some_and(|c| c.is_uppercase()) && i + 1 < parts.len() {
-            // The value is everything after this TypeName part
-            let value_start = parts[..=i].iter().map(|p| p.len() + 1).sum::<usize>();
-            let candidate = &s[value_start..];
-            // Check if this candidate matches a valid value (case-insensitive)
-            if valid_values
-                .iter()
-                .any(|v| v.eq_ignore_ascii_case(candidate))
-            {
-                return candidate;
-            }
+    let last_idx = parts.len() - 1;
+    let mut value_start = 0usize;
+    for part in parts.iter().take(last_idx) {
+        value_start += part.len() + 1;
+        if !is_type_name_segment(part) {
+            continue;
+        }
+        let candidate = &s[value_start..];
+        if valid_values
+            .iter()
+            .any(|v| v.eq_ignore_ascii_case(candidate))
+        {
+            return candidate;
         }
     }
-    // Fallback to simple last-segment extraction
     extract_enum_value(s)
 }
 
@@ -111,59 +310,7 @@ pub fn extract_enum_value_with_values<'a>(s: &'a str, valid_values: &[&str]) -> 
 /// assert_eq!(convert_enum_value("eu-west-1"), "eu-west-1");
 /// ```
 pub fn convert_enum_value(value: &str) -> &str {
-    let parts: Vec<&str> = value.split('.').collect();
-    match parts.len() {
-        2 => {
-            // TypeName.value pattern
-            if parts[0].chars().next().is_some_and(|c| c.is_uppercase()) {
-                parts[1]
-            } else {
-                value
-            }
-        }
-        3 => {
-            // provider.TypeName.value pattern
-            let provider = parts[0];
-            let type_name = parts[1];
-            if provider.chars().all(|c| c.is_lowercase())
-                && type_name.chars().next().is_some_and(|c| c.is_uppercase())
-            {
-                parts[2]
-            } else {
-                value
-            }
-        }
-        // 4-part: provider.resource.TypeName.value
-        // e.g., "aws.s3.VersioningStatus.Enabled" -> "Enabled"
-        4 => {
-            let provider = parts[0];
-            let type_name = parts[2];
-            if provider.chars().all(|c| c.is_lowercase())
-                && type_name.chars().next().is_some_and(|c| c.is_uppercase())
-            {
-                parts[3]
-            } else {
-                value
-            }
-        }
-        // 5+ part: provider.service.resource.TypeName.value (value may contain dots)
-        // e.g., "awscc.ec2.Vpc.InstanceTenancy.default" -> "default"
-        // e.g., "awscc.ec2.vpn_gateway.Type.ipsec.1" -> "ipsec.1"
-        n if n >= 5 => {
-            let provider = parts[0];
-            let type_name = parts[3];
-            if provider.chars().all(|c| c.is_lowercase())
-                && type_name.chars().next().is_some_and(|c| c.is_uppercase())
-            {
-                // Rejoin all parts after TypeName (index 3) to handle values with dots
-                let value_start = parts[..4].iter().map(|p| p.len() + 1).sum::<usize>();
-                &value[value_start..]
-            } else {
-                value
-            }
-        }
-        _ => value,
-    }
+    NamespacedId::parse(value).map_or(value, |id| id.value())
 }
 
 /// Check if a string is in DSL enum format (a namespaced identifier).
@@ -187,56 +334,7 @@ pub fn convert_enum_value(value: &str) -> &str {
 /// assert!(!is_dsl_enum_format("some.random.string"));
 /// ```
 pub fn is_dsl_enum_format(s: &str) -> bool {
-    let parts: Vec<&str> = s.split('.').collect();
-
-    match parts.len() {
-        // TypeName.value
-        2 => parts[0].chars().next().is_some_and(|c| c.is_uppercase()),
-        // provider.TypeName.value
-        3 => {
-            let provider = parts[0];
-            let type_name = parts[1];
-            // provider should be lowercase, TypeName should start with uppercase
-            provider.chars().all(|c| c.is_lowercase())
-                && type_name.chars().next().is_some_and(|c| c.is_uppercase())
-        }
-        // provider.resource.TypeName.value (e.g., aws.s3.VersioningStatus.Enabled)
-        4 => {
-            let provider = parts[0];
-            let resource = parts[1];
-            let type_name = parts[2];
-            // provider and resource should be lowercase/digits, TypeName should start with uppercase
-            provider.chars().all(|c| c.is_lowercase())
-                && resource
-                    .chars()
-                    .all(|c| c.is_lowercase() || c.is_ascii_digit() || c == '_')
-                && type_name.chars().next().is_some_and(|c| c.is_uppercase())
-        }
-        // provider.service.resource.TypeName.value (e.g., awscc.ec2.Vpc.InstanceTenancy.default)
-        // Also handles 6+ parts where the enum value itself contains dots
-        // (e.g., awscc.ec2.vpn_gateway.Type.ipsec.1)
-        // The `resource` segment accepts either the legacy snake_case form or
-        // the naming-conventions PascalCase form (e.g., `Vpc`), since resource
-        // kinds have been PascalCased.
-        n if n >= 5 => {
-            let provider = parts[0];
-            let service = parts[1];
-            let resource = parts[2];
-            let type_name = parts[3];
-            let resource_is_snake = resource
-                .chars()
-                .all(|c| c.is_lowercase() || c.is_ascii_digit() || c == '_');
-            let resource_is_pascal = resource.chars().next().is_some_and(|c| c.is_uppercase())
-                && resource.chars().all(|c| c.is_ascii_alphanumeric());
-            provider.chars().all(|c| c.is_lowercase())
-                && service
-                    .chars()
-                    .all(|c| c.is_lowercase() || c.is_ascii_digit())
-                && (resource_is_snake || resource_is_pascal)
-                && type_name.chars().next().is_some_and(|c| c.is_uppercase())
-        }
-        _ => false,
-    }
+    NamespacedId::parse(s).is_some()
 }
 
 /// Validate namespace format for an enum identifier.
@@ -284,41 +382,34 @@ pub fn validate_enum_namespace(s: &str, type_name: &str, namespace: &str) -> Res
         return Ok(());
     }
 
-    let parts: Vec<&str> = s.split('.').collect();
-    let ns_parts: Vec<&str> = namespace.split('.').collect();
-    let expected_full_len = ns_parts.len() + 2; // namespace segments + type_name + value
-
-    match parts.len() {
-        // 2-part: TypeName.value
-        2 => {
-            if parts[0] != type_name {
-                return Err(format!(
-                    "expected format {}.value or {}.{}.value",
-                    type_name, namespace, type_name
-                ));
-            }
-        }
-        // Full namespaced form: namespace.TypeName.value — strictly
-        // `ns_parts.len() + 2` parts. Any extra parts are malformed.
-        n if n == expected_full_len => {
-            for (i, &expected) in ns_parts.iter().enumerate() {
-                if parts[i] != expected {
-                    return Err(format!("expected format {}.{}.value", namespace, type_name));
-                }
-            }
-            if parts[ns_parts.len()] != type_name {
-                return Err(format!("expected format {}.{}.value", namespace, type_name));
-            }
-        }
-        _ => {
-            return Err(format!(
-                "expected format: value, {}.value, or {}.{}.value",
-                type_name, namespace, type_name
-            ));
-        }
+    // Reject dotted values that exceed the strict part count for the
+    // expected namespace shape — callers must strip those before validating.
+    let actual_parts = s.split('.').count();
+    let expected_full_len = namespace.split('.').count() + 2;
+    let is_two_part = actual_parts == 2;
+    let is_full_form = actual_parts == expected_full_len;
+    if !is_two_part && !is_full_form {
+        return Err(format!(
+            "expected format: value, {}.value, or {}.{}.value",
+            type_name, namespace, type_name
+        ));
     }
 
-    Ok(())
+    if let Some(id) = NamespacedId::parse(s)
+        && id.matches_namespace(namespace, type_name)
+    {
+        return Ok(());
+    }
+    // Mirror the original error-message shape: 2-part inputs get the
+    // "or full form" hint, full-form inputs get only the full form.
+    if is_two_part {
+        Err(format!(
+            "expected format {}.value or {}.{}.value",
+            type_name, namespace, type_name
+        ))
+    } else {
+        Err(format!("expected format {}.{}.value", namespace, type_name))
+    }
 }
 
 /// Resolve a single string value to its fully-qualified namespaced DSL format.
