@@ -81,7 +81,7 @@ async fn test_wasm_mock_provider_create_and_read() {
 
     // Create a resource
     let mut resource = Resource::with_provider("mock", "test.resource", "my-resource");
-    resource.attributes = HashMap::from([
+    resource.attributes = indexmap::IndexMap::from([
         ("name".into(), Expr(Value::String("my-resource".into()))),
         ("region".into(), Expr(Value::String("us-east-1".into()))),
         ("count".into(), Expr(Value::Int(42))),
@@ -129,7 +129,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
 
     // Create first
     let mut resource = Resource::with_provider("mock", "test.resource", "updatable");
-    resource.attributes = HashMap::from([
+    resource.attributes = indexmap::IndexMap::from([
         ("color".into(), Expr(Value::String("red".into()))),
         ("size".into(), Expr(Value::Int(10))),
     ]);
@@ -145,7 +145,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
 
     // Update with new attributes
     let mut updated_resource = Resource::with_provider("mock", "test.resource", "updatable");
-    updated_resource.attributes = HashMap::from([
+    updated_resource.attributes = indexmap::IndexMap::from([
         ("color".into(), Expr(Value::String("blue".into()))),
         ("size".into(), Expr(Value::Int(20))),
     ]);
@@ -195,7 +195,8 @@ async fn test_wasm_mock_provider_normalizer() {
     // normalize_desired: mock provider returns resources unchanged
     let mut resources = vec![{
         let mut r = Resource::with_provider("mock", "test.resource", "norm-test");
-        r.attributes = HashMap::from([("key".into(), Expr(Value::String("value".into())))]);
+        r.attributes =
+            indexmap::IndexMap::from([("key".into(), Expr(Value::String("value".into())))]);
         r
     }];
     let original_attrs = resources[0].resolved_attributes();
@@ -229,7 +230,7 @@ async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
     let provider = factory.create_provider(&HashMap::new()).await;
 
     let mut resource = Resource::with_provider("mock", "test.data_source", "example");
-    resource.attributes = HashMap::from([
+    resource.attributes = indexmap::IndexMap::from([
         (
             "identity_store_id".into(),
             Expr(Value::String("d-1234567890".into())),

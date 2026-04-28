@@ -333,6 +333,11 @@ pub fn create_plan(
             } else {
                 let temp_resource = Resource {
                     id: id.clone(),
+                    // `state.attributes` is `HashMap` — no source order
+                    // survives round-tripping through the provider. The
+                    // ordering of this synthetic temp resource doesn't
+                    // matter (it only feeds the dependency walker), so
+                    // a plain clone-through `wrap_map` is fine.
                     attributes: Expr::wrap_map(state.attributes.clone()),
                     kind: ResourceKind::Real,
                     lifecycle: lifecycle.clone(),

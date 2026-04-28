@@ -17,6 +17,7 @@ semver = "1"
 argon2 = "0.5"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
+indexmap = { version = "2", features = ["serde"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

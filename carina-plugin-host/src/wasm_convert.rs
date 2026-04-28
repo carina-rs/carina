@@ -590,7 +590,7 @@ mod tests {
     #[test]
     fn test_resource_roundtrip() {
         let mut resource = CoreResource::with_provider("aws", "s3.Bucket", "my-bucket");
-        resource.attributes = HashMap::from([
+        resource.attributes = indexmap::IndexMap::from([
             ("name".into(), Expr(CoreValue::String("my-bucket".into()))),
             ("region".into(), Expr(CoreValue::String("us-east-1".into()))),
         ]);

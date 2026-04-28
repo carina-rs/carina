@@ -21,7 +21,7 @@ use carina_core::module_resolver;
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
 use carina_core::resolver::resolve_refs_with_state_and_remote;
-use carina_core::resource::{Expr, Resource, ResourceId, State, Value};
+use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::schema::ResourceSchema;
 use carina_core::value::format_value;
 use carina_state::{LockInfo, ResourceState, StateBackend, StateFile, resolve_backend};
@@ -1305,7 +1305,7 @@ async fn run_apply_locked(
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
     for resource in &sorted_resources {
         if let Some(ref binding_name) = resource.binding {
-            let mut attrs: HashMap<String, Value> = Expr::resolve_map(&resource.attributes);
+            let mut attrs: HashMap<String, Value> = resource.resolved_attributes();
             // Merge existing state if available
             if let Some(state) = current_states.get(&resource.id)
                 && state.exists
@@ -1760,7 +1760,7 @@ async fn run_apply_from_plan_locked(
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
     for resource in sorted_resources {
         if let Some(ref binding_name) = resource.binding {
-            let mut attrs: HashMap<String, Value> = Expr::resolve_map(&resource.attributes);
+            let mut attrs: HashMap<String, Value> = resource.resolved_attributes();
             if let Some(state) = current_states.get(&resource.id)
                 && state.exists
             {

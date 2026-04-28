@@ -3,6 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 /// The `name` portion of a `ResourceId`.
@@ -449,17 +450,27 @@ impl Expr {
     /// `carina_core::resolver::resolve_refs_with_state_and_remote` (or an
     /// equivalent) first. See #1683 for a regression caused by assuming
     /// this method performed resolution.
-    pub fn resolve_map(attrs: &HashMap<String, Expr>) -> HashMap<String, Value> {
+    /// Project an `IndexMap<String, Expr>` (the shape `Resource.attributes`
+    /// uses since #2222) into a plain `HashMap<String, Value>` for callers
+    /// that only need key-based lookup (state merging, ResourceRef
+    /// resolution, provider trait inputs). Source-order is dropped on
+    /// purpose at this boundary — keep it on `Resource.attributes` itself
+    /// when iteration order matters.
+    pub fn resolve_map(attrs: &IndexMap<String, Expr>) -> HashMap<String, Value> {
         attrs
             .iter()
             .map(|(k, e)| (k.clone(), e.0.clone()))
             .collect()
     }
 
-    /// Wrap a `HashMap<String, Value>` into a `HashMap<String, Expr>`.
-    ///
-    /// This is the inverse of `resolve_map()`.
-    pub fn wrap_map(attrs: HashMap<String, Value>) -> HashMap<String, Expr> {
+    /// Wrap any `(String, Value)` iterator (`HashMap<String, Value>`,
+    /// `IndexMap<String, Value>`, `Vec<(String, Value)>`, …) into the
+    /// `IndexMap<String, Expr>` that `Resource.attributes` expects.
+    /// Source order follows the iteration order of `attrs`.
+    pub fn wrap_map<I>(attrs: I) -> IndexMap<String, Expr>
+    where
+        I: IntoIterator<Item = (String, Value)>,
+    {
         attrs.into_iter().map(|(k, v)| (k, Expr(v))).collect()
     }
 }
@@ -896,7 +907,13 @@ pub enum ResourceKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Resource {
     pub id: ResourceId,
-    pub attributes: HashMap<String, Expr>,
+    /// Source-order preserving map of attribute name → expression.
+    ///
+    /// `IndexMap` (not `HashMap`) so iteration order matches the order
+    /// the user wrote attributes in the `.crn` file. Anything that
+    /// re-renders attributes — diagnostic messages, formatter output,
+    /// plan display, snapshot tests — depends on this stability (#2222).
+    pub attributes: IndexMap<String, Expr>,
     /// Classification of this resource (real, virtual, or data source)
     #[serde(default)]
     pub kind: ResourceKind,
@@ -927,7 +944,7 @@ impl Resource {
     pub fn new(resource_type: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             id: ResourceId::new(resource_type, name),
-            attributes: HashMap::new(),
+            attributes: IndexMap::new(),
             kind: ResourceKind::Real,
             lifecycle: LifecycleConfig::default(),
             prefixes: HashMap::new(),
@@ -944,7 +961,7 @@ impl Resource {
     ) -> Self {
         Self {
             id: ResourceId::with_provider(provider, resource_type, name),
-            attributes: HashMap::new(),
+            attributes: IndexMap::new(),
             kind: ResourceKind::Real,
             lifecycle: LifecycleConfig::default(),
             prefixes: HashMap::new(),
@@ -955,8 +972,17 @@ impl Resource {
     }
 
     /// Returns the resolved attributes as a `HashMap<String, Value>`.
+    ///
+    /// Lookup-only callers (validation, differ, plan display) still
+    /// receive a `HashMap` — iteration over user-authored order is done
+    /// directly via `self.attributes` (`IndexMap`), so flipping this
+    /// helper would just force every downstream caller to widen its
+    /// signature for no order benefit.
     pub fn resolved_attributes(&self) -> HashMap<String, Value> {
-        Expr::resolve_map(&self.attributes)
+        self.attributes
+            .iter()
+            .map(|(k, e)| (k.clone(), e.0.clone()))
+            .collect()
     }
 
     /// Get an attribute value by key, returning `Option<&Value>`.
@@ -988,7 +1014,7 @@ impl Resource {
 
     /// Set attributes from a `HashMap<String, Value>`, wrapping each value in `Expr`.
     pub fn with_value_attributes(mut self, attrs: HashMap<String, Value>) -> Self {
-        self.attributes = attrs.into_iter().map(|(k, v)| (k, Expr(v))).collect();
+        self.attributes = Expr::wrap_map(attrs);
         self
     }
 
@@ -1845,7 +1871,7 @@ mod tests {
 
     #[test]
     fn expr_resolve_map() {
-        let mut attrs = HashMap::new();
+        let mut attrs = IndexMap::new();
         attrs.insert("name".to_string(), Expr(Value::String("test".to_string())));
         attrs.insert("count".to_string(), Expr(Value::Int(5)));
         let resolved = Expr::resolve_map(&attrs);

@@ -75,8 +75,10 @@ pub fn resolve_attr_prefixes(
                 continue;
             }
 
-            // Remove the _prefix attribute
-            resource.attributes.remove(&prefix_key);
+            // Remove the _prefix attribute. `shift_remove` (not
+            // `swap_remove`) preserves the source-order of the rest of
+            // the attributes, which is the whole point of #2222.
+            resource.attributes.shift_remove(&prefix_key);
 
             // Store prefix
             resource

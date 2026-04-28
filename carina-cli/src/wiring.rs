@@ -489,6 +489,12 @@ pub fn resolve_enum_aliases_with_ctx(ctx: &WiringContext, resources: &mut [Resou
         };
         let mut value_attrs = resource.resolved_attributes();
         resolve_attrs_aliases(&mut value_attrs, &resource.id.resource_type, factory);
+        // `value_attrs` is `HashMap`-shaped (state-side ordering doesn't
+        // survive AWS round-trips), so the order produced by `wrap_map`
+        // is whatever `HashMap` iteration gives. Stage 1 of #2222
+        // preserves order on the *parse* path; alias resolution
+        // rebuilds the map and that ordering is lost — acceptable for
+        // this PR's scope.
         resource.attributes = carina_core::resource::Expr::wrap_map(value_attrs);
     }
 }

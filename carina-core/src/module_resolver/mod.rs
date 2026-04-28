@@ -16,6 +16,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use indexmap::IndexMap;
+
 use crate::parser::{
     ModuleCall, ParseError, ParsedFile, ProviderContext, TypeExpr, UseStatement,
     validate_custom_type,
@@ -414,7 +416,9 @@ impl<'cfg> ModuleResolver<'cfg> {
             // This ensures that caller-provided ResourceRef values (which may
             // coincidentally share a binding name with a module-internal binding)
             // are not incorrectly prefixed.
-            let mut substituted_attrs = HashMap::new();
+            // Preserve user-authored attribute order across the
+            // module-call expansion (#2222) — `IndexMap`, not `HashMap`.
+            let mut substituted_attrs: IndexMap<String, Expr> = IndexMap::new();
             for (key, expr) in &new_resource.attributes {
                 let rewritten =
                     rewrite_intra_module_refs(expr, instance_prefix, &intra_module_bindings);
@@ -430,7 +434,7 @@ impl<'cfg> ModuleResolver<'cfg> {
         if !module.attribute_params.is_empty()
             && let Some(binding_name) = &call.binding_name
         {
-            let mut virtual_attrs: HashMap<String, Expr> = HashMap::new();
+            let mut virtual_attrs: IndexMap<String, Expr> = IndexMap::new();
 
             // Copy attribute values from the module definition
             for attr_param in &module.attribute_params {
