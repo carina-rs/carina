@@ -1494,7 +1494,7 @@ impl DiagnosticEngine {
         &self,
         doc: &Document,
         parsed: &ParsedFile,
-        binding_schema_map: &HashMap<String, ResourceSchema>,
+        binding_schema_map: &HashMap<&str, &ResourceSchema>,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
@@ -1534,7 +1534,7 @@ impl DiagnosticEngine {
         &self,
         doc: &Document,
         value: &Value,
-        binding_schema_map: &HashMap<String, ResourceSchema>,
+        binding_schema_map: &HashMap<&str, &ResourceSchema>,
         diagnostics: &mut Vec<Diagnostic>,
     ) {
         value.visit_refs(&mut |path| {
