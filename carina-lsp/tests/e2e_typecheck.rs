@@ -163,14 +163,20 @@ test.r.mode_holder {
 // ---------------------------------------------------------------
 
 fn region_schemas() -> HashMap<String, ResourceSchema> {
-    // Validator accepts the canonical DSL form `test.Region.ap_northeast_1`
-    // that the schema's namespace + name produces from a bare identifier.
-    // The `to_dsl` callback is what real AWS Region uses to normalise
-    // hyphenated AWS strings (`ap-northeast-1`) into the underscore DSL
-    // form before validation; we mirror that shape.
+    // Mirrors the production `aws_region()` shape (#2248): the `Custom`
+    // validate path does **not** consult the schema-level `to_dsl`
+    // callback — only `StringEnum` validation does, for alias matching.
+    // So a `Custom` validator that wants to accept both DSL
+    // (`test.Region.ap_northeast_1`) and raw AWS-string (`"ap-northeast-1"`)
+    // forms must normalise inside the callback, exactly as
+    // `carina-aws-types::types::aws_region` does.
     fn validate_region(v: &carina_core::resource::Value) -> Result<(), String> {
+        const VALID: &[&str] = &["ap-northeast-1", "us-west-2"];
         if let carina_core::resource::Value::String(s) = v {
-            if s == "test.Region.ap_northeast_1" || s == "test.Region.us_west_2" {
+            // Same shape as `aws_region()`: strip any namespace prefix
+            // (DSL form) and rewrite `_` → `-` to get the AWS form.
+            let normalized = carina_core::utils::extract_enum_value(s).replace('_', "-");
+            if VALID.contains(&normalized.as_str()) {
                 return Ok(());
             }
             return Err(format!("invalid Region '{}'", s));
@@ -225,6 +231,36 @@ test.r.region_holder {
         count_with(&diags, "Region") + count_with(&diags, "region"),
         0,
         "expected no Region diagnostics, got: {:?}",
+        messages_of(&diags),
+    );
+}
+
+#[test]
+fn region_accepts_aws_string_form() {
+    // The AC of #2248: a Custom type with a hyphen-tolerant validator
+    // must accept the raw AWS string form (`"ap-northeast-1"`) just as it
+    // accepts the DSL form (`ap_northeast_1`). The schema's `to_dsl`
+    // callback alone is *not* enough — the `Custom` validate path does
+    // not consult it, so the validator itself has to handle both shapes.
+    let engine = engine_with_schemas(region_schemas());
+    let fixture = write_fixture(&[(
+        "main.crn",
+        r#"
+test.r.region_holder {
+    name = "a"
+    region = "ap-northeast-1"
+}
+test.r.region_holder {
+    name = "b"
+    region = "us-west-2"
+}
+"#,
+    )]);
+    let diags = analyze(&engine, &fixture, "main.crn");
+    assert_eq!(
+        count_with(&diags, "Region") + count_with(&diags, "region"),
+        0,
+        "expected no Region diagnostics for raw AWS string form, got: {:?}",
         messages_of(&diags),
     );
 }
