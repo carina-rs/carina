@@ -51,7 +51,11 @@ pub fn resolve_refs_with_state_and_remote(
 
     for resource in resources.iter() {
         if let Some(ref binding_name) = resource.binding {
-            let mut attrs: HashMap<String, Value> = Expr::resolve_map(&resource.attributes);
+            // `attrs` only needs key-based lookup for state merging
+            // and ResourceRef resolution, so it stays `HashMap`. The
+            // source-ordered `IndexMap` view lives only on
+            // `Resource.attributes` (#2222).
+            let mut attrs: HashMap<String, Value> = resource.resolved_attributes();
 
             // Merge AWS state attributes (like `id`) if available
             if let Some(state) = current_states.get(&resource.id)
@@ -75,9 +79,11 @@ pub fn resolve_refs_with_state_and_remote(
         binding_map.insert(remote_binding.clone(), remote_attrs.clone());
     }
 
-    // Resolve ResourceRef values in all resources
+    // Resolve ResourceRef values in all resources. Stay in `IndexMap`
+    // so the user's authored attribute order survives resolution
+    // (#2222).
     for resource in resources.iter_mut() {
-        let mut resolved_attrs = HashMap::new();
+        let mut resolved_attrs: indexmap::IndexMap<String, Expr> = indexmap::IndexMap::new();
         for (key, expr) in &resource.attributes {
             resolved_attrs.insert(key.clone(), Expr(resolve_ref_value(expr, &binding_map)?));
         }
@@ -240,10 +246,8 @@ mod tests {
     use crate::resource::ResourceId;
 
     fn make_resource(name: &str, binding: Option<&str>, attrs: Vec<(&str, Value)>) -> Resource {
-        let attributes: HashMap<String, Value> =
-            attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
         let mut r = Resource::new("test.resource", name);
-        r.attributes = Expr::wrap_map(attributes);
+        r.attributes = Expr::wrap_map(attrs.into_iter().map(|(k, v)| (k.to_string(), v)));
         r.binding = binding.map(|b| b.to_string());
         r
     }

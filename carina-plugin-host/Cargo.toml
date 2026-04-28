@@ -25,3 +25,4 @@ sha2 = "0.10"
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
+indexmap = "2"

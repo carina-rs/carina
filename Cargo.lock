@@ -860,6 +860,7 @@ version = "0.4.0"
 dependencies = [
  "argon2",
  "futures",
+ "indexmap",
  "pest",
  "pest_derive",
  "semver",
@@ -898,6 +899,7 @@ dependencies = [
  "carina-provider-protocol",
  "dirs",
  "hyper 1.8.1",
+ "indexmap",
  "log",
  "semver",
  "serde",

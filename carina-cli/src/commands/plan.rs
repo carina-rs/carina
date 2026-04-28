@@ -356,8 +356,7 @@ pub(crate) fn resolve_export_values_for_display(
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
     for resource in resources {
         if let Some(ref binding_name) = resource.binding {
-            let mut attrs: HashMap<String, Value> =
-                carina_core::resource::Expr::resolve_map(&resource.attributes);
+            let mut attrs: HashMap<String, Value> = resource.resolved_attributes();
             if let Some(state) = current_states.get(&resource.id)
                 && state.exists
             {

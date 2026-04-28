@@ -6,6 +6,8 @@ mod config;
 
 pub use config::{DecryptorFn, ProviderContext, ValidatorFn};
 
+use indexmap::IndexMap;
+
 use crate::resource::{Expr, LifecycleConfig, Resource, ResourceId, ResourceKind, Value};
 use crate::schema::{
     validate_ipv4_address, validate_ipv4_cidr, validate_ipv6_address, validate_ipv6_cidr,
@@ -4008,8 +4010,11 @@ fn is_plain_string_without_interpolation(pair: &pest::iterators::Pair<Rule>) -> 
 fn parse_block_contents(
     pairs: pest::iterators::Pairs<Rule>,
     ctx: &ParseContext,
-) -> Result<HashMap<String, Value>, ParseError> {
-    let mut attributes: HashMap<String, Value> = HashMap::new();
+) -> Result<IndexMap<String, Value>, ParseError> {
+    // Source-order preserving (#2222) — `IndexMap` so the order in which
+    // the user wrote attributes in the .crn file flows all the way to
+    // `Resource.attributes`.
+    let mut attributes: IndexMap<String, Value> = IndexMap::new();
     let mut nested_blocks: HashMap<String, Vec<Value>> = HashMap::new();
 
     // Local scope extends the parent context with block-scoped let bindings
@@ -4053,11 +4058,15 @@ fn parse_block_contents(
                         // Recursively parse nested block contents (supports arbitrary depth)
                         let block_attrs = parse_block_contents(block_inner, &local_ctx)?;
 
-                        // Add to the list of blocks with this name
+                        // Add to the list of blocks with this name. Convert
+                        // back to `HashMap` here because `Value::Map`'s
+                        // payload is still a `HashMap` (#2222 Stage 1
+                        // touches only `Resource.attributes`); preserving
+                        // intra-`Map` order is left to a later stage.
                         nested_blocks
                             .entry(block_name)
                             .or_default()
-                            .push(Value::Map(block_attrs));
+                            .push(Value::Map(block_attrs.into_iter().collect()));
                     }
                     _ => {}
                 }
@@ -4087,8 +4096,8 @@ fn parse_block_contents(
 /// Extract lifecycle configuration from attributes.
 /// The parser parses `lifecycle { ... }` as a nested block, which becomes
 /// a List of Maps in attributes. We extract it and convert to LifecycleConfig.
-fn extract_lifecycle_config(attributes: &mut HashMap<String, Value>) -> LifecycleConfig {
-    if let Some(Value::List(blocks)) = attributes.remove("lifecycle") {
+fn extract_lifecycle_config(attributes: &mut IndexMap<String, Value>) -> LifecycleConfig {
+    if let Some(Value::List(blocks)) = attributes.shift_remove("lifecycle") {
         // Take the first lifecycle block (there should only be one)
         if let Some(Value::Map(map)) = blocks.into_iter().next() {
             let force_delete = matches!(map.get("force_delete"), Some(Value::Bool(true)));
@@ -4413,7 +4422,7 @@ fn parse_primary_value(
                         nested_blocks
                             .entry(block_name)
                             .or_default()
-                            .push(Value::Map(block_attrs));
+                            .push(Value::Map(block_attrs.into_iter().collect()));
                     }
                     _ => {}
                 }
@@ -4796,12 +4805,15 @@ fn resolve_forward_references(
     export_params: &mut [ExportParameter],
 ) {
     for resource in resources.iter_mut() {
-        let keys: Vec<String> = resource.attributes.keys().cloned().collect();
-        for key in keys {
-            if let Some(expr) = resource.attributes.remove(&key) {
-                let resolved = resolve_forward_ref_in_value(expr.into_value(), resource_bindings);
-                resource.attributes.insert(key, Expr(resolved));
-            }
+        // In-place replace via `iter_mut`: avoids the O(n²) cost of
+        // `shift_remove` + re-insert per key, and naturally preserves
+        // the user-authored attribute order without a key-collection
+        // round-trip. The placeholder is overwritten on the next line,
+        // so its identity doesn't matter.
+        for (_, expr) in resource.attributes.iter_mut() {
+            let placeholder = Value::Bool(false);
+            let value = std::mem::replace(&mut expr.0, placeholder);
+            expr.0 = resolve_forward_ref_in_value(value, resource_bindings);
         }
     }
     for attr_param in attribute_params.iter_mut() {
@@ -4911,10 +4923,10 @@ pub fn resolve_resource_refs_with_config(
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
     for resource in &parsed.resources {
         if let Some(ref binding_name) = resource.binding {
-            binding_map.insert(
-                binding_name.clone(),
-                Expr::resolve_map(&resource.attributes),
-            );
+            // `binding_map` only needs key-based lookup, not source order
+            // (callers consume it via `.get(name)` for ResourceRef
+            // resolution), so the inner map stays `HashMap`.
+            binding_map.insert(binding_name.clone(), resource.resolved_attributes());
         }
     }
 
@@ -4937,9 +4949,10 @@ pub fn resolve_resource_refs_with_config(
         binding_map.entry(us.binding.clone()).or_default();
     }
 
-    // Resolve references in each resource
+    // Resolve references in each resource. Keep `IndexMap` to preserve
+    // the user's source order through resolution (#2222).
     for resource in &mut parsed.resources {
-        let mut resolved_attrs: HashMap<String, Expr> = HashMap::new();
+        let mut resolved_attrs: IndexMap<String, Expr> = IndexMap::new();
 
         for (key, expr) in &resource.attributes {
             let resolved = resolve_value_with_config(expr, &binding_map, config)?;

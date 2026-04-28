@@ -1627,7 +1627,10 @@ pub fn resolve_block_names(
                 continue;
             }
 
-            let expr = resource.attributes.remove(&block_key).unwrap();
+            // `shift_remove` keeps the rest of the source-authored
+            // order intact; `swap_remove` would reorder remaining
+            // attributes — see #2222.
+            let expr = resource.attributes.shift_remove(&block_key).unwrap();
             resource.attributes.insert(canon_key, expr);
         }
 
