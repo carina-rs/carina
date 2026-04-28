@@ -184,18 +184,22 @@ impl DiagnosticEngine {
                 diagnostics.extend(self.check_module_calls(doc, parsed, base));
                 diagnostics.extend(self.check_upstream_state_sources(doc, parsed, base));
             }
-            // Build binding_name -> (provider, resource_type) map for ResourceRef type checking.
-            // Walk both top-level resources and for-body template resources so
-            // for-body refs can be type-checked against their referenced binding.
-            let mut binding_schema_map: HashMap<String, ResourceSchema> = HashMap::new();
-            for (_ctx, res) in parsed.iter_all_resources() {
-                if let Some(ref binding_name) = res.binding {
-                    let full_type = format!("{}.{}", res.id.provider, res.id.resource_type);
-                    if let Some(s) = self.schemas.get(&full_type).cloned() {
-                        binding_schema_map.insert(binding_name.clone(), s);
-                    }
-                }
-            }
+            // Build the canonical `binding_name → (resource, schema)`
+            // index once via the shared `BindingIndex` (#2231) so the LSP
+            // and `carina-core::validation` cannot drift over which
+            // bindings exist or how their schemas are looked up. The
+            // reference-checking helpers below consume a borrow-valued
+            // map, so no per-keystroke `ResourceSchema::clone()` is
+            // needed.
+            let schema_key_fn = |r: &carina_core::resource::Resource| {
+                format!("{}.{}", r.id.provider, r.id.resource_type)
+            };
+            let binding_index = carina_core::binding_index::BindingIndex::from_parsed(
+                parsed,
+                &self.schemas,
+                &schema_key_fn,
+            );
+            let binding_schema_map = binding_index.schemas_by_name();
 
             // Check resource types — include for-body template resources so
             // attribute/type/enum validation fires inside `for` loops too.
@@ -1009,7 +1013,7 @@ fn is_quoted_literal_attr(
 }
 
 fn check_resource_ref_type_mismatch(
-    binding_schema_map: &HashMap<String, ResourceSchema>,
+    binding_schema_map: &HashMap<&str, &ResourceSchema>,
     expected_type: &carina_core::schema::AttributeType,
     ref_binding: &str,
     ref_attr: &str,

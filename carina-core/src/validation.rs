@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::binding_index::BindingIndex;
 use crate::parser::{ModuleCall, ParsedFile, ProviderContext, TypeExpr, validate_custom_type};
 use crate::provider::ProviderFactory;
 use crate::resource::{Resource, Value};
@@ -86,15 +87,10 @@ pub fn validate_resource_ref_types(
 ) -> Result<(), String> {
     let mut all_errors = Vec::new();
 
-    // Build binding_name -> resource map from direct resources only.
-    // For-body template resources never carry a `binding`, so skipping
-    // them here keeps the map correct for lookup.
-    let mut binding_map: HashMap<String, &Resource> = HashMap::new();
-    for resource in &parsed.resources {
-        if let Some(ref binding_name) = resource.binding {
-            binding_map.insert(binding_name.clone(), resource);
-        }
-    }
+    // Single source of truth for `binding_name → (resource, schema)` —
+    // shared with the LSP via `BindingIndex` so the two paths cannot drift
+    // (#2231).
+    let bindings = BindingIndex::from_parsed(parsed, schemas, schema_key_fn);
 
     for (_ctx, resource) in parsed.iter_all_resources() {
         let schema_key = schema_key_fn(resource);
@@ -126,18 +122,21 @@ pub fn validate_resource_ref_types(
                 continue;
             }
 
-            // Look up the referenced binding's schema to get the type of the referenced attribute
-            let Some(ref_resource) = binding_map.get(ref_binding.as_str()) else {
-                all_errors.push(format!(
-                    "{}: unknown binding '{}' in reference {}.{}",
-                    resource.id, ref_binding, ref_binding, ref_attr,
-                ));
+            // Look up the referenced binding's schema. `BindingIndex::get`
+            // returns `Some` only when both the binding and its schema
+            // resolved; `contains_name` distinguishes "unknown binding"
+            // from "known binding, schema absent" so we keep the original
+            // diagnostic shape (only the former gets reported here).
+            let Some(ref_entry) = bindings.get(ref_binding.as_str()) else {
+                if !bindings.is_declared(ref_binding.as_str()) {
+                    all_errors.push(format!(
+                        "{}: unknown binding '{}' in reference {}.{}",
+                        resource.id, ref_binding, ref_binding, ref_attr,
+                    ));
+                }
                 continue;
             };
-            let ref_schema_key_str = schema_key_fn(ref_resource);
-            let Some(ref_schema) = schemas.get(&ref_schema_key_str) else {
-                continue;
-            };
+            let ref_schema = ref_entry.schema;
             let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr.as_str()) else {
                 let known_attrs: Vec<&str> =
                     ref_schema.attributes.keys().map(|s| s.as_str()).collect();
