@@ -254,11 +254,11 @@ test.r.region_holder {
 // ---------------------------------------------------------------
 // Scenario 3: nested-Struct field type mismatch
 //
-// Issue body asks for `List<Struct>` here, but list-literal fixtures
-// (`outer = [{...}]`) trigger the LSP prefer-block-syntax warning before
-// the type-check reaches the nested field, so this scenario uses two
-// nested single Structs instead. A `List<Struct>` variant via a
-// `with_block_name`-flagged StructField is left to a follow-up.
+// Two flavours: a single nested Struct (kept here because it pins the
+// pure recursion path) and a `List<Struct>` flavour (#2249) that uses
+// `with_block_name` so the user writes repeated `outer { ... }` blocks
+// — list literals (`outer = [{...}]`) trip the prefer-block-syntax
+// warning and short-circuit the type-check.
 // ---------------------------------------------------------------
 
 fn nested_struct_schemas() -> HashMap<String, ResourceSchema> {
@@ -292,11 +292,9 @@ fn nested_struct_int_field_with_string_value_diagnoses() {
         r#"
 test.r.nested {
     name = "a"
-    outer {
+    outer = {
         label = "x"
-        inner {
-            leaf = "not-an-int"
-        }
+        inner = { leaf = "not-an-int" }
     }
 }
 "#,
@@ -463,6 +461,127 @@ test.r.suggester {
     assert!(
         suggestion_hit.is_some(),
         "expected an unknown-attribute diagnostic suggesting `description`, got: {:?}",
+        messages_of(&diags),
+    );
+}
+
+// ---------------------------------------------------------------
+// Scenario 3b: List<Struct> with nested-Struct field error (#2249)
+//
+// `with_block_name("outer")` lets the user write repeated `outer { ... }`
+// blocks instead of a list literal `outer = [{...}]`. The list literal
+// would trip the LSP prefer-block-syntax warning before the type-check
+// could reach the bad field, masking the diagnostic this test is here
+// to pin.
+// ---------------------------------------------------------------
+
+fn list_struct_schemas() -> HashMap<String, ResourceSchema> {
+    let inner = AttributeType::Struct {
+        name: "Inner".to_string(),
+        fields: vec![StructField::new("leaf", AttributeType::Int)],
+    };
+    let outer = AttributeType::list(AttributeType::Struct {
+        name: "Outer".to_string(),
+        fields: vec![
+            StructField::new("inner", inner),
+            StructField::new("label", AttributeType::String),
+        ],
+    });
+
+    single_schema_map(
+        ResourceSchema::new("test.r.list_nested")
+            .attribute(AttributeSchema::new("name", AttributeType::String))
+            .attribute(AttributeSchema::new("outer", outer).with_block_name("outer")),
+    )
+}
+
+#[test]
+fn list_struct_int_field_with_string_value_diagnoses() {
+    let engine = engine_with_schemas(list_struct_schemas());
+    let fixture = write_fixture(&[(
+        "main.crn",
+        r#"
+test.r.list_nested {
+    name = "a"
+    outer {
+        label = "first"
+        inner = { leaf = 30 }
+    }
+    outer {
+        label = "second"
+        inner = { leaf = "not-an-int" }
+    }
+}
+"#,
+    )]);
+    let diags = analyze(&engine, &fixture, "main.crn");
+    // Guardrail: prefer-block-syntax warnings must not leak in for this
+    // schema shape; if one does, the test below would silently pass on
+    // the warning instead of the type-check.
+    assert!(
+        diags
+            .iter()
+            .all(|d| !d.message.contains("Prefer block syntax")),
+        "prefer-block-syntax warning leaked in despite `with_block_name`, got: {:?}",
+        messages_of(&diags),
+    );
+    assert!(
+        diags.iter().any(|d| d.message.contains("leaf")
+            || d.message.contains("Int")
+            || d.message.contains("not-an-int")),
+        "expected diagnostic for nested Int field in repeated `outer` block, got: {:?}",
+        messages_of(&diags),
+    );
+}
+
+// Rename variant: schema attribute is plural (`rules`), block name is
+// singular (`rule`) — the realistic AWS shape (`bucket.lifecycle.rules` +
+// repeated `rule { ... }` blocks). The single-schema-shape test above
+// would silently pass even if the LSP forgot to honour the rename, so a
+// dedicated case is needed.
+fn list_struct_renamed_block_schemas() -> HashMap<String, ResourceSchema> {
+    let rule = AttributeType::list(AttributeType::Struct {
+        name: "Rule".to_string(),
+        fields: vec![StructField::new("days", AttributeType::Int)],
+    });
+
+    single_schema_map(
+        ResourceSchema::new("test.r.renamed_block")
+            .attribute(AttributeSchema::new("name", AttributeType::String))
+            .attribute(AttributeSchema::new("rules", rule).with_block_name("rule")),
+    )
+}
+
+#[test]
+fn list_struct_renamed_block_int_field_with_string_value_diagnoses() {
+    let engine = engine_with_schemas(list_struct_renamed_block_schemas());
+    let fixture = write_fixture(&[(
+        "main.crn",
+        r#"
+test.r.renamed_block {
+    name = "a"
+    rule {
+        days = 7
+    }
+    rule {
+        days = "not-an-int"
+    }
+}
+"#,
+    )]);
+    let diags = analyze(&engine, &fixture, "main.crn");
+    assert!(
+        diags
+            .iter()
+            .all(|d| !d.message.contains("Prefer block syntax")),
+        "prefer-block-syntax warning leaked in despite `with_block_name`, got: {:?}",
+        messages_of(&diags),
+    );
+    assert!(
+        diags.iter().any(|d| d.message.contains("days")
+            || d.message.contains("Int")
+            || d.message.contains("not-an-int")),
+        "expected diagnostic for Int field in repeated `rule` block (attribute is `rules`), got: {:?}",
         messages_of(&diags),
     );
 }
