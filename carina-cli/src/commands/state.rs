@@ -19,7 +19,7 @@ use carina_state::{
 };
 
 use super::validate_and_resolve_with_config;
-use crate::commands::apply::apply_name_overrides;
+use crate::commands::shared::state_writeback::apply_name_overrides;
 use crate::error::AppError;
 use crate::wiring::{
     WiringContext, build_factories_from_providers, get_provider_with_ctx,
@@ -746,7 +746,10 @@ pub(crate) async fn run_state_refresh_locked(
 
     // Re-resolve exports using refreshed state
     if !parsed.export_params.is_empty() {
-        state.exports = crate::commands::apply::resolve_exports(&parsed.export_params, &state);
+        state.exports = crate::commands::shared::state_writeback::resolve_exports(
+            &parsed.export_params,
+            &state,
+        );
     }
 
     // Save state (with or without lock validation)

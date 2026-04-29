@@ -20,7 +20,7 @@ use carina_state::{
 
 use super::validate_and_resolve_with_config;
 use crate::DetailLevel;
-use crate::commands::apply::apply_name_overrides;
+use crate::commands::shared::state_writeback::apply_name_overrides;
 use crate::display::print_plan;
 use crate::error::AppError;
 use crate::wiring::{
@@ -473,7 +473,7 @@ pub fn compute_export_diffs(
         let Some(ref value) = param.value else {
             continue;
         };
-        let new_json = crate::commands::apply::dsl_value_to_json(value);
+        let new_json = crate::commands::shared::state_writeback::dsl_value_to_json(value);
         match (current_exports.get(&param.name), new_json) {
             (None, _) => changes.push(ExportChange::Added {
                 name: param.name.clone(),
