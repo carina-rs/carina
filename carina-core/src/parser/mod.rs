@@ -12348,11 +12348,11 @@ awscc.ec2.Vpc {
             }
         "#;
         let mut parsed = parse(input, &ProviderContext::default()).unwrap();
-        assert_eq!(parsed.resources.len(), 1);
+        assert_eq!(parsed.resources.len(), 1); // allow: direct — fixture test inspection
 
         // Simulate the rename that compute_anonymous_identifiers would
         // perform: the pending name becomes a hash-based bound identifier.
-        let resource = &mut parsed.resources[0];
+        let resource = &mut parsed.resources[0]; // allow: direct — fixture test inspection
         assert!(resource.id.name.is_pending());
         resource.id.name = crate::resource::ResourceName::Bound("hash123".to_string());
 
