@@ -446,15 +446,12 @@ impl DiagnosticEngine {
                                         // string literal, reshape the enum-variant error
                                         // into the shape-mismatch variant so editor hovers
                                         // match CLI output. See #2094.
-                                        let reshaped = if is_quoted_literal_attr(
-                                            parsed,
-                                            &resource.id,
-                                            attr_name,
-                                        ) {
-                                            tagged.into_string_literal_diagnostic()
-                                        } else {
-                                            tagged
-                                        };
+                                        let reshaped =
+                                            if resource.quoted_string_attrs.contains(attr_name) {
+                                                tagged.into_string_literal_diagnostic()
+                                            } else {
+                                                tagged
+                                            };
                                         reshaped.to_string()
                                     })
                                 }
@@ -486,11 +483,7 @@ impl DiagnosticEngine {
                                         // TypeError. See #2094.
                                         if namespace.is_some()
                                             && matches!(value, Value::String(s) if !s.contains('.'))
-                                            && is_quoted_literal_attr(
-                                                parsed,
-                                                &resource.id,
-                                                attr_name,
-                                            )
+                                            && resource.quoted_string_attrs.contains(attr_name)
                                         {
                                             let typed = match value {
                                                 Value::String(s) => s.as_str(),
@@ -995,23 +988,6 @@ fn strip_line_comment(line: &str) -> &str {
 /// Check whether a ResourceRef value is type-compatible with the expected attribute type.
 /// Returns `Some(message)` on mismatch, `None` when compatible or when the binding/attribute
 /// cannot be resolved (unknown bindings are not flagged here).
-/// Returns true when the parser tagged the top-level attribute `attr` on
-/// `resource_id` as having been written in the source as a quoted string
-/// literal (see #2094). Used by the enum / namespaced-Custom diagnostic
-/// arms to flip their message into the shape-mismatch form so editor
-/// warnings match CLI output.
-fn is_quoted_literal_attr(
-    parsed: &ParsedFile,
-    resource_id: &carina_core::resource::ResourceId,
-    attr: &str,
-) -> bool {
-    parsed.string_literal_paths.iter().any(|p| {
-        &p.resource_id == resource_id
-            && p.attribute_chain.len() == 1
-            && p.attribute_chain[0] == attr
-    })
-}
-
 fn check_resource_ref_type_mismatch(
     binding_schema_map: &HashMap<&str, &ResourceSchema>,
     expected_type: &carina_core::schema::AttributeType,

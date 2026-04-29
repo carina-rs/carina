@@ -363,19 +363,14 @@ pub fn redact_secrets_in_attributes(attrs: &HashMap<String, Value>) -> HashMap<S
 pub fn redact_secrets_in_resource(
     resource: &crate::resource::Resource,
 ) -> crate::resource::Resource {
+    let attributes = resource
+        .attributes
+        .iter()
+        .map(|(k, e)| (k.clone(), crate::resource::Expr(redact_secrets_in_value(e))))
+        .collect();
     crate::resource::Resource {
-        id: resource.id.clone(),
-        attributes: resource
-            .attributes
-            .iter()
-            .map(|(k, e)| (k.clone(), crate::resource::Expr(redact_secrets_in_value(e))))
-            .collect(),
-        kind: resource.kind.clone(),
-        lifecycle: resource.lifecycle.clone(),
-        prefixes: resource.prefixes.clone(),
-        binding: resource.binding.clone(),
-        dependency_bindings: resource.dependency_bindings.clone(),
-        module_source: resource.module_source.clone(),
+        attributes,
+        ..resource.clone()
     }
 }
 

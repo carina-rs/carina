@@ -1,6 +1,6 @@
 //! Resource - Representing resources and their state
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use indexmap::IndexMap;
@@ -890,6 +890,22 @@ pub struct Resource {
     /// Module source info for resources that belong to a module
     #[serde(default)]
     pub module_source: Option<ModuleSource>,
+    /// Top-level attribute names whose value was written as a quoted
+    /// string literal (`attr = "..."`) in the source `.crn`.
+    ///
+    /// **Why on `Resource`, not on `Value`:** the alternative is a
+    /// `Value::QuotedString` variant, but that ripples through every
+    /// `match` arm in the codebase. Co-locating the bit with the
+    /// owning resource is enough for the only consumer that needs it
+    /// (enum-attribute diagnostics — see #2094) without that blast
+    /// radius. Sharing a struct with the attributes also makes the
+    /// lookup rename-proof: there is no separate identifier keying
+    /// the metadata, so `compute_anonymous_identifiers` can rewrite
+    /// `Resource.id.name` freely (#2229).
+    ///
+    /// Parse-time only; `#[serde(skip)]` keeps it out of state.
+    #[serde(default, skip)]
+    pub quoted_string_attrs: HashSet<String>,
 }
 
 impl Resource {
@@ -903,6 +919,7 @@ impl Resource {
             binding: None,
             dependency_bindings: BTreeSet::new(),
             module_source: None,
+            quoted_string_attrs: HashSet::new(),
         }
     }
 
@@ -920,6 +937,7 @@ impl Resource {
             binding: None,
             dependency_bindings: BTreeSet::new(),
             module_source: None,
+            quoted_string_attrs: HashSet::new(),
         }
     }
 
@@ -1164,7 +1182,7 @@ mod tests {
     /// The AC test from #2225: lookups keyed by `ResourceId` must remain
     /// valid across the name-resolution pass. This is achieved by ensuring
     /// that the parser starts with `Pending`, then any rename to `Bound`
-    /// also propagates to sibling structures (StringLiteralPath etc.).
+    /// produces a stable identifier.
     /// We assert that two different mutation paths produce equal IDs.
     #[test]
     fn resource_id_rename_pending_to_bound() {
