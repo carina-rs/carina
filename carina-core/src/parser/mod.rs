@@ -481,24 +481,6 @@ pub struct UpstreamState {
     pub source: std::path::PathBuf,
 }
 
-/// Path identifying a single attribute (possibly nested) on a specific resource.
-///
-/// Used to tag which attribute values were written as a quoted string literal
-/// in the DSL (e.g. `target_type = "aaa"`) versus a bare identifier or
-/// namespaced identifier (e.g. `target_type = AWS_ACCOUNT`). The parser drops
-/// both of those origins into `Value::String`, so consumers that care about
-/// the distinction (enum-variant diagnostics, primarily) consult this set.
-///
-/// `attribute_chain` uses the field name for struct / map descents and the
-/// decimal string index for list descents, matching the path shape used by
-/// nested-struct validation. The top-level attribute name (e.g.
-/// `["target_type"]`) is the common case.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct StringLiteralPath {
-    pub resource_id: ResourceId,
-    pub attribute_chain: Vec<String>,
-}
-
 /// Parse result
 #[derive(Debug, Clone, Default)]
 pub struct ParsedFile {
@@ -532,10 +514,6 @@ pub struct ParsedFile {
     pub warnings: Vec<ParseWarning>,
     /// For-expressions whose iterables are unresolved; displayed as deferred in plan.
     pub deferred_for_expressions: Vec<DeferredForExpression>,
-    /// Attribute paths whose value was written as a quoted string literal in
-    /// the source (as opposed to a bare or namespaced identifier). Parse-time
-    /// information only; not persisted in state.
-    pub string_literal_paths: HashSet<StringLiteralPath>,
 }
 
 impl ParsedFile {
@@ -795,12 +773,6 @@ struct ParseContext<'cfg> {
     warnings: Vec<ParseWarning>,
     /// Deferred for-expressions collected during parsing
     deferred_for_expressions: Vec<DeferredForExpression>,
-    /// Attribute paths whose RHS in the source is a plain quoted string
-    /// literal. Populated by `parse_block_contents` while walking attribute
-    /// values of a resource; handed back to `ParsedFile` at the top level.
-    /// Wrapped in `Rc<RefCell<..>>` so that `ctx.clone()` (done for local
-    /// block scopes) shares the same underlying set.
-    string_literal_paths: std::rc::Rc<std::cell::RefCell<HashSet<StringLiteralPath>>>,
 }
 
 impl<'cfg> ParseContext<'cfg> {
@@ -816,12 +788,7 @@ impl<'cfg> ParseContext<'cfg> {
             upstream_states: HashMap::new(),
             warnings: Vec::new(),
             deferred_for_expressions: Vec::new(),
-            string_literal_paths: std::rc::Rc::new(std::cell::RefCell::new(HashSet::new())),
         }
-    }
-
-    fn record_string_literal(&self, path: StringLiteralPath) {
-        self.string_literal_paths.borrow_mut().insert(path);
     }
 
     fn set_variable(&mut self, name: String, value: impl Into<EvalValue>) {
@@ -1150,8 +1117,6 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
     // `check_identifier_scope(&ParsedFile)` — wired into
     // `load_configuration_with_config`. See #2126 / #2138.
 
-    let string_literal_paths = ctx.string_literal_paths.borrow().clone();
-
     // Lower the evaluator-internal `EvalValue` bindings to user-facing
     // `Value`. Closure bindings are dropped: they are evaluator-only
     // artifacts (partial applications produced by `let f = builtin(x)`
@@ -1187,7 +1152,6 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
         structural_bindings: ctx.structural_bindings,
         warnings: ctx.warnings,
         deferred_for_expressions: ctx.deferred_for_expressions,
-        string_literal_paths,
     })
 }
 
@@ -3883,10 +3847,10 @@ fn parse_anonymous_resource(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
 ) -> Result<Resource, ParseError> {
-    let body_pairs_clone = pair.clone().into_inner();
-    let mut inner = pair.into_inner();
+    let inner = pair.into_inner();
 
-    let namespaced_type = next_pair(&mut inner, "resource type", "anonymous resource")?
+    let mut iter = inner;
+    let namespaced_type = next_pair(&mut iter, "resource type", "anonymous resource")?
         .as_str()
         .to_string();
 
@@ -3899,7 +3863,9 @@ fn parse_anonymous_resource(
     let provider = parts[0];
     let resource_type = parts[1..].join(".");
 
-    let attributes = parse_block_contents(inner, ctx)?;
+    let mut quoted_out: Option<HashSet<String>> = Some(HashSet::new());
+    let attributes = parse_block_contents_with_quoted(iter, ctx, &mut quoted_out)?;
+    let quoted_string_attrs = quoted_out.unwrap_or_default();
 
     // Anonymous resources get an empty name that will be replaced by a hash-based
     // identifier computed from create-only properties after parsing.
@@ -3912,7 +3878,6 @@ fn parse_anonymous_resource(
     let lifecycle = extract_lifecycle_config(&mut attributes);
 
     let id = ResourceId::with_provider(provider, resource_type, resource_name);
-    record_string_literal_paths_for_resource(body_pairs_clone, &id, ctx);
 
     Ok(Resource {
         id,
@@ -3923,246 +3888,56 @@ fn parse_anonymous_resource(
         binding: None,
         dependency_bindings: BTreeSet::new(),
         module_source: None,
+        quoted_string_attrs,
     })
 }
 
-/// Walk a parsed resource body and record every attribute whose value is a
-/// plain quoted string literal (as opposed to a bare identifier or a
-/// namespaced identifier). The parser collapses all three into
-/// `Value::String`, so downstream diagnostics that need to distinguish them
-/// (e.g. "expected an enum identifier, got a string literal") consult this
-/// set. See #2094.
-///
-/// `pairs` is the `into_inner()` of the resource expression (starting with
-/// the namespaced resource type); the type pair is skipped here.
-fn record_string_literal_paths_for_resource(
-    pairs: pest::iterators::Pairs<Rule>,
-    resource_id: &ResourceId,
-    ctx: &ParseContext,
-) {
-    let mut remaining = pairs;
-    // Skip the leading namespaced type pair (e.g. `aws.s3_bucket`).
-    let _ = remaining.next();
-    record_string_literal_paths_in_block(remaining, resource_id, &[], ctx);
-}
-
-fn record_string_literal_paths_in_block(
-    pairs: pest::iterators::Pairs<Rule>,
-    resource_id: &ResourceId,
-    base_path: &[String],
-    ctx: &ParseContext,
-) {
-    // Track occurrence count per nested block name so a path like
-    // `["rules", "0", "protocol"]` vs `["rules", "1", "protocol"]` stays
-    // distinct — the schema validator walks list items by index.
-    let mut nested_block_counts: HashMap<String, usize> = HashMap::new();
-
-    for content_pair in pairs {
-        let item = match content_pair.as_rule() {
-            Rule::block_content => match content_pair.into_inner().next() {
-                Some(inner) => inner,
-                None => continue,
-            },
-            Rule::attribute => content_pair,
-            _ => continue,
-        };
-
-        match item.as_rule() {
-            Rule::attribute => {
-                let mut attr_inner = item.into_inner();
-                let key_pair = match attr_inner.next() {
-                    Some(k) => k,
-                    None => continue,
-                };
-                let key = match attribute_key_text(key_pair) {
-                    Some(k) => k,
-                    None => continue,
-                };
-                let value_pair = match attr_inner.next() {
-                    Some(v) => v,
-                    None => continue,
-                };
-                let mut chain = base_path.to_vec();
-                chain.push(key);
-                record_string_literals_in_expression(value_pair, resource_id, &chain, ctx);
-            }
-            Rule::nested_block => {
-                let mut block_inner = item.into_inner();
-                let name_pair = match block_inner.next() {
-                    Some(n) => n,
-                    None => continue,
-                };
-                let block_name = name_pair.as_str().to_string();
-                let index = nested_block_counts.entry(block_name.clone()).or_insert(0);
-                let idx = *index;
-                *index += 1;
-                let mut chain = base_path.to_vec();
-                chain.push(block_name);
-                chain.push(idx.to_string());
-                record_string_literal_paths_in_block(block_inner, resource_id, &chain, ctx);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn attribute_key_text(pair: pest::iterators::Pair<Rule>) -> Option<String> {
-    match pair.as_rule() {
-        Rule::identifier => Some(pair.as_str().to_string()),
-        Rule::string => extract_plain_string_key(pair),
-        _ => None,
-    }
-}
-
-/// Best-effort extraction of the textual content of a `Rule::string` pair used
-/// as an attribute key. Interpolation in keys is already disallowed elsewhere
-/// in the parser; here we just read the literal segments and concatenate.
-fn extract_plain_string_key(pair: pest::iterators::Pair<Rule>) -> Option<String> {
-    let inner = pair.into_inner().next()?;
-    match inner.as_rule() {
-        Rule::single_quoted_string => inner.into_inner().next().map(|p| p.as_str().to_string()),
-        Rule::double_quoted_string => {
-            let mut out = String::new();
-            for part in inner.into_inner() {
-                if part.as_rule() == Rule::string_part {
-                    for leaf in part.into_inner() {
-                        if leaf.as_rule() == Rule::string_literal {
-                            out.push_str(leaf.as_str());
-                        }
-                    }
-                }
-            }
-            Some(out)
-        }
-        _ => None,
-    }
-}
-
-/// Walk an `expression` pair and, if it unwraps to a plain string primary
-/// (no function calls, no operators, no interpolation), record the attribute
-/// at `chain` as coming from a quoted string literal. Also descends into
-/// list/map literals to tag their elements.
-fn record_string_literals_in_expression(
-    pair: pest::iterators::Pair<Rule>,
-    resource_id: &ResourceId,
-    chain: &[String],
-    ctx: &ParseContext,
-) {
-    // expression -> coalesce_expr -> pipe_expr -> compose_expr -> primary
-    // Only "bare" chains (no pipes, no composes, no coalesce) can represent a
-    // pure literal.
-    let primary = match unwrap_to_primary(pair) {
-        Some(p) => p,
-        None => return,
+/// True if a parsed expression is exactly a plain (uninterpolated)
+/// quoted string literal — no operators, no interpolation, no
+/// list / map wrapping. Used to populate `Resource.quoted_string_attrs`
+/// so enum-attribute diagnostics can distinguish a shape mismatch
+/// (`attr = "AWS_ACCOUNT"`) from a variant mismatch
+/// (`attr = AWS_ACCOUNT`); see #2094 / #2229.
+fn expression_is_plain_string_literal(pair: pest::iterators::Pair<Rule>) -> bool {
+    let Some(primary) = unwrap_to_primary(pair) else {
+        return false;
     };
-    let inner = match primary.into_inner().next() {
-        Some(i) => i,
-        None => return,
+    let Some(inner) = primary.into_inner().next() else {
+        return false;
     };
-    match inner.as_rule() {
-        // A `Rule::string` primary that has no interpolation is the one shape
-        // we tag; interpolated values like `"prefix-${name}"` do not count.
-        Rule::string if is_plain_string_without_interpolation(&inner) => {
-            ctx.record_string_literal(StringLiteralPath {
-                resource_id: resource_id.clone(),
-                attribute_chain: chain.to_vec(),
-            });
-        }
-        Rule::list => {
-            for (i, item) in inner.into_inner().enumerate() {
-                let mut c = chain.to_vec();
-                c.push(i.to_string());
-                record_string_literals_in_expression(item, resource_id, &c, ctx);
-            }
-        }
-        Rule::map => {
-            let mut nested_counts: HashMap<String, usize> = HashMap::new();
-            for entry in inner.into_inner() {
-                match entry.as_rule() {
-                    Rule::map_entry => {
-                        let mut ei = entry.into_inner();
-                        let key_pair = match ei.next() {
-                            Some(k) => k,
-                            None => continue,
-                        };
-                        let key = match attribute_key_text(key_pair) {
-                            Some(k) => k,
-                            None => continue,
-                        };
-                        let value_pair = match ei.next() {
-                            Some(v) => v,
-                            None => continue,
-                        };
-                        let mut c = chain.to_vec();
-                        c.push(key);
-                        record_string_literals_in_expression(value_pair, resource_id, &c, ctx);
-                    }
-                    Rule::nested_block => {
-                        let mut bi = entry.into_inner();
-                        let name_pair = match bi.next() {
-                            Some(n) => n,
-                            None => continue,
-                        };
-                        let block_name = name_pair.as_str().to_string();
-                        let index = nested_counts.entry(block_name.clone()).or_insert(0);
-                        let idx = *index;
-                        *index += 1;
-                        let mut c = chain.to_vec();
-                        c.push(block_name);
-                        c.push(idx.to_string());
-                        record_string_literal_paths_in_block(bi, resource_id, &c, ctx);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        _ => {}
+    if inner.as_rule() != Rule::string {
+        return false;
+    }
+    let Some(string_inner) = inner.into_inner().next() else {
+        return false;
+    };
+    match string_inner.as_rule() {
+        Rule::single_quoted_string => true,
+        Rule::double_quoted_string => string_inner
+            .into_inner()
+            .filter(|p| p.as_rule() == Rule::string_part)
+            .flat_map(|p| p.into_inner())
+            .all(|leaf| leaf.as_rule() != Rule::interpolation),
+        _ => false,
     }
 }
 
-/// Walk `expression` (or any intermediate operator rule) down to the first
-/// `primary`, returning `None` if any operator (|>, >>, ??) has more than
-/// one operand — such chains are expressions, not pure literals.
+/// Walk an `expression` (or any intermediate operator rule) down to
+/// the first `primary`, returning `None` if any operator (`|>`, `>>`,
+/// `??`) has more than one operand — such chains are expressions, not
+/// pure literals.
 fn unwrap_to_primary(pair: pest::iterators::Pair<Rule>) -> Option<pest::iterators::Pair<Rule>> {
-    let rule = pair.as_rule();
-    match rule {
+    match pair.as_rule() {
         Rule::primary => Some(pair),
         Rule::expression | Rule::coalesce_expr | Rule::pipe_expr | Rule::compose_expr => {
             let mut inner = pair.into_inner();
             let first = inner.next()?;
             if inner.next().is_some() {
-                // Second operand means an operator is applied — not a literal.
                 return None;
             }
             unwrap_to_primary(first)
         }
         _ => None,
-    }
-}
-
-fn is_plain_string_without_interpolation(pair: &pest::iterators::Pair<Rule>) -> bool {
-    // Rule::string -> (single_quoted_string | double_quoted_string)
-    let inner = match pair.clone().into_inner().next() {
-        Some(i) => i,
-        None => return false,
-    };
-    match inner.as_rule() {
-        // Single-quoted strings do not support interpolation.
-        Rule::single_quoted_string => true,
-        Rule::double_quoted_string => {
-            for part in inner.into_inner() {
-                if part.as_rule() != Rule::string_part {
-                    continue;
-                }
-                for leaf in part.into_inner() {
-                    if leaf.as_rule() == Rule::interpolation {
-                        return false;
-                    }
-                }
-            }
-            true
-        }
-        _ => false,
     }
 }
 
@@ -4173,6 +3948,19 @@ fn is_plain_string_without_interpolation(pair: &pest::iterators::Pair<Rule>) -> 
 fn parse_block_contents(
     pairs: pest::iterators::Pairs<Rule>,
     ctx: &ParseContext,
+) -> Result<IndexMap<String, Value>, ParseError> {
+    parse_block_contents_with_quoted(pairs, ctx, &mut None)
+}
+
+/// As [`parse_block_contents`], but if `quoted_out` is `Some`, populate it
+/// with the names of top-level attributes whose value is a plain quoted
+/// string literal (`attr = "..."`). Used by resource-level callers to
+/// build `Resource.quoted_string_attrs` for enum-attribute diagnostics
+/// (#2094 / #2229) without re-walking the pest tree.
+fn parse_block_contents_with_quoted(
+    pairs: pest::iterators::Pairs<Rule>,
+    ctx: &ParseContext,
+    quoted_out: &mut Option<HashSet<String>>,
 ) -> Result<IndexMap<String, Value>, ParseError> {
     // `IndexMap` so the order in which the user wrote attributes in the
     // .crn file flows all the way to `Resource.attributes` and to
@@ -4207,10 +3995,10 @@ fn parse_block_contents(
                         let key_pair =
                             next_pair(&mut attr_inner, "attribute name", "block content")?;
                         let key = extract_key_string(key_pair)?;
-                        let value = parse_expression(
-                            next_pair(&mut attr_inner, "attribute value", "block content")?,
-                            &local_ctx,
-                        )?;
+                        let value_pair =
+                            next_pair(&mut attr_inner, "attribute value", "block content")?;
+                        record_quoted_if_literal(quoted_out, &key, &value_pair);
+                        let value = parse_expression(value_pair, &local_ctx)?;
                         attributes.insert(key, value);
                     }
                     Rule::nested_block => {
@@ -4234,10 +4022,9 @@ fn parse_block_contents(
                 let mut attr_inner = content_pair.into_inner();
                 let key_pair = next_pair(&mut attr_inner, "attribute name", "block content")?;
                 let key = extract_key_string(key_pair)?;
-                let value = parse_expression(
-                    next_pair(&mut attr_inner, "attribute value", "block content")?,
-                    &local_ctx,
-                )?;
+                let value_pair = next_pair(&mut attr_inner, "attribute value", "block content")?;
+                record_quoted_if_literal(quoted_out, &key, &value_pair);
+                let value = parse_expression(value_pair, &local_ctx)?;
                 attributes.insert(key, value);
             }
             _ => {}
@@ -4250,6 +4037,21 @@ fn parse_block_contents(
     }
 
     Ok(attributes)
+}
+
+/// If `quoted_out` is enabled and `value_pair` is a plain quoted string
+/// literal (no interpolation, no operators, no list / map wrapping),
+/// record `key` in the output set.
+fn record_quoted_if_literal(
+    quoted_out: &mut Option<HashSet<String>>,
+    key: &str,
+    value_pair: &pest::iterators::Pair<Rule>,
+) {
+    if let Some(set) = quoted_out.as_mut()
+        && expression_is_plain_string_literal(value_pair.clone())
+    {
+        set.insert(key.to_string());
+    }
 }
 
 /// Extract lifecycle configuration from attributes.
@@ -4278,7 +4080,6 @@ fn parse_resource_expr(
     ctx: &ParseContext,
     binding_name: &str,
 ) -> Result<Resource, ParseError> {
-    let body_pairs_clone = pair.clone().into_inner();
     let mut inner = pair.into_inner();
 
     let namespaced_type = next_pair(&mut inner, "resource type", "resource expression")?
@@ -4295,7 +4096,9 @@ fn parse_resource_expr(
     let provider = parts[0];
     let resource_type = parts[1..].join(".");
 
-    let mut attributes = parse_block_contents(inner, ctx)?;
+    let mut quoted_out: Option<HashSet<String>> = Some(HashSet::new());
+    let mut attributes = parse_block_contents_with_quoted(inner, ctx, &mut quoted_out)?;
+    let quoted_string_attrs = quoted_out.unwrap_or_default();
 
     // All providers: use binding name as identifier.
     let resource_name = binding_name.to_string();
@@ -4306,7 +4109,6 @@ fn parse_resource_expr(
     attributes.insert("_type".to_string(), Value::String(namespaced_type.clone()));
 
     let id = ResourceId::with_provider(provider, resource_type, resource_name);
-    record_string_literal_paths_for_resource(body_pairs_clone, &id, ctx);
 
     Ok(Resource {
         id,
@@ -4317,6 +4119,7 @@ fn parse_resource_expr(
         binding: Some(binding_name.to_string()),
         dependency_bindings: BTreeSet::new(),
         module_source: None,
+        quoted_string_attrs,
     })
 }
 
@@ -4326,7 +4129,6 @@ fn parse_read_resource_expr(
     ctx: &ParseContext,
     binding_name: &str,
 ) -> Result<Resource, ParseError> {
-    let body_pairs_clone = pair.clone().into_inner();
     let mut inner = pair.into_inner();
 
     let namespaced_type = next_pair(&mut inner, "resource type", "read resource expression")?
@@ -4343,7 +4145,9 @@ fn parse_read_resource_expr(
     let provider = parts[0];
     let resource_type = parts[1..].join(".");
 
-    let mut attributes = parse_block_contents(inner, ctx)?;
+    let mut quoted_out: Option<HashSet<String>> = Some(HashSet::new());
+    let mut attributes = parse_block_contents_with_quoted(inner, ctx, &mut quoted_out)?;
+    let quoted_string_attrs = quoted_out.unwrap_or_default();
 
     // All providers: use binding name as identifier.
     let resource_name = binding_name.to_string();
@@ -4356,7 +4160,6 @@ fn parse_read_resource_expr(
     attributes.insert("_data_source".to_string(), Value::Bool(true));
 
     let id = ResourceId::with_provider(provider, resource_type, resource_name);
-    record_string_literal_paths_for_resource(body_pairs_clone, &id, ctx);
 
     Ok(Resource {
         id,
@@ -4367,6 +4170,7 @@ fn parse_read_resource_expr(
         binding: Some(binding_name.to_string()),
         dependency_bindings: BTreeSet::new(),
         module_source: None,
+        quoted_string_attrs,
     })
 }
 
@@ -12529,12 +12333,48 @@ awscc.ec2.Vpc {
         );
     }
 
-    /// Issue #2094: distinguish quoted string literals from bare identifiers
-    /// and namespaced identifiers at the parser level, so downstream enum
-    /// diagnostics can report shape mismatches ("got a string literal") vs.
-    /// variant mismatches ("invalid enum variant").
+    /// Issue #2229 acceptance criterion 3: the "was this attribute written
+    /// as a quoted literal?" bit must survive an anonymous-resource rename.
+    /// Anonymous resources start with an empty name; the post-parse
+    /// identifier pass rewrites that name. A side-table keyed by
+    /// `ResourceId` would silently miss after the rename. Co-locating
+    /// the bit on the `Resource` (the same struct that carries the
+    /// attributes) makes it impossible to lose.
     #[test]
-    fn string_literal_paths_distinguish_quoted_from_bare_and_namespaced() {
+    fn quoted_literal_marker_survives_anonymous_resource_rename() {
+        let input = r#"
+            aws.sso_admin.principal_assignment {
+                target_type = "AWS_ACCOUNT"
+            }
+        "#;
+        let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(parsed.resources.len(), 1);
+
+        // Simulate the rename that compute_anonymous_identifiers would
+        // perform: the pending name becomes a hash-based bound identifier.
+        let resource = &mut parsed.resources[0];
+        assert!(resource.id.name.is_pending());
+        resource.id.name = crate::resource::ResourceName::Bound("hash123".to_string());
+
+        // The "was quoted" marker must still be reachable on the
+        // resource — it co-locates with the attributes, not in a
+        // side-table keyed by the (now-stale) ResourceId.
+        assert!(
+            resource.quoted_string_attrs.contains("target_type"),
+            "quoted-literal attribute name must survive rename; got {:?}",
+            resource.quoted_string_attrs
+        );
+    }
+
+    /// Issue #2094 / #2229: distinguish quoted string literals from
+    /// bare identifiers and namespaced identifiers at the parser level,
+    /// so downstream enum diagnostics can report shape mismatches
+    /// ("got a string literal") vs. variant mismatches ("invalid enum
+    /// variant"). After #2229 the marker lives on the `Resource` that
+    /// owns the attributes (`Resource.quoted_string_attrs`); the
+    /// previous `string_literal_paths` side-table is gone.
+    #[test]
+    fn quoted_string_attrs_distinguish_quoted_from_bare_and_namespaced() {
         let input = r#"
             let a = aws.sso_admin.principal_assignment {
                 target_type = "aaa"
@@ -12550,44 +12390,34 @@ awscc.ec2.Vpc {
         "#;
         let parsed = parse(input, &ProviderContext::default()).unwrap();
 
-        let paths = &parsed.string_literal_paths;
-
-        let quoted = StringLiteralPath {
-            resource_id: ResourceId::with_provider("aws", "sso_admin.principal_assignment", "a"),
-            attribute_chain: vec!["target_type".to_string()],
+        let quoted_of = |binding: &str| -> bool {
+            parsed
+                .resources
+                .iter()
+                .find(|r| r.binding.as_deref() == Some(binding))
+                .map(|r| r.quoted_string_attrs.contains("target_type"))
+                .unwrap_or(false)
         };
-        assert!(
-            paths.contains(&quoted),
-            "quoted literal `target_type = \"aaa\"` must be recorded; paths = {:?}",
-            paths
-        );
 
-        let bare = StringLiteralPath {
-            resource_id: ResourceId::with_provider("aws", "sso_admin.principal_assignment", "b"),
-            attribute_chain: vec!["target_type".to_string()],
-        };
+        // Quoted literal carries the marker.
         assert!(
-            !paths.contains(&bare),
-            "bare identifier `target_type = AWS_ACCOUNT` must NOT be recorded as a string literal; paths = {:?}",
-            paths
+            quoted_of("a"),
+            "quoted literal `target_type = \"aaa\"` must be marked"
         );
-
-        let namespaced = StringLiteralPath {
-            resource_id: ResourceId::with_provider("aws", "sso_admin.principal_assignment", "c"),
-            attribute_chain: vec!["target_type".to_string()],
-        };
-        assert!(
-            !paths.contains(&namespaced),
-            "namespaced identifier must NOT be recorded as a string literal; paths = {:?}",
-            paths
-        );
+        // Bare identifier and namespaced identifier do not.
+        assert!(!quoted_of("b"), "bare identifier must NOT be marked");
+        assert!(!quoted_of("c"), "namespaced identifier must NOT be marked");
     }
 
     #[test]
-    fn string_literal_paths_record_nested_block_attributes() {
-        // Nested block `rules { protocol = "tcp" }` should produce a path
-        // with the block name and its per-occurrence index, matching how the
-        // schema validator walks list-of-struct values.
+    fn quoted_string_attrs_are_top_level_only() {
+        // The quoted-bit currently scopes to the resource's top-level
+        // attributes. Nested-block attributes (`rules { protocol = "tcp" }`)
+        // and list / map elements are intentionally not recorded — no
+        // current consumer needs them, and tracking them would re-introduce
+        // the path-keyed shape that #2229 removed. This test pins that
+        // contract so a future "let's also track nested" change is a
+        // visible API decision rather than a silent broadening.
         let input = r#"
             let sg = aws.ec2.SecurityGroup {
                 name = "sg-1"
@@ -12597,20 +12427,19 @@ awscc.ec2.Vpc {
             }
         "#;
         let parsed = parse(input, &ProviderContext::default()).unwrap();
-
-        let expected = StringLiteralPath {
-            resource_id: ResourceId::with_provider("aws", "ec2.SecurityGroup", "sg"),
-            attribute_chain: vec!["rules".to_string(), "0".to_string(), "protocol".to_string()],
-        };
-        assert!(
-            parsed.string_literal_paths.contains(&expected),
-            "nested-block string literal must be recorded with index path; paths = {:?}",
-            parsed.string_literal_paths
-        );
+        let sg = parsed
+            .resources
+            .iter()
+            .find(|r| r.binding.as_deref() == Some("sg"))
+            .expect("sg resource present");
+        assert!(sg.quoted_string_attrs.contains("name"));
+        // `protocol` lives inside the `rules` block; only top-level
+        // attribute names ("name", "rules") are tracked.
+        assert!(!sg.quoted_string_attrs.contains("protocol"));
     }
 
     #[test]
-    fn string_literal_paths_skip_interpolated_strings() {
+    fn quoted_string_attrs_skipped_for_interpolated_strings() {
         // An interpolated string is not a "plain" literal — users who write
         // "${x}" are constructing a value, not typing an enum by mistake.
         let input = r#"
@@ -12620,15 +12449,17 @@ awscc.ec2.Vpc {
             }
         "#;
         let parsed = parse(input, &ProviderContext::default()).unwrap();
-
-        let interpolated = StringLiteralPath {
-            resource_id: ResourceId::with_provider("aws", "s3_bucket", "r"),
-            attribute_chain: vec!["name".to_string()],
-        };
+        let r = parsed
+            .resources
+            .iter()
+            .find(|r| r.binding.as_deref() == Some("r"))
+            .expect("r resource present");
+        // Interpolations parse to `Value::Interpolation`, not a plain
+        // string, so they are never recorded in `quoted_string_attrs`.
         assert!(
-            !parsed.string_literal_paths.contains(&interpolated),
-            "interpolated strings must not be tagged as plain literals; paths = {:?}",
-            parsed.string_literal_paths
+            !r.quoted_string_attrs.contains("name"),
+            "interpolated string must not be tagged as a quoted literal; got {:?}",
+            r.quoted_string_attrs
         );
     }
 

@@ -38,17 +38,7 @@ pub fn validate_resources(
                         schema.resource_type, schema.resource_type
                     ));
                 }
-                // Consult parser-recorded string-literal origins so that
-                // `target_type = "aaa"` (a shape mismatch) gets a dedicated
-                // diagnostic, distinct from `target_type = aaa` (a variant
-                // mismatch). See #2094.
-                let literal_top_level_attrs: HashSet<&str> = parsed
-                    .string_literal_paths
-                    .iter()
-                    .filter(|p| p.resource_id == resource.id && p.attribute_chain.len() == 1)
-                    .map(|p| p.attribute_chain[0].as_str())
-                    .collect();
-                let is_string_literal = |attr: &str| literal_top_level_attrs.contains(attr);
+                let is_string_literal = |attr: &str| resource.quoted_string_attrs.contains(attr);
                 if let Err(errors) = schema
                     .validate_with_origins(&resource.resolved_attributes(), &is_string_literal)
                 {
@@ -859,7 +849,6 @@ mod tests {
             structural_bindings: HashSet::new(),
             warnings: Vec::new(),
             deferred_for_expressions: Vec::new(),
-            string_literal_paths: std::collections::HashSet::new(),
         }
     }
 

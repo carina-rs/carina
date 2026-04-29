@@ -459,6 +459,7 @@ impl<'cfg> ModuleResolver<'cfg> {
                 binding: Some(binding_name.clone()),
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
+                quoted_string_attrs: std::collections::HashSet::new(),
             };
             expanded_resources.push(virtual_resource);
         }
@@ -1135,6 +1136,7 @@ mod tests {
                 binding: None,
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
+                quoted_string_attrs: std::collections::HashSet::new(),
             }],
             variables: IndexMap::new(),
             uses: vec![],
@@ -1165,7 +1167,6 @@ mod tests {
             structural_bindings: HashSet::new(),
             warnings: vec![],
             deferred_for_expressions: vec![],
-            string_literal_paths: HashSet::new(),
         }
     }
 
@@ -1263,6 +1264,7 @@ mod tests {
                     binding: Some("vpc".to_string()),
                     dependency_bindings: BTreeSet::new(),
                     module_source: None,
+                    quoted_string_attrs: std::collections::HashSet::new(),
                 },
                 Resource {
                     id: ResourceId::new("ec2.Subnet", "sub"),
@@ -1280,6 +1282,7 @@ mod tests {
                     binding: Some("subnet".to_string()),
                     dependency_bindings: BTreeSet::new(),
                     module_source: None,
+                    quoted_string_attrs: std::collections::HashSet::new(),
                 },
             ],
             variables: IndexMap::new(),
@@ -1302,7 +1305,6 @@ mod tests {
             structural_bindings: HashSet::new(),
             warnings: vec![],
             deferred_for_expressions: vec![],
-            string_literal_paths: HashSet::new(),
         }
     }
 
@@ -1407,6 +1409,7 @@ mod tests {
                 binding: Some("sg".to_string()),
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
+                quoted_string_attrs: std::collections::HashSet::new(),
             }],
             variables: IndexMap::new(),
             uses: vec![],
@@ -1430,7 +1433,6 @@ mod tests {
             structural_bindings: HashSet::new(),
             warnings: vec![],
             deferred_for_expressions: vec![],
-            string_literal_paths: HashSet::new(),
         }
     }
 
@@ -2208,6 +2210,7 @@ thing { name = 'unchanged-but-different' }
                 binding: Some("vpc".to_string()),
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
+                quoted_string_attrs: std::collections::HashSet::new(),
             }],
             variables: IndexMap::new(),
             uses: vec![],
@@ -2238,7 +2241,6 @@ thing { name = 'unchanged-but-different' }
             structural_bindings: HashSet::new(),
             warnings: vec![],
             deferred_for_expressions: vec![],
-            string_literal_paths: HashSet::new(),
         }
     }
 
@@ -2556,7 +2558,6 @@ thing { name = 'unchanged-but-different' }
             structural_bindings: HashSet::new(),
             warnings: vec![],
             deferred_for_expressions: vec![],
-            string_literal_paths: HashSet::new(),
         }
     }
 
@@ -2729,7 +2730,6 @@ thing { name = 'unchanged-but-different' }
             structural_bindings: HashSet::new(),
             warnings: vec![],
             deferred_for_expressions: vec![],
-            string_literal_paths: HashSet::new(),
         };
 
         let resolver = {
@@ -2795,7 +2795,6 @@ thing { name = 'unchanged-but-different' }
             structural_bindings: HashSet::new(),
             warnings: vec![],
             deferred_for_expressions: vec![],
-            string_literal_paths: HashSet::new(),
         };
 
         let resolver = {
@@ -2889,7 +2888,6 @@ thing { name = 'unchanged-but-different' }
             structural_bindings: HashSet::new(),
             warnings: vec![],
             deferred_for_expressions: vec![],
-            string_literal_paths: HashSet::new(),
         };
 
         let resolver = {
@@ -2959,7 +2957,6 @@ thing { name = 'unchanged-but-different' }
             structural_bindings: HashSet::new(),
             warnings: vec![],
             deferred_for_expressions: vec![],
-            string_literal_paths: HashSet::new(),
         };
 
         let resolver = {
@@ -3026,7 +3023,6 @@ thing { name = 'unchanged-but-different' }
             structural_bindings: HashSet::new(),
             warnings: vec![],
             deferred_for_expressions: vec![],
-            string_literal_paths: HashSet::new(),
         };
 
         let resolver = {
@@ -3119,7 +3115,6 @@ thing { name = 'unchanged-but-different' }
             structural_bindings: HashSet::new(),
             warnings: vec![],
             deferred_for_expressions: vec![],
-            string_literal_paths: HashSet::new(),
         };
 
         let resolver = {
