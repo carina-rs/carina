@@ -1789,6 +1789,29 @@ pub mod types {
     pub fn cidr() -> AttributeType {
         AttributeType::Union(vec![ipv4_cidr(), ipv6_cidr()])
     }
+
+    /// Email address type (RFC 5322-ish lightweight validation).
+    ///
+    /// Validation is intentionally pragmatic, not a full RFC 5322 parser:
+    /// requires a non-empty local part, a single `@`, and a domain that
+    /// contains at least one dot with non-empty labels.
+    pub fn email() -> AttributeType {
+        AttributeType::Custom {
+            semantic_name: Some("Email".to_string()),
+            base: Box::new(AttributeType::String),
+            pattern: None,
+            length: None,
+            validate: |value| {
+                if let Value::String(s) = value {
+                    validate_email(s)
+                } else {
+                    Err("Expected string".to_string())
+                }
+            },
+            namespace: None,
+            to_dsl: None,
+        }
+    }
 }
 
 /// Validate an IPv4 address (e.g., "10.0.1.5", "192.168.0.1")
@@ -1921,6 +1944,68 @@ pub fn validate_ipv6_address(addr: &str) -> Result<(), String> {
         }
         for group in &groups {
             validate_ipv6_group(group, addr)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate an email address using a pragmatic, RFC 5322-ish lightweight check.
+///
+/// Requirements:
+/// - Exactly one `@` separator
+/// - Non-empty local part (no whitespace)
+/// - Non-empty domain containing at least one `.`
+/// - Every dot-separated domain label is non-empty (no leading/trailing dot,
+///   no consecutive dots) and free of whitespace
+///
+/// This is intentionally not a full RFC 5322 parser; it catches the common
+/// formatting mistakes without rejecting unusual-but-valid addresses.
+pub fn validate_email(email: &str) -> Result<(), String> {
+    if email.is_empty() {
+        return Err("Empty email address".to_string());
+    }
+
+    let parts: Vec<&str> = email.split('@').collect();
+    if parts.len() != 2 {
+        return Err(format!(
+            "Invalid email '{}': expected exactly one '@'",
+            email
+        ));
+    }
+
+    let local = parts[0];
+    let domain = parts[1];
+
+    if local.is_empty() {
+        return Err(format!("Invalid email '{}': empty local part", email));
+    }
+    if local.chars().any(char::is_whitespace) {
+        return Err(format!(
+            "Invalid email '{}': local part contains whitespace",
+            email
+        ));
+    }
+
+    if domain.is_empty() {
+        return Err(format!("Invalid email '{}': empty domain", email));
+    }
+    if !domain.contains('.') {
+        return Err(format!(
+            "Invalid email '{}': domain must contain at least one dot",
+            email
+        ));
+    }
+
+    for label in domain.split('.') {
+        if label.is_empty() {
+            return Err(format!("Invalid email '{}': domain has empty label", email));
+        }
+        if label.chars().any(char::is_whitespace) {
+            return Err(format!(
+                "Invalid email '{}': domain label contains whitespace",
+                email
+            ));
         }
     }
 

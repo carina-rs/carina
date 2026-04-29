@@ -2494,3 +2494,80 @@ fn custom_type_name_anonymous_pattern_and_length() {
     };
     assert_eq!(t.type_name(), "String(pattern, len: 1..=64)");
 }
+
+#[test]
+fn validate_email_function_directly() {
+    // Valid
+    assert!(validate_email("user@example.com").is_ok());
+    assert!(validate_email("user.name+tag@sub.example.co.jp").is_ok());
+    assert!(validate_email("a@b.c").is_ok());
+
+    // Invalid: no '@'
+    assert!(validate_email("no-at-sign.com").is_err());
+    // Invalid: no dot in domain
+    assert!(validate_email("noTLD@host").is_err());
+    // Invalid: empty local-part
+    assert!(validate_email("@example.com").is_err());
+    // Invalid: empty domain
+    assert!(validate_email("user@").is_err());
+    // Invalid: empty input
+    assert!(validate_email("").is_err());
+    // Invalid: more than one '@'
+    assert!(validate_email("a@b@c.com").is_err());
+    // Invalid: empty domain label (consecutive dots)
+    assert!(validate_email("user@example..com").is_err());
+    // Invalid: trailing dot in domain creates empty label
+    assert!(validate_email("user@example.com.").is_err());
+    // Invalid: whitespace
+    assert!(validate_email("us er@example.com").is_err());
+    assert!(validate_email("user@exa mple.com").is_err());
+}
+
+#[test]
+fn validate_email_type() {
+    let t = types::email();
+
+    // Type identity: Custom with semantic_name "Email" and String base
+    match &t {
+        AttributeType::Custom {
+            semantic_name,
+            base,
+            ..
+        } => {
+            assert_eq!(semantic_name.as_deref(), Some("Email"));
+            assert!(matches!(**base, AttributeType::String));
+        }
+        other => panic!("Expected AttributeType::Custom, got: {:?}", other),
+    }
+
+    // Valid emails
+    assert!(
+        t.validate(&Value::String("user@example.com".to_string()))
+            .is_ok()
+    );
+    assert!(
+        t.validate(&Value::String(
+            "user.name+tag@sub.example.co.jp".to_string()
+        ))
+        .is_ok()
+    );
+
+    // Invalid emails
+    assert!(
+        t.validate(&Value::String("no-at-sign.com".to_string()))
+            .is_err()
+    );
+    assert!(
+        t.validate(&Value::String("noTLD@host".to_string()))
+            .is_err()
+    );
+    assert!(
+        t.validate(&Value::String("@example.com".to_string()))
+            .is_err()
+    );
+    assert!(t.validate(&Value::String("user@".to_string())).is_err());
+    assert!(t.validate(&Value::String("".to_string())).is_err());
+
+    // Wrong type
+    assert!(t.validate(&Value::Int(42)).is_err());
+}
