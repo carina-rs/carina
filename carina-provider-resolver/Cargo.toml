@@ -21,4 +21,5 @@ zip = "2"
 dirs = "6"
 
 [dev-dependencies]
+indexmap = "2"
 tempfile = "3"

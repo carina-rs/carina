@@ -1,6 +1,5 @@
 //! Tests for WasmProviderFactory precompile cache functionality.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use carina_core::provider::ProviderFactory;
@@ -147,7 +146,7 @@ async fn test_precompiled_factory_creates_provider() {
         .expect("from_precompiled should succeed");
 
     // Verify the factory can actually create a working provider
-    let provider = factory.create_provider(&HashMap::new()).await;
+    let provider = factory.create_provider(&indexmap::IndexMap::new()).await;
     assert_eq!(provider.name(), "mock");
 }
 

@@ -1,5 +1,7 @@
 use super::*;
 
+use indexmap::IndexMap;
+
 #[test]
 fn type_aware_int_float_coercion() {
     assert!(type_aware_equal(
@@ -64,11 +66,11 @@ fn type_aware_struct_per_field() {
             StructField::new("name", AttributeType::String),
         ],
     };
-    let a = Value::Map(HashMap::from([
+    let a = Value::Map(IndexMap::from([
         ("count".to_string(), Value::Int(5)),
         ("name".to_string(), Value::String("test".to_string())),
     ]));
-    let b = Value::Map(HashMap::from([
+    let b = Value::Map(IndexMap::from([
         ("count".to_string(), Value::Float(5.0)),
         ("name".to_string(), Value::String("test".to_string())),
     ]));
@@ -152,13 +154,13 @@ fn type_aware_struct_ignores_default_bool_false() {
     };
 
     // Desired: only sse_algorithm specified (no bucket_key_enabled)
-    let desired = Value::Map(HashMap::from([(
+    let desired = Value::Map(IndexMap::from([(
         "sse_algorithm".to_string(),
         Value::String("AES256".to_string()),
     )]));
 
     // Current (from AWS): includes bucket_key_enabled: false as default
-    let current = Value::Map(HashMap::from([
+    let current = Value::Map(IndexMap::from([
         ("bucket_key_enabled".to_string(), Value::Bool(false)),
         (
             "sse_algorithm".to_string(),
@@ -185,13 +187,13 @@ fn type_aware_struct_does_not_ignore_non_default_bool() {
     };
 
     // Desired: only sse_algorithm
-    let desired = Value::Map(HashMap::from([(
+    let desired = Value::Map(IndexMap::from([(
         "sse_algorithm".to_string(),
         Value::String("AES256".to_string()),
     )]));
 
     // Current: bucket_key_enabled is true (non-default) — should NOT be equal
-    let current = Value::Map(HashMap::from([
+    let current = Value::Map(IndexMap::from([
         ("bucket_key_enabled".to_string(), Value::Bool(true)),
         (
             "sse_algorithm".to_string(),
@@ -282,13 +284,13 @@ fn type_aware_struct_ignores_default_string_enum_empty() {
     };
 
     // Desired: only name specified
-    let desired = Value::Map(HashMap::from([(
+    let desired = Value::Map(IndexMap::from([(
         "name".to_string(),
         Value::String("test".to_string()),
     )]));
 
     // Current: includes status: "" as default
-    let current = Value::Map(HashMap::from([
+    let current = Value::Map(IndexMap::from([
         ("name".to_string(), Value::String("test".to_string())),
         ("status".to_string(), Value::String(String::new())),
     ]));
@@ -323,13 +325,13 @@ fn type_aware_struct_ignores_default_custom_type() {
     };
 
     // Desired: only name specified
-    let desired = Value::Map(HashMap::from([(
+    let desired = Value::Map(IndexMap::from([(
         "name".to_string(),
         Value::String("test".to_string()),
     )]));
 
     // Current: includes port: 0 as default
-    let current = Value::Map(HashMap::from([
+    let current = Value::Map(IndexMap::from([
         ("name".to_string(), Value::String("test".to_string())),
         ("port".to_string(), Value::Int(0)),
     ]));
@@ -359,15 +361,15 @@ fn type_aware_struct_ignores_default_nested_struct_empty() {
     };
 
     // Desired: only name specified
-    let desired = Value::Map(HashMap::from([(
+    let desired = Value::Map(IndexMap::from([(
         "name".to_string(),
         Value::String("test".to_string()),
     )]));
 
     // Current: includes inner: {} as default
-    let current = Value::Map(HashMap::from([
+    let current = Value::Map(IndexMap::from([
         ("name".to_string(), Value::String("test".to_string())),
-        ("inner".to_string(), Value::Map(HashMap::new())),
+        ("inner".to_string(), Value::Map(IndexMap::new())),
     ]));
 
     assert!(
@@ -640,7 +642,7 @@ fn secret_in_map_no_change_when_hash_matches() {
 
     // Desired: tags map with a secret value
     let secret_value = Value::Secret(Box::new(Value::String("super-secret".to_string())));
-    let desired_tags = Value::Map(HashMap::from([
+    let desired_tags = Value::Map(IndexMap::from([
         ("Name".to_string(), Value::String("test".to_string())),
         ("SecretTag".to_string(), secret_value.clone()),
     ]));
@@ -648,7 +650,7 @@ fn secret_in_map_no_change_when_hash_matches() {
     // State: tags map with the secret hash (as stored by from_provider_state)
     let hash_json = value_to_json(&secret_value).unwrap();
     let hash_str = hash_json.as_str().unwrap().to_string();
-    let state_tags = Value::Map(HashMap::from([
+    let state_tags = Value::Map(IndexMap::from([
         ("Name".to_string(), Value::String("test".to_string())),
         ("SecretTag".to_string(), Value::String(hash_str)),
     ]));
@@ -807,7 +809,7 @@ fn secret_in_map_with_refresh_no_false_diff() {
     let resource_id = ResourceId::with_provider("awscc", "ec2.Vpc", "ec2_vpc_fb75c929");
 
     // Desired: tags map with a secret value (as written in .crn)
-    let desired_tags = Value::Map(HashMap::from([
+    let desired_tags = Value::Map(IndexMap::from([
         ("Name".to_string(), Value::String("test".to_string())),
         (
             "SecretTag".to_string(),
@@ -816,7 +818,7 @@ fn secret_in_map_with_refresh_no_false_diff() {
     ]));
 
     // Current state from provider read (refresh=true): plain-text values
-    let current_tags = Value::Map(HashMap::from([
+    let current_tags = Value::Map(IndexMap::from([
         ("Name".to_string(), Value::String("test".to_string())),
         (
             "SecretTag".to_string(),

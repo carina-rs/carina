@@ -384,6 +384,7 @@ mod tests {
     use super::*;
     use carina_core::parser::ProviderConfig;
     use carina_core::resource::Value;
+    use indexmap::IndexMap;
     use std::collections::{HashMap, HashSet};
 
     fn s3_backend_config(bucket: &str, region: &str) -> BackendConfig {
@@ -489,7 +490,7 @@ mod tests {
         ParsedFile {
             providers: vec![],
             resources: vec![],
-            variables: HashMap::new(),
+            variables: IndexMap::new(),
             uses: vec![],
             module_calls: vec![],
             arguments: vec![],
@@ -516,8 +517,8 @@ mod tests {
         parsed.providers.push(ProviderConfig {
             name: "fakeprovider".to_string(),
             source: Some("badscheme://not-a-valid-source".to_string()),
-            attributes: HashMap::new(),
-            default_tags: HashMap::new(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
             version: None,
             revision: None,
         });
@@ -548,8 +549,8 @@ mod tests {
         parsed.providers.push(ProviderConfig {
             name: "awscc".to_string(),
             source: None,
-            attributes: HashMap::new(),
-            default_tags: HashMap::new(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
             version: None,
             revision: None,
         });

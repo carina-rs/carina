@@ -4,6 +4,8 @@
 //! It is responsible for converting Effects into actual API calls.
 
 use std::collections::HashMap;
+
+use indexmap::IndexMap;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -187,7 +189,7 @@ pub trait ProviderNormalizer: Send + Sync {
     fn merge_default_tags(
         &self,
         _resources: &mut [Resource],
-        _default_tags: &HashMap<String, Value>,
+        _default_tags: &IndexMap<String, Value>,
         _schemas: &HashMap<String, ResourceSchema>,
     ) {
     }
@@ -209,7 +211,7 @@ impl ProviderNormalizer for NoopNormalizer {}
 pub fn merge_default_tags_for_provider(
     provider_name: &str,
     resources: &mut [Resource],
-    default_tags: &HashMap<String, Value>,
+    default_tags: &IndexMap<String, Value>,
     schemas: &HashMap<String, ResourceSchema>,
 ) {
     if default_tags.is_empty() {
@@ -384,7 +386,7 @@ impl ProviderNormalizer for ProviderRouter {
     fn merge_default_tags(
         &self,
         resources: &mut [Resource],
-        default_tags: &HashMap<String, Value>,
+        default_tags: &IndexMap<String, Value>,
         schemas: &HashMap<String, ResourceSchema>,
     ) {
         for ext in &self.normalizers {
@@ -419,7 +421,7 @@ pub trait ProviderFactory: Send + Sync {
     /// expressed in the attribute type schema (e.g., cross-attribute
     /// consistency checks). Type-level validation is handled by the host
     /// using [`provider_config_attribute_types`] before this is called.
-    fn validate_config(&self, attributes: &HashMap<String, Value>) -> Result<(), String>;
+    fn validate_config(&self, attributes: &IndexMap<String, Value>) -> Result<(), String>;
 
     /// Validate a value against a provider-defined custom type.
     /// Returns `Ok(())` if the value is valid or the type is unknown to this provider.
@@ -430,12 +432,12 @@ pub trait ProviderFactory: Send + Sync {
 
     /// Extract region from config in SDK format (e.g., "ap-northeast-1").
     /// Returns a default region if none is configured.
-    fn extract_region(&self, attributes: &HashMap<String, Value>) -> String;
+    fn extract_region(&self, attributes: &IndexMap<String, Value>) -> String;
 
     /// Create a provider instance from configuration attributes.
     fn create_provider(
         &self,
-        attributes: &HashMap<String, Value>,
+        attributes: &IndexMap<String, Value>,
     ) -> BoxFuture<'_, Box<dyn Provider>>;
 
     /// Create a normalizer instance from configuration attributes.
@@ -444,7 +446,7 @@ pub trait ProviderFactory: Send + Sync {
     /// plan-time normalization or state hydration should override this.
     fn create_normalizer(
         &self,
-        _attributes: &HashMap<String, Value>,
+        _attributes: &IndexMap<String, Value>,
     ) -> BoxFuture<'_, Box<dyn ProviderNormalizer>> {
         Box::pin(async { Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer> })
     }
@@ -1029,17 +1031,17 @@ mod tests {
             HashMap::new()
         }
 
-        fn validate_config(&self, _attributes: &HashMap<String, Value>) -> Result<(), String> {
+        fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
             Ok(())
         }
 
-        fn extract_region(&self, _attributes: &HashMap<String, Value>) -> String {
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
             "us-east-1".to_string()
         }
 
         fn create_provider(
             &self,
-            _attributes: &HashMap<String, Value>,
+            _attributes: &IndexMap<String, Value>,
         ) -> BoxFuture<'_, Box<dyn Provider>> {
             Box::pin(async { Box::new(MockProvider) as Box<dyn Provider> })
         }

@@ -64,14 +64,14 @@ pub(crate) fn builtin_values(args: &[Value]) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use indexmap::IndexMap;
 
     use crate::builtins::evaluate_builtin;
     use crate::resource::Value;
 
     #[test]
     fn keys_basic() {
-        let args = vec![Value::Map(HashMap::from([
+        let args = vec![Value::Map(IndexMap::from([
             ("b".to_string(), Value::Int(2)),
             ("a".to_string(), Value::Int(1)),
             ("c".to_string(), Value::Int(3)),
@@ -89,14 +89,14 @@ mod tests {
 
     #[test]
     fn keys_empty_map() {
-        let args = vec![Value::Map(HashMap::new())];
+        let args = vec![Value::Map(IndexMap::new())];
         let result = evaluate_builtin("keys", &args).unwrap();
         assert_eq!(result, Value::List(vec![]));
     }
 
     #[test]
     fn keys_single_entry() {
-        let args = vec![Value::Map(HashMap::from([(
+        let args = vec![Value::Map(IndexMap::from([(
             "only".to_string(),
             Value::String("value".to_string()),
         )]))];
@@ -113,7 +113,7 @@ mod tests {
 
     #[test]
     fn keys_wrong_arg_count_two() {
-        let args = vec![Value::Map(HashMap::new()), Value::Map(HashMap::new())];
+        let args = vec![Value::Map(IndexMap::new()), Value::Map(IndexMap::new())];
         let result = evaluate_builtin("keys", &args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("expects 1 argument"));
@@ -129,7 +129,7 @@ mod tests {
 
     #[test]
     fn values_basic() {
-        let args = vec![Value::Map(HashMap::from([
+        let args = vec![Value::Map(IndexMap::from([
             ("b".to_string(), Value::Int(2)),
             ("a".to_string(), Value::Int(1)),
             ("c".to_string(), Value::Int(3)),
@@ -144,14 +144,14 @@ mod tests {
 
     #[test]
     fn values_empty_map() {
-        let args = vec![Value::Map(HashMap::new())];
+        let args = vec![Value::Map(IndexMap::new())];
         let result = evaluate_builtin("values", &args).unwrap();
         assert_eq!(result, Value::List(vec![]));
     }
 
     #[test]
     fn values_mixed_types() {
-        let args = vec![Value::Map(HashMap::from([
+        let args = vec![Value::Map(IndexMap::from([
             ("name".to_string(), Value::String("test".to_string())),
             ("count".to_string(), Value::Int(42)),
         ]))];
@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn values_wrong_arg_count_two() {
-        let args = vec![Value::Map(HashMap::new()), Value::Map(HashMap::new())];
+        let args = vec![Value::Map(IndexMap::new()), Value::Map(IndexMap::new())];
         let result = evaluate_builtin("values", &args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("expects 1 argument"));

@@ -1136,7 +1136,7 @@ mod tests {
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
             }],
-            variables: HashMap::new(),
+            variables: IndexMap::new(),
             uses: vec![],
             module_calls: vec![],
             arguments: vec![
@@ -1282,7 +1282,7 @@ mod tests {
                     module_source: None,
                 },
             ],
-            variables: HashMap::new(),
+            variables: IndexMap::new(),
             uses: vec![],
             module_calls: vec![],
             arguments: vec![ArgumentParameter {
@@ -1408,7 +1408,7 @@ mod tests {
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
             }],
-            variables: HashMap::new(),
+            variables: IndexMap::new(),
             uses: vec![],
             module_calls: vec![],
             arguments: vec![],
@@ -2209,7 +2209,7 @@ thing { name = 'unchanged-but-different' }
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
             }],
-            variables: HashMap::new(),
+            variables: IndexMap::new(),
             uses: vec![],
             module_calls: vec![],
             arguments: vec![
@@ -2522,7 +2522,7 @@ thing { name = 'unchanged-but-different' }
         ParsedFile {
             providers: vec![],
             resources: vec![],
-            variables: HashMap::new(),
+            variables: IndexMap::new(),
             uses: vec![],
             module_calls: vec![],
             arguments: vec![ArgumentParameter {
@@ -2702,7 +2702,7 @@ thing { name = 'unchanged-but-different' }
         let module = ParsedFile {
             providers: vec![],
             resources: vec![],
-            variables: HashMap::new(),
+            variables: IndexMap::new(),
             uses: vec![],
             module_calls: vec![],
             arguments: vec![ArgumentParameter {
@@ -2765,7 +2765,7 @@ thing { name = 'unchanged-but-different' }
         let module = ParsedFile {
             providers: vec![],
             resources: vec![],
-            variables: HashMap::new(),
+            variables: IndexMap::new(),
             uses: vec![],
             module_calls: vec![],
             arguments: vec![ArgumentParameter {
@@ -2845,7 +2845,7 @@ thing { name = 'unchanged-but-different' }
         let module = ParsedFile {
             providers: vec![],
             resources: vec![],
-            variables: HashMap::new(),
+            variables: IndexMap::new(),
             uses: vec![],
             module_calls: vec![],
             arguments: vec![
@@ -2921,7 +2921,7 @@ thing { name = 'unchanged-but-different' }
         let module = ParsedFile {
             providers: vec![],
             resources: vec![],
-            variables: HashMap::new(),
+            variables: IndexMap::new(),
             uses: vec![],
             module_calls: vec![],
             arguments: vec![
@@ -2995,7 +2995,7 @@ thing { name = 'unchanged-but-different' }
         let module = ParsedFile {
             providers: vec![],
             resources: vec![],
-            variables: HashMap::new(),
+            variables: IndexMap::new(),
             uses: vec![],
             module_calls: vec![],
             arguments: vec![ArgumentParameter {
@@ -3082,7 +3082,7 @@ thing { name = 'unchanged-but-different' }
         let module = ParsedFile {
             providers: vec![],
             resources: vec![],
-            variables: HashMap::new(),
+            variables: IndexMap::new(),
             uses: vec![],
             module_calls: vec![],
             arguments: vec![

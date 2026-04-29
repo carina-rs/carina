@@ -558,6 +558,7 @@ impl ResourceState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indexmap::IndexMap;
 
     #[test]
     fn test_state_file_new() {
@@ -1379,10 +1380,9 @@ mod tests {
     fn test_from_provider_state_secret_in_map_stored_as_hash() {
         use carina_core::resource::{Resource, State as ProviderState, Value};
         use carina_core::value::SECRET_PREFIX;
-        use std::collections::HashMap as StdHashMap;
 
         let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc");
-        let mut tags_map = StdHashMap::new();
+        let mut tags_map = IndexMap::new();
         tags_map.insert("Name".to_string(), Value::String("test".to_string()));
         tags_map.insert(
             "SecretTag".to_string(),
@@ -1390,7 +1390,7 @@ mod tests {
         );
         resource.set_attr("tags".to_string(), Value::Map(tags_map));
 
-        let mut state_tags = StdHashMap::new();
+        let mut state_tags = IndexMap::new();
         state_tags.insert("Name".to_string(), Value::String("test".to_string()));
         state_tags.insert(
             "SecretTag".to_string(),
@@ -1433,11 +1433,10 @@ mod tests {
     fn test_from_provider_state_secret_in_map_preserves_provider_extra_keys() {
         use carina_core::resource::{Resource, State as ProviderState, Value};
         use carina_core::value::SECRET_PREFIX;
-        use std::collections::HashMap as StdHashMap;
 
         // User specifies only SecretTag in tags
         let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc");
-        let mut tags_map = StdHashMap::new();
+        let mut tags_map = IndexMap::new();
         tags_map.insert(
             "SecretTag".to_string(),
             Value::Secret(Box::new(Value::String("super-secret-value".to_string()))),
@@ -1445,7 +1444,7 @@ mod tests {
         resource.set_attr("tags".to_string(), Value::Map(tags_map));
 
         // Provider returns extra keys (e.g., CloudControl adds Name automatically)
-        let mut state_tags = StdHashMap::new();
+        let mut state_tags = IndexMap::new();
         state_tags.insert("Name".to_string(), Value::String("test".to_string()));
         state_tags.insert(
             "ExtraTag".to_string(),

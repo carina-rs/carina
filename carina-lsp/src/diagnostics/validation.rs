@@ -2,6 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use indexmap::IndexMap;
+
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
 use crate::document::Document;
@@ -21,7 +23,7 @@ impl DiagnosticEngine {
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
-        let maps: Vec<&HashMap<String, Value>> = match value {
+        let maps: Vec<&IndexMap<String, Value>> = match value {
             Value::Map(map) => vec![map],
             Value::List(items) => items
                 .iter()

@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 
+use indexmap::IndexMap;
+
 use crate::resource::Value;
 
 /// Count non-internal attributes that are semantically equal in both `from` and `to`.
@@ -87,10 +89,11 @@ impl MapDiff {
 
 /// Compute the diff between two maps, returning added, removed, and changed entries.
 ///
-/// All result vectors are sorted by key for deterministic output.
+/// All result vectors are sorted by key for deterministic output, so the
+/// caller's input order does not affect the result.
 pub fn compute_map_diff(
-    old_map: &HashMap<String, Value>,
-    new_map: &HashMap<String, Value>,
+    old_map: &IndexMap<String, Value>,
+    new_map: &IndexMap<String, Value>,
 ) -> MapDiff {
     let mut all_keys: Vec<&String> = old_map.keys().chain(new_map.keys()).collect();
     all_keys.sort();
@@ -202,8 +205,8 @@ mod tests {
 
     #[test]
     fn test_compute_map_diff_added_only() {
-        let old: HashMap<String, Value> = HashMap::new();
-        let new: HashMap<String, Value> = [
+        let old: IndexMap<String, Value> = IndexMap::new();
+        let new: IndexMap<String, Value> = [
             ("key1".to_string(), Value::String("val1".to_string())),
             ("key2".to_string(), Value::String("val2".to_string())),
         ]
@@ -220,10 +223,11 @@ mod tests {
 
     #[test]
     fn test_compute_map_diff_removed_only() {
-        let old: HashMap<String, Value> = [("key1".to_string(), Value::String("val1".to_string()))]
-            .into_iter()
-            .collect();
-        let new: HashMap<String, Value> = HashMap::new();
+        let old: IndexMap<String, Value> =
+            [("key1".to_string(), Value::String("val1".to_string()))]
+                .into_iter()
+                .collect();
+        let new: IndexMap<String, Value> = IndexMap::new();
 
         let diff = compute_map_diff(&old, &new);
         assert_eq!(diff.added.len(), 0);
@@ -234,13 +238,13 @@ mod tests {
 
     #[test]
     fn test_compute_map_diff_changed() {
-        let old: HashMap<String, Value> = [
+        let old: IndexMap<String, Value> = [
             ("key1".to_string(), Value::String("old_val".to_string())),
             ("key2".to_string(), Value::String("same".to_string())),
         ]
         .into_iter()
         .collect();
-        let new: HashMap<String, Value> = [
+        let new: IndexMap<String, Value> = [
             ("key1".to_string(), Value::String("new_val".to_string())),
             ("key2".to_string(), Value::String("same".to_string())),
         ]
@@ -264,14 +268,14 @@ mod tests {
 
     #[test]
     fn test_compute_map_diff_mixed() {
-        let old: HashMap<String, Value> = [
+        let old: IndexMap<String, Value> = [
             ("keep".to_string(), Value::String("same".to_string())),
             ("change".to_string(), Value::String("old".to_string())),
             ("remove".to_string(), Value::String("gone".to_string())),
         ]
         .into_iter()
         .collect();
-        let new: HashMap<String, Value> = [
+        let new: IndexMap<String, Value> = [
             ("keep".to_string(), Value::String("same".to_string())),
             ("change".to_string(), Value::String("new".to_string())),
             ("add".to_string(), Value::String("fresh".to_string())),

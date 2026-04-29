@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use argon2::Argon2;
+use indexmap::IndexMap;
 
 use crate::resource::{InterpolationPart, Value};
 use crate::utils::{convert_enum_value, is_dsl_enum_format};
@@ -173,7 +174,7 @@ pub fn json_to_dsl_value(json: &serde_json::Value) -> Option<Value> {
             items.iter().filter_map(json_to_dsl_value).collect(),
         )),
         serde_json::Value::Object(map) => {
-            let m: HashMap<_, _> = map
+            let m: IndexMap<_, _> = map
                 .iter()
                 .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
                 .collect();
@@ -362,7 +363,7 @@ pub fn redact_secrets_in_value(value: &Value) -> Value {
             Value::String(format!("{SECRET_PREFIX}{hash_hex}"))
         }
         Value::Map(map) => {
-            let redacted: HashMap<String, Value> = map
+            let redacted: IndexMap<String, Value> = map
                 .iter()
                 .map(|(k, v)| (k.clone(), redact_secrets_in_value(v)))
                 .collect();
@@ -573,7 +574,7 @@ mod tests {
 
     #[test]
     fn test_value_to_json_nan_in_map_returns_error() {
-        let mut map = HashMap::new();
+        let mut map = IndexMap::new();
         map.insert("key".to_string(), Value::Float(f64::INFINITY));
         let v = Value::Map(map);
         let result = value_to_json(&v);
@@ -595,7 +596,7 @@ mod tests {
 
     #[test]
     fn test_value_to_json_map() {
-        let mut map = HashMap::new();
+        let mut map = IndexMap::new();
         map.insert("key".to_string(), Value::String("val".to_string()));
         let v = Value::Map(map);
         assert_eq!(
@@ -778,7 +779,7 @@ mod tests {
 
     #[test]
     fn test_is_list_of_maps_true() {
-        let mut map = HashMap::new();
+        let mut map = IndexMap::new();
         map.insert("key".to_string(), Value::String("val".to_string()));
         let v = Value::List(vec![Value::Map(map)]);
         assert!(is_list_of_maps(&v));
@@ -804,10 +805,10 @@ mod tests {
 
     #[test]
     fn test_map_similarity_matching() {
-        let mut m1 = HashMap::new();
+        let mut m1 = IndexMap::new();
         m1.insert("a".to_string(), Value::Int(1));
         m1.insert("b".to_string(), Value::Int(2));
-        let mut m2 = HashMap::new();
+        let mut m2 = IndexMap::new();
         m2.insert("a".to_string(), Value::Int(1));
         m2.insert("b".to_string(), Value::Int(3));
         assert_eq!(map_similarity(&Value::Map(m1), &Value::Map(m2)), 1);
@@ -859,7 +860,7 @@ mod tests {
 
     #[test]
     fn test_format_value_secret_in_map() {
-        let mut map = HashMap::new();
+        let mut map = IndexMap::new();
         map.insert("Name".to_string(), Value::String("test".to_string()));
         map.insert(
             "SecretTag".to_string(),
@@ -882,7 +883,7 @@ mod tests {
 
     #[test]
     fn test_value_to_json_secret_in_map() {
-        let mut map = HashMap::new();
+        let mut map = IndexMap::new();
         map.insert("Name".to_string(), Value::String("test".to_string()));
         map.insert(
             "SecretTag".to_string(),
@@ -995,7 +996,7 @@ mod tests {
 
     #[test]
     fn test_redact_secrets_in_value_nested_in_map() {
-        let mut map = HashMap::new();
+        let mut map = IndexMap::new();
         map.insert("name".to_string(), Value::String("test".to_string()));
         map.insert(
             "password".to_string(),

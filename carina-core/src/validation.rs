@@ -2,6 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use indexmap::IndexMap;
+
 use crate::binding_index::BindingIndex;
 use crate::parser::{ModuleCall, ParsedFile, ProviderContext, TypeExpr, validate_custom_type};
 use crate::provider::ProviderFactory;
@@ -795,7 +797,7 @@ pub fn validate_type_expr_value(
 /// match. Callers then walk each field with their own type-check pass.
 pub fn struct_field_shape_errors(
     fields: &[(String, TypeExpr)],
-    entries: &HashMap<String, Value>,
+    entries: &IndexMap<String, Value>,
 ) -> Option<String> {
     // Sort unknown keys so the diagnostic is stable across HashMap's
     // per-process random hash seed.
@@ -817,7 +819,7 @@ pub fn struct_field_shape_errors(
 
 fn validate_struct_fields(
     fields: &[(String, TypeExpr)],
-    entries: &HashMap<String, Value>,
+    entries: &IndexMap<String, Value>,
     config: &ProviderContext,
 ) -> Option<String> {
     if let Some(e) = struct_field_shape_errors(fields, entries) {
@@ -843,7 +845,7 @@ mod tests {
         ParsedFile {
             providers: Vec::new(),
             resources: Vec::new(),
-            variables: HashMap::new(),
+            variables: IndexMap::new(),
             uses: Vec::new(),
             module_calls: Vec::new(),
             arguments: Vec::new(),
@@ -942,7 +944,7 @@ mod tests {
         parsed.resources.push(vpc); // allow: direct — fixture test inspection
 
         // Reference inside a Map inside a List
-        let mut map = HashMap::new();
+        let mut map = IndexMap::new();
         map.insert(
             "vpc_id".to_string(),
             Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
@@ -1445,8 +1447,8 @@ let vpc = awscc.ec2.Vpc {
         let mut parsed = empty_parsed();
         parsed.providers.push(crate::parser::ProviderConfig {
             name: "awscc".to_string(),
-            attributes: HashMap::new(),
-            default_tags: HashMap::new(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
             source: None,
             version: None,
             revision: None,
@@ -1472,8 +1474,8 @@ let vpc = awscc.ec2.Vpc {
         let mut parsed = empty_parsed();
         parsed.providers.push(crate::parser::ProviderConfig {
             name: "awscc".to_string(),
-            attributes: HashMap::new(),
-            default_tags: HashMap::new(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
             source: None,
             version: None,
             revision: None,
@@ -1495,8 +1497,8 @@ let vpc = awscc.ec2.Vpc {
         let mut parsed = empty_parsed();
         parsed.providers.push(crate::parser::ProviderConfig {
             name: "awscc".to_string(),
-            attributes: HashMap::new(),
-            default_tags: HashMap::new(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
             source: None,
             version: None,
             revision: None,
@@ -1536,8 +1538,8 @@ let vpc = awscc.ec2.Vpc {
     fn provider(name: &str) -> crate::parser::ProviderConfig {
         crate::parser::ProviderConfig {
             name: name.to_string(),
-            attributes: HashMap::new(),
-            default_tags: HashMap::new(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
             source: None,
             version: None,
             revision: None,
@@ -1604,7 +1606,7 @@ let vpc = awscc.ec2.Vpc {
 
     #[test]
     fn validate_type_expr_struct_error_uses_pascal_case_in_field_type() {
-        let mut map = std::collections::HashMap::new();
+        let mut map = indexmap::IndexMap::new();
         map.insert("count".to_string(), Value::String("x".into()));
         let fields = vec![("count".to_string(), TypeExpr::Int)];
         let msg = validate_type_expr_value(
@@ -1922,7 +1924,7 @@ let vpc = awscc.ec2.Vpc {
 
     #[test]
     fn validate_type_expr_struct_accepts_well_formed_map() {
-        let mut map = HashMap::new();
+        let mut map = IndexMap::new();
         map.insert("name".to_string(), Value::String("x".to_string()));
         map.insert("value".to_string(), Value::Int(1));
         let result = validate_type_expr_value(
@@ -1935,7 +1937,7 @@ let vpc = awscc.ec2.Vpc {
 
     #[test]
     fn validate_type_expr_struct_rejects_missing_field() {
-        let mut map = HashMap::new();
+        let mut map = IndexMap::new();
         map.insert("name".to_string(), Value::String("x".to_string()));
         let result = validate_type_expr_value(
             &struct_type_name_value(),
@@ -1950,7 +1952,7 @@ let vpc = awscc.ec2.Vpc {
 
     #[test]
     fn validate_type_expr_struct_rejects_unknown_field() {
-        let mut map = HashMap::new();
+        let mut map = IndexMap::new();
         map.insert("name".to_string(), Value::String("x".to_string()));
         map.insert("value".to_string(), Value::Int(1));
         map.insert("extra".to_string(), Value::String("y".to_string()));
@@ -1967,7 +1969,7 @@ let vpc = awscc.ec2.Vpc {
 
     #[test]
     fn validate_type_expr_struct_rejects_wrong_field_type() {
-        let mut map = HashMap::new();
+        let mut map = IndexMap::new();
         map.insert("name".to_string(), Value::String("x".to_string()));
         map.insert("value".to_string(), Value::String("not-an-int".to_string()));
         let result = validate_type_expr_value(
@@ -1997,7 +1999,7 @@ let vpc = awscc.ec2.Vpc {
         // error on every call, independent of HashMap's per-process random
         // hash seed.
         let fields: Vec<(String, TypeExpr)> = vec![("a".to_string(), TypeExpr::String)];
-        let mut entries = HashMap::new();
+        let mut entries: IndexMap<String, Value> = IndexMap::new();
         entries.insert("a".to_string(), Value::String("ok".into()));
         entries.insert("z_extra".to_string(), Value::String("x".into()));
         entries.insert("b_extra".to_string(), Value::String("y".into()));
@@ -2434,7 +2436,7 @@ let vpc = awscc.ec2.Vpc {
             .with_binding("registry_prod")
             .with_attribute("account_id", Value::String("111".to_string()));
 
-        let mut map_value = HashMap::new();
+        let mut map_value = IndexMap::new();
         map_value.insert(
             "prod".to_string(),
             Value::resource_ref(
@@ -2481,7 +2483,7 @@ let vpc = awscc.ec2.Vpc {
             .with_binding("registry_prod")
             .with_attribute("account_id", Value::String("111".to_string()));
 
-        let mut map_value = HashMap::new();
+        let mut map_value = IndexMap::new();
         map_value.insert(
             "prod".to_string(),
             Value::resource_ref(

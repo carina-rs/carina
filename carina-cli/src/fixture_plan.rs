@@ -129,7 +129,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             .expect("failed to build tokio runtime for merge_default_tags");
         let mut router = ProviderRouter::new();
         for factory in wiring.factories() {
-            let attrs = HashMap::new();
+            let attrs = indexmap::IndexMap::new();
             router.add_normalizer(rt.block_on(factory.create_normalizer(&attrs)));
         }
         for provider_config in &parsed.providers {

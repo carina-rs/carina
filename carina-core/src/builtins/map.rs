@@ -1,6 +1,6 @@
 //! `map(accessor, collection)` built-in function
 
-use std::collections::HashMap;
+use indexmap::IndexMap;
 
 use crate::resource::Value;
 
@@ -51,7 +51,7 @@ pub(crate) fn builtin_map(args: &[Value]) -> Result<Value, String> {
             Ok(Value::List(mapped?))
         }
         Value::Map(map) => {
-            let mapped: Result<HashMap<String, Value>, String> = map
+            let mapped: Result<IndexMap<String, Value>, String> = map
                 .iter()
                 .map(|(k, v)| match v {
                     Value::Map(inner) => inner
@@ -81,7 +81,7 @@ pub(crate) fn builtin_map(args: &[Value]) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use indexmap::IndexMap;
 
     use crate::builtins::evaluate_builtin;
     use crate::resource::Value;
@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn map_map_of_maps_extracts_field() {
-        let mut outer = HashMap::new();
+        let mut outer: IndexMap<String, Value> = IndexMap::new();
         outer.insert(
             "a".to_string(),
             make_map(vec![

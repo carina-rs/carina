@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use indexmap::IndexMap;
+
 use crate::resource::{ResourceId, Value, merge_with_saved};
 use crate::schema::{AttributeType, ResourceSchema};
 use crate::value::{SECRET_PREFIX, SecretHashContext, argon2id_hash, value_to_json_with_context};
@@ -153,8 +155,8 @@ fn type_aware_lists_equal(
 
 /// Map comparison with per-key type lookup.
 fn type_aware_maps_equal<'a, F>(
-    a: &HashMap<String, Value>,
-    b: &HashMap<String, Value>,
+    a: &IndexMap<String, Value>,
+    b: &IndexMap<String, Value>,
     get_type: F,
     secret_ctx: Option<&SecretHashContext>,
 ) -> bool
@@ -178,8 +180,8 @@ where
 /// for Bool, `0` for Int), the extra field is ignored. This prevents false diffs
 /// when AWS returns default values for fields the user didn't specify.
 fn type_aware_struct_equal(
-    a: &HashMap<String, Value>,
-    b: &HashMap<String, Value>,
+    a: &IndexMap<String, Value>,
+    b: &IndexMap<String, Value>,
     fields: &[crate::schema::StructField],
     secret_ctx: Option<&SecretHashContext>,
 ) -> bool {

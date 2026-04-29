@@ -128,8 +128,11 @@ fn json_to_core_value(v: &serde_json::Value) -> CoreValue {
 
 // -- Value map helpers --
 
-pub fn core_to_wit_value_map(map: &HashMap<String, CoreValue>) -> Vec<(String, wit::Value)> {
-    map.iter()
+pub fn core_to_wit_value_map<'a, M>(map: M) -> Vec<(String, wit::Value)>
+where
+    M: IntoIterator<Item = (&'a String, &'a CoreValue)>,
+{
+    map.into_iter()
         .map(|(k, v)| (k.clone(), core_to_wit_value(v)))
         .collect()
 }

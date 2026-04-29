@@ -119,7 +119,7 @@ fn build_mixed_operations_plan() -> Plan {
 fn build_map_key_diff_plan() -> Plan {
     let mut plan = Plan::new();
 
-    let old_tags: HashMap<String, Value> = [
+    let old_tags: indexmap::IndexMap<String, Value> = [
         ("Name".to_string(), Value::String("my-vpc".to_string())),
         (
             "Environment".to_string(),
@@ -130,7 +130,7 @@ fn build_map_key_diff_plan() -> Plan {
     .into_iter()
     .collect();
 
-    let new_tags: HashMap<String, Value> = [
+    let new_tags: indexmap::IndexMap<String, Value> = [
         ("Name".to_string(), Value::String("my-vpc".to_string())),
         (
             "Environment".to_string(),

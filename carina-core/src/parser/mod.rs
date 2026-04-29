@@ -428,11 +428,11 @@ pub struct ModuleCall {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProviderConfig {
     pub name: String,
-    pub attributes: HashMap<String, Value>,
+    pub attributes: IndexMap<String, Value>,
     /// Default tags to apply to all resources that support tags.
     /// Extracted from `default_tags = { ... }` in the provider block.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub default_tags: HashMap<String, Value>,
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub default_tags: IndexMap<String, Value>,
     /// Provider source (e.g., "github.com/carina-rs/carina-provider-awscc" or "file:///path/to/binary").
     /// Extracted from the provider block and not passed to the provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -503,7 +503,7 @@ pub struct StringLiteralPath {
 pub struct ParsedFile {
     pub providers: Vec<ProviderConfig>,
     pub resources: Vec<Resource>,
-    pub variables: HashMap<String, Value>,
+    pub variables: IndexMap<String, Value>,
     /// Module `use` statements
     pub uses: Vec<UseStatement>,
     /// Module calls (instantiations)
@@ -769,7 +769,7 @@ fn substitute_placeholder(v: &mut Value, index: Option<i64>, key: Option<&str>, 
 /// Parse context (variable scope)
 #[derive(Clone)]
 struct ParseContext<'cfg> {
-    variables: HashMap<String, Value>,
+    variables: IndexMap<String, Value>,
     /// Resource bindings (binding_name -> Resource)
     resource_bindings: HashMap<String, Resource>,
     /// Imported modules (alias -> path)
@@ -799,7 +799,7 @@ struct ParseContext<'cfg> {
 impl<'cfg> ParseContext<'cfg> {
     fn new(config: &'cfg ProviderContext) -> Self {
         Self {
-            variables: HashMap::new(),
+            variables: IndexMap::new(),
             resource_bindings: HashMap::new(),
             imported_modules: HashMap::new(),
             user_functions: HashMap::new(),
@@ -2783,7 +2783,7 @@ fn parse_provider_block(
         .as_str()
         .to_string();
 
-    let mut attributes = HashMap::new();
+    let mut attributes: IndexMap<String, Value> = IndexMap::new();
     for attr_pair in inner {
         if attr_pair.as_rule() == Rule::attribute {
             let mut attr_inner = attr_pair.into_inner();
@@ -2798,22 +2798,23 @@ fn parse_provider_block(
         }
     }
 
+    // `shift_remove` keeps the surviving attributes in source order.
     // Extract default_tags from attributes if present
-    let default_tags = if let Some(Value::Map(tags)) = attributes.remove("default_tags") {
+    let default_tags = if let Some(Value::Map(tags)) = attributes.shift_remove("default_tags") {
         tags
     } else {
-        HashMap::new()
+        IndexMap::new()
     };
 
     // Extract source from attributes if present
-    let source = if let Some(Value::String(s)) = attributes.remove("source") {
+    let source = if let Some(Value::String(s)) = attributes.shift_remove("source") {
         Some(s)
     } else {
         None
     };
 
     // Extract version from attributes if present
-    let version = if let Some(Value::String(v)) = attributes.remove("version") {
+    let version = if let Some(Value::String(v)) = attributes.shift_remove("version") {
         Some(VersionConstraint::parse(&v).map_err(|e| {
             pest::error::Error::new_from_pos(
                 pest::error::ErrorVariant::CustomError { message: e },
@@ -2825,7 +2826,7 @@ fn parse_provider_block(
     };
 
     // Extract revision from attributes if present
-    let revision = if let Some(Value::String(r)) = attributes.remove("revision") {
+    let revision = if let Some(Value::String(r)) = attributes.shift_remove("revision") {
         Some(r)
     } else {
         None
@@ -3548,7 +3549,7 @@ fn try_evaluate_fn_value(value: Value, ctx: &ParseContext) -> Result<Value, Pars
             Ok(Value::List(evaluated?))
         }
         Value::Map(map) => {
-            let evaluated: Result<HashMap<String, Value>, ParseError> = map
+            let evaluated: Result<IndexMap<String, Value>, ParseError> = map
                 .into_iter()
                 .map(|(k, v)| try_evaluate_fn_value(v, ctx).map(|ev| (k, ev)))
                 .collect();
@@ -4011,11 +4012,12 @@ fn parse_block_contents(
     pairs: pest::iterators::Pairs<Rule>,
     ctx: &ParseContext,
 ) -> Result<IndexMap<String, Value>, ParseError> {
-    // Source-order preserving (#2222) — `IndexMap` so the order in which
-    // the user wrote attributes in the .crn file flows all the way to
-    // `Resource.attributes`.
+    // `IndexMap` so the order in which the user wrote attributes in the
+    // .crn file flows all the way to `Resource.attributes` and to
+    // `Value::Map` payloads — anything that re-renders attributes
+    // (formatter, plan display, diagnostics) sees a stable order.
     let mut attributes: IndexMap<String, Value> = IndexMap::new();
-    let mut nested_blocks: HashMap<String, Vec<Value>> = HashMap::new();
+    let mut nested_blocks: IndexMap<String, Vec<Value>> = IndexMap::new();
 
     // Local scope extends the parent context with block-scoped let bindings
     let mut local_ctx = ctx.clone();
@@ -4058,15 +4060,10 @@ fn parse_block_contents(
                         // Recursively parse nested block contents (supports arbitrary depth)
                         let block_attrs = parse_block_contents(block_inner, &local_ctx)?;
 
-                        // Add to the list of blocks with this name. Convert
-                        // back to `HashMap` here because `Value::Map`'s
-                        // payload is still a `HashMap` (#2222 Stage 1
-                        // touches only `Resource.attributes`); preserving
-                        // intra-`Map` order is left to a later stage.
                         nested_blocks
                             .entry(block_name)
                             .or_default()
-                            .push(Value::Map(block_attrs.into_iter().collect()));
+                            .push(Value::Map(block_attrs));
                     }
                     _ => {}
                 }
@@ -4398,8 +4395,8 @@ fn parse_primary_value(
             Ok(Value::List(items?))
         }
         Rule::map => {
-            let mut map = HashMap::new();
-            let mut nested_blocks: HashMap<String, Vec<Value>> = HashMap::new();
+            let mut map: IndexMap<String, Value> = IndexMap::new();
+            let mut nested_blocks: IndexMap<String, Vec<Value>> = IndexMap::new();
             for entry in inner.into_inner() {
                 match entry.as_rule() {
                     Rule::map_entry => {
@@ -4422,7 +4419,7 @@ fn parse_primary_value(
                         nested_blocks
                             .entry(block_name)
                             .or_default()
-                            .push(Value::Map(block_attrs.into_iter().collect()));
+                            .push(Value::Map(block_attrs));
                     }
                     _ => {}
                 }
@@ -5119,7 +5116,7 @@ fn resolve_value_with_config(
             Ok(Value::List(resolved?))
         }
         Value::Map(map) => {
-            let mut resolved = HashMap::new();
+            let mut resolved: IndexMap<String, Value> = IndexMap::new();
             for (k, v) in map {
                 resolved.insert(
                     k.clone(),
@@ -11503,7 +11500,7 @@ awscc.ec2.Vpc {
         assert_eq!(parsed.deferred_for_expressions.len(), 1);
 
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
-        let mut accounts = HashMap::new();
+        let mut accounts: IndexMap<String, Value> = IndexMap::new();
         accounts.insert(
             "prod".to_string(),
             Value::String("111111111111".to_string()),
@@ -11671,7 +11668,7 @@ awscc.ec2.Vpc {
         let mut parsed = parse(input, &ProviderContext::default()).unwrap();
 
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
-        let mut accounts = HashMap::new();
+        let mut accounts: IndexMap<String, Value> = IndexMap::new();
         accounts.insert(
             "prod".to_string(),
             Value::String("111111111111".to_string()),
@@ -12354,6 +12351,155 @@ awscc.ec2.Vpc {
             !parsed.string_literal_paths.contains(&interpolated),
             "interpolated strings must not be tagged as plain literals; paths = {:?}",
             parsed.string_literal_paths
+        );
+    }
+
+    /// The payload of `Value::Map` must preserve the source order of the
+    /// keys the user wrote — top-level map literals included.
+    #[test]
+    fn value_map_preserves_insertion_order() {
+        let input = r#"
+            let m = {
+                z_first = "1"
+                a_second = "2"
+                m_third = "3"
+                b_fourth = "4"
+            }
+        "#;
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        let Some(Value::Map(map)) = parsed.variables.get("m") else {
+            panic!("expected variables['m'] to be a Value::Map");
+        };
+        let keys: Vec<&str> = map.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            vec!["z_first", "a_second", "m_third", "b_fourth"],
+            "Value::Map must preserve source key order; got {keys:?}"
+        );
+    }
+
+    /// `ProviderConfig.default_tags` must preserve the source order in
+    /// which the user wrote tag keys. The map is extracted from a
+    /// `default_tags = { ... }` block, so the same `Value::Map`
+    /// guarantee applies.
+    #[test]
+    fn provider_config_default_tags_preserve_insertion_order() {
+        let input = r#"
+            provider test {
+                source = "x/y"
+                version = "0.1"
+                region = "ap-northeast-1"
+                default_tags = {
+                    z_team = "infra"
+                    a_env = "prod"
+                    m_owner = "ops"
+                }
+            }
+        "#;
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        let pc = parsed
+            .providers
+            .first()
+            .expect("expected one provider config");
+        let keys: Vec<&str> = pc.default_tags.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            vec!["z_team", "a_env", "m_owner"],
+            "ProviderConfig.default_tags must preserve source key order; got {keys:?}"
+        );
+    }
+
+    /// `ProviderConfig.attributes` must preserve source order so that
+    /// anything re-rendering provider blocks (formatter, diagnostics)
+    /// sees a deterministic order.
+    #[test]
+    fn provider_config_attributes_preserve_insertion_order() {
+        let input = r#"
+            provider test {
+                source = "x/y"
+                version = "0.1"
+                z_extra = "1"
+                a_extra = "2"
+                m_extra = "3"
+                region = "ap-northeast-1"
+            }
+        "#;
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        let pc = parsed
+            .providers
+            .first()
+            .expect("expected one provider config");
+        let keys: Vec<&str> = pc.attributes.keys().map(String::as_str).collect();
+        // `source` and `version` are stripped from `attributes` (extracted
+        // separately into ProviderConfig fields), so the surviving keys
+        // are the user-authored order minus those two.
+        assert_eq!(
+            keys,
+            vec!["z_extra", "a_extra", "m_extra", "region"],
+            "ProviderConfig.attributes must preserve source key order; got {keys:?}"
+        );
+    }
+
+    /// `ParsedFile.variables` must preserve the order in which top-level
+    /// `let` bindings were declared so that iteration matches source
+    /// order. Later bindings can reference earlier ones.
+    #[test]
+    fn parsed_file_variables_preserve_insertion_order() {
+        let input = r#"
+            let z_first = "1"
+            let a_second = "2"
+            let m_third = "3"
+            let b_fourth = "4"
+        "#;
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        let keys: Vec<&str> = parsed.variables.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            vec!["z_first", "a_second", "m_third", "b_fourth"],
+            "ParsedFile.variables must preserve source order; got {keys:?}"
+        );
+    }
+
+    /// A nested block's attributes must surface in source order on the
+    /// `Value::Map` payload, end-to-end through the parser.
+    #[test]
+    fn nested_block_value_map_preserves_insertion_order() {
+        let input = r#"
+            provider test {
+                source = "x/y"
+                version = "0.1"
+                region = "ap-northeast-1"
+            }
+            let r = test.r.res {
+                name = "x"
+                nested {
+                    z_first = "1"
+                    a_second = "2"
+                    m_third = "3"
+                }
+            }
+        "#;
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        let resource = parsed
+            .resources
+            .first()
+            .expect("expected one resource binding");
+        let nested = resource
+            .get_attr("nested")
+            .expect("expected `nested` attribute");
+        // Nested blocks are wrapped in a List<Map> by the parser.
+        let Value::List(blocks) = nested else {
+            panic!("expected nested blocks to be a List, got {nested:?}");
+        };
+        let block = blocks.first().expect("expected one nested block");
+        let Value::Map(map) = block else {
+            panic!("expected nested block to be a Value::Map, got {block:?}");
+        };
+        let keys: Vec<&str> = map.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            vec!["z_first", "a_second", "m_third"],
+            "nested block Value::Map must preserve source key order; got {keys:?}"
         );
     }
 }

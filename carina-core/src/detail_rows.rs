@@ -6,6 +6,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use indexmap::IndexMap;
+
 use crate::diff_helpers::{compute_map_diff, compute_unchanged_count};
 use crate::effect::Effect;
 use crate::resource::{ResourceId, Value};
@@ -340,7 +342,7 @@ fn build_create_rows(
 }
 
 /// Build a `DetailRow::MapExpanded` for a map attribute (no annotations).
-fn build_expanded_map_row(key: &str, map: &HashMap<String, Value>) -> DetailRow {
+fn build_expanded_map_row(key: &str, map: &IndexMap<String, Value>) -> DetailRow {
     let mut keys: Vec<_> = map.keys().collect();
     keys.sort();
     let entries = keys
@@ -359,7 +361,7 @@ fn build_expanded_map_row(key: &str, map: &HashMap<String, Value>) -> DetailRow 
 
 /// Build a `DetailRow::MapExpanded` for tags with `default_tags` annotations.
 fn build_expanded_tags_row(
-    map: &HashMap<String, Value>,
+    map: &IndexMap<String, Value>,
     default_tag_keys: &HashSet<String>,
 ) -> DetailRow {
     let mut keys: Vec<_> = map.keys().collect();
@@ -679,7 +681,7 @@ fn compute_map_diff_entries(old_value: Option<&Value>, new_value: &Value) -> Vec
     let old_map = match old_value {
         Some(Value::Map(m)) => m,
         _ => {
-            let empty = HashMap::new();
+            let empty: IndexMap<String, Value> = IndexMap::new();
             let diff = compute_map_diff(&empty, new_map);
             return diff
                 .added
@@ -1084,7 +1086,7 @@ mod tests {
 
     #[test]
     fn test_create_map_expanded() {
-        let mut tags = HashMap::new();
+        let mut tags = IndexMap::new();
         tags.insert("Name".to_string(), Value::String("test".to_string()));
         tags.insert("Environment".to_string(), Value::String("prod".to_string()));
         let resource =
@@ -1117,7 +1119,7 @@ mod tests {
             binding: None,
             dependencies: HashSet::new(),
         };
-        let mut tags = HashMap::new();
+        let mut tags = IndexMap::new();
         tags.insert("Name".to_string(), Value::String("test".to_string()));
         let mut delete_attrs: HashMap<ResourceId, HashMap<String, Value>> = HashMap::new();
         delete_attrs.insert(
