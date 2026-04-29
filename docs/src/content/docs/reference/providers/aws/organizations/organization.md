@@ -44,7 +44,7 @@ Shorthand formats: `ALL` or `FeatureSet.ALL`
 
 ### `master_account_email`
 
-- **Type:** String
+- **Type:** Email
 
 ### `master_account_id`
 

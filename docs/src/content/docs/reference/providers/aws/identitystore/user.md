@@ -39,7 +39,7 @@ The user's user name. Provide either user_id or user_name.
 
 ### `emails`
 
-- **Type:** String
+- **Type:** Email
 - **Read-only**
 
 <p>The email address of the user.</p>
