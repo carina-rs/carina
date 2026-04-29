@@ -1,6 +1,6 @@
 ---
-title: "awscc.ec2.security_group_egress"
-description: "AWSCC EC2 security_group_egress resource reference"
+title: "awscc.ec2.SecurityGroupEgress"
+description: "AWSCC EC2 SecurityGroupEgress resource reference"
 ---
 
 
@@ -15,16 +15,16 @@ Adds the specified outbound (egress) rule to a security group.
 ## Example
 
 ```crn
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 }
 
-let sg = awscc.ec2.security_group {
+let sg = awscc.ec2.SecurityGroup {
   vpc_id            = vpc.vpc_id
   group_description = 'Example security group'
 }
 
-awscc.ec2.security_group_egress {
+awscc.ec2.SecurityGroupEgress {
   group_id    = sg.group_id
   description = 'Allow all outbound traffic'
   ip_protocol = all
@@ -83,7 +83,7 @@ If the protocol is TCP or UDP, this is the start of the port range. If the proto
 
 ### `group_id`
 
-- **Type:** String
+- **Type:** SecurityGroupId
 - **Required:** Yes
 - **Create-only:** Yes
 
@@ -111,12 +111,12 @@ If the protocol is TCP or UDP, this is the end of the port range. If the protoco
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `tcp` | `awscc.ec2.security_group_egress.IpProtocol.tcp` |
-| `udp` | `awscc.ec2.security_group_egress.IpProtocol.udp` |
-| `icmp` | `awscc.ec2.security_group_egress.IpProtocol.icmp` |
-| `icmpv6` | `awscc.ec2.security_group_egress.IpProtocol.icmpv6` |
-| `-1` | `awscc.ec2.security_group_egress.IpProtocol.all` |
-| `all` | `awscc.ec2.security_group_egress.IpProtocol.all` |
+| `tcp` | `awscc.ec2.SecurityGroupEgress.IpProtocol.tcp` |
+| `udp` | `awscc.ec2.SecurityGroupEgress.IpProtocol.udp` |
+| `icmp` | `awscc.ec2.SecurityGroupEgress.IpProtocol.icmp` |
+| `icmpv6` | `awscc.ec2.SecurityGroupEgress.IpProtocol.icmpv6` |
+| `-1` | `awscc.ec2.SecurityGroupEgress.IpProtocol.all` |
+| `all` | `awscc.ec2.SecurityGroupEgress.IpProtocol.all` |
 
 Shorthand formats: `tcp` or `IpProtocol.tcp`
 

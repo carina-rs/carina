@@ -1,6 +1,6 @@
 ---
-title: "awscc.ec2.subnet_route_table_association"
-description: "AWSCC EC2 subnet_route_table_association resource reference"
+title: "awscc.ec2.SubnetRouteTableAssociation"
+description: "AWSCC EC2 SubnetRouteTableAssociation resource reference"
 ---
 
 
@@ -11,23 +11,23 @@ Associates a subnet with a route table. The subnet and route table must be in th
 ## Example
 
 ```crn
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block           = '10.0.0.0/16'
   enable_dns_support   = true
   enable_dns_hostnames = true
 }
 
-let subnet = awscc.ec2.subnet {
+let subnet = awscc.ec2.Subnet {
   vpc_id            = vpc.vpc_id
   cidr_block        = '10.0.1.0/24'
   availability_zone = 'ap-northeast-1a'
 }
 
-let rt = awscc.ec2.route_table {
+let rt = awscc.ec2.RouteTable {
   vpc_id = vpc.vpc_id
 }
 
-awscc.ec2.subnet_route_table_association {
+awscc.ec2.SubnetRouteTableAssociation {
   subnet_id      = subnet.subnet_id
   route_table_id = rt.route_table_id
 }

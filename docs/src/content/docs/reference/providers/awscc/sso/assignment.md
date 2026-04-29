@@ -1,6 +1,6 @@
 ---
-title: "awscc.sso.assignment"
-description: "AWSCC SSO assignment resource reference"
+title: "awscc.sso.Assignment"
+description: "AWSCC SSO Assignment resource reference"
 ---
 
 
@@ -12,7 +12,7 @@ Resource Type definition for SSO assignmet
 
 ### `instance_arn`
 
-- **Type:** Arn
+- **Type:** String(pattern, len: 10..=1224)
 - **Required:** Yes
 - **Create-only:** Yes
 
@@ -20,7 +20,7 @@ The sso instance that the permission set is owned.
 
 ### `permission_set_arn`
 
-- **Type:** Arn
+- **Type:** String(pattern, len: 10..=1224)
 - **Required:** Yes
 - **Create-only:** Yes
 
@@ -44,7 +44,7 @@ The assignee's type, user/group
 
 ### `target_id`
 
-- **Type:** String
+- **Type:** AwsAccountId
 - **Required:** Yes
 - **Create-only:** Yes
 
@@ -64,8 +64,8 @@ The type of resource to be provisioned to, only aws account now
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `USER` | `awscc.sso.assignment.PrincipalType.USER` |
-| `GROUP` | `awscc.sso.assignment.PrincipalType.GROUP` |
+| `USER` | `awscc.sso.Assignment.PrincipalType.USER` |
+| `GROUP` | `awscc.sso.Assignment.PrincipalType.GROUP` |
 
 Shorthand formats: `USER` or `PrincipalType.USER`
 
@@ -73,7 +73,7 @@ Shorthand formats: `USER` or `PrincipalType.USER`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `AWS_ACCOUNT` | `awscc.sso.assignment.TargetType.AWS_ACCOUNT` |
+| `AWS_ACCOUNT` | `awscc.sso.Assignment.TargetType.AWS_ACCOUNT` |
 
 Shorthand formats: `AWS_ACCOUNT` or `TargetType.AWS_ACCOUNT`
 

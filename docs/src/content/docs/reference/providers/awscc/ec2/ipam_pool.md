@@ -1,6 +1,6 @@
 ---
-title: "awscc.ec2.ipam_pool"
-description: "AWSCC EC2 ipam_pool resource reference"
+title: "awscc.ec2.IpamPool"
+description: "AWSCC EC2 IpamPool resource reference"
 ---
 
 
@@ -11,7 +11,7 @@ Resource Schema of AWS::EC2::IPAMPool Type
 ## Example
 
 ```crn
-let ipam = awscc.ec2.ipam {
+let ipam = awscc.ec2.Ipam {
   description = 'Example IPAM'
   tier        = free
 
@@ -20,7 +20,7 @@ let ipam = awscc.ec2.ipam {
   }
 }
 
-awscc.ec2.ipam_pool {
+awscc.ec2.IpamPool {
   ipam_scope_id  = ipam.private_default_scope_id
   address_family = 'IPv4'
   locale         = 'ap-northeast-1'
@@ -160,8 +160,8 @@ An array of key-value pairs to apply to this resource.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `IPv4` | `awscc.ec2.ipam_pool.AddressFamily.IPv4` |
-| `IPv6` | `awscc.ec2.ipam_pool.AddressFamily.IPv6` |
+| `IPv4` | `awscc.ec2.IpamPool.AddressFamily.IPv4` |
+| `IPv6` | `awscc.ec2.IpamPool.AddressFamily.IPv6` |
 
 Shorthand formats: `IPv4` or `AddressFamily.IPv4`
 
@@ -169,8 +169,8 @@ Shorthand formats: `IPv4` or `AddressFamily.IPv4`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ec2` | `awscc.ec2.ipam_pool.AwsService.ec2` |
-| `global-services` | `awscc.ec2.ipam_pool.AwsService.global_services` |
+| `ec2` | `awscc.ec2.IpamPool.AwsService.ec2` |
+| `global-services` | `awscc.ec2.IpamPool.AwsService.global_services` |
 
 Shorthand formats: `ec2` or `AwsService.ec2`
 
@@ -178,8 +178,8 @@ Shorthand formats: `ec2` or `AwsService.ec2`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `public` | `awscc.ec2.ipam_pool.IpamScopeType.public` |
-| `private` | `awscc.ec2.ipam_pool.IpamScopeType.private` |
+| `public` | `awscc.ec2.IpamPool.IpamScopeType.public` |
+| `private` | `awscc.ec2.IpamPool.IpamScopeType.private` |
 
 Shorthand formats: `public` or `IpamScopeType.public`
 
@@ -187,8 +187,8 @@ Shorthand formats: `public` or `IpamScopeType.public`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `byoip` | `awscc.ec2.ipam_pool.PublicIpSource.byoip` |
-| `amazon` | `awscc.ec2.ipam_pool.PublicIpSource.amazon` |
+| `byoip` | `awscc.ec2.IpamPool.PublicIpSource.byoip` |
+| `amazon` | `awscc.ec2.IpamPool.PublicIpSource.amazon` |
 
 Shorthand formats: `byoip` or `PublicIpSource.byoip`
 
@@ -196,12 +196,12 @@ Shorthand formats: `byoip` or `PublicIpSource.byoip`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `create-in-progress` | `awscc.ec2.ipam_pool.State.create_in_progress` |
-| `create-complete` | `awscc.ec2.ipam_pool.State.create_complete` |
-| `modify-in-progress` | `awscc.ec2.ipam_pool.State.modify_in_progress` |
-| `modify-complete` | `awscc.ec2.ipam_pool.State.modify_complete` |
-| `delete-in-progress` | `awscc.ec2.ipam_pool.State.delete_in_progress` |
-| `delete-complete` | `awscc.ec2.ipam_pool.State.delete_complete` |
+| `create-in-progress` | `awscc.ec2.IpamPool.State.create_in_progress` |
+| `create-complete` | `awscc.ec2.IpamPool.State.create_complete` |
+| `modify-in-progress` | `awscc.ec2.IpamPool.State.modify_in_progress` |
+| `modify-complete` | `awscc.ec2.IpamPool.State.modify_complete` |
+| `delete-in-progress` | `awscc.ec2.IpamPool.State.delete_in_progress` |
+| `delete-complete` | `awscc.ec2.IpamPool.State.delete_complete` |
 
 Shorthand formats: `create_in_progress` or `State.create_in_progress`
 

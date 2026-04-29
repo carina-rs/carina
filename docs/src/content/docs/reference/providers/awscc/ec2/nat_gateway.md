@@ -1,6 +1,6 @@
 ---
-title: "awscc.ec2.nat_gateway"
-description: "AWSCC EC2 nat_gateway resource reference"
+title: "awscc.ec2.NatGateway"
+description: "AWSCC EC2 NatGateway resource reference"
 ---
 
 
@@ -14,24 +14,24 @@ Specifies a network address translation (NAT) gateway in the specified subnet. Y
 ## Example
 
 ```crn
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block           = '10.0.0.0/16'
   enable_dns_support   = true
   enable_dns_hostnames = true
 }
 
-let public_subnet = awscc.ec2.subnet {
+let public_subnet = awscc.ec2.Subnet {
   vpc_id                  = vpc.vpc_id
   cidr_block              = '10.0.1.0/24'
   availability_zone       = 'ap-northeast-1a'
   map_public_ip_on_launch = true
 }
 
-let eip = awscc.ec2.eip {
+let eip = awscc.ec2.Eip {
   domain = 'vpc'
 }
 
-awscc.ec2.nat_gateway {
+awscc.ec2.NatGateway {
   allocation_id = eip.allocation_id
   subnet_id     = public_subnet.subnet_id
 
@@ -140,8 +140,8 @@ The ID of the VPC in which the NAT gateway is located.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `zonal` | `awscc.ec2.nat_gateway.AvailabilityMode.zonal` |
-| `regional` | `awscc.ec2.nat_gateway.AvailabilityMode.regional` |
+| `zonal` | `awscc.ec2.NatGateway.AvailabilityMode.zonal` |
+| `regional` | `awscc.ec2.NatGateway.AvailabilityMode.regional` |
 
 Shorthand formats: `zonal` or `AvailabilityMode.zonal`
 
@@ -149,8 +149,8 @@ Shorthand formats: `zonal` or `AvailabilityMode.zonal`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `public` | `awscc.ec2.nat_gateway.ConnectivityType.public` |
-| `private` | `awscc.ec2.nat_gateway.ConnectivityType.private` |
+| `public` | `awscc.ec2.NatGateway.ConnectivityType.public` |
+| `private` | `awscc.ec2.NatGateway.ConnectivityType.private` |
 
 Shorthand formats: `public` or `ConnectivityType.public`
 

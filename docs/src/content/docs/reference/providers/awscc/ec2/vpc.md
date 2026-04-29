@@ -1,6 +1,6 @@
 ---
-title: "awscc.ec2.vpc"
-description: "AWSCC EC2 vpc resource reference"
+title: "awscc.ec2.Vpc"
+description: "AWSCC EC2 Vpc resource reference"
 ---
 
 
@@ -13,7 +13,7 @@ Specifies a virtual private cloud (VPC).
 ## Example
 
 ```crn
-awscc.ec2.vpc {
+awscc.ec2.Vpc {
   cidr_block           = '10.0.0.0/16'
   enable_dns_support   = true
   enable_dns_hostnames = true
@@ -87,9 +87,9 @@ The tags for the VPC.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `default` | `awscc.ec2.vpc.InstanceTenancy.default` |
-| `dedicated` | `awscc.ec2.vpc.InstanceTenancy.dedicated` |
-| `host` | `awscc.ec2.vpc.InstanceTenancy.host` |
+| `default` | `awscc.ec2.Vpc.InstanceTenancy.default` |
+| `dedicated` | `awscc.ec2.Vpc.InstanceTenancy.dedicated` |
+| `host` | `awscc.ec2.Vpc.InstanceTenancy.host` |
 
 Shorthand formats: `default` or `InstanceTenancy.default`
 

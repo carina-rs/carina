@@ -1,6 +1,6 @@
 ---
-title: "awscc.ec2.vpn_gateway"
-description: "AWSCC EC2 vpn_gateway resource reference"
+title: "awscc.ec2.VpnGateway"
+description: "AWSCC EC2 VpnGateway resource reference"
 ---
 
 
@@ -12,8 +12,8 @@ Specifies a virtual private gateway. A virtual private gateway is the endpoint o
 ## Example
 
 ```crn
-awscc.ec2.vpn_gateway {
-  type = awscc.ec2.vpn_gateway.Type.ipsec.1
+awscc.ec2.VpnGateway {
+  type = awscc.ec2.VpnGateway.Type.ipsec.1
 
   tags = {
     Environment = 'example'
