@@ -194,9 +194,24 @@ pub fn resolve_ref_value(
             let all_resolved = resolved_args.iter().all(|a| !contains_resource_ref(a));
 
             if all_resolved {
-                // Evaluate the built-in function; propagate errors since args are resolved
-                match crate::builtins::evaluate_builtin(name, &resolved_args) {
-                    Ok(result) => Ok(result),
+                // Evaluate the built-in function; propagate errors since args are resolved.
+                // The evaluator boundary is `EvalValue::into_value` — a closure
+                // returned here would mean `evaluate_builtin` saw fewer args
+                // than the function's arity, which can only happen if a
+                // partial application leaked through parsing. The parser is
+                // supposed to surface that as a parse error, so treat any
+                // closure here as a resolver-level invariant break.
+                use crate::eval_value::EvalValue;
+                let eval_args: Vec<EvalValue> =
+                    resolved_args.iter().cloned().map(EvalValue::from_value).collect();
+                match crate::builtins::evaluate_builtin(name, &eval_args) {
+                    Ok(result) => result.into_value().map_err(|leak| {
+                        format!(
+                            "{}(): produced a closure '{}' (still needs {} arg(s)); \
+                             this should have been caught at parse time",
+                            name, leak.name, leak.remaining_arity
+                        )
+                    }),
                     Err(e) => Err(format!("{}(): {}", name, e)),
                 }
             } else {
@@ -210,21 +225,6 @@ pub fn resolve_ref_value(
         Value::Secret(inner) => {
             let resolved_inner = resolve_ref_value(inner, binding_map)?;
             Ok(Value::Secret(Box::new(resolved_inner)))
-        }
-        Value::Closure {
-            name,
-            captured_args,
-            remaining_arity,
-        } => {
-            let resolved_args: Result<Vec<Value>, String> = captured_args
-                .iter()
-                .map(|a| resolve_ref_value(a, binding_map))
-                .collect();
-            Ok(Value::Closure {
-                name: name.clone(),
-                captured_args: resolved_args?,
-                remaining_arity: *remaining_arity,
-            })
         }
         _ => Ok(value.clone()),
     }

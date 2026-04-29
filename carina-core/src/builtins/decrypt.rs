@@ -82,7 +82,7 @@ fn parse_decrypt_args(args: &[Value]) -> Result<(&str, Option<&str>), String> {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::builtins::evaluate_builtin_with_config;
+    use crate::builtins::evaluate_builtin_with_config_to_value as evaluate_builtin_with_config;
     use crate::parser::ProviderContext;
     use crate::resource::Value;
 

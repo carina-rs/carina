@@ -141,16 +141,6 @@ pub fn value_to_json_with_context(
                 "{SECRET_PREFIX}{hash_hex}",
             )))
         }
-        Value::Closure {
-            name,
-            captured_args,
-            remaining_arity,
-        } => Err(format!(
-            "Closure values cannot be serialized: <closure: {}({}/{} args)>",
-            name,
-            captured_args.len(),
-            captured_args.len() + remaining_arity,
-        )),
     }
 }
 
@@ -244,19 +234,6 @@ pub fn format_value_with_key(value: &Value, _key: Option<&str>) -> String {
             format!("{}({})", name, arg_strs.join(", "))
         }
         Value::Secret(_) => "(secret)".to_string(),
-        Value::Closure {
-            name,
-            captured_args,
-            remaining_arity,
-        } => {
-            let total = captured_args.len() + remaining_arity;
-            format!(
-                "<closure: {}({}/{} args)>",
-                name,
-                captured_args.len(),
-                total
-            )
-        }
     }
 }
 
@@ -1058,27 +1035,8 @@ mod tests {
         assert!(json.contains("my-bucket"));
     }
 
-    #[test]
-    fn closure_format_value_display() {
-        let closure = Value::closure("map", vec![Value::String(".subnet_id".to_string())], 1);
-        let display = format_value(&closure);
-        assert_eq!(display, "<closure: map(1/2 args)>");
-    }
-
-    #[test]
-    fn closure_format_value_no_captured_args() {
-        let closure = Value::closure("join", vec![], 2);
-        let display = format_value(&closure);
-        assert_eq!(display, "<closure: join(0/2 args)>");
-    }
-
-    #[test]
-    fn closure_value_to_json_errors() {
-        let closure = Value::closure("map", vec![Value::String(".id".to_string())], 1);
-        let result = value_to_json(&closure);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.contains("Closure values cannot be serialized"));
-        assert!(err.contains("map"));
-    }
+    // Closure-shaped tests deleted: `Value::Closure` no longer exists,
+    // so `format_value` and `value_to_json` only see user-facing values.
+    // The "closure cannot become data" guarantee is now enforced at the
+    // type level by `EvalValue::into_value`.
 }

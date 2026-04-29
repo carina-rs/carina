@@ -299,19 +299,6 @@ pub enum Value {
     /// A secret value. The inner value is sent to the provider but stored as a
     /// SHA256 hash in state. Plan output displays `(secret)` instead of the value.
     Secret(Box<Value>),
-    /// A partially applied function (closure).
-    ///
-    /// Exists only during expression evaluation; never serialized to state.
-    /// Created when a function receives fewer arguments than it needs.
-    #[serde(skip)]
-    Closure {
-        /// Original function name
-        name: String,
-        /// Arguments already provided
-        captured_args: Vec<Value>,
-        /// How many more arguments are needed
-        remaining_arity: usize,
-    },
 }
 
 /// A part of a string interpolation expression
@@ -339,24 +326,6 @@ impl Value {
         Value::ResourceRef {
             path: AccessPath::from_ref(binding_name, attribute_name, field_path),
         }
-    }
-
-    /// Create a `Closure` value representing a partially applied function.
-    pub fn closure(
-        name: impl Into<String>,
-        captured_args: Vec<Value>,
-        remaining_arity: usize,
-    ) -> Self {
-        Value::Closure {
-            name: name.into(),
-            captured_args,
-            remaining_arity,
-        }
-    }
-
-    /// Returns true if this value is a `Closure`.
-    pub fn is_closure(&self) -> bool {
-        matches!(self, Value::Closure { .. })
     }
 
     /// If this is a `ResourceRef`, returns the binding name.
@@ -410,11 +379,6 @@ impl Value {
                 }
             }
             Value::Secret(inner) => inner.visit_refs(f),
-            Value::Closure { captured_args, .. } => {
-                for arg in captured_args {
-                    arg.visit_refs(f);
-                }
-            }
             Value::String(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_) => {}
         }
     }
@@ -445,8 +409,8 @@ impl Expr {
     ///
     /// Despite the legacy name, this method does **not** resolve
     /// `Value::ResourceRef` / `Value::Interpolation` / `Value::FunctionCall`
-    /// / `Value::Closure` / `Value::Secret` — it simply unwraps
-    /// `Expr` → `Value`. Callers that need concrete values must run
+    /// / `Value::Secret` — it simply unwraps `Expr` → `Value`. Callers
+    /// that need concrete values must run
     /// `carina_core::resolver::resolve_refs_with_state_and_remote` (or an
     /// equivalent) first. See #1683 for a regression caused by assuming
     /// this method performed resolution.
@@ -588,18 +552,6 @@ impl Value {
             }
             Value::Secret(inner) => {
                 inner.hash_into(hasher);
-            }
-            Value::Closure {
-                name,
-                captured_args,
-                remaining_arity,
-            } => {
-                name.hash(hasher);
-                captured_args.len().hash(hasher);
-                for arg in captured_args {
-                    arg.hash_into(hasher);
-                }
-                remaining_arity.hash(hasher);
             }
         }
     }
@@ -1951,60 +1903,9 @@ mod tests {
         assert_eq!(non_ref.ref_binding(), None);
     }
 
-    #[test]
-    fn closure_constructor() {
-        let closure = Value::closure("map", vec![Value::String(".subnet_id".to_string())], 1);
-        match &closure {
-            Value::Closure {
-                name,
-                captured_args,
-                remaining_arity,
-            } => {
-                assert_eq!(name, "map");
-                assert_eq!(captured_args.len(), 1);
-                assert_eq!(*remaining_arity, 1);
-            }
-            _ => panic!("Expected Closure variant"),
-        }
-    }
-
-    #[test]
-    fn closure_is_closure_helper() {
-        let closure = Value::closure("map", vec![], 2);
-        assert!(closure.is_closure());
-
-        let not_closure = Value::String("hello".to_string());
-        assert!(!not_closure.is_closure());
-    }
-
-    #[test]
-    fn closure_serde_serialize_fails() {
-        // Closure with #[serde(skip)] cannot be serialized — serde rejects it.
-        let closure = Value::closure("map", vec![Value::String(".id".to_string())], 1);
-        let result = serde_json::to_string(&closure);
-        assert!(result.is_err(), "Closure must not be serializable");
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("cannot be serialized"),
-            "Error should mention serialization: {err}"
-        );
-    }
-
-    #[test]
-    fn closure_not_in_contains_resource_ref() {
-        let closure = Value::closure("map", vec![Value::String(".id".to_string())], 1);
-        assert!(!contains_resource_ref(&closure));
-    }
-
-    #[test]
-    fn closure_with_resource_ref_in_captured_args() {
-        let closure = Value::Closure {
-            name: "map".to_string(),
-            captured_args: vec![Value::resource_ref("vpc", "id", vec![])],
-            remaining_arity: 1,
-        };
-        assert!(contains_resource_ref(&closure));
-    }
+    // Closure tests moved out: `Value::Closure` no longer exists. Closure
+    // construction, helper methods, and serde-skip behavior are now
+    // properties of `EvalValue`, exercised in `eval_value.rs`.
 
     #[test]
     fn visit_refs_collects_from_all_nested_variants() {
@@ -2023,11 +1924,6 @@ mod tests {
                 args: vec![Value::resource_ref("d", "id", vec![])],
             },
             Value::Secret(Box::new(Value::resource_ref("e", "id", vec![]))),
-            Value::Closure {
-                name: "fn".to_string(),
-                captured_args: vec![Value::resource_ref("f", "id", vec![])],
-                remaining_arity: 1,
-            },
             Value::String("plain".to_string()),
         ]);
 
@@ -2036,7 +1932,7 @@ mod tests {
             collected.push(path.binding().to_string());
         });
         collected.sort();
-        assert_eq!(collected, vec!["a", "b", "c", "d", "e", "f"]);
+        assert_eq!(collected, vec!["a", "b", "c", "d", "e"]);
     }
 
     #[test]

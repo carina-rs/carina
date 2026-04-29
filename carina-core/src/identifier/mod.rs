@@ -199,22 +199,6 @@ fn deterministic_value_string(value: &Value) -> String {
         Value::Secret(inner) => {
             format!("Secret({})", deterministic_value_string(inner))
         }
-        Value::Closure {
-            name,
-            captured_args,
-            remaining_arity,
-        } => {
-            let arg_strs: Vec<String> = captured_args
-                .iter()
-                .map(deterministic_value_string)
-                .collect();
-            format!(
-                "Closure({}({}) remaining={})",
-                name,
-                arg_strs.join(", "),
-                remaining_arity
-            )
-        }
     }
 }
 

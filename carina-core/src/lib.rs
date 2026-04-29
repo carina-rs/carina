@@ -10,6 +10,7 @@ pub mod detail_rows;
 pub mod diff_helpers;
 pub mod differ;
 pub mod effect;
+pub(crate) mod eval_value;
 pub mod executor;
 pub mod formatter;
 pub mod heredoc;

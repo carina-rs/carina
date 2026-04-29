@@ -288,30 +288,10 @@ mod tests {
         assert_eq!(deps.len(), 2);
     }
 
-    /// Regression: a ResourceRef inside a `Closure`'s captured args must show
-    /// up as a dependency. The prior hand-rolled walk had no `Closure` arm
-    /// and silently dropped these refs, which in turn let the topological
-    /// sort place the dependent resource before its upstream.
-    #[test]
-    fn collect_dependencies_finds_refs_inside_closure() {
-        let mut resource = Resource::new("test", "a");
-        resource.binding = Some("a".to_string());
-        resource.set_attr(
-            "fn".to_string(),
-            Value::Closure {
-                name: "map".to_string(),
-                captured_args: vec![Value::resource_ref("upstream", "id", vec![])],
-                remaining_arity: 1,
-            },
-        );
-
-        let deps = get_resource_dependencies(&resource);
-        assert!(
-            deps.contains("upstream"),
-            "Expected deps to include 'upstream' from Closure captured_args. Got: {:?}",
-            deps
-        );
-    }
+    // Closure-in-attribute regression test deleted: `Value::Closure` no
+    // longer exists, so a closure can never reach `Resource.attributes`.
+    // The original concern (refs inside captured args getting silently
+    // dropped from dependency walks) is now type-impossible.
 
     /// Regression test for #1078: when resolve_refs_with_state partially resolves
     /// a transitive reference (e.g., `tgw_attach.transit_gateway_id` resolves to

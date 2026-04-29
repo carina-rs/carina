@@ -62,7 +62,7 @@ pub(crate) fn builtin_replace(args: &[Value]) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::builtins::evaluate_builtin;
+    use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
     use crate::resource::Value;
 
     #[test]
@@ -146,11 +146,12 @@ mod tests {
 
     #[test]
     fn replace_partial_application() {
+        use crate::builtins::evaluate_builtin_for_tests;
         let args = vec![
             Value::String("hello".to_string()),
             Value::String("-".to_string()),
         ];
-        let result = evaluate_builtin("replace", &args).unwrap();
+        let result = evaluate_builtin_for_tests("replace", &args).unwrap();
         assert!(result.is_closure());
     }
 
