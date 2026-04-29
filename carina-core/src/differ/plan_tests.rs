@@ -1,4 +1,7 @@
 use super::*;
+
+use indexmap::IndexMap;
+
 use crate::resource::ResourceKind;
 
 #[test]
@@ -375,7 +378,7 @@ fn diff_detects_attribute_removal_with_prev_desired_keys() {
     );
     current_attrs.insert(
         "tags".to_string(),
-        Value::Map(HashMap::from([(
+        Value::Map(IndexMap::from([(
             "Name".to_string(),
             Value::String("test".to_string()),
         )])),
@@ -451,7 +454,7 @@ fn diff_no_change_without_prev_desired_keys() {
     );
     current_attrs.insert(
         "tags".to_string(),
-        Value::Map(HashMap::from([(
+        Value::Map(IndexMap::from([(
             "Name".to_string(),
             Value::String("test".to_string()),
         )])),
@@ -483,7 +486,7 @@ fn create_plan_detects_attribute_removal() {
     );
     attrs.insert(
         "tags".to_string(),
-        Value::Map(HashMap::from([(
+        Value::Map(IndexMap::from([(
             "Name".to_string(),
             Value::String("test".to_string()),
         )])),
@@ -535,7 +538,7 @@ fn create_plan_filters_non_removable_attribute_removal() {
     );
     attrs.insert(
         "tags".to_string(),
-        Value::Map(HashMap::from([(
+        Value::Map(IndexMap::from([(
             "Name".to_string(),
             Value::String("test".to_string()),
         )])),

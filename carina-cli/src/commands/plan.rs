@@ -416,7 +416,7 @@ pub(crate) fn resolve_export_value(
             Value::List(resolved)
         }
         Value::Map(map) => {
-            let resolved: HashMap<String, Value> = map
+            let resolved: indexmap::IndexMap<String, Value> = map
                 .iter()
                 .map(|(k, v)| (k.clone(), resolve_export_value(v, binding_map)))
                 .collect();

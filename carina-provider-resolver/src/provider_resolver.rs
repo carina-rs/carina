@@ -999,6 +999,7 @@ pub fn validate_lock_constraints(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indexmap::IndexMap;
     use std::io::Write;
 
     fn version_entry(source: &str, version: &str) -> LockEntry {
@@ -1031,8 +1032,8 @@ mod tests {
             source: Some(source.into()),
             version: None,
             revision: revision.map(|r| r.into()),
-            attributes: std::collections::HashMap::new(),
-            default_tags: std::collections::HashMap::new(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
         }
     }
 
@@ -1380,8 +1381,8 @@ sha256 = "abc"
             source: Some(source.clone()),
             version: None,
             revision: None,
-            attributes: std::collections::HashMap::new(),
-            default_tags: std::collections::HashMap::new(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
         }];
 
         let result = resolve_all(tmp.path(), &providers, LockMode::Normal).unwrap();
@@ -1405,8 +1406,8 @@ sha256 = "abc"
             source: Some("file:///nonexistent/path.wasm".into()),
             version: None,
             revision: None,
-            attributes: std::collections::HashMap::new(),
-            default_tags: std::collections::HashMap::new(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
         }];
         let err = resolve_all(tmp.path(), &providers, LockMode::Normal).unwrap_err();
         assert!(err.contains("not found"));
@@ -1502,8 +1503,8 @@ sha256 = "abc"
                 carina_core::version_constraint::VersionConstraint::parse(constraint).unwrap(),
             ),
             revision: None,
-            attributes: std::collections::HashMap::new(),
-            default_tags: std::collections::HashMap::new(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
         }
     }
 
@@ -1673,8 +1674,8 @@ sha256 = "abc"
             source: Some("file:///tmp/provider.wasm".into()),
             version: None,
             revision: None,
-            attributes: std::collections::HashMap::new(),
-            default_tags: std::collections::HashMap::new(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
         };
         assert!(check_lock_mismatch(&[cfg], &lock, LockMode::Normal).is_ok());
     }

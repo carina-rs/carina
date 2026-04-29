@@ -6,6 +6,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use indexmap::IndexMap;
+
 use crate::resource::{Resource, Value};
 use crate::utils::{extract_enum_value_with_values, validate_enum_namespace};
 use crate::value::format_value_with_key;
@@ -1500,7 +1502,7 @@ fn collect_block_names_from_type(attr_type: &AttributeType, result: &mut HashMap
 /// renames it to the canonical field name. Also recurses into nested
 /// struct values to resolve block names at all nesting levels.
 fn resolve_block_names_in_map(
-    map: &mut HashMap<String, Value>,
+    map: &mut IndexMap<String, Value>,
     fields: &[StructField],
     resource_id: &str,
     errors: &mut Vec<String>,
@@ -1540,7 +1542,7 @@ fn resolve_block_names_in_map(
             ));
             continue;
         }
-        let value = map.remove(&block_key).unwrap();
+        let value = map.shift_remove(&block_key).unwrap();
         map.insert(canon_key, value);
     }
 
@@ -2636,17 +2638,17 @@ mod tests {
         };
 
         // Valid: all required fields present
-        let mut map = HashMap::new();
+        let mut map = IndexMap::new();
         map.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
         map.insert("from_port".to_string(), Value::Int(80));
         assert!(t.validate(&Value::Map(map)).is_ok());
 
         // Invalid: missing required field
-        let empty_map = HashMap::new();
+        let empty_map = IndexMap::new();
         assert!(t.validate(&Value::Map(empty_map)).is_err());
 
         // Invalid: wrong type for field
-        let mut bad_map = HashMap::new();
+        let mut bad_map = IndexMap::new();
         bad_map.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
         bad_map.insert(
             "from_port".to_string(),
@@ -2674,7 +2676,7 @@ mod tests {
         };
 
         // Unknown field should be rejected
-        let mut map = HashMap::new();
+        let mut map = IndexMap::new();
         map.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
         map.insert(
             "unknown_field".to_string(),
@@ -2710,7 +2712,7 @@ mod tests {
         };
 
         // Typo: "ip_protcol" -> should suggest "ip_protocol"
-        let mut map = HashMap::new();
+        let mut map = IndexMap::new();
         map.insert("ip_protcol".to_string(), Value::String("tcp".to_string()));
         let result = t.validate(&Value::Map(map));
         assert!(result.is_err());
@@ -2729,7 +2731,7 @@ mod tests {
         }
 
         // Typo: "cidr_iip" -> should suggest "cidr_ip"
-        let mut map2 = HashMap::new();
+        let mut map2 = IndexMap::new();
         map2.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
         map2.insert(
             "cidr_iip".to_string(),
@@ -2760,7 +2762,7 @@ mod tests {
         };
 
         // With suggestion
-        let mut map = HashMap::new();
+        let mut map = IndexMap::new();
         map.insert("vpc_idd".to_string(), Value::String("vpc-123".to_string()));
         let err = t.validate(&Value::Map(map)).unwrap_err();
         assert_eq!(
@@ -2769,7 +2771,7 @@ mod tests {
         );
 
         // Without suggestion (completely different name)
-        let mut map2 = HashMap::new();
+        let mut map2 = IndexMap::new();
         map2.insert(
             "completely_different".to_string(),
             Value::String("x".to_string()),
@@ -2822,13 +2824,13 @@ mod tests {
         };
         let list_type = AttributeType::list(struct_type);
 
-        let mut item = HashMap::new();
+        let mut item = IndexMap::new();
         item.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
         let list = Value::List(vec![Value::Map(item)]);
         assert!(list_type.validate(&list).is_ok());
 
         // Invalid item in list
-        let bad_list = Value::List(vec![Value::Map(HashMap::new())]);
+        let bad_list = Value::List(vec![Value::Map(IndexMap::new())]);
         assert!(list_type.validate(&bad_list).is_err());
     }
 
@@ -2841,7 +2843,7 @@ mod tests {
             fields: vec![StructField::new("status", AttributeType::String).required()],
         };
 
-        let mut map = HashMap::new();
+        let mut map = IndexMap::new();
         map.insert("status".to_string(), Value::String("Enabled".to_string()));
         let single_list = Value::List(vec![Value::Map(map)]);
         let result = struct_type.validate(&single_list);
@@ -2867,9 +2869,9 @@ mod tests {
             fields: vec![StructField::new("status", AttributeType::String).required()],
         };
 
-        let mut map1 = HashMap::new();
+        let mut map1 = IndexMap::new();
         map1.insert("status".to_string(), Value::String("Enabled".to_string()));
-        let mut map2 = HashMap::new();
+        let mut map2 = IndexMap::new();
         map2.insert("status".to_string(), Value::String("Suspended".to_string()));
         let multi_list = Value::List(vec![Value::Map(map1), Value::Map(map2)]);
         let result = struct_type.validate(&multi_list);
@@ -3393,7 +3395,7 @@ mod tests {
             AttributeType::String,
         ]);
 
-        let mut map = HashMap::new();
+        let mut map = IndexMap::new();
         map.insert(
             "federated".to_string(),
             Value::String("arn:...".to_string()),
@@ -3513,7 +3515,7 @@ mod tests {
             r.set_attr(
                 "operating_region".to_string(),
                 Value::List(vec![Value::Map({
-                    let mut m = HashMap::new();
+                    let mut m = IndexMap::new();
                     m.insert(
                         "region_name".to_string(),
                         Value::String("us-east-1".to_string()),
@@ -3567,7 +3569,7 @@ mod tests {
             r.set_attr(
                 "operating_region".to_string(),
                 Value::List(vec![Value::Map({
-                    let mut m = HashMap::new();
+                    let mut m = IndexMap::new();
                     m.insert(
                         "region_name".to_string(),
                         Value::String("us-east-1".to_string()),
@@ -3579,7 +3581,7 @@ mod tests {
             r.set_attr(
                 "operating_regions".to_string(),
                 Value::List(vec![Value::Map({
-                    let mut m = HashMap::new();
+                    let mut m = IndexMap::new();
                     m.insert(
                         "region_name".to_string(),
                         Value::String("us-west-2".to_string()),
@@ -3643,11 +3645,11 @@ mod tests {
     fn resolve_block_names_nested_struct() {
         // Simulate: lifecycle_configuration = { transition { ... } }
         // where "transition" is the block name for "transitions" field
-        let mut inner_map = HashMap::new();
+        let mut inner_map = IndexMap::new();
         inner_map.insert(
             "transition".to_string(),
             Value::List(vec![Value::Map({
-                let mut m = HashMap::new();
+                let mut m = IndexMap::new();
                 m.insert(
                     "storage_class".to_string(),
                     Value::String("GLACIER".to_string()),
@@ -3706,13 +3708,13 @@ mod tests {
         // with block_name("transition") on the List field, an attribute assignment
         // `transition = { ... }` (Value::Map) should NOT be renamed to `transitions`.
         // Only block syntax `transition { ... }` (Value::List) should be renamed.
-        let mut inner_map = HashMap::new();
+        let mut inner_map = IndexMap::new();
         // This is an attribute assignment: transition = { storage_class = "GLACIER" }
         // Parser produces Value::Map for attribute assignments
         inner_map.insert(
             "transition".to_string(),
             Value::Map({
-                let mut m = HashMap::new();
+                let mut m = IndexMap::new();
                 m.insert(
                     "storage_class".to_string(),
                     Value::String("GLACIER".to_string()),
@@ -3776,12 +3778,12 @@ mod tests {
     fn resolve_block_names_block_syntax_renamed_when_singular_field_exists() {
         // Block syntax `transition { ... }` should still be renamed to `transitions`
         // even when a singular `transition` field exists in the schema.
-        let mut inner_map = HashMap::new();
+        let mut inner_map = IndexMap::new();
         // Block syntax produces Value::List
         inner_map.insert(
             "transition".to_string(),
             Value::List(vec![Value::Map({
-                let mut m = HashMap::new();
+                let mut m = IndexMap::new();
                 m.insert(
                     "storage_class".to_string(),
                     Value::String("GLACIER".to_string()),
@@ -3852,7 +3854,7 @@ mod tests {
             r.set_attr(
                 "ingress".to_string(),
                 Value::List(vec![Value::Map({
-                    let mut m = HashMap::new();
+                    let mut m = IndexMap::new();
                     m.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
                     m
                 })]),
@@ -3899,12 +3901,12 @@ mod tests {
                 "ingress".to_string(),
                 Value::List(vec![
                     Value::Map({
-                        let mut m = HashMap::new();
+                        let mut m = IndexMap::new();
                         m.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
                         m
                     }),
                     Value::Map({
-                        let mut m = HashMap::new();
+                        let mut m = IndexMap::new();
                         m.insert("ip_protocol".to_string(), Value::String("udp".to_string()));
                         m
                     }),
@@ -3942,11 +3944,11 @@ mod tests {
     fn resolve_block_names_nested_same_block_and_canonical_name() {
         // Nested struct field where block_name == canonical field name.
         // Should resolve without errors.
-        let mut inner_map = HashMap::new();
+        let mut inner_map = IndexMap::new();
         inner_map.insert(
             "tag".to_string(),
             Value::List(vec![Value::Map({
-                let mut m = HashMap::new();
+                let mut m = IndexMap::new();
                 m.insert("key".to_string(), Value::String("Name".to_string()));
                 m.insert("value".to_string(), Value::String("test".to_string()));
                 m
@@ -4040,7 +4042,7 @@ mod tests {
             "bucket_name".to_string(),
             Value::String("my-bucket".to_string()),
         );
-        attrs.insert("tags".to_string(), Value::Map(HashMap::new()));
+        attrs.insert("tags".to_string(), Value::Map(IndexMap::new()));
 
         let result = schema.validate(&attrs);
         assert!(result.is_err());
@@ -4063,7 +4065,7 @@ mod tests {
             "bucket_name".to_string(),
             Value::String("my-bucket".to_string()),
         );
-        attrs.insert("tags".to_string(), Value::Map(HashMap::new()));
+        attrs.insert("tags".to_string(), Value::Map(IndexMap::new()));
 
         assert!(schema.validate(&attrs).is_ok());
     }

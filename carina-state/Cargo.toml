@@ -24,4 +24,5 @@ thiserror = "2"
 hostname = "0.4"
 
 [dev-dependencies]
+indexmap = "2"
 tempfile = "3"

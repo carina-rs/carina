@@ -1,6 +1,7 @@
 use super::*;
 use crate::resource::Resource;
 use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use indexmap::IndexMap;
 
 fn make_s3_bucket_schema() -> (String, ResourceSchema) {
     let schema = ResourceSchema::new("awscc.s3.Bucket")
@@ -208,8 +209,8 @@ fn test_reconcile_anonymous_id_partial_create_only_match() {
         .collect();
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
-        attributes: HashMap::new(),
-        default_tags: HashMap::new(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
         source: None,
         version: None,
         revision: None,
@@ -416,7 +417,7 @@ fn test_anonymous_resource_no_create_only_properties() {
         )]
         .into_iter()
         .collect(),
-        default_tags: HashMap::new(),
+        default_tags: IndexMap::new(),
         source: None,
         version: None,
         revision: None,
@@ -457,7 +458,7 @@ fn test_anonymous_resource_no_create_only_deterministic() {
         )]
         .into_iter()
         .collect(),
-        default_tags: HashMap::new(),
+        default_tags: IndexMap::new(),
         source: None,
         version: None,
         revision: None,
@@ -502,8 +503,8 @@ fn test_anonymous_resource_no_create_only_collision() {
         .collect();
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
-        attributes: HashMap::new(),
-        default_tags: HashMap::new(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
         source: None,
         version: None,
         revision: None,
@@ -550,8 +551,8 @@ fn test_identity_attribute_prevents_collision() {
             .collect();
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
-        attributes: HashMap::new(),
-        default_tags: HashMap::new(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
         source: None,
         version: None,
         revision: None,
@@ -680,7 +681,7 @@ fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
         )]
         .into_iter()
         .collect(),
-        default_tags: HashMap::new(),
+        default_tags: IndexMap::new(),
         source: None,
         version: None,
         revision: None,
@@ -785,8 +786,8 @@ fn test_reconcile_anonymous_id_create_only_exists_but_none_set() {
         .collect();
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
-        attributes: HashMap::new(),
-        default_tags: HashMap::new(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
         source: None,
         version: None,
         revision: None,
@@ -977,8 +978,8 @@ fn test_reconcile_no_create_only_picks_closest_among_multiple_state_entries() {
         .collect();
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
-        attributes: HashMap::new(),
-        default_tags: HashMap::new(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
         source: None,
         version: None,
         revision: None,
@@ -1083,8 +1084,8 @@ fn test_reconcile_no_create_only_same_id_in_state_no_change() {
         .collect();
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
-        attributes: HashMap::new(),
-        default_tags: HashMap::new(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
         source: None,
         version: None,
         revision: None,
@@ -1157,8 +1158,8 @@ fn test_compute_anonymous_id_uses_simhash_for_no_create_only() {
             .collect();
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
-        attributes: HashMap::new(),
-        default_tags: HashMap::new(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
         source: None,
         version: None,
         revision: None,
@@ -1216,8 +1217,8 @@ fn test_compute_anonymous_id_simhash_vs_create_only_hash_independent() {
     .collect();
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
-        attributes: HashMap::new(),
-        default_tags: HashMap::new(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
         source: None,
         version: None,
         revision: None,
@@ -1313,8 +1314,8 @@ fn test_compute_anonymous_id_stable_with_prefixed_create_only_attribute() {
         .collect();
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
-        attributes: HashMap::new(),
-        default_tags: HashMap::new(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
         source: None,
         version: None,
         revision: None,
@@ -1358,8 +1359,8 @@ fn test_compute_anonymous_id_different_prefix_produces_different_id() {
         .collect();
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
-        attributes: HashMap::new(),
-        default_tags: HashMap::new(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
         source: None,
         version: None,
         revision: None,
@@ -1551,7 +1552,7 @@ fn test_reconcile_eip_tag_update_with_unset_create_only_props() {
         )]
         .into_iter()
         .collect(),
-        default_tags: HashMap::new(),
+        default_tags: IndexMap::new(),
         source: None,
         version: None,
         revision: None,
@@ -1561,7 +1562,7 @@ fn test_reconcile_eip_tag_update_with_unset_create_only_props() {
     // Step 1: Create EIP with tags Environment=acceptance-test
     let mut r1 = Resource::with_provider("awscc", "ec2.eip", "");
     r1.set_attr("domain".to_string(), Value::String("vpc".to_string()));
-    let mut tags1 = std::collections::HashMap::new();
+    let mut tags1 = indexmap::IndexMap::new();
     tags1.insert(
         "Environment".to_string(),
         Value::String("acceptance-test".to_string()),
@@ -1586,7 +1587,7 @@ fn test_reconcile_eip_tag_update_with_unset_create_only_props() {
     // Step 2: Change tag Environment=staging (only tags changed)
     let mut r2 = Resource::with_provider("awscc", "ec2.eip", "");
     r2.set_attr("domain".to_string(), Value::String("vpc".to_string()));
-    let mut tags2 = std::collections::HashMap::new();
+    let mut tags2 = indexmap::IndexMap::new();
     tags2.insert(
         "Environment".to_string(),
         Value::String("staging".to_string()),
@@ -1964,7 +1965,7 @@ fn test_detect_rename_no_create_only_skips_when_attributes_differ_too_much() {
     // Anonymous snapshot with many attributes.
     let mut anon = Resource::with_provider("awscc", "sso.Instance", "");
     anon.set_attr("name".to_string(), Value::String("old-name".to_string()));
-    let mut tags = std::collections::HashMap::new();
+    let mut tags = indexmap::IndexMap::new();
     tags.insert("k1".to_string(), Value::String("v1".to_string()));
     tags.insert("k2".to_string(), Value::String("v2".to_string()));
     anon.set_attr("tags".to_string(), Value::Map(tags));
@@ -1986,7 +1987,7 @@ fn test_detect_rename_no_create_only_skips_when_attributes_differ_too_much() {
         "name".to_string(),
         Value::String("completely-different".to_string()),
     );
-    let mut different_tags = std::collections::HashMap::new();
+    let mut different_tags = indexmap::IndexMap::new();
     different_tags.insert("other1".to_string(), Value::String("foo".to_string()));
     different_tags.insert("other2".to_string(), Value::String("bar".to_string()));
     different_tags.insert("other3".to_string(), Value::String("baz".to_string()));

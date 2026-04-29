@@ -1402,7 +1402,7 @@ fn format_map_diff(old_value: Option<&Value>, new_value: &Value, attr_prefix: &s
         Some(Value::Map(m)) => m,
         _ => {
             // No old map; treat all new keys as added
-            let empty = HashMap::new();
+            let empty = indexmap::IndexMap::new();
             let diff = compute_map_diff(&empty, new_map);
             let mut lines = Vec::new();
             for entry in &diff.added {

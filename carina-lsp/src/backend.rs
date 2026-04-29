@@ -791,6 +791,7 @@ fn should_reload_for_event(event: &FileEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indexmap::IndexMap;
 
     fn file_event(path: &std::path::Path, typ: FileChangeType) -> FileEvent {
         FileEvent {
@@ -914,7 +915,7 @@ mod tests {
         let installed = tmp.path().join("carina-provider-foo.wasm");
         std::fs::write(&installed, b"fake").unwrap();
 
-        let mut attributes = std::collections::HashMap::new();
+        let mut attributes = IndexMap::new();
         attributes.insert(
             "_installed_at".to_string(),
             Value::String(installed.display().to_string()),
@@ -925,7 +926,7 @@ mod tests {
             version: None,
             revision: None,
             attributes,
-            default_tags: std::collections::HashMap::new(),
+            default_tags: IndexMap::new(),
         };
         let configs = vec![(tmp.path().to_path_buf(), config)];
         let prober = test_prober();
@@ -956,8 +957,8 @@ mod tests {
             source: None,
             version: None,
             revision: None,
-            attributes: std::collections::HashMap::new(),
-            default_tags: std::collections::HashMap::new(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
         };
         let configs = vec![(tmp.path().to_path_buf(), config)];
         let prober = test_prober();
@@ -974,13 +975,13 @@ mod reload_skip_tests {
     use super::*;
     use carina_core::parser::ProviderConfig;
     use carina_core::resource::Value;
-    use std::collections::HashMap;
+    use indexmap::IndexMap;
 
     fn mk_config(name: &str, source: Option<&str>) -> ProviderConfig {
         ProviderConfig {
             name: name.into(),
-            attributes: HashMap::new(),
-            default_tags: HashMap::new(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
             source: source.map(String::from),
             version: None,
             revision: None,

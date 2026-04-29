@@ -49,14 +49,14 @@ pub(crate) fn builtin_lookup(args: &[Value]) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use indexmap::IndexMap;
 
     use crate::builtins::evaluate_builtin;
     use crate::resource::Value;
 
     #[test]
     fn lookup_key_found() {
-        let map = Value::Map(HashMap::from([
+        let map = Value::Map(IndexMap::from([
             ("a".to_string(), Value::String("one".to_string())),
             ("b".to_string(), Value::String("two".to_string())),
         ]));
@@ -71,7 +71,7 @@ mod tests {
 
     #[test]
     fn lookup_key_not_found() {
-        let map = Value::Map(HashMap::from([
+        let map = Value::Map(IndexMap::from([
             ("a".to_string(), Value::String("one".to_string())),
             ("b".to_string(), Value::String("two".to_string())),
         ]));
@@ -86,7 +86,7 @@ mod tests {
 
     #[test]
     fn lookup_empty_map() {
-        let map = Value::Map(HashMap::new());
+        let map = Value::Map(IndexMap::new());
         let args = vec![
             map,
             Value::String("key".to_string()),
@@ -98,7 +98,7 @@ mod tests {
 
     #[test]
     fn lookup_int_default() {
-        let map = Value::Map(HashMap::from([("x".to_string(), Value::Int(42))]));
+        let map = Value::Map(IndexMap::from([("x".to_string(), Value::Int(42))]));
         let args = vec![map, Value::String("missing".to_string()), Value::Int(0)];
         let result = evaluate_builtin("lookup", &args).unwrap();
         assert_eq!(result, Value::Int(0));
@@ -106,7 +106,7 @@ mod tests {
 
     #[test]
     fn lookup_returns_non_string_value() {
-        let map = Value::Map(HashMap::from([("count".to_string(), Value::Int(99))]));
+        let map = Value::Map(IndexMap::from([("count".to_string(), Value::Int(99))]));
         let args = vec![map, Value::String("count".to_string()), Value::Int(0)];
         let result = evaluate_builtin("lookup", &args).unwrap();
         assert_eq!(result, Value::Int(99));
@@ -114,7 +114,10 @@ mod tests {
 
     #[test]
     fn lookup_partial_application() {
-        let args = vec![Value::Map(HashMap::new()), Value::String("key".to_string())];
+        let args = vec![
+            Value::Map(IndexMap::new()),
+            Value::String("key".to_string()),
+        ];
         let result = evaluate_builtin("lookup", &args).unwrap();
         assert!(result.is_closure());
     }
@@ -134,7 +137,7 @@ mod tests {
     #[test]
     fn lookup_non_string_key() {
         let args = vec![
-            Value::Map(HashMap::new()),
+            Value::Map(IndexMap::new()),
             Value::Int(1),
             Value::String("default".to_string()),
         ];

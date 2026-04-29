@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 
+use indexmap::IndexMap;
+
 use crate::deps::get_resource_dependencies;
 use crate::resource::{
     Expr, InterpolationPart, Resource, ResourceId, State, Value, contains_resource_ref,
@@ -142,7 +144,7 @@ pub fn resolve_ref_value(
             Ok(Value::List(resolved?))
         }
         Value::Map(map) => {
-            let mut resolved = HashMap::new();
+            let mut resolved: IndexMap<String, Value> = IndexMap::new();
             for (k, v) in map {
                 resolved.insert(k.clone(), resolve_ref_value(v, binding_map)?);
             }
@@ -492,7 +494,7 @@ mod tests {
         let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
         // web binding has a nested map: network = { vpc_id = "vpc-123" }
-        let mut network_map = HashMap::new();
+        let mut network_map = IndexMap::new();
         network_map.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
         let mut attrs = HashMap::new();
         attrs.insert("network".to_string(), Value::Map(network_map));
@@ -514,9 +516,9 @@ mod tests {
         let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
         // web.output.network.vpc_id
-        let mut inner_map = HashMap::new();
+        let mut inner_map = IndexMap::new();
         inner_map.insert("vpc_id".to_string(), Value::String("vpc-456".to_string()));
-        let mut output_map = HashMap::new();
+        let mut output_map = IndexMap::new();
         output_map.insert("network".to_string(), Value::Map(inner_map));
         let mut attrs = HashMap::new();
         attrs.insert("output".to_string(), Value::Map(output_map));
@@ -536,7 +538,7 @@ mod tests {
     fn test_resolve_chained_field_missing_key_keeps_ref() {
         let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
-        let mut network_map = HashMap::new();
+        let mut network_map = IndexMap::new();
         network_map.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
         let mut attrs = HashMap::new();
         attrs.insert("network".to_string(), Value::Map(network_map));
@@ -650,7 +652,7 @@ mod tests {
 
         // Build remote bindings: network -> { vpc -> Map { vpc_id -> "vpc-123" } }
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
-        let mut vpc_attrs = HashMap::new();
+        let mut vpc_attrs = IndexMap::new();
         vpc_attrs.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
         vpc_attrs.insert(
             "cidr_block".to_string(),

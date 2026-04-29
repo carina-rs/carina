@@ -21,8 +21,8 @@ hyper = "1"
 tokio = { version = "1", features = ["rt"] }
 dirs = "6"
 sha2 = "0.10"
+indexmap = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
-indexmap = "2"

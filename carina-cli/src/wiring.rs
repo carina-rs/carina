@@ -1,5 +1,8 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
+
+#[cfg(test)]
+use indexmap::IndexMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -442,7 +445,7 @@ pub fn normalize_desired_with_ctx(ctx: &WiringContext, resources: &mut [Resource
         .expect("failed to build tokio runtime for normalize_desired");
     let mut router = ProviderRouter::new();
     for factory in ctx.factories() {
-        let attrs = HashMap::new();
+        let attrs = indexmap::IndexMap::new();
         router.add_normalizer(rt.block_on(factory.create_normalizer(&attrs)));
     }
     router.normalize_desired(resources);
@@ -463,7 +466,7 @@ pub fn normalize_state_with_ctx(
         .expect("failed to build tokio runtime for normalize_state");
     let mut router = ProviderRouter::new();
     for factory in ctx.factories() {
-        let attrs = HashMap::new();
+        let attrs = indexmap::IndexMap::new();
         router.add_normalizer(rt.block_on(factory.create_normalizer(&attrs)));
     }
     router.normalize_state(current_states);
@@ -489,12 +492,9 @@ pub fn resolve_enum_aliases_with_ctx(ctx: &WiringContext, resources: &mut [Resou
         };
         let mut value_attrs = resource.resolved_attributes();
         resolve_attrs_aliases(&mut value_attrs, &resource.id.resource_type, factory);
-        // `value_attrs` is `HashMap`-shaped (state-side ordering doesn't
-        // survive AWS round-trips), so the order produced by `wrap_map`
-        // is whatever `HashMap` iteration gives. Stage 1 of #2222
-        // preserves order on the *parse* path; alias resolution
-        // rebuilds the map and that ordering is lost — acceptable for
-        // this PR's scope.
+        // `value_attrs` is `HashMap`-shaped, so the source order written
+        // by the user does not survive alias resolution. Re-rendering the
+        // attributes after this point can produce a different key order.
         resource.attributes = carina_core::resource::Expr::wrap_map(value_attrs);
     }
 }
@@ -1554,7 +1554,7 @@ mod tests {
     fn test_resolve_enum_aliases_in_struct_field() {
         // Aliases within struct fields (maps inside lists) should also be resolved
         let mut resource = Resource::with_provider("awscc", "ec2.SecurityGroup", "test-sg");
-        let mut egress_map = HashMap::new();
+        let mut egress_map = IndexMap::new();
         egress_map.insert(
             "ip_protocol".to_string(),
             Value::String("awscc.ec2.SecurityGroup.IpProtocol.all".to_string()),
@@ -1699,7 +1699,7 @@ mod tests {
         // State already has the default tags (from a previous apply)
         let id = resource.id.clone();
         let mut state_attrs = HashMap::new();
-        let mut tags = HashMap::new();
+        let mut tags = IndexMap::new();
         tags.insert(
             "Environment".to_string(),
             Value::String("production".to_string()),
@@ -1709,8 +1709,8 @@ mod tests {
         let mut current_states = HashMap::new();
         current_states.insert(id.clone(), state);
 
-        let default_tags: HashMap<String, Value> = {
-            let mut m = HashMap::new();
+        let default_tags: IndexMap<String, Value> = {
+            let mut m = IndexMap::new();
             m.insert(
                 "Environment".to_string(),
                 Value::String("production".to_string()),
@@ -1751,7 +1751,7 @@ mod tests {
             .expect("failed to build tokio runtime");
         let mut router = ProviderRouter::new();
         for factory in ctx.factories() {
-            let attrs = HashMap::new();
+            let attrs = IndexMap::new();
             router.add_normalizer(rt.block_on(factory.create_normalizer(&attrs)));
         }
         let mut resources_with = vec![resource];

@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+use indexmap::IndexMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -1095,7 +1097,7 @@ impl WasmProviderFactory {
 
     async fn create_initialized_instance(
         &self,
-        attributes: &HashMap<String, Value>,
+        attributes: &IndexMap<String, Value>,
     ) -> Result<(Store<HostState>, WasmBindings), String> {
         let (mut store, bindings) = if self.enable_http {
             create_instance_with_http(&self.engine, &self.component).await?
@@ -1119,7 +1121,7 @@ impl WasmProviderFactory {
     /// WASM instances for the provider and normalizer.
     async fn get_or_create_shared_instance(
         &self,
-        attributes: &HashMap<String, Value>,
+        attributes: &IndexMap<String, Value>,
     ) -> Result<Arc<SharedWasmInstance>, String> {
         let mut guard = self.shared_instance.lock().await;
         if let Some(ref instance) = *guard {
@@ -1175,7 +1177,7 @@ impl ProviderFactory for WasmProviderFactory {
         self.cached_provider_config_types.clone()
     }
 
-    fn validate_config(&self, attributes: &HashMap<String, Value>) -> Result<(), String> {
+    fn validate_config(&self, attributes: &IndexMap<String, Value>) -> Result<(), String> {
         let wit_attrs = wasm_convert::core_to_wit_value_map(attributes);
 
         tokio::task::block_in_place(|| {
@@ -1205,7 +1207,7 @@ impl ProviderFactory for WasmProviderFactory {
         })
     }
 
-    fn extract_region(&self, attributes: &HashMap<String, Value>) -> String {
+    fn extract_region(&self, attributes: &IndexMap<String, Value>) -> String {
         if let Some(Value::String(region)) = attributes.get("region") {
             carina_core::utils::convert_region_value(region)
         } else {
@@ -1239,7 +1241,7 @@ impl ProviderFactory for WasmProviderFactory {
 
     fn create_provider(
         &self,
-        attributes: &HashMap<String, Value>,
+        attributes: &IndexMap<String, Value>,
     ) -> BoxFuture<'_, Box<dyn Provider>> {
         let attrs = attributes.clone();
         Box::pin(async move {
@@ -1256,7 +1258,7 @@ impl ProviderFactory for WasmProviderFactory {
 
     fn create_normalizer(
         &self,
-        attributes: &HashMap<String, Value>,
+        attributes: &IndexMap<String, Value>,
     ) -> BoxFuture<'_, Box<dyn ProviderNormalizer>> {
         let attrs = attributes.clone();
         Box::pin(async move {

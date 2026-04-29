@@ -2,6 +2,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use indexmap::IndexMap;
+
 use serde_json::json;
 
 use carina_core::effect::Effect;
@@ -281,11 +283,11 @@ fn plan_file_serde_round_trip() {
         state_serial: Some(1),
         provider_configs: vec![ProviderConfig {
             name: "aws".to_string(),
-            attributes: HashMap::from([(
+            attributes: IndexMap::from([(
                 "region".to_string(),
                 Value::String("aws.Region.ap_northeast_1".to_string()),
             )]),
-            default_tags: HashMap::new(),
+            default_tags: IndexMap::new(),
             source: None,
             version: None,
             revision: None,
@@ -548,12 +550,12 @@ fn test_detailed_exitcode_read_only_no_changes() {
 }
 
 fn make_awscc_provider(region_dsl: &str) -> ProviderConfig {
-    let mut attrs = HashMap::new();
+    let mut attrs = IndexMap::new();
     attrs.insert("region".to_string(), Value::String(region_dsl.to_string()));
     ProviderConfig {
         name: "awscc".to_string(),
         attributes: attrs,
-        default_tags: HashMap::new(),
+        default_tags: IndexMap::new(),
         source: None,
         version: None,
         revision: None,
@@ -671,7 +673,7 @@ fn test_find_state_bucket_resource_matching_type() {
             Resource::with_provider("aws", "s3.Bucket", "my-bucket")
                 .with_attribute("bucket", Value::String("my-bucket".to_string())),
         ],
-        variables: HashMap::new(),
+        variables: IndexMap::new(),
         uses: vec![],
         module_calls: vec![],
         arguments: vec![],
@@ -1967,7 +1969,7 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
             Resource::new("s3.Bucket", "keep-bucket")
                 .with_attribute("bucket", Value::String("keep-bucket".to_string())),
         ],
-        variables: HashMap::new(),
+        variables: IndexMap::new(),
         uses: vec![],
         module_calls: vec![],
         arguments: vec![],

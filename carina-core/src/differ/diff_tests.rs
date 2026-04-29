@@ -1,5 +1,7 @@
 use super::*;
 
+use indexmap::IndexMap;
+
 #[test]
 fn diff_create_when_not_exists() {
     let desired = Resource::new("bucket", "test");
@@ -106,12 +108,12 @@ fn create_plan_with_read_only_resource() {
 
 #[test]
 fn diff_update_when_list_of_maps_changed() {
-    let mut ingress1 = HashMap::new();
+    let mut ingress1 = IndexMap::new();
     ingress1.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
     ingress1.insert("from_port".to_string(), Value::Int(80));
     ingress1.insert("to_port".to_string(), Value::Int(80));
 
-    let mut ingress2 = HashMap::new();
+    let mut ingress2 = IndexMap::new();
     ingress2.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
     ingress2.insert("from_port".to_string(), Value::Int(443));
     ingress2.insert("to_port".to_string(), Value::Int(443));
@@ -520,12 +522,12 @@ fn replace_carries_create_before_destroy_lifecycle() {
 
 #[test]
 fn diff_no_change_when_list_of_maps_reordered() {
-    let mut rule1 = HashMap::new();
+    let mut rule1 = IndexMap::new();
     rule1.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
     rule1.insert("from_port".to_string(), Value::Int(80));
     rule1.insert("to_port".to_string(), Value::Int(80));
 
-    let mut rule2 = HashMap::new();
+    let mut rule2 = IndexMap::new();
     rule2.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
     rule2.insert("from_port".to_string(), Value::Int(443));
     rule2.insert("to_port".to_string(), Value::Int(443));
@@ -612,7 +614,7 @@ fn replace_with_provider_prefixed_schema_key() {
 fn diff_no_change_when_struct_has_extra_fields_with_saved() {
     let desired = Resource::new("ec2.Subnet", "test-subnet").with_attribute(
         "private_dns_name_options_on_launch",
-        Value::Map(HashMap::from([
+        Value::Map(IndexMap::from([
             (
                 "hostname_type".to_string(),
                 Value::String("ip-name".to_string()),
@@ -626,7 +628,7 @@ fn diff_no_change_when_struct_has_extra_fields_with_saved() {
 
     let current_attrs = HashMap::from([(
         "private_dns_name_options_on_launch".to_string(),
-        Value::Map(HashMap::from([
+        Value::Map(IndexMap::from([
             (
                 "hostname_type".to_string(),
                 Value::String("ip-name".to_string()),
@@ -643,7 +645,7 @@ fn diff_no_change_when_struct_has_extra_fields_with_saved() {
     )]);
     let current = State::existing(ResourceId::new("ec2.Subnet", "test-subnet"), current_attrs);
 
-    let saved = HashMap::from([
+    let saved = IndexMap::from([
         (
             "hostname_type".to_string(),
             Value::String("ip-name".to_string()),
@@ -675,7 +677,7 @@ fn diff_no_change_when_struct_has_extra_fields_with_saved() {
 fn diff_detects_drift_on_unmanaged_field() {
     let desired = Resource::new("ec2.Subnet", "test-subnet").with_attribute(
         "private_dns_name_options_on_launch",
-        Value::Map(HashMap::from([
+        Value::Map(IndexMap::from([
             (
                 "hostname_type".to_string(),
                 Value::String("ip-name".to_string()),
@@ -690,7 +692,7 @@ fn diff_detects_drift_on_unmanaged_field() {
     // AWS returns aaaa_record: true (drifted from saved false)
     let current_attrs = HashMap::from([(
         "private_dns_name_options_on_launch".to_string(),
-        Value::Map(HashMap::from([
+        Value::Map(IndexMap::from([
             (
                 "hostname_type".to_string(),
                 Value::String("ip-name".to_string()),
@@ -707,7 +709,7 @@ fn diff_detects_drift_on_unmanaged_field() {
     )]);
     let current = State::existing(ResourceId::new("ec2.Subnet", "test-subnet"), current_attrs);
 
-    let saved = HashMap::from([
+    let saved = IndexMap::from([
         (
             "hostname_type".to_string(),
             Value::String("ip-name".to_string()),
@@ -741,7 +743,7 @@ fn diff_detects_drift_on_unmanaged_field() {
 fn diff_no_change_when_bare_struct_with_extra_fields() {
     let desired = Resource::new("ec2.Subnet", "test-subnet").with_attribute(
         "private_dns_name_options_on_launch",
-        Value::Map(HashMap::from([
+        Value::Map(IndexMap::from([
             (
                 "hostname_type".to_string(),
                 Value::String("ip-name".to_string()),
@@ -756,7 +758,7 @@ fn diff_no_change_when_bare_struct_with_extra_fields() {
     // Provider read returns Map with extra fields not in desired
     let current_attrs = HashMap::from([(
         "private_dns_name_options_on_launch".to_string(),
-        Value::Map(HashMap::from([
+        Value::Map(IndexMap::from([
             (
                 "hostname_type".to_string(),
                 Value::String("ip-name".to_string()),
@@ -776,7 +778,7 @@ fn diff_no_change_when_bare_struct_with_extra_fields() {
     // Saved state has the same Map with extra fields
     let saved_map = HashMap::from([(
         "private_dns_name_options_on_launch".to_string(),
-        Value::Map(HashMap::from([
+        Value::Map(IndexMap::from([
             (
                 "hostname_type".to_string(),
                 Value::String("ip-name".to_string()),
@@ -808,7 +810,7 @@ fn diff_works_without_saved_state() {
     // desired keys against current (not the other direction).
     let desired = Resource::new("ec2.Subnet", "test-subnet").with_attribute(
         "opts",
-        Value::Map(HashMap::from([
+        Value::Map(IndexMap::from([
             ("a".to_string(), Value::Int(1)),
             ("b".to_string(), Value::Int(2)),
         ])),
@@ -816,7 +818,7 @@ fn diff_works_without_saved_state() {
 
     let current_attrs = HashMap::from([(
         "opts".to_string(),
-        Value::Map(HashMap::from([
+        Value::Map(IndexMap::from([
             ("a".to_string(), Value::Int(1)),
             ("b".to_string(), Value::Int(2)),
             ("c".to_string(), Value::Int(3)),
@@ -945,7 +947,7 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
     let desired = Resource::with_provider("awscc", "ec2.SecurityGroup", "test-sg").with_attribute(
         "security_group_egress",
         Value::List(vec![
-            Value::Map(HashMap::from([
+            Value::Map(IndexMap::from([
                 (
                     "ip_protocol".to_string(),
                     Value::String("awscc.ec2.SecurityGroup.IpProtocol.tcp".to_string()),
@@ -961,7 +963,7 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
                     Value::String("Allow HTTPS outbound".to_string()),
                 ),
             ])),
-            Value::Map(HashMap::from([
+            Value::Map(IndexMap::from([
                 ("ip_protocol".to_string(), Value::String("-1".to_string())),
                 (
                     "cidr_ip".to_string(),
@@ -980,7 +982,7 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
     let current_attrs = HashMap::from([(
         "security_group_egress".to_string(),
         Value::List(vec![
-            Value::Map(HashMap::from([
+            Value::Map(IndexMap::from([
                 (
                     "ip_protocol".to_string(),
                     Value::String("awscc.ec2.SecurityGroup.IpProtocol.tcp".to_string()),
@@ -996,7 +998,7 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
                     Value::String("Allow HTTPS outbound".to_string()),
                 ),
             ])),
-            Value::Map(HashMap::from([
+            Value::Map(IndexMap::from([
                 ("ip_protocol".to_string(), Value::String("-1".to_string())),
                 ("from_port".to_string(), Value::Int(-1)),
                 ("to_port".to_string(), Value::Int(-1)),
@@ -1021,7 +1023,7 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
     let saved = HashMap::from([(
         "security_group_egress".to_string(),
         Value::List(vec![
-            Value::Map(HashMap::from([
+            Value::Map(IndexMap::from([
                 (
                     "ip_protocol".to_string(),
                     Value::String("awscc.ec2.SecurityGroup.IpProtocol.tcp".to_string()),
@@ -1037,7 +1039,7 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
                     Value::String("Allow HTTPS outbound".to_string()),
                 ),
             ])),
-            Value::Map(HashMap::from([
+            Value::Map(IndexMap::from([
                 (
                     "ip_protocol".to_string(),
                     Value::String("awscc.ec2.SecurityGroup.IpProtocol.all".to_string()),
@@ -1096,7 +1098,7 @@ fn diff_false_positive_when_ordered_true_for_struct_list() {
     );
 
     // Same items in different order
-    let item_a = Value::Map(HashMap::from([
+    let item_a = Value::Map(IndexMap::from([
         ("ip_protocol".to_string(), Value::String("tcp".to_string())),
         ("from_port".to_string(), Value::Int(443)),
         ("to_port".to_string(), Value::Int(443)),
@@ -1109,7 +1111,7 @@ fn diff_false_positive_when_ordered_true_for_struct_list() {
             Value::String("HTTPS".to_string()),
         ),
     ]));
-    let item_b = Value::Map(HashMap::from([
+    let item_b = Value::Map(IndexMap::from([
         ("ip_protocol".to_string(), Value::String("-1".to_string())),
         (
             "cidr_ip".to_string(),

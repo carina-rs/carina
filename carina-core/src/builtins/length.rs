@@ -33,7 +33,7 @@ pub(crate) fn builtin_length(args: &[Value]) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use indexmap::IndexMap;
 
     use crate::builtins::evaluate_builtin;
     use crate::resource::Value;
@@ -58,7 +58,7 @@ mod tests {
 
     #[test]
     fn length_map() {
-        let args = vec![Value::Map(HashMap::from([
+        let args = vec![Value::Map(IndexMap::from([
             ("a".to_string(), Value::Int(1)),
             ("b".to_string(), Value::Int(2)),
         ]))];
@@ -68,7 +68,7 @@ mod tests {
 
     #[test]
     fn length_empty_map() {
-        let args = vec![Value::Map(HashMap::new())];
+        let args = vec![Value::Map(IndexMap::new())];
         let result = evaluate_builtin("length", &args).unwrap();
         assert_eq!(result, Value::Int(0));
     }

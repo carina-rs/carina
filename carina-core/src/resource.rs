@@ -275,7 +275,7 @@ pub enum Value {
     Float(f64),
     Bool(bool),
     List(Vec<Value>),
-    Map(HashMap<String, Value>),
+    Map(IndexMap<String, Value>),
     /// Reference to another resource's attribute via an access path.
     ///
     /// The access path segments represent:
@@ -607,7 +607,7 @@ impl Value {
 
 /// Compare two maps using semantic equality for their values.
 /// This ensures nested lists within maps are compared order-insensitively.
-fn maps_semantically_equal(a: &HashMap<String, Value>, b: &HashMap<String, Value>) -> bool {
+fn maps_semantically_equal(a: &IndexMap<String, Value>, b: &IndexMap<String, Value>) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -1121,7 +1121,7 @@ mod tests {
             Value::Float(-0.5),
             Value::Bool(true),
             Value::List(vec![Value::String("a".to_string()), Value::Int(1)]),
-            Value::Map(HashMap::from([
+            Value::Map(IndexMap::from([
                 ("key".to_string(), Value::String("val".to_string())),
                 ("num".to_string(), Value::Int(10)),
             ])),
@@ -1334,11 +1334,11 @@ mod tests {
 
     #[test]
     fn semantically_equal_lists_of_maps_different_order() {
-        let mut map1 = HashMap::new();
+        let mut map1 = IndexMap::new();
         map1.insert("port".to_string(), Value::Int(80));
         map1.insert("protocol".to_string(), Value::String("tcp".to_string()));
 
-        let mut map2 = HashMap::new();
+        let mut map2 = IndexMap::new();
         map2.insert("port".to_string(), Value::Int(443));
         map2.insert("protocol".to_string(), Value::String("tcp".to_string()));
 
@@ -1375,13 +1375,13 @@ mod tests {
     #[test]
     fn semantically_equal_nested_lists() {
         // Lists inside maps are compared order-insensitively via recursive semantically_equal
-        let mut map1 = HashMap::new();
+        let mut map1 = IndexMap::new();
         map1.insert(
             "ports".to_string(),
             Value::List(vec![Value::Int(80), Value::Int(443)]),
         );
 
-        let mut map2 = HashMap::new();
+        let mut map2 = IndexMap::new();
         map2.insert(
             "ports".to_string(),
             Value::List(vec![Value::Int(443), Value::Int(80)]),
@@ -1394,10 +1394,10 @@ mod tests {
 
     #[test]
     fn semantically_equal_maps_different_keys() {
-        let mut map1 = HashMap::new();
+        let mut map1 = IndexMap::new();
         map1.insert("a".to_string(), Value::Int(1));
 
-        let mut map2 = HashMap::new();
+        let mut map2 = IndexMap::new();
         map2.insert("b".to_string(), Value::Int(1));
 
         assert!(!Value::Map(map1).semantically_equal(&Value::Map(map2)));
@@ -1405,10 +1405,10 @@ mod tests {
 
     #[test]
     fn semantically_equal_maps_different_sizes() {
-        let mut map1 = HashMap::new();
+        let mut map1 = IndexMap::new();
         map1.insert("a".to_string(), Value::Int(1));
 
-        let mut map2 = HashMap::new();
+        let mut map2 = IndexMap::new();
         map2.insert("a".to_string(), Value::Int(1));
         map2.insert("b".to_string(), Value::Int(2));
 
@@ -1417,14 +1417,14 @@ mod tests {
 
     #[test]
     fn merge_with_saved_map_fills_extra_keys() {
-        let desired = Value::Map(HashMap::from([
+        let desired = Value::Map(IndexMap::from([
             (
                 "hostname_type".to_string(),
                 Value::String("ip-name".to_string()),
             ),
             ("a_record".to_string(), Value::Bool(true)),
         ]));
-        let saved = Value::Map(HashMap::from([
+        let saved = Value::Map(IndexMap::from([
             (
                 "hostname_type".to_string(),
                 Value::String("ip-name".to_string()),
@@ -1434,7 +1434,7 @@ mod tests {
         ]));
 
         let merged = merge_with_saved(&desired, &saved);
-        let expected = Value::Map(HashMap::from([
+        let expected = Value::Map(IndexMap::from([
             (
                 "hostname_type".to_string(),
                 Value::String("ip-name".to_string()),
@@ -1447,14 +1447,14 @@ mod tests {
 
     #[test]
     fn merge_with_saved_desired_wins() {
-        let desired = Value::Map(HashMap::from([("a".to_string(), Value::Int(10))]));
-        let saved = Value::Map(HashMap::from([
+        let desired = Value::Map(IndexMap::from([("a".to_string(), Value::Int(10))]));
+        let saved = Value::Map(IndexMap::from([
             ("a".to_string(), Value::Int(5)),
             ("b".to_string(), Value::Int(20)),
         ]));
 
         let merged = merge_with_saved(&desired, &saved);
-        let expected = Value::Map(HashMap::from([
+        let expected = Value::Map(IndexMap::from([
             ("a".to_string(), Value::Int(10)),
             ("b".to_string(), Value::Int(20)),
         ]));
@@ -1463,17 +1463,17 @@ mod tests {
 
     #[test]
     fn merge_with_saved_list_of_maps() {
-        let desired = Value::List(vec![Value::Map(HashMap::from([(
+        let desired = Value::List(vec![Value::Map(IndexMap::from([(
             "port".to_string(),
             Value::Int(80),
         )]))]);
-        let saved = Value::List(vec![Value::Map(HashMap::from([
+        let saved = Value::List(vec![Value::Map(IndexMap::from([
             ("port".to_string(), Value::Int(80)),
             ("protocol".to_string(), Value::String("tcp".to_string())),
         ]))]);
 
         let merged = merge_with_saved(&desired, &saved);
-        let expected = Value::List(vec![Value::Map(HashMap::from([
+        let expected = Value::List(vec![Value::Map(IndexMap::from([
             ("port".to_string(), Value::Int(80)),
             ("protocol".to_string(), Value::String("tcp".to_string())),
         ]))]);
@@ -1530,7 +1530,7 @@ mod tests {
         // Simulates security group rules (100+ maps)
         let n = 150;
         let make_rule = |i: i64| {
-            Value::Map(HashMap::from([
+            Value::Map(IndexMap::from([
                 ("port".to_string(), Value::Int(i)),
                 ("protocol".to_string(), Value::String("tcp".to_string())),
                 (
@@ -1571,12 +1571,12 @@ mod tests {
         // Verify merge_lists works correctly with large lists
         let n = 50;
         let desired: Vec<Value> = (0..n)
-            .map(|i| Value::Map(HashMap::from([("port".to_string(), Value::Int(i))])))
+            .map(|i| Value::Map(IndexMap::from([("port".to_string(), Value::Int(i))])))
             .collect();
         let saved: Vec<Value> = (0..n)
             .rev()
             .map(|i| {
-                Value::Map(HashMap::from([
+                Value::Map(IndexMap::from([
                     ("port".to_string(), Value::Int(i)),
                     ("protocol".to_string(), Value::String("tcp".to_string())),
                 ]))
@@ -1612,11 +1612,11 @@ mod tests {
         assert_ne!(v1.canonical_hash(), v3.canonical_hash());
 
         // Maps with same content should hash the same regardless of insertion order
-        let m1 = Value::Map(HashMap::from([
+        let m1 = Value::Map(IndexMap::from([
             ("a".to_string(), Value::Int(1)),
             ("b".to_string(), Value::Int(2)),
         ]));
-        let m2 = Value::Map(HashMap::from([
+        let m2 = Value::Map(IndexMap::from([
             ("b".to_string(), Value::Int(2)),
             ("a".to_string(), Value::Int(1)),
         ]));
@@ -2010,7 +2010,7 @@ mod tests {
     fn visit_refs_collects_from_all_nested_variants() {
         let value = Value::List(vec![
             Value::resource_ref("a", "id", vec![]),
-            Value::Map(HashMap::from([(
+            Value::Map(IndexMap::from([(
                 "k".to_string(),
                 Value::resource_ref("b", "id", vec![]),
             )])),
