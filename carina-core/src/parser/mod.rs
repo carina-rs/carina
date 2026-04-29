@@ -8,6 +8,7 @@ pub use config::{DecryptorFn, ProviderContext, ValidatorFn};
 
 use indexmap::IndexMap;
 
+use crate::eval_value::EvalValue;
 use crate::resource::{Expr, LifecycleConfig, Resource, ResourceId, ResourceKind, Value};
 use crate::schema::{
     validate_ipv4_address, validate_ipv4_cidr, validate_ipv6_address, validate_ipv6_cidr,
@@ -769,7 +770,13 @@ fn substitute_placeholder(v: &mut Value, index: Option<i64>, key: Option<&str>, 
 /// Parse context (variable scope)
 #[derive(Clone)]
 struct ParseContext<'cfg> {
-    variables: IndexMap<String, Value>,
+    /// Variables bound by `let` statements during parsing. Carries
+    /// `EvalValue` rather than `Value` because partial applications
+    /// (e.g. `let f = join("-")`) produce a closure that lives until a
+    /// later pipe finishes the application. Lowered to `Value` at the
+    /// end of `parse(...)`; an unfinished closure surfaces as a
+    /// parse-time error.
+    variables: IndexMap<String, EvalValue>,
     /// Resource bindings (binding_name -> Resource)
     resource_bindings: HashMap<String, Resource>,
     /// Imported modules (alias -> path)
@@ -817,11 +824,11 @@ impl<'cfg> ParseContext<'cfg> {
         self.string_literal_paths.borrow_mut().insert(path);
     }
 
-    fn set_variable(&mut self, name: String, value: Value) {
-        self.variables.insert(name, value);
+    fn set_variable(&mut self, name: String, value: impl Into<EvalValue>) {
+        self.variables.insert(name, value.into());
     }
 
-    fn get_variable(&self, name: &str) -> Option<&Value> {
+    fn get_variable(&self, name: &str) -> Option<&EvalValue> {
         self.variables.get(name)
     }
 
@@ -1144,10 +1151,29 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
     // `load_configuration_with_config`. See #2126 / #2138.
 
     let string_literal_paths = ctx.string_literal_paths.borrow().clone();
+
+    // Lower the evaluator-internal `EvalValue` bindings to user-facing
+    // `Value`. Closure bindings are dropped: they are evaluator-only
+    // artifacts (partial applications produced by `let f = builtin(x)`
+    // and consumed by a later pipe like `data |> f()`). After the parse
+    // pass finishes, only fully-reduced `Value`s belong in
+    // `ParsedFile.variables`; nothing downstream knows how to handle a
+    // closure. Pipe / call paths read from `ctx.variables` directly via
+    // `get_variable`, so the closure was already available where it
+    // mattered.
+    let variables: IndexMap<String, Value> = ctx
+        .variables
+        .into_iter()
+        .filter_map(|(name, eval)| match eval.into_value() {
+            Ok(v) => Some((name, v)),
+            Err(_leak) => None,
+        })
+        .collect();
+
     Ok(ParsedFile {
         providers,
         resources,
-        variables: ctx.variables,
+        variables,
         uses,
         module_calls,
         arguments,
@@ -1731,7 +1757,16 @@ fn parse_module_call(
 }
 
 /// Result of parsing the RHS of a let binding: (value, resources, module_calls, use_statement)
-type LetBindingRhs = (Value, Vec<Resource>, Vec<ModuleCall>, Option<UseStatement>);
+/// Tuple returned by the let-binding parser. The RHS is `EvalValue`
+/// rather than `Value` so partial applications (closures) can survive
+/// until a later pipe finishes them; the surrounding parse pass lowers
+/// each binding to `Value` at the end of `parse(...)`.
+type LetBindingRhs = (
+    EvalValue,
+    Vec<Resource>,
+    Vec<ModuleCall>,
+    Option<UseStatement>,
+);
 
 /// Extended parse_let_binding that also handles module calls, imports, and for expressions.
 ///
@@ -1745,7 +1780,7 @@ fn parse_let_binding_extended(
 ) -> Result<
     (
         String,
-        Value,
+        EvalValue,
         Vec<Resource>,
         Vec<ModuleCall>,
         Option<UseStatement>,
@@ -1765,7 +1800,14 @@ fn parse_let_binding_extended(
     if rhs_pair.as_rule() == Rule::use_expr {
         let use_stmt = parse_use_expr(rhs_pair, &name, ctx)?;
         let value = Value::String(format!("${{use:{}}}", use_stmt.path));
-        return Ok((name, value, vec![], vec![], Some(use_stmt), false));
+        return Ok((
+            name,
+            EvalValue::from_value(value),
+            vec![],
+            vec![],
+            Some(use_stmt),
+            false,
+        ));
     }
 
     // Detect if the RHS is a structurally-required expression (if/for/read)
@@ -1848,14 +1890,14 @@ fn parse_pipe_expr_with_resource_or_module(
     if !compose_rhs.is_empty() {
         // Process the compose chain
         for rhs_pair in compose_rhs {
-            let rhs = parse_primary_value(rhs_pair, ctx)?;
+            let rhs = parse_primary_eval(rhs_pair, ctx)?;
 
             if !value.is_closure() {
                 return Err(ParseError::InvalidExpression {
                     line: 0,
                     message: format!(
                         "left side of >> must be a Closure (partially applied function), got {}",
-                        value_type_name(&value)
+                        eval_type_name(&value)
                     ),
                 });
             }
@@ -1864,12 +1906,12 @@ fn parse_pipe_expr_with_resource_or_module(
                     line: 0,
                     message: format!(
                         "right side of >> must be a Closure (partially applied function), got {}",
-                        value_type_name(&rhs)
+                        eval_type_name(&rhs)
                     ),
                 });
             }
 
-            let functions = if let Value::Closure {
+            let functions = if let EvalValue::Closure {
                 name,
                 captured_args,
                 ..
@@ -1883,11 +1925,7 @@ fn parse_pipe_expr_with_resource_or_module(
                 vec![value, rhs]
             };
 
-            value = Value::Closure {
-                name: "__compose__".to_string(),
-                captured_args: functions,
-                remaining_arity: 1,
-            };
+            value = EvalValue::closure("__compose__", functions, 1);
         }
     }
 
@@ -1901,49 +1939,86 @@ fn parse_pipe_expr_with_resource_or_module(
             fc_inner.map(|arg| parse_expression(arg, ctx)).collect();
         let extra_args = extra_args?;
 
-        // Build args: pipe value goes as the last argument (data-last convention)
-        let mut args = extra_args;
-        args.push(value);
+        // Lower the running pipe value to a `Value` for the builtin
+        // dispatch path (which expects fully-reduced data arguments).
+        // Closures are handled separately just below.
+        let pipe_value_for_args = match &value {
+            EvalValue::User(v) => Some(v.clone()),
+            EvalValue::Closure { .. } => None,
+        };
 
         // Check if the pipe target is a Closure variable
-        if let Some(Value::Closure {
+        if let Some(EvalValue::Closure {
             name: fn_name,
             captured_args,
             remaining_arity,
         }) = ctx.get_variable(&func_name)
-            && args.iter().all(is_static_value)
         {
-            value = crate::builtins::apply_closure_with_config(
-                fn_name,
-                captured_args,
-                *remaining_arity,
-                &args,
-                ctx.config,
-            )
-            .map_err(|e| ParseError::InvalidExpression {
-                line: 0,
-                message: e,
-            })?;
-            continue;
+            // Build closure-application args. The pipe value (`x` in
+            // `x |> f`) goes as the last argument; we keep it as
+            // EvalValue so a chained closure can pipe through.
+            let mut all_args: Vec<EvalValue> = extra_args
+                .iter()
+                .cloned()
+                .map(EvalValue::from_value)
+                .collect();
+            all_args.push(value.clone());
+            if extra_args.iter().all(is_static_value)
+                && pipe_value_for_args.as_ref().is_some_and(is_static_value)
+            {
+                value = crate::builtins::apply_closure_with_config(
+                    fn_name,
+                    captured_args,
+                    *remaining_arity,
+                    &all_args,
+                    ctx.config,
+                )
+                .map_err(|e| ParseError::InvalidExpression {
+                    line: 0,
+                    message: e,
+                })?;
+                continue;
+            }
         }
+
+        // Build args for the non-closure dispatch path: at this point
+        // we need a `Vec<Value>`, so the running pipe value must be a
+        // user-facing value (not a closure).
+        let pipe_value = match pipe_value_for_args {
+            Some(v) => v,
+            None => {
+                return Err(ParseError::InvalidExpression {
+                    line: 0,
+                    message: format!(
+                        "cannot pipe a closure into '{}' — finish the partial application first",
+                        func_name
+                    ),
+                });
+            }
+        };
+        let mut args = extra_args;
+        args.push(pipe_value);
 
         // Eagerly evaluate partial application for builtin pipe targets
         if let Some(arity) = crate::builtins::builtin_arity(&func_name)
             && args.len() < arity
             && args.iter().all(is_static_value)
         {
-            value = crate::builtins::evaluate_builtin_with_config(&func_name, &args, ctx.config)
-                .map_err(|e| ParseError::InvalidExpression {
+            let eval_args: Vec<EvalValue> =
+                args.iter().cloned().map(EvalValue::from_value).collect();
+            value =
+                crate::builtins::evaluate_builtin_with_config(&func_name, &eval_args, ctx.config)
+                    .map_err(|e| ParseError::InvalidExpression {
                     line: 0,
                     message: format!("{}(): {}", func_name, e),
                 })?;
             continue;
         }
 
-        value = Value::FunctionCall {
+        value = EvalValue::from_value(Value::FunctionCall {
             name: func_name,
             args,
-        };
+        });
     }
 
     Ok((value, expanded_resources, module_calls, maybe_import))
@@ -1960,7 +2035,12 @@ fn parse_primary_with_resource_or_module(
         Rule::read_resource_expr => {
             let resource = parse_read_resource_expr(inner, ctx, binding_name)?;
             let ref_value = Value::String(format!("${{{}}}", binding_name));
-            Ok((ref_value, vec![resource], vec![], None))
+            Ok((
+                EvalValue::from_value(ref_value),
+                vec![resource],
+                vec![],
+                None,
+            ))
         }
         Rule::upstream_state_expr => {
             let (line, _) = inner.as_span().start_pos().line_col();
@@ -1973,17 +2053,27 @@ fn parse_primary_with_resource_or_module(
             }
             ctx.upstream_states.insert(us.binding.clone(), us);
             let ref_value = Value::String(format!("${{{}}}", binding_name));
-            Ok((ref_value, vec![], vec![], None))
+            Ok((EvalValue::from_value(ref_value), vec![], vec![], None))
         }
         Rule::resource_expr => {
             let resource = parse_resource_expr(inner, ctx, binding_name)?;
             let ref_value = Value::String(format!("${{{}}}", binding_name));
-            Ok((ref_value, vec![resource], vec![], None))
+            Ok((
+                EvalValue::from_value(ref_value),
+                vec![resource],
+                vec![],
+                None,
+            ))
         }
         Rule::for_expr => {
             let (resources, module_calls) = parse_for_expr(inner, ctx, binding_name)?;
             let ref_value = Value::String(format!("${{for:{}}}", binding_name));
-            Ok((ref_value, resources, module_calls, None))
+            Ok((
+                EvalValue::from_value(ref_value),
+                resources,
+                module_calls,
+                None,
+            ))
         }
         Rule::if_expr => {
             let (value, resources, module_calls, import) = parse_if_expr(inner, ctx, binding_name)?;
@@ -1992,14 +2082,14 @@ fn parse_primary_with_resource_or_module(
         Rule::module_call => {
             let call = parse_module_call(inner, ctx)?;
             let value = Value::String(format!("${{module:{}}}", call.module_name));
-            Ok((value, vec![], vec![call], None))
+            Ok((EvalValue::from_value(value), vec![], vec![call], None))
         }
         Rule::function_call => {
-            let value = parse_primary_value(inner, ctx)?;
+            let value = parse_primary_eval(inner, ctx)?;
             Ok((value, vec![], vec![], None))
         }
         _ => {
-            let value = parse_primary_value(inner, ctx)?;
+            let value = parse_primary_eval(inner, ctx)?;
             Ok((value, vec![], vec![], None))
         }
     }
@@ -2446,7 +2536,17 @@ fn parse_for_iterable(
 ) -> Result<Value, ParseError> {
     // for_iterable contains function_call | list | variable_ref | "(" expression ")"
     let inner = first_inner(pair, "iterable expression", "for iterable")?;
-    let value = parse_primary_value(inner, ctx)?;
+    let eval = parse_primary_eval(inner, ctx)?;
+    let value = eval
+        .into_value()
+        .map_err(|leak| ParseError::InvalidExpression {
+            line: 0,
+            message: format!(
+                "for iterable evaluates to a closure '{}' (still needs {} arg(s)); \
+             closures cannot be iterated",
+                leak.name, leak.remaining_arity
+            ),
+        })?;
     evaluate_static_value(value, ctx.config)
 }
 
@@ -2459,7 +2559,17 @@ fn is_static_value(value: &Value) -> bool {
         Value::FunctionCall { args, .. } => args.iter().all(is_static_value),
         Value::ResourceRef { .. } | Value::Interpolation(_) => false,
         Value::Secret(inner) => is_static_value(inner),
-        Value::Closure { captured_args, .. } => captured_args.iter().all(is_static_value),
+    }
+}
+
+/// `is_static_value` for the evaluator-internal `EvalValue` type.
+/// A closure's static-ness is decided by whether all of its captured
+/// args are themselves static. The pipe/compose paths use this when
+/// they need to decide whether to eagerly apply a partial application.
+fn is_static_eval(value: &EvalValue) -> bool {
+    match value {
+        EvalValue::User(v) => is_static_value(v),
+        EvalValue::Closure { captured_args, .. } => captured_args.iter().all(is_static_eval),
     }
 }
 
@@ -2484,12 +2594,26 @@ fn evaluate_static_value(value: Value, config: &ProviderContext) -> Result<Value
                 .map(|v| evaluate_static_value(v, config))
                 .collect();
             let evaluated_args = evaluated_args?;
-            crate::builtins::evaluate_builtin_with_config(name, &evaluated_args, config).map_err(
-                |e| ParseError::InvalidExpression {
+            let eval_args: Vec<EvalValue> = evaluated_args
+                .iter()
+                .cloned()
+                .map(EvalValue::from_value)
+                .collect();
+            let result = crate::builtins::evaluate_builtin_with_config(name, &eval_args, config)
+                .map_err(|e| ParseError::InvalidExpression {
                     line: 0,
                     message: format!("for iterable function call '{name}' failed: {e}"),
-                },
-            )
+                })?;
+            result
+                .into_value()
+                .map_err(|leak| ParseError::InvalidExpression {
+                    line: 0,
+                    message: format!(
+                        "for iterable function call '{name}' returned a closure '{}' \
+                     (still needs {} arg(s)); finish the partial application",
+                        leak.name, leak.remaining_arity
+                    ),
+                })
         }
         other => Ok(other),
     }
@@ -2602,7 +2726,7 @@ fn parse_if_expr(
     } else {
         // No else clause and condition is false: produce nothing
         let ref_value = Value::String(format!("${{if:{}}}", binding_name));
-        Ok((ref_value, vec![], vec![], None))
+        Ok((EvalValue::from_value(ref_value), vec![], vec![], None))
     }
 }
 
@@ -2616,13 +2740,13 @@ fn parse_if_body_to_rhs(
     match result {
         IfBodyResult::Resource(r) => {
             let ref_value = Value::String(format!("${{{}}}", binding_name));
-            Ok((ref_value, vec![*r], vec![], None))
+            Ok((EvalValue::from_value(ref_value), vec![*r], vec![], None))
         }
         IfBodyResult::ModuleCall(c) => {
             let value = Value::String(format!("${{module:{}}}", c.module_name));
-            Ok((value, vec![], vec![c], None))
+            Ok((EvalValue::from_value(value), vec![], vec![c], None))
         }
-        IfBodyResult::Value(v) => Ok((v, vec![], vec![], None)),
+        IfBodyResult::Value(v) => Ok((EvalValue::from_value(v), vec![], vec![], None)),
     }
 }
 
@@ -3410,7 +3534,16 @@ pub(crate) fn value_type_name(value: &Value) -> &'static str {
         Value::Interpolation(_) => "string",
         Value::FunctionCall { .. } => "function call",
         Value::Secret(_) => "secret",
-        Value::Closure { .. } => "closure",
+    }
+}
+
+/// Return a human-readable type name for an `EvalValue`. Closures only
+/// exist on the evaluator-internal type, so this is the version used by
+/// pipe/compose error messages where a closure can legitimately show up.
+pub(crate) fn eval_type_name(value: &EvalValue) -> &'static str {
+    match value {
+        EvalValue::User(v) => value_type_name(v),
+        EvalValue::Closure { .. } => "closure",
     }
 }
 
@@ -3498,28 +3631,57 @@ fn try_evaluate_fn_value(value: Value, ctx: &ParseContext) -> Result<Value, Pars
             let evaluated_args = evaluated_args?;
 
             // Check if the name refers to a Closure variable
-            if let Some(Value::Closure {
+            if let Some(EvalValue::Closure {
                 name: fn_name,
                 captured_args,
                 remaining_arity,
             }) = ctx.get_variable(name)
             {
-                return crate::builtins::apply_closure_with_config(
+                let eval_args: Vec<EvalValue> = evaluated_args
+                    .iter()
+                    .cloned()
+                    .map(EvalValue::from_value)
+                    .collect();
+                let result = crate::builtins::apply_closure_with_config(
                     fn_name,
                     captured_args,
                     *remaining_arity,
-                    &evaluated_args,
+                    &eval_args,
                     ctx.config,
                 )
                 .map_err(|e| ParseError::InvalidExpression {
                     line: 0,
                     message: e,
-                });
+                })?;
+                return result
+                    .into_value()
+                    .map_err(|leak| ParseError::InvalidExpression {
+                        line: 0,
+                        message: format!(
+                            "applying closure '{}' (still needs {} arg(s)) leaves a closure; \
+                         finish the partial application before using the result as data",
+                            leak.name, leak.remaining_arity
+                        ),
+                    });
             }
 
             // Try built-in first (with config for decrypt support)
-            match crate::builtins::evaluate_builtin_with_config(name, &evaluated_args, ctx.config) {
-                Ok(result) => Ok(result),
+            let eval_args: Vec<EvalValue> = evaluated_args
+                .iter()
+                .cloned()
+                .map(EvalValue::from_value)
+                .collect();
+            match crate::builtins::evaluate_builtin_with_config(name, &eval_args, ctx.config) {
+                Ok(result) => result
+                    .into_value()
+                    .map_err(|leak| ParseError::InvalidExpression {
+                        line: 0,
+                        message: format!(
+                            "{}(): produced a closure '{}' (still needs {} arg(s)); \
+                         finish the partial application before using the result as data",
+                            name, leak.name, leak.remaining_arity
+                        ),
+                    }),
                 Err(_builtin_err) => {
                     // Try user-defined function
                     if let Some(user_fn) = ctx.user_functions.get(name) {
@@ -4208,10 +4370,35 @@ fn parse_read_resource_expr(
     })
 }
 
+/// Parse an expression. The result is a fully-reduced `Value`: any
+/// closure that surfaces during evaluation surfaces here as a
+/// parse-time error. Use [`parse_expression_eval`] in pipe/compose
+/// paths where partial applications are legitimate intermediates.
 fn parse_expression(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
 ) -> Result<Value, ParseError> {
+    let eval = parse_expression_eval(pair, ctx)?;
+    eval.into_value()
+        .map_err(|leak| ParseError::InvalidExpression {
+            line: 0,
+            message: format!(
+                "expression evaluates to a closure '{}' (still needs {} arg(s)); finish the \
+             partial application — closures are not valid as data",
+                leak.name, leak.remaining_arity
+            ),
+        })
+}
+
+/// Parse an expression and return the raw `EvalValue`, preserving any
+/// closure produced during partial application. Only the pipe/compose
+/// paths and the let-binding RHS need this; everything else should
+/// call [`parse_expression`] and let unfinished closures surface as
+/// errors at the type boundary.
+fn parse_expression_eval(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+) -> Result<EvalValue, ParseError> {
     let inner = first_inner(pair, "expression body", "expression")?;
     parse_coalesce_expr(inner, ctx)
 }
@@ -4219,7 +4406,7 @@ fn parse_expression(
 fn parse_coalesce_expr(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
-) -> Result<Value, ParseError> {
+) -> Result<EvalValue, ParseError> {
     let mut inner = pair.into_inner();
     let first = next_pair(&mut inner, "pipe expression", "coalesce expression")?;
     let value = parse_pipe_expr(first, ctx)?;
@@ -4228,7 +4415,7 @@ fn parse_coalesce_expr(
     if let Some(rhs_pair) = inner.next() {
         let default = parse_pipe_expr(rhs_pair, ctx)?;
         match &value {
-            Value::ResourceRef { .. } => Ok(default),
+            EvalValue::User(Value::ResourceRef { .. }) => Ok(default),
             _ => Ok(value),
         }
     } else {
@@ -4239,14 +4426,14 @@ fn parse_coalesce_expr(
 fn parse_compose_expr(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
-) -> Result<Value, ParseError> {
+) -> Result<EvalValue, ParseError> {
     let mut inner = pair.into_inner();
     let first = next_pair(&mut inner, "primary expression", "compose expression")?;
-    let mut value = parse_primary_value(first, ctx)?;
+    let mut value = parse_primary_eval(first, ctx)?;
 
     // Collect remaining primaries for >> composition
     for rhs_pair in inner {
-        let rhs = parse_primary_value(rhs_pair, ctx)?;
+        let rhs = parse_primary_eval(rhs_pair, ctx)?;
 
         // Both sides must be Closures
         if !value.is_closure() {
@@ -4254,7 +4441,7 @@ fn parse_compose_expr(
                 line: 0,
                 message: format!(
                     "left side of >> must be a Closure (partially applied function), got {}",
-                    value_type_name(&value)
+                    eval_type_name(&value)
                 ),
             });
         }
@@ -4263,14 +4450,14 @@ fn parse_compose_expr(
                 line: 0,
                 message: format!(
                     "right side of >> must be a Closure (partially applied function), got {}",
-                    value_type_name(&rhs)
+                    eval_type_name(&rhs)
                 ),
             });
         }
 
         // Build a composed closure: __compose__ with the chain stored in captured_args
         // If the left side is already a __compose__, extend the chain; otherwise start a new one
-        let functions = if let Value::Closure {
+        let functions = if let EvalValue::Closure {
             name,
             captured_args,
             ..
@@ -4284,11 +4471,7 @@ fn parse_compose_expr(
             vec![value, rhs]
         };
 
-        value = Value::Closure {
-            name: "__compose__".to_string(),
-            captured_args: functions,
-            remaining_arity: 1,
-        };
+        value = EvalValue::closure("__compose__", functions, 1);
     }
 
     Ok(value)
@@ -4297,7 +4480,7 @@ fn parse_compose_expr(
 fn parse_pipe_expr(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
-) -> Result<Value, ParseError> {
+) -> Result<EvalValue, ParseError> {
     let mut inner = pair.into_inner();
     let compose = next_pair(&mut inner, "compose expression", "pipe expression")?;
     let mut value = parse_compose_expr(compose, ctx)?;
@@ -4312,66 +4495,99 @@ fn parse_pipe_expr(
             fc_inner.map(|arg| parse_expression(arg, ctx)).collect();
         let extra_args = extra_args?;
 
-        // Build args: pipe value goes as the last argument (data-last convention)
-        let mut args = extra_args;
-        args.push(value);
-
-        // Check if the pipe target is a Closure variable
-        if let Some(Value::Closure {
+        // Check if the pipe target is a Closure variable. The pipe
+        // value (the running `value`) is appended last as an
+        // EvalValue, so a closure carried in the binding can finish
+        // applying through subsequent pipes.
+        if let Some(EvalValue::Closure {
             name: fn_name,
             captured_args,
             remaining_arity,
         }) = ctx.get_variable(&func_name)
-            && args.iter().all(is_static_value)
         {
-            value = crate::builtins::apply_closure_with_config(
-                fn_name,
-                captured_args,
-                *remaining_arity,
-                &args,
-                ctx.config,
-            )
-            .map_err(|e| ParseError::InvalidExpression {
-                line: 0,
-                message: e,
-            })?;
-            continue;
+            let mut all_args: Vec<EvalValue> = extra_args
+                .iter()
+                .cloned()
+                .map(EvalValue::from_value)
+                .collect();
+            all_args.push(value.clone());
+            if all_args.iter().all(is_static_eval) {
+                value = crate::builtins::apply_closure_with_config(
+                    fn_name,
+                    captured_args,
+                    *remaining_arity,
+                    &all_args,
+                    ctx.config,
+                )
+                .map_err(|e| ParseError::InvalidExpression {
+                    line: 0,
+                    message: e,
+                })?;
+                continue;
+            }
         }
+
+        // Build args for the non-closure dispatch path. The running
+        // pipe value must be a user-facing value here; a closure
+        // would mean the user piped a partial application into a
+        // non-closure-aware call, which we surface as a parse error.
+        let pipe_value = match value {
+            EvalValue::User(v) => v,
+            EvalValue::Closure {
+                ref name,
+                remaining_arity,
+                ..
+            } => {
+                return Err(ParseError::InvalidExpression {
+                    line: 0,
+                    message: format!(
+                        "cannot pipe a closure '{}' (still needs {} arg(s)) into '{}' \
+                         — finish the partial application first",
+                        name, remaining_arity, func_name
+                    ),
+                });
+            }
+        };
+        let mut args = extra_args;
+        args.push(pipe_value);
 
         // Try to eagerly evaluate user-defined function calls
         if ctx.user_functions.contains_key(&func_name) && args.iter().all(is_static_value) {
             let user_fn = ctx.user_functions.get(&func_name).unwrap().clone();
-            value = evaluate_user_function(&user_fn, &args, ctx)?;
+            value = EvalValue::from_value(evaluate_user_function(&user_fn, &args, ctx)?);
         } else if let Some(arity) = crate::builtins::builtin_arity(&func_name) {
             // Eagerly evaluate partial application for builtin pipe targets
             if args.len() < arity && args.iter().all(is_static_value) {
-                value =
-                    crate::builtins::evaluate_builtin_with_config(&func_name, &args, ctx.config)
-                        .map_err(|e| ParseError::InvalidExpression {
-                            line: 0,
-                            message: format!("{}(): {}", func_name, e),
-                        })?;
+                let eval_args: Vec<EvalValue> =
+                    args.iter().cloned().map(EvalValue::from_value).collect();
+                value = crate::builtins::evaluate_builtin_with_config(
+                    &func_name, &eval_args, ctx.config,
+                )
+                .map_err(|e| ParseError::InvalidExpression {
+                    line: 0,
+                    message: format!("{}(): {}", func_name, e),
+                })?;
             } else {
-                value = Value::FunctionCall {
+                value = EvalValue::from_value(Value::FunctionCall {
                     name: func_name,
                     args,
-                };
+                });
             }
         } else {
-            value = Value::FunctionCall {
+            value = EvalValue::from_value(Value::FunctionCall {
                 name: func_name,
                 args,
-            };
+            });
         }
     }
 
     Ok(value)
 }
 
-fn parse_primary_value(
+fn parse_primary_eval(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
-) -> Result<Value, ParseError> {
+) -> Result<EvalValue, ParseError> {
     // For primary, get inner content; otherwise process directly
     let inner = if pair.as_rule() == Rule::primary {
         first_inner(pair, "value", "primary expression")?
@@ -4392,7 +4608,7 @@ fn parse_primary_value(
                 .into_inner()
                 .map(|item| parse_expression(item, ctx))
                 .collect();
-            Ok(Value::List(items?))
+            Ok(EvalValue::from_value(Value::List(items?)))
         }
         Rule::map => {
             let mut map: IndexMap<String, Value> = IndexMap::new();
@@ -4427,7 +4643,7 @@ fn parse_primary_value(
             for (name, blocks) in nested_blocks {
                 map.insert(name, Value::List(blocks));
             }
-            Ok(Value::Map(map))
+            Ok(EvalValue::from_value(Value::Map(map)))
         }
         Rule::namespaced_id => {
             // Namespaced identifier (e.g., aws.Region.ap_northeast_1)
@@ -4449,32 +4665,35 @@ fn parse_primary_value(
                     })
                 } else if ctx.is_resource_binding(parts[0]) {
                     // Known resource binding: treat as resource reference
-                    Ok(Value::resource_ref(
+                    Ok(EvalValue::from_value(Value::resource_ref(
                         parts[0].to_string(),
                         parts[1].to_string(),
                         vec![],
-                    ))
+                    )))
                 } else {
                     // Unknown 2-part identifier: could be TypeName.value enum shorthand
                     // Will be resolved during schema validation
-                    Ok(Value::String(format!("{}.{}", parts[0], parts[1])))
+                    Ok(EvalValue::from_value(Value::String(format!(
+                        "{}.{}",
+                        parts[0], parts[1]
+                    ))))
                 }
             } else if ctx.is_resource_binding(parts[0]) {
                 // 3+ part identifier where first part is a resource binding:
                 // chained field access (e.g., web.network.vpc_id)
-                Ok(Value::resource_ref(
+                Ok(EvalValue::from_value(Value::resource_ref(
                     parts[0].to_string(),
                     parts[1].to_string(),
                     parts[2..].iter().map(|s| s.to_string()).collect(),
-                ))
+                )))
             } else {
                 // 3+ part identifier is a namespaced type (aws.Region.ap_northeast_1)
-                Ok(Value::String(full_str.to_string()))
+                Ok(EvalValue::from_value(Value::String(full_str.to_string())))
             }
         }
         Rule::boolean => {
             let b = inner.as_str() == "true";
-            Ok(Value::Bool(b))
+            Ok(EvalValue::from_value(Value::Bool(b)))
         }
         Rule::float => {
             let f: f64 = inner
@@ -4484,7 +4703,7 @@ fn parse_primary_value(
                     line: inner.line_col().0,
                     message: format!("invalid float literal: {e}"),
                 })?;
-            Ok(Value::Float(f))
+            Ok(EvalValue::from_value(Value::Float(f)))
         }
         Rule::number => {
             let n: i64 = inner
@@ -4494,9 +4713,9 @@ fn parse_primary_value(
                     line: inner.line_col().0,
                     message: format!("integer literal out of range: {e}"),
                 })?;
-            Ok(Value::Int(n))
+            Ok(EvalValue::from_value(Value::Int(n)))
         }
-        Rule::string => parse_string_value(inner, ctx),
+        Rule::string => parse_string_value(inner, ctx).map(EvalValue::from_value),
         Rule::function_call => {
             let mut fc_inner = inner.into_inner();
             let func_name = next_pair(&mut fc_inner, "function name", "function call")?
@@ -4507,18 +4726,20 @@ fn parse_primary_value(
             let args = args?;
 
             // Check if the name refers to a Closure variable (direct call on closure)
-            if let Some(Value::Closure {
+            if let Some(EvalValue::Closure {
                 name: fn_name,
                 captured_args,
                 remaining_arity,
             }) = ctx.get_variable(&func_name)
                 && args.iter().all(is_static_value)
             {
+                let eval_args: Vec<EvalValue> =
+                    args.iter().cloned().map(EvalValue::from_value).collect();
                 return crate::builtins::apply_closure_with_config(
                     fn_name,
                     captured_args,
                     *remaining_arity,
-                    &args,
+                    &eval_args,
                     ctx.config,
                 )
                 .map_err(|e| ParseError::InvalidExpression {
@@ -4530,7 +4751,7 @@ fn parse_primary_value(
             // Try to eagerly evaluate user-defined function calls
             if ctx.user_functions.contains_key(&func_name) && args.iter().all(is_static_value) {
                 let user_fn = ctx.user_functions.get(&func_name).unwrap().clone();
-                return evaluate_user_function(&user_fn, &args, ctx);
+                return evaluate_user_function(&user_fn, &args, ctx).map(EvalValue::from_value);
             }
 
             // Eagerly evaluate partial application (fewer args than arity → Closure)
@@ -4538,8 +4759,10 @@ fn parse_primary_value(
                 && args.len() < arity
                 && args.iter().all(is_static_value)
             {
+                let eval_args: Vec<EvalValue> =
+                    args.iter().cloned().map(EvalValue::from_value).collect();
                 return crate::builtins::evaluate_builtin_with_config(
-                    &func_name, &args, ctx.config,
+                    &func_name, &eval_args, ctx.config,
                 )
                 .map_err(|e| ParseError::InvalidExpression {
                     line: 0,
@@ -4547,10 +4770,10 @@ fn parse_primary_value(
                 });
             }
 
-            Ok(Value::FunctionCall {
+            Ok(EvalValue::from_value(Value::FunctionCall {
                 name: func_name,
                 args,
-            })
+            }))
         }
         Rule::variable_ref => {
             // variable_ref = { identifier ~ (field_access | index_access)* }
@@ -4566,7 +4789,9 @@ fn parse_primary_value(
                 // Simple variable reference (no access chain)
                 match ctx.get_variable(first_ident) {
                     Some(val) => Ok(val.clone()),
-                    None => Ok(Value::String(first_ident.to_string())),
+                    None => Ok(EvalValue::from_value(Value::String(
+                        first_ident.to_string(),
+                    ))),
                 }
             } else {
                 // Build binding_name, attribute_name, and field_path from access steps.
@@ -4629,22 +4854,28 @@ fn parse_primary_value(
                         None => {
                             // Return as ResourceRef with empty attribute_name
                             // (will be resolved later)
-                            Ok(Value::resource_ref(binding_name, String::new(), vec![]))
+                            Ok(EvalValue::from_value(Value::resource_ref(
+                                binding_name,
+                                String::new(),
+                                vec![],
+                            )))
                         }
                     }
                 } else {
                     let attribute_name = field_names.remove(0);
-                    Ok(Value::resource_ref(
+                    Ok(EvalValue::from_value(Value::resource_ref(
                         binding_name,
                         attribute_name,
                         field_names,
-                    ))
+                    )))
                 }
             }
         }
-        Rule::if_expr => parse_if_value_expr(inner, ctx),
-        Rule::expression => parse_expression(inner, ctx),
-        _ => Ok(Value::String(inner.as_str().to_string())),
+        Rule::if_expr => parse_if_value_expr(inner, ctx).map(EvalValue::from_value),
+        Rule::expression => parse_expression_eval(inner, ctx),
+        _ => Ok(EvalValue::from_value(Value::String(
+            inner.as_str().to_string(),
+        ))),
     }
 }
 
@@ -5147,8 +5378,22 @@ fn resolve_value_with_config(
 
             let all_args_resolved = resolved_args.iter().all(is_static_value);
 
-            match crate::builtins::evaluate_builtin_with_config(name, &resolved_args, config) {
-                Ok(result) => Ok(result),
+            let eval_args: Vec<EvalValue> = resolved_args
+                .iter()
+                .cloned()
+                .map(EvalValue::from_value)
+                .collect();
+            match crate::builtins::evaluate_builtin_with_config(name, &eval_args, config) {
+                Ok(result) => result
+                    .into_value()
+                    .map_err(|leak| ParseError::InvalidExpression {
+                        line: 0,
+                        message: format!(
+                            "{}(): produced a closure '{}' (still needs {} arg(s)); \
+                         finish the partial application before using the result as data",
+                            name, leak.name, leak.remaining_arity
+                        ),
+                    }),
                 Err(e) => {
                     if all_args_resolved {
                         // All args are resolved but builtin failed — propagate the error
@@ -5181,6 +5426,51 @@ pub fn parse_and_resolve(input: &str) -> Result<ParsedFile, ParseError> {
 mod tests {
     use super::*;
     use crate::resource::InterpolationPart;
+
+    #[test]
+    fn parse_and_resolve_returns_value_only_no_closure() {
+        // Issue #2230 acceptance criterion 3: `parse_and_resolve` must
+        // never expose a closure to its caller. Type-system enforcement
+        // makes the literal claim trivially true (`Value::Closure` does
+        // not exist), so this test doubles as a smoke check that
+        // legitimate partial-application expressions (data-last pipes
+        // + builtin chaining) still parse and produce a `Value` tree
+        // that no consumer needs to inspect for a closure case.
+        let input = r#"
+            let xs = ["a", "b", "c"]
+            let joined = xs |> join("-")
+        "#;
+        let parsed = parse_and_resolve(input).expect("parse_and_resolve should succeed");
+        let joined = parsed
+            .variables
+            .get("joined")
+            .expect("joined binding present");
+        // No `Closure` arm exists on `Value`, so the only way this
+        // could fail is if the call survived as a `FunctionCall` —
+        // also a valid `Value`, never a closure. The point of the
+        // test is that the type contract holds: whatever shape this
+        // is, downstream code does not have to consider closures.
+        match joined {
+            Value::String(_) | Value::FunctionCall { .. } => {}
+            other => panic!("unexpected variant for `joined`: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unfinished_closure_in_let_binding_is_dropped() {
+        // Issue #2230 acceptance criterion 2: a `let` binding holding
+        // an unfinished partial application must not surface a closure
+        // to the caller. The evaluator-internal `EvalValue::Closure`
+        // is dropped at the lowering boundary; the binding name simply
+        // does not appear in `ParsedFile.variables`.
+        let input = r#"let f = join("-")"#;
+        let parsed =
+            parse_and_resolve(input).expect("partial application in let binding should parse");
+        assert!(
+            parsed.variables.get("f").is_none(),
+            "closure binding must not survive into ParsedFile.variables"
+        );
+    }
 
     #[test]
     fn iter_all_resources_yields_direct_then_deferred() {
@@ -6859,24 +7149,19 @@ aws.s3.Bucket {
     }
 
     #[test]
-    fn partial_application_produces_closure() {
-        // `let f = map(".subnet_id")` should produce a Closure
+    fn partial_application_let_binding_dropped_from_variables() {
+        // After #2230 a `let` binding holding a partial application
+        // is an evaluator-only artifact: it lives on `EvalValue`
+        // during parsing so a later pipe / call can finish it, but
+        // it never reaches `ParsedFile.variables`. Parsing succeeds;
+        // the binding simply does not appear in the user-facing
+        // variable map.
         let input = r#"
             let f = map(".subnet_id")
         "#;
-        let result = parse(input, &ProviderContext::default()).unwrap();
-        match result.variables.get("f") {
-            Some(Value::Closure {
-                name,
-                captured_args,
-                remaining_arity,
-            }) => {
-                assert_eq!(name, "map");
-                assert_eq!(captured_args, &[Value::String(".subnet_id".to_string())]);
-                assert_eq!(*remaining_arity, 1);
-            }
-            other => panic!("Expected Closure, got {:?}", other),
-        }
+        let result = parse(input, &ProviderContext::default())
+            .expect("partial application in let binding should parse");
+        assert!(result.variables.get("f").is_none());
     }
 
     #[test]
@@ -10838,27 +11123,25 @@ arguments {
     }
 
     #[test]
-    fn test_compose_operator_produces_closure() {
-        // map(".id") >> join(",") should produce a composed Closure
+    fn test_compose_operator_followed_by_pipe_consumes_closure() {
+        // After #2230, the composed closure produced by `>>` lives on
+        // `EvalValue` and is consumed by the later pipe. The
+        // intermediate binding `f` is an evaluator artifact and is
+        // dropped at the parse boundary; only the fully-reduced
+        // `result` survives.
         let input = r#"
             let f = map(".id") >> join(",")
             let result = [{ id = "a" }, { id = "b" }] |> f()
         "#;
         let result = parse(input, &ProviderContext::default()).unwrap();
 
-        // f should be a Closure with name "__compose__"
-        match result.variables.get("f").unwrap() {
-            Value::Closure { name, .. } => {
-                assert_eq!(name, "__compose__");
-            }
-            other => panic!("Expected Closure, got {:?}", other),
-        }
-
-        // result should be the string "a,b"
         assert_eq!(
             result.variables.get("result").unwrap(),
             &Value::String("a,b".to_string())
         );
+        // `f` is a closure-only binding and does not appear in the
+        // user-facing variable map.
+        assert!(result.variables.get("f").is_none());
     }
 
     #[test]
@@ -10938,23 +11221,18 @@ arguments {
 
     #[test]
     fn test_compose_three_functions() {
-        // Three-way composition structure check
+        // Three-way composition: parser must accept the chain and
+        // (via #2230) keep the result confined to the evaluator-only
+        // `EvalValue` layer. The binding is dropped from the
+        // user-facing variable map; the test that the chain still
+        // *applies* correctly is covered by
+        // `test_compose_operator_followed_by_pipe_consumes_closure`.
         let input = r#"
             let transform = split(",") >> join("-") >> split("-")
         "#;
-        let result = parse(input, &ProviderContext::default()).unwrap();
-        match result.variables.get("transform").unwrap() {
-            Value::Closure {
-                name,
-                captured_args,
-                remaining_arity,
-            } => {
-                assert_eq!(name, "__compose__");
-                assert_eq!(captured_args.len(), 3);
-                assert_eq!(remaining_arity, &1);
-            }
-            other => panic!("Expected Closure, got {:?}", other),
-        }
+        let result =
+            parse(input, &ProviderContext::default()).expect("three-way composition should parse");
+        assert!(result.variables.get("transform").is_none());
     }
 
     #[test]

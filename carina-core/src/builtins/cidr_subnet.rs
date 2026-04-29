@@ -149,7 +149,7 @@ fn calculate_cidr_subnet(prefix: &str, newbits: i64, netnum: i64) -> Result<Stri
 
 #[cfg(test)]
 mod tests {
-    use crate::builtins::evaluate_builtin;
+    use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
     use crate::resource::Value;
 
     fn cidr_subnet(prefix: &str, newbits: i64, netnum: i64) -> Result<Value, String> {
@@ -298,10 +298,12 @@ mod tests {
 
     #[test]
     fn partial_application_with_two_args() {
+        use crate::builtins::evaluate_builtin_for_tests;
+        use crate::eval_value::EvalValue;
         let args = vec![Value::String("10.0.0.0/16".to_string()), Value::Int(8)];
-        let result = evaluate_builtin("cidr_subnet", &args).unwrap();
+        let result = evaluate_builtin_for_tests("cidr_subnet", &args).unwrap();
         match result {
-            Value::Closure {
+            EvalValue::Closure {
                 name,
                 captured_args,
                 remaining_arity,

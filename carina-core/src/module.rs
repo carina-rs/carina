@@ -175,19 +175,6 @@ fn format_value(value: &Value) -> String {
             format!("{}({})", name, arg_strs.join(", "))
         }
         Value::Secret(_) => "(secret)".to_string(),
-        Value::Closure {
-            name,
-            captured_args,
-            remaining_arity,
-        } => {
-            let total = captured_args.len() + remaining_arity;
-            format!(
-                "<closure: {}({}/{} args)>",
-                name,
-                captured_args.len(),
-                total
-            )
-        }
     }
 }
 

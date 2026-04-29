@@ -51,7 +51,7 @@ pub(crate) fn builtin_lookup(args: &[Value]) -> Result<Value, String> {
 mod tests {
     use indexmap::IndexMap;
 
-    use crate::builtins::evaluate_builtin;
+    use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
     use crate::resource::Value;
 
     #[test]
@@ -114,11 +114,12 @@ mod tests {
 
     #[test]
     fn lookup_partial_application() {
+        use crate::builtins::evaluate_builtin_for_tests;
         let args = vec![
             Value::Map(IndexMap::new()),
             Value::String("key".to_string()),
         ];
-        let result = evaluate_builtin("lookup", &args).unwrap();
+        let result = evaluate_builtin_for_tests("lookup", &args).unwrap();
         assert!(result.is_closure());
     }
 

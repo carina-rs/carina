@@ -20,6 +20,7 @@ mod split;
 mod trim;
 mod upper_lower;
 
+use crate::eval_value::EvalValue;
 use crate::parser::ProviderContext;
 use crate::resource::Value;
 
@@ -105,26 +106,67 @@ macro_rules! register_builtins {
 
         /// Evaluate a built-in function by name with the given arguments.
         ///
-        /// If fewer arguments than the arity are provided, returns a
-        /// `Value::Closure` capturing the partial arguments.
-        /// Returns `Err` if the function is unknown or if the arguments are invalid.
-        pub fn evaluate_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
+        /// If fewer arguments than the arity are provided, returns an
+        /// `EvalValue::Closure` capturing the partial arguments.
+        /// Returns `Err` if the function is unknown, the arguments are
+        /// invalid, or one of the supplied arguments is itself a closure.
+        pub(crate) fn evaluate_builtin(
+            name: &str,
+            args: &[EvalValue],
+        ) -> Result<EvalValue, String> {
             match name {
                 $(
                     stringify!($name) => {
                         let arity: usize = $arity;
                         if !args.is_empty() && args.len() < arity {
-                            return Ok(Value::Closure {
-                                name: name.to_string(),
-                                captured_args: args.to_vec(),
-                                remaining_arity: arity - args.len(),
-                            });
+                            return Ok(EvalValue::closure(
+                                name,
+                                args.to_vec(),
+                                arity - args.len(),
+                            ));
                         }
-                        $handler(args)
+                        // Lower each argument to a `Value` for the
+                        // handler. Handlers expect fully-reduced inputs,
+                        // so a closure here is a usage error: the caller
+                        // tried to pass a partially-applied function as a
+                        // data argument.
+                        let lowered: Result<Vec<Value>, String> = args
+                            .iter()
+                            .cloned()
+                            .map(|arg| {
+                                arg.into_value().map_err(|leak| {
+                                    format!(
+                                        "{}: closure '{}' (still needs {} arg(s)) cannot be \
+                                         used as a data argument; finish the partial \
+                                         application first",
+                                        name, leak.name, leak.remaining_arity
+                                    )
+                                })
+                            })
+                            .collect();
+                        $handler(&lowered?).map(EvalValue::from_value)
                     }
                 )*
                 _ => Err(format!("Unknown built-in function: {name}")),
             }
+        }
+
+        /// Public alias that lowers an `EvalValue` result to a `Value`
+        /// for callers that don't care about the closure case (e.g.
+        /// LSP-style hover preview that just wants "what does this call
+        /// produce"). Returns `Err` if the call would produce a closure.
+        pub fn evaluate_builtin_to_value(
+            name: &str,
+            args: &[Value],
+        ) -> Result<Value, String> {
+            let eval_args: Vec<EvalValue> = args.iter().cloned().map(EvalValue::from_value).collect();
+            let result = evaluate_builtin(name, &eval_args)?;
+            result.into_value().map_err(|leak| {
+                format!(
+                    "{}: would return a closure ({} arg(s) still needed)",
+                    leak.name, leak.remaining_arity
+                )
+            })
         }
     };
 }
@@ -227,77 +269,19 @@ register_builtins! {
     },
 }
 
-/// Apply additional arguments to a Closure.
-///
-/// Merges `new_args` into the closure's captured args. If enough arguments are
-/// now present, evaluates the underlying built-in function. Otherwise returns
-/// a new Closure with updated captured args and remaining arity.
-pub fn apply_closure(
-    name: &str,
-    captured_args: &[Value],
-    remaining_arity: usize,
-    new_args: &[Value],
-) -> Result<Value, String> {
-    // Handle composed closures: pipe the argument through each function in sequence
-    if name == "__compose__" {
-        if new_args.len() != 1 {
-            return Err(format!(
-                "composed function expects exactly 1 argument, got {}",
-                new_args.len(),
-            ));
-        }
-        let mut result = new_args[0].clone();
-        for func in captured_args {
-            if let Value::Closure {
-                name: fn_name,
-                captured_args: fn_captured,
-                remaining_arity: fn_remaining,
-            } = func
-            {
-                result = apply_closure(fn_name, fn_captured, *fn_remaining, &[result])?;
-            } else {
-                return Err(format!(
-                    "composed function chain contains a non-Closure value: {:?}",
-                    func
-                ));
-            }
-        }
-        return Ok(result);
-    }
-
-    if new_args.len() > remaining_arity {
-        return Err(format!(
-            "{}() closure expects {} more argument{}, got {}",
-            name,
-            remaining_arity,
-            if remaining_arity == 1 { "" } else { "s" },
-            new_args.len(),
-        ));
-    }
-    let mut all_args = captured_args.to_vec();
-    all_args.extend_from_slice(new_args);
-    let new_remaining = remaining_arity - new_args.len();
-    if new_remaining == 0 {
-        evaluate_builtin(name, &all_args)
-    } else {
-        Ok(Value::Closure {
-            name: name.to_string(),
-            captured_args: all_args,
-            remaining_arity: new_remaining,
-        })
-    }
-}
-
 /// Apply additional arguments to a Closure using parser configuration.
 ///
-/// Same as [`apply_closure`] but routes `decrypt` through the config-aware path.
-pub fn apply_closure_with_config(
+/// Merges `new_args` into the closure's captured args. If enough arguments
+/// are now present, evaluates the underlying built-in function (routing
+/// `decrypt` through the config-aware path). Otherwise returns a new
+/// `EvalValue::Closure` with updated captured args and remaining arity.
+pub(crate) fn apply_closure_with_config(
     name: &str,
-    captured_args: &[Value],
+    captured_args: &[EvalValue],
     remaining_arity: usize,
-    new_args: &[Value],
+    new_args: &[EvalValue],
     config: &ProviderContext,
-) -> Result<Value, String> {
+) -> Result<EvalValue, String> {
     // Handle composed closures: pipe the argument through each function in sequence
     if name == "__compose__" {
         if new_args.len() != 1 {
@@ -308,7 +292,7 @@ pub fn apply_closure_with_config(
         }
         let mut result = new_args[0].clone();
         for func in captured_args {
-            if let Value::Closure {
+            if let EvalValue::Closure {
                 name: fn_name,
                 captured_args: fn_captured,
                 remaining_arity: fn_remaining,
@@ -346,11 +330,7 @@ pub fn apply_closure_with_config(
     if new_remaining == 0 {
         evaluate_builtin_with_config(name, &all_args, config)
     } else {
-        Ok(Value::Closure {
-            name: name.to_string(),
-            captured_args: all_args,
-            remaining_arity: new_remaining,
-        })
+        Ok(EvalValue::closure(name, all_args, new_remaining))
     }
 }
 
@@ -358,24 +338,37 @@ pub fn apply_closure_with_config(
 ///
 /// This dispatches `decrypt` to use the decryptor from the config instead of
 /// the global Mutex. All other builtins are delegated to [`evaluate_builtin`].
-pub fn evaluate_builtin_with_config(
+pub(crate) fn evaluate_builtin_with_config(
     name: &str,
-    args: &[Value],
+    args: &[EvalValue],
     config: &ProviderContext,
-) -> Result<Value, String> {
+) -> Result<EvalValue, String> {
     // Check for partial application before dispatching
     if let Some(arity) = builtin_arity(name)
         && !args.is_empty()
         && args.len() < arity
     {
-        return Ok(Value::Closure {
-            name: name.to_string(),
-            captured_args: args.to_vec(),
-            remaining_arity: arity - args.len(),
-        });
+        return Ok(EvalValue::closure(name, args.to_vec(), arity - args.len()));
     }
     match name {
-        "decrypt" => decrypt::builtin_decrypt_with_config(args, config),
+        "decrypt" => {
+            // `decrypt` is the only handler that needs the parser config.
+            // It still operates on `&[Value]` so we lower the arguments.
+            let lowered: Result<Vec<Value>, String> = args
+                .iter()
+                .cloned()
+                .map(|arg| {
+                    arg.into_value().map_err(|leak| {
+                        format!(
+                            "decrypt: closure '{}' (still needs {} arg(s)) cannot be \
+                             used as a data argument; finish the partial application first",
+                            leak.name, leak.remaining_arity
+                        )
+                    })
+                })
+                .collect();
+            decrypt::builtin_decrypt_with_config(&lowered?, config).map(EvalValue::from_value)
+        }
         _ => evaluate_builtin(name, args),
     }
 }
@@ -383,6 +376,37 @@ pub fn evaluate_builtin_with_config(
 /// Check if a function name is a known built-in function.
 pub fn is_known_builtin(name: &str) -> bool {
     builtin_functions().iter().any(|f| f.name == name)
+}
+
+/// Test-only helper: dispatch a built-in by lifting `&[Value]` to
+/// `&[EvalValue]` and returning the raw `EvalValue` result. Used by the
+/// per-builtin test modules so existing assertions like
+/// `result.is_closure()` keep working without forcing each test to
+/// allocate `EvalValue` arguments by hand.
+#[cfg(test)]
+pub(crate) fn evaluate_builtin_for_tests(name: &str, args: &[Value]) -> Result<EvalValue, String> {
+    let eval_args: Vec<EvalValue> = args.iter().cloned().map(EvalValue::from_value).collect();
+    evaluate_builtin(name, &eval_args)
+}
+
+/// `evaluate_builtin_with_config`'s `Value`-friendly counterpart for
+/// tests. Lifts arguments to `EvalValue`, dispatches, and lowers the
+/// result back to `Value` — failing on closure leaks the same way
+/// production code does.
+#[cfg(test)]
+pub(crate) fn evaluate_builtin_with_config_to_value(
+    name: &str,
+    args: &[Value],
+    config: &ProviderContext,
+) -> Result<Value, String> {
+    let eval_args: Vec<EvalValue> = args.iter().cloned().map(EvalValue::from_value).collect();
+    let result = evaluate_builtin_with_config(name, &eval_args, config)?;
+    result.into_value().map_err(|leak| {
+        format!(
+            "{}: would return a closure ({} arg(s) still needed)",
+            leak.name, leak.remaining_arity
+        )
+    })
 }
 
 /// Return a human-readable type name for a Value
@@ -398,7 +422,6 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::Interpolation(_) => "Interpolation",
         Value::FunctionCall { .. } => "FunctionCall",
         Value::Secret(_) => "Secret",
-        Value::Closure { .. } => "Closure",
     }
 }
 

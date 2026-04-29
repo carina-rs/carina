@@ -40,7 +40,7 @@ pub(crate) fn builtin_env(args: &[Value]) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::builtins::evaluate_builtin;
+    use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
     use crate::resource::Value;
 
     #[test]

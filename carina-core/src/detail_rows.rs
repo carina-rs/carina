@@ -1192,15 +1192,11 @@ mod tests {
         };
         assert!(value_references_binding(&function_call, "vpc"));
 
-        let secret = Value::Secret(Box::new(refs_vpc.clone()));
+        let secret = Value::Secret(Box::new(refs_vpc));
         assert!(value_references_binding(&secret, "vpc"));
 
-        let closure = Value::Closure {
-            name: "map".to_string(),
-            captured_args: vec![refs_vpc],
-            remaining_arity: 1,
-        };
-        assert!(value_references_binding(&closure, "vpc"));
+        // Closure variant removed from `Value` (issue #2230): closures
+        // live on `EvalValue` and never reach this code path.
 
         // Still false when the binding is genuinely absent.
         assert!(!value_references_binding(

@@ -56,7 +56,7 @@ pub(crate) fn builtin_concat(args: &[Value]) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::builtins::evaluate_builtin;
+    use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
     use crate::resource::Value;
 
     #[test]
@@ -148,8 +148,9 @@ mod tests {
 
     #[test]
     fn concat_partial_application_one_arg() {
+        use crate::builtins::evaluate_builtin_for_tests;
         let args = vec![Value::List(vec![Value::Int(1)])];
-        let result = evaluate_builtin("concat", &args).unwrap();
+        let result = evaluate_builtin_for_tests("concat", &args).unwrap();
         assert!(result.is_closure());
     }
 

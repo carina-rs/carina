@@ -83,7 +83,7 @@ pub(crate) fn builtin_map(args: &[Value]) -> Result<Value, String> {
 mod tests {
     use indexmap::IndexMap;
 
-    use crate::builtins::evaluate_builtin;
+    use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
     use crate::resource::Value;
 
     fn make_map(pairs: Vec<(&str, Value)>) -> Value {
@@ -159,8 +159,9 @@ mod tests {
 
     #[test]
     fn map_partial_application_one_arg() {
+        use crate::builtins::evaluate_builtin_for_tests;
         let args = vec![Value::String(".field".to_string())];
-        let result = evaluate_builtin("map", &args).unwrap();
+        let result = evaluate_builtin_for_tests("map", &args).unwrap();
         assert!(result.is_closure());
     }
 

@@ -93,7 +93,7 @@ fn compare_values(
 
 #[cfg(test)]
 mod tests {
-    use crate::builtins::evaluate_builtin;
+    use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
     use crate::resource::Value;
 
     // ── min() tests ──
@@ -149,7 +149,8 @@ mod tests {
 
     #[test]
     fn min_partial_application_one_arg() {
-        let result = evaluate_builtin("min", &[Value::Int(1)]).unwrap();
+        use crate::builtins::evaluate_builtin_for_tests;
+        let result = evaluate_builtin_for_tests("min", &[Value::Int(1)]).unwrap();
         assert!(result.is_closure());
     }
 

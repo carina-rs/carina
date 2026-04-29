@@ -60,7 +60,7 @@ pub(crate) fn builtin_join(args: &[Value]) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::builtins::evaluate_builtin;
+    use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
     use crate::resource::Value;
 
     #[test]
@@ -123,8 +123,9 @@ mod tests {
 
     #[test]
     fn join_partial_application() {
+        use crate::builtins::evaluate_builtin_for_tests;
         let args = vec![Value::String("-".to_string())];
-        let result = evaluate_builtin("join", &args).unwrap();
+        let result = evaluate_builtin_for_tests("join", &args).unwrap();
         assert!(result.is_closure());
     }
 
