@@ -383,6 +383,30 @@ impl Value {
         }
     }
 
+    /// Recursively check whether this value contains a `Value::Closure`
+    /// anywhere in its tree. `Value::Closure` is an evaluator-internal
+    /// variant produced during partial application of user functions; it
+    /// must not survive resolution. This walker is the cheap check that
+    /// `parse_and_resolve` and tests use to enforce the contract.
+    pub fn contains_closure(&self) -> bool {
+        match self {
+            Value::Closure { .. } => true,
+            Value::List(items) => items.iter().any(Value::contains_closure),
+            Value::Map(map) => map.values().any(Value::contains_closure),
+            Value::Interpolation(parts) => parts.iter().any(|p| match p {
+                InterpolationPart::Expr(v) => v.contains_closure(),
+                InterpolationPart::Literal(_) => false,
+            }),
+            Value::FunctionCall { args, .. } => args.iter().any(Value::contains_closure),
+            Value::Secret(inner) => inner.contains_closure(),
+            Value::String(_)
+            | Value::Int(_)
+            | Value::Float(_)
+            | Value::Bool(_)
+            | Value::ResourceRef { .. } => false,
+        }
+    }
+
     /// Recursively walk this value, invoking `f` on each `ResourceRef`'s `AccessPath`.
     pub fn visit_refs(&self, f: &mut impl FnMut(&AccessPath)) {
         match self {

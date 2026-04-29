@@ -5174,7 +5174,30 @@ fn resolve_value_with_config(
 pub fn parse_and_resolve(input: &str) -> Result<ParsedFile, ParseError> {
     let mut parsed = parse(input, &ProviderContext::default())?;
     resolve_resource_refs(&mut parsed)?;
+    debug_assert!(
+        !parsed_contains_closure(&parsed),
+        "Value::Closure leaked past parse_and_resolve — closures are evaluator-internal \
+         and must be fully applied or folded into a FunctionCall before reaching consumers"
+    );
     Ok(parsed)
+}
+
+/// True when any `Value` reachable from `parsed` is a `Value::Closure`.
+///
+/// Backs the debug-only contract on `parse_and_resolve`. The walk covers
+/// every public surface that downstream consumers iterate.
+fn parsed_contains_closure(parsed: &ParsedFile) -> bool {
+    parsed
+        .resources
+        .iter()
+        .flat_map(|r| r.attributes.values())
+        .any(|expr| expr.as_value().contains_closure())
+        || parsed.variables.values().any(Value::contains_closure)
+        || parsed
+            .providers
+            .iter()
+            .flat_map(|p| p.attributes.values())
+            .any(Value::contains_closure)
 }
 
 #[cfg(test)]
@@ -12501,5 +12524,92 @@ awscc.ec2.Vpc {
             vec!["z_first", "a_second", "m_third"],
             "nested block Value::Map must preserve source key order; got {keys:?}"
         );
+    }
+
+    /// `Value::Closure` is an evaluator-internal representation produced
+    /// during partial application (e.g. `subnets |> map(".id")`). It must
+    /// never survive `parse_and_resolve`: by the time the parser hands a
+    /// `ParsedFile` back, every closure has either been fully applied or
+    /// folded into a `FunctionCall`. If a closure leaks out, downstream
+    /// consumers (validator, plan display, state serializer) silently
+    /// match it as "some other Value variant" and produce wrong output.
+    #[test]
+    fn parse_and_resolve_returns_no_closures() {
+        // A pipe call that fully applies its argument — this is the
+        // common case and the result should be a fully-resolved value
+        // (FunctionCall or evaluated literal), never a Closure.
+        let input = r#"
+            let xs = ["a", "b", "c"]
+            let joined = xs |> join("-")
+        "#;
+        let parsed = parse_and_resolve(input).expect("parse_and_resolve should succeed");
+        assert_no_closure_in_parsed(&parsed);
+    }
+
+    /// Even when the source explicitly partially applies a builtin
+    /// (`join("-")` with arity 2), the closure must not survive
+    /// `parse_and_resolve` — pipelines or other call sites are expected
+    /// to finish the application. If a parse-time partial-application
+    /// shape can't be folded, the parser must surface an error rather
+    /// than letting a closure leak to consumers.
+    ///
+    /// This test currently exercises the "fully consumed via pipe" path;
+    /// any future regression that lets a bare partial application escape
+    /// will trip the `debug_assert!` inside `parse_and_resolve`.
+    #[test]
+    fn partial_application_via_pipe_is_fully_applied() {
+        let input = r#"
+            let parts = ["a", "b"]
+            let joined = parts |> join("-")
+        "#;
+        let parsed = parse_and_resolve(input).expect("parse_and_resolve should succeed");
+        assert_no_closure_in_parsed(&parsed);
+    }
+
+    /// A user-defined function whose body produces a fully-applied call
+    /// must produce a closure-free `ParsedFile`: the closure lives strictly
+    /// inside the evaluator's call frame.
+    #[test]
+    fn parse_and_resolve_with_user_function_returns_no_closures() {
+        let input = r#"
+            fn join_two(a: String, b: String): String {
+                join("-", [a, b])
+            }
+            let result = join_two("begin", "end")
+        "#;
+        let parsed = parse_and_resolve(input).expect("parse_and_resolve should succeed");
+        assert_no_closure_in_parsed(&parsed);
+    }
+
+    /// Walk every `Value` reachable from a `ParsedFile` and panic if any
+    /// is a `Value::Closure`.
+    fn assert_no_closure_in_parsed(parsed: &ParsedFile) {
+        for resource in &parsed.resources {
+            for (key, expr) in &resource.attributes {
+                assert!(
+                    !expr.as_value().contains_closure(),
+                    "resource {} attribute {} contains a Closure",
+                    resource.id.display_type(),
+                    key
+                );
+            }
+        }
+        for (name, value) in &parsed.variables {
+            assert!(
+                !value.contains_closure(),
+                "variable {} contains a Closure",
+                name
+            );
+        }
+        for provider in &parsed.providers {
+            for (name, value) in &provider.attributes {
+                assert!(
+                    !value.contains_closure(),
+                    "provider {} attribute {} contains a Closure",
+                    provider.name,
+                    name
+                );
+            }
+        }
     }
 }

@@ -946,7 +946,10 @@ impl Value {
             Value::Interpolation(_) => "Interpolation".to_string(),
             Value::FunctionCall { name, .. } => format!("FunctionCall({})", name),
             Value::Secret(_) => "Secret".to_string(),
-            Value::Closure { name, .. } => format!("Closure({})", name),
+            Value::Closure { name, .. } => unreachable!(
+                "Value::Closure({name}) reached schema::Value::type_name — closures are \
+                 evaluator-internal and must not survive resolution"
+            ),
         }
     }
 }
