@@ -20,6 +20,7 @@ mod cst;
 mod cst_builder;
 mod format;
 mod parser;
+mod rules;
 
 pub use config::FormatConfig;
 pub use format::{format, format_with_block_names, needs_format};
