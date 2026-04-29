@@ -1,12 +1,8 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::time::Duration;
 
 use colored::Colorize;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use futures::stream::{self, StreamExt};
 
@@ -14,15 +10,12 @@ use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
 use carina_core::effect::Effect;
-use carina_core::executor::{
-    ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, ProgressInfo,
-};
+use carina_core::executor::{ExecutionInput, ExecutionResult};
 use carina_core::module_resolver;
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
 use carina_core::resolver::resolve_refs_with_state_and_remote;
 use carina_core::resource::{Resource, ResourceId, State, Value};
-use carina_core::schema::ResourceSchema;
 use carina_core::value::format_value;
 use carina_state::{LockInfo, ResourceState, StateBackend, StateFile, resolve_backend};
 
@@ -31,8 +24,21 @@ use carina_core::parser::ProviderContext;
 use super::validate_and_resolve_with_config;
 use crate::DetailLevel;
 use crate::commands::plan::PlanFile;
+use crate::commands::shared::effect_execution::{
+    execute_import_effects, execute_state_only_effects,
+};
+use crate::commands::shared::observer::CliObserver;
+#[cfg(test)]
+use crate::commands::shared::progress::format_duration;
+use crate::commands::shared::progress::{
+    RefreshProgress, emit_newline_on_interrupt, refresh_multi_progress,
+};
+use crate::commands::shared::state_writeback::{
+    ApplyStateSave, FinalizeApplyInput, apply_name_overrides, build_state_after_apply,
+    resolve_exports,
+};
 use crate::commands::state::map_lock_error;
-use crate::display::{format_effect, print_plan};
+use crate::display::print_plan;
 use crate::error::AppError;
 use crate::wiring::{
     WiringContext, build_factories_from_providers, create_providers_from_configs,
@@ -40,283 +46,6 @@ use crate::wiring::{
     reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
     resolve_data_source_refs_for_refresh, resolve_names_with_ctx,
 };
-
-/// Format a duration as a human-readable string like "3.2s" or "1m 5.3s".
-pub(crate) fn format_duration(d: Duration) -> String {
-    let secs = d.as_secs_f64();
-    if secs < 60.0 {
-        format!("{:.1}s", secs)
-    } else {
-        let mins = secs as u64 / 60;
-        let remaining = secs - (mins as f64 * 60.0);
-        format!("{}m {:.1}s", mins, remaining)
-    }
-}
-
-/// Braille spinner frames for animated progress display.
-pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-/// Create the spinner style used by both apply and destroy.
-pub(crate) fn spinner_style() -> ProgressStyle {
-    ProgressStyle::with_template("  {spinner:.cyan} {msg}...")
-        .unwrap()
-        .tick_strings(SPINNER_FRAMES)
-}
-
-/// Spinner for tracking state refresh progress per resource.
-///
-/// Shows a spinner while each resource is being read, then displays timing
-/// when done. Uses `indicatif` for animated terminal output with a shared
-/// `MultiProgress` to support concurrent spinners.
-pub(crate) struct RefreshProgress {
-    pb: ProgressBar,
-    start: std::time::Instant,
-}
-
-impl RefreshProgress {
-    /// Print the "Refreshing state..." header and prepare for per-resource spinners.
-    pub fn start_header() {
-        println!("{}", "Refreshing state...".cyan());
-    }
-
-    /// Begin tracking a resource read under a shared `MultiProgress`.
-    pub fn begin_multi(multi: &MultiProgress, id: &ResourceId) -> Self {
-        let pb = multi.add(ProgressBar::new_spinner());
-        pb.set_style(spinner_style());
-        pb.set_message(format!("{}", id));
-        pb.enable_steady_tick(Duration::from_millis(80));
-        Self {
-            pb,
-            start: std::time::Instant::now(),
-        }
-    }
-
-    /// Finish the spinner with a success checkmark and elapsed time.
-    pub fn finish(self) {
-        let elapsed = self.start.elapsed();
-        let timing = format!("[{}]", format_duration(elapsed)).dimmed();
-        let msg = format!("{} {} {}", "✓".green(), self.pb.message(), timing);
-        self.pb
-            .set_style(ProgressStyle::with_template("  {msg}").unwrap());
-        self.pb.finish_with_message(msg);
-    }
-}
-
-/// Create a `MultiProgress` for concurrent refresh spinners.
-///
-/// Redirects the draw target to stderr when stdout is not a terminal (e.g., in CI),
-/// so that spinner animations are suppressed but `println` messages still appear.
-pub(crate) fn refresh_multi_progress() -> MultiProgress {
-    let multi = MultiProgress::new();
-    if !std::io::stdout().is_terminal() {
-        multi.set_draw_target(indicatif::ProgressDrawTarget::stderr());
-    }
-    multi
-}
-
-/// CLI observer that prints colored progress output using `indicatif`.
-///
-/// Uses dynamic display: resources appear only when they start executing or
-/// complete. No upfront tree is shown. Spinners are created lazily on
-/// `EffectStarted` and finished on `EffectSucceeded`/`EffectFailed`.
-struct CliObserver {
-    multi: MultiProgress,
-    /// Map from effect description to its ProgressBar, created lazily when
-    /// the effect starts executing. Guarded by a Mutex for concurrent access.
-    bars: Mutex<HashMap<String, ProgressBar>>,
-}
-
-impl CliObserver {
-    /// Create a new observer.
-    fn new(_plan: &Plan) -> Self {
-        let multi = MultiProgress::new();
-        if !std::io::stdout().is_terminal() {
-            multi.set_draw_target(indicatif::ProgressDrawTarget::stderr());
-        }
-
-        Self {
-            multi,
-            bars: Mutex::new(HashMap::new()),
-        }
-    }
-}
-
-/// Format a progress counter as a dimmed string like "1/10".
-fn format_progress(progress: &ProgressInfo) -> String {
-    format!("{}/{}", progress.completed, progress.total)
-}
-
-impl ExecutionObserver for CliObserver {
-    fn on_event(&self, event: &ExecutionEvent) {
-        match event {
-            ExecutionEvent::Waiting { .. } => {
-                // Dynamic display: don't show waiting resources.
-                // They will appear when they start executing.
-            }
-            ExecutionEvent::EffectStarted { effect } => {
-                let key = format_effect(effect);
-                let pb = self.multi.add(ProgressBar::new_spinner());
-                pb.set_style(spinner_style());
-                pb.set_message(key.clone());
-                pb.enable_steady_tick(Duration::from_millis(80));
-                self.bars.lock().unwrap().insert(key, pb);
-            }
-            ExecutionEvent::EffectSucceeded {
-                effect,
-                duration,
-                progress,
-                ..
-            } => {
-                let key = format_effect(effect);
-                let timing = format!("[{}]", format_duration(*duration)).dimmed();
-                let counter = format_progress(progress).dimmed();
-                let msg = format!(
-                    "{} {} {} {}",
-                    "✓".green(),
-                    format_effect(effect),
-                    timing,
-                    counter
-                );
-                let mut bars = self.bars.lock().unwrap();
-                if let Some(pb) = bars.remove(&key) {
-                    pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
-                    pb.finish_with_message(msg);
-                } else {
-                    eprintln!("  {msg}");
-                }
-            }
-            ExecutionEvent::EffectFailed {
-                effect,
-                error,
-                duration,
-                progress,
-            } => {
-                let key = format_effect(effect);
-                let timing = format!("[{}]", format_duration(*duration)).dimmed();
-                let counter = format_progress(progress).dimmed();
-                let msg = format!(
-                    "{} {} {} {}\n      {} {}",
-                    "✗".red(),
-                    format_effect(effect),
-                    timing,
-                    counter,
-                    "→".red(),
-                    error.red()
-                );
-                let mut bars = self.bars.lock().unwrap();
-                if let Some(pb) = bars.remove(&key) {
-                    pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
-                    pb.finish_with_message(msg.clone());
-                }
-                // Always print errors to stderr so they're visible even when
-                // indicatif's MultiProgress swallows progress bar output.
-                eprintln!("  {msg}");
-            }
-            ExecutionEvent::EffectSkipped {
-                effect,
-                reason,
-                progress,
-            } => {
-                let key = format_effect(effect);
-                let counter = format_progress(progress).dimmed();
-                let msg = format!(
-                    "{} {} - {} {}",
-                    "⊘".yellow(),
-                    format_effect(effect),
-                    reason,
-                    counter
-                );
-                // Skipped effects may not have a spinner (they were never started).
-                let mut bars = self.bars.lock().unwrap();
-                if let Some(pb) = bars.remove(&key) {
-                    pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
-                    pb.finish_with_message(msg);
-                } else {
-                    eprintln!("  {}", msg);
-                }
-            }
-            ExecutionEvent::CascadeUpdateSucceeded { id } => {
-                self.multi
-                    .println(format!("  {} Update {} (cascade)", "✓".green(), id))
-                    .ok();
-            }
-            ExecutionEvent::CascadeUpdateFailed { id, error } => {
-                self.multi
-                    .println(format!("  {} Update {} (cascade)", "✗".red(), id))
-                    .ok();
-                self.multi
-                    .println(format!("      {} {}", "→".red(), error.red()))
-                    .ok();
-            }
-            ExecutionEvent::RenameSucceeded { id, from, to } => {
-                self.multi
-                    .println(format!(
-                        "  {} Rename {} \"{}\" → \"{}\"",
-                        "✓".green(),
-                        id,
-                        from,
-                        to
-                    ))
-                    .ok();
-            }
-            ExecutionEvent::RenameFailed { id, error } => {
-                self.multi
-                    .println(format!("  {} Rename {}", "✗".red(), id))
-                    .ok();
-                self.multi
-                    .println(format!("      {} {}", "→".red(), error.red()))
-                    .ok();
-            }
-            ExecutionEvent::RefreshStarted => {
-                self.multi.println("").ok();
-                self.multi
-                    .println(format!(
-                        "{}",
-                        "Refreshing uncertain resource states...".cyan()
-                    ))
-                    .ok();
-            }
-            ExecutionEvent::RefreshSucceeded { id } => {
-                self.multi
-                    .println(format!("  {} Refresh {}", "✓".green(), id))
-                    .ok();
-            }
-            ExecutionEvent::RefreshFailed { id, error } => {
-                self.multi
-                    .println(format!("  {} Refresh {} - {}", "!".yellow(), id, error))
-                    .ok();
-            }
-        }
-    }
-}
-
-/// Apply permanent name overrides from state to desired resources.
-///
-/// When a create_before_destroy replacement produces a non-renameable temporary name
-/// (can_rename=false), the state stores the permanent name. This function applies
-/// those overrides so the plan doesn't detect a false diff.
-pub fn apply_name_overrides(resources: &mut [Resource], state_file: &Option<StateFile>) {
-    let state_file = match state_file {
-        Some(sf) => sf,
-        None => return,
-    };
-
-    let overrides = state_file.build_name_overrides();
-    if overrides.is_empty() {
-        return;
-    }
-
-    for resource in resources.iter_mut() {
-        if let Some(name_overrides) = overrides.get(&resource.id) {
-            for (attr, value) in name_overrides {
-                resource.attributes.insert(
-                    attr.clone(),
-                    carina_core::resource::Expr(Value::String(value.clone())),
-                );
-            }
-        }
-    }
-}
 
 /// Re-export ExecutionResult as the public API for apply results.
 pub type ApplyResult = ExecutionResult;
@@ -346,21 +75,6 @@ pub async fn execute_effects(
     *current_states = result.current_states.clone();
 
     result
-}
-
-/// Queue a state refresh for a resource after a failed operation.
-///
-/// This is kept for use by tests in `tests.rs`. The core executor has its own
-/// internal version.
-#[cfg(test)]
-pub fn queue_state_refresh(
-    pending_refreshes: &mut HashMap<ResourceId, String>,
-    id: &ResourceId,
-    identifier: Option<&str>,
-) {
-    if let Some(identifier) = identifier.filter(|identifier| !identifier.is_empty()) {
-        pending_refreshes.insert(id.clone(), identifier.to_string());
-    }
 }
 
 /// Refresh states for resources whose operations failed.
@@ -400,80 +114,11 @@ pub async fn refresh_pending_states(
     failed_refreshes
 }
 
-/// Execute import effects by reading the resource from the provider.
-///
-/// For each Import effect, calls provider.read() with the given identifier
-/// to fetch the current state and stores the result in applied_states
-/// so that finalize_apply can persist it.
-async fn execute_import_effects(plan: &Plan, provider: &dyn Provider, result: &mut ApplyResult) {
-    for effect in plan.effects() {
-        if let Effect::Import { id, identifier } = effect {
-            println!("  {} Importing {} (id: {})...", "<-".cyan(), id, identifier);
-            match provider.read(id, Some(identifier)).await {
-                Ok(state) => {
-                    if state.exists {
-                        println!("  {} Imported {}", "✓".green(), id);
-                        result.applied_states.insert(id.clone(), state);
-                        result.success_count += 1;
-                    } else {
-                        println!(
-                            "  {} Import failed: resource {} with id {} not found",
-                            "✗".red(),
-                            id,
-                            identifier
-                        );
-                        result.failure_count += 1;
-                    }
-                }
-                Err(e) => {
-                    println!("  {} Import failed for {}: {}", "✗".red(), id, e);
-                    result.failure_count += 1;
-                }
-            }
-        }
-    }
-}
-
-/// Execute state-only effects (remove, move) with user feedback.
-///
-/// These effects only modify state and don't call the provider.
-fn execute_state_only_effects(plan: &Plan, result: &mut ApplyResult) {
-    for effect in plan.effects() {
-        match effect {
-            Effect::Remove { id } => {
-                println!("  {} Removing {} from state", "x".red(), id);
-                result.success_count += 1;
-            }
-            Effect::Move { from, to } => {
-                println!("  {} Moving {} -> {}", "->".yellow(), from, to);
-                result.success_count += 1;
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Input parameters for `finalize_apply`.
-///
-/// Groups the execution result, resource data, and backend configuration
-/// needed to save state after an apply operation.
-pub struct FinalizeApplyInput<'a> {
-    pub result: &'a ApplyResult,
-    pub state_file: Option<StateFile>,
-    pub sorted_resources: &'a [Resource],
-    pub current_states: &'a HashMap<ResourceId, State>,
-    pub plan: &'a Plan,
-    pub backend: &'a dyn StateBackend,
-    pub lock: Option<&'a LockInfo>,
-    pub schemas: &'a HashMap<String, ResourceSchema>,
-    pub export_params: &'a [carina_core::parser::ExportParameter],
-}
-
 /// Save state after apply. Does NOT release the lock -- caller is responsible.
 ///
 /// When `lock` is `None` (i.e. `--lock=false`), state is written without lock
 /// validation via `save_state_unlocked`.
-pub async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), AppError> {
+pub(crate) async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), AppError> {
     println!();
     println!("{}", "Saving state...".cyan());
 
@@ -503,66 +148,6 @@ pub async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), AppErro
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
 
     Ok(())
-}
-
-/// Resolve export expressions using the binding map built from applied state.
-pub(crate) fn resolve_exports(
-    export_params: &[carina_core::parser::ExportParameter],
-    state: &StateFile,
-) -> HashMap<String, serde_json::Value> {
-    use carina_core::resource::Value;
-
-    // Build binding map from state (binding name → attributes)
-    let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
-    for rs in &state.resources {
-        if let Some(ref binding) = rs.binding {
-            let attrs: HashMap<String, Value> = rs
-                .attributes
-                .iter()
-                .filter_map(|(k, v)| {
-                    carina_core::value::json_to_dsl_value(v).map(|val| (k.clone(), val))
-                })
-                .collect();
-            binding_map.insert(binding.clone(), attrs);
-        }
-    }
-
-    let mut exports = HashMap::new();
-    for param in export_params {
-        if let Some(ref value) = param.value {
-            // Resolve both ResourceRef and cross-file dot-notation strings
-            // (e.g., "registry_prod.account_id" parsed from a different .crn file).
-            let resolved = crate::commands::plan::resolve_export_value(value, &binding_map);
-            if let Some(json) = dsl_value_to_json(&resolved) {
-                exports.insert(param.name.clone(), json);
-            }
-        }
-    }
-    exports
-}
-
-/// Convert a DSL Value to a serde_json::Value for state persistence.
-pub(crate) fn dsl_value_to_json(value: &carina_core::resource::Value) -> Option<serde_json::Value> {
-    use carina_core::resource::Value;
-    match value {
-        Value::String(s) => Some(serde_json::Value::String(s.clone())),
-        Value::Bool(b) => Some(serde_json::Value::Bool(*b)),
-        Value::Int(i) => Some(serde_json::Value::Number((*i).into())),
-        Value::Float(f) => serde_json::Number::from_f64(*f).map(serde_json::Value::Number),
-        Value::List(items) => {
-            let json_items: Vec<serde_json::Value> =
-                items.iter().filter_map(dsl_value_to_json).collect();
-            Some(serde_json::Value::Array(json_items))
-        }
-        Value::Map(map) => {
-            let json_map: serde_json::Map<String, serde_json::Value> = map
-                .iter()
-                .filter_map(|(k, v)| dsl_value_to_json(v).map(|jv| (k.clone(), jv)))
-                .collect();
-            Some(serde_json::Value::Object(json_map))
-        }
-        _ => None, // ResourceRef, Null, etc. — skip
-    }
 }
 
 /// Renew the lock and write state with lock validation.
@@ -617,122 +202,6 @@ pub(crate) async fn persist_exports_only(
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
     println!("  {} Exports updated", "✓".green());
     Ok(())
-}
-
-pub struct ApplyStateSave<'a> {
-    pub state_file: Option<StateFile>,
-    pub sorted_resources: &'a [Resource],
-    pub current_states: &'a HashMap<ResourceId, State>,
-    pub applied_states: &'a HashMap<ResourceId, State>,
-    pub permanent_name_overrides: &'a HashMap<ResourceId, HashMap<String, String>>,
-    pub plan: &'a Plan,
-    pub successfully_deleted: &'a HashSet<ResourceId>,
-    pub failed_refreshes: &'a HashSet<ResourceId>,
-    pub schemas: &'a HashMap<String, ResourceSchema>,
-}
-
-pub fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateFile, AppError> {
-    let ApplyStateSave {
-        state_file,
-        sorted_resources,
-        current_states,
-        applied_states,
-        permanent_name_overrides,
-        plan,
-        successfully_deleted,
-        failed_refreshes,
-        schemas,
-    } = save;
-    let mut state = state_file.unwrap_or_default();
-
-    for resource in sorted_resources {
-        let existing = state.find_resource(
-            &resource.id.provider,
-            &resource.id.resource_type,
-            resource.id.name_str(),
-        );
-        // Collect write-only attribute names from the schema for this resource type.
-        // Schema keys include the provider prefix (e.g., "awscc.ec2.Vpc"), so we must
-        // construct the key the same way as schema_key_for_resource().
-        let schema_key = if resource.id.provider.is_empty() {
-            resource.id.resource_type.clone()
-        } else {
-            format!("{}.{}", resource.id.provider, resource.id.resource_type)
-        };
-        let write_only_keys: Vec<String> = schemas
-            .get(&schema_key)
-            .map(|schema| {
-                schema
-                    .attributes
-                    .iter()
-                    .filter(|(_, attr)| attr.write_only)
-                    .map(|(name, _)| name.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        if let Some(applied_state) = applied_states.get(&resource.id) {
-            let mut resource_state =
-                ResourceState::from_provider_state(resource, applied_state, existing)?;
-            if let Some(overrides) = permanent_name_overrides.get(&resource.id) {
-                resource_state.name_overrides = overrides.clone();
-            }
-            if !write_only_keys.is_empty() {
-                resource_state.merge_write_only_attributes(resource, &write_only_keys);
-            }
-            state.upsert_resource(resource_state);
-        } else if failed_refreshes.contains(&resource.id) {
-            continue;
-        } else if let Some(current_state) = current_states.get(&resource.id) {
-            if current_state.exists {
-                let mut resource_state =
-                    ResourceState::from_provider_state(resource, current_state, existing)?;
-                if !write_only_keys.is_empty() {
-                    resource_state.merge_write_only_attributes(resource, &write_only_keys);
-                }
-                state.upsert_resource(resource_state);
-            } else {
-                state.remove_resource(
-                    &resource.id.provider,
-                    &resource.id.resource_type,
-                    resource.id.name_str(),
-                );
-            }
-        }
-    }
-
-    for effect in plan.effects() {
-        match effect {
-            Effect::Delete { id, .. } if successfully_deleted.contains(id) => {
-                state.remove_resource(&id.provider, &id.resource_type, id.name_str());
-            }
-            Effect::Import { .. } => {
-                // Already handled in the sorted_resources loop above via applied_states.
-                // Re-upserting here would overwrite metadata (lifecycle, prefixes,
-                // desired_keys, binding, dependency_bindings) with bare defaults.
-            }
-            Effect::Remove { id } => {
-                state.remove_resource(&id.provider, &id.resource_type, id.name_str());
-            }
-            Effect::Move { from, to } => {
-                // Move: update the resource's identity in state
-                if let Some(existing) = state
-                    .find_resource(&from.provider, &from.resource_type, from.name_str())
-                    .cloned()
-                {
-                    state.remove_resource(&from.provider, &from.resource_type, from.name_str());
-                    let mut moved_resource = existing;
-                    moved_resource.provider = to.provider.clone();
-                    moved_resource.resource_type = to.resource_type.clone();
-                    moved_resource.name = to.name_str().to_string();
-                    state.upsert_resource(moved_resource);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    Ok(state)
 }
 
 /// Detect infrastructure drift by comparing planned states against actual infrastructure.
@@ -1839,16 +1308,6 @@ async fn run_apply_from_plan_locked(
     }
 }
 
-// The confirmation prompt's "Enter a value: " has no trailing newline, and on
-// Ctrl+C the inner interrupt future fires before the outer run_with_ctrl_c
-// handler — so nothing else emits a newline before the lock-release message.
-fn emit_newline_on_interrupt<W: std::io::Write>(writer: &mut W, result: &Result<String, AppError>) {
-    if matches!(result, Err(AppError::Interrupted)) {
-        let _ = writeln!(writer);
-        let _ = writer.flush();
-    }
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ApplyConfirmation {
     Confirmed,
@@ -1898,7 +1357,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carina_core::schema::{AttributeSchema, AttributeType};
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use std::time::Duration;
 
     #[test]
     fn build_state_after_apply_finds_write_only_with_provider_prefix() {

@@ -15,11 +15,13 @@ use carina_core::schema::ResourceSchema;
 use carina_state::{BackendError, LockInfo, ResourceState, StateBackend, StateFile};
 
 use crate::commands::apply::{
-    ApplyResult, ApplyStateSave, FinalizeApplyInput, build_state_after_apply, detect_drift,
-    execute_effects, finalize_apply, queue_state_refresh, refresh_pending_states,
+    ApplyResult, detect_drift, execute_effects, finalize_apply, refresh_pending_states,
     save_state_locked,
 };
 use crate::commands::plan::{CurrentStateEntry, PlanFile};
+use crate::commands::shared::state_writeback::{
+    ApplyStateSave, FinalizeApplyInput, build_state_after_apply, queue_state_refresh,
+};
 use crate::commands::state::run_state_refresh_locked;
 use crate::wiring::{
     WiringContext, compute_anonymous_identifiers, reconcile_prefixed_names, resolve_attr_prefixes,

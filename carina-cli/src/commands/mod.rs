@@ -7,6 +7,7 @@ pub mod init;
 pub mod lint;
 pub mod module;
 pub mod plan;
+pub(crate) mod shared;
 pub mod skills;
 pub mod state;
 pub mod validate;

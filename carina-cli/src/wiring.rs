@@ -28,7 +28,7 @@ use carina_core::validation;
 use carina_provider_mock::MockProvider;
 use carina_state::StateFile;
 
-use crate::commands::apply::{RefreshProgress, refresh_multi_progress};
+use crate::commands::shared::progress::{RefreshProgress, refresh_multi_progress};
 use crate::error::AppError;
 
 /// Result of creating a plan, with context needed for saving
