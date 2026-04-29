@@ -123,5 +123,4 @@ mod tests {
         assert_eq!(err.name, "join");
         assert_eq!(err.remaining_arity, 2);
     }
-
 }

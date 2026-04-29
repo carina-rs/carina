@@ -1761,7 +1761,12 @@ fn parse_module_call(
 /// rather than `Value` so partial applications (closures) can survive
 /// until a later pipe finishes them; the surrounding parse pass lowers
 /// each binding to `Value` at the end of `parse(...)`.
-type LetBindingRhs = (EvalValue, Vec<Resource>, Vec<ModuleCall>, Option<UseStatement>);
+type LetBindingRhs = (
+    EvalValue,
+    Vec<Resource>,
+    Vec<ModuleCall>,
+    Option<UseStatement>,
+);
 
 /// Extended parse_let_binding that also handles module calls, imports, and for expressions.
 ///
@@ -1952,13 +1957,14 @@ fn parse_pipe_expr_with_resource_or_module(
             // Build closure-application args. The pipe value (`x` in
             // `x |> f`) goes as the last argument; we keep it as
             // EvalValue so a chained closure can pipe through.
-            let mut all_args: Vec<EvalValue> =
-                extra_args.iter().cloned().map(EvalValue::from_value).collect();
+            let mut all_args: Vec<EvalValue> = extra_args
+                .iter()
+                .cloned()
+                .map(EvalValue::from_value)
+                .collect();
             all_args.push(value.clone());
             if extra_args.iter().all(is_static_value)
-                && pipe_value_for_args
-                    .as_ref()
-                    .is_some_and(is_static_value)
+                && pipe_value_for_args.as_ref().is_some_and(is_static_value)
             {
                 value = crate::builtins::apply_closure_with_config(
                     fn_name,
@@ -2000,15 +2006,12 @@ fn parse_pipe_expr_with_resource_or_module(
         {
             let eval_args: Vec<EvalValue> =
                 args.iter().cloned().map(EvalValue::from_value).collect();
-            value = crate::builtins::evaluate_builtin_with_config(
-                &func_name,
-                &eval_args,
-                ctx.config,
-            )
-            .map_err(|e| ParseError::InvalidExpression {
-                line: 0,
-                message: format!("{}(): {}", func_name, e),
-            })?;
+            value =
+                crate::builtins::evaluate_builtin_with_config(&func_name, &eval_args, ctx.config)
+                    .map_err(|e| ParseError::InvalidExpression {
+                    line: 0,
+                    message: format!("{}(): {}", func_name, e),
+                })?;
             continue;
         }
 
@@ -2032,7 +2035,12 @@ fn parse_primary_with_resource_or_module(
         Rule::read_resource_expr => {
             let resource = parse_read_resource_expr(inner, ctx, binding_name)?;
             let ref_value = Value::String(format!("${{{}}}", binding_name));
-            Ok((EvalValue::from_value(ref_value), vec![resource], vec![], None))
+            Ok((
+                EvalValue::from_value(ref_value),
+                vec![resource],
+                vec![],
+                None,
+            ))
         }
         Rule::upstream_state_expr => {
             let (line, _) = inner.as_span().start_pos().line_col();
@@ -2050,12 +2058,22 @@ fn parse_primary_with_resource_or_module(
         Rule::resource_expr => {
             let resource = parse_resource_expr(inner, ctx, binding_name)?;
             let ref_value = Value::String(format!("${{{}}}", binding_name));
-            Ok((EvalValue::from_value(ref_value), vec![resource], vec![], None))
+            Ok((
+                EvalValue::from_value(ref_value),
+                vec![resource],
+                vec![],
+                None,
+            ))
         }
         Rule::for_expr => {
             let (resources, module_calls) = parse_for_expr(inner, ctx, binding_name)?;
             let ref_value = Value::String(format!("${{for:{}}}", binding_name));
-            Ok((EvalValue::from_value(ref_value), resources, module_calls, None))
+            Ok((
+                EvalValue::from_value(ref_value),
+                resources,
+                module_calls,
+                None,
+            ))
         }
         Rule::if_expr => {
             let (value, resources, module_calls, import) = parse_if_expr(inner, ctx, binding_name)?;
@@ -2519,14 +2537,16 @@ fn parse_for_iterable(
     // for_iterable contains function_call | list | variable_ref | "(" expression ")"
     let inner = first_inner(pair, "iterable expression", "for iterable")?;
     let eval = parse_primary_eval(inner, ctx)?;
-    let value = eval.into_value().map_err(|leak| ParseError::InvalidExpression {
-        line: 0,
-        message: format!(
-            "for iterable evaluates to a closure '{}' (still needs {} arg(s)); \
+    let value = eval
+        .into_value()
+        .map_err(|leak| ParseError::InvalidExpression {
+            line: 0,
+            message: format!(
+                "for iterable evaluates to a closure '{}' (still needs {} arg(s)); \
              closures cannot be iterated",
-            leak.name, leak.remaining_arity
-        ),
-    })?;
+                leak.name, leak.remaining_arity
+            ),
+        })?;
     evaluate_static_value(value, ctx.config)
 }
 
@@ -2584,14 +2604,16 @@ fn evaluate_static_value(value: Value, config: &ProviderContext) -> Result<Value
                     line: 0,
                     message: format!("for iterable function call '{name}' failed: {e}"),
                 })?;
-            result.into_value().map_err(|leak| ParseError::InvalidExpression {
-                line: 0,
-                message: format!(
-                    "for iterable function call '{name}' returned a closure '{}' \
+            result
+                .into_value()
+                .map_err(|leak| ParseError::InvalidExpression {
+                    line: 0,
+                    message: format!(
+                        "for iterable function call '{name}' returned a closure '{}' \
                      (still needs {} arg(s)); finish the partial application",
-                    leak.name, leak.remaining_arity
-                ),
-            })
+                        leak.name, leak.remaining_arity
+                    ),
+                })
         }
         other => Ok(other),
     }
@@ -3631,14 +3653,16 @@ fn try_evaluate_fn_value(value: Value, ctx: &ParseContext) -> Result<Value, Pars
                     line: 0,
                     message: e,
                 })?;
-                return result.into_value().map_err(|leak| ParseError::InvalidExpression {
-                    line: 0,
-                    message: format!(
-                        "applying closure '{}' (still needs {} arg(s)) leaves a closure; \
+                return result
+                    .into_value()
+                    .map_err(|leak| ParseError::InvalidExpression {
+                        line: 0,
+                        message: format!(
+                            "applying closure '{}' (still needs {} arg(s)) leaves a closure; \
                          finish the partial application before using the result as data",
-                        leak.name, leak.remaining_arity
-                    ),
-                });
+                            leak.name, leak.remaining_arity
+                        ),
+                    });
             }
 
             // Try built-in first (with config for decrypt support)
@@ -3648,14 +3672,16 @@ fn try_evaluate_fn_value(value: Value, ctx: &ParseContext) -> Result<Value, Pars
                 .map(EvalValue::from_value)
                 .collect();
             match crate::builtins::evaluate_builtin_with_config(name, &eval_args, ctx.config) {
-                Ok(result) => result.into_value().map_err(|leak| ParseError::InvalidExpression {
-                    line: 0,
-                    message: format!(
-                        "{}(): produced a closure '{}' (still needs {} arg(s)); \
+                Ok(result) => result
+                    .into_value()
+                    .map_err(|leak| ParseError::InvalidExpression {
+                        line: 0,
+                        message: format!(
+                            "{}(): produced a closure '{}' (still needs {} arg(s)); \
                          finish the partial application before using the result as data",
-                        name, leak.name, leak.remaining_arity
-                    ),
-                }),
+                            name, leak.name, leak.remaining_arity
+                        ),
+                    }),
                 Err(_builtin_err) => {
                     // Try user-defined function
                     if let Some(user_fn) = ctx.user_functions.get(name) {
@@ -4353,14 +4379,15 @@ fn parse_expression(
     ctx: &ParseContext,
 ) -> Result<Value, ParseError> {
     let eval = parse_expression_eval(pair, ctx)?;
-    eval.into_value().map_err(|leak| ParseError::InvalidExpression {
-        line: 0,
-        message: format!(
-            "expression evaluates to a closure '{}' (still needs {} arg(s)); finish the \
+    eval.into_value()
+        .map_err(|leak| ParseError::InvalidExpression {
+            line: 0,
+            message: format!(
+                "expression evaluates to a closure '{}' (still needs {} arg(s)); finish the \
              partial application — closures are not valid as data",
-            leak.name, leak.remaining_arity
-        ),
-    })
+                leak.name, leak.remaining_arity
+            ),
+        })
 }
 
 /// Parse an expression and return the raw `EvalValue`, preserving any
@@ -4478,8 +4505,11 @@ fn parse_pipe_expr(
             remaining_arity,
         }) = ctx.get_variable(&func_name)
         {
-            let mut all_args: Vec<EvalValue> =
-                extra_args.iter().cloned().map(EvalValue::from_value).collect();
+            let mut all_args: Vec<EvalValue> = extra_args
+                .iter()
+                .cloned()
+                .map(EvalValue::from_value)
+                .collect();
             all_args.push(value.clone());
             if all_args.iter().all(is_static_eval) {
                 value = crate::builtins::apply_closure_with_config(
@@ -4531,9 +4561,7 @@ fn parse_pipe_expr(
                 let eval_args: Vec<EvalValue> =
                     args.iter().cloned().map(EvalValue::from_value).collect();
                 value = crate::builtins::evaluate_builtin_with_config(
-                    &func_name,
-                    &eval_args,
-                    ctx.config,
+                    &func_name, &eval_args, ctx.config,
                 )
                 .map_err(|e| ParseError::InvalidExpression {
                     line: 0,
@@ -4734,9 +4762,7 @@ fn parse_primary_eval(
                 let eval_args: Vec<EvalValue> =
                     args.iter().cloned().map(EvalValue::from_value).collect();
                 return crate::builtins::evaluate_builtin_with_config(
-                    &func_name,
-                    &eval_args,
-                    ctx.config,
+                    &func_name, &eval_args, ctx.config,
                 )
                 .map_err(|e| ParseError::InvalidExpression {
                     line: 0,
@@ -5358,14 +5384,16 @@ fn resolve_value_with_config(
                 .map(EvalValue::from_value)
                 .collect();
             match crate::builtins::evaluate_builtin_with_config(name, &eval_args, config) {
-                Ok(result) => result.into_value().map_err(|leak| ParseError::InvalidExpression {
-                    line: 0,
-                    message: format!(
-                        "{}(): produced a closure '{}' (still needs {} arg(s)); \
+                Ok(result) => result
+                    .into_value()
+                    .map_err(|leak| ParseError::InvalidExpression {
+                        line: 0,
+                        message: format!(
+                            "{}(): produced a closure '{}' (still needs {} arg(s)); \
                          finish the partial application before using the result as data",
-                        name, leak.name, leak.remaining_arity
-                    ),
-                }),
+                            name, leak.name, leak.remaining_arity
+                        ),
+                    }),
                 Err(e) => {
                     if all_args_resolved {
                         // All args are resolved but builtin failed — propagate the error
@@ -5413,7 +5441,10 @@ mod tests {
             let joined = xs |> join("-")
         "#;
         let parsed = parse_and_resolve(input).expect("parse_and_resolve should succeed");
-        let joined = parsed.variables.get("joined").expect("joined binding present");
+        let joined = parsed
+            .variables
+            .get("joined")
+            .expect("joined binding present");
         // No `Closure` arm exists on `Value`, so the only way this
         // could fail is if the call survived as a `FunctionCall` —
         // also a valid `Value`, never a closure. The point of the
@@ -11199,8 +11230,8 @@ arguments {
         let input = r#"
             let transform = split(",") >> join("-") >> split("-")
         "#;
-        let result = parse(input, &ProviderContext::default())
-            .expect("three-way composition should parse");
+        let result =
+            parse(input, &ProviderContext::default()).expect("three-way composition should parse");
         assert!(result.variables.get("transform").is_none());
     }
 

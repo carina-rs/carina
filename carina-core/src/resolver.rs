@@ -202,8 +202,11 @@ pub fn resolve_ref_value(
                 // supposed to surface that as a parse error, so treat any
                 // closure here as a resolver-level invariant break.
                 use crate::eval_value::EvalValue;
-                let eval_args: Vec<EvalValue> =
-                    resolved_args.iter().cloned().map(EvalValue::from_value).collect();
+                let eval_args: Vec<EvalValue> = resolved_args
+                    .iter()
+                    .cloned()
+                    .map(EvalValue::from_value)
+                    .collect();
                 match crate::builtins::evaluate_builtin(name, &eval_args) {
                     Ok(result) => result.into_value().map_err(|leak| {
                         format!(

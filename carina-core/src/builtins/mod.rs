@@ -384,12 +384,8 @@ pub fn is_known_builtin(name: &str) -> bool {
 /// `result.is_closure()` keep working without forcing each test to
 /// allocate `EvalValue` arguments by hand.
 #[cfg(test)]
-pub(crate) fn evaluate_builtin_for_tests(
-    name: &str,
-    args: &[Value],
-) -> Result<EvalValue, String> {
-    let eval_args: Vec<EvalValue> =
-        args.iter().cloned().map(EvalValue::from_value).collect();
+pub(crate) fn evaluate_builtin_for_tests(name: &str, args: &[Value]) -> Result<EvalValue, String> {
+    let eval_args: Vec<EvalValue> = args.iter().cloned().map(EvalValue::from_value).collect();
     evaluate_builtin(name, &eval_args)
 }
 
@@ -403,8 +399,7 @@ pub(crate) fn evaluate_builtin_with_config_to_value(
     args: &[Value],
     config: &ProviderContext,
 ) -> Result<Value, String> {
-    let eval_args: Vec<EvalValue> =
-        args.iter().cloned().map(EvalValue::from_value).collect();
+    let eval_args: Vec<EvalValue> = args.iter().cloned().map(EvalValue::from_value).collect();
     let result = evaluate_builtin_with_config(name, &eval_args, config)?;
     result.into_value().map_err(|leak| {
         format!(
