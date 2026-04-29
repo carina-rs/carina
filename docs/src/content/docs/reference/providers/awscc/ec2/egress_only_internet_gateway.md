@@ -1,6 +1,6 @@
 ---
-title: "awscc.ec2.egress_only_internet_gateway"
-description: "AWSCC EC2 egress_only_internet_gateway resource reference"
+title: "awscc.ec2.EgressOnlyInternetGateway"
+description: "AWSCC EC2 EgressOnlyInternetGateway resource reference"
 ---
 
 
@@ -11,11 +11,11 @@ Resource Type definition for AWS::EC2::EgressOnlyInternetGateway
 ## Example
 
 ```crn
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 }
 
-awscc.ec2.egress_only_internet_gateway {
+awscc.ec2.EgressOnlyInternetGateway {
   vpc_id = vpc.vpc_id
 
   tags = {

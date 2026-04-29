@@ -1,6 +1,6 @@
 ---
-title: "awscc.ec2.subnet"
-description: "AWSCC EC2 subnet resource reference"
+title: "awscc.ec2.Subnet"
+description: "AWSCC EC2 Subnet resource reference"
 ---
 
 
@@ -13,13 +13,13 @@ Specifies a subnet for the specified VPC.
 ## Example
 
 ```crn
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block           = '10.0.0.0/16'
   enable_dns_support   = true
   enable_dns_hostnames = true
 }
 
-awscc.ec2.subnet {
+awscc.ec2.Subnet {
   vpc_id                  = vpc.vpc_id
   cidr_block              = '10.0.1.0/24'
   availability_zone       = 'ap-northeast-1a'
@@ -173,9 +173,9 @@ The ID of the VPC the subnet is in. If you update this property, you must also u
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `off` | `awscc.ec2.subnet.InternetGatewayBlockMode.off` |
-| `block-bidirectional` | `awscc.ec2.subnet.InternetGatewayBlockMode.block_bidirectional` |
-| `block-ingress` | `awscc.ec2.subnet.InternetGatewayBlockMode.block_ingress` |
+| `off` | `awscc.ec2.Subnet.InternetGatewayBlockMode.off` |
+| `block-bidirectional` | `awscc.ec2.Subnet.InternetGatewayBlockMode.block_bidirectional` |
+| `block-ingress` | `awscc.ec2.Subnet.InternetGatewayBlockMode.block_ingress` |
 
 Shorthand formats: `off` or `InternetGatewayBlockMode.off`
 
@@ -183,8 +183,8 @@ Shorthand formats: `off` or `InternetGatewayBlockMode.off`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ip-name` | `awscc.ec2.subnet.HostnameType.ip_name` |
-| `resource-name` | `awscc.ec2.subnet.HostnameType.resource_name` |
+| `ip-name` | `awscc.ec2.Subnet.HostnameType.ip_name` |
+| `resource-name` | `awscc.ec2.Subnet.HostnameType.resource_name` |
 
 Shorthand formats: `ip_name` or `HostnameType.ip_name`
 

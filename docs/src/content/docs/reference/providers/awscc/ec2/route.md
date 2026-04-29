@@ -1,6 +1,6 @@
 ---
-title: "awscc.ec2.route"
-description: "AWSCC EC2 route resource reference"
+title: "awscc.ec2.Route"
+description: "AWSCC EC2 Route resource reference"
 ---
 
 
@@ -13,24 +13,24 @@ Specifies a route in a route table. For more information, see [Routes](https://d
 ## Example
 
 ```crn
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block           = '10.0.0.0/16'
   enable_dns_support   = true
   enable_dns_hostnames = true
 }
 
-let igw = awscc.ec2.internet_gateway {}
+let igw = awscc.ec2.InternetGateway {}
 
-let igw_attachment = awscc.ec2.vpc_gateway_attachment {
+let igw_attachment = awscc.ec2.VpcGatewayAttachment {
   vpc_id              = vpc.vpc_id
   internet_gateway_id = igw.internet_gateway_id
 }
 
-let rt = awscc.ec2.route_table {
+let rt = awscc.ec2.RouteTable {
   vpc_id = vpc.vpc_id
 }
 
-awscc.ec2.route {
+awscc.ec2.Route {
   route_table_id         = rt.route_table_id
   destination_cidr_block = '0.0.0.0/0'
   gateway_id             = igw_attachment.internet_gateway_id

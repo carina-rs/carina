@@ -1,6 +1,6 @@
 ---
-title: "awscc.ec2.security_group"
-description: "AWSCC EC2 security_group resource reference"
+title: "awscc.ec2.SecurityGroup"
+description: "AWSCC EC2 SecurityGroup resource reference"
 ---
 
 
@@ -11,11 +11,11 @@ Resource Type definition for AWS::EC2::SecurityGroup
 ## Example
 
 ```crn
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 }
 
-awscc.ec2.security_group {
+awscc.ec2.SecurityGroup {
   vpc_id            = vpc.vpc_id
   group_description = 'Example security group'
 
@@ -92,12 +92,12 @@ The ID of the VPC for the security group.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `tcp` | `awscc.ec2.security_group.IpProtocol.tcp` |
-| `udp` | `awscc.ec2.security_group.IpProtocol.udp` |
-| `icmp` | `awscc.ec2.security_group.IpProtocol.icmp` |
-| `icmpv6` | `awscc.ec2.security_group.IpProtocol.icmpv6` |
-| `-1` | `awscc.ec2.security_group.IpProtocol.all` |
-| `all` | `awscc.ec2.security_group.IpProtocol.all` |
+| `tcp` | `awscc.ec2.SecurityGroup.IpProtocol.tcp` |
+| `udp` | `awscc.ec2.SecurityGroup.IpProtocol.udp` |
+| `icmp` | `awscc.ec2.SecurityGroup.IpProtocol.icmp` |
+| `icmpv6` | `awscc.ec2.SecurityGroup.IpProtocol.icmpv6` |
+| `-1` | `awscc.ec2.SecurityGroup.IpProtocol.all` |
+| `all` | `awscc.ec2.SecurityGroup.IpProtocol.all` |
 
 Shorthand formats: `tcp` or `IpProtocol.tcp`
 
@@ -135,7 +135,7 @@ Shorthand formats: `tcp` or `IpProtocol.tcp`
 
 ### `group_id`
 
-- **Type:** String
+- **Type:** SecurityGroupId
 
 The group ID of the specified security group.
 

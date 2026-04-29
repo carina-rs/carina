@@ -1,6 +1,6 @@
 ---
-title: "awscc.identitystore.group"
-description: "AWSCC IDENTITYSTORE group resource reference"
+title: "awscc.identitystore.Group"
+description: "AWSCC IDENTITYSTORE Group resource reference"
 ---
 
 

@@ -1,6 +1,6 @@
 ---
-title: "awscc.iam.role"
-description: "AWSCC IAM role resource reference"
+title: "awscc.iam.Role"
+description: "AWSCC IAM Role resource reference"
 ---
 
 
@@ -12,7 +12,7 @@ Creates a new role for your AWS-account.
 ## Example
 
 ```crn
-awscc.iam.role {
+awscc.iam.Role {
   role_name = 'my-example-role'
 
   assume_role_policy_document = {

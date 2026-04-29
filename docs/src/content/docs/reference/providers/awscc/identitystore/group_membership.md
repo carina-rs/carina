@@ -1,6 +1,6 @@
 ---
-title: "awscc.identitystore.group_membership"
-description: "AWSCC IDENTITYSTORE group_membership resource reference"
+title: "awscc.identitystore.GroupMembership"
+description: "AWSCC IDENTITYSTORE GroupMembership resource reference"
 ---
 
 

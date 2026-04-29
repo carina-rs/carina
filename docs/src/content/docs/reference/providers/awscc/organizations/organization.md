@@ -1,6 +1,6 @@
 ---
-title: "awscc.organizations.organization"
-description: "AWSCC ORGANIZATIONS organization resource reference"
+title: "awscc.organizations.Organization"
+description: "AWSCC ORGANIZATIONS Organization resource reference"
 ---
 
 
@@ -24,8 +24,8 @@ Specifies the feature set supported by the new organization. Each feature set su
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ALL` | `awscc.organizations.organization.FeatureSet.ALL` |
-| `CONSOLIDATED_BILLING` | `awscc.organizations.organization.FeatureSet.CONSOLIDATED_BILLING` |
+| `ALL` | `awscc.organizations.Organization.FeatureSet.ALL` |
+| `CONSOLIDATED_BILLING` | `awscc.organizations.Organization.FeatureSet.CONSOLIDATED_BILLING` |
 
 Shorthand formats: `ALL` or `FeatureSet.ALL`
 

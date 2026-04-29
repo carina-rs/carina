@@ -1,6 +1,6 @@
 ---
-title: "awscc.organizations.account"
-description: "AWSCC ORGANIZATIONS account resource reference"
+title: "awscc.organizations.Account"
+description: "AWSCC ORGANIZATIONS Account resource reference"
 ---
 
 
@@ -53,8 +53,8 @@ A list of tags that you want to attach to the newly created account. For each ta
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `INVITED` | `awscc.organizations.account.JoinedMethod.INVITED` |
-| `CREATED` | `awscc.organizations.account.JoinedMethod.CREATED` |
+| `INVITED` | `awscc.organizations.Account.JoinedMethod.INVITED` |
+| `CREATED` | `awscc.organizations.Account.JoinedMethod.CREATED` |
 
 Shorthand formats: `INVITED` or `JoinedMethod.INVITED`
 
@@ -62,11 +62,11 @@ Shorthand formats: `INVITED` or `JoinedMethod.INVITED`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `PENDING_ACTIVATION` | `awscc.organizations.account.State.PENDING_ACTIVATION` |
-| `ACTIVE` | `awscc.organizations.account.State.ACTIVE` |
-| `SUSPENDED` | `awscc.organizations.account.State.SUSPENDED` |
-| `PENDING_CLOSURE` | `awscc.organizations.account.State.PENDING_CLOSURE` |
-| `CLOSED` | `awscc.organizations.account.State.CLOSED` |
+| `PENDING_ACTIVATION` | `awscc.organizations.Account.State.PENDING_ACTIVATION` |
+| `ACTIVE` | `awscc.organizations.Account.State.ACTIVE` |
+| `SUSPENDED` | `awscc.organizations.Account.State.SUSPENDED` |
+| `PENDING_CLOSURE` | `awscc.organizations.Account.State.PENDING_CLOSURE` |
+| `CLOSED` | `awscc.organizations.Account.State.CLOSED` |
 
 Shorthand formats: `PENDING_ACTIVATION` or `State.PENDING_ACTIVATION`
 
@@ -74,9 +74,9 @@ Shorthand formats: `PENDING_ACTIVATION` or `State.PENDING_ACTIVATION`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ACTIVE` | `awscc.organizations.account.Status.ACTIVE` |
-| `SUSPENDED` | `awscc.organizations.account.Status.SUSPENDED` |
-| `PENDING_CLOSURE` | `awscc.organizations.account.Status.PENDING_CLOSURE` |
+| `ACTIVE` | `awscc.organizations.Account.Status.ACTIVE` |
+| `SUSPENDED` | `awscc.organizations.Account.Status.SUSPENDED` |
+| `PENDING_CLOSURE` | `awscc.organizations.Account.Status.PENDING_CLOSURE` |
 
 Shorthand formats: `ACTIVE` or `Status.ACTIVE`
 
@@ -105,6 +105,12 @@ The method by which the account joined the organization.
 - **Type:** String
 
 The date the account became a part of the organization.
+
+### `paths`
+
+- **Type:** `List<String>`
+
+The paths in the organization where the account exists.
 
 ### `state`
 

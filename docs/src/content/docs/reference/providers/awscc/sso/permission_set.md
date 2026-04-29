@@ -1,6 +1,6 @@
 ---
-title: "awscc.sso.permission_set"
-description: "AWSCC SSO permission_set resource reference"
+title: "awscc.sso.PermissionSet"
+description: "AWSCC SSO PermissionSet resource reference"
 ---
 
 
@@ -31,7 +31,7 @@ The inline policy to put in permission set.
 
 ### `instance_arn`
 
-- **Type:** Arn
+- **Type:** String(pattern, len: 10..=1224)
 - **Required:** Yes
 - **Create-only:** Yes
 
@@ -94,7 +94,7 @@ The length of time that a user can be signed in to an AWS account.
 
 ### `permission_set_arn`
 
-- **Type:** Arn
+- **Type:** String(pattern, len: 10..=1224)
 
 The permission set that the policy will be attached to
 

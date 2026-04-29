@@ -1,6 +1,6 @@
 ---
-title: "awscc.ec2.flow_log"
-description: "AWSCC EC2 flow_log resource reference"
+title: "awscc.ec2.FlowLog"
+description: "AWSCC EC2 FlowLog resource reference"
 ---
 
 
@@ -11,11 +11,11 @@ Specifies a VPC flow log, which enables you to capture IP traffic for a specific
 ## Example
 
 ```crn
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 }
 
-awscc.ec2.flow_log {
+awscc.ec2.FlowLog {
   resource_id          = vpc.vpc_id
   resource_type        = VPC
   traffic_type         = ALL
@@ -129,8 +129,8 @@ The type of traffic to log. You can log traffic that the resource accepts or rej
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `plain-text` | `awscc.ec2.flow_log.FileFormat.plain_text` |
-| `parquet` | `awscc.ec2.flow_log.FileFormat.parquet` |
+| `plain-text` | `awscc.ec2.FlowLog.FileFormat.plain_text` |
+| `parquet` | `awscc.ec2.FlowLog.FileFormat.parquet` |
 
 Shorthand formats: `plain_text` or `FileFormat.plain_text`
 
@@ -138,9 +138,9 @@ Shorthand formats: `plain_text` or `FileFormat.plain_text`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `cloud-watch-logs` | `awscc.ec2.flow_log.LogDestinationType.cloud_watch_logs` |
-| `s3` | `awscc.ec2.flow_log.LogDestinationType.s3` |
-| `kinesis-data-firehose` | `awscc.ec2.flow_log.LogDestinationType.kinesis_data_firehose` |
+| `cloud-watch-logs` | `awscc.ec2.FlowLog.LogDestinationType.cloud_watch_logs` |
+| `s3` | `awscc.ec2.FlowLog.LogDestinationType.s3` |
+| `kinesis-data-firehose` | `awscc.ec2.FlowLog.LogDestinationType.kinesis_data_firehose` |
 
 Shorthand formats: `cloud_watch_logs` or `LogDestinationType.cloud_watch_logs`
 
@@ -148,12 +148,12 @@ Shorthand formats: `cloud_watch_logs` or `LogDestinationType.cloud_watch_logs`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `NetworkInterface` | `awscc.ec2.flow_log.ResourceType.NetworkInterface` |
-| `Subnet` | `awscc.ec2.flow_log.ResourceType.Subnet` |
-| `VPC` | `awscc.ec2.flow_log.ResourceType.VPC` |
-| `TransitGateway` | `awscc.ec2.flow_log.ResourceType.TransitGateway` |
-| `TransitGatewayAttachment` | `awscc.ec2.flow_log.ResourceType.TransitGatewayAttachment` |
-| `RegionalNatGateway` | `awscc.ec2.flow_log.ResourceType.RegionalNatGateway` |
+| `NetworkInterface` | `awscc.ec2.FlowLog.ResourceType.NetworkInterface` |
+| `Subnet` | `awscc.ec2.FlowLog.ResourceType.Subnet` |
+| `VPC` | `awscc.ec2.FlowLog.ResourceType.VPC` |
+| `TransitGateway` | `awscc.ec2.FlowLog.ResourceType.TransitGateway` |
+| `TransitGatewayAttachment` | `awscc.ec2.FlowLog.ResourceType.TransitGatewayAttachment` |
+| `RegionalNatGateway` | `awscc.ec2.FlowLog.ResourceType.RegionalNatGateway` |
 
 Shorthand formats: `NetworkInterface` or `ResourceType.NetworkInterface`
 
@@ -161,9 +161,9 @@ Shorthand formats: `NetworkInterface` or `ResourceType.NetworkInterface`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ACCEPT` | `awscc.ec2.flow_log.TrafficType.ACCEPT` |
-| `ALL` | `awscc.ec2.flow_log.TrafficType.ALL` |
-| `REJECT` | `awscc.ec2.flow_log.TrafficType.REJECT` |
+| `ACCEPT` | `awscc.ec2.FlowLog.TrafficType.ACCEPT` |
+| `ALL` | `awscc.ec2.FlowLog.TrafficType.ALL` |
+| `REJECT` | `awscc.ec2.FlowLog.TrafficType.REJECT` |
 
 Shorthand formats: `ACCEPT` or `TrafficType.ACCEPT`
 

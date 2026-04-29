@@ -1,6 +1,6 @@
 ---
-title: "awscc.route53.hosted_zone"
-description: "AWSCC ROUTE53 hosted_zone resource reference"
+title: "awscc.route53.HostedZone"
+description: "AWSCC ROUTE53 HostedZone resource reference"
 ---
 
 

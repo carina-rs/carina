@@ -1,6 +1,6 @@
 ---
-title: "awscc.ec2.vpc_endpoint"
-description: "AWSCC EC2 vpc_endpoint resource reference"
+title: "awscc.ec2.VpcEndpoint"
+description: "AWSCC EC2 VpcEndpoint resource reference"
 ---
 
 
@@ -14,24 +14,24 @@ Specifies a VPC endpoint. A VPC endpoint provides a private connection between y
 ## Example
 
 ```crn
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block           = '10.0.0.0/16'
   enable_dns_support   = true
   enable_dns_hostnames = true
 }
 
-let subnet = awscc.ec2.subnet {
+let subnet = awscc.ec2.Subnet {
   vpc_id            = vpc.vpc_id
   cidr_block        = '10.0.100.0/24'
   availability_zone = 'ap-northeast-1a'
 }
 
-let sg = awscc.ec2.security_group {
+let sg = awscc.ec2.SecurityGroup {
   vpc_id            = vpc.vpc_id
   group_description = 'SG for VPC Endpoint'
 }
 
-awscc.ec2.security_group_ingress {
+awscc.ec2.SecurityGroupIngress {
   group_id    = sg.group_id
   description = 'Allow HTTPS from VPC'
   ip_protocol = 'tcp'
@@ -40,7 +40,7 @@ awscc.ec2.security_group_ingress {
   cidr_ip     = '10.0.0.0/16'
 }
 
-awscc.ec2.vpc_endpoint {
+awscc.ec2.VpcEndpoint {
   vpc_id              = vpc.vpc_id
   service_name        = 'com.amazonaws.ap-northeast-1.ecr.dkr'
   vpc_endpoint_type   = 'Interface'
@@ -162,11 +162,11 @@ The ID of the VPC.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ipv4` | `awscc.ec2.vpc_endpoint.DnsRecordIpType.ipv4` |
-| `ipv6` | `awscc.ec2.vpc_endpoint.DnsRecordIpType.ipv6` |
-| `dualstack` | `awscc.ec2.vpc_endpoint.DnsRecordIpType.dualstack` |
-| `service-defined` | `awscc.ec2.vpc_endpoint.DnsRecordIpType.service_defined` |
-| `not-specified` | `awscc.ec2.vpc_endpoint.DnsRecordIpType.not_specified` |
+| `ipv4` | `awscc.ec2.VpcEndpoint.DnsRecordIpType.ipv4` |
+| `ipv6` | `awscc.ec2.VpcEndpoint.DnsRecordIpType.ipv6` |
+| `dualstack` | `awscc.ec2.VpcEndpoint.DnsRecordIpType.dualstack` |
+| `service-defined` | `awscc.ec2.VpcEndpoint.DnsRecordIpType.service_defined` |
+| `not-specified` | `awscc.ec2.VpcEndpoint.DnsRecordIpType.not_specified` |
 
 Shorthand formats: `ipv4` or `DnsRecordIpType.ipv4`
 
@@ -174,9 +174,9 @@ Shorthand formats: `ipv4` or `DnsRecordIpType.ipv4`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `OnlyInboundResolver` | `awscc.ec2.vpc_endpoint.PrivateDnsOnlyForInboundResolverEndpoint.OnlyInboundResolver` |
-| `AllResolvers` | `awscc.ec2.vpc_endpoint.PrivateDnsOnlyForInboundResolverEndpoint.AllResolvers` |
-| `NotSpecified` | `awscc.ec2.vpc_endpoint.PrivateDnsOnlyForInboundResolverEndpoint.NotSpecified` |
+| `OnlyInboundResolver` | `awscc.ec2.VpcEndpoint.PrivateDnsOnlyForInboundResolverEndpoint.OnlyInboundResolver` |
+| `AllResolvers` | `awscc.ec2.VpcEndpoint.PrivateDnsOnlyForInboundResolverEndpoint.AllResolvers` |
+| `NotSpecified` | `awscc.ec2.VpcEndpoint.PrivateDnsOnlyForInboundResolverEndpoint.NotSpecified` |
 
 Shorthand formats: `OnlyInboundResolver` or `PrivateDnsOnlyForInboundResolverEndpoint.OnlyInboundResolver`
 
@@ -184,10 +184,10 @@ Shorthand formats: `OnlyInboundResolver` or `PrivateDnsOnlyForInboundResolverEnd
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `VERIFIED_DOMAINS_ONLY` | `awscc.ec2.vpc_endpoint.PrivateDnsPreference.VERIFIED_DOMAINS_ONLY` |
-| `ALL_DOMAINS` | `awscc.ec2.vpc_endpoint.PrivateDnsPreference.ALL_DOMAINS` |
-| `VERIFIED_DOMAINS_AND_SPECIFIED_DOMAINS` | `awscc.ec2.vpc_endpoint.PrivateDnsPreference.VERIFIED_DOMAINS_AND_SPECIFIED_DOMAINS` |
-| `SPECIFIED_DOMAINS_ONLY` | `awscc.ec2.vpc_endpoint.PrivateDnsPreference.SPECIFIED_DOMAINS_ONLY` |
+| `VERIFIED_DOMAINS_ONLY` | `awscc.ec2.VpcEndpoint.PrivateDnsPreference.VERIFIED_DOMAINS_ONLY` |
+| `ALL_DOMAINS` | `awscc.ec2.VpcEndpoint.PrivateDnsPreference.ALL_DOMAINS` |
+| `VERIFIED_DOMAINS_AND_SPECIFIED_DOMAINS` | `awscc.ec2.VpcEndpoint.PrivateDnsPreference.VERIFIED_DOMAINS_AND_SPECIFIED_DOMAINS` |
+| `SPECIFIED_DOMAINS_ONLY` | `awscc.ec2.VpcEndpoint.PrivateDnsPreference.SPECIFIED_DOMAINS_ONLY` |
 
 Shorthand formats: `VERIFIED_DOMAINS_ONLY` or `PrivateDnsPreference.VERIFIED_DOMAINS_ONLY`
 
@@ -195,10 +195,10 @@ Shorthand formats: `VERIFIED_DOMAINS_ONLY` or `PrivateDnsPreference.VERIFIED_DOM
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ipv4` | `awscc.ec2.vpc_endpoint.IpAddressType.ipv4` |
-| `ipv6` | `awscc.ec2.vpc_endpoint.IpAddressType.ipv6` |
-| `dualstack` | `awscc.ec2.vpc_endpoint.IpAddressType.dualstack` |
-| `not-specified` | `awscc.ec2.vpc_endpoint.IpAddressType.not_specified` |
+| `ipv4` | `awscc.ec2.VpcEndpoint.IpAddressType.ipv4` |
+| `ipv6` | `awscc.ec2.VpcEndpoint.IpAddressType.ipv6` |
+| `dualstack` | `awscc.ec2.VpcEndpoint.IpAddressType.dualstack` |
+| `not-specified` | `awscc.ec2.VpcEndpoint.IpAddressType.not_specified` |
 
 Shorthand formats: `ipv4` or `IpAddressType.ipv4`
 
@@ -206,11 +206,11 @@ Shorthand formats: `ipv4` or `IpAddressType.ipv4`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `Interface` | `awscc.ec2.vpc_endpoint.VpcEndpointType.Interface` |
-| `Gateway` | `awscc.ec2.vpc_endpoint.VpcEndpointType.Gateway` |
-| `GatewayLoadBalancer` | `awscc.ec2.vpc_endpoint.VpcEndpointType.GatewayLoadBalancer` |
-| `ServiceNetwork` | `awscc.ec2.vpc_endpoint.VpcEndpointType.ServiceNetwork` |
-| `Resource` | `awscc.ec2.vpc_endpoint.VpcEndpointType.Resource` |
+| `Interface` | `awscc.ec2.VpcEndpoint.VpcEndpointType.Interface` |
+| `Gateway` | `awscc.ec2.VpcEndpoint.VpcEndpointType.Gateway` |
+| `GatewayLoadBalancer` | `awscc.ec2.VpcEndpoint.VpcEndpointType.GatewayLoadBalancer` |
+| `ServiceNetwork` | `awscc.ec2.VpcEndpoint.VpcEndpointType.ServiceNetwork` |
+| `Resource` | `awscc.ec2.VpcEndpoint.VpcEndpointType.Resource` |
 
 Shorthand formats: `Interface` or `VpcEndpointType.Interface`
 

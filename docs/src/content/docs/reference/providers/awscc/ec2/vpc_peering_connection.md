@@ -1,6 +1,6 @@
 ---
-title: "awscc.ec2.vpc_peering_connection"
-description: "AWSCC EC2 vpc_peering_connection resource reference"
+title: "awscc.ec2.VpcPeeringConnection"
+description: "AWSCC EC2 VpcPeeringConnection resource reference"
 ---
 
 
@@ -11,15 +11,15 @@ Resource Type definition for AWS::EC2::VPCPeeringConnection
 ## Example
 
 ```crn
-let vpc1 = awscc.ec2.vpc {
+let vpc1 = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 }
 
-let vpc2 = awscc.ec2.vpc {
+let vpc2 = awscc.ec2.Vpc {
   cidr_block = '10.1.0.0/16'
 }
 
-awscc.ec2.vpc_peering_connection {
+awscc.ec2.VpcPeeringConnection {
   vpc_id      = vpc1.vpc_id
   peer_vpc_id = vpc2.vpc_id
 

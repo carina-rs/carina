@@ -1,6 +1,6 @@
 ---
-title: "awscc.sso.instance"
-description: "AWSCC SSO instance resource reference"
+title: "awscc.sso.Instance"
+description: "AWSCC SSO Instance resource reference"
 ---
 
 
@@ -28,9 +28,9 @@ The name you want to assign to this Identity Center (SSO) Instance
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `CREATE_IN_PROGRESS` | `awscc.sso.instance.Status.CREATE_IN_PROGRESS` |
-| `DELETE_IN_PROGRESS` | `awscc.sso.instance.Status.DELETE_IN_PROGRESS` |
-| `ACTIVE` | `awscc.sso.instance.Status.ACTIVE` |
+| `CREATE_IN_PROGRESS` | `awscc.sso.Instance.Status.CREATE_IN_PROGRESS` |
+| `DELETE_IN_PROGRESS` | `awscc.sso.Instance.Status.DELETE_IN_PROGRESS` |
+| `ACTIVE` | `awscc.sso.Instance.Status.ACTIVE` |
 
 Shorthand formats: `CREATE_IN_PROGRESS` or `Status.CREATE_IN_PROGRESS`
 
@@ -44,7 +44,7 @@ The ID of the identity store associated with the created Identity Center (SSO) I
 
 ### `instance_arn`
 
-- **Type:** Arn
+- **Type:** String(pattern, len: 10..=1224)
 
 The SSO Instance ARN that is returned upon creation of the Identity Center (SSO) Instance
 

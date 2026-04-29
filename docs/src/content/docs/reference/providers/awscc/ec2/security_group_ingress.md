@@ -1,6 +1,6 @@
 ---
-title: "awscc.ec2.security_group_ingress"
-description: "AWSCC EC2 security_group_ingress resource reference"
+title: "awscc.ec2.SecurityGroupIngress"
+description: "AWSCC EC2 SecurityGroupIngress resource reference"
 ---
 
 
@@ -11,16 +11,16 @@ Resource Type definition for AWS::EC2::SecurityGroupIngress
 ## Example
 
 ```crn
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 }
 
-let sg = awscc.ec2.security_group {
+let sg = awscc.ec2.SecurityGroup {
   vpc_id            = vpc.vpc_id
   group_description = 'Example security group'
 }
 
-awscc.ec2.security_group_ingress {
+awscc.ec2.SecurityGroupIngress {
   group_id    = sg.group_id
   description = 'Allow HTTPS from VPC'
   ip_protocol = 'tcp'
@@ -65,7 +65,7 @@ The start of port range for the TCP and UDP protocols, or an ICMP/ICMPv6 type nu
 
 ### `group_id`
 
-- **Type:** String
+- **Type:** SecurityGroupId
 - **Required:** No
 - **Create-only:** Yes
 
@@ -133,12 +133,12 @@ The end of port range for the TCP and UDP protocols, or an ICMP/ICMPv6 code. A v
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `tcp` | `awscc.ec2.security_group_ingress.IpProtocol.tcp` |
-| `udp` | `awscc.ec2.security_group_ingress.IpProtocol.udp` |
-| `icmp` | `awscc.ec2.security_group_ingress.IpProtocol.icmp` |
-| `icmpv6` | `awscc.ec2.security_group_ingress.IpProtocol.icmpv6` |
-| `-1` | `awscc.ec2.security_group_ingress.IpProtocol.all` |
-| `all` | `awscc.ec2.security_group_ingress.IpProtocol.all` |
+| `tcp` | `awscc.ec2.SecurityGroupIngress.IpProtocol.tcp` |
+| `udp` | `awscc.ec2.SecurityGroupIngress.IpProtocol.udp` |
+| `icmp` | `awscc.ec2.SecurityGroupIngress.IpProtocol.icmp` |
+| `icmpv6` | `awscc.ec2.SecurityGroupIngress.IpProtocol.icmpv6` |
+| `-1` | `awscc.ec2.SecurityGroupIngress.IpProtocol.all` |
+| `all` | `awscc.ec2.SecurityGroupIngress.IpProtocol.all` |
 
 Shorthand formats: `tcp` or `IpProtocol.tcp`
 

@@ -1,6 +1,6 @@
 ---
-title: "awscc.ec2.ipam"
-description: "AWSCC EC2 ipam resource reference"
+title: "awscc.ec2.Ipam"
+description: "AWSCC EC2 Ipam resource reference"
 ---
 
 
@@ -11,7 +11,7 @@ Resource Schema of AWS::EC2::IPAM Type
 ## Example
 
 ```crn
-awscc.ec2.ipam {
+awscc.ec2.Ipam {
   description = 'Example IPAM'
   tier        = free
 
@@ -80,8 +80,8 @@ The tier of the IPAM.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ipam-owner` | `awscc.ec2.ipam.MeteredAccount.ipam_owner` |
-| `resource-owner` | `awscc.ec2.ipam.MeteredAccount.resource_owner` |
+| `ipam-owner` | `awscc.ec2.Ipam.MeteredAccount.ipam_owner` |
+| `resource-owner` | `awscc.ec2.Ipam.MeteredAccount.resource_owner` |
 
 Shorthand formats: `ipam_owner` or `MeteredAccount.ipam_owner`
 
@@ -89,8 +89,8 @@ Shorthand formats: `ipam_owner` or `MeteredAccount.ipam_owner`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `free` | `awscc.ec2.ipam.Tier.free` |
-| `advanced` | `awscc.ec2.ipam.Tier.advanced` |
+| `free` | `awscc.ec2.Ipam.Tier.free` |
+| `advanced` | `awscc.ec2.Ipam.Tier.advanced` |
 
 Shorthand formats: `free` or `Tier.free`
 

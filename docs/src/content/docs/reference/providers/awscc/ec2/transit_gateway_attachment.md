@@ -1,6 +1,6 @@
 ---
-title: "awscc.ec2.transit_gateway_attachment"
-description: "AWSCC EC2 transit_gateway_attachment resource reference"
+title: "awscc.ec2.TransitGatewayAttachment"
+description: "AWSCC EC2 TransitGatewayAttachment resource reference"
 ---
 
 
@@ -11,21 +11,21 @@ Resource Type definition for AWS::EC2::TransitGatewayAttachment
 ## Example
 
 ```crn
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 }
 
-let subnet = awscc.ec2.subnet {
+let subnet = awscc.ec2.Subnet {
   vpc_id            = vpc.vpc_id
   cidr_block        = '10.0.1.0/24'
   availability_zone = 'ap-northeast-1a'
 }
 
-let tgw = awscc.ec2.transit_gateway {
+let tgw = awscc.ec2.TransitGateway {
   description = 'Example Transit Gateway'
 }
 
-awscc.ec2.transit_gateway_attachment {
+awscc.ec2.TransitGatewayAttachment {
   transit_gateway_id = tgw.id
   vpc_id             = vpc.vpc_id
   subnet_ids         = [subnet.subnet_id]
@@ -73,8 +73,8 @@ The options for the transit gateway vpc attachment.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `enable` | `awscc.ec2.transit_gateway_attachment.ApplianceModeSupport.enable` |
-| `disable` | `awscc.ec2.transit_gateway_attachment.ApplianceModeSupport.disable` |
+| `enable` | `awscc.ec2.TransitGatewayAttachment.ApplianceModeSupport.enable` |
+| `disable` | `awscc.ec2.TransitGatewayAttachment.ApplianceModeSupport.disable` |
 
 Shorthand formats: `enable` or `ApplianceModeSupport.enable`
 
@@ -82,8 +82,8 @@ Shorthand formats: `enable` or `ApplianceModeSupport.enable`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `enable` | `awscc.ec2.transit_gateway_attachment.DnsSupport.enable` |
-| `disable` | `awscc.ec2.transit_gateway_attachment.DnsSupport.disable` |
+| `enable` | `awscc.ec2.TransitGatewayAttachment.DnsSupport.enable` |
+| `disable` | `awscc.ec2.TransitGatewayAttachment.DnsSupport.disable` |
 
 Shorthand formats: `enable` or `DnsSupport.enable`
 
@@ -91,8 +91,8 @@ Shorthand formats: `enable` or `DnsSupport.enable`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `enable` | `awscc.ec2.transit_gateway_attachment.Ipv6Support.enable` |
-| `disable` | `awscc.ec2.transit_gateway_attachment.Ipv6Support.disable` |
+| `enable` | `awscc.ec2.TransitGatewayAttachment.Ipv6Support.enable` |
+| `disable` | `awscc.ec2.TransitGatewayAttachment.Ipv6Support.disable` |
 
 Shorthand formats: `enable` or `Ipv6Support.enable`
 
@@ -100,8 +100,8 @@ Shorthand formats: `enable` or `Ipv6Support.enable`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `enable` | `awscc.ec2.transit_gateway_attachment.SecurityGroupReferencingSupport.enable` |
-| `disable` | `awscc.ec2.transit_gateway_attachment.SecurityGroupReferencingSupport.disable` |
+| `enable` | `awscc.ec2.TransitGatewayAttachment.SecurityGroupReferencingSupport.enable` |
+| `disable` | `awscc.ec2.TransitGatewayAttachment.SecurityGroupReferencingSupport.disable` |
 
 Shorthand formats: `enable` or `SecurityGroupReferencingSupport.enable`
 

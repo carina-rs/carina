@@ -1,6 +1,6 @@
 ---
-title: "awscc.logs.log_group"
-description: "AWSCC LOGS log_group resource reference"
+title: "awscc.logs.LogGroup"
+description: "AWSCC LOGS LogGroup resource reference"
 ---
 
 
@@ -15,7 +15,7 @@ The ``AWS::Logs::LogGroup`` resource specifies a log group. A log group defines 
 ## Example
 
 ```crn
-awscc.logs.log_group {
+awscc.logs.LogGroup {
   log_group_name    = '/example/my-app'
   retention_in_days = 30
 
@@ -33,7 +33,7 @@ awscc.logs.log_group {
 - **Required:** No
 - **Default:** `false`
 
-
+Indicates whether bearer token authentication is enabled for this log group. When enabled, bearer token authentication is allowed on operations until it is explicitly disabled.
 
 ### `data_protection_policy`
 
@@ -107,9 +107,9 @@ An array of key-value pairs to apply to the log group. For more information, see
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `STANDARD` | `awscc.logs.log_group.LogGroupClass.STANDARD` |
-| `INFREQUENT_ACCESS` | `awscc.logs.log_group.LogGroupClass.INFREQUENT_ACCESS` |
-| `DELIVERY` | `awscc.logs.log_group.LogGroupClass.DELIVERY` |
+| `STANDARD` | `awscc.logs.LogGroup.LogGroupClass.STANDARD` |
+| `INFREQUENT_ACCESS` | `awscc.logs.LogGroup.LogGroupClass.INFREQUENT_ACCESS` |
+| `DELIVERY` | `awscc.logs.LogGroup.LogGroupClass.DELIVERY` |
 
 Shorthand formats: `STANDARD` or `LogGroupClass.STANDARD`
 

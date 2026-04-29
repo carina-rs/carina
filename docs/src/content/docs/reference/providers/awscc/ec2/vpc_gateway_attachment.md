@@ -1,6 +1,6 @@
 ---
-title: "awscc.ec2.vpc_gateway_attachment"
-description: "AWSCC EC2 vpc_gateway_attachment resource reference"
+title: "awscc.ec2.VpcGatewayAttachment"
+description: "AWSCC EC2 VpcGatewayAttachment resource reference"
 ---
 
 
@@ -11,15 +11,15 @@ Resource Type definition for AWS::EC2::VPCGatewayAttachment
 ## Example
 
 ```crn
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   cidr_block           = '10.0.0.0/16'
   enable_dns_support   = true
   enable_dns_hostnames = true
 }
 
-let igw = awscc.ec2.internet_gateway {}
+let igw = awscc.ec2.InternetGateway {}
 
-awscc.ec2.vpc_gateway_attachment {
+awscc.ec2.VpcGatewayAttachment {
   vpc_id              = vpc.vpc_id
   internet_gateway_id = igw.internet_gateway_id
 }

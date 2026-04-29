@@ -1,6 +1,6 @@
 ---
-title: "awscc.s3.bucket"
-description: "AWSCC S3 bucket resource reference"
+title: "awscc.s3.Bucket"
+description: "AWSCC S3 Bucket resource reference"
 ---
 
 
@@ -13,7 +13,7 @@ The ``AWS::S3::Bucket`` resource creates an Amazon S3 bucket in the same AWS Reg
 ## Example
 
 ```crn
-awscc.s3.bucket {
+awscc.s3.Bucket {
   bucket_name = 'my-example-bucket'
 
   versioning_configuration = {
@@ -215,8 +215,8 @@ Information used to configure the bucket as a static website. For more informati
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `Enabled` | `awscc.s3.bucket.AbacStatus.Enabled` |
-| `Disabled` | `awscc.s3.bucket.AbacStatus.Disabled` |
+| `Enabled` | `awscc.s3.Bucket.AbacStatus.Enabled` |
+| `Disabled` | `awscc.s3.Bucket.AbacStatus.Disabled` |
 
 Shorthand formats: `Enabled` or `AbacStatus.Enabled`
 
@@ -224,8 +224,8 @@ Shorthand formats: `Enabled` or `AbacStatus.Enabled`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `Enabled` | `awscc.s3.bucket.AccelerationStatus.Enabled` |
-| `Suspended` | `awscc.s3.bucket.AccelerationStatus.Suspended` |
+| `Enabled` | `awscc.s3.Bucket.AccelerationStatus.Enabled` |
+| `Suspended` | `awscc.s3.Bucket.AccelerationStatus.Suspended` |
 
 Shorthand formats: `Enabled` or `AccelerationStatus.Enabled`
 
@@ -233,14 +233,14 @@ Shorthand formats: `Enabled` or `AccelerationStatus.Enabled`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `AuthenticatedRead` | `awscc.s3.bucket.AccessControl.AuthenticatedRead` |
-| `AwsExecRead` | `awscc.s3.bucket.AccessControl.AwsExecRead` |
-| `BucketOwnerFullControl` | `awscc.s3.bucket.AccessControl.BucketOwnerFullControl` |
-| `BucketOwnerRead` | `awscc.s3.bucket.AccessControl.BucketOwnerRead` |
-| `LogDeliveryWrite` | `awscc.s3.bucket.AccessControl.LogDeliveryWrite` |
-| `Private` | `awscc.s3.bucket.AccessControl.Private` |
-| `PublicRead` | `awscc.s3.bucket.AccessControl.PublicRead` |
-| `PublicReadWrite` | `awscc.s3.bucket.AccessControl.PublicReadWrite` |
+| `AuthenticatedRead` | `awscc.s3.Bucket.AccessControl.AuthenticatedRead` |
+| `AwsExecRead` | `awscc.s3.Bucket.AccessControl.AwsExecRead` |
+| `BucketOwnerFullControl` | `awscc.s3.Bucket.AccessControl.BucketOwnerFullControl` |
+| `BucketOwnerRead` | `awscc.s3.Bucket.AccessControl.BucketOwnerRead` |
+| `LogDeliveryWrite` | `awscc.s3.Bucket.AccessControl.LogDeliveryWrite` |
+| `Private` | `awscc.s3.Bucket.AccessControl.Private` |
+| `PublicRead` | `awscc.s3.Bucket.AccessControl.PublicRead` |
+| `PublicReadWrite` | `awscc.s3.Bucket.AccessControl.PublicReadWrite` |
 
 Shorthand formats: `AuthenticatedRead` or `AccessControl.AuthenticatedRead`
 
@@ -248,7 +248,7 @@ Shorthand formats: `AuthenticatedRead` or `AccessControl.AuthenticatedRead`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `Destination` | `awscc.s3.bucket.Owner.Destination` |
+| `Destination` | `awscc.s3.Bucket.Owner.Destination` |
 
 Shorthand formats: `Destination` or `Owner.Destination`
 
@@ -256,8 +256,8 @@ Shorthand formats: `Destination` or `Owner.Destination`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `NONE` | `awscc.s3.bucket.EncryptionType.NONE` |
-| `SSE-C` | `awscc.s3.bucket.EncryptionType.SSE_C` |
+| `NONE` | `awscc.s3.Bucket.EncryptionType.NONE` |
+| `SSE-C` | `awscc.s3.Bucket.EncryptionType.SSE_C` |
 
 Shorthand formats: `NONE` or `EncryptionType.NONE`
 
@@ -265,8 +265,8 @@ Shorthand formats: `NONE` or `EncryptionType.NONE`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `global` | `awscc.s3.bucket.BucketNamespace.global` |
-| `account-regional` | `awscc.s3.bucket.BucketNamespace.account_regional` |
+| `global` | `awscc.s3.Bucket.BucketNamespace.global` |
+| `account-regional` | `awscc.s3.Bucket.BucketNamespace.account_regional` |
 
 Shorthand formats: `global` or `BucketNamespace.global`
 
@@ -274,11 +274,11 @@ Shorthand formats: `global` or `BucketNamespace.global`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `GET` | `awscc.s3.bucket.AllowedMethods.GET` |
-| `PUT` | `awscc.s3.bucket.AllowedMethods.PUT` |
-| `HEAD` | `awscc.s3.bucket.AllowedMethods.HEAD` |
-| `POST` | `awscc.s3.bucket.AllowedMethods.POST` |
-| `DELETE` | `awscc.s3.bucket.AllowedMethods.DELETE` |
+| `GET` | `awscc.s3.Bucket.AllowedMethods.GET` |
+| `PUT` | `awscc.s3.Bucket.AllowedMethods.PUT` |
+| `HEAD` | `awscc.s3.Bucket.AllowedMethods.HEAD` |
+| `POST` | `awscc.s3.Bucket.AllowedMethods.POST` |
+| `DELETE` | `awscc.s3.Bucket.AllowedMethods.DELETE` |
 
 Shorthand formats: `GET` or `AllowedMethods.GET`
 
@@ -286,7 +286,7 @@ Shorthand formats: `GET` or `AllowedMethods.GET`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `V_1` | `awscc.s3.bucket.OutputSchemaVersion.V_1` |
+| `V_1` | `awscc.s3.Bucket.OutputSchemaVersion.V_1` |
 
 Shorthand formats: `V_1` or `OutputSchemaVersion.V_1`
 
@@ -294,8 +294,8 @@ Shorthand formats: `V_1` or `OutputSchemaVersion.V_1`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `COMPLIANCE` | `awscc.s3.bucket.Mode.COMPLIANCE` |
-| `GOVERNANCE` | `awscc.s3.bucket.Mode.GOVERNANCE` |
+| `COMPLIANCE` | `awscc.s3.Bucket.Mode.COMPLIANCE` |
+| `GOVERNANCE` | `awscc.s3.Bucket.Mode.GOVERNANCE` |
 
 Shorthand formats: `COMPLIANCE` or `Mode.COMPLIANCE`
 
@@ -303,8 +303,8 @@ Shorthand formats: `COMPLIANCE` or `Mode.COMPLIANCE`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `Disabled` | `awscc.s3.bucket.DeleteMarkerReplicationStatus.Disabled` |
-| `Enabled` | `awscc.s3.bucket.DeleteMarkerReplicationStatus.Enabled` |
+| `Disabled` | `awscc.s3.Bucket.DeleteMarkerReplicationStatus.Disabled` |
+| `Enabled` | `awscc.s3.Bucket.DeleteMarkerReplicationStatus.Enabled` |
 
 Shorthand formats: `Disabled` or `DeleteMarkerReplicationStatus.Disabled`
 
@@ -312,9 +312,9 @@ Shorthand formats: `Disabled` or `DeleteMarkerReplicationStatus.Disabled`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `CSV` | `awscc.s3.bucket.Format.CSV` |
-| `ORC` | `awscc.s3.bucket.Format.ORC` |
-| `Parquet` | `awscc.s3.bucket.Format.Parquet` |
+| `CSV` | `awscc.s3.Bucket.Format.CSV` |
+| `ORC` | `awscc.s3.Bucket.Format.ORC` |
+| `Parquet` | `awscc.s3.Bucket.Format.Parquet` |
 
 Shorthand formats: `CSV` or `Format.CSV`
 
@@ -322,8 +322,8 @@ Shorthand formats: `CSV` or `Format.CSV`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `Disabled` | `awscc.s3.bucket.IntelligentTieringConfigurationStatus.Disabled` |
-| `Enabled` | `awscc.s3.bucket.IntelligentTieringConfigurationStatus.Enabled` |
+| `Disabled` | `awscc.s3.Bucket.IntelligentTieringConfigurationStatus.Disabled` |
+| `Enabled` | `awscc.s3.Bucket.IntelligentTieringConfigurationStatus.Enabled` |
 
 Shorthand formats: `Disabled` or `IntelligentTieringConfigurationStatus.Disabled`
 
@@ -331,8 +331,8 @@ Shorthand formats: `Disabled` or `IntelligentTieringConfigurationStatus.Disabled
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `All` | `awscc.s3.bucket.IncludedObjectVersions.All` |
-| `Current` | `awscc.s3.bucket.IncludedObjectVersions.Current` |
+| `All` | `awscc.s3.Bucket.IncludedObjectVersions.All` |
+| `Current` | `awscc.s3.Bucket.IncludedObjectVersions.Current` |
 
 Shorthand formats: `All` or `IncludedObjectVersions.All`
 
@@ -340,22 +340,22 @@ Shorthand formats: `All` or `IncludedObjectVersions.All`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `Size` | `awscc.s3.bucket.OptionalFields.Size` |
-| `LastModifiedDate` | `awscc.s3.bucket.OptionalFields.LastModifiedDate` |
-| `StorageClass` | `awscc.s3.bucket.OptionalFields.StorageClass` |
-| `ETag` | `awscc.s3.bucket.OptionalFields.ETag` |
-| `IsMultipartUploaded` | `awscc.s3.bucket.OptionalFields.IsMultipartUploaded` |
-| `ReplicationStatus` | `awscc.s3.bucket.OptionalFields.ReplicationStatus` |
-| `EncryptionStatus` | `awscc.s3.bucket.OptionalFields.EncryptionStatus` |
-| `ObjectLockRetainUntilDate` | `awscc.s3.bucket.OptionalFields.ObjectLockRetainUntilDate` |
-| `ObjectLockMode` | `awscc.s3.bucket.OptionalFields.ObjectLockMode` |
-| `ObjectLockLegalHoldStatus` | `awscc.s3.bucket.OptionalFields.ObjectLockLegalHoldStatus` |
-| `IntelligentTieringAccessTier` | `awscc.s3.bucket.OptionalFields.IntelligentTieringAccessTier` |
-| `BucketKeyStatus` | `awscc.s3.bucket.OptionalFields.BucketKeyStatus` |
-| `ChecksumAlgorithm` | `awscc.s3.bucket.OptionalFields.ChecksumAlgorithm` |
-| `ObjectAccessControlList` | `awscc.s3.bucket.OptionalFields.ObjectAccessControlList` |
-| `ObjectOwner` | `awscc.s3.bucket.OptionalFields.ObjectOwner` |
-| `LifecycleExpirationDate` | `awscc.s3.bucket.OptionalFields.LifecycleExpirationDate` |
+| `Size` | `awscc.s3.Bucket.OptionalFields.Size` |
+| `LastModifiedDate` | `awscc.s3.Bucket.OptionalFields.LastModifiedDate` |
+| `StorageClass` | `awscc.s3.Bucket.OptionalFields.StorageClass` |
+| `ETag` | `awscc.s3.Bucket.OptionalFields.ETag` |
+| `IsMultipartUploaded` | `awscc.s3.Bucket.OptionalFields.IsMultipartUploaded` |
+| `ReplicationStatus` | `awscc.s3.Bucket.OptionalFields.ReplicationStatus` |
+| `EncryptionStatus` | `awscc.s3.Bucket.OptionalFields.EncryptionStatus` |
+| `ObjectLockRetainUntilDate` | `awscc.s3.Bucket.OptionalFields.ObjectLockRetainUntilDate` |
+| `ObjectLockMode` | `awscc.s3.Bucket.OptionalFields.ObjectLockMode` |
+| `ObjectLockLegalHoldStatus` | `awscc.s3.Bucket.OptionalFields.ObjectLockLegalHoldStatus` |
+| `IntelligentTieringAccessTier` | `awscc.s3.Bucket.OptionalFields.IntelligentTieringAccessTier` |
+| `BucketKeyStatus` | `awscc.s3.Bucket.OptionalFields.BucketKeyStatus` |
+| `ChecksumAlgorithm` | `awscc.s3.Bucket.OptionalFields.ChecksumAlgorithm` |
+| `ObjectAccessControlList` | `awscc.s3.Bucket.OptionalFields.ObjectAccessControlList` |
+| `ObjectOwner` | `awscc.s3.Bucket.OptionalFields.ObjectOwner` |
+| `LifecycleExpirationDate` | `awscc.s3.Bucket.OptionalFields.LifecycleExpirationDate` |
 
 Shorthand formats: `Size` or `OptionalFields.Size`
 
@@ -363,8 +363,8 @@ Shorthand formats: `Size` or `OptionalFields.Size`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `Daily` | `awscc.s3.bucket.ScheduleFrequency.Daily` |
-| `Weekly` | `awscc.s3.bucket.ScheduleFrequency.Weekly` |
+| `Daily` | `awscc.s3.Bucket.ScheduleFrequency.Daily` |
+| `Weekly` | `awscc.s3.Bucket.ScheduleFrequency.Weekly` |
 
 Shorthand formats: `Daily` or `ScheduleFrequency.Daily`
 
@@ -372,8 +372,8 @@ Shorthand formats: `Daily` or `ScheduleFrequency.Daily`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ENABLED` | `awscc.s3.bucket.ConfigurationState.ENABLED` |
-| `DISABLED` | `awscc.s3.bucket.ConfigurationState.DISABLED` |
+| `ENABLED` | `awscc.s3.Bucket.ConfigurationState.ENABLED` |
+| `DISABLED` | `awscc.s3.Bucket.ConfigurationState.DISABLED` |
 
 Shorthand formats: `ENABLED` or `ConfigurationState.ENABLED`
 
@@ -381,8 +381,8 @@ Shorthand formats: `ENABLED` or `ConfigurationState.ENABLED`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `varies_by_storage_class` | `awscc.s3.bucket.TransitionDefaultMinimumObjectSize.varies_by_storage_class` |
-| `all_storage_classes_128K` | `awscc.s3.bucket.TransitionDefaultMinimumObjectSize.all_storage_classes_128K` |
+| `varies_by_storage_class` | `awscc.s3.Bucket.TransitionDefaultMinimumObjectSize.varies_by_storage_class` |
+| `all_storage_classes_128K` | `awscc.s3.Bucket.TransitionDefaultMinimumObjectSize.all_storage_classes_128K` |
 
 Shorthand formats: `varies_by_storage_class` or `TransitionDefaultMinimumObjectSize.varies_by_storage_class`
 
@@ -390,8 +390,8 @@ Shorthand formats: `varies_by_storage_class` or `TransitionDefaultMinimumObjectS
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `aws` | `awscc.s3.bucket.TableBucketType.aws` |
-| `customer` | `awscc.s3.bucket.TableBucketType.customer` |
+| `aws` | `awscc.s3.Bucket.TableBucketType.aws` |
+| `customer` | `awscc.s3.Bucket.TableBucketType.customer` |
 
 Shorthand formats: `aws` or `TableBucketType.aws`
 
@@ -399,8 +399,8 @@ Shorthand formats: `aws` or `TableBucketType.aws`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `aws:kms` | `awscc.s3.bucket.MetadataTableEncryptionConfigurationSseAlgorithm.aws:kms` |
-| `AES256` | `awscc.s3.bucket.MetadataTableEncryptionConfigurationSseAlgorithm.AES256` |
+| `aws:kms` | `awscc.s3.Bucket.MetadataTableEncryptionConfigurationSseAlgorithm.aws:kms` |
+| `AES256` | `awscc.s3.Bucket.MetadataTableEncryptionConfigurationSseAlgorithm.AES256` |
 
 Shorthand formats: `aws:kms` or `MetadataTableEncryptionConfigurationSseAlgorithm.aws:kms`
 
@@ -408,8 +408,8 @@ Shorthand formats: `aws:kms` or `MetadataTableEncryptionConfigurationSseAlgorith
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `Disabled` | `awscc.s3.bucket.MetricsStatus.Disabled` |
-| `Enabled` | `awscc.s3.bucket.MetricsStatus.Enabled` |
+| `Disabled` | `awscc.s3.Bucket.MetricsStatus.Disabled` |
+| `Enabled` | `awscc.s3.Bucket.MetricsStatus.Enabled` |
 
 Shorthand formats: `Disabled` or `MetricsStatus.Disabled`
 
@@ -417,12 +417,12 @@ Shorthand formats: `Disabled` or `MetricsStatus.Disabled`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `DEEP_ARCHIVE` | `awscc.s3.bucket.NoncurrentVersionTransitionStorageClass.DEEP_ARCHIVE` |
-| `GLACIER` | `awscc.s3.bucket.NoncurrentVersionTransitionStorageClass.GLACIER` |
-| `GLACIER_IR` | `awscc.s3.bucket.NoncurrentVersionTransitionStorageClass.GLACIER_IR` |
-| `INTELLIGENT_TIERING` | `awscc.s3.bucket.NoncurrentVersionTransitionStorageClass.INTELLIGENT_TIERING` |
-| `ONEZONE_IA` | `awscc.s3.bucket.NoncurrentVersionTransitionStorageClass.ONEZONE_IA` |
-| `STANDARD_IA` | `awscc.s3.bucket.NoncurrentVersionTransitionStorageClass.STANDARD_IA` |
+| `DEEP_ARCHIVE` | `awscc.s3.Bucket.NoncurrentVersionTransitionStorageClass.DEEP_ARCHIVE` |
+| `GLACIER` | `awscc.s3.Bucket.NoncurrentVersionTransitionStorageClass.GLACIER` |
+| `GLACIER_IR` | `awscc.s3.Bucket.NoncurrentVersionTransitionStorageClass.GLACIER_IR` |
+| `INTELLIGENT_TIERING` | `awscc.s3.Bucket.NoncurrentVersionTransitionStorageClass.INTELLIGENT_TIERING` |
+| `ONEZONE_IA` | `awscc.s3.Bucket.NoncurrentVersionTransitionStorageClass.ONEZONE_IA` |
+| `STANDARD_IA` | `awscc.s3.Bucket.NoncurrentVersionTransitionStorageClass.STANDARD_IA` |
 
 Shorthand formats: `DEEP_ARCHIVE` or `NoncurrentVersionTransitionStorageClass.DEEP_ARCHIVE`
 
@@ -430,7 +430,7 @@ Shorthand formats: `DEEP_ARCHIVE` or `NoncurrentVersionTransitionStorageClass.DE
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `Enabled` | `awscc.s3.bucket.ObjectLockEnabled.Enabled` |
+| `Enabled` | `awscc.s3.Bucket.ObjectLockEnabled.Enabled` |
 
 Shorthand formats: `Enabled` or `ObjectLockEnabled.Enabled`
 
@@ -438,9 +438,9 @@ Shorthand formats: `Enabled` or `ObjectLockEnabled.Enabled`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ObjectWriter` | `awscc.s3.bucket.ObjectOwnership.ObjectWriter` |
-| `BucketOwnerPreferred` | `awscc.s3.bucket.ObjectOwnership.BucketOwnerPreferred` |
-| `BucketOwnerEnforced` | `awscc.s3.bucket.ObjectOwnership.BucketOwnerEnforced` |
+| `ObjectWriter` | `awscc.s3.Bucket.ObjectOwnership.ObjectWriter` |
+| `BucketOwnerPreferred` | `awscc.s3.Bucket.ObjectOwnership.BucketOwnerPreferred` |
+| `BucketOwnerEnforced` | `awscc.s3.Bucket.ObjectOwnership.BucketOwnerEnforced` |
 
 Shorthand formats: `ObjectWriter` or `ObjectOwnership.ObjectWriter`
 
@@ -448,8 +448,8 @@ Shorthand formats: `ObjectWriter` or `ObjectOwnership.ObjectWriter`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `EventTime` | `awscc.s3.bucket.PartitionDateSource.EventTime` |
-| `DeliveryTime` | `awscc.s3.bucket.PartitionDateSource.DeliveryTime` |
+| `EventTime` | `awscc.s3.Bucket.PartitionDateSource.EventTime` |
+| `DeliveryTime` | `awscc.s3.Bucket.PartitionDateSource.DeliveryTime` |
 
 Shorthand formats: `EventTime` or `PartitionDateSource.EventTime`
 
@@ -457,8 +457,8 @@ Shorthand formats: `EventTime` or `PartitionDateSource.EventTime`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ENABLED` | `awscc.s3.bucket.Expiration.ENABLED` |
-| `DISABLED` | `awscc.s3.bucket.Expiration.DISABLED` |
+| `ENABLED` | `awscc.s3.Bucket.Expiration.ENABLED` |
+| `DISABLED` | `awscc.s3.Bucket.Expiration.DISABLED` |
 
 Shorthand formats: `ENABLED` or `Expiration.ENABLED`
 
@@ -466,8 +466,8 @@ Shorthand formats: `ENABLED` or `Expiration.ENABLED`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `http` | `awscc.s3.bucket.Protocol.http` |
-| `https` | `awscc.s3.bucket.Protocol.https` |
+| `http` | `awscc.s3.Bucket.Protocol.http` |
+| `https` | `awscc.s3.Bucket.Protocol.https` |
 
 Shorthand formats: `http` or `Protocol.http`
 
@@ -475,8 +475,8 @@ Shorthand formats: `http` or `Protocol.http`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `Enabled` | `awscc.s3.bucket.ReplicaModificationsStatus.Enabled` |
-| `Disabled` | `awscc.s3.bucket.ReplicaModificationsStatus.Disabled` |
+| `Enabled` | `awscc.s3.Bucket.ReplicaModificationsStatus.Enabled` |
+| `Disabled` | `awscc.s3.Bucket.ReplicaModificationsStatus.Disabled` |
 
 Shorthand formats: `Enabled` or `ReplicaModificationsStatus.Enabled`
 
@@ -484,14 +484,14 @@ Shorthand formats: `Enabled` or `ReplicaModificationsStatus.Enabled`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `DEEP_ARCHIVE` | `awscc.s3.bucket.ReplicationDestinationStorageClass.DEEP_ARCHIVE` |
-| `GLACIER` | `awscc.s3.bucket.ReplicationDestinationStorageClass.GLACIER` |
-| `GLACIER_IR` | `awscc.s3.bucket.ReplicationDestinationStorageClass.GLACIER_IR` |
-| `INTELLIGENT_TIERING` | `awscc.s3.bucket.ReplicationDestinationStorageClass.INTELLIGENT_TIERING` |
-| `ONEZONE_IA` | `awscc.s3.bucket.ReplicationDestinationStorageClass.ONEZONE_IA` |
-| `REDUCED_REDUNDANCY` | `awscc.s3.bucket.ReplicationDestinationStorageClass.REDUCED_REDUNDANCY` |
-| `STANDARD` | `awscc.s3.bucket.ReplicationDestinationStorageClass.STANDARD` |
-| `STANDARD_IA` | `awscc.s3.bucket.ReplicationDestinationStorageClass.STANDARD_IA` |
+| `DEEP_ARCHIVE` | `awscc.s3.Bucket.ReplicationDestinationStorageClass.DEEP_ARCHIVE` |
+| `GLACIER` | `awscc.s3.Bucket.ReplicationDestinationStorageClass.GLACIER` |
+| `GLACIER_IR` | `awscc.s3.Bucket.ReplicationDestinationStorageClass.GLACIER_IR` |
+| `INTELLIGENT_TIERING` | `awscc.s3.Bucket.ReplicationDestinationStorageClass.INTELLIGENT_TIERING` |
+| `ONEZONE_IA` | `awscc.s3.Bucket.ReplicationDestinationStorageClass.ONEZONE_IA` |
+| `REDUCED_REDUNDANCY` | `awscc.s3.Bucket.ReplicationDestinationStorageClass.REDUCED_REDUNDANCY` |
+| `STANDARD` | `awscc.s3.Bucket.ReplicationDestinationStorageClass.STANDARD` |
+| `STANDARD_IA` | `awscc.s3.Bucket.ReplicationDestinationStorageClass.STANDARD_IA` |
 
 Shorthand formats: `DEEP_ARCHIVE` or `ReplicationDestinationStorageClass.DEEP_ARCHIVE`
 
@@ -499,8 +499,8 @@ Shorthand formats: `DEEP_ARCHIVE` or `ReplicationDestinationStorageClass.DEEP_AR
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `Disabled` | `awscc.s3.bucket.ReplicationRuleStatus.Disabled` |
-| `Enabled` | `awscc.s3.bucket.ReplicationRuleStatus.Enabled` |
+| `Disabled` | `awscc.s3.Bucket.ReplicationRuleStatus.Disabled` |
+| `Enabled` | `awscc.s3.Bucket.ReplicationRuleStatus.Enabled` |
 
 Shorthand formats: `Disabled` or `ReplicationRuleStatus.Disabled`
 
@@ -508,8 +508,8 @@ Shorthand formats: `Disabled` or `ReplicationRuleStatus.Disabled`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `Disabled` | `awscc.s3.bucket.ReplicationTimeStatus.Disabled` |
-| `Enabled` | `awscc.s3.bucket.ReplicationTimeStatus.Enabled` |
+| `Disabled` | `awscc.s3.Bucket.ReplicationTimeStatus.Disabled` |
+| `Enabled` | `awscc.s3.Bucket.ReplicationTimeStatus.Enabled` |
 
 Shorthand formats: `Disabled` or `ReplicationTimeStatus.Disabled`
 
@@ -517,8 +517,8 @@ Shorthand formats: `Disabled` or `ReplicationTimeStatus.Disabled`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `Enabled` | `awscc.s3.bucket.RuleStatus.Enabled` |
-| `Disabled` | `awscc.s3.bucket.RuleStatus.Disabled` |
+| `Enabled` | `awscc.s3.Bucket.RuleStatus.Enabled` |
+| `Disabled` | `awscc.s3.Bucket.RuleStatus.Disabled` |
 
 Shorthand formats: `Enabled` or `RuleStatus.Enabled`
 
@@ -526,9 +526,9 @@ Shorthand formats: `Enabled` or `RuleStatus.Enabled`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `aws:kms` | `awscc.s3.bucket.ServerSideEncryptionByDefaultSseAlgorithm.aws:kms` |
-| `AES256` | `awscc.s3.bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256` |
-| `aws:kms:dsse` | `awscc.s3.bucket.ServerSideEncryptionByDefaultSseAlgorithm.aws:kms:dsse` |
+| `aws:kms` | `awscc.s3.Bucket.ServerSideEncryptionByDefaultSseAlgorithm.aws:kms` |
+| `AES256` | `awscc.s3.Bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256` |
+| `aws:kms:dsse` | `awscc.s3.Bucket.ServerSideEncryptionByDefaultSseAlgorithm.aws:kms:dsse` |
 
 Shorthand formats: `aws:kms` or `ServerSideEncryptionByDefaultSseAlgorithm.aws:kms`
 
@@ -536,8 +536,8 @@ Shorthand formats: `aws:kms` or `ServerSideEncryptionByDefaultSseAlgorithm.aws:k
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `Disabled` | `awscc.s3.bucket.SseKmsEncryptedObjectsStatus.Disabled` |
-| `Enabled` | `awscc.s3.bucket.SseKmsEncryptedObjectsStatus.Enabled` |
+| `Disabled` | `awscc.s3.Bucket.SseKmsEncryptedObjectsStatus.Disabled` |
+| `Enabled` | `awscc.s3.Bucket.SseKmsEncryptedObjectsStatus.Enabled` |
 
 Shorthand formats: `Disabled` or `SseKmsEncryptedObjectsStatus.Disabled`
 
@@ -545,8 +545,8 @@ Shorthand formats: `Disabled` or `SseKmsEncryptedObjectsStatus.Disabled`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ARCHIVE_ACCESS` | `awscc.s3.bucket.AccessTier.ARCHIVE_ACCESS` |
-| `DEEP_ARCHIVE_ACCESS` | `awscc.s3.bucket.AccessTier.DEEP_ARCHIVE_ACCESS` |
+| `ARCHIVE_ACCESS` | `awscc.s3.Bucket.AccessTier.ARCHIVE_ACCESS` |
+| `DEEP_ARCHIVE_ACCESS` | `awscc.s3.Bucket.AccessTier.DEEP_ARCHIVE_ACCESS` |
 
 Shorthand formats: `ARCHIVE_ACCESS` or `AccessTier.ARCHIVE_ACCESS`
 
@@ -554,12 +554,12 @@ Shorthand formats: `ARCHIVE_ACCESS` or `AccessTier.ARCHIVE_ACCESS`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `DEEP_ARCHIVE` | `awscc.s3.bucket.TransitionStorageClass.DEEP_ARCHIVE` |
-| `GLACIER` | `awscc.s3.bucket.TransitionStorageClass.GLACIER` |
-| `GLACIER_IR` | `awscc.s3.bucket.TransitionStorageClass.GLACIER_IR` |
-| `INTELLIGENT_TIERING` | `awscc.s3.bucket.TransitionStorageClass.INTELLIGENT_TIERING` |
-| `ONEZONE_IA` | `awscc.s3.bucket.TransitionStorageClass.ONEZONE_IA` |
-| `STANDARD_IA` | `awscc.s3.bucket.TransitionStorageClass.STANDARD_IA` |
+| `DEEP_ARCHIVE` | `awscc.s3.Bucket.TransitionStorageClass.DEEP_ARCHIVE` |
+| `GLACIER` | `awscc.s3.Bucket.TransitionStorageClass.GLACIER` |
+| `GLACIER_IR` | `awscc.s3.Bucket.TransitionStorageClass.GLACIER_IR` |
+| `INTELLIGENT_TIERING` | `awscc.s3.Bucket.TransitionStorageClass.INTELLIGENT_TIERING` |
+| `ONEZONE_IA` | `awscc.s3.Bucket.TransitionStorageClass.ONEZONE_IA` |
+| `STANDARD_IA` | `awscc.s3.Bucket.TransitionStorageClass.STANDARD_IA` |
 
 Shorthand formats: `DEEP_ARCHIVE` or `TransitionStorageClass.DEEP_ARCHIVE`
 
@@ -567,8 +567,8 @@ Shorthand formats: `DEEP_ARCHIVE` or `TransitionStorageClass.DEEP_ARCHIVE`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `Enabled` | `awscc.s3.bucket.VersioningConfigurationStatus.Enabled` |
-| `Suspended` | `awscc.s3.bucket.VersioningConfigurationStatus.Suspended` |
+| `Enabled` | `awscc.s3.Bucket.VersioningConfigurationStatus.Enabled` |
+| `Suspended` | `awscc.s3.Bucket.VersioningConfigurationStatus.Suspended` |
 
 Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 

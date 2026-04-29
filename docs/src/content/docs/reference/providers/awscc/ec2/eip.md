@@ -1,6 +1,6 @@
 ---
-title: "awscc.ec2.eip"
-description: "AWSCC EC2 eip resource reference"
+title: "awscc.ec2.Eip"
+description: "AWSCC EC2 Eip resource reference"
 ---
 
 
@@ -13,7 +13,7 @@ Specifies an Elastic IP (EIP) address and can, optionally, associate it with an 
 ## Example
 
 ```crn
-awscc.ec2.eip {
+awscc.ec2.Eip {
   domain = 'vpc'
 
   tags = {
@@ -93,8 +93,8 @@ The Elastic IP address you are accepting for transfer. You can only accept one t
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `vpc` | `awscc.ec2.eip.Domain.vpc` |
-| `standard` | `awscc.ec2.eip.Domain.standard` |
+| `vpc` | `awscc.ec2.Eip.Domain.vpc` |
+| `standard` | `awscc.ec2.Eip.Domain.standard` |
 
 Shorthand formats: `vpc` or `Domain.vpc`
 

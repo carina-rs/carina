@@ -1,6 +1,6 @@
 ---
-title: "awscc.ec2.internet_gateway"
-description: "AWSCC EC2 internet_gateway resource reference"
+title: "awscc.ec2.InternetGateway"
+description: "AWSCC EC2 InternetGateway resource reference"
 ---
 
 
@@ -11,7 +11,7 @@ Allocates an internet gateway for use with a VPC. After creating the Internet ga
 ## Example
 
 ```crn
-awscc.ec2.internet_gateway {
+awscc.ec2.InternetGateway {
   tags = {
     Environment = 'example'
   }
