@@ -7,7 +7,7 @@ use super::ast::{AttributeParameter, ExportParameter, ModuleCall, ParsedFile};
 use super::error::{ParseError, undefined_identifier_error};
 use super::static_eval::is_static_value;
 use crate::eval_value::EvalValue;
-use crate::resource::{Expr, Resource, Value};
+use crate::resource::{Resource, Value};
 use indexmap::IndexMap;
 use std::collections::HashMap;
 
@@ -30,10 +30,10 @@ pub(super) fn resolve_forward_references(
         // the user-authored attribute order without a key-collection
         // round-trip. The placeholder is overwritten on the next line,
         // so its identity doesn't matter.
-        for (_, expr) in resource.attributes.iter_mut() {
+        for (_, attr) in resource.attributes.iter_mut() {
             let placeholder = Value::Bool(false);
-            let value = std::mem::replace(&mut expr.0, placeholder);
-            expr.0 = resolve_forward_ref_in_value(value, resource_bindings);
+            let value = std::mem::replace(attr, placeholder);
+            *attr = resolve_forward_ref_in_value(value, resource_bindings);
         }
     }
     for attr_param in attribute_params.iter_mut() {
@@ -172,11 +172,11 @@ pub fn resolve_resource_refs_with_config(
     // Resolve references in each resource. Keep `IndexMap` to preserve
     // the user's source order through resolution (#2222).
     for resource in &mut parsed.resources {
-        let mut resolved_attrs: IndexMap<String, Expr> = IndexMap::new();
+        let mut resolved_attrs: IndexMap<String, Value> = IndexMap::new();
 
         for (key, expr) in &resource.attributes {
             let resolved = resolve_value_with_config(expr, &binding_map, config)?;
-            resolved_attrs.insert(key.clone(), Expr(resolved));
+            resolved_attrs.insert(key.clone(), resolved);
         }
 
         resource.attributes = resolved_attrs;
@@ -271,8 +271,8 @@ fn accumulate_undefined_reference_errors(
     };
 
     for resource in &parsed.resources {
-        for expr in resource.attributes.values() {
-            check(&expr.0);
+        for value in resource.attributes.values() {
+            check(value);
         }
     }
     for attr in &parsed.attribute_params {

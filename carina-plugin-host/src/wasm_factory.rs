@@ -25,7 +25,7 @@ use carina_core::provider::{
     SavedAttrs,
 };
 use carina_core::resource::{
-    Expr, LifecycleConfig, Resource, ResourceId, State, Value, contains_resource_ref,
+    LifecycleConfig, Resource, ResourceId, State, Value, contains_resource_ref,
 };
 use carina_core::schema::{CompletionValue, ResourceSchema};
 
@@ -1510,7 +1510,7 @@ impl ProviderNormalizer for WasmProviderNormalizer {
                         {
                             continue;
                         }
-                        core_res.attributes.insert(key, Expr(value));
+                        core_res.attributes.insert(key, value);
                     }
                 }
             }

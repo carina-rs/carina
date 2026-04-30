@@ -13,7 +13,7 @@ use indexmap::IndexMap;
 
 use super::*;
 use crate::parser::{ArgumentParameter, ModuleCall, ParsedFile, ProviderContext, TypeExpr};
-use crate::resource::{Expr, LifecycleConfig, Resource, ResourceId, ResourceKind, Value};
+use crate::resource::{LifecycleConfig, Resource, ResourceId, ResourceKind, Value};
 
 fn create_test_module() -> ParsedFile {
     ParsedFile {
@@ -31,7 +31,7 @@ fn create_test_module() -> ParsedFile {
                     "_type".to_string(),
                     Value::String("aws.security_group".to_string()),
                 );
-                Expr::wrap_map(attrs)
+                attrs.into_iter().collect()
             },
             kind: ResourceKind::Real,
             lifecycle: LifecycleConfig::default(),
@@ -159,7 +159,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                         "cidr_block".to_string(),
                         Value::resource_ref("cidr".to_string(), String::new(), vec![]),
                     );
-                    Expr::wrap_map(attrs)
+                    attrs.into_iter().collect()
                 },
                 kind: ResourceKind::Real,
                 lifecycle: LifecycleConfig::default(),
@@ -177,7 +177,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                         "vpc_id".to_string(),
                         Value::resource_ref("vpc".to_string(), "id".to_string(), vec![]),
                     );
-                    Expr::wrap_map(attrs)
+                    attrs.into_iter().collect()
                 },
                 kind: ResourceKind::Real,
                 lifecycle: LifecycleConfig::default(),
@@ -304,7 +304,7 @@ fn create_module_with_attributes() -> ParsedFile {
                     "_type".to_string(),
                     Value::String("aws.security_group".to_string()),
                 );
-                Expr::wrap_map(attrs)
+                attrs.into_iter().collect()
             },
             kind: ResourceKind::Real,
             lifecycle: LifecycleConfig::default(),
@@ -1105,7 +1105,7 @@ fn create_module_with_interpolation() -> ParsedFile {
                     "env".to_string(),
                     Value::resource_ref("env_name".to_string(), String::new(), vec![]),
                 );
-                Expr::wrap_map(attrs)
+                attrs.into_iter().collect()
             },
             kind: ResourceKind::Real,
             lifecycle: LifecycleConfig::default(),

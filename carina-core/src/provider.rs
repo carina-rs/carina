@@ -725,7 +725,7 @@ mod tests {
             let attrs = resource.attributes.clone();
             Box::pin(async move {
                 Ok(
-                    State::existing(id, crate::resource::Expr::resolve_map(&attrs))
+                    State::existing(id, crate::resource::attrs_to_hashmap(&attrs))
                         .with_identifier("mock-id-123"),
                 )
             })
@@ -743,7 +743,7 @@ mod tests {
             Box::pin(async move {
                 Ok(State::existing(
                     id,
-                    crate::resource::Expr::resolve_map(&attrs),
+                    crate::resource::attrs_to_hashmap(&attrs),
                 ))
             })
         }
@@ -799,7 +799,7 @@ mod tests {
             Box::pin(async move {
                 Ok(State::existing(
                     id,
-                    crate::resource::Expr::resolve_map(&attrs),
+                    crate::resource::attrs_to_hashmap(&attrs),
                 ))
             })
         }
@@ -1063,7 +1063,7 @@ mod tests {
                 // Prefix all string attribute values with "normalized:"
                 for resource in resources.iter_mut() {
                     for value in resource.attributes.values_mut() {
-                        if let Value::String(s) = &mut **value {
+                        if let Value::String(s) = value {
                             *s = format!("normalized:{}", s);
                         }
                     }
@@ -1176,7 +1176,7 @@ mod tests {
                 for resource in resources.iter_mut() {
                     if resource.id.provider == "normalizing" {
                         for value in resource.attributes.values_mut() {
-                            if let Value::String(s) = &mut **value {
+                            if let Value::String(s) = value {
                                 *s = format!("norm:{}", s);
                             }
                         }

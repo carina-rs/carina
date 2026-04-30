@@ -6,7 +6,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use indexmap::IndexMap;
 
 use crate::parser::ModuleCall;
-use crate::resource::{Expr, LifecycleConfig, Resource, ResourceId, ResourceKind, Value};
+use crate::resource::{LifecycleConfig, Resource, ResourceId, ResourceKind, Value};
 
 use super::error::ModuleError;
 use super::resolver::ModuleResolver;
@@ -161,12 +161,12 @@ impl ModuleResolver<'_> {
             // are not incorrectly prefixed.
             // Preserve user-authored attribute order across the
             // module-call expansion (#2222) — `IndexMap`, not `HashMap`.
-            let mut substituted_attrs: IndexMap<String, Expr> = IndexMap::new();
+            let mut substituted_attrs: IndexMap<String, Value> = IndexMap::new();
             for (key, expr) in &new_resource.attributes {
                 let rewritten =
                     rewrite_intra_module_refs(expr, instance_prefix, &intra_module_bindings);
                 let substituted = substitute_arguments(&rewritten, &argument_values);
-                substituted_attrs.insert(key.clone(), Expr(substituted));
+                substituted_attrs.insert(key.clone(), substituted);
             }
             new_resource.attributes = substituted_attrs;
 
@@ -177,7 +177,7 @@ impl ModuleResolver<'_> {
         if !module.attribute_params.is_empty()
             && let Some(binding_name) = &call.binding_name
         {
-            let mut virtual_attrs: IndexMap<String, Expr> = IndexMap::new();
+            let mut virtual_attrs: IndexMap<String, Value> = IndexMap::new();
 
             // Copy attribute values from the module definition
             for attr_param in &module.attribute_params {
@@ -186,7 +186,7 @@ impl ModuleResolver<'_> {
                     let rewritten =
                         rewrite_intra_module_refs(value, instance_prefix, &intra_module_bindings);
                     let substituted = substitute_arguments(&rewritten, &argument_values);
-                    virtual_attrs.insert(attr_param.name.clone(), Expr(substituted));
+                    virtual_attrs.insert(attr_param.name.clone(), substituted);
                 }
             }
 
@@ -502,9 +502,9 @@ pub fn reconcile_anonymous_module_instances(
     // bindings with the old prefix. Walk every value and rewrite those.
     for r in resources.iter_mut() {
         let mut replacements = Vec::new();
-        for (key, expr) in r.attributes.iter() {
-            let rewritten = rewrite_ref_prefixes(&expr.0, &prefix_remap);
-            if rewritten != expr.0 {
+        for (key, value) in r.attributes.iter() {
+            let rewritten = rewrite_ref_prefixes(value, &prefix_remap);
+            if rewritten != *value {
                 replacements.push((key.clone(), rewritten));
             }
         }

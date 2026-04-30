@@ -622,62 +622,12 @@ fn resource_kind_enum_data_source() {
 }
 
 #[test]
-fn expr_wraps_value() {
-    let expr = Expr(Value::String("hello".to_string()));
-    assert!(matches!(*expr, Value::String(_)));
-}
-
-#[test]
-fn expr_wraps_resource_ref() {
-    let expr = Expr(Value::resource_ref(
-        "vpc".to_string(),
-        "id".to_string(),
-        vec![],
-    ));
-    assert!(matches!(*expr, Value::ResourceRef { .. }));
-    assert!(!expr.is_resolved());
-}
-
-#[test]
-fn expr_wraps_interpolation() {
-    let expr = Expr(Value::Interpolation(vec![
-        InterpolationPart::Literal("prefix-".to_string()),
-        InterpolationPart::Expr(Value::resource_ref(
-            "vpc".to_string(),
-            "id".to_string(),
-            vec![],
-        )),
-    ]));
-    assert!(matches!(*expr, Value::Interpolation(_)));
-    assert!(!expr.is_resolved());
-}
-
-#[test]
-fn expr_wraps_function_call() {
-    let expr = Expr(Value::FunctionCall {
-        name: "join".to_string(),
-        args: vec![
-            Value::String("-".to_string()),
-            Value::List(vec![
-                Value::String("a".to_string()),
-                Value::String("b".to_string()),
-            ]),
-        ],
-    });
-    assert!(matches!(*expr, Value::FunctionCall { .. }));
-}
-
-#[test]
-fn resource_attributes_use_expr_type() {
+fn resource_attributes_use_value_type() {
     let resource = Resource::new("s3.Bucket", "test")
-        .with_expr_attribute("name", Expr(Value::String("my-bucket".to_string())))
-        .with_expr_attribute(
+        .with_attribute("name", Value::String("my-bucket".to_string()))
+        .with_attribute(
             "vpc_id",
-            Expr(Value::resource_ref(
-                "vpc".to_string(),
-                "id".to_string(),
-                vec![],
-            )),
+            Value::resource_ref("vpc".to_string(), "id".to_string(), vec![]),
         );
     assert!(matches!(resource.get_attr("name"), Some(Value::String(_))));
     assert!(matches!(
@@ -687,81 +637,11 @@ fn resource_attributes_use_expr_type() {
 }
 
 #[test]
-fn expr_serde_round_trip() {
-    let exprs = vec![
-        Expr(Value::String("hello".to_string())),
-        Expr(Value::Int(42)),
-        Expr(Value::resource_ref(
-            "vpc".to_string(),
-            "id".to_string(),
-            vec![],
-        )),
-        Expr(Value::Interpolation(vec![
-            InterpolationPart::Literal("prefix-".to_string()),
-            InterpolationPart::Expr(Value::resource_ref(
-                "vpc".to_string(),
-                "id".to_string(),
-                vec![],
-            )),
-        ])),
-        Expr(Value::FunctionCall {
-            name: "join".to_string(),
-            args: vec![
-                Value::String("-".to_string()),
-                Value::List(vec![
-                    Value::String("a".to_string()),
-                    Value::String("b".to_string()),
-                ]),
-            ],
-        }),
-    ];
-
-    for expr in exprs {
-        let json = serde_json::to_string(&expr).unwrap();
-        let deserialized: Expr = serde_json::from_str(&json).unwrap();
-        assert_eq!(expr, deserialized, "Round-trip failed for {:?}", expr);
-    }
-}
-
-#[test]
-fn expr_is_resolved_for_plain_values() {
-    assert!(Expr(Value::String("hello".to_string())).is_resolved());
-    assert!(Expr(Value::Int(42)).is_resolved());
-    assert!(Expr(Value::Bool(true)).is_resolved());
-}
-
-#[test]
-fn expr_is_not_resolved_for_refs() {
-    assert!(
-        !Expr(Value::resource_ref(
-            "vpc".to_string(),
-            "id".to_string(),
-            vec![]
-        ))
-        .is_resolved()
-    );
-}
-
-#[test]
-fn expr_deref_to_value() {
-    let expr = Expr(Value::String("hello".to_string()));
-    let val: &Value = &expr;
-    assert!(matches!(val, Value::String(s) if s == "hello"));
-}
-
-#[test]
-fn expr_from_value() {
-    let value = Value::Int(42);
-    let expr: Expr = value.into();
-    assert_eq!(expr.0, Value::Int(42));
-}
-
-#[test]
-fn expr_resolve_map() {
+fn attrs_to_hashmap_clones_values() {
     let mut attrs = IndexMap::new();
-    attrs.insert("name".to_string(), Expr(Value::String("test".to_string())));
-    attrs.insert("count".to_string(), Expr(Value::Int(5)));
-    let resolved = Expr::resolve_map(&attrs);
+    attrs.insert("name".to_string(), Value::String("test".to_string()));
+    attrs.insert("count".to_string(), Value::Int(5));
+    let resolved = attrs_to_hashmap(&attrs);
     assert_eq!(
         resolved.get("name"),
         Some(&Value::String("test".to_string()))

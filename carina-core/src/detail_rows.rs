@@ -268,7 +268,7 @@ fn build_create_rows(
     let default_tag_keys: HashSet<String> = r
         .attributes
         .get("_default_tag_keys")
-        .and_then(|v| match &**v {
+        .and_then(|v| match v {
             Value::List(items) => Some(
                 items
                     .iter()
@@ -294,17 +294,17 @@ fn build_create_rows(
         // Expand tags map into individual rows with default_tags annotation
         if key.as_str() == "tags"
             && !default_tag_keys.is_empty()
-            && let Value::Map(map) = &**value
+            && let Value::Map(map) = value
         {
             rows.push(build_expanded_tags_row(map, &default_tag_keys));
             continue;
         }
         if is_list_of_maps(value) {
             rows.push(build_list_of_maps_row(key, value));
-        } else if let Value::Map(map) = &**value {
+        } else if let Value::Map(map) = value {
             rows.push(build_expanded_map_row(key, map));
         } else {
-            let ref_binding = match &**value {
+            let ref_binding = match value {
                 Value::ResourceRef { path } => Some(path.binding().to_string()),
                 _ => None,
             };

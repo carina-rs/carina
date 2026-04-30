@@ -1579,13 +1579,10 @@ impl Provider for RecordingProvider {
         // Return a state with a new identifier to simulate resource creation
         let mut attrs = resource.attributes.clone();
         // Simulate AWS returning a new ID
-        attrs.insert(
-            "vpc_id".to_string(),
-            carina_core::resource::Expr(Value::String("vpc-NEW".to_string())),
-        );
+        attrs.insert("vpc_id".to_string(), Value::String("vpc-NEW".to_string()));
         let state = State::existing(
             resource.id.clone(),
-            carina_core::resource::Expr::resolve_map(&attrs),
+            carina_core::resource::attrs_to_hashmap(&attrs),
         )
         .with_identifier("vpc-NEW");
         Box::pin(async move { Ok(state) })

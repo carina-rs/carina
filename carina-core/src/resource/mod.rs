@@ -156,20 +156,6 @@ impl std::fmt::Display for ResourceId {
     }
 }
 
-/// An unevaluated expression in the DSL.
-///
-/// `Expr` is a newtype wrapper around `Value` that represents values which may need
-/// resolution before becoming final. The parser produces `Expr` values for resource
-/// attributes; the resolver resolves references within the inner `Value` (e.g.,
-/// replacing `ResourceRef` variants with concrete values).
-///
-/// `Expr` wraps `Value` to enforce a type-level distinction between pre-resolution
-/// and post-resolution data. This prevents downstream code from accidentally receiving
-/// unresolved expressions.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct Expr(pub Value);
-
 /// A typed access path representing a `ResourceRef` target.
 ///
 /// The path always carries a binding name and an attribute name; nested field
@@ -291,9 +277,6 @@ pub enum InterpolationPart {
     Expr(Value),
 }
 
-/// Legacy alias for `InterpolationPart`.
-pub type ExprPart = InterpolationPart;
-
 impl Value {
     /// Create a `ResourceRef` from binding name, attribute name, and optional field path.
     ///
@@ -365,84 +348,22 @@ impl Value {
     }
 }
 
-impl Expr {
-    /// Returns a reference to the inner `Value`.
-    pub fn as_value(&self) -> &Value {
-        &self.0
-    }
-
-    /// Consumes self and returns the inner `Value`.
-    pub fn into_value(self) -> Value {
-        self.0
-    }
-
-    /// Returns true if the inner value contains no `ResourceRef` variants.
-    ///
-    /// This checks recursively: `ResourceRef`s nested inside `List`, `Map`,
-    /// `Interpolation`, `FunctionCall`, or `Secret` are detected.
-    /// Note that `Interpolation` and `FunctionCall` variants without nested
-    /// `ResourceRef`s are considered resolved by this method.
-    pub fn is_resolved(&self) -> bool {
-        !contains_resource_ref(&self.0)
-    }
-
-    /// Extract the inner `Value` of each entry in an `Expr` attribute map.
-    ///
-    /// Despite the legacy name, this method does **not** resolve
-    /// `Value::ResourceRef` / `Value::Interpolation` / `Value::FunctionCall`
-    /// / `Value::Secret` — it simply unwraps `Expr` → `Value`. Callers
-    /// that need concrete values must run
-    /// `carina_core::resolver::resolve_refs_with_state_and_remote` (or an
-    /// equivalent) first. See #1683 for a regression caused by assuming
-    /// this method performed resolution.
-    /// Project an `IndexMap<String, Expr>` (the shape `Resource.attributes`
-    /// uses since #2222) into a plain `HashMap<String, Value>` for callers
-    /// that only need key-based lookup (state merging, ResourceRef
-    /// resolution, provider trait inputs). Source-order is dropped on
-    /// purpose at this boundary — keep it on `Resource.attributes` itself
-    /// when iteration order matters.
-    pub fn resolve_map(attrs: &IndexMap<String, Expr>) -> HashMap<String, Value> {
-        attrs
-            .iter()
-            .map(|(k, e)| (k.clone(), e.0.clone()))
-            .collect()
-    }
-
-    /// Wrap any `(String, Value)` iterator (`HashMap<String, Value>`,
-    /// `IndexMap<String, Value>`, `Vec<(String, Value)>`, …) into the
-    /// `IndexMap<String, Expr>` that `Resource.attributes` expects.
-    /// Source order follows the iteration order of `attrs`.
-    pub fn wrap_map<I>(attrs: I) -> IndexMap<String, Expr>
-    where
-        I: IntoIterator<Item = (String, Value)>,
-    {
-        attrs.into_iter().map(|(k, v)| (k, Expr(v))).collect()
-    }
-}
-
-impl From<Value> for Expr {
-    fn from(value: Value) -> Self {
-        Expr(value)
-    }
-}
-
-impl PartialEq<Value> for Expr {
-    fn eq(&self, other: &Value) -> bool {
-        self.0 == *other
-    }
-}
-
-impl std::ops::Deref for Expr {
-    type Target = Value;
-    fn deref(&self) -> &Value {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for Expr {
-    fn deref_mut(&mut self) -> &mut Value {
-        &mut self.0
-    }
+/// Project an `IndexMap<String, Value>` (the shape `Resource.attributes`
+/// uses since #2222) into a plain `HashMap<String, Value>` for callers
+/// that only need key-based lookup (state merging, ResourceRef
+/// resolution, provider trait inputs). Source-order is dropped on
+/// purpose at this boundary — keep it on `Resource.attributes` itself
+/// when iteration order matters.
+///
+/// Despite the historical name (the helper used to operate on the now-removed
+/// `Expr` newtype), this function does **not** resolve `Value::ResourceRef` /
+/// `Value::Interpolation` / `Value::FunctionCall` / `Value::Secret` — it just
+/// projects ordered attribute storage to a hashmap. Callers that need concrete
+/// values must run `carina_core::resolver::resolve_refs_with_state_and_remote`
+/// (or an equivalent) first. See #1683 for a regression caused by assuming
+/// this method performed resolution.
+pub fn attrs_to_hashmap(attrs: &IndexMap<String, Value>) -> HashMap<String, Value> {
+    attrs.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
 }
 
 /// Check if a Value contains any ResourceRef (possibly nested)
@@ -846,7 +767,7 @@ pub struct Resource {
     /// the user wrote attributes in the `.crn` file. Anything that
     /// re-renders attributes — diagnostic messages, formatter output,
     /// plan display, snapshot tests — depends on this stability (#2222).
-    pub attributes: IndexMap<String, Expr>,
+    pub attributes: IndexMap<String, Value>,
     /// Classification of this resource (real, virtual, or data source)
     #[serde(default)]
     pub kind: ResourceKind,
@@ -922,7 +843,7 @@ impl Resource {
         }
     }
 
-    /// Returns the resolved attributes as a `HashMap<String, Value>`.
+    /// Returns the attributes projected to a `HashMap<String, Value>`.
     ///
     /// Lookup-only callers (validation, differ, plan display) still
     /// receive a `HashMap` — iteration over user-authored order is done
@@ -930,42 +851,32 @@ impl Resource {
     /// helper would just force every downstream caller to widen its
     /// signature for no order benefit.
     pub fn resolved_attributes(&self) -> HashMap<String, Value> {
-        self.attributes
-            .iter()
-            .map(|(k, e)| (k.clone(), e.0.clone()))
-            .collect()
+        attrs_to_hashmap(&self.attributes)
     }
 
     /// Get an attribute value by key, returning `Option<&Value>`.
-    ///
-    /// Convenience method that unwraps the `Expr` wrapper.
     pub fn get_attr(&self, key: &str) -> Option<&Value> {
-        self.attributes.get(key).map(|e| &e.0)
+        self.attributes.get(key)
     }
 
     /// Get a mutable attribute value by key, returning `Option<&mut Value>`.
     pub fn get_attr_mut(&mut self, key: &str) -> Option<&mut Value> {
-        self.attributes.get_mut(key).map(|e| &mut e.0)
+        self.attributes.get_mut(key)
     }
 
-    /// Set an attribute value, wrapping it in `Expr`.
+    /// Set an attribute value.
     pub fn set_attr(&mut self, key: impl Into<String>, value: Value) {
-        self.attributes.insert(key.into(), Expr(value));
+        self.attributes.insert(key.into(), value);
     }
 
     pub fn with_attribute(mut self, key: impl Into<String>, value: Value) -> Self {
-        self.attributes.insert(key.into(), Expr(value));
+        self.attributes.insert(key.into(), value);
         self
     }
 
-    pub fn with_expr_attribute(mut self, key: impl Into<String>, expr: Expr) -> Self {
-        self.attributes.insert(key.into(), expr);
-        self
-    }
-
-    /// Set attributes from a `HashMap<String, Value>`, wrapping each value in `Expr`.
+    /// Set attributes from a `HashMap<String, Value>`.
     pub fn with_value_attributes(mut self, attrs: HashMap<String, Value>) -> Self {
-        self.attributes = Expr::wrap_map(attrs);
+        self.attributes = attrs.into_iter().collect();
         self
     }
 

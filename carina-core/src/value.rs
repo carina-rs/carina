@@ -366,7 +366,7 @@ pub fn redact_secrets_in_resource(
     let attributes = resource
         .attributes
         .iter()
-        .map(|(k, e)| (k.clone(), crate::resource::Expr(redact_secrets_in_value(e))))
+        .map(|(k, e)| (k.clone(), redact_secrets_in_value(e)))
         .collect();
     crate::resource::Resource {
         attributes,

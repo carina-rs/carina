@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use carina_core::provider::{Provider, ProviderFactory};
-use carina_core::resource::{Expr, Resource, ResourceId, Value};
+use carina_core::resource::{Resource, ResourceId, Value};
 use carina_plugin_host::WasmProviderFactory;
 
 fn wasm_path() -> Option<PathBuf> {
@@ -82,9 +82,9 @@ async fn test_wasm_mock_provider_create_and_read() {
     // Create a resource
     let mut resource = Resource::with_provider("mock", "test.resource", "my-resource");
     resource.attributes = indexmap::IndexMap::from([
-        ("name".into(), Expr(Value::String("my-resource".into()))),
-        ("region".into(), Expr(Value::String("us-east-1".into()))),
-        ("count".into(), Expr(Value::Int(42))),
+        ("name".into(), Value::String("my-resource".into())),
+        ("region".into(), Value::String("us-east-1".into())),
+        ("count".into(), Value::Int(42)),
     ]);
 
     let created = provider
@@ -130,8 +130,8 @@ async fn test_wasm_mock_provider_update_and_delete() {
     // Create first
     let mut resource = Resource::with_provider("mock", "test.resource", "updatable");
     resource.attributes = indexmap::IndexMap::from([
-        ("color".into(), Expr(Value::String("red".into()))),
-        ("size".into(), Expr(Value::Int(10))),
+        ("color".into(), Value::String("red".into())),
+        ("size".into(), Value::Int(10)),
     ]);
 
     let created = provider
@@ -146,8 +146,8 @@ async fn test_wasm_mock_provider_update_and_delete() {
     // Update with new attributes
     let mut updated_resource = Resource::with_provider("mock", "test.resource", "updatable");
     updated_resource.attributes = indexmap::IndexMap::from([
-        ("color".into(), Expr(Value::String("blue".into()))),
-        ("size".into(), Expr(Value::Int(20))),
+        ("color".into(), Value::String("blue".into())),
+        ("size".into(), Value::Int(20)),
     ]);
 
     let updated = provider
@@ -195,8 +195,7 @@ async fn test_wasm_mock_provider_normalizer() {
     // normalize_desired: mock provider returns resources unchanged
     let mut resources = vec![{
         let mut r = Resource::with_provider("mock", "test.resource", "norm-test");
-        r.attributes =
-            indexmap::IndexMap::from([("key".into(), Expr(Value::String("value".into())))]);
+        r.attributes = indexmap::IndexMap::from([("key".into(), Value::String("value".into()))]);
         r
     }];
     let original_attrs = resources[0].resolved_attributes();
@@ -233,11 +232,11 @@ async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
     resource.attributes = indexmap::IndexMap::from([
         (
             "identity_store_id".into(),
-            Expr(Value::String("d-1234567890".into())),
+            Value::String("d-1234567890".into()),
         ),
         (
             "user_name".into(),
-            Expr(Value::String("alice@example.com".into())),
+            Value::String("alice@example.com".into()),
         ),
     ]);
 

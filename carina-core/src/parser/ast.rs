@@ -491,8 +491,8 @@ impl ParsedFile {
                         let mut resource = deferred.template_resource.clone();
                         resource.id.set_name(address.clone());
                         resource.binding = Some(address);
-                        for (_k, expr) in resource.attributes.iter_mut() {
-                            substitute_placeholder(&mut expr.0, None, None, item);
+                        for (_k, value) in resource.attributes.iter_mut() {
+                            substitute_placeholder(value, None, None, item);
                         }
                         expanded_resources.push(resource);
                     }
@@ -505,8 +505,8 @@ impl ParsedFile {
                         let mut resource = deferred.template_resource.clone();
                         resource.id.set_name(address.clone());
                         resource.binding = Some(address);
-                        for (_k, expr) in resource.attributes.iter_mut() {
-                            substitute_placeholder(&mut expr.0, Some(i as i64), None, item);
+                        for (_k, value) in resource.attributes.iter_mut() {
+                            substitute_placeholder(value, Some(i as i64), None, item);
                         }
                         expanded_resources.push(resource);
                     }
@@ -522,8 +522,8 @@ impl ParsedFile {
                         let mut resource = deferred.template_resource.clone();
                         resource.id.set_name(address.clone());
                         resource.binding = Some(address);
-                        for (_k, expr) in resource.attributes.iter_mut() {
-                            substitute_placeholder(&mut expr.0, None, Some(key), val);
+                        for (_k, value) in resource.attributes.iter_mut() {
+                            substitute_placeholder(value, None, Some(key), val);
                         }
                         expanded_resources.push(resource);
                     }

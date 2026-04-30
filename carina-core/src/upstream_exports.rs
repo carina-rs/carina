@@ -198,7 +198,7 @@ pub fn check_upstream_state_field_references(
         // `ResourceContext::Deferred` branch to mention the for header so
         // users can tell body errors from top-level ones.
         for (ctx, resource) in parsed.iter_all_resources() {
-            for (attr_name, expr) in resource.attributes.iter() {
+            for (attr_name, value) in resource.attributes.iter() {
                 let location = match ctx {
                     ResourceContext::Direct => {
                         format!("{} attribute `{}`", resource.id, attr_name)
@@ -208,7 +208,7 @@ pub fn check_upstream_state_field_references(
                         d.header, resource.id, attr_name
                     ),
                 };
-                check(expr.as_value(), &location);
+                check(value, &location);
             }
         }
         for attr in &parsed.attribute_params {
@@ -318,7 +318,7 @@ pub fn check_upstream_state_field_types(
         let Some(schema) = schemas.get(&key) else {
             continue;
         };
-        for (attr_name, expr) in resource.attributes.iter() {
+        for (attr_name, value) in resource.attributes.iter() {
             if attr_name.starts_with('_') {
                 continue;
             }
@@ -333,7 +333,7 @@ pub fn check_upstream_state_field_types(
                 ),
             };
             check_ref_against_type(
-                expr.as_value(),
+                value,
                 &attr_schema.attr_type,
                 exports,
                 &location,

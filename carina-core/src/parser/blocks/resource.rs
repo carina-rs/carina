@@ -11,7 +11,7 @@ use crate::parser::context::{ParseContext, extract_key_string, first_inner, next
 use crate::parser::error::ParseError;
 use crate::parser::parse_expression;
 use crate::parser::util::expression_is_plain_string_literal;
-use crate::resource::{Expr, Resource, ResourceId, ResourceKind, Value};
+use crate::resource::{Resource, ResourceId, ResourceKind, Value};
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -53,7 +53,7 @@ pub(in crate::parser) fn parse_anonymous_resource(
 
     Ok(Resource {
         id,
-        attributes: Expr::wrap_map(attributes),
+        attributes: attributes.into_iter().collect(),
         kind: ResourceKind::Real,
         lifecycle,
         prefixes: HashMap::new(),
@@ -214,7 +214,7 @@ pub(crate) fn parse_resource_expr(
 
     Ok(Resource {
         id,
-        attributes: Expr::wrap_map(attributes),
+        attributes: attributes.into_iter().collect(),
         kind: ResourceKind::Real,
         lifecycle,
         prefixes: HashMap::new(),
@@ -265,7 +265,7 @@ pub(crate) fn parse_read_resource_expr(
 
     Ok(Resource {
         id,
-        attributes: Expr::wrap_map(attributes),
+        attributes: attributes.into_iter().collect(),
         kind: ResourceKind::DataSource,
         lifecycle,
         prefixes: HashMap::new(),

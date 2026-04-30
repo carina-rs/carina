@@ -34,10 +34,9 @@ pub(crate) fn apply_name_overrides(resources: &mut [Resource], state_file: &Opti
     for resource in resources.iter_mut() {
         if let Some(name_overrides) = overrides.get(&resource.id) {
             for (attr, value) in name_overrides {
-                resource.attributes.insert(
-                    attr.clone(),
-                    carina_core::resource::Expr(Value::String(value.clone())),
-                );
+                resource
+                    .attributes
+                    .insert(attr.clone(), Value::String(value.clone()));
             }
         }
     }
@@ -278,7 +277,7 @@ pub(crate) fn build_orphan_resource(sf: &carina_state::StateFile, id: &ResourceI
         .collect();
     Resource {
         id: id.clone(),
-        attributes: carina_core::resource::Expr::wrap_map(attributes),
+        attributes: attributes.into_iter().collect(),
         kind: carina_core::resource::ResourceKind::Real,
         lifecycle: rs.lifecycle.clone(),
         prefixes: rs.prefixes.clone(),
