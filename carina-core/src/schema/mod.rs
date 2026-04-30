@@ -202,15 +202,40 @@ impl AttributeType {
         }
     }
 
-    /// Check if a value conforms to this type
+    /// Check if a value conforms to this type.
+    ///
+    /// Top-level dispatcher: each `AttributeType` variant has its own
+    /// `validate_*` helper. Values that resolve at runtime
+    /// (`Value::FunctionCall`, `Value::Secret`) bypass validation here so
+    /// every per-variant helper can assume it is dealing with a concrete
+    /// value (or one of the variant-specific dynamic shapes like
+    /// `ResourceRef`/`Interpolation` that the helpers handle individually).
     pub fn validate(&self, value: &Value) -> Result<(), TypeError> {
         // FunctionCall and Secret values are resolved at runtime, skip validation
         if matches!(value, Value::FunctionCall { .. } | Value::Secret(_)) {
             return Ok(());
         }
 
+        match self {
+            AttributeType::StringEnum { .. } => self.validate_string_enum(value),
+            AttributeType::Custom { .. } => self.validate_custom(value),
+            AttributeType::List { .. } => self.validate_list(value),
+            AttributeType::Map { .. } => self.validate_map(value),
+            AttributeType::Struct { .. } => self.validate_struct(value),
+            AttributeType::Union(_) => self.validate_union(value),
+            AttributeType::String
+            | AttributeType::Int
+            | AttributeType::Float
+            | AttributeType::Bool => self.validate_primitive(value),
+        }
+    }
+
+    /// Validate a primitive (`String`/`Int`/`Float`/`Bool`) value.
+    /// `ResourceRef` and `Interpolation` resolve to strings at runtime and
+    /// are accepted for `String`. `Float` accepts integers as valid numbers
+    /// and rejects non-finite floats explicitly.
+    fn validate_primitive(&self, value: &Value) -> Result<(), TypeError> {
         match (self, value) {
-            // ResourceRef and Interpolation values resolve to strings at runtime, so they're valid for String types
             (
                 AttributeType::String,
                 Value::String(_) | Value::ResourceRef { .. } | Value::Interpolation(_),
@@ -222,251 +247,292 @@ impl AttributeType {
             }),
             (AttributeType::Float, Value::Int(_)) => Ok(()), // integers are valid numbers
             (AttributeType::Bool, Value::Bool(_)) => Ok(()),
-
-            (
-                AttributeType::StringEnum {
-                    name,
-                    values,
-                    namespace,
-                    to_dsl,
-                },
-                v,
-            ) => {
-                // Interpolation values resolve to strings at runtime, so accept them
-                if matches!(v, Value::Interpolation(_)) {
-                    return Ok(());
-                }
-                let resolved_value = Self::resolve_enum_input(name, namespace.as_deref(), v);
-                if matches!(resolved_value, Value::ResourceRef { .. }) {
-                    return Ok(());
-                }
-                // Capture the user's original input for diagnostics. The parser
-                // collapses both quoted literals (`"aaa"`) and bare identifiers
-                // (`dedicated`) into `Value::String`, and `resolve_enum_input`
-                // rewrites the non-dotted form into a synthesized namespaced
-                // string for lookup. That synthesized form must stay internal:
-                // error messages should quote what the user actually typed.
-                // See #2077.
-                let user_input = match v {
-                    Value::String(s) => Some(s.as_str()),
-                    _ => None,
-                };
-                if let Value::String(s) = &resolved_value {
-                    // Check if the raw string directly matches a valid enum value
-                    // before namespace validation. This handles values containing
-                    // dots (e.g., "ipsec.1") that would be misinterpreted as
-                    // namespace separators.
-                    let direct_match = values.iter().any(|v| string_enum_value_matches(s, v));
-                    let valid: Vec<&str> = values.iter().map(String::as_str).collect();
-                    let variant = if direct_match {
-                        s.as_str()
-                    } else {
-                        extract_enum_value_with_values(s, &valid)
-                    };
-
-                    // Non-direct matches must have the exact form
-                    // `{namespace}.{name}.{variant}`. This rejects malformed
-                    // inputs like double-namespaced values while still allowing
-                    // enum values that themselves contain dots (e.g., "ipsec.1").
-                    if !direct_match && let Some(ns) = namespace.as_deref() {
-                        let expected_prefix = format!("{}.{}.", ns, name);
-                        let prefix_matches = s.starts_with(&expected_prefix)
-                            && &s[expected_prefix.len()..] == variant;
-                        if !prefix_matches {
-                            // Fall back to strict namespace validation, which
-                            // produces a clear error for the common bare form.
-                            let user_form = user_input.unwrap_or(s.as_str());
-                            validate_enum_namespace(s, name, ns).map_err(|message| {
-                                TypeError::ValidationFailed {
-                                    message: format!(
-                                        "Invalid {} '{}': {}",
-                                        name, user_form, message
-                                    ),
-                                }
-                            })?;
-                        }
-                    }
-                    let matches_canonical =
-                        values.iter().any(|v| string_enum_value_matches(variant, v));
-                    let matches_alias = to_dsl.is_some_and(|f| {
-                        values
-                            .iter()
-                            .any(|v| string_enum_value_matches(variant, &f(v)))
-                    });
-                    if matches_canonical || matches_alias {
-                        Ok(())
-                    } else {
-                        // Build the allowed-values list in the form the user
-                        // should type — fully-qualified for namespaced enums,
-                        // bare otherwise. Also include `to_dsl` aliases so
-                        // the message covers every shape validation accepts.
-                        let mut expected: Vec<String> = Vec::new();
-                        let mut push = |v: &str| {
-                            let rendered = match namespace.as_deref() {
-                                Some(ns) => format!("{}.{}.{}", ns, name, v),
-                                None => v.to_string(),
-                            };
-                            if !expected.contains(&rendered) {
-                                expected.push(rendered);
-                            }
-                        };
-                        for v in values {
-                            push(v);
-                        }
-                        if let Some(f) = to_dsl {
-                            for v in values {
-                                let alias = f(v);
-                                if alias != *v {
-                                    push(&alias);
-                                }
-                            }
-                        }
-                        Err(TypeError::InvalidEnumVariant {
-                            value: user_input.unwrap_or(s.as_str()).to_string(),
-                            attribute: None,
-                            type_name: Some(name.clone()),
-                            expected,
-                        })
-                    }
-                } else {
-                    Err(TypeError::TypeMismatch {
-                        expected: self.type_name(),
-                        got: resolved_value.type_name(),
-                    })
-                }
-            }
-
-            (
-                AttributeType::Custom {
-                    validate,
-                    semantic_name,
-                    namespace,
-                    ..
-                },
-                v,
-            ) => {
-                // ResourceRef and Interpolation values resolve to strings at runtime,
-                // so they're valid for Custom types
-                if matches!(v, Value::ResourceRef { .. } | Value::Interpolation(_)) {
-                    return Ok(());
-                }
-                let name_for_resolve = semantic_name.as_deref().unwrap_or("");
-                let resolved_value =
-                    Self::resolve_enum_input(name_for_resolve, namespace.as_deref(), v);
-                validate(&resolved_value)
-                    .map_err(|msg| TypeError::ValidationFailed { message: msg })
-            }
-
-            (AttributeType::List { inner, .. }, Value::List(items)) => {
-                for (i, item) in items.iter().enumerate() {
-                    inner.validate(item).map_err(|e| TypeError::ListItemError {
-                        index: i,
-                        inner: Box::new(e),
-                    })?;
-                }
-                Ok(())
-            }
-
-            (
-                AttributeType::Map {
-                    key: key_type,
-                    value: inner,
-                },
-                Value::Map(map),
-            ) => {
-                // Validate keys against key type
-                for k in map.keys() {
-                    key_type.validate(&Value::String(k.clone())).map_err(|e| {
-                        TypeError::MapKeyError {
-                            key: k.clone(),
-                            inner: Box::new(e),
-                        }
-                    })?;
-                }
-                for (k, v) in map {
-                    inner.validate(v).map_err(|e| TypeError::MapValueError {
-                        key: k.clone(),
-                        inner: Box::new(e),
-                    })?;
-                }
-                Ok(())
-            }
-
-            // Struct type rejects Value::List (block syntax)
-            // Block syntax produces Value::List([Value::Map(...)]), but bare Struct
-            // requires map assignment syntax: attr = { ... }
-            (AttributeType::Struct { name, .. }, Value::List(_)) => {
-                Err(TypeError::BlockSyntaxNotAllowed {
-                    attribute: name.clone(),
-                })
-            }
-
-            (AttributeType::Struct { name, fields }, Value::Map(map)) => {
-                // Check required fields
-                for field in fields {
-                    if field.required && !map.contains_key(&field.name) {
-                        return Err(TypeError::StructFieldError {
-                            field: field.name.clone(),
-                            inner: Box::new(TypeError::MissingRequired {
-                                name: field.name.clone(),
-                            }),
-                        });
-                    }
-                }
-                // Type-check each field value
-                let field_map: std::collections::HashMap<&str, &StructField> =
-                    fields.iter().map(|f| (f.name.as_str(), f)).collect();
-                let field_names: Vec<&str> = field_map.keys().copied().collect();
-                for (k, v) in map {
-                    if let Some(field) = field_map.get(k.as_str()) {
-                        field
-                            .field_type
-                            .validate(v)
-                            .map_err(|e| TypeError::StructFieldError {
-                                field: k.clone(),
-                                inner: Box::new(e),
-                            })?;
-                    } else {
-                        let suggestion = suggest_similar_name(k, &field_names);
-                        return Err(TypeError::UnknownStructField {
-                            struct_name: name.clone(),
-                            field: k.clone(),
-                            suggestion,
-                        });
-                    }
-                }
-                Ok(())
-            }
-
-            // Union type: valid if any member accepts the value
-            (AttributeType::Union(types), _) => {
-                let mut struct_error = None;
-                for member in types {
-                    match member.validate(value) {
-                        Ok(()) => return Ok(()),
-                        Err(e) => {
-                            // Prefer Struct validation errors over generic TypeMismatch
-                            // when the value is a Map — these give actionable feedback
-                            // (e.g., "unknown field 'aaa'") instead of "expected Struct | String, got Map"
-                            if matches!(value, Value::Map(_))
-                                && matches!(member, AttributeType::Struct { .. })
-                            {
-                                struct_error = Some(e);
-                            }
-                        }
-                    }
-                }
-                Err(struct_error.unwrap_or(TypeError::TypeMismatch {
-                    expected: self.type_name(),
-                    got: value.type_name(),
-                }))
-            }
-
             _ => Err(TypeError::TypeMismatch {
                 expected: self.type_name(),
                 got: value.type_name(),
             }),
         }
+    }
+
+    /// Validate against a `StringEnum` variant.
+    ///
+    /// Panics if `self` is not a `StringEnum` — only called from the
+    /// top-level dispatcher.
+    fn validate_string_enum(&self, value: &Value) -> Result<(), TypeError> {
+        let AttributeType::StringEnum {
+            name,
+            values,
+            namespace,
+            to_dsl,
+        } = self
+        else {
+            unreachable!("validate_string_enum called on non-StringEnum");
+        };
+
+        // Interpolation values resolve to strings at runtime, so accept them
+        if matches!(value, Value::Interpolation(_)) {
+            return Ok(());
+        }
+        let resolved_value = Self::resolve_enum_input(name, namespace.as_deref(), value);
+        if matches!(resolved_value, Value::ResourceRef { .. }) {
+            return Ok(());
+        }
+        // Capture the user's original input for diagnostics. The parser
+        // collapses both quoted literals (`"aaa"`) and bare identifiers
+        // (`dedicated`) into `Value::String`, and `resolve_enum_input`
+        // rewrites the non-dotted form into a synthesized namespaced
+        // string for lookup. That synthesized form must stay internal:
+        // error messages should quote what the user actually typed.
+        // See #2077.
+        let user_input = match value {
+            Value::String(s) => Some(s.as_str()),
+            _ => None,
+        };
+        if let Value::String(s) = &resolved_value {
+            // Check if the raw string directly matches a valid enum value
+            // before namespace validation. This handles values containing
+            // dots (e.g., "ipsec.1") that would be misinterpreted as
+            // namespace separators.
+            let direct_match = values.iter().any(|v| string_enum_value_matches(s, v));
+            let valid: Vec<&str> = values.iter().map(String::as_str).collect();
+            let variant = if direct_match {
+                s.as_str()
+            } else {
+                extract_enum_value_with_values(s, &valid)
+            };
+
+            // Non-direct matches must have the exact form
+            // `{namespace}.{name}.{variant}`. This rejects malformed
+            // inputs like double-namespaced values while still allowing
+            // enum values that themselves contain dots (e.g., "ipsec.1").
+            if !direct_match && let Some(ns) = namespace.as_deref() {
+                let expected_prefix = format!("{}.{}.", ns, name);
+                let prefix_matches =
+                    s.starts_with(&expected_prefix) && &s[expected_prefix.len()..] == variant;
+                if !prefix_matches {
+                    // Fall back to strict namespace validation, which
+                    // produces a clear error for the common bare form.
+                    let user_form = user_input.unwrap_or(s.as_str());
+                    validate_enum_namespace(s, name, ns).map_err(|message| {
+                        TypeError::ValidationFailed {
+                            message: format!("Invalid {} '{}': {}", name, user_form, message),
+                        }
+                    })?;
+                }
+            }
+            let matches_canonical = values.iter().any(|v| string_enum_value_matches(variant, v));
+            let matches_alias = to_dsl.is_some_and(|f| {
+                values
+                    .iter()
+                    .any(|v| string_enum_value_matches(variant, &f(v)))
+            });
+            if matches_canonical || matches_alias {
+                Ok(())
+            } else {
+                // Build the allowed-values list in the form the user
+                // should type — fully-qualified for namespaced enums,
+                // bare otherwise. Also include `to_dsl` aliases so
+                // the message covers every shape validation accepts.
+                let mut expected: Vec<String> = Vec::new();
+                let mut push = |v: &str| {
+                    let rendered = match namespace.as_deref() {
+                        Some(ns) => format!("{}.{}.{}", ns, name, v),
+                        None => v.to_string(),
+                    };
+                    if !expected.contains(&rendered) {
+                        expected.push(rendered);
+                    }
+                };
+                for v in values {
+                    push(v);
+                }
+                if let Some(f) = to_dsl {
+                    for v in values {
+                        let alias = f(v);
+                        if alias != *v {
+                            push(&alias);
+                        }
+                    }
+                }
+                Err(TypeError::InvalidEnumVariant {
+                    value: user_input.unwrap_or(s.as_str()).to_string(),
+                    attribute: None,
+                    type_name: Some(name.clone()),
+                    expected,
+                })
+            }
+        } else {
+            Err(TypeError::TypeMismatch {
+                expected: self.type_name(),
+                got: resolved_value.type_name(),
+            })
+        }
+    }
+
+    /// Validate against a `Custom` variant by delegating to its `validate`
+    /// closure after expanding any enum-shorthand identifier in `value`.
+    fn validate_custom(&self, value: &Value) -> Result<(), TypeError> {
+        let AttributeType::Custom {
+            validate,
+            semantic_name,
+            namespace,
+            ..
+        } = self
+        else {
+            unreachable!("validate_custom called on non-Custom");
+        };
+
+        // ResourceRef and Interpolation values resolve to strings at runtime,
+        // so they're valid for Custom types
+        if matches!(value, Value::ResourceRef { .. } | Value::Interpolation(_)) {
+            return Ok(());
+        }
+        let name_for_resolve = semantic_name.as_deref().unwrap_or("");
+        let resolved_value =
+            Self::resolve_enum_input(name_for_resolve, namespace.as_deref(), value);
+        validate(&resolved_value).map_err(|msg| TypeError::ValidationFailed { message: msg })
+    }
+
+    /// Validate a `List` variant by validating each item with the inner type.
+    fn validate_list(&self, value: &Value) -> Result<(), TypeError> {
+        let AttributeType::List { inner, .. } = self else {
+            unreachable!("validate_list called on non-List");
+        };
+        let Value::List(items) = value else {
+            return Err(TypeError::TypeMismatch {
+                expected: self.type_name(),
+                got: value.type_name(),
+            });
+        };
+        for (i, item) in items.iter().enumerate() {
+            inner.validate(item).map_err(|e| TypeError::ListItemError {
+                index: i,
+                inner: Box::new(e),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Validate a `Map` variant: keys against `key`, values against `value`.
+    fn validate_map(&self, value: &Value) -> Result<(), TypeError> {
+        let AttributeType::Map {
+            key: key_type,
+            value: inner,
+        } = self
+        else {
+            unreachable!("validate_map called on non-Map");
+        };
+        let Value::Map(map) = value else {
+            return Err(TypeError::TypeMismatch {
+                expected: self.type_name(),
+                got: value.type_name(),
+            });
+        };
+        // Validate keys against key type
+        for k in map.keys() {
+            key_type
+                .validate(&Value::String(k.clone()))
+                .map_err(|e| TypeError::MapKeyError {
+                    key: k.clone(),
+                    inner: Box::new(e),
+                })?;
+        }
+        for (k, v) in map {
+            inner.validate(v).map_err(|e| TypeError::MapValueError {
+                key: k.clone(),
+                inner: Box::new(e),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Validate a `Struct` variant: required fields, known field names, and
+    /// recursively check each field's value.
+    ///
+    /// Block syntax produces `Value::List([Value::Map(...)])`, but bare
+    /// `Struct` requires map assignment syntax (`attr = { ... }`); a
+    /// `Value::List` is rejected explicitly with `BlockSyntaxNotAllowed`.
+    fn validate_struct(&self, value: &Value) -> Result<(), TypeError> {
+        let AttributeType::Struct { name, fields } = self else {
+            unreachable!("validate_struct called on non-Struct");
+        };
+
+        // Struct type rejects Value::List (block syntax)
+        if matches!(value, Value::List(_)) {
+            return Err(TypeError::BlockSyntaxNotAllowed {
+                attribute: name.clone(),
+            });
+        }
+        let Value::Map(map) = value else {
+            return Err(TypeError::TypeMismatch {
+                expected: self.type_name(),
+                got: value.type_name(),
+            });
+        };
+
+        // Check required fields
+        for field in fields {
+            if field.required && !map.contains_key(&field.name) {
+                return Err(TypeError::StructFieldError {
+                    field: field.name.clone(),
+                    inner: Box::new(TypeError::MissingRequired {
+                        name: field.name.clone(),
+                    }),
+                });
+            }
+        }
+        // Type-check each field value
+        let field_map: std::collections::HashMap<&str, &StructField> =
+            fields.iter().map(|f| (f.name.as_str(), f)).collect();
+        let field_names: Vec<&str> = field_map.keys().copied().collect();
+        for (k, v) in map {
+            if let Some(field) = field_map.get(k.as_str()) {
+                field
+                    .field_type
+                    .validate(v)
+                    .map_err(|e| TypeError::StructFieldError {
+                        field: k.clone(),
+                        inner: Box::new(e),
+                    })?;
+            } else {
+                let suggestion = suggest_similar_name(k, &field_names);
+                return Err(TypeError::UnknownStructField {
+                    struct_name: name.clone(),
+                    field: k.clone(),
+                    suggestion,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate a `Union` variant: succeed if any member accepts the value.
+    ///
+    /// Prefer a `Struct` member's structured error over generic
+    /// `TypeMismatch` when the value is a `Map` — that gives actionable
+    /// feedback (e.g. "unknown field 'aaa'") instead of
+    /// "expected Struct | String, got Map".
+    fn validate_union(&self, value: &Value) -> Result<(), TypeError> {
+        let AttributeType::Union(types) = self else {
+            unreachable!("validate_union called on non-Union");
+        };
+        let mut struct_error = None;
+        for member in types {
+            match member.validate(value) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if matches!(value, Value::Map(_))
+                        && matches!(member, AttributeType::Struct { .. })
+                    {
+                        struct_error = Some(e);
+                    }
+                }
+            }
+        }
+        Err(struct_error.unwrap_or(TypeError::TypeMismatch {
+            expected: self.type_name(),
+            got: value.type_name(),
+        }))
     }
 
     pub fn type_name(&self) -> String {
