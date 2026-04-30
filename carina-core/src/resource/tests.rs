@@ -794,8 +794,8 @@ fn resource_module_source_typed_field() {
 }
 
 #[test]
-fn access_path_from_ref() {
-    let path = AccessPath::from_ref("vpc", "id", vec![]);
+fn access_path_new() {
+    let path = AccessPath::new("vpc", "id");
     assert_eq!(path.binding(), "vpc");
     assert_eq!(path.attribute(), "id");
     assert!(path.field_path().is_empty());
@@ -803,11 +803,11 @@ fn access_path_from_ref() {
 }
 
 #[test]
-fn access_path_with_field_path() {
-    let path = AccessPath::from_ref("web", "network", vec!["vpc_id".to_string()]);
+fn access_path_with_fields() {
+    let path = AccessPath::with_fields("web", "network", vec!["vpc_id".to_string()]);
     assert_eq!(path.binding(), "web");
     assert_eq!(path.attribute(), "network");
-    assert_eq!(path.field_path(), vec!["vpc_id"]);
+    assert_eq!(path.field_path(), ["vpc_id".to_string()]);
     assert_eq!(path.to_dot_string(), "web.network.vpc_id");
 }
 
@@ -832,7 +832,10 @@ fn value_ref_helpers() {
     let value = Value::resource_ref("vpc", "vpc_id", vec!["nested".to_string()]);
     assert_eq!(value.ref_binding(), Some("vpc"));
     assert_eq!(value.ref_attribute(), Some("vpc_id"));
-    assert_eq!(value.ref_field_path(), Some(vec!["nested"]));
+    assert_eq!(
+        value.ref_field_path(),
+        Some(["nested".to_string()].as_slice())
+    );
 
     let non_ref = Value::String("hello".to_string());
     assert_eq!(non_ref.ref_binding(), None);

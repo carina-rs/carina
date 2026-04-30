@@ -516,12 +516,9 @@ mod tests {
     /// via `normalize_desired` — they get resolved later by the executor.
     #[test]
     fn core_to_wit_value_resource_ref_produces_debug_string() {
-        use carina_core::resource::{AccessPath, PathSegment};
+        use carina_core::resource::AccessPath;
         let v = CoreValue::ResourceRef {
-            path: AccessPath(vec![
-                PathSegment::Field("sso".into()),
-                PathSegment::Field("identity_store_id".into()),
-            ]),
+            path: AccessPath::new("sso", "identity_store_id"),
         };
         let wit::Value::StrVal(s) = core_to_wit_value(&v) else {
             panic!("expected StrVal");

@@ -114,10 +114,10 @@ pub fn resolve_ref_value(
                 let mut resolved = resolve_ref_value(attr_value, binding_map)?;
 
                 // Traverse chained field path through nested maps
-                for field in &field_path {
+                for field in field_path {
                     match resolved {
                         Value::Map(ref map) => {
-                            if let Some(nested) = map.get(*field) {
+                            if let Some(nested) = map.get(field) {
                                 resolved = resolve_ref_value(nested, binding_map)?;
                             } else {
                                 // Field not found in nested map, keep original ref

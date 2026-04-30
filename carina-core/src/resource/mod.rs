@@ -170,94 +170,75 @@ impl std::fmt::Display for ResourceId {
 #[serde(transparent)]
 pub struct Expr(pub Value);
 
-/// A single segment in an access path.
+/// A typed access path representing a `ResourceRef` target.
 ///
-/// For now, only `Field` is used. `Index` and `Key` will be added in the future
-/// for array indexing and map key access.
+/// The path always carries a binding name and an attribute name; nested field
+/// access (e.g., `web.network.vpc_id`) is captured in `field_path`. The
+/// "binding + attribute is mandatory" invariant is enforced by the type system
+/// — there is no way to construct an `AccessPath` without both.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum PathSegment {
-    /// Named field access (e.g., `vpc`, `id`, `vpc_id`)
-    Field(String),
+pub struct AccessPath {
+    binding: String,
+    attribute: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    field_path: Vec<String>,
 }
-
-impl PathSegment {
-    /// Returns the field name if this is a `Field` segment.
-    pub fn as_field(&self) -> Option<&str> {
-        match self {
-            PathSegment::Field(name) => Some(name),
-        }
-    }
-}
-
-impl std::fmt::Display for PathSegment {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PathSegment::Field(name) => write!(f, "{}", name),
-        }
-    }
-}
-
-/// A unified access path representing a chain of field accesses.
-///
-/// For a `ResourceRef`, the path contains:
-/// - segment 0: binding name (e.g., "vpc")
-/// - segment 1: attribute name (e.g., "vpc_id")
-/// - segments 2+: nested field path (e.g., "network", "id")
-///
-/// This replaces the asymmetric `binding_name` / `attribute_name` / `field_path`
-/// representation where the 2nd segment was named differently but treated the same
-/// as subsequent segments.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct AccessPath(pub Vec<PathSegment>);
 
 impl AccessPath {
-    /// Create an AccessPath from the legacy binding_name, attribute_name, field_path fields.
-    pub fn from_ref(
-        binding_name: impl Into<String>,
-        attribute_name: impl Into<String>,
+    /// Create an `AccessPath` referring to a top-level attribute of a binding.
+    pub fn new(binding: impl Into<String>, attribute: impl Into<String>) -> Self {
+        Self {
+            binding: binding.into(),
+            attribute: attribute.into(),
+            field_path: Vec::new(),
+        }
+    }
+
+    /// Create an `AccessPath` with a nested field path (e.g., `web.network.vpc_id`).
+    pub fn with_fields(
+        binding: impl Into<String>,
+        attribute: impl Into<String>,
         field_path: Vec<String>,
     ) -> Self {
-        let mut segments = Vec::with_capacity(2 + field_path.len());
-        segments.push(PathSegment::Field(binding_name.into()));
-        segments.push(PathSegment::Field(attribute_name.into()));
-        for field in field_path {
-            segments.push(PathSegment::Field(field));
+        Self {
+            binding: binding.into(),
+            attribute: attribute.into(),
+            field_path,
         }
-        AccessPath(segments)
     }
 
-    /// Returns the binding name (first segment).
+    /// Returns the binding name.
     pub fn binding(&self) -> &str {
-        self.0.first().and_then(|s| s.as_field()).unwrap_or("")
+        &self.binding
     }
 
-    /// Returns the attribute name (second segment).
+    /// Returns the attribute name.
     pub fn attribute(&self) -> &str {
-        self.0.get(1).and_then(|s| s.as_field()).unwrap_or("")
+        &self.attribute
     }
 
-    /// Returns the remaining field path (segments after the first two) as strings.
-    pub fn field_path(&self) -> Vec<&str> {
-        self.0.iter().skip(2).filter_map(|s| s.as_field()).collect()
+    /// Returns the nested field path (empty if the reference targets a
+    /// top-level attribute).
+    pub fn field_path(&self) -> &[String] {
+        &self.field_path
     }
 
-    /// Returns all segments as a dot-separated string.
+    /// Returns the path as `binding.attribute[.field...]`.
     pub fn to_dot_string(&self) -> String {
-        self.0
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-            .join(".")
-    }
-
-    /// Returns the number of segments.
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// Returns true if the path has no segments.
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        let mut out = String::with_capacity(
+            self.binding.len()
+                + self.attribute.len()
+                + 1
+                + self.field_path.iter().map(|s| s.len() + 1).sum::<usize>(),
+        );
+        out.push_str(&self.binding);
+        out.push('.');
+        out.push_str(&self.attribute);
+        for field in &self.field_path {
+            out.push('.');
+            out.push_str(field);
+        }
+        out
     }
 }
 
@@ -324,7 +305,7 @@ impl Value {
         field_path: Vec<String>,
     ) -> Self {
         Value::ResourceRef {
-            path: AccessPath::from_ref(binding_name, attribute_name, field_path),
+            path: AccessPath::with_fields(binding_name, attribute_name, field_path),
         }
     }
 
@@ -345,7 +326,7 @@ impl Value {
     }
 
     /// If this is a `ResourceRef`, returns the field path.
-    pub fn ref_field_path(&self) -> Option<Vec<&str>> {
+    pub fn ref_field_path(&self) -> Option<&[String]> {
         match self {
             Value::ResourceRef { path } => Some(path.field_path()),
             _ => None,
