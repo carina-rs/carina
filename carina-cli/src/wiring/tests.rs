@@ -424,7 +424,7 @@ fn import_fallback_skips_when_already_in_state_by_name_attribute() {
 /// string and ships it to the remote API as a literal.
 #[test]
 fn resolve_data_source_refs_replaces_resource_ref_with_concrete_value() {
-    use carina_core::resource::{AccessPath, Expr, PathSegment, ResourceKind};
+    use carina_core::resource::{AccessPath, Expr, ResourceKind};
 
     let identity_store_id = "d-9067c29a4b";
 
@@ -438,10 +438,7 @@ fn resolve_data_source_refs_replaces_resource_ref_with_concrete_value() {
     mizzy.attributes.insert(
         "identity_store_id".to_string(),
         Expr(Value::ResourceRef {
-            path: AccessPath(vec![
-                PathSegment::Field("sso".into()),
-                PathSegment::Field("identity_store_id".into()),
-            ]),
+            path: AccessPath::new("sso", "identity_store_id"),
         }),
     );
     mizzy.attributes.insert(

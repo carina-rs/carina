@@ -271,7 +271,7 @@ pub(super) fn rewrite_intra_module_refs(
             Value::resource_ref(
                 format!("{}.{}", instance_prefix, path.binding()),
                 path.attribute().to_string(),
-                path.field_path().iter().map(|s| s.to_string()).collect(),
+                path.field_path().to_vec(),
             )
         }
         Value::List(items) => Value::List(
@@ -529,7 +529,7 @@ fn rewrite_ref_prefixes(
                 return Value::resource_ref(
                     new_binding,
                     path.attribute().to_string(),
-                    path.field_path().into_iter().map(String::from).collect(),
+                    path.field_path().to_vec(),
                 );
             }
             value.clone()
