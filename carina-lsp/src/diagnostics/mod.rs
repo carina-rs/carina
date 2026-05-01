@@ -150,8 +150,8 @@ impl DiagnosticEngine {
         // mishandle (#2131 / #2132).
         let declared_providers = self.extract_declared_provider_names(&text);
         let known_bindings: HashSet<String> = match merged.as_ref() {
-            Some(merged) => carina_core::parser::collect_known_bindings_merged(merged)
-                .into_iter()
+            Some(merged) => carina_core::binding_index::BindingNameSet::from_parsed(merged)
+                .iter_names()
                 .map(String::from)
                 .collect(),
             None => self.extract_resource_bindings(crate::completion::DslSource::BufferOnly(&text)),

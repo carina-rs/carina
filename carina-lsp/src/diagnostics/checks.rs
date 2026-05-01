@@ -126,11 +126,12 @@ fn find_for_iterable_binding_column(
 }
 
 /// Binding names declared anywhere in the merged parse. Delegates to
-/// [`carina_core::parser::collect_known_bindings_merged`] so LSP
-/// diagnostics stay consistent with the CLI's
-/// [`carina_core::parser::check_identifier_scope`] pass.
-fn collect_known_bindings(merged: &ParsedFile) -> HashSet<&str> {
-    carina_core::parser::collect_known_bindings_merged(merged)
+/// [`carina_core::binding_index::BindingNameSet`] so LSP diagnostics
+/// stay consistent with the CLI's
+/// [`carina_core::parser::check_identifier_scope`] pass (which goes
+/// through the same set).
+fn collect_known_bindings(merged: &ParsedFile) -> carina_core::binding_index::BindingNameSet {
+    carina_core::binding_index::BindingNameSet::from_parsed(merged)
 }
 
 /// Whether `deferred` was parsed from the editor's current document.
@@ -543,7 +544,7 @@ impl DiagnosticEngine {
             if !deferred_in_current_file(deferred, current_file_name) {
                 continue;
             }
-            if known.contains(deferred.iterable_binding.as_str()) {
+            if known.contains(&deferred.iterable_binding) {
                 continue;
             }
             let line_zero_based = deferred.line.saturating_sub(1) as u32;
@@ -563,7 +564,7 @@ impl DiagnosticEngine {
             // Build the same enriched UndefinedIdentifier the CLI would emit
             // so the editor shows the did-you-mean suggestion and the list of
             // in-scope bindings (#2038).
-            let in_scope: Vec<String> = known.iter().map(|s| s.to_string()).collect();
+            let in_scope: Vec<String> = known.iter_names().map(String::from).collect();
             let err = carina_core::parser::ParseError::undefined_identifier(
                 deferred.iterable_binding.clone(),
                 deferred.line,
