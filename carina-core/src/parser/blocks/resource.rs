@@ -258,8 +258,6 @@ pub(crate) fn parse_read_resource_expr(
     let lifecycle = extract_lifecycle_config(&mut attributes);
 
     attributes.insert("_type".to_string(), Value::String(namespaced_type.clone()));
-    // Mark as data source
-    attributes.insert("_data_source".to_string(), Value::Bool(true));
 
     let id = ResourceId::with_provider(provider, resource_type, resource_name);
 

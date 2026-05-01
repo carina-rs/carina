@@ -1135,7 +1135,25 @@ fn parse_read_resource_expr() {
     assert_eq!(resource.id.resource_type, "s3_bucket");
     assert_eq!(resource.id.name_str(), "existing"); // binding name becomes the resource ID
     assert!(resource.is_data_source());
-    assert_eq!(resource.get_attr("_data_source"), Some(&Value::Bool(true)));
+}
+
+#[test]
+fn parse_read_resource_does_not_inject_data_source_attribute() {
+    // Regression test for #2224: `kind == DataSource` is the only
+    // record that a `read` block produces a data source — there must
+    // be no `_data_source` key shadowing it in the attribute map.
+    let input = r#"
+        let existing = read aws.s3_bucket {
+            name = "my-bucket"
+            region = "us-east-1"
+        }
+    "#;
+    let result = parse(input, &ProviderContext::default()).unwrap();
+    let resource = &result.resources[0];
+    assert!(resource.is_data_source());
+    assert!(resource.attributes.contains_key("name"));
+    assert!(resource.attributes.contains_key("region"));
+    assert!(!resource.attributes.contains_key("_data_source"));
 }
 
 #[test]
