@@ -39,6 +39,12 @@ pub struct PlanContext {
     /// Maps moved-to resource IDs to their original (moved-from) IDs.
     /// Used by display to show "(moved from: ...)" annotations on Update/Replace effects.
     pub moved_origins: HashMap<ResourceId, ResourceId>,
+    /// Snapshot of `upstream_state` bindings as resolved at plan time.
+    /// Persisted to the plan file (#2303) so apply-from-plan can verify
+    /// the upstream values have not drifted before re-using them for
+    /// cascade re-resolution. Empty when the configuration declares no
+    /// `upstream_state` blocks.
+    pub upstream_snapshot: HashMap<String, HashMap<String, carina_core::resource::Value>>,
 }
 
 /// Cached provider factories and schemas, constructed once per CLI invocation.
@@ -1089,6 +1095,7 @@ pub async fn create_plan_from_parsed_with_upstream(
         sorted_resources,
         current_states,
         moved_origins,
+        upstream_snapshot: remote_bindings.clone(),
     })
 }
 
