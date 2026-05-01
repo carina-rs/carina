@@ -73,15 +73,15 @@ pub(crate) struct FinalizeApplyInput<'a> {
     pub export_params: &'a [carina_core::parser::ExportParameter],
 }
 
-/// Resolve export expressions using the binding map built from applied state.
+/// Resolve export expressions using bindings built from applied state.
 pub(crate) fn resolve_exports(
     export_params: &[carina_core::parser::ExportParameter],
     state: &StateFile,
 ) -> HashMap<String, serde_json::Value> {
+    use carina_core::binding_index::{BindingValueSource, ResolvedBindings};
     use carina_core::resource::Value;
 
-    // Build binding map from state (binding name → attributes)
-    let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+    let mut bindings = ResolvedBindings::default();
     for rs in &state.resources {
         if let Some(ref binding) = rs.binding {
             let attrs: HashMap<String, Value> = rs
@@ -91,7 +91,7 @@ pub(crate) fn resolve_exports(
                     carina_core::value::json_to_dsl_value(v).map(|val| (k.clone(), val))
                 })
                 .collect();
-            binding_map.insert(binding.clone(), attrs);
+            bindings.set(binding, attrs, BindingValueSource::Local);
         }
     }
 
@@ -100,7 +100,7 @@ pub(crate) fn resolve_exports(
         if let Some(ref value) = param.value {
             // Resolve both ResourceRef and cross-file dot-notation strings
             // (e.g., "registry_prod.account_id" parsed from a different .crn file).
-            let resolved = crate::commands::plan::resolve_export_value(value, &binding_map);
+            let resolved = crate::commands::plan::resolve_export_value(value, &bindings);
             if let Some(json) = dsl_value_to_json(&resolved) {
                 exports.insert(param.name.clone(), json);
             }

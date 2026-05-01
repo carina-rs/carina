@@ -6,6 +6,7 @@ use colored::Colorize;
 
 use futures::stream::{self, StreamExt};
 
+use carina_core::binding_index::ResolvedBindings;
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
@@ -57,14 +58,14 @@ pub type ApplyResult = ExecutionResult;
 pub async fn execute_effects(
     plan: &Plan,
     provider: &dyn Provider,
-    binding_map: &mut HashMap<String, HashMap<String, Value>>,
+    bindings: &mut ResolvedBindings,
     current_states: &mut HashMap<ResourceId, State>,
     unresolved_resources: &HashMap<ResourceId, Resource>,
 ) -> ApplyResult {
     let input = ExecutionInput {
         plan,
         unresolved_resources,
-        binding_map: std::mem::take(binding_map),
+        bindings: std::mem::take(bindings),
         current_states: std::mem::take(current_states),
     };
 
@@ -770,24 +771,12 @@ async fn run_apply_locked(
         current_states.insert(id, state);
     }
 
-    // Build initial binding map for reference resolution
-    let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
-    for resource in &sorted_resources {
-        if let Some(ref binding_name) = resource.binding {
-            let mut attrs: HashMap<String, Value> = resource.resolved_attributes();
-            // Merge existing state if available
-            if let Some(state) = current_states.get(&resource.id)
-                && state.exists
-            {
-                for (k, v) in &state.attributes {
-                    if !attrs.contains_key(k) {
-                        attrs.insert(k.clone(), v.clone());
-                    }
-                }
-            }
-            binding_map.insert(binding_name.clone(), attrs);
-        }
-    }
+    // Build initial bindings for reference resolution
+    let mut bindings = ResolvedBindings::from_resources_with_state(
+        &sorted_resources,
+        &current_states,
+        &remote_bindings,
+    );
 
     // Resolve references and enum identifiers, then create initial plan for display
     let mut resources_for_plan = sorted_resources.clone();
@@ -952,7 +941,7 @@ async fn run_apply_locked(
     let mut result = execute_effects(
         &plan,
         &provider,
-        &mut binding_map,
+        &mut bindings,
         &mut current_states,
         &unresolved_resources,
     )
@@ -1225,23 +1214,12 @@ async fn run_apply_from_plan_locked(
         return Ok(());
     }
 
-    // Build initial binding map for reference resolution
-    let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
-    for resource in sorted_resources {
-        if let Some(ref binding_name) = resource.binding {
-            let mut attrs: HashMap<String, Value> = resource.resolved_attributes();
-            if let Some(state) = current_states.get(&resource.id)
-                && state.exists
-            {
-                for (k, v) in &state.attributes {
-                    if !attrs.contains_key(k) {
-                        attrs.insert(k.clone(), v.clone());
-                    }
-                }
-            }
-            binding_map.insert(binding_name.clone(), attrs);
-        }
-    }
+    // Build initial bindings for reference resolution
+    let mut bindings = ResolvedBindings::from_resources_with_state(
+        sorted_resources,
+        &current_states,
+        &HashMap::new(),
+    );
 
     println!("{}", "Applying changes...".cyan().bold());
     println!();
@@ -1255,7 +1233,7 @@ async fn run_apply_from_plan_locked(
     let mut result = execute_effects(
         plan,
         &provider,
-        &mut binding_map,
+        &mut bindings,
         &mut current_states,
         &unresolved_resources,
     )

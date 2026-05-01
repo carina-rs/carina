@@ -1702,14 +1702,14 @@ async fn rename_failure_in_create_before_destroy_counts_as_failure() {
     });
 
     let provider = RenameFailProvider;
-    let mut binding_map = HashMap::new();
+    let mut bindings = carina_core::binding_index::ResolvedBindings::default();
     let mut current_states = HashMap::from([(id.clone(), old_state)]);
     let unresolved_resources = HashMap::from([(id.clone(), new_resource)]);
 
     let result = execute_effects(
         &plan,
         &provider,
-        &mut binding_map,
+        &mut bindings,
         &mut current_states,
         &unresolved_resources,
     )
@@ -1810,10 +1810,11 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
         changed_attributes: vec!["cidr_block".to_string()],
     });
 
-    // --- Initial binding map (with old state) ---
-    let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
-    binding_map.insert(
-        "vpc".to_string(),
+    // --- Initial bindings (with old state) ---
+    use carina_core::binding_index::{BindingValueSource, ResolvedBindings};
+    let mut bindings = ResolvedBindings::default();
+    bindings.set(
+        "vpc",
         HashMap::from([
             ("vpc_id".to_string(), Value::String("vpc-OLD".to_string())),
             (
@@ -1821,9 +1822,10 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
                 Value::String("10.0.0.0/16".to_string()),
             ),
         ]),
+        BindingValueSource::Local,
     );
-    binding_map.insert(
-        "subnet".to_string(),
+    bindings.set(
+        "subnet",
         HashMap::from([
             ("vpc_id".to_string(), Value::String("vpc-OLD".to_string())),
             (
@@ -1831,6 +1833,7 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
                 Value::String("10.1.1.0/24".to_string()),
             ),
         ]),
+        BindingValueSource::Local,
     );
 
     // --- Unresolved resource map ---
@@ -1844,7 +1847,7 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
     let result = execute_effects(
         &plan,
         &provider,
-        &mut binding_map,
+        &mut bindings,
         &mut current_states,
         &unresolved_resources,
     )

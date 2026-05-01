@@ -14,7 +14,7 @@ use crate::resource::{Resource, ResourceId, State, Value};
 use super::basic::{
     BasicEffectResult, ExecutionState, count_actionable_effects, execute_basic_effect,
     process_basic_result, queue_state_refresh, refresh_pending_states, resolve_resource,
-    resolve_resource_with_source, update_binding_map,
+    resolve_resource_with_source,
 };
 use super::{ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, ProgressInfo};
 
@@ -297,7 +297,7 @@ pub(super) async fn execute_effects_phased(
                     continue;
                 }
 
-                let binding_snapshot = input.binding_map.clone();
+                let binding_snapshot = input.bindings.clone();
                 let unresolved = &input.unresolved_resources;
                 let completed_ref = &completed;
 
@@ -334,7 +334,7 @@ pub(super) async fn execute_effects_phased(
                             failed_bindings: &mut failed_bindings,
                             successfully_deleted: &mut successfully_deleted,
                             pending_refreshes: &mut pending_refreshes,
-                            binding_map: &mut input.binding_map,
+                            bindings: &mut input.bindings,
                         },
                     );
                 }
@@ -416,7 +416,7 @@ pub(super) async fn execute_effects_phased(
                     continue;
                 }
 
-                let binding_snapshot = input.binding_map.clone();
+                let binding_snapshot = input.bindings.clone();
                 let unresolved = &input.unresolved_resources;
 
                 in_flight.push(async move {
@@ -456,11 +456,10 @@ pub(super) async fn execute_effects_phased(
 
                         match provider.create(&resolved).await {
                             Ok(state) => {
-                                let mut local_binding_map = binding_snapshot.clone();
-                                update_binding_map(
-                                    &mut local_binding_map,
-                                    &resolved.resolved_attributes(),
+                                let mut local_bindings = binding_snapshot.clone();
+                                local_bindings.record_applied(
                                     to.binding.as_deref(),
+                                    &resolved.resolved_attributes(),
                                     &state,
                                 );
 
@@ -469,7 +468,7 @@ pub(super) async fn execute_effects_phased(
                                 let mut cascade_states = Vec::new();
                                 for cascade in cascading_updates {
                                     let resolved_to =
-                                        match resolve_resource(&cascade.to, &local_binding_map) {
+                                        match resolve_resource(&cascade.to, &local_bindings) {
                                             Ok(r) => r,
                                             Err(e) => {
                                                 observer.on_event(
@@ -508,10 +507,9 @@ pub(super) async fn execute_effects_phased(
                                                     id: &cascade.id,
                                                 },
                                             );
-                                            update_binding_map(
-                                                &mut local_binding_map,
-                                                &resolved_to.resolved_attributes(),
+                                            local_bindings.record_applied(
                                                 cascade.to.binding.as_deref(),
+                                                &resolved_to.resolved_attributes(),
                                                 &cascade_state,
                                             );
                                             cascade_states.push((
@@ -603,10 +601,9 @@ pub(super) async fn execute_effects_phased(
                 } => {
                     let effect = &effects[idx];
                     if let Effect::Replace { to, .. } = effect {
-                        update_binding_map(
-                            &mut input.binding_map,
-                            &to.resolved_attributes(),
+                        input.bindings.record_applied(
                             to.binding.as_deref(),
+                            &to.resolved_attributes(),
                             &state,
                         );
                     }
@@ -614,10 +611,9 @@ pub(super) async fn execute_effects_phased(
                         cascade_states
                     {
                         applied_states.insert(cascade_id, cascade_state.clone());
-                        update_binding_map(
-                            &mut input.binding_map,
-                            &cascade_attrs,
+                        input.bindings.record_applied(
                             cascade_binding.as_deref(),
+                            &cascade_attrs,
                             &cascade_state,
                         );
                     }
@@ -887,7 +883,7 @@ pub(super) async fn execute_effects_phased(
                     continue;
                 }
 
-                let binding_snapshot = input.binding_map.clone();
+                let binding_snapshot = input.bindings.clone();
                 let unresolved = &input.unresolved_resources;
 
                 if let Effect::Replace {
@@ -1120,12 +1116,9 @@ pub(super) async fn execute_effects_phased(
                 } => {
                     success_count += 1;
                     applied_states.insert(resource_id, state.clone());
-                    update_binding_map(
-                        &mut input.binding_map,
-                        &resolved_attrs,
-                        binding.as_deref(),
-                        &state,
-                    );
+                    input
+                        .bindings
+                        .record_applied(binding.as_deref(), &resolved_attrs, &state);
                 }
                 PhaseEffectResult::NonCbdCreateFailure { binding } => {
                     failure_count += 1;

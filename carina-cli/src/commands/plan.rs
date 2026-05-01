@@ -352,23 +352,11 @@ pub(crate) fn resolve_export_values_for_display(
     resources: &[Resource],
     current_states: &HashMap<ResourceId, State>,
 ) -> Vec<carina_core::parser::ExportParameter> {
-    // Build binding map from resources + current state
-    let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
-    for resource in resources {
-        if let Some(ref binding_name) = resource.binding {
-            let mut attrs: HashMap<String, Value> = resource.resolved_attributes();
-            if let Some(state) = current_states.get(&resource.id)
-                && state.exists
-            {
-                for (k, v) in &state.attributes {
-                    if !attrs.contains_key(k) {
-                        attrs.insert(k.clone(), v.clone());
-                    }
-                }
-            }
-            binding_map.insert(binding_name.clone(), attrs);
-        }
-    }
+    let bindings = carina_core::binding_index::ResolvedBindings::from_resources_with_state(
+        resources,
+        current_states,
+        &HashMap::new(),
+    );
 
     export_params
         .iter()
@@ -376,7 +364,7 @@ pub(crate) fn resolve_export_values_for_display(
             let resolved_value = param
                 .value
                 .as_ref()
-                .map(|v| resolve_export_value(v, &binding_map));
+                .map(|v| resolve_export_value(v, &bindings));
             carina_core::parser::ExportParameter {
                 name: param.name.clone(),
                 type_expr: param.type_expr.clone(),
@@ -389,19 +377,19 @@ pub(crate) fn resolve_export_values_for_display(
 /// Resolve a single export value, handling both ResourceRef and dot-notation strings.
 pub(crate) fn resolve_export_value(
     value: &Value,
-    binding_map: &HashMap<String, HashMap<String, Value>>,
+    bindings: &carina_core::binding_index::ResolvedBindings,
 ) -> Value {
     use carina_core::resolver::resolve_ref_value;
 
     match value {
         Value::ResourceRef { .. } => {
-            resolve_ref_value(value, binding_map).unwrap_or_else(|_| value.clone())
+            resolve_ref_value(value, bindings).unwrap_or_else(|_| value.clone())
         }
         // Cross-file: "binding.attr" parsed as String instead of ResourceRef
         Value::String(s) if s.contains('.') && !s.contains(' ') => {
             let parts: Vec<&str> = s.splitn(2, '.').collect();
             if parts.len() == 2
-                && let Some(attrs) = binding_map.get(parts[0])
+                && let Some(attrs) = bindings.get(parts[0])
                 && let Some(resolved) = attrs.get(parts[1])
             {
                 return resolved.clone();
@@ -411,14 +399,14 @@ pub(crate) fn resolve_export_value(
         Value::List(items) => {
             let resolved: Vec<Value> = items
                 .iter()
-                .map(|item| resolve_export_value(item, binding_map))
+                .map(|item| resolve_export_value(item, bindings))
                 .collect();
             Value::List(resolved)
         }
         Value::Map(map) => {
             let resolved: indexmap::IndexMap<String, Value> = map
                 .iter()
-                .map(|(k, v)| (k.clone(), resolve_export_value(v, binding_map)))
+                .map(|(k, v)| (k.clone(), resolve_export_value(v, bindings)))
                 .collect();
             Value::Map(resolved)
         }

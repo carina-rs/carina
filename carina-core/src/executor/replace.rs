@@ -3,13 +3,12 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use crate::binding_index::ResolvedBindings;
 use crate::effect::Effect;
 use crate::provider::Provider;
 use crate::resource::{Resource, ResourceId, State, Value};
 
-use super::basic::{
-    BasicEffectResult, resolve_resource, resolve_resource_with_source, update_binding_map,
-};
+use super::basic::{BasicEffectResult, resolve_resource, resolve_resource_with_source};
 use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
 
 /// Result of executing a single effect.
@@ -40,7 +39,7 @@ pub(super) struct ReplaceContext<'a> {
     pub(super) lifecycle: &'a crate::resource::LifecycleConfig,
     pub(super) cascading_updates: &'a [crate::effect::CascadingUpdate],
     pub(super) temporary_name: Option<&'a crate::effect::TemporaryName>,
-    pub(super) binding_map: &'a HashMap<String, HashMap<String, Value>>,
+    pub(super) bindings: &'a ResolvedBindings,
     pub(super) unresolved: &'a HashMap<ResourceId, Resource>,
     pub(super) started: Instant,
     pub(super) progress: ProgressInfo,
@@ -69,7 +68,7 @@ pub(super) async fn execute_cbd_replace_parallel(
     ctx: &ReplaceContext<'_>,
     observer: &dyn ExecutionObserver,
 ) -> SingleEffectResult {
-    let resolved = match resolve_resource(ctx.to, ctx.binding_map) {
+    let resolved = match resolve_resource(ctx.to, ctx.bindings) {
         Ok(r) => r,
         Err(e) => {
             observer.on_event(&ExecutionEvent::EffectFailed {
@@ -88,19 +87,18 @@ pub(super) async fn execute_cbd_replace_parallel(
 
     match provider.create(&resolved).await {
         Ok(state) => {
-            // Build a local binding map update for cascade resolution
-            let mut local_binding_map = ctx.binding_map.clone();
-            update_binding_map(
-                &mut local_binding_map,
-                &resolved.resolved_attributes(),
+            // Build a local bindings clone for cascade resolution
+            let mut local_bindings = ctx.bindings.clone();
+            local_bindings.record_applied(
                 ctx.to.binding.as_deref(),
+                &resolved.resolved_attributes(),
                 &state,
             );
 
             // Execute cascading updates
             let mut cascade_failed = false;
             for cascade in ctx.cascading_updates {
-                let resolved_to = match resolve_resource(&cascade.to, &local_binding_map) {
+                let resolved_to = match resolve_resource(&cascade.to, &local_bindings) {
                     Ok(r) => r,
                     Err(e) => {
                         observer.on_event(&ExecutionEvent::CascadeUpdateFailed {
@@ -121,10 +119,9 @@ pub(super) async fn execute_cbd_replace_parallel(
                     Ok(cascade_state) => {
                         observer
                             .on_event(&ExecutionEvent::CascadeUpdateSucceeded { id: &cascade.id });
-                        update_binding_map(
-                            &mut local_binding_map,
-                            &resolved_to.resolved_attributes(),
+                        local_bindings.record_applied(
                             cascade.to.binding.as_deref(),
+                            &resolved_to.resolved_attributes(),
                             &cascade_state,
                         );
                     }
@@ -299,28 +296,28 @@ pub(super) async fn execute_dbd_replace_parallel(
     match provider.delete(ctx.id, identifier, ctx.lifecycle).await {
         Ok(()) => {
             let resolve_source = ctx.unresolved.get(&ctx.to.id).unwrap_or(ctx.to);
-            let resolved =
-                match resolve_resource_with_source(ctx.to, resolve_source, ctx.binding_map) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        observer.on_event(&ExecutionEvent::EffectFailed {
-                            effect: ctx.effect,
-                            error: &e,
-                            duration: ctx.started.elapsed(),
-                            progress: ctx.progress,
-                        });
-                        refreshes.push((ctx.to.id.clone(), identifier.to_string()));
-                        return SingleEffectResult::Replace {
-                            success: false,
-                            state: None,
-                            resource_id: ctx.to.id.clone(),
-                            resolved_attrs: None,
-                            binding: ctx.effect.binding_name(),
-                            refreshes,
-                            permanent_overrides: None,
-                        };
-                    }
-                };
+            let resolved = match resolve_resource_with_source(ctx.to, resolve_source, ctx.bindings)
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    observer.on_event(&ExecutionEvent::EffectFailed {
+                        effect: ctx.effect,
+                        error: &e,
+                        duration: ctx.started.elapsed(),
+                        progress: ctx.progress,
+                    });
+                    refreshes.push((ctx.to.id.clone(), identifier.to_string()));
+                    return SingleEffectResult::Replace {
+                        success: false,
+                        state: None,
+                        resource_id: ctx.to.id.clone(),
+                        resolved_attrs: None,
+                        binding: ctx.effect.binding_name(),
+                        refreshes,
+                        permanent_overrides: None,
+                    };
+                }
+            };
             match provider.create(&resolved).await {
                 Ok(state) => {
                     observer.on_event(&ExecutionEvent::EffectSucceeded {

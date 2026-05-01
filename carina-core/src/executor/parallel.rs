@@ -13,7 +13,7 @@ use crate::resource::{Resource, ResourceId, State};
 
 use super::basic::{
     ExecutionState, count_actionable_effects, execute_basic_effect, process_basic_result,
-    refresh_pending_states, update_binding_map,
+    refresh_pending_states,
 };
 use super::replace::{ReplaceContext, SingleEffectResult, execute_replace_parallel};
 use super::{ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, ProgressInfo};
@@ -268,8 +268,8 @@ pub(super) async fn execute_effects_sequential(
                 continue;
             }
 
-            // Snapshot binding_map for this effect's resolution
-            let binding_snapshot = input.binding_map.clone();
+            // Snapshot bindings for this effect's resolution
+            let binding_snapshot = input.bindings.clone();
             let unresolved = &input.unresolved_resources;
             let completed_ref = &completed;
 
@@ -316,7 +316,7 @@ pub(super) async fn execute_effects_sequential(
                                 lifecycle,
                                 cascading_updates,
                                 temporary_name: temporary_name.as_ref(),
-                                binding_map: &binding_snapshot,
+                                bindings: &binding_snapshot,
                                 unresolved,
                                 started,
                                 progress,
@@ -371,7 +371,7 @@ pub(super) async fn execute_effects_sequential(
                         failed_bindings: &mut failed_bindings,
                         successfully_deleted: &mut successfully_deleted,
                         pending_refreshes: &mut pending_refreshes,
-                        binding_map: &mut input.binding_map,
+                        bindings: &mut input.bindings,
                     },
                 );
             }
@@ -387,12 +387,9 @@ pub(super) async fn execute_effects_sequential(
                 if let Some(state) = &state {
                     applied_states.insert(resource_id, state.clone());
                     if let Some(attrs) = &resolved_attrs {
-                        update_binding_map(
-                            &mut input.binding_map,
-                            attrs,
-                            binding.as_deref(),
-                            state,
-                        );
+                        input
+                            .bindings
+                            .record_applied(binding.as_deref(), attrs, state);
                     }
                 }
                 if success {

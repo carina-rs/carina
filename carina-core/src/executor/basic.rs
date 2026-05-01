@@ -1,10 +1,11 @@
 //! Single-effect execution: Create, Update, Delete dispatch, resource resolution,
-//! Secret unwrapping, and binding map updates.
+//! Secret unwrapping, and post-apply binding updates.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use crate::binding_index::ResolvedBindings;
 use crate::effect::Effect;
 use crate::provider::Provider;
 use crate::resolver::resolve_ref_value;
@@ -43,7 +44,7 @@ pub(super) struct ExecutionState<'a> {
     pub(super) failed_bindings: &'a mut std::collections::HashSet<String>,
     pub(super) successfully_deleted: &'a mut std::collections::HashSet<ResourceId>,
     pub(super) pending_refreshes: &'a mut HashMap<ResourceId, String>,
-    pub(super) binding_map: &'a mut HashMap<String, HashMap<String, Value>>,
+    pub(super) bindings: &'a mut ResolvedBindings,
 }
 
 /// Queue a state refresh for a resource after a failed operation.
@@ -94,15 +95,15 @@ pub(super) async fn refresh_pending_states(
     failed_refreshes
 }
 
-/// Resolve a resource's attributes using the current binding map.
+/// Resolve a resource's attributes using the current bindings.
 /// Secret values are unwrapped so the provider receives the plain inner value.
 pub(super) fn resolve_resource(
     resource: &Resource,
-    binding_map: &HashMap<String, HashMap<String, Value>>,
+    bindings: &ResolvedBindings,
 ) -> Result<Resource, String> {
     let mut resolved = resource.clone();
     for (key, expr) in &resource.attributes {
-        let resolved_value = resolve_ref_value(expr, binding_map)?;
+        let resolved_value = resolve_ref_value(expr, bindings)?;
         resolved
             .attributes
             .insert(key.clone(), unwrap_secret(resolved_value));
@@ -115,11 +116,11 @@ pub(super) fn resolve_resource(
 pub(super) fn resolve_resource_with_source(
     target: &Resource,
     source: &Resource,
-    binding_map: &HashMap<String, HashMap<String, Value>>,
+    bindings: &ResolvedBindings,
 ) -> Result<Resource, String> {
     let mut resolved = target.clone();
     for (key, expr) in &source.attributes {
-        let resolved_value = resolve_ref_value(expr, binding_map)?;
+        let resolved_value = resolve_ref_value(expr, bindings)?;
         resolved
             .attributes
             .insert(key.clone(), unwrap_secret(resolved_value));
@@ -142,22 +143,6 @@ fn unwrap_secret(value: Value) -> Value {
     }
 }
 
-/// Update the binding map with a newly created/updated resource's state.
-pub(super) fn update_binding_map(
-    binding_map: &mut HashMap<String, HashMap<String, Value>>,
-    resource_attrs: &HashMap<String, Value>,
-    binding: Option<&str>,
-    state: &State,
-) {
-    if let Some(binding_name) = binding {
-        let mut attrs = resource_attrs.clone();
-        for (k, v) in &state.attributes {
-            attrs.insert(k.clone(), v.clone());
-        }
-        binding_map.insert(binding_name.to_string(), attrs);
-    }
-}
-
 /// Process a `BasicEffectResult` by updating shared execution state.
 ///
 /// This helper is used by both sequential and phased execution paths to avoid
@@ -173,7 +158,7 @@ pub(super) fn process_basic_result(result: BasicEffectResult, exec: &mut Executi
             *exec.success_count += 1;
             if let Some(s) = effect_state {
                 if let Some(attrs) = &resolved_attrs {
-                    update_binding_map(exec.binding_map, attrs, binding.as_deref(), &s);
+                    exec.bindings.record_applied(binding.as_deref(), attrs, &s);
                 }
                 exec.applied_states.insert(resource_id, s);
             }
@@ -215,7 +200,7 @@ pub(super) fn count_actionable_effects(effects: &[Effect]) -> usize {
 pub(super) async fn execute_basic_effect<'a>(
     effect: &'a Effect,
     provider: &'a dyn Provider,
-    binding_map: &'a HashMap<String, HashMap<String, Value>>,
+    bindings: &'a ResolvedBindings,
     unresolved: &'a HashMap<ResourceId, Resource>,
     completed: &'a AtomicUsize,
     total: usize,
@@ -231,7 +216,7 @@ pub(super) async fn execute_basic_effect<'a>(
 
     match effect {
         Effect::Create(resource) => {
-            let resolved = match resolve_resource(resource, binding_map) {
+            let resolved = match resolve_resource(resource, bindings) {
                 Ok(r) => r,
                 Err(e) => {
                     observer.on_event(&ExecutionEvent::EffectFailed {
@@ -278,7 +263,7 @@ pub(super) async fn execute_basic_effect<'a>(
         }
         Effect::Update { id, from, to, .. } => {
             let resolve_source = unresolved.get(id).unwrap_or(to);
-            let resolved_to = match resolve_resource_with_source(to, resolve_source, binding_map) {
+            let resolved_to = match resolve_resource_with_source(to, resolve_source, bindings) {
                 Ok(r) => r,
                 Err(e) => {
                     observer.on_event(&ExecutionEvent::EffectFailed {

@@ -48,13 +48,8 @@ pub fn resolve_refs_with_state_and_remote(
         }
     }
 
-    // Build the canonical value-aware view (#2299). `as_map()` hands back
-    // the legacy `&HashMap<String, HashMap<String, Value>>` shape so
-    // `resolve_ref_value` and the `carina-cli` re-export keep working
-    // unchanged; #2300 will thread `&ResolvedBindings` through.
-    let resolved_bindings =
+    let bindings =
         ResolvedBindings::from_resources_with_state(resources, current_states, remote_bindings);
-    let binding_map = resolved_bindings.as_map();
 
     // Resolve ResourceRef values in all resources. Stay in `IndexMap`
     // so the user's authored attribute order survives resolution
@@ -62,7 +57,7 @@ pub fn resolve_refs_with_state_and_remote(
     for resource in resources.iter_mut() {
         let mut resolved_attrs: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
         for (key, value) in &resource.attributes {
-            resolved_attrs.insert(key.clone(), resolve_ref_value(value, binding_map)?);
+            resolved_attrs.insert(key.clone(), resolve_ref_value(value, &bindings)?);
         }
         resource.attributes = resolved_attrs;
     }
@@ -73,27 +68,24 @@ pub fn resolve_refs_with_state_and_remote(
 ///
 /// If the referenced binding or attribute is not found, the value is returned as-is.
 /// Returns an error if a builtin function fails with fully-resolved arguments.
-pub fn resolve_ref_value(
-    value: &Value,
-    binding_map: &HashMap<String, HashMap<String, Value>>,
-) -> Result<Value, String> {
+pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<Value, String> {
     match value {
         Value::ResourceRef { path } => {
             let binding_name = path.binding();
             let attribute_name = path.attribute();
             let field_path = path.field_path();
-            if let Some(attrs) = binding_map.get(binding_name)
+            if let Some(attrs) = bindings.get(binding_name)
                 && let Some(attr_value) = attrs.get(attribute_name)
             {
                 // Resolve the initial attribute value
-                let mut resolved = resolve_ref_value(attr_value, binding_map)?;
+                let mut resolved = resolve_ref_value(attr_value, bindings)?;
 
                 // Traverse chained field path through nested maps
                 for field in field_path {
                     match resolved {
                         Value::Map(ref map) => {
                             if let Some(nested) = map.get(field) {
-                                resolved = resolve_ref_value(nested, binding_map)?;
+                                resolved = resolve_ref_value(nested, bindings)?;
                             } else {
                                 // Field not found in nested map, keep original ref
                                 return Ok(value.clone());
@@ -114,14 +106,14 @@ pub fn resolve_ref_value(
         Value::List(items) => {
             let resolved: Result<Vec<Value>, String> = items
                 .iter()
-                .map(|v| resolve_ref_value(v, binding_map))
+                .map(|v| resolve_ref_value(v, bindings))
                 .collect();
             Ok(Value::List(resolved?))
         }
         Value::Map(map) => {
             let mut resolved: IndexMap<String, Value> = IndexMap::new();
             for (k, v) in map {
-                resolved.insert(k.clone(), resolve_ref_value(v, binding_map)?);
+                resolved.insert(k.clone(), resolve_ref_value(v, bindings)?);
             }
             Ok(Value::Map(resolved))
         }
@@ -130,7 +122,7 @@ pub fn resolve_ref_value(
                 .iter()
                 .map(|p| match p {
                     InterpolationPart::Expr(v) => {
-                        Ok(InterpolationPart::Expr(resolve_ref_value(v, binding_map)?))
+                        Ok(InterpolationPart::Expr(resolve_ref_value(v, bindings)?))
                     }
                     other => Ok(other.clone()),
                 })
@@ -141,7 +133,7 @@ pub fn resolve_ref_value(
             // First, resolve all arguments
             let resolved_args: Result<Vec<Value>, String> = args
                 .iter()
-                .map(|a| resolve_ref_value(a, binding_map))
+                .map(|a| resolve_ref_value(a, bindings))
                 .collect();
             let resolved_args = resolved_args?;
 
@@ -181,7 +173,7 @@ pub fn resolve_ref_value(
             }
         }
         Value::Secret(inner) => {
-            let resolved_inner = resolve_ref_value(inner, binding_map)?;
+            let resolved_inner = resolve_ref_value(inner, bindings)?;
             Ok(Value::Secret(Box::new(resolved_inner)))
         }
         _ => Ok(value.clone()),
@@ -200,32 +192,46 @@ mod tests {
         r
     }
 
+    /// Build a `ResolvedBindings` from a flat `binding_name → attributes`
+    /// map. Each entry is dropped in via `from_resources_with_state` so
+    /// the resulting view is identical to what production code constructs
+    /// — there is no test-only back door into the type.
+    fn bindings_from(entries: Vec<(&str, Vec<(&str, Value)>)>) -> ResolvedBindings {
+        let resources: Vec<Resource> = entries
+            .into_iter()
+            .map(|(binding, attrs)| {
+                make_resource(&format!("{}-resource", binding), Some(binding), attrs)
+            })
+            .collect();
+        ResolvedBindings::from_resources_with_state(&resources, &HashMap::new(), &HashMap::new())
+    }
+
     #[test]
     fn test_resolve_simple_resource_ref() {
-        let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
-        let mut attrs = HashMap::new();
-        attrs.insert("id".to_string(), Value::String("vpc-123".to_string()));
-        binding_map.insert("my_vpc".to_string(), attrs);
+        let bindings = bindings_from(vec![(
+            "my_vpc",
+            vec![("id", Value::String("vpc-123".to_string()))],
+        )]);
 
         let ref_value = Value::resource_ref("my_vpc".to_string(), "id".to_string(), vec![]);
 
-        let resolved = resolve_ref_value(&ref_value, &binding_map).unwrap();
+        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
         assert_eq!(resolved, Value::String("vpc-123".to_string()));
     }
 
     #[test]
     fn test_resolve_nested_refs_in_list() {
-        let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
-        let mut attrs = HashMap::new();
-        attrs.insert("id".to_string(), Value::String("sg-456".to_string()));
-        binding_map.insert("my_sg".to_string(), attrs);
+        let bindings = bindings_from(vec![(
+            "my_sg",
+            vec![("id", Value::String("sg-456".to_string()))],
+        )]);
 
         let list = Value::List(vec![
             Value::String("static".to_string()),
             Value::resource_ref("my_sg".to_string(), "id".to_string(), vec![]),
         ]);
 
-        let resolved = resolve_ref_value(&list, &binding_map).unwrap();
+        let resolved = resolve_ref_value(&list, &bindings).unwrap();
         assert_eq!(
             resolved,
             Value::List(vec![
@@ -237,10 +243,10 @@ mod tests {
 
     #[test]
     fn test_resolve_nested_refs_in_map() {
-        let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
-        let mut attrs = HashMap::new();
-        attrs.insert("id".to_string(), Value::String("subnet-789".to_string()));
-        binding_map.insert("my_subnet".to_string(), attrs);
+        let bindings = bindings_from(vec![(
+            "my_subnet",
+            vec![("id", Value::String("subnet-789".to_string()))],
+        )]);
 
         let map = Value::Map(
             vec![(
@@ -251,7 +257,7 @@ mod tests {
             .collect(),
         );
 
-        let resolved = resolve_ref_value(&map, &binding_map).unwrap();
+        let resolved = resolve_ref_value(&map, &bindings).unwrap();
         if let Value::Map(m) = resolved {
             assert_eq!(
                 m.get("subnet_id"),
@@ -264,20 +270,20 @@ mod tests {
 
     #[test]
     fn test_unresolved_ref_stays_as_is() {
-        let binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let bindings = ResolvedBindings::default();
 
         let ref_value = Value::resource_ref("nonexistent".to_string(), "id".to_string(), vec![]);
 
-        let resolved = resolve_ref_value(&ref_value, &binding_map).unwrap();
+        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
         assert_eq!(resolved, ref_value);
     }
 
     #[test]
     fn test_resolve_interpolation_all_resolved() {
-        let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
-        let mut attrs = HashMap::new();
-        attrs.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
-        binding_map.insert("my_vpc".to_string(), attrs);
+        let bindings = bindings_from(vec![(
+            "my_vpc",
+            vec![("vpc_id", Value::String("vpc-123".to_string()))],
+        )]);
 
         let interp = Value::Interpolation(vec![
             InterpolationPart::Literal("subnet-".to_string()),
@@ -288,13 +294,13 @@ mod tests {
             )),
         ]);
 
-        let resolved = resolve_ref_value(&interp, &binding_map).unwrap();
+        let resolved = resolve_ref_value(&interp, &bindings).unwrap();
         assert_eq!(resolved, Value::String("subnet-vpc-123".to_string()));
     }
 
     #[test]
     fn test_resolve_interpolation_partially_unresolved() {
-        let binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let bindings = ResolvedBindings::default();
 
         let interp = Value::Interpolation(vec![
             InterpolationPart::Literal("subnet-".to_string()),
@@ -305,14 +311,14 @@ mod tests {
             )),
         ]);
 
-        let resolved = resolve_ref_value(&interp, &binding_map).unwrap();
+        let resolved = resolve_ref_value(&interp, &bindings).unwrap();
         // Should remain as Interpolation since the ref couldn't be resolved
         assert!(matches!(resolved, Value::Interpolation(_)));
     }
 
     #[test]
     fn test_resolve_interpolation_with_non_string_types() {
-        let binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let bindings = ResolvedBindings::default();
 
         let interp = Value::Interpolation(vec![
             InterpolationPart::Literal("port-".to_string()),
@@ -321,7 +327,7 @@ mod tests {
             InterpolationPart::Expr(Value::Bool(true)),
         ]);
 
-        let resolved = resolve_ref_value(&interp, &binding_map).unwrap();
+        let resolved = resolve_ref_value(&interp, &bindings).unwrap();
         assert_eq!(
             resolved,
             Value::String("port-8080-enabled-true".to_string())
@@ -372,7 +378,7 @@ mod tests {
 
     #[test]
     fn test_resolve_function_call_join() {
-        let binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let bindings = ResolvedBindings::default();
 
         let func = Value::FunctionCall {
             name: "join".to_string(),
@@ -386,17 +392,16 @@ mod tests {
             ],
         };
 
-        let resolved = resolve_ref_value(&func, &binding_map).unwrap();
+        let resolved = resolve_ref_value(&func, &bindings).unwrap();
         assert_eq!(resolved, Value::String("a-b-c".to_string()));
     }
 
     #[test]
     fn test_resolve_function_call_with_resource_ref() {
-        let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
-        binding_map.insert(
-            "vpc".to_string(),
-            HashMap::from([("id".to_string(), Value::String("vpc-123".to_string()))]),
-        );
+        let bindings = bindings_from(vec![(
+            "vpc",
+            vec![("id", Value::String("vpc-123".to_string()))],
+        )]);
 
         // join("-", ["prefix", vpc.id]) should resolve vpc.id first, then evaluate
         let func = Value::FunctionCall {
@@ -410,13 +415,13 @@ mod tests {
             ],
         };
 
-        let resolved = resolve_ref_value(&func, &binding_map).unwrap();
+        let resolved = resolve_ref_value(&func, &bindings).unwrap();
         assert_eq!(resolved, Value::String("prefix-vpc-123".to_string()));
     }
 
     #[test]
     fn test_resolve_function_call_unresolved_ref_kept() {
-        let binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let bindings = ResolvedBindings::default();
 
         // If a ResourceRef in the args can't be resolved, the FunctionCall is kept
         let func = Value::FunctionCall {
@@ -431,20 +436,16 @@ mod tests {
             ],
         };
 
-        let resolved = resolve_ref_value(&func, &binding_map).unwrap();
+        let resolved = resolve_ref_value(&func, &bindings).unwrap();
         assert!(matches!(resolved, Value::FunctionCall { .. }));
     }
 
     #[test]
     fn test_resolve_chained_field_access() {
-        let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
-
         // web binding has a nested map: network = { vpc_id = "vpc-123" }
         let mut network_map = IndexMap::new();
         network_map.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
-        let mut attrs = HashMap::new();
-        attrs.insert("network".to_string(), Value::Map(network_map));
-        binding_map.insert("web".to_string(), attrs);
+        let bindings = bindings_from(vec![("web", vec![("network", Value::Map(network_map))])]);
 
         // web.network.vpc_id should resolve to "vpc-123"
         let ref_value = Value::resource_ref(
@@ -453,22 +454,18 @@ mod tests {
             vec!["vpc_id".to_string()],
         );
 
-        let resolved = resolve_ref_value(&ref_value, &binding_map).unwrap();
+        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
         assert_eq!(resolved, Value::String("vpc-123".to_string()));
     }
 
     #[test]
     fn test_resolve_deeply_chained_field_access() {
-        let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
-
         // web.output.network.vpc_id
         let mut inner_map = IndexMap::new();
         inner_map.insert("vpc_id".to_string(), Value::String("vpc-456".to_string()));
         let mut output_map = IndexMap::new();
         output_map.insert("network".to_string(), Value::Map(inner_map));
-        let mut attrs = HashMap::new();
-        attrs.insert("output".to_string(), Value::Map(output_map));
-        binding_map.insert("web".to_string(), attrs);
+        let bindings = bindings_from(vec![("web", vec![("output", Value::Map(output_map))])]);
 
         let ref_value = Value::resource_ref(
             "web".to_string(),
@@ -476,19 +473,15 @@ mod tests {
             vec!["network".to_string(), "vpc_id".to_string()],
         );
 
-        let resolved = resolve_ref_value(&ref_value, &binding_map).unwrap();
+        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
         assert_eq!(resolved, Value::String("vpc-456".to_string()));
     }
 
     #[test]
     fn test_resolve_chained_field_missing_key_keeps_ref() {
-        let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
-
         let mut network_map = IndexMap::new();
         network_map.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
-        let mut attrs = HashMap::new();
-        attrs.insert("network".to_string(), Value::Map(network_map));
-        binding_map.insert("web".to_string(), attrs);
+        let bindings = bindings_from(vec![("web", vec![("network", Value::Map(network_map))])]);
 
         // web.network.nonexistent should keep original ref
         let ref_value = Value::resource_ref(
@@ -497,14 +490,14 @@ mod tests {
             vec!["nonexistent".to_string()],
         );
 
-        let resolved = resolve_ref_value(&ref_value, &binding_map).unwrap();
+        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
         assert_eq!(resolved, ref_value);
     }
 
     #[test]
     fn resolve_builtin_error_propagated_when_args_resolved() {
         // env() with a var name that is extremely unlikely to be set should propagate error
-        let binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let bindings = ResolvedBindings::default();
         let value = Value::FunctionCall {
             name: "env".to_string(),
             args: vec![Value::String(
@@ -512,7 +505,7 @@ mod tests {
             )],
         };
 
-        let result = resolve_ref_value(&value, &binding_map);
+        let result = resolve_ref_value(&value, &bindings);
         assert!(
             result.is_err(),
             "Expected error for env() with missing var, got: {:?}",
@@ -529,7 +522,7 @@ mod tests {
     #[test]
     fn resolve_builtin_with_unresolved_ref_stays_as_function_call() {
         // join("-", vpc.tags) should stay as FunctionCall when vpc.tags is unresolved
-        let binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let bindings = ResolvedBindings::default();
         let value = Value::FunctionCall {
             name: "join".to_string(),
             args: vec![
@@ -538,7 +531,7 @@ mod tests {
             ],
         };
 
-        let result = resolve_ref_value(&value, &binding_map);
+        let result = resolve_ref_value(&value, &bindings);
         assert!(result.is_ok(), "Unresolved ref should not cause error");
         match result.unwrap() {
             Value::FunctionCall { name, .. } => assert_eq!(name, "join"),
