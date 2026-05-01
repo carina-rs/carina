@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use indexmap::IndexMap;
 
+use crate::binding_index::ResolvedBindings;
 use crate::deps::get_resource_dependencies;
 use crate::resource::{
     InterpolationPart, Resource, ResourceId, State, Value, contains_resource_ref,
@@ -47,38 +48,13 @@ pub fn resolve_refs_with_state_and_remote(
         }
     }
 
-    // Build a map of binding_name -> attributes (merged from DSL and AWS state)
-    let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
-
-    for resource in resources.iter() {
-        if let Some(ref binding_name) = resource.binding {
-            // `attrs` only needs key-based lookup for state merging
-            // and ResourceRef resolution, so it stays `HashMap`. The
-            // source-ordered `IndexMap` view lives only on
-            // `Resource.attributes` (#2222).
-            let mut attrs: HashMap<String, Value> = resource.resolved_attributes();
-
-            // Merge AWS state attributes (like `id`) if available
-            if let Some(state) = current_states.get(&resource.id)
-                && state.exists
-            {
-                for (k, v) in &state.attributes {
-                    if !attrs.contains_key(k) {
-                        attrs.insert(k.clone(), v.clone());
-                    }
-                }
-            }
-
-            binding_map.insert(binding_name.clone(), attrs);
-        }
-    }
-
-    // Inject upstream state bindings.
-    // Each upstream_state binding (e.g., "network") maps to a Map value containing
-    // resource bindings as nested maps (e.g., { "vpc" -> Map { "vpc_id" -> "vpc-123" } }).
-    for (remote_binding, remote_attrs) in remote_bindings {
-        binding_map.insert(remote_binding.clone(), remote_attrs.clone());
-    }
+    // Build the canonical value-aware view (#2299). `as_map()` hands back
+    // the legacy `&HashMap<String, HashMap<String, Value>>` shape so
+    // `resolve_ref_value` and the `carina-cli` re-export keep working
+    // unchanged; #2300 will thread `&ResolvedBindings` through.
+    let resolved_bindings =
+        ResolvedBindings::from_resources_with_state(resources, current_states, remote_bindings);
+    let binding_map = resolved_bindings.as_map();
 
     // Resolve ResourceRef values in all resources. Stay in `IndexMap`
     // so the user's authored attribute order survives resolution
@@ -86,7 +62,7 @@ pub fn resolve_refs_with_state_and_remote(
     for resource in resources.iter_mut() {
         let mut resolved_attrs: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
         for (key, value) in &resource.attributes {
-            resolved_attrs.insert(key.clone(), resolve_ref_value(value, &binding_map)?);
+            resolved_attrs.insert(key.clone(), resolve_ref_value(value, binding_map)?);
         }
         resource.attributes = resolved_attrs;
     }
