@@ -135,6 +135,82 @@ pub enum AttributeType {
     Union(Vec<AttributeType>),
 }
 
+/// One step in a [`FieldPath`]. Either a struct field name or a list
+/// index — what the path needs to express to point a downstream tool
+/// (e.g. the LSP) at the offending location in the source DSL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldPathStep {
+    Field(String),
+    Index(usize),
+}
+
+impl fmt::Display for FieldPathStep {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FieldPathStep::Field(name) => write!(f, "{}", name),
+            FieldPathStep::Index(i) => write!(f, "[{}]", i),
+        }
+    }
+}
+
+/// Path from the validated value's root to the location that produced
+/// a particular [`TypeError`]. Used by [`AttributeType::validate_collect`]
+/// so the LSP can map errors back to source positions without
+/// re-running validation itself (#2214).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FieldPath {
+    steps: Vec<FieldPathStep>,
+}
+
+impl FieldPath {
+    pub fn new() -> Self {
+        Self { steps: Vec::new() }
+    }
+
+    pub fn steps(&self) -> &[FieldPathStep] {
+        &self.steps
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    /// Append a struct-field step and return a new path. Cheap clone
+    /// because validation paths are tiny (depth-of-struct, typically
+    /// < 5).
+    pub fn push_field(&self, name: impl Into<String>) -> Self {
+        let mut next = self.clone();
+        next.steps.push(FieldPathStep::Field(name.into()));
+        next
+    }
+
+    /// Append a list-index step and return a new path.
+    pub fn push_index(&self, index: usize) -> Self {
+        let mut next = self.clone();
+        next.steps.push(FieldPathStep::Index(index));
+        next
+    }
+}
+
+impl fmt::Display for FieldPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut first = true;
+        for step in &self.steps {
+            match step {
+                FieldPathStep::Field(name) => {
+                    if !first {
+                        write!(f, ".")?;
+                    }
+                    write!(f, "{}", name)?;
+                }
+                FieldPathStep::Index(i) => write!(f, "[{}]", i)?,
+            }
+            first = false;
+        }
+        Ok(())
+    }
+}
+
 impl AttributeType {
     /// Create a List type with default ordering (ordered=true, matching CloudFormation default).
     pub fn list(inner: AttributeType) -> Self {
@@ -227,6 +303,159 @@ impl AttributeType {
             | AttributeType::Int
             | AttributeType::Float
             | AttributeType::Bool => self.validate_primitive(value),
+        }
+    }
+
+    /// Validate a value and collect every error along with the
+    /// [`FieldPath`] from the value's root to the offending location
+    /// (#2214).
+    ///
+    /// This is the path-tagged sibling of [`Self::validate`]: where
+    /// `validate` returns the first error wrapped in
+    /// `StructFieldError` / `ListItemError` / `MapValueError` enclosure
+    /// and stops, `validate_collect` keeps walking through every
+    /// field of every nested struct (and every item of a list-of-struct)
+    /// so a downstream tool like the LSP can surface every problem at
+    /// once with positional information.
+    ///
+    /// For non-Struct, non-List<Struct> shapes the result is exactly
+    /// one error (or none) — there is no nested context to descend
+    /// into, so this method is no slower than `validate` for primitives.
+    pub fn validate_collect(&self, value: &Value) -> Vec<(FieldPath, TypeError)> {
+        let mut out = Vec::new();
+        self.collect_into(&FieldPath::new(), value, &mut out);
+        out
+    }
+
+    fn collect_into(&self, path: &FieldPath, value: &Value, out: &mut Vec<(FieldPath, TypeError)>) {
+        // FunctionCall and Secret resolve at runtime — same skip rule
+        // as `validate`.
+        if matches!(value, Value::FunctionCall { .. } | Value::Secret(_)) {
+            return;
+        }
+
+        match self {
+            AttributeType::Struct { name, fields } => {
+                self.collect_struct(path, name, fields, value, out);
+            }
+            AttributeType::List { inner, .. } => {
+                self.collect_list(path, inner, value, out);
+            }
+            // For everything else the existing single-shot validator is
+            // already correct: it returns at most one error and there
+            // is no nested structure to recurse into. Forward the error
+            // (if any) under the current path.
+            _ => {
+                if let Err(e) = self.validate(value) {
+                    out.push((path.clone(), e));
+                }
+            }
+        }
+    }
+
+    fn collect_struct(
+        &self,
+        path: &FieldPath,
+        name: &str,
+        fields: &[StructField],
+        value: &Value,
+        out: &mut Vec<(FieldPath, TypeError)>,
+    ) {
+        // Block syntax → Value::List([Value::Map(...)])  for List<Struct>;
+        // bare Struct rejects List with `BlockSyntaxNotAllowed`.
+        if matches!(value, Value::List(_)) {
+            out.push((
+                path.clone(),
+                TypeError::BlockSyntaxNotAllowed {
+                    attribute: name.to_string(),
+                },
+            ));
+            return;
+        }
+        let Value::Map(map) = value else {
+            out.push((
+                path.clone(),
+                TypeError::TypeMismatch {
+                    expected: self.type_name(),
+                    got: value.type_name(),
+                },
+            ));
+            return;
+        };
+
+        // Map every accepted name (canonical + block_name alias) to the
+        // canonical `StructField`. Pre-#2214 the LSP did this alias
+        // resolution itself; now the core validator is the single
+        // source of truth and `validate_struct` shares the same map
+        // (#2214 reconciliation).
+        let accepted = build_accepted_field_map(fields);
+        let canonical_field_names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+
+        // Required-field check.
+        for f in fields {
+            if f.required && !map.contains_key(&f.name) {
+                let field_path = path.push_field(f.name.clone());
+                out.push((
+                    field_path,
+                    TypeError::MissingRequired {
+                        name: f.name.clone(),
+                    },
+                ));
+            }
+        }
+
+        // Each present field — descend (for nested struct/list of
+        // struct) or run the leaf validator.
+        for (k, v) in map {
+            match accepted.get(k.as_str()) {
+                Some(field) => {
+                    let next_path = path.push_field(k.clone());
+                    // ResourceRef / Interpolation values are placeholders
+                    // resolved at apply time — skip type checking but
+                    // still descend into ResourceRef-free shapes.
+                    if matches!(v, Value::ResourceRef { .. }) {
+                        continue;
+                    }
+                    field.field_type.collect_into(&next_path, v, out);
+                }
+                None => {
+                    let suggestion = suggest_similar_name(k, &canonical_field_names);
+                    out.push((
+                        path.push_field(k.clone()),
+                        TypeError::UnknownStructField {
+                            struct_name: name.to_string(),
+                            field: k.clone(),
+                            suggestion,
+                        },
+                    ));
+                }
+            }
+        }
+    }
+
+    fn collect_list(
+        &self,
+        path: &FieldPath,
+        inner: &AttributeType,
+        value: &Value,
+        out: &mut Vec<(FieldPath, TypeError)>,
+    ) {
+        let Value::List(items) = value else {
+            out.push((
+                path.clone(),
+                TypeError::TypeMismatch {
+                    expected: self.type_name(),
+                    got: value.type_name(),
+                },
+            ));
+            return;
+        };
+        // For List<Struct> we want per-item descent so each item's
+        // errors carry a `[i]` step in the path. For plain List<T>
+        // this still works — each item runs the leaf validator under
+        // the indexed path.
+        for (i, item) in items.iter().enumerate() {
+            inner.collect_into(&path.push_index(i), item, out);
         }
     }
 
@@ -481,12 +710,14 @@ impl AttributeType {
                 });
             }
         }
-        // Type-check each field value
-        let field_map: std::collections::HashMap<&str, &StructField> =
-            fields.iter().map(|f| (f.name.as_str(), f)).collect();
-        let field_names: Vec<&str> = field_map.keys().copied().collect();
+        // Type-check each field value. Use the same accepted-name map
+        // (canonical + block_name alias) the path-tagged validator
+        // builds; before #2214 this branch only knew canonical names
+        // and silently rejected aliases that the LSP happily accepted.
+        let accepted = build_accepted_field_map(fields);
+        let canonical_names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
         for (k, v) in map {
-            if let Some(field) = field_map.get(k.as_str()) {
+            if let Some(field) = accepted.get(k.as_str()) {
                 field
                     .field_type
                     .validate(v)
@@ -495,7 +726,7 @@ impl AttributeType {
                         inner: Box::new(e),
                     })?;
             } else {
-                let suggestion = suggest_similar_name(k, &field_names);
+                let suggestion = suggest_similar_name(k, &canonical_names);
                 return Err(TypeError::UnknownStructField {
                     struct_name: name.clone(),
                     field: k.clone(),
@@ -676,6 +907,25 @@ impl AttributeType {
             (a, b) => a.type_name() == b.type_name(),
         }
     }
+}
+
+/// Map every accepted field name to its canonical [`StructField`].
+/// Both the canonical `name` and any `block_name` alias resolve to the
+/// same field, so users can write either form interchangeably.
+///
+/// Used by both [`AttributeType::validate`] (single-shot) and
+/// [`AttributeType::validate_collect`] (path-tagged) so the two paths
+/// agree on which keys are accepted (#2214 — the LSP previously did
+/// this alias resolution itself, which let the two validators drift).
+fn build_accepted_field_map(fields: &[StructField]) -> HashMap<&str, &StructField> {
+    let mut accepted: HashMap<&str, &StructField> = HashMap::new();
+    for f in fields {
+        accepted.insert(f.name.as_str(), f);
+        if let Some(block) = f.block_name.as_deref() {
+            accepted.insert(block, f);
+        }
+    }
+    accepted
 }
 
 /// Source length is contained in sink length (narrow ⊆ wide).

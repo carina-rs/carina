@@ -2571,3 +2571,181 @@ fn validate_email_type() {
     // Wrong type
     assert!(t.validate(&Value::Int(42)).is_err());
 }
+
+#[cfg(test)]
+mod validate_collect_tests {
+    use super::*;
+    use indexmap::IndexMap;
+
+    fn struct_type(name: &str, fields: Vec<StructField>) -> AttributeType {
+        AttributeType::Struct {
+            name: name.to_string(),
+            fields,
+        }
+    }
+
+    fn map_value(entries: Vec<(&str, Value)>) -> Value {
+        let mut map = IndexMap::new();
+        for (k, v) in entries {
+            map.insert(k.to_string(), v);
+        }
+        Value::Map(map)
+    }
+
+    #[test]
+    fn collect_empty_on_valid_value() {
+        let ty = struct_type(
+            "Versioning",
+            vec![
+                StructField::new("status", AttributeType::String).required(),
+                StructField::new("mfa_delete", AttributeType::Bool),
+            ],
+        );
+        let v = map_value(vec![
+            ("status", Value::String("Enabled".to_string())),
+            ("mfa_delete", Value::Bool(false)),
+        ]);
+        let errors = ty.validate_collect(&v);
+        assert!(
+            errors.is_empty(),
+            "valid struct must produce no errors, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn collect_reports_all_unknown_fields_with_path() {
+        // Two unknown fields in one struct — `validate_collect` must
+        // surface both, while the legacy `validate()` would stop at the
+        // first.
+        let ty = struct_type(
+            "Versioning",
+            vec![StructField::new("status", AttributeType::String)],
+        );
+        let v = map_value(vec![
+            ("statuus", Value::String("Enabled".to_string())),
+            ("mfa", Value::Bool(false)),
+        ]);
+        let errors = ty.validate_collect(&v);
+        assert_eq!(
+            errors.len(),
+            2,
+            "expected two unknown-field errors, got {errors:?}"
+        );
+        let names: Vec<String> = errors.iter().map(|(p, _)| p.to_string()).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        assert!(names.contains(&"statuus"), "got {names:?}");
+        assert!(names.contains(&"mfa"), "got {names:?}");
+    }
+
+    #[test]
+    fn collect_descends_into_nested_struct_with_field_path() {
+        // Inner struct has a type error — the path must record the
+        // outer field name then the inner field name so the LSP can
+        // walk back to the source position.
+        let inner = struct_type(
+            "Inner",
+            vec![StructField::new("count", AttributeType::Int).required()],
+        );
+        let outer = struct_type("Outer", vec![StructField::new("nested", inner).required()]);
+        let v = map_value(vec![(
+            "nested",
+            map_value(vec![("count", Value::String("not an int".to_string()))]),
+        )]);
+        let errors = outer.validate_collect(&v);
+        assert_eq!(errors.len(), 1, "got {errors:?}");
+        let (path, _err) = &errors[0];
+        let steps: Vec<String> = path.steps().iter().map(|s| s.to_string()).collect();
+        assert_eq!(steps, vec!["nested".to_string(), "count".to_string()]);
+    }
+
+    #[test]
+    fn collect_descends_into_list_of_struct_with_index_path() {
+        // List<Struct> errors must include the list index in the path
+        // so the LSP can locate the offending block.
+        let inner = struct_type(
+            "Item",
+            vec![StructField::new("name", AttributeType::String).required()],
+        );
+        let outer_attr = AttributeType::List {
+            inner: Box::new(inner),
+            ordered: true,
+        };
+
+        // Two list items, second one has wrong type for `name`
+        let v = Value::List(vec![
+            map_value(vec![("name", Value::String("ok".to_string()))]),
+            map_value(vec![("name", Value::Int(42))]),
+        ]);
+        let errors = outer_attr.validate_collect(&v);
+        assert_eq!(errors.len(), 1, "got {errors:?}");
+        let path = &errors[0].0;
+        let steps: Vec<String> = path.steps().iter().map(|s| s.to_string()).collect();
+        assert_eq!(steps, vec!["[1]".to_string(), "name".to_string()]);
+    }
+
+    #[test]
+    fn collect_resolves_block_name_alias() {
+        // `block_name` is an alias users can type instead of `name` in
+        // the DSL (e.g. `transition` for the canonical `transitions`).
+        // The unified validator must recognise the alias rather than
+        // flagging it as an unknown field — the LSP used to do this
+        // alias lookup itself, but that responsibility now belongs to
+        // the core validator.
+        let ty = struct_type(
+            "Lifecycle",
+            vec![
+                StructField::new("transitions", AttributeType::String)
+                    .with_block_name("transition"),
+            ],
+        );
+        let v = map_value(vec![("transition", Value::String("ok".to_string()))]);
+        let errors = ty.validate_collect(&v);
+        assert!(
+            errors.is_empty(),
+            "block_name alias must not flag the field as unknown, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn collect_skips_resource_ref_in_struct_field() {
+        // ResourceRef values are placeholders that resolve at apply
+        // time. Skipping them avoids spurious "wrong type" errors for
+        // fields whose value is `vpc.id` etc.
+        let ty = struct_type(
+            "Subnet",
+            vec![StructField::new("vpc_id", AttributeType::Int)],
+        );
+        let v = map_value(vec![(
+            "vpc_id",
+            Value::resource_ref("vpc".to_string(), "id".to_string(), vec![]),
+        )]);
+        let errors = ty.validate_collect(&v);
+        assert!(
+            errors.is_empty(),
+            "ResourceRef in struct field must not produce an error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn collect_yields_unknown_struct_field_with_suggestion() {
+        // The existing `validate()` already produces a
+        // `UnknownStructField { suggestion }` for typos. The
+        // collected variant must preserve this — the LSP previously
+        // emitted a plain "Unknown field" message and lost the
+        // suggestion, which #2214 fixes.
+        let ty = struct_type(
+            "Versioning",
+            vec![StructField::new("status", AttributeType::String)],
+        );
+        let v = map_value(vec![("statuus", Value::String("x".to_string()))]);
+        let errors = ty.validate_collect(&v);
+        assert_eq!(errors.len(), 1);
+        match &errors[0].1 {
+            TypeError::UnknownStructField {
+                suggestion: Some(s),
+                ..
+            } => assert_eq!(s, "status"),
+            other => panic!("expected UnknownStructField with suggestion, got {other:?}"),
+        }
+    }
+}
