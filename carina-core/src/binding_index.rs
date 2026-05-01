@@ -1,19 +1,26 @@
 //! Single source of truth for binding-name lookups (#2231 / #2251).
 //!
-//! Two sibling views live here:
+//! Three sibling views live here, each answering a different question
+//! about the same set of names declared in a parsed Carina configuration:
 //!
-//! - [`BindingIndex`] — the schema-aware view, `binding_name → (resource,
-//!   schema)`. Used by validation and the LSP.
-//! - [`ResolvedBindings`] — the value-aware view, `binding_name →
-//!   merged attributes`. Used by the resolver and the executor.
+//! - [`BindingNameSet`] — "is this identifier in scope at all?" View
+//!   for the parser and LSP scope-check pass. Records all eight
+//!   declaration kinds the parser tracks (resource, argument, module
+//!   call, upstream state, import alias, user function, variable,
+//!   structural binding from let-of-if/for/read).
+//! - [`BindingIndex`] — "what schema and which `Resource` does this
+//!   binding point at?" Schema-aware view. Used by validation and the
+//!   LSP. Each entry has both a `Resource` and a `ResourceSchema`.
+//! - [`ResolvedBindings`] — "what attribute values does this binding
+//!   actually carry?" Value-aware view. Used by the resolver and
+//!   executor. Includes upstream-state bindings that have no `Resource`
+//!   or `ResourceSchema`.
 //!
-//! They are separate types because their invariants differ: every
-//! `BindingIndex` entry has a `Resource` and a `ResourceSchema`, while
-//! `ResolvedBindings` includes upstream-state bindings that have neither.
-//! Callers that need both views (e.g. validation that wants the schema
-//! *and* the resolved value) hold both indexes side by side.
-//!
-//! Parser is still out of scope and will be folded in by #2301.
+//! The three are separate types rather than fields on one because their
+//! invariants differ — `BindingIndex` requires both `Resource` and
+//! `ResourceSchema`, `ResolvedBindings` requires only attribute values
+//! (no schema), `BindingNameSet` requires only the name and an origin
+//! tag. Callers that need more than one view hold them side by side.
 //!
 //! Built once at the parse → validate boundary, then borrowed. The walk
 //! is **top-level only** (`parsed.resources`) on purpose: for-body
@@ -132,6 +139,159 @@ impl<'a> BindingIndex<'a> {
             .iter()
             .map(|(name, entry)| (name.as_str(), entry.schema))
             .collect()
+    }
+}
+
+/// Origin of a binding name in [`BindingNameSet`]. Eight kinds, one per
+/// declaration form a parsed Carina configuration can introduce.
+///
+/// Lives on `BindingNameSet` (the scope-only view) rather than on
+/// [`BindingValueSource`] (the value-aware view) because not every kind
+/// has a value: `Use` (import alias) and `UserFunction` are pure
+/// identifiers that the resolver/executor never need to look up
+/// attributes on.
+///
+/// `#[non_exhaustive]` so adding a new declaration form (a future
+/// `data` block, etc.) does not break downstream `match` arms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum BindingNameKind {
+    /// `let <name> = ...` resource binding.
+    Resource,
+    /// `argument <name> { ... }` module argument.
+    Argument,
+    /// `module <name> "..." { ... }` call site.
+    ModuleCall,
+    /// `upstream_state <name> "..." { ... }` data source.
+    UpstreamState,
+    /// `use <alias> from "..."` import.
+    Use,
+    /// `function <name>(...) { ... }` user-defined function.
+    UserFunction,
+    /// `variable <name> { ... }` config variable.
+    Variable,
+    /// Iteration / condition binding from `for <name> in ...` or
+    /// equivalent structural form. Recorded for scope checks but not
+    /// addressable by `ResourceRef` (see the module doc for the
+    /// pre-existing invariant).
+    Structural,
+}
+
+/// Name-only scope view: every identifier a parsed Carina configuration
+/// has brought into scope, tagged with its declaration kind.
+///
+/// This is the canonical replacement for the parser's
+/// `collect_known_bindings_merged` helper (#2104 / #2301). The two
+/// views ([`BindingIndex`] and [`ResolvedBindings`]) carry richer data
+/// (schema; resolved values) but are restricted to bindings that
+/// actually carry such data. `BindingNameSet` is the broadest of the
+/// three — it answers "is this identifier in scope at all?" for
+/// parser- and LSP-side identifier-scope diagnostics.
+///
+/// The set is built once from a [`ParsedFile`] (the merged
+/// directory-level view) and borrowed thereafter; names are owned
+/// `String`s so the set survives independent of the source.
+#[derive(Debug, Default, Clone)]
+pub struct BindingNameSet {
+    by_name: HashMap<String, BindingNameKind>,
+}
+
+impl BindingNameSet {
+    /// Build the set from a merged [`ParsedFile`], populating every
+    /// declaration form the parser tracks.
+    ///
+    /// **Kind precedence on collisions**: a single name can appear in
+    /// more than one parser-side map by design — for example, a `let
+    /// vpc = aws.ec2.Vpc { ... }` registers `vpc` in both
+    /// `parsed.resources` (as a resource binding) *and*
+    /// `parsed.variables` (as a let-value binding, holding a
+    /// placeholder ref). To keep the kind label meaningful, sources are
+    /// inserted in **most-specific-first** order and the first
+    /// `insert` wins (later sources call `entry().or_insert`).
+    ///
+    /// The order — `Resource` → `ModuleCall` → `UpstreamState` →
+    /// `Argument` → `Use` → `UserFunction` → `Structural` → `Variable`
+    /// — keeps `Variable` last because `parsed.variables` is the
+    /// catch-all "any `let`-RHS placeholder lives here" map, while the
+    /// preceding sources are narrower declaration forms.
+    pub fn from_parsed(parsed: &ParsedFile) -> Self {
+        let mut by_name: HashMap<String, BindingNameKind> = HashMap::new();
+
+        for resource in &parsed.resources {
+            if let Some(name) = resource.binding.as_deref() {
+                by_name
+                    .entry(name.to_string())
+                    .or_insert(BindingNameKind::Resource);
+            }
+        }
+        for call in &parsed.module_calls {
+            if let Some(name) = call.binding_name.as_deref() {
+                by_name
+                    .entry(name.to_string())
+                    .or_insert(BindingNameKind::ModuleCall);
+            }
+        }
+        for upstream in &parsed.upstream_states {
+            by_name
+                .entry(upstream.binding.clone())
+                .or_insert(BindingNameKind::UpstreamState);
+        }
+        for arg in &parsed.arguments {
+            by_name
+                .entry(arg.name.clone())
+                .or_insert(BindingNameKind::Argument);
+        }
+        for use_decl in &parsed.uses {
+            by_name
+                .entry(use_decl.alias.clone())
+                .or_insert(BindingNameKind::Use);
+        }
+        for fn_name in parsed.user_functions.keys() {
+            by_name
+                .entry(fn_name.clone())
+                .or_insert(BindingNameKind::UserFunction);
+        }
+        for structural in &parsed.structural_bindings {
+            by_name
+                .entry(structural.clone())
+                .or_insert(BindingNameKind::Structural);
+        }
+        for var_name in parsed.variables.keys() {
+            by_name
+                .entry(var_name.clone())
+                .or_insert(BindingNameKind::Variable);
+        }
+
+        Self { by_name }
+    }
+
+    /// `true` iff `name` is declared somewhere in the parsed file.
+    pub fn contains(&self, name: &str) -> bool {
+        self.by_name.contains_key(name)
+    }
+
+    /// Declaration kind for `name`, or `None` if the name is not
+    /// in scope.
+    pub fn kind(&self, name: &str) -> Option<BindingNameKind> {
+        self.by_name.get(name).copied()
+    }
+
+    /// Iterate every in-scope name. Order is unspecified.
+    pub fn iter_names(&self) -> impl Iterator<Item = &str> {
+        self.by_name.keys().map(String::as_str)
+    }
+
+    /// Iterate every (name, kind) pair. Order is unspecified.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, BindingNameKind)> {
+        self.by_name.iter().map(|(k, v)| (k.as_str(), *v))
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_name.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_name.is_empty()
     }
 }
 
@@ -750,6 +910,177 @@ mod resolved_bindings_tests {
         assert_eq!(
             resolved.get("registry").and_then(|a| a.get("kind")),
             Some(&Value::String("second".to_string()))
+        );
+    }
+}
+
+#[cfg(test)]
+mod binding_name_set_tests {
+    use super::*;
+    use crate::parser::parse;
+
+    fn parsed_with(src: &str) -> ParsedFile {
+        parse(src, &Default::default()).expect("parse")
+    }
+
+    #[test]
+    fn records_resource_let_bindings_as_resource_kind() {
+        let src = r#"
+let vpc = aws.ec2.Vpc {
+    name = "v"
+    cidr_block = "10.0.0.0/16"
+}
+"#;
+        let parsed = parsed_with(src);
+        let names = BindingNameSet::from_parsed(&parsed);
+
+        assert!(names.contains("vpc"));
+        assert_eq!(names.kind("vpc"), Some(BindingNameKind::Resource));
+    }
+
+    #[test]
+    fn records_upstream_state_with_upstream_kind() {
+        let src = r#"
+let network = upstream_state {
+    source = "../network"
+}
+"#;
+        let parsed = parsed_with(src);
+        let names = BindingNameSet::from_parsed(&parsed);
+
+        assert!(names.contains("network"));
+        assert_eq!(names.kind("network"), Some(BindingNameKind::UpstreamState));
+    }
+
+    #[test]
+    fn records_top_level_let_value_with_variable_kind() {
+        // `let <name> = <Value>` (non-resource RHS) is captured under
+        // `parsed.variables` and surfaces as `Variable` in the name set.
+        let src = r#"
+let region = "ap-northeast-1"
+"#;
+        let parsed = parsed_with(src);
+        let names = BindingNameSet::from_parsed(&parsed);
+
+        assert!(names.contains("region"));
+        assert_eq!(names.kind("region"), Some(BindingNameKind::Variable));
+    }
+
+    #[test]
+    fn records_arguments_block_entries_with_argument_kind() {
+        let src = r#"
+arguments {
+    env: String
+}
+"#;
+        let parsed = parsed_with(src);
+        let names = BindingNameSet::from_parsed(&parsed);
+
+        assert!(names.contains("env"));
+        assert_eq!(names.kind("env"), Some(BindingNameKind::Argument));
+    }
+
+    #[test]
+    fn records_fn_def_with_user_function_kind() {
+        let src = r#"
+fn double(x: Int) {
+    x
+}
+"#;
+        let parsed = parsed_with(src);
+        let names = BindingNameSet::from_parsed(&parsed);
+
+        assert!(names.contains("double"));
+        assert_eq!(names.kind("double"), Some(BindingNameKind::UserFunction));
+    }
+
+    #[test]
+    fn records_module_call_with_module_call_kind() {
+        let src = r#"
+let cluster = module {
+    source = "../cluster"
+}
+"#;
+        let parsed = parsed_with(src);
+        let names = BindingNameSet::from_parsed(&parsed);
+
+        assert!(
+            names.contains("cluster"),
+            "module-call binding must be in scope; got {:?}",
+            names.iter_names().collect::<Vec<_>>()
+        );
+        assert_eq!(names.kind("cluster"), Some(BindingNameKind::ModuleCall));
+    }
+
+    #[test]
+    fn matches_collect_known_bindings_merged_byte_for_byte() {
+        // BindingNameSet is the canonical replacement for
+        // `collect_known_bindings_merged`. The set of names must be
+        // identical so the replacement is a pure refactor.
+        let src = r#"
+arguments {
+    env: String
+}
+
+let region = "ap-northeast-1"
+
+let vpc = aws.ec2.Vpc {
+    name = "v"
+    cidr_block = "10.0.0.0/16"
+}
+
+let network = upstream_state {
+    source = "../network"
+}
+
+fn double(x: Int) {
+    x
+}
+"#;
+        let parsed = parsed_with(src);
+        let names = BindingNameSet::from_parsed(&parsed);
+        let legacy = crate::parser::collect_known_bindings_merged(&parsed);
+
+        let from_set: std::collections::HashSet<&str> = names.iter_names().collect();
+        let legacy_set: std::collections::HashSet<&str> = legacy.into_iter().collect();
+        assert_eq!(from_set, legacy_set);
+    }
+
+    #[test]
+    fn structural_binding_is_in_scope_but_not_addressable_by_resource_ref() {
+        // The pre-#2301 invariant: when a `let` binds the result of an
+        // `if` / `for` / `read` expression, the parser flags the
+        // binding `is_structural` and records the name in
+        // `parsed.structural_bindings` (so unused-binding warnings
+        // don't fire). Such names are visible to scope checks but not
+        // surfaced through `ResolvedBindings` — the executor /
+        // resolver address bindings by their attribute map, and a
+        // structural binding's "value" is the entire if/for branch,
+        // not an attribute set.
+        let src = r#"
+let chosen = if true { "primary" } else { "fallback" }
+"#;
+        let parsed = parsed_with(src);
+        let names = BindingNameSet::from_parsed(&parsed);
+
+        // Scope-side: `chosen` is in scope as a Structural kind.
+        assert!(
+            names.contains("chosen"),
+            "structural binding must be in scope; got {:?}",
+            names.iter_names().collect::<Vec<_>>()
+        );
+        assert_eq!(names.kind("chosen"), Some(BindingNameKind::Structural));
+
+        // Value-side: `ResolvedBindings` does NOT carry an entry for
+        // `chosen`, so a `ResourceRef` to `chosen.foo` cannot resolve.
+        let resolved = ResolvedBindings::from_resources_with_state(
+            &parsed.resources,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(
+            resolved.get("chosen").is_none(),
+            "structural bindings must stay invisible to ResourceRef resolution",
         );
     }
 }

@@ -209,6 +209,12 @@ pub fn resolve_resource_refs_with_config(
 /// directory-wide checks. The same set feeds [`check_identifier_scope`]
 /// and the LSP borrows it (via `carina_lsp::diagnostics::checks`) to
 /// keep diagnostic suggestions consistent with the CLI.
+///
+/// Thin wrapper over [`crate::binding_index::BindingNameSet::from_parsed`]
+/// (#2301). Prefer the new type at fresh call sites; this helper is kept
+/// because `accumulate_*` helpers below still take `&HashSet<&str>` as a
+/// borrowed view (changing that signature would force `undefined_identifier_error`
+/// to rebuild a borrowed view per call).
 pub fn collect_known_bindings_merged(parsed: &ParsedFile) -> std::collections::HashSet<&str> {
     let mut known: std::collections::HashSet<&str> = std::collections::HashSet::new();
     known.extend(parsed.resources.iter().filter_map(|r| r.binding.as_deref())); // allow: direct — parser-internal, pre-expansion
