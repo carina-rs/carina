@@ -1,18 +1,20 @@
-//! Single source of truth for the `binding_name → (resource, schema)` lookup
-//! that validation and the LSP both need (#2231).
+//! Single source of truth for binding-name lookups (#2231 / #2251).
 //!
-//! The four pre-existing call sites that hand-rolled their own binding map
-//! (parser, resolver, validation, LSP) historically drifted in subtle ways —
-//! the LSP saw a different set of bindings than the parser, structural
-//! `for`/`if` bindings were missed in some checks, and adding a new binding
-//! source meant chasing four files. This type collapses **the schema-lookup
-//! shape** (validation + LSP) into one builder.
+//! Two sibling views live here:
 //!
-//! Resolver and parser are deliberately out of scope here: resolver's map
-//! holds owned merged attribute values (DSL + AWS state), which is a
-//! different shape, and parser's notion of "in-scope names" runs before
-//! schemas are known. Both can share `BindingIndex` later by extending
-//! `BindingEntry`; for now the smaller surface keeps the refactor reviewable.
+//! - [`BindingIndex`] — the schema-aware view, `binding_name → (resource,
+//!   schema)`. Used by validation and the LSP.
+//! - [`ResolvedBindings`] — the value-aware view, `binding_name →
+//!   merged attributes`. Used by the resolver (#2299), and will be used
+//!   by the executor (#2300).
+//!
+//! They are separate types because their invariants differ: every
+//! `BindingIndex` entry has a `Resource` and a `ResourceSchema`, while
+//! `ResolvedBindings` includes upstream-state bindings that have neither.
+//! Callers that need both views (e.g. validation that wants the schema
+//! *and* the resolved value) hold both indexes side by side.
+//!
+//! Parser is still out of scope and will be folded in by #2301.
 //!
 //! Built once at the parse → validate boundary, then borrowed. The walk
 //! is **top-level only** (`parsed.resources`) on purpose: for-body
@@ -32,7 +34,7 @@
 //! ```
 
 use crate::parser::ParsedFile;
-use crate::resource::Resource;
+use crate::resource::{Resource, ResourceId, State, Value};
 use crate::schema::ResourceSchema;
 use std::collections::HashMap;
 
@@ -131,6 +133,104 @@ impl<'a> BindingIndex<'a> {
             .iter()
             .map(|(name, entry)| (name.as_str(), entry.schema))
             .collect()
+    }
+}
+
+/// Where the values for a binding came from. `Local` means a `let` binding
+/// in the current configuration; `Upstream` means an `upstream_state` data
+/// source bringing values in from another state file.
+///
+/// Marked `#[non_exhaustive]` because #2301 will introduce structural
+/// sources (`for` / `if` / module) — flagging the intent now keeps
+/// downstream `match` arms from becoming exhaustive against the current
+/// two variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BindingValueSource {
+    Local,
+    Upstream,
+}
+
+/// Value-aware sibling of [`BindingIndex`]. See the module-level doc for
+/// why this is a separate type.
+///
+/// Owned, not borrowed: building the merged map requires combining
+/// `Resource.attributes` with `State.attributes`, and there is no single
+/// upstream `HashMap<String, HashMap<String, Value>>` already on hand to
+/// borrow from. Owning the merged map avoids a self-referential
+/// structure.
+///
+/// The two internal maps are populated in lockstep by
+/// `from_resources_with_state` (the only writer) so a `name` is always
+/// present in both or neither. Once `resolve_ref_value` and the
+/// executor stop taking a raw `&HashMap<String, HashMap<String, Value>>`
+/// (#2300), the storage will fold into a single `HashMap<String,
+/// ResolvedBinding>`; until then the parallel shape lets `as_map()`
+/// hand out a borrow of the legacy view without an extra allocation.
+#[derive(Debug, Default)]
+pub struct ResolvedBindings {
+    attrs: HashMap<String, HashMap<String, Value>>,
+    sources: HashMap<String, BindingValueSource>,
+}
+
+impl ResolvedBindings {
+    /// Build the resolved view from the same three inputs the resolver
+    /// already takes: top-level resources (DSL), the last-known state map,
+    /// and upstream-state bindings.
+    ///
+    /// DSL keys win over state keys on conflict. Upstream bindings are
+    /// inserted last and overwrite any local binding of the same name.
+    /// Both rules match the pre-existing resolver behaviour so this
+    /// refactor is a pure internal change.
+    pub fn from_resources_with_state(
+        resources: &[Resource],
+        current_states: &HashMap<ResourceId, State>,
+        remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    ) -> Self {
+        let mut attrs: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let mut sources: HashMap<String, BindingValueSource> = HashMap::new();
+
+        for resource in resources.iter() {
+            let Some(binding_name) = resource.binding.as_ref() else {
+                continue;
+            };
+            let mut merged: HashMap<String, Value> = resource.resolved_attributes();
+            if let Some(state) = current_states.get(&resource.id)
+                && state.exists
+            {
+                for (k, v) in &state.attributes {
+                    merged.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+            attrs.insert(binding_name.clone(), merged);
+            sources.insert(binding_name.clone(), BindingValueSource::Local);
+        }
+
+        for (remote_binding, remote_attrs) in remote_bindings {
+            attrs.insert(remote_binding.clone(), remote_attrs.clone());
+            sources.insert(remote_binding.clone(), BindingValueSource::Upstream);
+        }
+
+        Self { attrs, sources }
+    }
+
+    pub fn get(&self, name: &str) -> Option<&HashMap<String, Value>> {
+        self.attrs.get(name)
+    }
+
+    pub fn source(&self, name: &str) -> Option<BindingValueSource> {
+        self.sources.get(name).copied()
+    }
+
+    /// Borrow the legacy `binding_name → attributes` view.
+    ///
+    /// `resolve_ref_value` (and the executor, via #2300) still take
+    /// `&HashMap<String, HashMap<String, Value>>` — exposing it
+    /// directly avoids both an extra allocation and a public-API change
+    /// in `carina-cli` while #2299 lands. Slated to disappear once
+    /// #2300 threads `&ResolvedBindings` all the way through.
+    pub fn as_map(&self) -> &HashMap<String, HashMap<String, Value>> {
+        &self.attrs
     }
 }
 
@@ -280,5 +380,186 @@ let vpc = aws.ec2.Vpc {
         schemas.insert("aws.ec2.Vpc".to_string(), vpc_schema());
         let index = BindingIndex::from_parsed(&parsed, &schemas, &schema_key_aws);
         assert!(index.get("missing").is_none());
+    }
+}
+
+#[cfg(test)]
+mod resolved_bindings_tests {
+    use super::*;
+    use crate::resource::{Resource, ResourceId, State, Value};
+    use std::collections::BTreeSet;
+
+    fn make_resource(name: &str, binding: Option<&str>, attrs: Vec<(&str, Value)>) -> Resource {
+        let mut r = Resource::new("test.resource", name);
+        r.attributes = attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        r.binding = binding.map(|b| b.to_string());
+        r
+    }
+
+    #[test]
+    fn local_binding_carries_dsl_attributes() {
+        let resources = vec![make_resource(
+            "my-vpc",
+            Some("vpc"),
+            vec![("cidr_block", Value::String("10.0.0.0/16".to_string()))],
+        )];
+        let states: HashMap<ResourceId, State> = HashMap::new();
+        let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
+
+        let resolved = ResolvedBindings::from_resources_with_state(&resources, &states, &remote);
+
+        let attrs = resolved.get("vpc").expect("vpc binding present");
+        assert_eq!(
+            attrs.get("cidr_block"),
+            Some(&Value::String("10.0.0.0/16".to_string()))
+        );
+        assert_eq!(resolved.source("vpc"), Some(BindingValueSource::Local));
+    }
+
+    #[test]
+    fn local_binding_merges_state_attributes_when_dsl_missing_them() {
+        let rid = ResourceId::new("test.resource", "my-vpc");
+        let resources = vec![make_resource(
+            "my-vpc",
+            Some("vpc"),
+            vec![("cidr_block", Value::String("10.0.0.0/16".to_string()))],
+        )];
+        let mut states: HashMap<ResourceId, State> = HashMap::new();
+        states.insert(
+            rid.clone(),
+            State {
+                id: rid,
+                identifier: None,
+                exists: true,
+                attributes: vec![
+                    ("id".to_string(), Value::String("vpc-abc".to_string())),
+                    // conflicting key — DSL value should win
+                    ("cidr_block".to_string(), Value::String("WRONG".to_string())),
+                ]
+                .into_iter()
+                .collect(),
+                dependency_bindings: BTreeSet::new(),
+            },
+        );
+        let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
+
+        let resolved = ResolvedBindings::from_resources_with_state(&resources, &states, &remote);
+
+        let attrs = resolved.get("vpc").expect("vpc binding present");
+        assert_eq!(
+            attrs.get("id"),
+            Some(&Value::String("vpc-abc".to_string())),
+            "state-only attribute must be merged in",
+        );
+        assert_eq!(
+            attrs.get("cidr_block"),
+            Some(&Value::String("10.0.0.0/16".to_string())),
+            "DSL value must win when both sides define a key",
+        );
+    }
+
+    #[test]
+    fn upstream_state_binding_is_first_class() {
+        // Upstream-state bindings have no `Resource` and no `ResourceSchema`,
+        // which is the case `BindingIndex` cannot represent.
+        let resources: Vec<Resource> = Vec::new();
+        let states: HashMap<ResourceId, State> = HashMap::new();
+        let mut remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let mut network_attrs = HashMap::new();
+        network_attrs.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
+        remote.insert("network".to_string(), network_attrs);
+
+        let resolved = ResolvedBindings::from_resources_with_state(&resources, &states, &remote);
+
+        let attrs = resolved.get("network").expect("upstream binding present");
+        assert_eq!(
+            attrs.get("vpc_id"),
+            Some(&Value::String("vpc-123".to_string()))
+        );
+        assert_eq!(
+            resolved.source("network"),
+            Some(BindingValueSource::Upstream)
+        );
+    }
+
+    #[test]
+    fn unbound_resources_are_excluded() {
+        let resources = vec![make_resource(
+            "anonymous",
+            None,
+            vec![("cidr_block", Value::String("10.0.0.0/16".to_string()))],
+        )];
+        let states: HashMap<ResourceId, State> = HashMap::new();
+        let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
+
+        let resolved = ResolvedBindings::from_resources_with_state(&resources, &states, &remote);
+        assert!(resolved.get("anonymous").is_none());
+    }
+
+    #[test]
+    fn upstream_overrides_local_on_name_collision() {
+        // The pre-#2299 resolver inserted remote bindings *after* local
+        // ones, so upstream wins when both define the same name. This is
+        // load-bearing behaviour — preserving it makes #2299 a no-op for
+        // configurations that already rely on it.
+        let resources = vec![make_resource(
+            "my-local",
+            Some("shared"),
+            vec![("kind", Value::String("local".to_string()))],
+        )];
+        let states: HashMap<ResourceId, State> = HashMap::new();
+        let mut remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        remote.insert(
+            "shared".to_string(),
+            vec![("kind".to_string(), Value::String("upstream".to_string()))]
+                .into_iter()
+                .collect(),
+        );
+
+        let resolved = ResolvedBindings::from_resources_with_state(&resources, &states, &remote);
+        let attrs = resolved.get("shared").expect("shared binding present");
+        assert_eq!(
+            attrs.get("kind"),
+            Some(&Value::String("upstream".to_string())),
+            "upstream binding must override local one with the same name",
+        );
+        assert_eq!(
+            resolved.source("shared"),
+            Some(BindingValueSource::Upstream),
+        );
+    }
+
+    #[test]
+    fn destroyed_state_does_not_contribute_attributes() {
+        // `State.exists = false` represents a tombstone (resource was
+        // destroyed since the last apply). The resolver must not merge
+        // its attributes — they describe a no-longer-real resource.
+        let rid = ResourceId::new("test.resource", "my-vpc");
+        let resources = vec![make_resource(
+            "my-vpc",
+            Some("vpc"),
+            vec![("cidr_block", Value::String("10.0.0.0/16".to_string()))],
+        )];
+        let mut states: HashMap<ResourceId, State> = HashMap::new();
+        states.insert(
+            rid.clone(),
+            State {
+                id: rid,
+                identifier: None,
+                exists: false,
+                attributes: vec![("id".to_string(), Value::String("vpc-stale".to_string()))]
+                    .into_iter()
+                    .collect(),
+                dependency_bindings: BTreeSet::new(),
+            },
+        );
+        let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
+
+        let resolved = ResolvedBindings::from_resources_with_state(&resources, &states, &remote);
+        let attrs = resolved.get("vpc").expect("vpc binding present");
+        assert!(
+            attrs.get("id").is_none(),
+            "tombstoned state must not contribute attributes",
+        );
     }
 }
