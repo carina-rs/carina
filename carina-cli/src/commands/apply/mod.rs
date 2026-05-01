@@ -78,6 +78,151 @@ pub async fn execute_effects(
     result
 }
 
+/// Re-load each upstream declared in the saved plan and verify its
+/// attribute map matches the snapshot the plan was computed against
+/// (#2303). Fails on the first drifted binding so the user gets an
+/// actionable message naming what changed; pretending the apply will
+/// succeed and silently mixing plan-time and apply-time values
+/// produces incorrect cascade re-resolution.
+async fn verify_upstream_snapshot(
+    sources: &[crate::commands::plan::UpstreamSource],
+    snapshot: &HashMap<String, HashMap<String, Value>>,
+    base_dir: &std::path::Path,
+) -> Result<(), AppError> {
+    use carina_core::parser::UpstreamState;
+    let upstream_states: Vec<UpstreamState> = sources
+        .iter()
+        .map(|s| UpstreamState {
+            binding: s.binding.clone(),
+            source: s.source.clone(),
+        })
+        .collect();
+    let provider_context = ProviderContext::default();
+    let mut cycle_guard = super::plan::seed_cycle_guard(base_dir);
+    let current = super::plan::load_upstream_states(
+        &upstream_states,
+        base_dir,
+        &provider_context,
+        &mut cycle_guard,
+    )
+    .await?;
+
+    diff_upstream_snapshot(snapshot, &current).map_err(AppError::Config)
+}
+
+/// Pure comparison between a planned snapshot and a freshly-loaded
+/// upstream view. Returns the user-facing error message naming the
+/// first binding that disagrees, or `Ok(())` when the two views are
+/// equal.
+///
+/// Split out so it can be unit-tested without a real upstream backend.
+fn diff_upstream_snapshot(
+    snapshot: &HashMap<String, HashMap<String, Value>>,
+    current: &HashMap<String, HashMap<String, Value>>,
+) -> Result<(), String> {
+    for (binding, planned_attrs) in snapshot {
+        match current.get(binding) {
+            None => {
+                return Err(format!(
+                    "upstream_state '{}' was present at plan time but is missing now. \
+                     Re-run 'carina plan' to capture the current upstream view.",
+                    binding
+                ));
+            }
+            Some(current_attrs) if current_attrs != planned_attrs => {
+                return Err(format!(
+                    "upstream_state '{}' has drifted since the plan was created. \
+                     Re-run 'carina plan' so the apply uses the values it was computed against.",
+                    binding
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    for binding in current.keys() {
+        if !snapshot.contains_key(binding) {
+            return Err(format!(
+                "upstream_state '{}' was added since the plan was created. \
+                 Re-run 'carina plan' so the apply sees the new upstream binding.",
+                binding
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod upstream_snapshot_tests {
+    use super::*;
+
+    fn binding(name: &str, attrs: &[(&str, &str)]) -> (String, HashMap<String, Value>) {
+        let map = attrs
+            .iter()
+            .map(|(k, v)| (k.to_string(), Value::String(v.to_string())))
+            .collect();
+        (name.to_string(), map)
+    }
+
+    #[test]
+    fn matching_snapshot_passes() {
+        let snapshot: HashMap<String, HashMap<String, Value>> =
+            vec![binding("network", &[("vpc_id", "vpc-A")])]
+                .into_iter()
+                .collect();
+        let current = snapshot.clone();
+        assert!(diff_upstream_snapshot(&snapshot, &current).is_ok());
+    }
+
+    #[test]
+    fn drifted_attribute_fails() {
+        // Same binding name, but the attribute value changed underneath.
+        // This is the original bug: cascade re-resolution would silently
+        // see "vpc-B" while the static plan was built around "vpc-A".
+        let snapshot: HashMap<String, HashMap<String, Value>> =
+            vec![binding("network", &[("vpc_id", "vpc-A")])]
+                .into_iter()
+                .collect();
+        let current: HashMap<String, HashMap<String, Value>> =
+            vec![binding("network", &[("vpc_id", "vpc-B")])]
+                .into_iter()
+                .collect();
+        let err = diff_upstream_snapshot(&snapshot, &current).expect_err("must fail");
+        assert!(
+            err.contains("network"),
+            "error must name the binding: {err}"
+        );
+        assert!(err.contains("drifted"), "error must say drifted: {err}");
+    }
+
+    #[test]
+    fn binding_disappeared_fails() {
+        let snapshot: HashMap<String, HashMap<String, Value>> =
+            vec![binding("network", &[("vpc_id", "vpc-A")])]
+                .into_iter()
+                .collect();
+        let current: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let err = diff_upstream_snapshot(&snapshot, &current).expect_err("must fail");
+        assert!(err.contains("missing now"), "got: {err}");
+    }
+
+    #[test]
+    fn binding_appeared_fails() {
+        let snapshot: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let current: HashMap<String, HashMap<String, Value>> =
+            vec![binding("network", &[("vpc_id", "vpc-A")])]
+                .into_iter()
+                .collect();
+        let err = diff_upstream_snapshot(&snapshot, &current).expect_err("must fail");
+        assert!(err.contains("added since"), "got: {err}");
+    }
+
+    #[test]
+    fn empty_both_sides_passes() {
+        let empty: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        assert!(diff_upstream_snapshot(&empty, &empty).is_ok());
+    }
+}
+
 /// Refresh states for resources whose operations failed.
 ///
 /// This is kept for use by tests in `tests.rs`. The core executor has its own
@@ -1001,10 +1146,15 @@ pub async fn run_apply_from_plan(
     let plan_file: PlanFile =
         serde_json::from_str(&content).map_err(|e| format!("Failed to parse plan file: {}", e))?;
 
-    // Validate version compatibility
-    if plan_file.version != 1 {
+    // Validate version compatibility. Plan-file version 2 added the
+    // upstream-state snapshot (#2303); older plans cannot guarantee the
+    // upstream values used during cascade re-resolution match what the
+    // plan was computed against, so they are rejected outright per the
+    // repo's no-backward-compat policy.
+    if plan_file.version != 2 {
         return Err(AppError::Config(format!(
-            "Unsupported plan file version: {} (expected 1)",
+            "Unsupported plan file version: {} (expected 2). \
+             Re-run 'carina plan' to produce a plan in the current format.",
             plan_file.version
         )));
     }
@@ -1214,11 +1364,19 @@ async fn run_apply_from_plan_locked(
         return Ok(());
     }
 
-    // Build initial bindings for reference resolution
+    // Verify upstream-state bindings have not drifted since `carina
+    // plan` ran (#2303). Re-load each upstream the plan declared and
+    // compare against the persisted snapshot; if any binding's
+    // attribute map disagrees, fail rather than silently mixing
+    // plan-time and apply-time values during cascade re-resolution.
+    let upstream_snapshot = plan_file.upstream_snapshot.clone();
+    if !plan_file.upstream_sources.is_empty() {
+        verify_upstream_snapshot(&plan_file.upstream_sources, &upstream_snapshot, base_dir).await?;
+    }
     let mut bindings = ResolvedBindings::from_resources_with_state(
         sorted_resources,
         &current_states,
-        &HashMap::new(),
+        &upstream_snapshot,
     );
 
     println!("{}", "Applying changes...".cyan().bold());

@@ -53,6 +53,33 @@ pub struct PlanFile {
     pub sorted_resources: Vec<Resource>,
     /// Current states (for binding_map + state saving)
     pub current_states: Vec<CurrentStateEntry>,
+    /// `upstream_state` bindings as resolved at plan time (#2303).
+    ///
+    /// Persisted so `apply --plan` can verify the upstream values have
+    /// not drifted between plan and apply. If any binding here disagrees
+    /// with the freshly-loaded upstream view at apply time, the apply
+    /// fails with a structured error rather than silently mixing
+    /// plan-time and apply-time values during cascade re-resolution.
+    ///
+    /// Empty when the configuration declares no `upstream_state` blocks.
+    pub upstream_snapshot: HashMap<String, HashMap<String, Value>>,
+    /// `upstream_state` block sources (binding name → directory) as
+    /// declared in the original `.crn` config (#2303). Persisted so
+    /// `apply --plan` can re-load each upstream and compare against
+    /// `upstream_snapshot`.
+    pub upstream_sources: Vec<UpstreamSource>,
+}
+
+/// Serializable representation of an `upstream_state` declaration's
+/// source directory — needed because `parser::ast::UpstreamState` is
+/// not `Serialize`/`Deserialize` and pulling a `serde` derive into
+/// `carina-core::parser::ast` would have wider blast radius than this
+/// PR wants. Constructed once at plan time and consumed at
+/// apply-from-plan time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpstreamSource {
+    pub binding: String,
+    pub source: std::path::PathBuf,
 }
 
 /// Entry for serializing current resource states
@@ -69,7 +96,7 @@ fn build_plan_file(
     ctx: &crate::wiring::PlanContext,
 ) -> PlanFile {
     PlanFile {
-        version: 1,
+        version: 2,
         carina_version: env!("CARGO_PKG_VERSION").to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
         source_path: path.display().to_string(),
@@ -89,6 +116,15 @@ fn build_plan_file(
             .map(|(id, state)| CurrentStateEntry {
                 id: id.clone(),
                 state: redact_secrets_in_state(state),
+            })
+            .collect(),
+        upstream_snapshot: ctx.upstream_snapshot.clone(),
+        upstream_sources: parsed
+            .upstream_states
+            .iter()
+            .map(|us| UpstreamSource {
+                binding: us.binding.clone(),
+                source: us.source.clone(),
             })
             .collect(),
     }
