@@ -76,6 +76,12 @@ pub(crate) fn parse_string_value(
     }
 
     if has_interpolation {
+        // Deliberately do *not* call `Value::canonicalize` here. The
+        // deferred-for placeholder substitution in
+        // `parser/ast.rs::substitute_placeholder` matches whole
+        // `Value::String` placeholders, so we must keep `Expr` parts
+        // intact through parse → for-expansion. Canonicalization runs
+        // later, after resolution (see #2227).
         Ok(Value::Interpolation(parts))
     } else {
         // No interpolation — collapse to a plain String

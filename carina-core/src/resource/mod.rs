@@ -277,7 +277,120 @@ pub enum InterpolationPart {
     Expr(Value),
 }
 
+/// Body of `Value::canonicalize_in_place` for the `Interpolation` arm:
+/// fold simple `Expr(scalar)` into a `Literal` (consuming the scalar's
+/// string), merge adjacent `Literal`s, and collapse the result to
+/// `Value::String` when no `Expr` parts remain.
+fn canonicalize_interpolation(parts: Vec<InterpolationPart>) -> Value {
+    let mut merged: Vec<InterpolationPart> = Vec::with_capacity(parts.len());
+    for part in parts {
+        let next = match part {
+            InterpolationPart::Literal(s) => InterpolationPart::Literal(s),
+            InterpolationPart::Expr(mut v) => {
+                v.canonicalize_in_place();
+                match value_into_literal(v) {
+                    Ok(s) => InterpolationPart::Literal(s),
+                    Err(other) => InterpolationPart::Expr(other),
+                }
+            }
+        };
+        match (merged.last_mut(), next) {
+            (Some(InterpolationPart::Literal(prev)), InterpolationPart::Literal(s)) => {
+                prev.push_str(&s);
+            }
+            (_, p) => merged.push(p),
+        }
+    }
+    if merged.is_empty() {
+        return Value::String(String::new());
+    }
+    if merged.len() == 1 {
+        // Pop the sole element. If it is a Literal, we collapse to
+        // `Value::String`; otherwise it is a non-foldable Expr and we
+        // rebuild the single-element Interpolation.
+        match merged.pop().expect("len == 1") {
+            InterpolationPart::Literal(s) => return Value::String(s),
+            expr @ InterpolationPart::Expr(_) => merged.push(expr),
+        }
+    }
+    Value::Interpolation(merged)
+}
+
+/// If `v` is a string-shaped scalar, return its string form (consuming
+/// `v`); otherwise return `v` unchanged so the caller can keep wrapping
+/// it as an `Expr`.
+///
+/// `Secret(_)` is intentionally **not** folded: stripping the wrapper
+/// would let the secret travel as a plain `Literal` and bypass
+/// redaction in plan display, state serialization, and logging. Secrets
+/// stay as `Expr(Secret(...))`.
+fn value_into_literal(v: Value) -> Result<String, Value> {
+    match v {
+        Value::String(s) => Ok(s),
+        Value::Int(n) => Ok(n.to_string()),
+        Value::Float(f) => Ok(f.to_string()),
+        Value::Bool(b) => Ok(b.to_string()),
+        other => Err(other),
+    }
+}
+
 impl Value {
+    /// Recursively normalize this `Value` so that downstream code does not
+    /// have to handle redundant `Interpolation` shapes.
+    ///
+    /// Applied bottom-up:
+    ///
+    /// - Adjacent `InterpolationPart::Literal`s are merged.
+    /// - `InterpolationPart::Expr(v)` whose `v` is a bare `String`/`Int`/
+    ///   `Float`/`Bool` is folded into a `Literal`, then merged with
+    ///   neighbors per the previous rule. `Secret(_)` is intentionally
+    ///   not folded — keeping it wrapped preserves redaction in plan
+    ///   display, state serialization, and logging.
+    /// - An `Interpolation` whose parts collapse to a single `Literal` is
+    ///   replaced with `Value::String(s)`.
+    ///
+    /// `List`, `Map`, `Secret`, and `FunctionCall` recurse into their
+    /// children at the `Value` level. Other variants are returned
+    /// unchanged. The transformation is idempotent.
+    ///
+    /// See #2227.
+    pub fn canonicalize(mut self) -> Value {
+        self.canonicalize_in_place();
+        self
+    }
+
+    /// In-place variant of [`Self::canonicalize`]. Useful when the caller
+    /// only has a `&mut Value` (e.g. inside `IndexMap::values_mut()`).
+    pub fn canonicalize_in_place(&mut self) {
+        match self {
+            Value::List(items) => {
+                for item in items {
+                    item.canonicalize_in_place();
+                }
+            }
+            Value::Map(map) => {
+                for v in map.values_mut() {
+                    v.canonicalize_in_place();
+                }
+            }
+            Value::Secret(inner) => inner.canonicalize_in_place(),
+            Value::FunctionCall { args, .. } => {
+                for arg in args {
+                    arg.canonicalize_in_place();
+                }
+            }
+            Value::Interpolation(_) => {
+                // Move the parts out so we can consume and rebuild them.
+                let parts = match std::mem::replace(self, Value::Interpolation(Vec::new())) {
+                    Value::Interpolation(parts) => parts,
+                    _ => unreachable!("matched Value::Interpolation"),
+                };
+                *self = canonicalize_interpolation(parts);
+            }
+            _ => {}
+        }
+    }
+
     /// Create a `ResourceRef` from binding name, attribute name, and optional field path.
     ///
     /// This is the primary constructor for `ResourceRef` values, replacing direct

@@ -159,27 +159,7 @@ pub fn resolve_ref_value(
                     other => Ok(other.clone()),
                 })
                 .collect();
-            let resolved_parts = resolved_parts?;
-
-            // Check if all parts are now resolved (no remaining ResourceRef)
-            let all_resolved = resolved_parts.iter().all(|p| match p {
-                InterpolationPart::Expr(v) => !contains_resource_ref(v),
-                InterpolationPart::Literal(_) => true,
-            });
-
-            if all_resolved {
-                // Concatenate all parts into a single String
-                let s = resolved_parts
-                    .iter()
-                    .map(|p| match p {
-                        InterpolationPart::Literal(s) => s.clone(),
-                        InterpolationPart::Expr(v) => value_to_string(v),
-                    })
-                    .collect::<String>();
-                Ok(Value::String(s))
-            } else {
-                Ok(Value::Interpolation(resolved_parts))
-            }
+            Ok(Value::Interpolation(resolved_parts?).canonicalize())
         }
         Value::FunctionCall { name, args } => {
             // First, resolve all arguments
@@ -229,18 +209,6 @@ pub fn resolve_ref_value(
             Ok(Value::Secret(Box::new(resolved_inner)))
         }
         _ => Ok(value.clone()),
-    }
-}
-
-/// Convert a Value to its string representation for interpolation
-fn value_to_string(value: &Value) -> String {
-    match value {
-        Value::String(s) => s.clone(),
-        Value::Int(n) => n.to_string(),
-        Value::Float(f) => f.to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Secret(inner) => value_to_string(inner),
-        _ => crate::value::format_value(value),
     }
 }
 
