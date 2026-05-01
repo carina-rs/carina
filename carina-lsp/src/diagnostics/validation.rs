@@ -1,118 +1,118 @@
-//! Struct and block syntax validation for resource attributes.
+//! LSP adapter that runs core's path-tagged validator
+//! ([`AttributeType::validate_collect`]) and anchors each error at
+//! its source position. The recursive struct/list-of-struct walk
+//! lives entirely in `carina-core` after #2214; this module just
+//! translates `(FieldPath, TypeError)` to LSP diagnostics.
 
-use std::collections::{HashMap, HashSet};
-
-use indexmap::IndexMap;
+use std::collections::HashMap;
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
 use crate::document::Document;
 use crate::position;
 use carina_core::resource::Value;
-use carina_core::schema::ResourceSchema;
+use carina_core::schema::{AttributeType, FieldPath, FieldPathStep, ResourceSchema};
 
 use super::{DiagnosticEngine, carina_diagnostic};
 
 impl DiagnosticEngine {
+    /// Run [`AttributeType::validate_collect`] against the resource
+    /// attribute's schema and translate each `(FieldPath, TypeError)`
+    /// into an LSP `Diagnostic` anchored at the offending source
+    /// position. The LSP no longer recurses into nested struct shapes
+    /// — that responsibility belongs to the core validator (#2214).
+    ///
+    /// Takes `&AttributeType` (rather than `&[StructField]`) so the
+    /// per-keystroke diagnostic pass borrows the schema instead of
+    /// deep-cloning every `StructField` (which itself contains
+    /// recursive `AttributeType` sub-trees).
     pub(super) fn validate_struct_value(
         &self,
         doc: &Document,
         attr_name: &str,
         value: &Value,
-        fields: &[carina_core::schema::StructField],
+        ty: &AttributeType,
     ) -> Vec<Diagnostic> {
+        let errors = ty.validate_collect(value);
         let mut diagnostics = Vec::new();
-
-        let maps: Vec<&IndexMap<String, Value>> = match value {
-            Value::Map(map) => vec![map],
-            Value::List(items) => items
-                .iter()
-                .filter_map(|item| {
-                    if let Value::Map(map) = item {
-                        Some(map)
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
-            _ => return diagnostics,
-        };
-
-        let field_names: HashSet<&str> = fields.iter().map(|f| f.name.as_str()).collect();
-        // Also include block_names as valid field names
-        let block_name_to_canonical: HashMap<&str, &str> = fields
-            .iter()
-            .filter_map(|f| f.block_name.as_deref().map(|bn| (bn, f.name.as_str())))
-            .collect();
-        let field_map: HashMap<&str, &carina_core::schema::StructField> =
-            fields.iter().map(|f| (f.name.as_str(), f)).collect();
-
-        for (map_index, map) in maps.iter().enumerate() {
-            for (key, val) in *map {
-                let all_positions = self.find_all_nested_field_positions(doc, attr_name, key);
-                if let Some(Some((line, col))) = all_positions.get(map_index) {
-                    let (line, col) = (*line, *col);
-                    // Resolve block_name to canonical name
-                    let canonical_key = block_name_to_canonical
-                        .get(key.as_str())
-                        .copied()
-                        .unwrap_or(key.as_str());
-
-                    // Check for unknown fields
-                    if !field_names.contains(canonical_key) {
-                        diagnostics.push(carina_diagnostic(
-                            line,
-                            col,
-                            col + key.len() as u32,
-                            DiagnosticSeverity::WARNING,
-                            format!("Unknown field '{}' in '{}'", key, attr_name),
-                        ));
-                        continue;
-                    }
-
-                    // Type validation for known fields
-                    if let Some(field) = field_map.get(canonical_key) {
-                        // Skip validation for ResourceRef values (resolved at runtime)
-                        let type_error = if matches!(val, Value::ResourceRef { .. }) {
-                            None
-                        } else {
-                            field.field_type.validate(val).err().map(|e| e.to_string())
-                        };
-
-                        if let Some(message) = type_error {
-                            diagnostics.push(carina_diagnostic(
-                                line,
-                                col,
-                                col + key.len() as u32,
-                                DiagnosticSeverity::WARNING,
-                                message,
-                            ));
-                        }
-
-                        // Recurse into nested Struct / List<Struct> fields
-                        let nested_fields = match &field.field_type {
-                            carina_core::schema::AttributeType::Struct { fields, .. } => {
-                                Some(fields)
-                            }
-                            carina_core::schema::AttributeType::List { inner, .. } => {
-                                match inner.as_ref() {
-                                    carina_core::schema::AttributeType::Struct {
-                                        fields, ..
-                                    } => Some(fields),
-                                    _ => None,
-                                }
-                            }
-                            _ => None,
-                        };
-                        if let Some(nested) = nested_fields {
-                            diagnostics.extend(self.validate_struct_value(doc, key, val, nested));
-                        }
-                    }
-                }
+        for (path, err) in errors {
+            if let Some((line, col, end_col)) = self.range_for_path(doc, attr_name, &path) {
+                diagnostics.push(carina_diagnostic(
+                    line,
+                    col,
+                    end_col,
+                    DiagnosticSeverity::WARNING,
+                    err.to_string(),
+                ));
             }
         }
-
         diagnostics
+    }
+
+    /// Walk a [`FieldPath`] across the source `doc` and return the
+    /// `(line, col, end_col)` triple to underline. Returns `None` when
+    /// the path cannot be located — better to drop the diagnostic
+    /// than to attach it to the wrong line.
+    fn range_for_path(
+        &self,
+        doc: &Document,
+        attr_name: &str,
+        path: &FieldPath,
+    ) -> Option<(u32, u32, u32)> {
+        let steps = path.steps();
+        if steps.is_empty() {
+            return None;
+        }
+
+        // For a List<Struct> at the top level (block syntax `attr {
+        // ... } attr { ... }`), the first step is a `[i]` index that
+        // selects which block to walk into; the *next* step is the
+        // first field name to find inside that block.
+        let (block_index, name_steps): (usize, &[FieldPathStep]) = match &steps[0] {
+            FieldPathStep::Index(i) => (*i, &steps[1..]),
+            FieldPathStep::Field(_) => (0, steps),
+        };
+
+        let Some(FieldPathStep::Field(first_name)) = name_steps.first() else {
+            // Path ends with an index — anchor on the block header itself.
+            let positions = self.find_all_block_positions(doc, attr_name);
+            return positions
+                .get(block_index)
+                .map(|(line, col)| (*line, *col, *col + attr_name.len() as u32));
+        };
+
+        // The first name lookup goes through the LSP's existing
+        // nested-block scanner, which already handles repeated blocks
+        // and assignment-style `attr = { ... }`.
+        let positions = self.find_all_nested_field_positions(doc, attr_name, first_name);
+        let Some(Some((mut line, mut col))) = positions.get(block_index).copied() else {
+            return None;
+        };
+
+        // For deeper paths (struct nested inside struct), descend by
+        // re-using the same scanner with the previous field name as
+        // the block name. This is approximate — LSP-side struct path
+        // resolution is best-effort — but matches what the legacy
+        // `validate_struct_value` was already doing.
+        let mut current_block = first_name.as_str();
+        for step in name_steps.iter().skip(1) {
+            if let FieldPathStep::Field(child) = step {
+                let nested_positions =
+                    self.find_all_nested_field_positions(doc, current_block, child);
+                if let Some(Some((nl, nc))) = nested_positions.first().copied() {
+                    line = nl;
+                    col = nc;
+                }
+                current_block = child.as_str();
+            }
+            // `Index` steps inside a nested struct (List<Struct> field
+            // of a struct) keep the `current_block` cursor where it
+            // is; the existing scanner walks all matching blocks and
+            // we already pinned the outer index above.
+        }
+
+        let end_col = col + current_block.len() as u32;
+        Some((line, col, end_col))
     }
 
     /// Find the start positions of ALL blocks with the given name.

@@ -566,27 +566,26 @@ impl DiagnosticEngine {
                                 ));
                             }
 
-                            // Struct field validation
-                            let struct_fields = match &attr_schema.attr_type {
-                                carina_core::schema::AttributeType::Struct { fields, .. } => {
-                                    Some(fields)
-                                }
-                                carina_core::schema::AttributeType::List { inner, .. } => {
-                                    match inner.as_ref() {
-                                        carina_core::schema::AttributeType::Struct {
-                                            fields,
-                                            ..
-                                        } => Some(fields),
-                                        _ => None,
-                                    }
-                                }
-                                _ => None,
+                            // Struct field validation. The wrapper borrows
+                            // the schema's `AttributeType` directly so we
+                            // don't deep-clone the field set on every
+                            // keystroke (LSP `analyze_with_filename` is on
+                            // the per-keystroke hot path).
+                            let is_struct_shape = match &attr_schema.attr_type {
+                                carina_core::schema::AttributeType::Struct { .. } => true,
+                                carina_core::schema::AttributeType::List { inner, .. } => matches!(
+                                    inner.as_ref(),
+                                    carina_core::schema::AttributeType::Struct { .. }
+                                ),
+                                _ => false,
                             };
-
-                            if let Some(fields) = struct_fields {
-                                diagnostics.extend(
-                                    self.validate_struct_value(doc, attr_name, attr_value, fields),
-                                );
+                            if is_struct_shape {
+                                diagnostics.extend(self.validate_struct_value(
+                                    doc,
+                                    attr_name,
+                                    attr_value,
+                                    &attr_schema.attr_type,
+                                ));
                             }
                         }
                     }
