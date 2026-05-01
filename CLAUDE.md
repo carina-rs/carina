@@ -107,9 +107,11 @@ Key rules:
 - For the fastest iteration loop, `cargo check -p <crate-name>` skips linking and is ~30–50% faster than `cargo build -p <crate-name>`.
 - Provider crates (aws, awscc) are in separate repositories — changes here may require updating those repos.
 
-### Build Cache Setup (sccache + shared target)
+### Build Cache Setup (sccache, per-worktree target)
 
-To speed up builds across git worktrees, set up sccache and a shared target directory. Without this, each worktree recompiles all dependencies from scratch.
+To speed up builds across git worktrees, set up sccache. Each worktree
+keeps its own `target/` directory; sccache provides cross-worktree reuse
+at the rustc-invocation level.
 
 ```bash
 # Install sccache
@@ -120,15 +122,39 @@ mkdir -p .cargo
 cat > .cargo/config.toml << 'EOF'
 [build]
 rustc-wrapper = "sccache"
-target-dir = "/Users/mizzy/.cargo-target/carina"
 EOF
 ```
 
-This configuration:
-- **sccache**: Caches compiled artifacts globally. New worktrees hit the cache instead of recompiling.
-- **shared target-dir**: All worktrees share one target directory. Cargo uses file locks to handle concurrent access (builds are serialized, not parallel).
+Why this shape:
 
-Note: `.cargo/config.toml` is gitignored because it contains machine-specific paths. Each new worktree needs this file copied or recreated.
+- **sccache** caches compiled artifacts by content hash globally. New
+  worktrees hit the cache at the rustc-call level instead of recompiling
+  dependencies from scratch — that is where the cross-worktree reuse
+  actually comes from.
+- **Per-worktree `target/`** (the cargo default — no `target-dir` override)
+  keeps each worktree's incremental build state local. Cargo locks the
+  target directory while building, so a single shared `target-dir` across
+  worktrees serializes parallel work and produces "Blocking waiting for
+  file lock on artifact directory" stalls when multiple agents run at
+  once. Per-worktree `target/` removes that contention; sccache still
+  carries the dependency-level reuse.
+
+Earlier guidance recommended `target-dir = "/Users/mizzy/.cargo-target/carina"`
+in `.cargo/config.toml`. That is now discouraged. If you have the override
+locally, drop it:
+
+```bash
+# Edit .cargo/config.toml and remove the `target-dir = ...` line
+```
+
+This is currently a pilot — the per-worktree shape is the new default,
+but real wall-clock numbers will be collected over the next few PR cycles
+before the change is considered final (#2290).
+
+Note: `.cargo/config.toml` is gitignored because it contains
+machine-specific paths. Each new worktree needs the file copied or
+recreated. The `target/` directory inside the worktree should also be
+gitignored (it already is at the workspace level).
 
 ## Architecture
 
