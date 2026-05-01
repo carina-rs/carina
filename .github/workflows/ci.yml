@@ -107,11 +107,14 @@ jobs:
         with:
           targets: wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
       # Build the WASM fixture so carina-plugin-host's integration tests run
       # instead of silently skipping. Without this step a stale or missing
       # fixture leaves the wasm_integration_test suite as a no-op in CI.
       - run: cargo build -p carina-provider-mock --target wasm32-wasip2
-      - run: cargo test --all-features
+      - run: cargo nextest run --workspace --all-features
+      # nextest does not run doctests; cover them with cargo test --doc.
+      - run: cargo test --workspace --doc --all-features
 
   binary-build:
     name: Binary Build (linux-x86_64)
