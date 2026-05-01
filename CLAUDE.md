@@ -5,10 +5,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build and Test Commands
 
 ```bash
-# Build
-cargo build
+# Compile-only sanity check (faster than `cargo build`; does not link binaries)
+cargo check
 
-# Run all tests
+# Run all tests (also compiles; do NOT run `cargo build` separately first)
 cargo test
 
 # Run tests for a specific crate
@@ -26,6 +26,35 @@ cargo run -- apply .
 # With AWS credentials (using aws-vault)
 aws-vault exec <profile> -- cargo run -- plan .
 ```
+
+### Verify Protocol — Do Not Run Redundant Builds
+
+The verify cycle is the slowest thing about working on this repo. Most of
+that cost is cargo work, and the single biggest waste is running
+`cargo build` immediately before `cargo test`: the test step compiles
+the same artifacts the build step just produced, doubling the wait.
+
+**Rules:**
+
+- **Do not run `cargo build`** as a separate verification step. `cargo test`
+  already compiles everything it needs. Running both is pure duplication.
+- For a faster compile-only sanity check during iteration, use
+  `cargo check -p <crate>` (skips linking, ~30–50% faster than `cargo build`).
+- The only legitimate use of `cargo build` in the verify cycle is
+  `cargo build --release` immediately before opening a PR, to catch
+  release-only issues that debug builds miss. Skip it for refactors,
+  bug fixes, or anything that has not changed `Cargo.toml` / unsafe code /
+  the `release` profile config.
+- Order your verify cycle as: `cargo test -p <crate>` → broaden to
+  `cargo test --workspace` only when the change spans crates → then
+  `cargo clippy --workspace --all-targets -- -D warnings` →
+  `bash scripts/check-*.sh`.
+
+CI's `Test` job runs `cargo build -p carina-provider-mock --target wasm32-wasip2`
+*before* `cargo test`, but that build targets a different platform
+(`wasm32-wasip2`) than the test step (host), so it is not redundant —
+it produces the WASM fixture that `carina-plugin-host`'s integration
+tests load. Do not generalize from that step to local development.
 
 ### Plan Display Testing
 
@@ -63,20 +92,20 @@ If snapshots are not updated after a display change, CI will fail on the `Test` 
 When working on a specific crate, always use crate-specific commands to avoid unnecessary compilation:
 
 ```bash
-# Prefer crate-specific builds over full workspace builds
-cargo build -p carina-core          # Instead of `cargo build`
-cargo test -p carina-core           # Instead of `cargo test`
+# Prefer crate-scoped check/test over full workspace runs
+cargo check -p carina-core          # Fastest sanity check while iterating
+cargo test -p carina-core           # Compiles + runs the crate's tests
 
-# Only use full workspace build/test when changes span multiple crates
-cargo build
+# Only use full workspace test when changes span multiple crates,
+# or as the final pre-PR sweep
 cargo test
 ```
 
 Key rules:
-- After modifying a single crate, build/test only that crate with `-p <crate-name>`
-- Use full workspace `cargo build` / `cargo test` only when changes affect multiple crates or before creating a PR
-- For `cargo check`, prefer `cargo check -p <crate-name>` as well
-- Provider crates (aws, awscc) are in separate repositories — changes here may require updating those repos
+- After modifying a single crate, test only that crate with `cargo test -p <crate-name>`. Do **not** run `cargo build -p <crate-name>` first — `cargo test` does the build.
+- Use full workspace `cargo test` only when changes affect multiple crates or before creating a PR.
+- For the fastest iteration loop, `cargo check -p <crate-name>` skips linking and is ~30–50% faster than `cargo build -p <crate-name>`.
+- Provider crates (aws, awscc) are in separate repositories — changes here may require updating those repos.
 
 ### Build Cache Setup (sccache + shared target)
 
