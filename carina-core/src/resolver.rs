@@ -9,7 +9,7 @@ use indexmap::IndexMap;
 
 use crate::deps::get_resource_dependencies;
 use crate::resource::{
-    Expr, InterpolationPart, Resource, ResourceId, State, Value, contains_resource_ref,
+    InterpolationPart, Resource, ResourceId, State, Value, contains_resource_ref,
 };
 
 /// Resolve all ResourceRef values in resources using current state.
@@ -48,7 +48,6 @@ pub fn resolve_refs_with_state_and_remote(
     }
 
     // Build a map of binding_name -> attributes (merged from DSL and AWS state)
-    // Extract Value from Expr for the binding map since resolve_ref_value works with Value
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
     for resource in resources.iter() {
@@ -85,9 +84,9 @@ pub fn resolve_refs_with_state_and_remote(
     // so the user's authored attribute order survives resolution
     // (#2222).
     for resource in resources.iter_mut() {
-        let mut resolved_attrs: indexmap::IndexMap<String, Expr> = indexmap::IndexMap::new();
-        for (key, expr) in &resource.attributes {
-            resolved_attrs.insert(key.clone(), Expr(resolve_ref_value(expr, &binding_map)?));
+        let mut resolved_attrs: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
+        for (key, value) in &resource.attributes {
+            resolved_attrs.insert(key.clone(), resolve_ref_value(value, &binding_map)?);
         }
         resource.attributes = resolved_attrs;
     }
@@ -252,7 +251,7 @@ mod tests {
 
     fn make_resource(name: &str, binding: Option<&str>, attrs: Vec<(&str, Value)>) -> Resource {
         let mut r = Resource::new("test.resource", name);
-        r.attributes = Expr::wrap_map(attrs.into_iter().map(|(k, v)| (k.to_string(), v)));
+        r.attributes = attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
         r.binding = binding.map(|b| b.to_string());
         r
     }

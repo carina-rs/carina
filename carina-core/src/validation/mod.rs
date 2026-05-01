@@ -96,7 +96,7 @@ pub fn validate_resource_ref_types(
                 continue;
             }
 
-            let (ref_binding, ref_attr) = match attr_value.as_value() {
+            let (ref_binding, ref_attr) = match attr_value {
                 Value::ResourceRef { path } => {
                     (path.binding().to_string(), path.attribute().to_string())
                 }

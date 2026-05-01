@@ -47,7 +47,7 @@ pub fn resolve_attr_prefixes(
             .iter()
             .filter_map(|(key, value)| {
                 if let Some(base_attr) = key.strip_suffix("_prefix")
-                    && let Value::String(prefix_value) = &**value
+                    && let Value::String(prefix_value) = value
                     && let Some(attr_schema) = schema.attributes.get(base_attr)
                     && is_string_compatible_type(&attr_schema.attr_type)
                 {

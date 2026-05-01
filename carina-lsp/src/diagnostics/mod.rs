@@ -383,7 +383,7 @@ impl DiagnosticEngine {
                             if matches!(
                                 &attr_schema.attr_type,
                                 carina_core::schema::AttributeType::Struct { .. }
-                            ) && matches!(&**attr_value, Value::List(_))
+                            ) && matches!(attr_value, Value::List(_))
                             {
                                 let search_name =
                                     attr_schema.block_name.as_deref().unwrap_or(attr_name);
@@ -403,7 +403,7 @@ impl DiagnosticEngine {
                                 }
                             }
 
-                            let type_error = match (&attr_schema.attr_type, &**attr_value) {
+                            let type_error = match (&attr_schema.attr_type, attr_value) {
                                 // Bool type should not receive String
                                 (carina_core::schema::AttributeType::Bool, Value::String(s)) => {
                                     Some(format!(

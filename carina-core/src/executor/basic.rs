@@ -8,7 +8,7 @@ use std::time::Instant;
 use crate::effect::Effect;
 use crate::provider::Provider;
 use crate::resolver::resolve_ref_value;
-use crate::resource::{Expr, Resource, ResourceId, State, Value};
+use crate::resource::{Resource, ResourceId, State, Value};
 
 use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
 
@@ -105,7 +105,7 @@ pub(super) fn resolve_resource(
         let resolved_value = resolve_ref_value(expr, binding_map)?;
         resolved
             .attributes
-            .insert(key.clone(), Expr(unwrap_secret(resolved_value)));
+            .insert(key.clone(), unwrap_secret(resolved_value));
     }
     Ok(resolved)
 }
@@ -122,7 +122,7 @@ pub(super) fn resolve_resource_with_source(
         let resolved_value = resolve_ref_value(expr, binding_map)?;
         resolved
             .attributes
-            .insert(key.clone(), Expr(unwrap_secret(resolved_value)));
+            .insert(key.clone(), unwrap_secret(resolved_value));
     }
     Ok(resolved)
 }

@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 
 use carina_core::resource::{
-    Expr, LifecycleConfig, Resource as CoreResource, ResourceId as CoreResourceId,
-    State as CoreState, Value as CoreValue,
+    LifecycleConfig, Resource as CoreResource, ResourceId as CoreResourceId, State as CoreState,
+    Value as CoreValue,
 };
 use carina_core::schema::{
     AttributeSchema as CoreAttributeSchema, AttributeType as CoreAttributeType,
@@ -196,7 +196,7 @@ pub fn wit_to_core_resource(resource: &wit::ResourceDef) -> CoreResource {
     core_resource.attributes = resource
         .attributes
         .iter()
-        .map(|(k, v)| (k.clone(), Expr(wit_to_core_value(v))))
+        .map(|(k, v)| (k.clone(), wit_to_core_value(v)))
         .collect();
     core_resource
 }
@@ -591,8 +591,8 @@ mod tests {
     fn test_resource_roundtrip() {
         let mut resource = CoreResource::with_provider("aws", "s3.Bucket", "my-bucket");
         resource.attributes = indexmap::IndexMap::from([
-            ("name".into(), Expr(CoreValue::String("my-bucket".into()))),
-            ("region".into(), Expr(CoreValue::String("us-east-1".into()))),
+            ("name".into(), CoreValue::String("my-bucket".into())),
+            ("region".into(), CoreValue::String("us-east-1".into())),
         ]);
 
         let wit = core_to_wit_resource(&resource);

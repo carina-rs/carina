@@ -495,7 +495,7 @@ pub fn resolve_enum_aliases_with_ctx(ctx: &WiringContext, resources: &mut [Resou
         // `value_attrs` is `HashMap`-shaped, so the source order written
         // by the user does not survive alias resolution. Re-rendering the
         // attributes after this point can produce a different key order.
-        resource.attributes = carina_core::resource::Expr::wrap_map(value_attrs);
+        resource.attributes = value_attrs.into_iter().collect();
     }
 }
 

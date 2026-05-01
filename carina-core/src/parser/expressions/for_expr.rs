@@ -272,7 +272,7 @@ pub(crate) fn parse_for_expr(
                     .attributes
                     .iter()
                     .filter(|(k, _)| !k.starts_with('_'))
-                    .map(|(k, expr)| (k.clone(), expr.0.clone()))
+                    .map(|(k, value)| (k.clone(), value.clone()))
                     .collect();
                 ctx.deferred_for_expressions.push(DeferredForExpression {
                     file: None,
@@ -349,7 +349,7 @@ pub(crate) fn parse_for_expr(
                         .attributes
                         .iter()
                         .filter(|(k, _)| !k.starts_with('_'))
-                        .map(|(k, expr)| (k.clone(), expr.0.clone()))
+                        .map(|(k, value)| (k.clone(), value.clone()))
                         .collect();
                     ctx.deferred_for_expressions.push(DeferredForExpression {
                         file: None,

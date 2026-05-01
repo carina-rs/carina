@@ -424,7 +424,7 @@ fn import_fallback_skips_when_already_in_state_by_name_attribute() {
 /// string and ships it to the remote API as a literal.
 #[test]
 fn resolve_data_source_refs_replaces_resource_ref_with_concrete_value() {
-    use carina_core::resource::{AccessPath, Expr, ResourceKind};
+    use carina_core::resource::{AccessPath, ResourceKind};
 
     let identity_store_id = "d-9067c29a4b";
 
@@ -437,13 +437,13 @@ fn resolve_data_source_refs_replaces_resource_ref_with_concrete_value() {
     mizzy.kind = ResourceKind::DataSource;
     mizzy.attributes.insert(
         "identity_store_id".to_string(),
-        Expr(Value::ResourceRef {
+        Value::ResourceRef {
             path: AccessPath::new("sso", "identity_store_id"),
-        }),
+        },
     );
     mizzy.attributes.insert(
         "user_name".to_string(),
-        Expr(Value::String("gosukenator@gmail.com".into())),
+        Value::String("gosukenator@gmail.com".into()),
     );
 
     // current_states after phase 1: sso has been refreshed and its

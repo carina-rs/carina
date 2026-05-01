@@ -6,7 +6,7 @@ use crate::deps::get_resource_dependencies;
 use crate::effect::{CascadingUpdate, Effect, TemporaryName};
 use crate::identifier::generate_random_suffix;
 use crate::plan::{Plan, PlanError};
-use crate::resource::{Expr, LifecycleConfig, Resource, ResourceId, ResourceKind, State, Value};
+use crate::resource::{LifecycleConfig, Resource, ResourceId, ResourceKind, State, Value};
 use crate::schema::ResourceSchema;
 
 use super::{Diff, diff};
@@ -338,7 +338,7 @@ pub fn create_plan(
                     // ordering of this synthetic temp resource doesn't
                     // matter (it only feeds the dependency walker), so
                     // a plain clone-through `wrap_map` is fine.
-                    attributes: Expr::wrap_map(state.attributes.clone()),
+                    attributes: state.attributes.clone().into_iter().collect(),
                     kind: ResourceKind::Real,
                     lifecycle: lifecycle.clone(),
                     prefixes: HashMap::new(),
@@ -497,16 +497,14 @@ pub fn cascade_dependent_updates(
             let ref_attrs: Vec<String> = resource
                 .attributes
                 .iter()
-                .filter(|(_, v)| {
-                    matches!(v.as_value(), Value::ResourceRef { path } if path.binding() == dep)
-                })
+                .filter(|(_, v)| matches!(v, Value::ResourceRef { path } if path.binding() == dep))
                 .map(|(k, _)| k.clone())
                 .collect();
 
             let ref_hints: Vec<(String, String)> = resource
                 .attributes
                 .iter()
-                .filter_map(|(k, v)| match v.as_value() {
+                .filter_map(|(k, v)| match v {
                     Value::ResourceRef { path } if path.binding() == dep => Some((
                         k.clone(),
                         format!("{}.{}", path.binding(), path.attribute()),
@@ -589,7 +587,7 @@ pub fn cascade_dependent_updates(
                     .attributes
                     .iter()
                     .filter(|(_, v)| {
-                        matches!(v.as_value(), Value::ResourceRef { path } if path.binding() == replaced_binding)
+                        matches!(v, Value::ResourceRef { path } if path.binding() == replaced_binding)
                     })
                     .map(|(k, _)| k.clone())
                     .collect();
@@ -626,7 +624,7 @@ pub fn cascade_dependent_updates(
                     let ref_hints: Vec<(String, String)> = unresolved
                         .attributes
                         .iter()
-                        .filter_map(|(k, v)| match v.as_value() {
+                        .filter_map(|(k, v)| match v {
                             Value::ResourceRef { path }
                                 if path.binding() == replaced_binding
                                     && create_only_refs.contains(k) =>
