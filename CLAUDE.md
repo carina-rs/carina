@@ -123,6 +123,76 @@ Key rules:
 - For the fastest iteration loop, `cargo check -p <crate-name>` skips linking and is ~30–50% faster than `cargo build -p <crate-name>`.
 - Provider crates (aws, awscc) are in separate repositories — changes here may require updating those repos.
 
+### Crate-Scoped Verify Helper
+
+`scripts/touched-crates.sh` maps a set of changed files to the cargo
+`-p <crate>` flags that exercise them, so iteration verify can stay
+crate-scoped instead of always sweeping the workspace:
+
+```bash
+# What crates does the current branch touch (vs origin/main)?
+scripts/touched-crates.sh
+# → "-p carina-core -p carina-cli"   (or "--workspace", or empty)
+
+# Run nextest only over the touched crates:
+cargo nextest run $(scripts/touched-crates.sh)
+
+# Diff against a specific base:
+scripts/touched-crates.sh --base main
+
+# Pipe a custom file list (e.g. only the dirty ones):
+git diff --name-only | scripts/touched-crates.sh --stdin
+```
+
+Outputs and what they mean:
+
+| Output           | Meaning                                                   |
+| ---------------- | --------------------------------------------------------- |
+| `-p <crate> ...` | Run only those crates' tests; transitive consumers are not invalidated by this change. |
+| `--workspace`    | Cross-cutting change (touched `carina-core`, root `Cargo.toml`/`Cargo.lock`, or an unrecognized path). Sweep the whole workspace. |
+| (empty)          | No test-relevant files changed (only docs / CI / scripts / infra). Skip the test step. |
+
+The helper is intentionally pessimistic: when in doubt, it emits
+`--workspace`. The two main "fall back" rules:
+
+1. **`carina-core` touched ⇒ `--workspace`.** Every other crate
+   depends on `carina-core`, so testing only `carina-core` would miss
+   downstream regressions. Run the full sweep instead.
+2. **Unknown path ⇒ `--workspace`.** A new top-level directory or a
+   file in a path the helper does not classify is treated as
+   workspace-wide until the helper learns about it.
+
+For more rigorous transitive impact analysis (e.g. "which crates'
+*tests* are affected when I change a function in `carina-core`?"),
+use the `dagayn` MCP `get_impact_radius` tool, which walks the call
+graph rather than relying on the directory mapping above.
+
+The helper feeds the verify cycle order from #2289 / #2291:
+
+```bash
+# 1. Compile-only sanity (still crate-scoped during iteration)
+cargo check -p <crate>
+
+# 2. Tests, scoped to what changed
+SCOPE=$(scripts/touched-crates.sh)
+if [[ -n "$SCOPE" ]]; then
+    cargo nextest run $SCOPE
+fi
+
+# 3. Doctests (cheap; nextest does not run them)
+cargo test --workspace --doc
+
+# 4. Lints
+cargo clippy --workspace --all-targets -- -D warnings
+
+# 5. Repo invariants
+bash scripts/check-*.sh
+```
+
+Steps 3–5 stay workspace-scoped because they are already fast and
+catch issues that a crate-scoped run would miss (cross-crate doctest
+references, workspace-level lint config, repo-wide invariant scripts).
+
 ### Build Cache Setup (sccache, per-worktree target)
 
 To speed up builds across git worktrees, set up sccache. Each worktree
