@@ -491,9 +491,7 @@ impl ParsedFile {
                         let mut resource = deferred.template_resource.clone();
                         resource.id.set_name(address.clone());
                         resource.binding = Some(address);
-                        for (_k, value) in resource.attributes.iter_mut() {
-                            substitute_placeholder(value, None, None, item);
-                        }
+                        substitute_attrs(&mut resource, None, None, item);
                         expanded_resources.push(resource);
                     }
                     resolved_indices.push(idx);
@@ -505,9 +503,7 @@ impl ParsedFile {
                         let mut resource = deferred.template_resource.clone();
                         resource.id.set_name(address.clone());
                         resource.binding = Some(address);
-                        for (_k, value) in resource.attributes.iter_mut() {
-                            substitute_placeholder(value, Some(i as i64), None, item);
-                        }
+                        substitute_attrs(&mut resource, Some(i as i64), None, item);
                         expanded_resources.push(resource);
                     }
                     resolved_indices.push(idx);
@@ -522,9 +518,7 @@ impl ParsedFile {
                         let mut resource = deferred.template_resource.clone();
                         resource.id.set_name(address.clone());
                         resource.binding = Some(address);
-                        for (_k, value) in resource.attributes.iter_mut() {
-                            substitute_placeholder(value, None, Some(key), val);
-                        }
+                        substitute_attrs(&mut resource, None, Some(key), val);
                         expanded_resources.push(resource);
                     }
                     resolved_indices.push(idx);
@@ -581,6 +575,23 @@ impl ParsedFile {
 
         self.resources.extend(expanded_resources);
         self.warnings.extend(new_warnings);
+    }
+}
+
+/// Run `substitute_placeholder` over every attribute of `resource`, then
+/// canonicalize each attribute in place. The canonicalize step lives here
+/// (and not at parse time) because once placeholders have been replaced
+/// with concrete scalars, surrounding `Interpolation` shapes can collapse
+/// to a `String` (#2227).
+fn substitute_attrs(
+    resource: &mut crate::resource::Resource,
+    index: Option<i64>,
+    key: Option<&str>,
+    value: &Value,
+) {
+    for (_, attr) in resource.attributes.iter_mut() {
+        substitute_placeholder(attr, index, key, value);
+        attr.canonicalize_in_place();
     }
 }
 

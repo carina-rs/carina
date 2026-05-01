@@ -106,6 +106,7 @@ fn resolve_forward_ref_in_value(
                     })
                     .collect(),
             )
+            .canonicalize()
         }
         Value::FunctionCall { name, args } => Value::FunctionCall {
             name,
@@ -359,7 +360,7 @@ fn resolve_value_with_config(
                     other => Ok(other.clone()),
                 })
                 .collect();
-            Ok(Value::Interpolation(resolved?))
+            Ok(Value::Interpolation(resolved?).canonicalize())
         }
         Value::FunctionCall { name, args } => {
             let resolved_args: Result<Vec<Value>, ParseError> = args

@@ -2542,10 +2542,7 @@ fn parse_string_interpolation_simple() {
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
-        Some(&Value::Interpolation(vec![
-            InterpolationPart::Literal("vpc-".to_string()),
-            InterpolationPart::Expr(Value::String("prod".to_string())),
-        ]))
+        Some(&Value::String("vpc-prod".to_string()))
     );
 }
 
@@ -2563,12 +2560,7 @@ fn parse_string_interpolation_multiple_exprs() {
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
-        Some(&Value::Interpolation(vec![
-            InterpolationPart::Literal("vpc-".to_string()),
-            InterpolationPart::Expr(Value::String("prod".to_string())),
-            InterpolationPart::Literal("-".to_string()),
-            InterpolationPart::Expr(Value::String("us-east-1".to_string())),
-        ]))
+        Some(&Value::String("vpc-prod-us-east-1".to_string()))
     );
 }
 
@@ -2661,10 +2653,7 @@ fn parse_string_interpolation_with_bool() {
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
-        Some(&Value::Interpolation(vec![
-            InterpolationPart::Literal("enabled-".to_string()),
-            InterpolationPart::Expr(Value::Bool(true)),
-        ]))
+        Some(&Value::String("enabled-true".to_string()))
     );
 }
 
@@ -2680,10 +2669,7 @@ fn parse_string_interpolation_with_number() {
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
-        Some(&Value::Interpolation(vec![
-            InterpolationPart::Literal("port-".to_string()),
-            InterpolationPart::Expr(Value::Int(8080)),
-        ]))
+        Some(&Value::String("port-8080".to_string()))
     );
 }
 
@@ -2701,9 +2687,7 @@ fn parse_string_interpolation_only_expr() {
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("tag"),
-        Some(&Value::Interpolation(vec![InterpolationPart::Expr(
-            Value::String("prod".to_string())
-        ),]))
+        Some(&Value::String("prod".to_string()))
     );
 }
 
@@ -2748,13 +2732,10 @@ fn parse_local_let_binding_with_interpolation() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     let subnet = &result.resources[0];
 
-    // Local binding should resolve outer scope variable in interpolation
+    // Local binding should resolve outer scope variable in interpolation.
     assert_eq!(
         subnet.get_attr("tag_name"),
-        Some(&Value::Interpolation(vec![
-            InterpolationPart::Literal("app-".to_string()),
-            InterpolationPart::Expr(Value::String("prod".to_string())),
-        ]))
+        Some(&Value::String("app-prod".to_string()))
     );
 }
 
@@ -2772,13 +2753,10 @@ fn parse_local_let_binding_chain() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     let subnet = &result.resources[0];
 
-    // Chained local bindings should resolve correctly
+    // Chained local bindings should resolve correctly.
     assert_eq!(
         subnet.get_attr("tag_name"),
-        Some(&Value::Interpolation(vec![
-            InterpolationPart::Expr(Value::String("app".to_string())),
-            InterpolationPart::Literal("-subnet".to_string()),
-        ]))
+        Some(&Value::String("app-subnet".to_string()))
     );
 
     // Local bindings should NOT appear in attributes
@@ -4709,21 +4687,11 @@ fn user_fn_with_string_interpolation() {
         }
     "#;
 
-    // At parse time, fn is evaluated but interpolation is not fully resolved
+    // The greet() call evaluates to "hello world", which folds into
+    // the surrounding "-suffix" literal.
     let result = parse(input, &ProviderContext::default()).unwrap();
     let name = result.resources[0].get_attr("name").unwrap();
-    match name {
-        Value::Interpolation(parts) => {
-            // The greet() call is evaluated to "hello world"
-            assert_eq!(parts.len(), 2);
-            assert_eq!(
-                parts[0],
-                InterpolationPart::Expr(Value::String("hello world".to_string()))
-            );
-            assert_eq!(parts[1], InterpolationPart::Literal("-suffix".to_string()));
-        }
-        _ => panic!("Expected Interpolation, got: {:?}", name),
-    }
+    assert_eq!(name, &Value::String("hello world-suffix".to_string()));
 }
 
 #[test]

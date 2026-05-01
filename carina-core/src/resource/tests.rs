@@ -766,3 +766,220 @@ fn visit_refs_on_leaf_variants_calls_nothing() {
         assert_eq!(count, 0);
     }
 }
+
+// canonicalize() — see #2227
+
+#[test]
+fn canonicalize_leaves_simple_values_alone() {
+    for v in [
+        Value::String("s".into()),
+        Value::Int(1),
+        Value::Float(1.5),
+        Value::Bool(true),
+        Value::resource_ref("vpc", "id", vec![]),
+    ] {
+        assert_eq!(v.clone().canonicalize(), v);
+    }
+}
+
+#[test]
+fn canonicalize_collapses_all_literal_interpolation_to_string() {
+    let v = Value::Interpolation(vec![
+        InterpolationPart::Literal("foo".into()),
+        InterpolationPart::Literal("bar".into()),
+    ]);
+    assert_eq!(v.canonicalize(), Value::String("foobar".into()));
+}
+
+#[test]
+fn canonicalize_collapses_single_literal_interpolation_to_string() {
+    let v = Value::Interpolation(vec![InterpolationPart::Literal("foo".into())]);
+    assert_eq!(v.canonicalize(), Value::String("foo".into()));
+}
+
+#[test]
+fn canonicalize_unwraps_single_scalar_expr_interpolation() {
+    // Every string-shaped scalar (String / Int / Float / Bool) is
+    // folded into a flat `Value::String` when wrapped in a
+    // single-element interpolation.
+    let cases: Vec<(Value, &str)> = vec![
+        (Value::String("foo".into()), "foo"),
+        (Value::Int(42), "42"),
+        (Value::Float(1.5), "1.5"),
+        (Value::Bool(true), "true"),
+    ];
+    for (inner, expected) in cases {
+        let label = format!("{:?}", inner);
+        let v = Value::Interpolation(vec![InterpolationPart::Expr(inner)]);
+        assert_eq!(
+            v.canonicalize(),
+            Value::String(expected.into()),
+            "case {} failed",
+            label
+        );
+    }
+}
+
+#[test]
+fn canonicalize_merges_adjacent_literals() {
+    let v = Value::Interpolation(vec![
+        InterpolationPart::Literal("a".into()),
+        InterpolationPart::Literal("b".into()),
+        InterpolationPart::Expr(Value::resource_ref("vpc", "id", vec![])),
+        InterpolationPart::Literal("c".into()),
+        InterpolationPart::Literal("d".into()),
+    ]);
+    assert_eq!(
+        v.canonicalize(),
+        Value::Interpolation(vec![
+            InterpolationPart::Literal("ab".into()),
+            InterpolationPart::Expr(Value::resource_ref("vpc", "id", vec![])),
+            InterpolationPart::Literal("cd".into()),
+        ])
+    );
+}
+
+#[test]
+fn canonicalize_folds_simple_expr_into_literal_then_merges() {
+    // ["prefix-", Expr(String("foo")), "-suffix"] -> "prefix-foo-suffix"
+    let v = Value::Interpolation(vec![
+        InterpolationPart::Literal("prefix-".into()),
+        InterpolationPart::Expr(Value::String("foo".into())),
+        InterpolationPart::Literal("-suffix".into()),
+    ]);
+    assert_eq!(v.canonicalize(), Value::String("prefix-foo-suffix".into()));
+}
+
+#[test]
+fn canonicalize_keeps_resource_ref_expr_in_interpolation() {
+    let parts = vec![
+        InterpolationPart::Literal("prefix-".into()),
+        InterpolationPart::Expr(Value::resource_ref("vpc", "id", vec![])),
+    ];
+    let v = Value::Interpolation(parts.clone());
+    assert_eq!(v.canonicalize(), Value::Interpolation(parts));
+}
+
+#[test]
+fn canonicalize_recurses_into_list_and_map() {
+    let v = Value::List(vec![
+        Value::Interpolation(vec![InterpolationPart::Literal("foo".into())]),
+        Value::Map(IndexMap::from([(
+            "k".to_string(),
+            Value::Interpolation(vec![InterpolationPart::Literal("bar".into())]),
+        )])),
+    ]);
+    assert_eq!(
+        v.canonicalize(),
+        Value::List(vec![
+            Value::String("foo".into()),
+            Value::Map(IndexMap::from([(
+                "k".to_string(),
+                Value::String("bar".into()),
+            )])),
+        ])
+    );
+}
+
+#[test]
+fn canonicalize_recurses_into_function_call_args() {
+    let v = Value::FunctionCall {
+        name: "upper".into(),
+        args: vec![Value::Interpolation(vec![InterpolationPart::Literal(
+            "foo".into(),
+        )])],
+    };
+    assert_eq!(
+        v.canonicalize(),
+        Value::FunctionCall {
+            name: "upper".into(),
+            args: vec![Value::String("foo".into())],
+        }
+    );
+}
+
+#[test]
+fn canonicalize_recurses_into_secret() {
+    let v = Value::Secret(Box::new(Value::Interpolation(vec![
+        InterpolationPart::Literal("hidden".into()),
+    ])));
+    assert_eq!(
+        v.canonicalize(),
+        Value::Secret(Box::new(Value::String("hidden".into())))
+    );
+}
+
+#[test]
+fn canonicalize_collapses_nested_interpolation() {
+    // Inner `Interpolation([Literal("foo")])` collapses to `String("foo")`,
+    // its outer `Expr(String("foo"))` folds into a Literal, and the
+    // single-literal Interpolation collapses to `String("foo")`.
+    let v = Value::Interpolation(vec![InterpolationPart::Expr(Value::Interpolation(vec![
+        InterpolationPart::Literal("foo".into()),
+    ]))]);
+    assert_eq!(v.canonicalize(), Value::String("foo".into()));
+}
+
+#[test]
+fn canonicalize_keeps_secret_expr_in_interpolation() {
+    // A `Secret(_)` inside an `Expr` must NOT be folded into a Literal:
+    // doing so would let the secret travel as plain text and bypass
+    // redaction in plan display, state serialization, and logging.
+    let secret = Value::Secret(Box::new(Value::String("password".into())));
+    let parts = vec![
+        InterpolationPart::Literal("db-".into()),
+        InterpolationPart::Expr(secret.clone()),
+    ];
+    let v = Value::Interpolation(parts.clone());
+    assert_eq!(v.canonicalize(), Value::Interpolation(parts));
+
+    // Even when the Secret is the only Expr part, it must stay wrapped.
+    let only_secret = Value::Interpolation(vec![InterpolationPart::Expr(secret.clone())]);
+    assert_eq!(
+        only_secret.canonicalize(),
+        Value::Interpolation(vec![InterpolationPart::Expr(secret)]),
+    );
+}
+
+#[test]
+fn canonicalize_is_idempotent() {
+    let inputs = vec![
+        // All-Literal Interpolation collapses to String on first call.
+        Value::Interpolation(vec![
+            InterpolationPart::Literal("foo".into()),
+            InterpolationPart::Literal("bar".into()),
+        ]),
+        // ResourceRef-bearing Interpolation stays as Interpolation.
+        Value::Interpolation(vec![
+            InterpolationPart::Literal("a".into()),
+            InterpolationPart::Expr(Value::resource_ref("x", "y", vec![])),
+            InterpolationPart::Literal("b".into()),
+        ]),
+        // Nested Interpolation inside an Expr.
+        Value::Interpolation(vec![InterpolationPart::Expr(Value::Interpolation(vec![
+            InterpolationPart::Literal("nested".into()),
+        ]))]),
+        // Secret-wrapped Interpolation: canonicalize recurses through
+        // Secret at the Value level but keeps Secret(Expr) wrapped.
+        Value::Secret(Box::new(Value::Interpolation(vec![
+            InterpolationPart::Literal("hidden".into()),
+        ]))),
+        // List, Map, FunctionCall — recursion shapes.
+        Value::List(vec![Value::String("x".into())]),
+        Value::Map(IndexMap::from([(
+            "k".to_string(),
+            Value::Interpolation(vec![InterpolationPart::Literal("v".into())]),
+        )])),
+        Value::FunctionCall {
+            name: "upper".into(),
+            args: vec![Value::Interpolation(vec![InterpolationPart::Literal(
+                "x".into(),
+            )])],
+        },
+    ];
+    for v in inputs {
+        let once = v.clone().canonicalize();
+        let twice = once.clone().canonicalize();
+        assert_eq!(once, twice, "canonicalize must be idempotent for {:?}", v);
+    }
+}
