@@ -5,8 +5,7 @@
 //! - [`BindingIndex`] — the schema-aware view, `binding_name → (resource,
 //!   schema)`. Used by validation and the LSP.
 //! - [`ResolvedBindings`] — the value-aware view, `binding_name →
-//!   merged attributes`. Used by the resolver (#2299), and will be used
-//!   by the executor (#2300).
+//!   merged attributes`. Used by the resolver and the executor.
 //!
 //! They are separate types because their invariants differ: every
 //! `BindingIndex` entry has a `Resource` and a `ResourceSchema`, while
@@ -151,6 +150,16 @@ pub enum BindingValueSource {
     Upstream,
 }
 
+/// One entry in [`ResolvedBindings`]: the merged attribute map and the
+/// source it came from. Stored as a single struct (rather than two
+/// parallel maps) so the type system enforces "every name has both
+/// attributes and a source".
+#[derive(Debug, Clone)]
+pub struct ResolvedBinding {
+    pub attributes: HashMap<String, Value>,
+    pub source: BindingValueSource,
+}
+
 /// Value-aware sibling of [`BindingIndex`]. See the module-level doc for
 /// why this is a separate type.
 ///
@@ -159,18 +168,9 @@ pub enum BindingValueSource {
 /// upstream `HashMap<String, HashMap<String, Value>>` already on hand to
 /// borrow from. Owning the merged map avoids a self-referential
 /// structure.
-///
-/// The two internal maps are populated in lockstep by
-/// `from_resources_with_state` (the only writer) so a `name` is always
-/// present in both or neither. Once `resolve_ref_value` and the
-/// executor stop taking a raw `&HashMap<String, HashMap<String, Value>>`
-/// (#2300), the storage will fold into a single `HashMap<String,
-/// ResolvedBinding>`; until then the parallel shape lets `as_map()`
-/// hand out a borrow of the legacy view without an extra allocation.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ResolvedBindings {
-    attrs: HashMap<String, HashMap<String, Value>>,
-    sources: HashMap<String, BindingValueSource>,
+    by_name: HashMap<String, ResolvedBinding>,
 }
 
 impl ResolvedBindings {
@@ -187,8 +187,7 @@ impl ResolvedBindings {
         current_states: &HashMap<ResourceId, State>,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
     ) -> Self {
-        let mut attrs: HashMap<String, HashMap<String, Value>> = HashMap::new();
-        let mut sources: HashMap<String, BindingValueSource> = HashMap::new();
+        let mut by_name: HashMap<String, ResolvedBinding> = HashMap::new();
 
         for resource in resources.iter() {
             let Some(binding_name) = resource.binding.as_ref() else {
@@ -202,35 +201,89 @@ impl ResolvedBindings {
                     merged.entry(k.clone()).or_insert_with(|| v.clone());
                 }
             }
-            attrs.insert(binding_name.clone(), merged);
-            sources.insert(binding_name.clone(), BindingValueSource::Local);
+            by_name.insert(
+                binding_name.clone(),
+                ResolvedBinding {
+                    attributes: merged,
+                    source: BindingValueSource::Local,
+                },
+            );
         }
 
         for (remote_binding, remote_attrs) in remote_bindings {
-            attrs.insert(remote_binding.clone(), remote_attrs.clone());
-            sources.insert(remote_binding.clone(), BindingValueSource::Upstream);
+            by_name.insert(
+                remote_binding.clone(),
+                ResolvedBinding {
+                    attributes: remote_attrs.clone(),
+                    source: BindingValueSource::Upstream,
+                },
+            );
         }
 
-        Self { attrs, sources }
+        Self { by_name }
     }
 
     pub fn get(&self, name: &str) -> Option<&HashMap<String, Value>> {
-        self.attrs.get(name)
+        self.by_name.get(name).map(|b| &b.attributes)
     }
 
     pub fn source(&self, name: &str) -> Option<BindingValueSource> {
-        self.sources.get(name).copied()
+        self.by_name.get(name).map(|b| b.source)
     }
 
-    /// Borrow the legacy `binding_name → attributes` view.
+    /// Record (or refresh) a binding after a `Create` / `Update` effect
+    /// returns its post-apply state.
     ///
-    /// `resolve_ref_value` (and the executor, via #2300) still take
-    /// `&HashMap<String, HashMap<String, Value>>` — exposing it
-    /// directly avoids both an extra allocation and a public-API change
-    /// in `carina-cli` while #2299 lands. Slated to disappear once
-    /// #2300 threads `&ResolvedBindings` all the way through.
-    pub fn as_map(&self) -> &HashMap<String, HashMap<String, Value>> {
-        &self.attrs
+    /// `resource_attrs` is the resolved DSL attribute map; `state` is
+    /// what the provider just reported. **State wins on key collision** —
+    /// the provider's freshly-returned values (e.g. an auto-assigned
+    /// `id`) are by definition the source of truth for the binding's
+    /// downstream consumers. This is the inverse of `from_resources_with_state`'s
+    /// "DSL wins" pre-apply rule: pre-apply we trust the DSL, post-apply
+    /// we trust the provider.
+    ///
+    /// Replaces the executor's `update_binding_map` helper (#2300).
+    pub fn record_applied(
+        &mut self,
+        binding: Option<&str>,
+        resource_attrs: &HashMap<String, Value>,
+        state: &State,
+    ) {
+        let Some(name) = binding else {
+            return;
+        };
+        let mut merged = resource_attrs.clone();
+        for (k, v) in &state.attributes {
+            merged.insert(k.clone(), v.clone());
+        }
+        self.by_name.insert(
+            name.to_string(),
+            ResolvedBinding {
+                attributes: merged,
+                source: BindingValueSource::Local,
+            },
+        );
+    }
+
+    /// Set a binding directly to the given attribute map and source.
+    /// Replaces any existing entry with the same name.
+    ///
+    /// Used by call sites that already hold a fully-resolved attribute
+    /// map and don't need the `record_applied` state-merge path — for
+    /// example, post-apply state writeback that hydrates bindings
+    /// straight out of `StateFile.resources[].attributes`.
+    ///
+    /// The name is `set` rather than `insert` to avoid sounding like
+    /// `HashMap::insert` (which returns the previous value); this method
+    /// is fire-and-forget.
+    pub fn set(&mut self, name: &str, attrs: HashMap<String, Value>, source: BindingValueSource) {
+        self.by_name.insert(
+            name.to_string(),
+            ResolvedBinding {
+                attributes: attrs,
+                source,
+            },
+        );
     }
 }
 
@@ -560,6 +613,143 @@ mod resolved_bindings_tests {
         assert!(
             attrs.get("id").is_none(),
             "tombstoned state must not contribute attributes",
+        );
+    }
+
+    #[test]
+    fn record_applied_inserts_state_winning_merge() {
+        // Post-apply semantics: the freshly returned `State.attributes`
+        // must override the DSL `resource_attrs` on conflict — the
+        // provider just told us the real value (e.g. an auto-assigned
+        // `id` differs from the placeholder, or `arn` materialises). The
+        // executor relied on this in `update_binding_map`, so the
+        // `ResolvedBindings` API has to preserve it byte-for-byte.
+        let mut resolved = ResolvedBindings::default();
+        let resource_attrs: HashMap<String, Value> = vec![
+            ("name".to_string(), Value::String("vpc-dsl".to_string())),
+            (
+                "cidr_block".to_string(),
+                Value::String("10.0.0.0/16".to_string()),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let state = State {
+            id: ResourceId::new("test.resource", "my-vpc"),
+            identifier: None,
+            exists: true,
+            attributes: vec![
+                // overrides DSL value
+                ("name".to_string(), Value::String("vpc-applied".to_string())),
+                // adds a state-only key
+                ("id".to_string(), Value::String("vpc-abc".to_string())),
+            ]
+            .into_iter()
+            .collect(),
+            dependency_bindings: BTreeSet::new(),
+        };
+
+        resolved.record_applied(Some("vpc"), &resource_attrs, &state);
+
+        let attrs = resolved.get("vpc").expect("vpc binding present");
+        assert_eq!(
+            attrs.get("name"),
+            Some(&Value::String("vpc-applied".to_string())),
+            "state must win over resource_attrs on conflict",
+        );
+        assert_eq!(attrs.get("id"), Some(&Value::String("vpc-abc".to_string())));
+        assert_eq!(
+            attrs.get("cidr_block"),
+            Some(&Value::String("10.0.0.0/16".to_string())),
+        );
+        assert_eq!(resolved.source("vpc"), Some(BindingValueSource::Local));
+    }
+
+    #[test]
+    fn record_applied_with_no_binding_is_a_noop() {
+        let mut resolved = ResolvedBindings::default();
+        let attrs: HashMap<String, Value> = HashMap::new();
+        let state = State {
+            id: ResourceId::new("test.resource", "anon"),
+            identifier: None,
+            exists: true,
+            attributes: HashMap::new(),
+            dependency_bindings: BTreeSet::new(),
+        };
+
+        resolved.record_applied(None, &attrs, &state);
+        assert!(resolved.get("anon").is_none());
+    }
+
+    #[test]
+    fn cloned_view_does_not_share_storage_with_original() {
+        // The phased / replace executor paths snapshot the binding map
+        // for cascade frames: `local_binding_map = binding_snapshot.clone()`.
+        // After #2300 the same pattern relies on `ResolvedBindings: Clone`,
+        // and the clone must be independent so frame-local mutations
+        // don't leak back into the parent snapshot.
+        let resources = vec![make_resource(
+            "vpc",
+            Some("vpc"),
+            vec![("cidr_block", Value::String("10.0.0.0/16".to_string()))],
+        )];
+        let states: HashMap<ResourceId, State> = HashMap::new();
+        let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let parent = ResolvedBindings::from_resources_with_state(&resources, &states, &remote);
+
+        let mut child = parent.clone();
+        let extra_state = State {
+            id: ResourceId::new("test.resource", "subnet"),
+            identifier: None,
+            exists: true,
+            attributes: vec![("id".to_string(), Value::String("subnet-1".to_string()))]
+                .into_iter()
+                .collect(),
+            dependency_bindings: BTreeSet::new(),
+        };
+        child.record_applied(Some("subnet"), &HashMap::new(), &extra_state);
+
+        assert!(child.get("subnet").is_some());
+        assert!(
+            parent.get("subnet").is_none(),
+            "child mutation must not leak into the parent snapshot",
+        );
+    }
+
+    #[test]
+    fn set_replaces_entry_and_records_source() {
+        // `set` is the no-merge counterpart to `record_applied` — used
+        // when the caller already holds a fully-resolved attribute map
+        // (e.g. post-apply state-writeback hydrating exports). Verify
+        // it overwrites any existing entry and records the given source.
+        let mut resolved = ResolvedBindings::default();
+        let initial: HashMap<String, Value> =
+            vec![("kind".to_string(), Value::String("first".to_string()))]
+                .into_iter()
+                .collect();
+        resolved.set("registry", initial, BindingValueSource::Upstream);
+        assert_eq!(
+            resolved.source("registry"),
+            Some(BindingValueSource::Upstream)
+        );
+        assert_eq!(
+            resolved.get("registry").and_then(|a| a.get("kind")),
+            Some(&Value::String("first".to_string()))
+        );
+
+        let replacement: HashMap<String, Value> =
+            vec![("kind".to_string(), Value::String("second".to_string()))]
+                .into_iter()
+                .collect();
+        resolved.set("registry", replacement, BindingValueSource::Local);
+        assert_eq!(
+            resolved.source("registry"),
+            Some(BindingValueSource::Local),
+            "set must replace the source as well as the attributes",
+        );
+        assert_eq!(
+            resolved.get("registry").and_then(|a| a.get("kind")),
+            Some(&Value::String("second".to_string()))
         );
     }
 }

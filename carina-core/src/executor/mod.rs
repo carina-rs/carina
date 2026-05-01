@@ -19,9 +19,10 @@ mod replace;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use crate::binding_index::ResolvedBindings;
 use crate::effect::Effect;
 use crate::provider::Provider;
-use crate::resource::{ResourceId, State, Value};
+use crate::resource::{ResourceId, State};
 
 use parallel::execute_effects_sequential;
 use phased::{execute_effects_phased, has_interdependent_replaces};
@@ -30,7 +31,7 @@ use phased::{execute_effects_phased, has_interdependent_replaces};
 pub struct ExecutionInput<'a> {
     pub plan: &'a crate::plan::Plan,
     pub unresolved_resources: &'a HashMap<ResourceId, crate::resource::Resource>,
-    pub binding_map: HashMap<String, HashMap<String, Value>>,
+    pub bindings: ResolvedBindings,
     pub current_states: HashMap<ResourceId, State>,
 }
 
@@ -120,7 +121,7 @@ pub trait ExecutionObserver: Send + Sync {
 /// Execute a plan by dispatching effects to a provider.
 ///
 /// This function contains the core execution logic, including:
-/// - Reference resolution via binding_map
+/// - Reference resolution via the canonical `ResolvedBindings` view
 /// - 3-phase Replace ordering for interdependent replaces
 /// - Binding map updates after each effect
 /// - Failure propagation (failed_bindings)

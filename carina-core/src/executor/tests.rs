@@ -1,7 +1,7 @@
 use super::*;
 use crate::plan::Plan;
 use crate::provider::{BoxFuture, ProviderError, ProviderResult};
-use crate::resource::{LifecycleConfig, Resource};
+use crate::resource::{LifecycleConfig, Resource, Value};
 use parallel::{build_dependency_levels, build_dependency_map};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -229,7 +229,7 @@ async fn test_simple_create() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        binding_map: HashMap::new(),
+        bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
     };
 
@@ -265,7 +265,7 @@ async fn test_simple_delete() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        binding_map: HashMap::new(),
+        bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
     };
 
@@ -293,7 +293,7 @@ async fn test_failed_effect_propagates_to_dependent() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        binding_map: HashMap::new(),
+        bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
     };
 
@@ -340,7 +340,7 @@ async fn test_cbd_creates_before_deletes() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        binding_map: HashMap::new(),
+        bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
     };
 
@@ -381,7 +381,7 @@ async fn test_dbd_deletes_before_creates() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        binding_map: HashMap::new(),
+        bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
     };
 
@@ -455,7 +455,7 @@ async fn test_phased_cbd_creates_in_forward_order_deletes_in_reverse() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        binding_map: HashMap::new(),
+        bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
     };
 
@@ -528,7 +528,7 @@ async fn test_phased_noncbd_creates_after_deletes() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        binding_map: HashMap::new(),
+        bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
     };
 
@@ -561,7 +561,7 @@ async fn test_observer_events_emitted_correctly() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        binding_map: HashMap::new(),
+        bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
     };
 
@@ -585,7 +585,7 @@ async fn test_read_effect_is_no_op() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        binding_map: HashMap::new(),
+        bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
     };
 
@@ -622,7 +622,7 @@ async fn test_independent_effects_run_in_parallel() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        binding_map: HashMap::new(),
+        bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
     };
 
@@ -669,7 +669,7 @@ async fn test_parallel_failure_skips_dependents() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        binding_map: HashMap::new(),
+        bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
     };
 
@@ -713,7 +713,7 @@ async fn test_dependency_levels_sequential_chain() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        binding_map: HashMap::new(),
+        bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
     };
 
@@ -923,7 +923,7 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        binding_map: HashMap::new(),
+        bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
     };
 
@@ -962,7 +962,7 @@ async fn test_waiting_events_emitted_for_dependent_effects() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        binding_map: HashMap::new(),
+        bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
     };
 
@@ -1120,7 +1120,7 @@ async fn test_update_effect_binding_map_propagation() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        binding_map: HashMap::new(),
+        bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
     };
 
@@ -1224,7 +1224,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        binding_map: HashMap::new(),
+        bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
     };
 
@@ -1418,7 +1418,7 @@ async fn test_delete_waits_for_replace_cbd_of_dependent() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        binding_map: HashMap::new(),
+        bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
     };
 
@@ -1503,7 +1503,7 @@ async fn test_delete_waits_for_replace_cbd_even_when_delete_binding_is_none() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        binding_map: HashMap::new(),
+        bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
     };
 
