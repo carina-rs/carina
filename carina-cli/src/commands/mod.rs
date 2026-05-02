@@ -137,7 +137,7 @@ pub fn validate_and_resolve(
 /// Create a `ProviderContext` with custom type validators extracted from
 /// the already-collected schema map and factory-based validation for WASM providers.
 fn enrich_provider_context(
-    schemas: &std::collections::HashMap<String, carina_core::schema::ResourceSchema>,
+    schemas: &carina_core::schema::SchemaRegistry,
     factories: Arc<Vec<Box<dyn carina_core::provider::ProviderFactory>>>,
 ) -> ProviderContext {
     ProviderContext {
@@ -324,9 +324,6 @@ pub fn validate_and_resolve_errors_with_factories(
             &parsed.export_params,
             &parsed.resources,
             ctx.schemas(),
-            &|r: &carina_core::resource::Resource| {
-                carina_core::provider::schema_key_for_resource(ctx.factories(), r)
-            },
         ) {
             errors.extend(split_validation_message(&msg));
         }
@@ -371,9 +368,6 @@ pub fn validate_and_resolve_errors_with_factories(
             parsed,
             &upstream_exports,
             ctx.schemas(),
-            &|r: &carina_core::resource::Resource| {
-                carina_core::provider::schema_key_for_resource(ctx.factories(), r)
-            },
         );
         // #1894 (option 2): cross-directory `for`-iterable shape check.
         // Surfaces pending `list ↔ map` migrations in the upstream's

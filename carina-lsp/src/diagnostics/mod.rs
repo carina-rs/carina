@@ -15,7 +15,7 @@ use crate::position;
 use carina_core::parser::{ParseError, ParsedFile};
 use carina_core::provider::ProviderFactory;
 use carina_core::resource::Value;
-use carina_core::schema::ResourceSchema;
+use carina_core::schema::{ResourceSchema, SchemaRegistry};
 
 /// Create a `Diagnostic` on a single line with the standard "carina" source.
 pub(crate) fn carina_diagnostic(
@@ -59,7 +59,7 @@ pub(crate) fn carina_diagnostic_range(
 }
 
 pub struct DiagnosticEngine {
-    schemas: Arc<HashMap<String, ResourceSchema>>,
+    schemas: Arc<SchemaRegistry>,
     provider_names: Vec<String>,
     factories: Arc<Vec<Box<dyn ProviderFactory>>>,
     /// Providers that failed to load: name -> error reason.
@@ -70,7 +70,7 @@ pub struct DiagnosticEngine {
 
 impl DiagnosticEngine {
     pub fn new(
-        schemas: Arc<HashMap<String, ResourceSchema>>,
+        schemas: Arc<SchemaRegistry>,
         provider_names: Vec<String>,
         factories: Arc<Vec<Box<dyn ProviderFactory>>>,
     ) -> Self {
@@ -191,14 +191,8 @@ impl DiagnosticEngine {
             // reference-checking helpers below consume a borrow-valued
             // map, so no per-keystroke `ResourceSchema::clone()` is
             // needed.
-            let schema_key_fn = |r: &carina_core::resource::Resource| {
-                format!("{}.{}", r.id.provider, r.id.resource_type)
-            };
-            let binding_index = carina_core::binding_index::BindingIndex::from_parsed(
-                parsed,
-                &self.schemas,
-                &schema_key_fn,
-            );
+            let binding_index =
+                carina_core::binding_index::BindingIndex::from_parsed(parsed, &self.schemas);
             let binding_schema_map = binding_index.schemas_by_name();
 
             // Check resource types — include for-body template resources so
@@ -211,7 +205,7 @@ impl DiagnosticEngine {
                 // anchor on the first top-level `mode =` in the file.
                 let scope = resource_source_range(doc, ctx, provider, &resource.id.resource_type);
 
-                if !self.schemas.contains_key(&full_resource_type) {
+                if self.schemas.get_for(resource).is_none() {
                     let provider_loaded = self.provider_names.contains(&provider.to_string());
 
                     if let Some(reason) = self.provider_errors.get(provider) {
@@ -282,7 +276,7 @@ impl DiagnosticEngine {
                 }
 
                 // Semantic validation using schema
-                let schema = self.schemas.get(&full_resource_type).cloned();
+                let schema = self.schemas.get_for(resource).cloned();
                 if let Some(schema) = &schema {
                     // Check data source without `read` keyword
                     if schema.is_data_source()

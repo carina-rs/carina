@@ -422,7 +422,7 @@ async fn run_state_show(
 
     if tui {
         let plan = build_plan_from_state(&state);
-        carina_tui::run(&plan, &HashMap::new())
+        carina_tui::run(&plan, &carina_core::schema::SchemaRegistry::new())
             .map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
     } else {
         let output = format_state_show(&state);

@@ -51,7 +51,7 @@ impl CompletionProvider {
         };
 
         // Get schema for specific resource type
-        if let Some(schema) = self.schemas.get(resource_type) {
+        if let Some(schema) = self.lookup_schema(resource_type) {
             for attr in schema.attributes.values().filter(|a| !a.read_only) {
                 let detail = attr.description.clone();
                 let required_marker = if attr.required { " (required)" } else { "" };
@@ -129,7 +129,7 @@ impl CompletionProvider {
         // Type-based resource reference completions:
         // Look up the attribute's type from the schema. If it's a Custom type,
         // find bindings whose resource schema has an attribute with the same Custom type name.
-        if let Some(schema) = self.schemas.get(resource_type)
+        if let Some(schema) = self.lookup_schema(resource_type)
             && let Some(attr_schema) = schema.attributes.get(attr_name)
         {
             let target_type_name = Self::extract_custom_type_name(&attr_schema.attr_type);
@@ -144,7 +144,7 @@ impl CompletionProvider {
                     }
                     // Look up the binding's resource schema and find attributes
                     // with matching Custom type name
-                    if let Some(binding_schema) = self.schemas.get(binding_resource_type) {
+                    if let Some(binding_schema) = self.lookup_schema(binding_resource_type) {
                         for binding_attr in binding_schema.attributes.values() {
                             if let Some(binding_type_name) =
                                 Self::extract_custom_type_name(&binding_attr.attr_type)
@@ -195,8 +195,7 @@ impl CompletionProvider {
         // unconditional suggest so the user still gets autocomplete on
         // the bare name.
         let attr_type_for_for_filter = self
-            .schemas
-            .get(resource_type)
+            .lookup_schema(resource_type)
             .and_then(|s| s.attributes.get(attr_name))
             .map(|a| &a.attr_type);
         let for_bindings = super::top_level::extract_for_bindings_in_scope(text, position);
@@ -238,7 +237,7 @@ impl CompletionProvider {
         }
 
         // Look up the attribute type from schema
-        if let Some(schema) = self.schemas.get(resource_type)
+        if let Some(schema) = self.lookup_schema(resource_type)
             && let Some(attr_schema) = schema.attributes.get(attr_name)
         {
             // Struct types: offer `{ }` snippet only, no built-in functions
@@ -350,7 +349,7 @@ impl CompletionProvider {
         edit_range: Range,
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
-        if let Some(schema) = self.schemas.get(binding_resource_type) {
+        if let Some(schema) = self.lookup_schema(binding_resource_type) {
             for attr in schema.attributes.values() {
                 let full_ref = format!("{}.{}", binding_name, attr.name);
                 completions.push(CompletionItem {
@@ -867,7 +866,7 @@ impl CompletionProvider {
             if resource_type.is_empty() {
                 continue;
             }
-            let Some(schema) = self.schemas.get(&resource_type) else {
+            let Some(schema) = self.lookup_schema(&resource_type) else {
                 continue;
             };
             for attr in schema.attributes.values() {
@@ -1079,17 +1078,21 @@ impl CompletionProvider {
             .collect();
 
         // Resource types from schemas
-        let resource = self.schemas.iter().map(move |(resource_type, schema)| {
-            let description = schema
-                .description
-                .as_deref()
-                .unwrap_or("Resource reference");
-            type_completion_item(
-                resource_type.clone(),
-                format!("{} reference", description),
-                replacement_range,
-            )
-        });
+        let resource = self
+            .schemas
+            .iter()
+            .map(move |(provider, resource_type, _kind, schema)| {
+                let key = if provider.is_empty() {
+                    resource_type.to_string()
+                } else {
+                    format!("{}.{}", provider, resource_type)
+                };
+                let description = schema
+                    .description
+                    .as_deref()
+                    .unwrap_or("Resource reference");
+                type_completion_item(key, format!("{} reference", description), replacement_range)
+            });
 
         basic.chain(generic).chain(custom).chain(resource).collect()
     }

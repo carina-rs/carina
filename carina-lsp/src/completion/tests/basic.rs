@@ -1116,10 +1116,10 @@ fn unknown_attribute_fallback_has_no_type_pollution() {
     use carina_core::schema::{AttributeSchema, AttributeType, CompletionValue, ResourceSchema};
     use std::sync::Arc;
 
-    let schema = ResourceSchema::new("test.foo.bar")
+    let schema = ResourceSchema::new("foo.bar")
         .attribute(AttributeSchema::new("known_attr", AttributeType::String));
-    let mut schemas = HashMap::new();
-    schemas.insert("test.foo.bar".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
     let regions = vec![CompletionValue {
         value: "aws.Region.ap_northeast_1".to_string(),
         description: "Tokyo".to_string(),

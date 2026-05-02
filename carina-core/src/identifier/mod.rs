@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::parser::ProviderConfig;
 use crate::resource::{Resource, ResourceId, Value};
-use crate::schema::ResourceSchema;
+use crate::schema::SchemaRegistry;
 use crate::validation::is_string_compatible_type;
 
 /// Generate a random 8-character lowercase hex suffix using UUID v4.
@@ -28,15 +28,12 @@ pub fn generate_random_suffix() -> String {
 /// Errors if both `<attr>_prefix` and `<attr>` are specified, or if prefix is empty.
 pub fn resolve_attr_prefixes(
     resources: &mut [Resource],
-    schemas: &HashMap<String, ResourceSchema>,
-    schema_key_fn: &dyn Fn(&Resource) -> String,
+    registry: &SchemaRegistry,
 ) -> Result<(), String> {
     let mut all_errors = Vec::new();
 
     for resource in resources.iter_mut() {
-        let schema_key = schema_key_fn(resource);
-
-        let schema = match schemas.get(&schema_key) {
+        let schema = match registry.get_for(resource) {
             Some(s) => s,
             None => continue, // Unknown resource type; validate_resources will catch this
         };
@@ -366,8 +363,7 @@ fn compute_resource_simhash(
 pub fn compute_anonymous_identifiers(
     resources: &mut [Resource],
     providers: &[ProviderConfig],
-    schemas: &HashMap<String, ResourceSchema>,
-    schema_key_fn: &dyn Fn(&Resource) -> String,
+    registry: &SchemaRegistry,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
 ) -> Result<(), String> {
     use std::collections::BTreeMap;
@@ -386,9 +382,8 @@ pub fn compute_anonymous_identifiers(
             continue;
         }
         let provider_name = &resource.id.provider;
-        let schema_key = schema_key_fn(resource);
 
-        let Some(schema) = schemas.get(&schema_key) else {
+        let Some(schema) = registry.get_for(resource) else {
             continue;
         };
 
@@ -516,8 +511,7 @@ pub struct AnonymousIdStateInfo {
 /// entries for that resource type with their create-only attribute values.
 pub fn reconcile_anonymous_identifiers(
     resources: &mut [Resource],
-    schemas: &HashMap<String, ResourceSchema>,
-    schema_key_fn: &dyn Fn(&Resource) -> String,
+    registry: &SchemaRegistry,
     find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
 ) {
     for resource in resources.iter_mut() {
@@ -532,8 +526,7 @@ pub fn reconcile_anonymous_identifiers(
             continue;
         }
 
-        let schema_key = schema_key_fn(resource);
-        let Some(schema) = schemas.get(&schema_key) else {
+        let Some(schema) = registry.get_for(resource) else {
             continue;
         };
 
@@ -658,8 +651,7 @@ pub fn reconcile_anonymous_identifiers(
 /// resource (so it would otherwise appear as a Delete in the plan).
 pub fn detect_anonymous_to_named_renames(
     resources: &[Resource],
-    schemas: &HashMap<String, ResourceSchema>,
-    schema_key_fn: &dyn Fn(&Resource) -> String,
+    registry: &SchemaRegistry,
     find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
     providers: &[ProviderConfig],
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
@@ -686,8 +678,7 @@ pub fn detect_anonymous_to_named_renames(
             continue;
         }
 
-        let schema_key = schema_key_fn(resource);
-        let Some(schema) = schemas.get(&schema_key) else {
+        let Some(schema) = registry.get_for(resource) else {
             continue;
         };
 

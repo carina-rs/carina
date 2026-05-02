@@ -1549,16 +1549,16 @@ fn resolve_block_names_renames_key() {
         r
     }];
 
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "ec2.ipam".to_string(),
+        "",
         ResourceSchema::new("ec2.ipam").attribute(
             AttributeSchema::new("operating_regions", AttributeType::String)
                 .with_block_name("operating_region"),
         ),
     );
 
-    resolve_block_names(&mut resources, &schemas, |r| r.id.resource_type.clone()).unwrap();
+    resolve_block_names(&mut resources, &schemas).unwrap();
 
     assert!(resources[0].attributes.contains_key("operating_regions"));
     assert!(!resources[0].attributes.contains_key("operating_region"));
@@ -1572,14 +1572,14 @@ fn resolve_block_names_noop_when_no_match() {
         r
     }];
 
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "ec2.ipam".to_string(),
+        "",
         ResourceSchema::new("ec2.ipam")
             .attribute(AttributeSchema::new("name", AttributeType::String)),
     );
 
-    resolve_block_names(&mut resources, &schemas, |r| r.id.resource_type.clone()).unwrap();
+    resolve_block_names(&mut resources, &schemas).unwrap();
 
     assert!(resources[0].attributes.contains_key("name"));
 }
@@ -1615,16 +1615,16 @@ fn resolve_block_names_errors_on_mixed_syntax() {
         r
     }];
 
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "ec2.ipam".to_string(),
+        "",
         ResourceSchema::new("ec2.ipam").attribute(
             AttributeSchema::new("operating_regions", AttributeType::String)
                 .with_block_name("operating_region"),
         ),
     );
 
-    let result = resolve_block_names(&mut resources, &schemas, |r| r.id.resource_type.clone());
+    let result = resolve_block_names(&mut resources, &schemas);
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.contains("operating_region"));
@@ -1642,10 +1642,10 @@ fn resolve_block_names_skips_unknown_schema() {
         r
     }];
 
-    let schemas = HashMap::new();
+    let schemas = SchemaRegistry::new();
 
     // Should not error for unknown resource types
-    resolve_block_names(&mut resources, &schemas, |r| r.id.resource_type.clone()).unwrap();
+    resolve_block_names(&mut resources, &schemas).unwrap();
 
     // Key should remain unchanged
     assert!(resources[0].attributes.contains_key("operating_region"));
@@ -1687,9 +1687,9 @@ fn resolve_block_names_nested_struct() {
         r
     }];
 
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "s3.Bucket".to_string(),
+        "",
         ResourceSchema::new("s3.Bucket").attribute(AttributeSchema::new(
             "lifecycle_configuration",
             AttributeType::Struct {
@@ -1708,7 +1708,7 @@ fn resolve_block_names_nested_struct() {
         )),
     );
 
-    resolve_block_names(&mut resources, &schemas, |r| r.id.resource_type.clone()).unwrap();
+    resolve_block_names(&mut resources, &schemas).unwrap();
 
     // The nested "transition" key should be renamed to "transitions"
     let lifecycle = match resources[0].get_attr("lifecycle_configuration") {
@@ -1752,9 +1752,9 @@ fn resolve_block_names_singular_field_not_renamed_when_assigned() {
         r
     }];
 
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "s3.Bucket".to_string(),
+        "",
         ResourceSchema::new("s3.Bucket").attribute(AttributeSchema::new(
             "lifecycle_configuration",
             AttributeType::Struct {
@@ -1780,7 +1780,7 @@ fn resolve_block_names_singular_field_not_renamed_when_assigned() {
         )),
     );
 
-    resolve_block_names(&mut resources, &schemas, |r| r.id.resource_type.clone()).unwrap();
+    resolve_block_names(&mut resources, &schemas).unwrap();
 
     let lifecycle = match resources[0].get_attr("lifecycle_configuration") {
         Some(Value::Map(m)) => m,
@@ -1821,9 +1821,9 @@ fn resolve_block_names_block_syntax_renamed_when_singular_field_exists() {
         r
     }];
 
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "s3.Bucket".to_string(),
+        "",
         ResourceSchema::new("s3.Bucket").attribute(AttributeSchema::new(
             "lifecycle_configuration",
             AttributeType::Struct {
@@ -1849,7 +1849,7 @@ fn resolve_block_names_block_syntax_renamed_when_singular_field_exists() {
         )),
     );
 
-    resolve_block_names(&mut resources, &schemas, |r| r.id.resource_type.clone()).unwrap();
+    resolve_block_names(&mut resources, &schemas).unwrap();
 
     let lifecycle = match resources[0].get_attr("lifecycle_configuration") {
         Some(Value::Map(m)) => m,
@@ -1885,9 +1885,9 @@ fn resolve_block_names_same_block_and_canonical_name() {
         r
     }];
 
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "ec2.SecurityGroup".to_string(),
+        "",
         ResourceSchema::new("ec2.SecurityGroup").attribute(
             AttributeSchema::new(
                 "ingress",
@@ -1901,7 +1901,7 @@ fn resolve_block_names_same_block_and_canonical_name() {
     );
 
     // Should succeed without errors (block_name == canonical name, no rename needed)
-    resolve_block_names(&mut resources, &schemas, |r| r.id.resource_type.clone()).unwrap();
+    resolve_block_names(&mut resources, &schemas).unwrap();
 
     // Key should remain as "ingress"
     assert!(resources[0].attributes.contains_key("ingress"));
@@ -1938,9 +1938,9 @@ fn resolve_block_names_same_block_and_canonical_name_multiple_items() {
         r
     }];
 
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "ec2.SecurityGroup".to_string(),
+        "",
         ResourceSchema::new("ec2.SecurityGroup").attribute(
             AttributeSchema::new(
                 "ingress",
@@ -1954,7 +1954,7 @@ fn resolve_block_names_same_block_and_canonical_name_multiple_items() {
     );
 
     // Should succeed; block_name == canonical name means no conflict possible
-    resolve_block_names(&mut resources, &schemas, |r| r.id.resource_type.clone()).unwrap();
+    resolve_block_names(&mut resources, &schemas).unwrap();
 
     assert!(resources[0].attributes.contains_key("ingress"));
     match resources[0].get_attr("ingress") {
@@ -1984,9 +1984,9 @@ fn resolve_block_names_nested_same_block_and_canonical_name() {
         r
     }];
 
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "test.resource".to_string(),
+        "",
         ResourceSchema::new("test.resource").attribute(AttributeSchema::new(
             "config",
             AttributeType::Struct {
@@ -2009,7 +2009,7 @@ fn resolve_block_names_nested_same_block_and_canonical_name() {
     );
 
     // Should succeed without errors
-    resolve_block_names(&mut resources, &schemas, |r| r.id.resource_type.clone()).unwrap();
+    resolve_block_names(&mut resources, &schemas).unwrap();
 
     let config = match resources[0].get_attr("config") {
         Some(Value::Map(m)) => m,
@@ -3233,4 +3233,71 @@ fn custom_validator_returns_structured_type_error_directly() {
         }
         other => panic!("expected InvalidEnumVariant, got: {other:?}"),
     }
+}
+
+// --- SchemaRegistry tests (#2328) ---
+
+#[test]
+fn schema_registry_new_is_empty() {
+    let registry = SchemaRegistry::new();
+    assert_eq!(registry.len(), 0);
+    assert!(registry.is_empty());
+}
+
+#[test]
+fn schema_registry_inserts_managed_and_data_source_for_same_type() {
+    let mut registry = SchemaRegistry::new();
+    let managed = ResourceSchema::new("s3.Bucket");
+    let data_source = ResourceSchema::new("s3.Bucket").as_data_source();
+
+    registry.insert("aws", managed);
+    registry.insert("aws", data_source);
+
+    assert_eq!(registry.len(), 2);
+    assert!(registry.has_managed("aws", "s3.Bucket"));
+    assert!(registry.has_data_source("aws", "s3.Bucket"));
+}
+
+#[test]
+fn schema_registry_get_picks_kind_from_resource() {
+    use crate::resource::Resource;
+
+    let mut registry = SchemaRegistry::new();
+    registry.insert("aws", ResourceSchema::new("s3.Bucket"));
+    registry.insert("aws", ResourceSchema::new("s3.Bucket").as_data_source());
+
+    let managed_res = Resource::with_provider("aws", "s3.Bucket", "new");
+    let data_res = Resource::with_provider("aws", "s3.Bucket", "existing")
+        .with_kind(crate::resource::ResourceKind::DataSource);
+
+    let m = registry
+        .get_for(&managed_res)
+        .expect("managed schema present");
+    assert_eq!(m.kind, SchemaKind::Managed);
+
+    let d = registry
+        .get_for(&data_res)
+        .expect("data source schema present");
+    assert_eq!(d.kind, SchemaKind::DataSource);
+}
+
+#[test]
+fn schema_registry_missing_returns_none() {
+    let registry = SchemaRegistry::new();
+    assert!(
+        registry
+            .get("aws", "s3.Bucket", SchemaKind::Managed)
+            .is_none()
+    );
+    assert!(!registry.has_managed("aws", "s3.Bucket"));
+    assert!(!registry.has_data_source("aws", "s3.Bucket"));
+}
+
+#[test]
+fn schema_registry_has_managed_only_does_not_imply_data_source() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert("aws", ResourceSchema::new("s3.Bucket"));
+
+    assert!(registry.has_managed("aws", "s3.Bucket"));
+    assert!(!registry.has_data_source("aws", "s3.Bucket"));
 }

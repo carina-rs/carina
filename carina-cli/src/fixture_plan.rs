@@ -13,7 +13,7 @@ use carina_core::differ::{cascade_dependent_updates, create_plan};
 use carina_core::plan::Plan;
 use carina_core::resolver::resolve_refs_with_state_and_remote;
 use carina_core::resource::{ResourceId, State, Value};
-use carina_core::schema::ResourceSchema;
+use carina_core::schema::SchemaRegistry;
 use carina_state::{StateFile, check_and_migrate};
 
 use crate::commands::validate_and_resolve;
@@ -30,7 +30,7 @@ const FIXTURE_SUBPATH: &str = "tests/fixtures/plan_display";
 pub struct FixturePlan {
     pub plan: Plan,
     pub current_states: HashMap<ResourceId, State>,
-    pub schemas: HashMap<String, ResourceSchema>,
+    pub schemas: SchemaRegistry,
     pub moved_origins: HashMap<ResourceId, ResourceId>,
     pub deferred_for_expressions: Vec<carina_core::parser::DeferredForExpression>,
     pub export_params: Vec<carina_core::parser::ExportParameter>,

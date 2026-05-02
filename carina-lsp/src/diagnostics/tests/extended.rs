@@ -271,11 +271,11 @@ fn list_item_type_validation() {
         to_dsl: None,
     });
 
-    let schema = ResourceSchema::new("test.list.resource")
+    let schema = ResourceSchema::new("list.resource")
         .attribute(AttributeSchema::new("protocols", list_enum));
 
-    let mut schemas = HashMap::new();
-    schemas.insert("test.list.resource".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
 
     let engine = DiagnosticEngine::new(
         Arc::new(schemas),
@@ -355,8 +355,8 @@ fn union_static_value_validated() {
             ]),
         ));
 
-    let mut schemas = HashMap::new();
-    schemas.insert("test.test.resource".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
 
     let engine = custom_engine(schemas);
     let doc = create_document(
@@ -408,8 +408,8 @@ fn union_valid_static_value_no_warning() {
             ]),
         ));
 
-    let mut schemas = HashMap::new();
-    schemas.insert("test.test.resource".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
 
     let engine = custom_engine(schemas);
     let doc = create_document(
@@ -454,8 +454,8 @@ fn union_valid_int_value_no_warning() {
             ]),
         ));
 
-    let mut schemas = HashMap::new();
-    schemas.insert("test.test.resource".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
 
     let engine = custom_engine(schemas);
     let doc = create_document(
@@ -1292,7 +1292,7 @@ fn resource_ref_type_check_helper_regression() {
     }
 
     // Source resource: has a String attribute "name" and a Custom "my_id"
-    let source_schema = ResourceSchema::new("test.source")
+    let source_schema = ResourceSchema::new("source")
         .attribute(AttributeSchema::new("name", AttributeType::String))
         .attribute(AttributeSchema::new(
             "my_id",
@@ -1308,7 +1308,7 @@ fn resource_ref_type_check_helper_regression() {
         ));
 
     // Target resource: has Union, StringEnum, and Custom attributes
-    let target_schema = ResourceSchema::new("test.target")
+    let target_schema = ResourceSchema::new("target")
         .attribute(AttributeSchema::new(
             "union_attr",
             AttributeType::Union(vec![AttributeType::Int, AttributeType::Bool]),
@@ -1335,9 +1335,9 @@ fn resource_ref_type_check_helper_regression() {
             },
         ));
 
-    let mut schemas = HashMap::new();
-    schemas.insert("test.source".to_string(), source_schema);
-    schemas.insert("test.target".to_string(), target_schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", source_schema);
+    schemas.insert("test", target_schema);
     let engine = custom_engine(schemas);
 
     // Case 1: Union attr with incompatible ResourceRef (MyId != Int|Bool) -> mismatch
@@ -1449,9 +1449,8 @@ attributes {
 #[test]
 fn resource_validation_failed_with_attribute_points_to_attribute_line() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeError};
-    use std::collections::HashMap;
 
-    let schema = ResourceSchema::new("mock.test.resource")
+    let schema = ResourceSchema::new("test.resource")
         .attribute(AttributeSchema::new("name", AttributeType::String).required())
         .attribute(AttributeSchema::new(
             "tags",
@@ -1471,8 +1470,8 @@ fn resource_validation_failed_with_attribute_points_to_attribute_line() {
             Ok(())
         });
 
-    let mut schemas = HashMap::new();
-    schemas.insert("mock.test.resource".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("mock", schema);
     let engine = custom_engine(schemas);
 
     let doc = create_document(
@@ -1503,7 +1502,7 @@ fn warning_when_provider_loaded_but_schema_missing() {
     // Provider is loaded but doesn't have a schema for this resource type.
     // Should show WARNING (not ERROR), not "Unknown resource type".
     let engine = DiagnosticEngine::new(
-        Arc::new(HashMap::new()),
+        Arc::new(SchemaRegistry::new()),
         vec!["awscc".to_string()],
         Arc::new(vec![]),
     );
@@ -1545,7 +1544,7 @@ fn error_when_provider_not_loaded_at_all() {
     // Message should point at the missing download, not a generic "Unknown
     // resource type" (which misleads the user into searching for typos in a
     // name that is actually correct — see issue #2005).
-    let engine = DiagnosticEngine::new(Arc::new(HashMap::new()), vec![], Arc::new(vec![]));
+    let engine = DiagnosticEngine::new(Arc::new(SchemaRegistry::new()), vec![], Arc::new(vec![]));
     let doc = create_document(
         r#"awscc.iam.role {
   role_name = 'test'
@@ -1585,7 +1584,7 @@ fn no_undefined_resource_for_namespaced_enum_value() {
     // provider_names includes "awscc", so awscc.xxx.yyy.EnumType.VALUE
     // should NOT be flagged as "Undefined resource"
     let engine = DiagnosticEngine::new(
-        Arc::new(HashMap::new()),
+        Arc::new(SchemaRegistry::new()),
         vec!["awscc".to_string()],
         Arc::new(vec![]),
     );
@@ -1617,7 +1616,7 @@ fn no_undefined_resource_for_declared_but_uninstalled_provider() {
     // awscc = aws...'` — which is both wrong (awscc is a namespace, not a let
     // binding) and actively misleading (following the fix breaks valid DSL).
     let engine = DiagnosticEngine::new(
-        Arc::new(HashMap::new()),
+        Arc::new(SchemaRegistry::new()),
         vec![], // nothing installed — simulates missing .carina/
         Arc::new(vec![]),
     );
@@ -1646,7 +1645,7 @@ fn undefined_resource_still_fires_when_identifier_is_not_a_declared_provider() {
     // binding diagnostics. When the root identifier is not a declared provider
     // and not a defined binding, the existing "Undefined resource" message
     // should still fire.
-    let engine = DiagnosticEngine::new(Arc::new(HashMap::new()), vec![], Arc::new(vec![]));
+    let engine = DiagnosticEngine::new(Arc::new(SchemaRegistry::new()), vec![], Arc::new(vec![]));
     let doc = create_document(
         r#"provider awscc {
   region = totally_unknown.some_attr
@@ -1698,8 +1697,8 @@ fn map_key_validation_warns_on_invalid_key() {
         },
     ));
 
-    let mut schemas = HashMap::new();
-    schemas.insert("test.test.resource".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
 
     let engine = DiagnosticEngine::new(
         Arc::new(schemas),
@@ -1754,19 +1753,21 @@ fn distinct_semantic_customs_are_rejected() {
         }
     }
 
-    // Source resource: has an AwsAccountId attribute
-    let source_schema = ResourceSchema::new("sts.caller_identity").attribute(AttributeSchema::new(
-        "account_id",
-        AttributeType::Custom {
-            semantic_name: Some("AwsAccountId".to_string()),
-            base: Box::new(AttributeType::String),
-            pattern: None,
-            length: None,
-            validate: legacy_validator(validate_account_id),
-            namespace: Some("aws".to_string()),
-            to_dsl: None,
-        },
-    ));
+    // Source resource: data source with an AwsAccountId attribute
+    let source_schema = ResourceSchema::new("sts.caller_identity")
+        .as_data_source()
+        .attribute(AttributeSchema::new(
+            "account_id",
+            AttributeType::Custom {
+                semantic_name: Some("AwsAccountId".to_string()),
+                base: Box::new(AttributeType::String),
+                pattern: None,
+                length: None,
+                validate: legacy_validator(validate_account_id),
+                namespace: Some("aws".to_string()),
+                to_dsl: None,
+            },
+        ));
 
     // Target resource: has a TargetId attribute (also String-based Custom)
     let target_schema = ResourceSchema::new("sso.Assignment").attribute(AttributeSchema::new(
@@ -1782,9 +1783,9 @@ fn distinct_semantic_customs_are_rejected() {
         },
     ));
 
-    let mut schemas = HashMap::new();
-    schemas.insert("aws.sts.caller_identity".to_string(), source_schema);
-    schemas.insert("awscc.sso.Assignment".to_string(), target_schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("aws", source_schema);
+    schemas.insert("awscc", target_schema);
     let engine = custom_engine(schemas);
 
     let doc = create_document(
@@ -1813,7 +1814,6 @@ fn exports_cross_file_ref_no_false_positive() {
     // skip these dot-notation strings to avoid false positives.
     use carina_core::resource::Value;
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
-    use std::collections::HashMap;
 
     let aws_account_id_type = AttributeType::Custom {
         semantic_name: Some("AwsAccountId".to_string()),
@@ -1831,11 +1831,10 @@ fn exports_cross_file_ref_no_false_positive() {
         namespace: None,
         to_dsl: None,
     };
-    let schema = ResourceSchema::new("awscc.organizations.account")
+    let schema = ResourceSchema::new("organizations.account")
         .attribute(AttributeSchema::new("account_id", aws_account_id_type));
-    let schemas: HashMap<String, ResourceSchema> = vec![(schema.resource_type.clone(), schema)]
-        .into_iter()
-        .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
     let engine = custom_engine(schemas);
 
     // exports.crn parsed alone: "registry_prod.account_id" stays as String
@@ -1896,13 +1895,11 @@ fn exports_type_warning_survives_formatter_round_trip() {
 fn exports_ref_type_warning_survives_formatter_round_trip() {
     use carina_core::formatter::{FormatConfig, format};
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
-    use std::collections::HashMap;
 
-    let schema = ResourceSchema::new("test.sample.resource")
+    let schema = ResourceSchema::new("sample.resource")
         .attribute(AttributeSchema::new("enabled", AttributeType::Bool));
-    let schemas: HashMap<String, ResourceSchema> = vec![(schema.resource_type.clone(), schema)]
-        .into_iter()
-        .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
     let engine = custom_engine(schemas);
 
     let original = r#"let item = test.sample.resource {
@@ -1944,13 +1941,11 @@ exports {
 fn exports_ref_type_warning_survives_document_reparse_after_format_edit() {
     use carina_core::formatter::{FormatConfig, format};
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
-    use std::collections::HashMap;
 
-    let schema = ResourceSchema::new("test.sample.resource")
+    let schema = ResourceSchema::new("sample.resource")
         .attribute(AttributeSchema::new("enabled", AttributeType::Bool));
-    let schemas: HashMap<String, ResourceSchema> = vec![(schema.resource_type.clone(), schema)]
-        .into_iter()
-        .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
     let engine = custom_engine(schemas);
 
     let original = r#"let item = test.sample.resource {
@@ -2083,14 +2078,12 @@ fn exports_type_warning_multiline_vs_oneline() {
 #[test]
 fn exports_map_type_warning_for_cross_file_ref() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
-    use std::collections::HashMap;
 
     // Schema: registry_prod.account_id is String — incompatible with map(bool)
-    let schema = ResourceSchema::new("awscc.organizations.account")
+    let schema = ResourceSchema::new("organizations.account")
         .attribute(AttributeSchema::new("account_id", AttributeType::String));
-    let schemas: HashMap<String, ResourceSchema> = vec![(schema.resource_type.clone(), schema)]
-        .into_iter()
-        .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
     let engine = custom_engine(schemas);
 
     let tmp = tempfile::tempdir().unwrap();
@@ -2119,7 +2112,7 @@ fn exports_map_type_warning_for_cross_file_ref() {
 #[test]
 fn no_undefined_resource_for_sibling_binding_in_exports() {
     let engine = DiagnosticEngine::new(
-        Arc::new(HashMap::new()),
+        Arc::new(SchemaRegistry::new()),
         vec!["awscc".to_string()],
         Arc::new(vec![]),
     );
@@ -3149,14 +3142,12 @@ fn unreferenced_binding_is_still_flagged_unused() {
 #[test]
 fn exports_type_check_resolves_resource_binding_from_sibling_file() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
-    use std::collections::HashMap as StdHashMap;
 
     // Schema: registry_prod.account_id is String.
-    let schema = ResourceSchema::new("awscc.organizations.account")
+    let schema = ResourceSchema::new("organizations.account")
         .attribute(AttributeSchema::new("account_id", AttributeType::String));
-    let schemas: StdHashMap<String, ResourceSchema> = vec![(schema.resource_type.clone(), schema)]
-        .into_iter()
-        .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
     let engine = custom_engine(schemas);
 
     let tmp = tempfile::tempdir().unwrap();

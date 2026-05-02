@@ -15,10 +15,8 @@
 
 mod support;
 
-use std::collections::HashMap;
-
 use carina_core::schema::{
-    AttributeSchema, AttributeType, ResourceSchema, StructField, legacy_validator,
+    AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField, legacy_validator,
 };
 use support::fixture::{analyze, engine_with_schemas, single_schema_map, write_fixture};
 
@@ -40,7 +38,7 @@ fn messages_of(diags: &[tower_lsp::lsp_types::Diagnostic]) -> Vec<&String> {
 // Scenario 1: StringEnum with bare / TypeQualified / fully-qualified
 // ---------------------------------------------------------------
 
-fn enum_schemas() -> HashMap<String, ResourceSchema> {
+fn enum_schemas() -> SchemaRegistry {
     let mode = AttributeType::StringEnum {
         name: "Mode".to_string(),
         values: vec!["fast".to_string(), "slow".to_string()],
@@ -48,7 +46,7 @@ fn enum_schemas() -> HashMap<String, ResourceSchema> {
         to_dsl: None,
     };
     single_schema_map(
-        ResourceSchema::new("test.r.mode_holder")
+        ResourceSchema::new("r.mode_holder")
             .attribute(AttributeSchema::new("name", AttributeType::String))
             .attribute(AttributeSchema::new("mode", mode)),
     )
@@ -109,7 +107,7 @@ test.r.mode_holder {
 // Scenario 2: Custom type with `to_dsl` normalization (Region-like)
 // ---------------------------------------------------------------
 
-fn region_schemas() -> HashMap<String, ResourceSchema> {
+fn region_schemas() -> SchemaRegistry {
     // Mirrors the production `aws_region()` shape (#2248): the `Custom`
     // validate path does **not** consult the schema-level `to_dsl`
     // callback — only `StringEnum` validation does, for alias matching.
@@ -145,7 +143,7 @@ fn region_schemas() -> HashMap<String, ResourceSchema> {
     };
 
     single_schema_map(
-        ResourceSchema::new("test.r.region_holder")
+        ResourceSchema::new("r.region_holder")
             .attribute(AttributeSchema::new("name", AttributeType::String))
             .attribute(AttributeSchema::new("region", region_custom)),
     )
@@ -244,7 +242,7 @@ test.r.region_holder {
 // warning and short-circuit the type-check.
 // ---------------------------------------------------------------
 
-fn nested_struct_schemas() -> HashMap<String, ResourceSchema> {
+fn nested_struct_schemas() -> SchemaRegistry {
     // Single Struct holding another single Struct — keeps the fixture in
     // block syntax (no list literals) so the test exercises only the
     // nested-Struct type-check path, not the prefer-block-syntax warning.
@@ -261,7 +259,7 @@ fn nested_struct_schemas() -> HashMap<String, ResourceSchema> {
     };
 
     single_schema_map(
-        ResourceSchema::new("test.r.nested")
+        ResourceSchema::new("r.nested")
             .attribute(AttributeSchema::new("name", AttributeType::String))
             .attribute(AttributeSchema::new("outer", outer)),
     )
@@ -298,10 +296,10 @@ test.r.nested {
 // Scenario 4: Union with multiple member candidates
 // ---------------------------------------------------------------
 
-fn union_schemas() -> HashMap<String, ResourceSchema> {
+fn union_schemas() -> SchemaRegistry {
     let union = AttributeType::Union(vec![AttributeType::Int, AttributeType::String]);
     single_schema_map(
-        ResourceSchema::new("test.r.union")
+        ResourceSchema::new("r.union")
             .attribute(AttributeSchema::new("name", AttributeType::String))
             .attribute(AttributeSchema::new("value", union)),
     )
@@ -361,20 +359,20 @@ test.r.union {
 // Scenario 5: ResourceRef pointing to a binding declared in a sibling file
 // ---------------------------------------------------------------
 
-fn resource_ref_schemas() -> HashMap<String, ResourceSchema> {
+fn resource_ref_schemas() -> SchemaRegistry {
     // Producer: declares a `name` and an `id` attribute marked read-only
     // (provider-computed). Consumers reference it via `<binding>.id`.
-    let producer = ResourceSchema::new("test.r.producer")
+    let producer = ResourceSchema::new("r.producer")
         .attribute(AttributeSchema::new("name", AttributeType::String))
         .attribute(AttributeSchema::new("id", AttributeType::String).read_only());
 
     // Consumer: takes a string `target_id`. The fixture below feeds it the
     // producer's computed `id` via a ResourceRef declared in a sibling file.
-    let consumer = ResourceSchema::new("test.r.consumer")
+    let consumer = ResourceSchema::new("r.consumer")
         .attribute(AttributeSchema::new("name", AttributeType::String))
         .attribute(AttributeSchema::new("target_id", AttributeType::String));
 
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(producer.resource_type.clone(), producer);
     schemas.insert(consumer.resource_type.clone(), consumer);
     schemas
@@ -422,7 +420,7 @@ let upstream = test.r.producer {
 #[test]
 fn unknown_attribute_emits_suggestion() {
     let engine = engine_with_schemas(single_schema_map(
-        ResourceSchema::new("test.r.suggester")
+        ResourceSchema::new("r.suggester")
             .attribute(AttributeSchema::new("name", AttributeType::String))
             .attribute(AttributeSchema::new("description", AttributeType::String)),
     ));
@@ -458,7 +456,7 @@ test.r.suggester {
 // to pin.
 // ---------------------------------------------------------------
 
-fn list_struct_schemas() -> HashMap<String, ResourceSchema> {
+fn list_struct_schemas() -> SchemaRegistry {
     let inner = AttributeType::Struct {
         name: "Inner".to_string(),
         fields: vec![StructField::new("leaf", AttributeType::Int)],
@@ -472,7 +470,7 @@ fn list_struct_schemas() -> HashMap<String, ResourceSchema> {
     });
 
     single_schema_map(
-        ResourceSchema::new("test.r.list_nested")
+        ResourceSchema::new("r.list_nested")
             .attribute(AttributeSchema::new("name", AttributeType::String))
             .attribute(AttributeSchema::new("outer", outer).with_block_name("outer")),
     )
@@ -522,14 +520,14 @@ test.r.list_nested {
 // repeated `rule { ... }` blocks). The single-schema-shape test above
 // would silently pass even if the LSP forgot to honour the rename, so a
 // dedicated case is needed.
-fn list_struct_renamed_block_schemas() -> HashMap<String, ResourceSchema> {
+fn list_struct_renamed_block_schemas() -> SchemaRegistry {
     let rule = AttributeType::list(AttributeType::Struct {
         name: "Rule".to_string(),
         fields: vec![StructField::new("days", AttributeType::Int)],
     });
 
     single_schema_map(
-        ResourceSchema::new("test.r.renamed_block")
+        ResourceSchema::new("r.renamed_block")
             .attribute(AttributeSchema::new("name", AttributeType::String))
             .attribute(AttributeSchema::new("rules", rule).with_block_name("rule")),
     )

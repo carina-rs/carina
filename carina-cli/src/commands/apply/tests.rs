@@ -1,5 +1,5 @@
 use super::*;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 use std::time::Duration;
 
 #[test]
@@ -8,12 +8,12 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
     // but the buggy code used resource.id.resource_type (e.g., "ec2.Vpc") for lookup.
     // This test verifies that write-only attributes are found when the schema key
     // includes the provider prefix.
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     let schema = ResourceSchema::new("ec2.Vpc")
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
         .attribute(AttributeSchema::new("ipv4_netmask_length", AttributeType::Int).write_only());
     // Schema is registered with provider-prefixed key
-    schemas.insert("awscc.ec2.Vpc".to_string(), schema);
+    schemas.insert("awscc", schema);
 
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc");
     resource.set_attr(
@@ -75,7 +75,7 @@ fn build_state_after_apply_preserves_block_name_attribute() {
     // This is the scenario in issue #1499 (iam_role/with_policy).
     use carina_core::schema::StructField;
 
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     let schema = ResourceSchema::new("iam.role")
         .attribute(AttributeSchema::new("role_name", AttributeType::String).create_only())
         .attribute(
@@ -91,7 +91,7 @@ fn build_state_after_apply_preserves_block_name_attribute() {
             )
             .with_block_name("policy"),
         );
-    schemas.insert("awscc.iam.role".to_string(), schema);
+    schemas.insert("awscc", schema);
 
     // Resource with resolved block name (policy -> policies)
     let mut resource = Resource::with_provider("awscc", "iam.role", "test-role");
@@ -301,7 +301,7 @@ fn block_name_attribute_state_roundtrip() {
     // from issue #1499.
     use carina_core::schema::StructField;
 
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     let schema = ResourceSchema::new("ec2.ipam")
         .attribute(
             AttributeSchema::new(
@@ -314,7 +314,7 @@ fn block_name_attribute_state_roundtrip() {
             .with_block_name("operating_region"),
         )
         .attribute(AttributeSchema::new("description", AttributeType::String));
-    schemas.insert("awscc.ec2.ipam".to_string(), schema);
+    schemas.insert("awscc", schema);
 
     // Resource with resolved block name
     let mut resource = Resource::with_provider("awscc", "ec2.ipam", "test-ipam");

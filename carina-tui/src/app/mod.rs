@@ -9,7 +9,7 @@ use carina_core::plan_tree::{
     build_dependency_graph, build_single_parent_tree, extract_compact_hint,
 };
 use carina_core::resource::ResourceId;
-use carina_core::schema::ResourceSchema;
+use carina_core::schema::SchemaRegistry;
 use ratatui::widgets::ListState;
 
 /// A node in the tree view representing one effect
@@ -93,7 +93,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(plan: &Plan, schemas: &HashMap<String, ResourceSchema>) -> Self {
+    pub fn new(plan: &Plan, schemas: &SchemaRegistry) -> Self {
         let schemas_opt = if schemas.is_empty() {
             None
         } else {
@@ -685,7 +685,7 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
     }
 }
 
-fn effect_to_node(effect: &Effect, schemas: Option<&HashMap<String, ResourceSchema>>) -> TreeNode {
+fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode {
     let detail_rows = build_detail_rows(effect, schemas, DetailLevel::Full, None);
 
     match effect {

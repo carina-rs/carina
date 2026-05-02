@@ -65,7 +65,7 @@ fn cascade_dependent_updates_adds_update_for_dependent() {
     });
 
     // Apply cascade
-    let schemas = HashMap::new();
+    let schemas = SchemaRegistry::new();
     cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
 
     // Verify the Replace effect now has a cascading update for the subnet
@@ -157,7 +157,7 @@ fn cascade_skips_resources_already_in_plan() {
         changed_attributes: vec!["cidr_block".to_string()],
     });
 
-    let schemas = HashMap::new();
+    let schemas = SchemaRegistry::new();
     cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
 
     // The Replace should have NO cascading updates since subnet already has an Update
@@ -216,7 +216,7 @@ fn cascade_no_op_without_create_before_destroy() {
         cascade_ref_hints: vec![],
     });
 
-    let schemas = HashMap::new();
+    let schemas = SchemaRegistry::new();
     cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
 
     if let Effect::Replace {
@@ -302,7 +302,7 @@ fn cascade_transitive_dependencies() {
         cascade_ref_hints: vec![],
     });
 
-    let schemas = HashMap::new();
+    let schemas = SchemaRegistry::new();
     cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
 
     // Only subnet directly depends on VPC, so only subnet gets cascading update
@@ -372,7 +372,7 @@ fn cascade_anonymous_resource_dependent() {
         cascade_ref_hints: vec![],
     });
 
-    let schemas = HashMap::new();
+    let schemas = SchemaRegistry::new();
     cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
 
     if let Effect::Replace {
@@ -451,8 +451,8 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
         )
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String).required());
 
-    let mut schemas = HashMap::new();
-    schemas.insert("ec2.Subnet".to_string(), subnet_schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("", subnet_schema);
 
     // Build a plan with Replace for VPC (create_before_destroy)
     let mut plan = Plan::new();
@@ -605,8 +605,8 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
         )
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String).required());
 
-    let mut schemas = HashMap::new();
-    schemas.insert("ec2.Subnet".to_string(), subnet_schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("", subnet_schema);
 
     // Build a plan:
     // - VPC Replace (create_before_destroy) due to cidr_block change
@@ -739,9 +739,9 @@ fn auto_detect_create_before_destroy_when_resource_has_dependents() {
         )
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String).required());
 
-    let mut schemas = HashMap::new();
-    schemas.insert("ec2.Vpc".to_string(), vpc_schema);
-    schemas.insert("ec2.Subnet".to_string(), subnet_schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("", vpc_schema);
+    schemas.insert("", subnet_schema);
 
     // Build a plan with Replace for VPC using DEFAULT lifecycle (no explicit CBD)
     let mut plan = Plan::new();
@@ -845,8 +845,8 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
         .attribute(AttributeSchema::new("tags", AttributeType::String))
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String).required());
 
-    let mut schemas = HashMap::new();
-    schemas.insert("ec2.Subnet".to_string(), subnet_schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("", subnet_schema);
 
     // Build a plan:
     // - VPC Replace (create_before_destroy) due to cidr_block change
@@ -960,8 +960,8 @@ fn cascade_prevent_destroy_blocks_promotion_to_replace() {
         )
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String).required());
 
-    let mut schemas = HashMap::new();
-    schemas.insert("ec2.Subnet".to_string(), subnet_schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("", subnet_schema);
 
     // Build a plan with Replace for VPC (create_before_destroy)
     let mut plan = Plan::new();
@@ -1070,8 +1070,8 @@ fn cascade_prevent_destroy_blocks_merge_upgrade_to_replace() {
         .attribute(AttributeSchema::new("tags", AttributeType::String))
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String).required());
 
-    let mut schemas = HashMap::new();
-    schemas.insert("ec2.Subnet".to_string(), subnet_schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("", subnet_schema);
 
     // Build a plan with Replace for VPC and Update for subnet (tags changed)
     let mut plan = Plan::new();

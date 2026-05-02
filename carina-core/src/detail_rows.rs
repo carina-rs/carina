@@ -11,7 +11,7 @@ use indexmap::IndexMap;
 use crate::diff_helpers::{compute_map_diff, compute_unchanged_count};
 use crate::effect::Effect;
 use crate::resource::{ResourceId, Value};
-use crate::schema::ResourceSchema;
+use crate::schema::SchemaRegistry;
 use crate::value::{format_value, format_value_with_key, is_list_of_maps, map_similarity};
 
 /// Controls how much detail is shown in plan output.
@@ -210,7 +210,7 @@ pub struct CascadingUpdateAttr {
 /// with appropriate formatting (colors, prefixes, etc.).
 pub fn build_detail_rows(
     effect: &Effect,
-    schemas: Option<&HashMap<String, ResourceSchema>>,
+    registry: Option<&SchemaRegistry>,
     detail: DetailLevel,
     delete_attributes: Option<&HashMap<ResourceId, HashMap<String, Value>>>,
 ) -> Vec<DetailRow> {
@@ -219,7 +219,7 @@ pub fn build_detail_rows(
     }
 
     match effect {
-        Effect::Create(r) => build_create_rows(r, schemas, detail),
+        Effect::Create(r) => build_create_rows(r, registry, detail),
         Effect::Update {
             from,
             to,
@@ -244,7 +244,7 @@ pub fn build_detail_rows(
             detail,
         ),
         Effect::Delete { id, .. } => build_delete_rows(id, delete_attributes),
-        Effect::Read { resource } => build_create_rows(resource, schemas, detail),
+        Effect::Read { resource } => build_create_rows(resource, registry, detail),
         Effect::Import { identifier, .. } => {
             vec![DetailRow::Attribute {
                 key: "id".to_string(),
@@ -259,7 +259,7 @@ pub fn build_detail_rows(
 
 fn build_create_rows(
     r: &crate::resource::Resource,
-    schemas: Option<&HashMap<String, ResourceSchema>>,
+    registry: Option<&SchemaRegistry>,
     detail: DetailLevel,
 ) -> Vec<DetailRow> {
     let mut rows = Vec::new();
@@ -319,22 +319,20 @@ fn build_create_rows(
 
     // In Full mode, show defaults and read-only attributes
     if detail == DetailLevel::Full
-        && let Some(schema_map) = schemas
+        && let Some(registry) = registry
+        && let Some(schema) = registry.get_for(r)
     {
-        let schema_key = r.id.display_type();
-        if let Some(schema) = schema_map.get(&schema_key) {
-            let user_keys: HashSet<&str> = keys.iter().map(|k| k.as_str()).collect();
+        let user_keys: HashSet<&str> = keys.iter().map(|k| k.as_str()).collect();
 
-            for (attr, formatted) in schema.compute_default_attrs(&user_keys) {
-                rows.push(DetailRow::Default {
-                    key: attr,
-                    value: formatted,
-                });
-            }
+        for (attr, formatted) in schema.compute_default_attrs(&user_keys) {
+            rows.push(DetailRow::Default {
+                key: attr,
+                value: formatted,
+            });
+        }
 
-            for attr in schema.compute_read_only_attrs(&user_keys) {
-                rows.push(DetailRow::ReadOnly { key: attr });
-            }
+        for attr in schema.compute_read_only_attrs(&user_keys) {
+            rows.push(DetailRow::ReadOnly { key: attr });
         }
     }
 

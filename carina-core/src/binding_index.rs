@@ -33,7 +33,7 @@
 //! type/enum diagnostics fire); only the binding-name table is scoped.
 //!
 //! ```ignore
-//! let index = BindingIndex::from_parsed(&parsed, &schemas, &schema_key_fn);
+//! let index = BindingIndex::from_parsed(&parsed, &registry);
 //! if let Some(entry) = index.get("vpc") {
 //!     // entry.resource and entry.schema are both available
 //! }
@@ -41,7 +41,7 @@
 
 use crate::parser::ParsedFile;
 use crate::resource::{Resource, ResourceId, State, Value};
-use crate::schema::ResourceSchema;
+use crate::schema::{ResourceSchema, SchemaRegistry};
 use std::collections::HashMap;
 
 /// One entry in the binding index. Both fields are non-`Option` because the
@@ -68,20 +68,16 @@ pub struct BindingIndex<'a> {
 }
 
 impl<'a> BindingIndex<'a> {
-    /// Build the index from a parsed file and a schema map. `schema_key_fn`
-    /// converts a `Resource` to the key under which its schema is stored
-    /// (e.g. `"aws.s3.Bucket" -> "s3.Bucket"`); validation and the LSP both
-    /// already pass such a function around, so the contract here mirrors
-    /// theirs.
+    /// Build the index from a parsed file and a [`SchemaRegistry`]. The
+    /// registry handles the `(provider, resource_type, kind) -> schema`
+    /// lookup, including the kind-aware split between managed resources
+    /// and data sources.
     ///
-    /// Bindings whose schema is missing from `schemas` are silently skipped
-    /// — callers (validation / LSP) treat unknown resource types as a
-    /// separate diagnostic, so reporting them again here would double-count.
-    pub fn from_parsed(
-        parsed: &'a ParsedFile,
-        schemas: &'a HashMap<String, ResourceSchema>,
-        schema_key_fn: &dyn Fn(&Resource) -> String,
-    ) -> Self {
+    /// Bindings whose schema is missing from the registry are silently
+    /// skipped — callers (validation / LSP) treat unknown resource types
+    /// as a separate diagnostic, so reporting them again here would
+    /// double-count.
+    pub fn from_parsed(parsed: &'a ParsedFile, registry: &'a SchemaRegistry) -> Self {
         let mut entries = HashMap::new();
         let mut known_names = std::collections::HashSet::new();
         // Walk top-level resources only. The parser auto-generates a
@@ -98,7 +94,7 @@ impl<'a> BindingIndex<'a> {
                 continue;
             };
             known_names.insert(binding_name.clone());
-            let Some(schema) = schemas.get(&schema_key_fn(resource)) else {
+            let Some(schema) = registry.get_for(resource) else {
                 continue;
             };
             entries.insert(binding_name.clone(), BindingEntry { resource, schema });
@@ -453,14 +449,16 @@ mod tests {
     use crate::parser::parse;
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    fn schema_key_aws(r: &Resource) -> String {
-        format!("{}.{}", r.id.provider, r.id.resource_type)
-    }
-
     fn vpc_schema() -> ResourceSchema {
-        ResourceSchema::new("aws.ec2.Vpc")
+        ResourceSchema::new("ec2.Vpc")
             .attribute(AttributeSchema::new("name", AttributeType::String))
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
+    }
+
+    fn registry_with_vpc() -> SchemaRegistry {
+        let mut r = SchemaRegistry::new();
+        r.insert("aws", vpc_schema());
+        r
     }
 
     #[test]
@@ -472,12 +470,11 @@ let vpc = aws.ec2.Vpc {
 }
 "#;
         let parsed = parse(src, &Default::default()).expect("parse");
-        let mut schemas = HashMap::new();
-        schemas.insert("aws.ec2.Vpc".to_string(), vpc_schema());
+        let registry = registry_with_vpc();
 
-        let index = BindingIndex::from_parsed(&parsed, &schemas, &schema_key_aws);
+        let index = BindingIndex::from_parsed(&parsed, &registry);
         let entry = index.get("vpc").expect("vpc binding present");
-        assert_eq!(entry.schema.resource_type, "aws.ec2.Vpc");
+        assert_eq!(entry.schema.resource_type, "ec2.Vpc");
         assert_eq!(entry.resource.binding.as_deref(), Some("vpc"));
         assert_eq!(index.len(), 1);
     }
@@ -493,10 +490,9 @@ aws.ec2.Vpc {
 }
 "#;
         let parsed = parse(src, &Default::default()).expect("parse");
-        let mut schemas = HashMap::new();
-        schemas.insert("aws.ec2.Vpc".to_string(), vpc_schema());
+        let registry = registry_with_vpc();
 
-        let index = BindingIndex::from_parsed(&parsed, &schemas, &schema_key_aws);
+        let index = BindingIndex::from_parsed(&parsed, &registry);
         assert!(index.is_empty());
     }
 
@@ -513,9 +509,9 @@ let vpc = aws.ec2.Vpc {
 }
 "#;
         let parsed = parse(src, &Default::default()).expect("parse");
-        let schemas: HashMap<String, ResourceSchema> = HashMap::new();
+        let registry = SchemaRegistry::new();
 
-        let index = BindingIndex::from_parsed(&parsed, &schemas, &schema_key_aws);
+        let index = BindingIndex::from_parsed(&parsed, &registry);
         assert!(index.get("vpc").is_none());
         assert!(
             index.is_declared("vpc"),
@@ -543,10 +539,9 @@ for _, n in some_iterable {
 }
 "#;
         let parsed = parse(src, &Default::default()).expect("parse");
-        let mut schemas = HashMap::new();
-        schemas.insert("aws.ec2.Vpc".to_string(), vpc_schema());
+        let registry = registry_with_vpc();
 
-        let index = BindingIndex::from_parsed(&parsed, &schemas, &schema_key_aws);
+        let index = BindingIndex::from_parsed(&parsed, &registry);
         assert!(index.get("net").is_some(), "named let binding indexed");
         assert!(
             !index.is_declared("n"),
@@ -568,13 +563,12 @@ let vpc = aws.ec2.Vpc {
 }
 "#;
         let parsed = parse(src, &Default::default()).expect("parse");
-        let mut schemas = HashMap::new();
-        schemas.insert("aws.ec2.Vpc".to_string(), vpc_schema());
-        let index = BindingIndex::from_parsed(&parsed, &schemas, &schema_key_aws);
+        let registry = registry_with_vpc();
+        let index = BindingIndex::from_parsed(&parsed, &registry);
 
         let by_name = index.schemas_by_name();
         let schema = by_name.get("vpc").expect("vpc projection present");
-        assert_eq!(schema.resource_type, "aws.ec2.Vpc");
+        assert_eq!(schema.resource_type, "ec2.Vpc");
         // The projection borrows from the index — pointer-equal to
         // `index.get(...).schema`, which is the whole point.
         assert!(std::ptr::eq(*schema, index.get("vpc").unwrap().schema));
@@ -589,9 +583,8 @@ let vpc = aws.ec2.Vpc {
 }
 "#;
         let parsed = parse(src, &Default::default()).expect("parse");
-        let mut schemas = HashMap::new();
-        schemas.insert("aws.ec2.Vpc".to_string(), vpc_schema());
-        let index = BindingIndex::from_parsed(&parsed, &schemas, &schema_key_aws);
+        let registry = registry_with_vpc();
+        let index = BindingIndex::from_parsed(&parsed, &registry);
         assert!(index.get("missing").is_none());
     }
 }

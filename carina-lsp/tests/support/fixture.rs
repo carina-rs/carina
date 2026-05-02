@@ -3,10 +3,9 @@
 //! directory-shaped layout the project's invariant requires
 //! (`main.crn` + sibling files like `providers.crn`, `exports.crn`).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use carina_core::schema::ResourceSchema;
+use carina_core::schema::{ResourceSchema, SchemaRegistry};
 use carina_lsp::diagnostics::DiagnosticEngine;
 use carina_lsp::document::Document;
 use tempfile::TempDir;
@@ -37,25 +36,25 @@ pub fn analyze(engine: &DiagnosticEngine, fixture: &TempDir, file_name: &str) ->
 }
 
 /// Build a `DiagnosticEngine` from in-memory schemas. Provider names
-/// are derived from the `<provider>.<...>` keys so the engine can
+/// are derived from registered schema entries so the engine can
 /// recognise the synthetic providers used in tests.
 #[allow(dead_code)]
-pub fn engine_with_schemas(schemas: HashMap<String, ResourceSchema>) -> DiagnosticEngine {
+pub fn engine_with_schemas(schemas: SchemaRegistry) -> DiagnosticEngine {
     let provider_names: Vec<String> = schemas
-        .keys()
-        .filter_map(|k| k.split('.').next())
+        .iter()
+        .map(|(provider, _, _, _)| provider.to_string())
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
-        .map(String::from)
         .collect();
     DiagnosticEngine::new(Arc::new(schemas), provider_names, Arc::new(vec![]))
 }
 
-/// Wrap one `ResourceSchema` in a `HashMap` keyed by its
-/// `resource_type`. Convenience for single-resource scenarios.
+/// Wrap one `ResourceSchema` in a `SchemaRegistry` registered under the
+/// `test` provider — the standard provider name for synthetic test fixtures
+/// in this crate.
 #[allow(dead_code)]
-pub fn single_schema_map(schema: ResourceSchema) -> HashMap<String, ResourceSchema> {
-    let mut schemas = HashMap::new();
-    schemas.insert(schema.resource_type.clone(), schema);
-    schemas
+pub fn single_schema_map(schema: ResourceSchema) -> SchemaRegistry {
+    let mut registry = SchemaRegistry::new();
+    registry.insert("test", schema);
+    registry
 }

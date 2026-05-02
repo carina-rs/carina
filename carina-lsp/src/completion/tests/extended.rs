@@ -156,11 +156,11 @@ fn list_string_enum_completions() {
         to_dsl: None,
     });
 
-    let schema = ResourceSchema::new("test.list.resource")
+    let schema = ResourceSchema::new("list.resource")
         .attribute(AttributeSchema::new("protocols", list_enum));
 
-    let mut schemas = HashMap::new();
-    schemas.insert("test.list.resource".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
 
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
@@ -312,14 +312,14 @@ fn no_completions_for_unknown_resource_type_in_block() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     // Create a provider with two schemas
-    let schema_a = ResourceSchema::new("test.a.resource")
+    let schema_a = ResourceSchema::new("a.resource")
         .attribute(AttributeSchema::new("attr_a", AttributeType::String));
-    let schema_b = ResourceSchema::new("test.b.resource")
+    let schema_b = ResourceSchema::new("b.resource")
         .attribute(AttributeSchema::new("attr_b", AttributeType::String));
 
-    let mut schemas = HashMap::new();
-    schemas.insert("test.a.resource".to_string(), schema_a);
-    schemas.insert("test.b.resource".to_string(), schema_b);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema_a);
+    schemas.insert("test", schema_b);
 
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
@@ -1009,7 +1009,7 @@ outer =
 #[test]
 fn map_key_completions_from_string_enum_key_type() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
-    use std::collections::HashMap;
+
     use std::sync::Arc;
 
     // Create a schema with a Map attribute whose key is StringEnum
@@ -1028,10 +1028,10 @@ fn map_key_completions_from_string_enum_key_type() {
         AttributeType::map(AttributeType::String),
     );
     let schema =
-        ResourceSchema::new("test.resource").attribute(AttributeSchema::new("condition", map_type));
+        ResourceSchema::new("resource").attribute(AttributeSchema::new("condition", map_type));
 
-    let mut schemas = HashMap::new();
-    schemas.insert("test.resource".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
 
     let provider = super::super::CompletionProvider::new(Arc::new(schemas), vec![], vec![], vec![]);
 
@@ -1068,7 +1068,7 @@ fn map_key_completions_from_string_enum_key_type() {
 #[test]
 fn union_struct_field_completions() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
-    use std::collections::HashMap;
+
     use std::sync::Arc;
 
     // principal: Union([Struct { fields: [service, aws, federated] }, String])
@@ -1089,11 +1089,11 @@ fn union_struct_field_completions() {
         fields: vec![StructField::new("principal", principal_type)],
     };
 
-    let schema = ResourceSchema::new("test.resource")
+    let schema = ResourceSchema::new("resource")
         .attribute(AttributeSchema::new("statement", statement_type));
 
-    let mut schemas = HashMap::new();
-    schemas.insert("test.resource".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
 
     let provider = super::super::CompletionProvider::new(Arc::new(schemas), vec![], vec![], vec![]);
 
@@ -2510,7 +2510,7 @@ exports {
 #[test]
 fn exports_map_value_offers_matching_resource_refs() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
-    use std::collections::HashMap;
+
     fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
@@ -2523,10 +2523,10 @@ fn exports_map_value_offers_matching_resource_refs() {
         namespace: None,
         to_dsl: None,
     };
-    let schema = ResourceSchema::new("awscc.organizations.account")
+    let schema = ResourceSchema::new("organizations.account")
         .attribute(AttributeSchema::new("account_id", account_id));
-    let mut schemas = HashMap::new();
-    schemas.insert("awscc.organizations.account".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![]);
 
@@ -2595,7 +2595,7 @@ fn exports_list_value_position_filters_by_element_type() {
 #[test]
 fn exports_map_value_multiple_entries_returns_refs() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
-    use std::collections::HashMap;
+
     fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
@@ -2608,10 +2608,10 @@ fn exports_map_value_multiple_entries_returns_refs() {
         namespace: None,
         to_dsl: None,
     };
-    let schema = ResourceSchema::new("awscc.organizations.account")
+    let schema = ResourceSchema::new("organizations.account")
         .attribute(AttributeSchema::new("account_id", account_id));
-    let mut schemas = HashMap::new();
-    schemas.insert("awscc.organizations.account".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![]);
 
@@ -2653,7 +2653,7 @@ exports {
 #[test]
 fn exports_map_value_includes_bindings_from_sibling_files() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
-    use std::collections::HashMap;
+
     fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
@@ -2666,10 +2666,10 @@ fn exports_map_value_includes_bindings_from_sibling_files() {
         namespace: None,
         to_dsl: None,
     };
-    let schema = ResourceSchema::new("awscc.organizations.account")
+    let schema = ResourceSchema::new("organizations.account")
         .attribute(AttributeSchema::new("account_id", account_id));
-    let mut schemas = HashMap::new();
-    schemas.insert("awscc.organizations.account".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![]);
 
@@ -2711,7 +2711,7 @@ exports {
 #[test]
 fn custom_type_value_ref_includes_sibling_file_bindings() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
-    use std::collections::HashMap;
+
     fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
@@ -2724,16 +2724,13 @@ fn custom_type_value_ref_includes_sibling_file_bindings() {
         namespace: None,
         to_dsl: None,
     };
-    let account_schema = ResourceSchema::new("awscc.organizations.account")
+    let account_schema = ResourceSchema::new("organizations.account")
         .attribute(AttributeSchema::new("account_id", account_id.clone()));
-    let consumer_schema = ResourceSchema::new("awscc.organizations.policy_target_attachment")
+    let consumer_schema = ResourceSchema::new("organizations.policy_target_attachment")
         .attribute(AttributeSchema::new("target_id", account_id));
-    let mut schemas = HashMap::new();
-    schemas.insert("awscc.organizations.account".to_string(), account_schema);
-    schemas.insert(
-        "awscc.organizations.policy_target_attachment".to_string(),
-        consumer_schema,
-    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", account_schema);
+    schemas.insert("awscc", consumer_schema);
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![]);
 
@@ -2772,11 +2769,11 @@ let attach = awscc.organizations.policy_target_attachment {
 #[test]
 fn argument_parameters_include_sibling_file_args() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
-    use std::collections::HashMap;
-    let schema = ResourceSchema::new("awscc.s3.Bucket")
+
+    let schema = ResourceSchema::new("s3.Bucket")
         .attribute(AttributeSchema::new("name", AttributeType::String));
-    let mut schemas = HashMap::new();
-    schemas.insert("awscc.s3.Bucket".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![]);
 
@@ -2815,7 +2812,7 @@ let b = awscc.s3.Bucket {
 #[test]
 fn binding_dot_completion_resolves_sibling_file_binding() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
-    use std::collections::HashMap;
+
     fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
@@ -2828,16 +2825,13 @@ fn binding_dot_completion_resolves_sibling_file_binding() {
         namespace: None,
         to_dsl: None,
     };
-    let account_schema = ResourceSchema::new("awscc.organizations.account")
+    let account_schema = ResourceSchema::new("organizations.account")
         .attribute(AttributeSchema::new("account_id", account_id.clone()));
-    let consumer_schema = ResourceSchema::new("awscc.organizations.policy_target_attachment")
+    let consumer_schema = ResourceSchema::new("organizations.policy_target_attachment")
         .attribute(AttributeSchema::new("target_id", account_id));
-    let mut schemas = HashMap::new();
-    schemas.insert("awscc.organizations.account".to_string(), account_schema);
-    schemas.insert(
-        "awscc.organizations.policy_target_attachment".to_string(),
-        consumer_schema,
-    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", account_schema);
+    schemas.insert("awscc", consumer_schema);
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![]);
 

@@ -10,7 +10,7 @@ use carina_core::effect::Effect;
 use carina_core::executor::ExecutionResult;
 use carina_core::plan::Plan;
 use carina_core::resource::{Resource, ResourceId, State, Value};
-use carina_core::schema::ResourceSchema;
+use carina_core::schema::SchemaRegistry;
 use carina_state::{LockInfo, ResourceState, StateBackend, StateFile};
 
 use crate::error::AppError;
@@ -69,7 +69,7 @@ pub(crate) struct FinalizeApplyInput<'a> {
     pub plan: &'a Plan,
     pub backend: &'a dyn StateBackend,
     pub lock: Option<&'a LockInfo>,
-    pub schemas: &'a HashMap<String, ResourceSchema>,
+    pub schemas: &'a SchemaRegistry,
     pub export_params: &'a [carina_core::parser::ExportParameter],
 }
 
@@ -142,7 +142,7 @@ pub(crate) struct ApplyStateSave<'a> {
     pub plan: &'a Plan,
     pub successfully_deleted: &'a HashSet<ResourceId>,
     pub failed_refreshes: &'a HashSet<ResourceId>,
-    pub schemas: &'a HashMap<String, ResourceSchema>,
+    pub schemas: &'a SchemaRegistry,
 }
 
 pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateFile, AppError> {
@@ -166,15 +166,8 @@ pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateF
             resource.id.name_str(),
         );
         // Collect write-only attribute names from the schema for this resource type.
-        // Schema keys include the provider prefix (e.g., "awscc.ec2.Vpc"), so we must
-        // construct the key the same way as schema_key_for_resource().
-        let schema_key = if resource.id.provider.is_empty() {
-            resource.id.resource_type.clone()
-        } else {
-            format!("{}.{}", resource.id.provider, resource.id.resource_type)
-        };
         let write_only_keys: Vec<String> = schemas
-            .get(&schema_key)
+            .get_for(resource)
             .map(|schema| {
                 schema
                     .attributes

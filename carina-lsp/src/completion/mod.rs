@@ -9,20 +9,22 @@ mod tests;
 
 pub(crate) use dsl_source::DslSource;
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use tower_lsp::lsp_types::{Command, CompletionItem, CompletionItemKind, Position};
 
 use crate::document::Document;
-use carina_core::schema::{AttributeType, CompletionValue, ResourceSchema, StructField};
+use carina_core::schema::{
+    AttributeType, CompletionValue, ResourceSchema, SchemaKind, SchemaRegistry, StructField,
+};
 
 pub struct CompletionProvider {
-    schemas: Arc<HashMap<String, ResourceSchema>>,
+    schemas: Arc<SchemaRegistry>,
     provider_names: Vec<String>,
     region_completions_data: Vec<CompletionValue>,
-    /// Resource type patterns sorted longest-first for matching
+    /// Resource type patterns sorted longest-first for matching.
+    /// Each pattern is `"<provider>.<resource_type>"` for both Managed and DataSource entries.
     resource_type_patterns: Vec<String>,
     /// Custom type names from provider validators (e.g., "arn", "vpc_id")
     custom_type_names: Vec<String>,
@@ -30,13 +32,24 @@ pub struct CompletionProvider {
 
 impl CompletionProvider {
     pub fn new(
-        schemas: Arc<HashMap<String, ResourceSchema>>,
+        schemas: Arc<SchemaRegistry>,
         provider_names: Vec<String>,
         region_completions_data: Vec<CompletionValue>,
         custom_type_names: Vec<String>,
     ) -> Self {
-        // Build sorted resource type patterns from schema keys (longest first)
-        let mut resource_type_patterns: Vec<String> = schemas.keys().cloned().collect();
+        // Build sorted resource type patterns from registry entries (longest first).
+        let mut resource_type_patterns: Vec<String> = schemas
+            .iter()
+            .map(|(provider, resource_type, _kind, _schema)| {
+                if provider.is_empty() {
+                    resource_type.to_string()
+                } else {
+                    format!("{}.{}", provider, resource_type)
+                }
+            })
+            .collect();
+        resource_type_patterns.sort();
+        resource_type_patterns.dedup();
         resource_type_patterns.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
         Self {
@@ -46,6 +59,20 @@ impl CompletionProvider {
             resource_type_patterns,
             custom_type_names,
         }
+    }
+
+    /// Look up a schema by `"<provider>.<resource_type>"` key, trying Managed first.
+    pub(super) fn lookup_schema(&self, key: &str) -> Option<&ResourceSchema> {
+        let (provider, resource_type) = match key.split_once('.') {
+            Some(parts) => parts,
+            None => return self.schemas.get("", key, SchemaKind::Managed),
+        };
+        self.schemas
+            .get(provider, resource_type, SchemaKind::Managed)
+            .or_else(|| {
+                self.schemas
+                    .get(provider, resource_type, SchemaKind::DataSource)
+            })
     }
 
     pub fn complete(
@@ -598,7 +625,7 @@ impl CompletionProvider {
             arguments: None,
         };
 
-        if let Some(schema) = self.schemas.get(resource_type) {
+        if let Some(schema) = self.lookup_schema(resource_type) {
             // Try struct field completions first
             if let Some(fields) = self.resolve_struct_fields_for_path(schema, attr_path) {
                 return fields
@@ -680,7 +707,7 @@ impl CompletionProvider {
         attr_path: &[String],
         field_name: &str,
     ) -> Vec<CompletionItem> {
-        if let Some(schema) = self.schemas.get(resource_type)
+        if let Some(schema) = self.lookup_schema(resource_type)
             && let Some(fields) = self.resolve_struct_fields_for_path(schema, attr_path)
             && let Some(field) = fields.iter().find(|f| f.name == field_name)
         {

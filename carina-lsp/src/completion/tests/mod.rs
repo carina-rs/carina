@@ -98,11 +98,11 @@ pub(super) fn test_provider_with_block_name_nested() -> CompletionProvider {
         ],
     };
 
-    let schema = ResourceSchema::new("test.block.resource")
+    let schema = ResourceSchema::new("block.resource")
         .attribute(AttributeSchema::new("config", config_struct));
 
-    let mut schemas = HashMap::new();
-    schemas.insert("test.block.resource".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
 
     CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![])
 }
@@ -124,11 +124,11 @@ pub(super) fn test_provider_with_nested_structs() -> CompletionProvider {
         ],
     };
 
-    let schema = ResourceSchema::new("test.nested.resource")
+    let schema = ResourceSchema::new("nested.resource")
         .attribute(AttributeSchema::new("outer", outer_struct));
 
-    let mut schemas = HashMap::new();
-    schemas.insert("test.nested.resource".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
 
     CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![])
 }
@@ -137,10 +137,10 @@ pub(super) fn test_provider_with_nested_structs() -> CompletionProvider {
 /// `attr` string attribute. Enough to exercise value-position completions
 /// without needing real provider schemas.
 pub(super) fn test_provider_single_attr() -> CompletionProvider {
-    let schema = ResourceSchema::new("test.foo.bar")
+    let schema = ResourceSchema::new("foo.bar")
         .attribute(AttributeSchema::new("attr", AttributeType::String));
-    let mut schemas = HashMap::new();
-    schemas.insert("test.foo.bar".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
     CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![])
 }
 
@@ -154,10 +154,10 @@ pub(super) fn test_provider_with_enum_and_regions() -> CompletionProvider {
         namespace: None,
         to_dsl: None,
     };
-    let schema = ResourceSchema::new("awscc.s3.Bucket")
+    let schema = ResourceSchema::new("s3.Bucket")
         .attribute(AttributeSchema::new("versioning_status", status_enum));
-    let mut schemas = HashMap::new();
-    schemas.insert("awscc.s3.Bucket".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
 
     let region_completions: Vec<CompletionValue> = vec![
         CompletionValue {
@@ -194,15 +194,15 @@ pub(super) fn test_provider_with_nameless_enum() -> CompletionProvider {
         fields: vec![StructField::new("status", status_enum.clone())],
     };
 
-    let schema = ResourceSchema::new("awscc.s3.Bucket")
+    let schema = ResourceSchema::new("s3.Bucket")
         .attribute(AttributeSchema::new("versioning_status", status_enum))
         .attribute(AttributeSchema::new(
             "versioning_configuration",
             versioning_struct,
         ));
 
-    let mut schemas = HashMap::new();
-    schemas.insert("awscc.s3.Bucket".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
 
     CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![])
 }
@@ -230,11 +230,11 @@ pub(super) fn test_provider_with_custom_semantic_attr() -> CompletionProvider {
         namespace: Some("awscc.sso.Assignment".to_string()),
         to_dsl: None,
     };
-    let schema = ResourceSchema::new("awscc.sso.Assignment")
+    let schema = ResourceSchema::new("sso.Assignment")
         .attribute(AttributeSchema::new("principal_type", principal_type))
         .attribute(AttributeSchema::new("target_id", account_id));
 
-    let mut schemas = HashMap::new();
-    schemas.insert("awscc.sso.Assignment".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
     CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![])
 }

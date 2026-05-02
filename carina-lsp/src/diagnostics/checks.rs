@@ -461,9 +461,6 @@ impl DiagnosticEngine {
             merged,
             &exports,
             &self.schemas,
-            &|r: &carina_core::resource::Resource| {
-                carina_core::provider::schema_key_for_resource(&self.factories, r)
-            },
         );
         // #1894 (option 2): cross-directory `for`-iterable shape check.
         // Anchored at the same `binding.field` ref occurrence so the
@@ -1009,15 +1006,7 @@ impl DiagnosticEngine {
         let ref_resource = resources
             .iter()
             .find(|r| r.binding.as_deref() == Some(ref_binding))?;
-        let schema_key = format!(
-            "{}.{}",
-            ref_resource.id.provider, ref_resource.id.resource_type
-        );
-        // Try without provider prefix too (different providers use different key formats)
-        let ref_schema = self
-            .schemas
-            .get(&schema_key)
-            .or_else(|| self.schemas.get(&ref_resource.id.resource_type))?;
+        let ref_schema = self.schemas.get_for(ref_resource)?;
         let ref_attr_schema = ref_schema.attributes.get(ref_attr)?;
         let ref_type_name = ref_attr_schema.attr_type.type_name();
         let ref_type_snake = carina_core::parser::pascal_to_snake(&ref_type_name);
@@ -1068,7 +1057,19 @@ impl DiagnosticEngine {
                 // Look up resource type from sibling bindings
                 if let Some(resource_type) = sibling_bindings.get(binding) {
                     // Look up attribute schema type
-                    if let Some(schema) = self.schemas.get(resource_type)
+                    let (provider, rt) = resource_type
+                        .split_once('.')
+                        .unwrap_or(("", resource_type.as_str()));
+                    if let Some(schema) = self
+                        .schemas
+                        .get(provider, rt, carina_core::schema::SchemaKind::Managed)
+                        .or_else(|| {
+                            self.schemas.get(
+                                provider,
+                                rt,
+                                carina_core::schema::SchemaKind::DataSource,
+                            )
+                        })
                         && let Some(attr_schema) = schema.attributes.get(attr)
                     {
                         let ref_type = &attr_schema.attr_type;
@@ -1269,12 +1270,10 @@ impl DiagnosticEngine {
 
         // Schema-level ref type checking for ResourceRef values in exports
         let resources = all_resources.unwrap_or(&parsed.resources);
-        let schema_key_fn = |r: &Resource| format!("{}.{}", r.id.provider, r.id.resource_type);
         if let Err(ref_errors) = carina_core::validation::validate_export_param_ref_types(
             &parsed.export_params,
             resources,
             &self.schemas,
-            &schema_key_fn,
         ) {
             for error_msg in ref_errors.split('\n') {
                 if let Some((line, col)) = self.find_ref_error_position(doc, error_msg) {
