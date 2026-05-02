@@ -1120,7 +1120,11 @@ fn format_invalid_enum(
 /// impl re-renders the same form the user should type — fully-qualified
 /// (`awscc.sso.Assignment.TargetType.AWS_ACCOUNT`) when `provider` is set,
 /// bare (`fast`) otherwise. See #2220.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializes via `serde` so the LSP can ferry the structured data
+/// through `Diagnostic.data` for `textDocument/codeAction` consumption
+/// (#2309).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExpectedEnumVariant {
     /// Provider segment of the namespace (`"awscc"` for
     /// `awscc.sso.Assignment.TargetType.AWS_ACCOUNT`). `None` for

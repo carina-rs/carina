@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod code_action;
 pub mod completion;
 pub mod diagnostics;
 pub mod document;

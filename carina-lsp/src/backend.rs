@@ -374,6 +374,18 @@ impl LanguageServer for Backend {
                     ),
                 ),
                 document_formatting_provider: Some(OneOf::Left(true)),
+                // Declare `code_action_kinds` explicitly so editors that
+                // gate on `only` (`CodeActionContext.only`) can avoid
+                // probing this server for kinds it never emits. Carina
+                // only ships QUICKFIX actions for #2309 today; add more
+                // kinds here when other features start emitting actions.
+                code_action_provider: Some(CodeActionProviderCapability::Options(
+                    CodeActionOptions {
+                        code_action_kinds: Some(vec![CodeActionKind::QUICKFIX]),
+                        resolve_provider: None,
+                        work_done_progress_options: Default::default(),
+                    },
+                )),
                 ..Default::default()
             },
             ..Default::default()
@@ -572,6 +584,28 @@ impl LanguageServer for Backend {
             }
         }
         Ok(None)
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        // The handler is purely diagnostic-driven: the editor passes the
+        // diagnostics it currently shows in `params.context.diagnostics`,
+        // each one carrying its `Diagnostic.data` payload unchanged. We
+        // read the structured `EnumDiagnosticData` off matching
+        // diagnostics and emit one `CodeAction` per remaining candidate.
+        // Diagnostics without an enum payload (or from other features)
+        // produce no actions here.
+        let uri = &params.text_document.uri;
+        let mut actions: Vec<CodeActionOrCommand> = Vec::new();
+        for diag in &params.context.diagnostics {
+            for action in crate::code_action::code_actions_for_diagnostic(uri, diag) {
+                actions.push(CodeActionOrCommand::CodeAction(action));
+            }
+        }
+        if actions.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(actions))
+        }
     }
 }
 
