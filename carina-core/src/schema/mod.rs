@@ -1747,6 +1747,16 @@ pub struct OperationConfig {
     pub create_max_retries: Option<u32>,
 }
 
+/// Classification of a resource schema: managed (full CRUD lifecycle) vs
+/// data source (read-only lookup of existing infrastructure).
+///
+/// See `docs/specs/2026-05-02-resource-vs-data-source-design.md` (Decision 1-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaKind {
+    Managed,
+    DataSource,
+}
+
 /// Resource schema
 #[derive(Debug, Clone)]
 pub struct ResourceSchema {
@@ -1756,8 +1766,9 @@ pub struct ResourceSchema {
     /// Optional validator function for cross-attribute validation
     /// (e.g., mutually exclusive required fields)
     pub validator: Option<ResourceValidator>,
-    /// If true, this resource type is a data source and must be used with `read`
-    pub data_source: bool,
+    /// Whether this is a managed resource or a data source.
+    /// Data sources must be used with the `read` keyword.
+    pub kind: SchemaKind,
     /// The attribute that serves as the unique name for this resource type.
     /// Used for automatic unique name generation during create-before-destroy replacement.
     /// (e.g., "bucket_name" for s3.bucket, "log_group_name" for logs.log_group)
@@ -1784,7 +1795,7 @@ impl ResourceSchema {
             attributes: HashMap::new(),
             description: None,
             validator: None,
-            data_source: false,
+            kind: SchemaKind::Managed,
             name_attribute: None,
             force_replace: false,
             operation_config: None,
@@ -1822,8 +1833,12 @@ impl ResourceSchema {
     }
 
     pub fn as_data_source(mut self) -> Self {
-        self.data_source = true;
+        self.kind = SchemaKind::DataSource;
         self
+    }
+
+    pub fn is_data_source(&self) -> bool {
+        matches!(self.kind, SchemaKind::DataSource)
     }
 
     pub fn with_name_attribute(mut self, attr: impl Into<String>) -> Self {

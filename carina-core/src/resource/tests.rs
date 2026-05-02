@@ -583,9 +583,9 @@ fn resource_default_metadata_fields() {
 }
 
 #[test]
-fn resource_kind_enum_real_by_default() {
+fn resource_kind_enum_managed_by_default() {
     let resource = Resource::new("s3.Bucket", "my-bucket");
-    assert_eq!(resource.kind, ResourceKind::Real);
+    assert_eq!(resource.kind, ResourceKind::Managed);
     assert!(!resource.is_virtual());
     assert!(!resource.is_data_source());
 }

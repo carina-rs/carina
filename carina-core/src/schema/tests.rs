@@ -13,15 +13,17 @@ fn attribute_schema_write_only_builder() {
 }
 
 #[test]
-fn resource_schema_data_source_default_false() {
+fn resource_schema_kind_default_managed() {
     let schema = ResourceSchema::new("test.resource");
-    assert!(!schema.data_source);
+    assert_eq!(schema.kind, SchemaKind::Managed);
+    assert!(!schema.is_data_source());
 }
 
 #[test]
-fn resource_schema_as_data_source_sets_flag() {
+fn resource_schema_as_data_source_sets_kind() {
     let schema = ResourceSchema::new("test.resource").as_data_source();
-    assert!(schema.data_source);
+    assert_eq!(schema.kind, SchemaKind::DataSource);
+    assert!(schema.is_data_source());
 }
 
 #[test]

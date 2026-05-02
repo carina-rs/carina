@@ -278,7 +278,7 @@ pub(crate) fn build_orphan_resource(sf: &carina_state::StateFile, id: &ResourceI
     Resource {
         id: id.clone(),
         attributes: attributes.into_iter().collect(),
-        kind: carina_core::resource::ResourceKind::Real,
+        kind: carina_core::resource::ResourceKind::Managed,
         lifecycle: rs.lifecycle.clone(),
         prefixes: rs.prefixes.clone(),
         binding: rs.binding.clone(),

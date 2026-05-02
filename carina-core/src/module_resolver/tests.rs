@@ -33,7 +33,7 @@ fn create_test_module() -> ParsedFile {
                 );
                 attrs.into_iter().collect()
             },
-            kind: ResourceKind::Real,
+            kind: ResourceKind::Managed,
             lifecycle: LifecycleConfig::default(),
             prefixes: HashMap::new(),
             binding: None,
@@ -161,7 +161,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                     );
                     attrs.into_iter().collect()
                 },
-                kind: ResourceKind::Real,
+                kind: ResourceKind::Managed,
                 lifecycle: LifecycleConfig::default(),
                 prefixes: HashMap::new(),
                 binding: Some("vpc".to_string()),
@@ -179,7 +179,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                     );
                     attrs.into_iter().collect()
                 },
-                kind: ResourceKind::Real,
+                kind: ResourceKind::Managed,
                 lifecycle: LifecycleConfig::default(),
                 prefixes: HashMap::new(),
                 binding: Some("subnet".to_string()),
@@ -306,7 +306,7 @@ fn create_module_with_attributes() -> ParsedFile {
                 );
                 attrs.into_iter().collect()
             },
-            kind: ResourceKind::Real,
+            kind: ResourceKind::Managed,
             lifecycle: LifecycleConfig::default(),
             prefixes: HashMap::new(),
             binding: Some("sg".to_string()),
@@ -1107,7 +1107,7 @@ fn create_module_with_interpolation() -> ParsedFile {
                 );
                 attrs.into_iter().collect()
             },
-            kind: ResourceKind::Real,
+            kind: ResourceKind::Managed,
             lifecycle: LifecycleConfig::default(),
             prefixes: HashMap::new(),
             binding: Some("vpc".to_string()),

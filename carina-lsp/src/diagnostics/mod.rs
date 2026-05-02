@@ -285,7 +285,7 @@ impl DiagnosticEngine {
                 let schema = self.schemas.get(&full_resource_type).cloned();
                 if let Some(schema) = &schema {
                     // Check data source without `read` keyword
-                    if schema.data_source
+                    if schema.is_data_source()
                         && !resource.is_data_source()
                         && let Some((line, col)) = self.find_resource_type_position(
                             doc,

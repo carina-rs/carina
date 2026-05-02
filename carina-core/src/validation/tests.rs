@@ -407,7 +407,7 @@ fn make_schema(resource_type: &str, attrs: Vec<(&str, AttributeType)>) -> Resour
         attributes,
         description: None,
         validator: None,
-        data_source: false,
+        kind: crate::schema::SchemaKind::Managed,
         name_attribute: None,
         force_replace: false,
         operation_config: None,
