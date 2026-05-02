@@ -525,6 +525,223 @@ pub fn check_upstream_state_for_iterable_shapes(
     errors
 }
 
+/// A reference walks past the top-level upstream export with a `.field`
+/// chain that doesn't match the export's declared `TypeExpr` — the
+/// downstream wrote `orgs.account.foo` but `account`'s declared
+/// `TypeExpr` is a `list(...)` / `map(...)` / scalar (no fields), or
+/// a `Struct{...}` whose fields don't include `foo`.
+///
+/// Sibling of [`UpstreamForIterableShapeError`] from #2317 — same family
+/// of "downstream's usage doesn't fit the upstream's declared shape",
+/// different consumer (attribute access vs `for` iterable). The two
+/// share the same detection-layer style: walk the parsed project,
+/// look up the declared `TypeExpr` per `(binding, field)`, and emit a
+/// structured diagnostic when the usage doesn't fit.
+#[derive(Debug, Clone)]
+pub struct UpstreamAttributeAccessShapeError {
+    pub location: String,
+    pub binding: String,
+    pub field: String,
+    /// Field-path segments after `binding.field`, exactly as the
+    /// downstream wrote them. Kept in full for code actions that want
+    /// to render the original access path.
+    pub field_path: Vec<String>,
+    /// What the upstream declared at the deepest segment that *did*
+    /// resolve. For `orgs.account.network.bad_field` that's the
+    /// `Struct{...}` for `network`; for `orgs.accounts.foo` against a
+    /// `list(...)` it's the `list(...)` itself.
+    pub mismatched_at: TypeExpr,
+    /// The first segment in `field_path` that didn't fit
+    /// `mismatched_at`. Stored directly rather than as an index because
+    /// no consumer currently needs the position back into `field_path`.
+    pub bad_segment: String,
+}
+
+impl UpstreamAttributeAccessShapeError {
+    pub fn diagnostic_message(&self) -> String {
+        match &self.mismatched_at {
+            TypeExpr::Struct { fields } => {
+                let known: Vec<&str> = fields.iter().map(|(name, _)| name.as_str()).collect();
+                format!(
+                    "upstream_state `{}.{}` has no field `{}`; declared fields are: {}",
+                    self.binding,
+                    self.field,
+                    self.bad_segment,
+                    known.join(", "),
+                )
+            }
+            TypeExpr::List(_) => format!(
+                "upstream_state `{}.{}` is declared as `{}` but `.{}` reads it as a struct; iterate the list with `for x in {}.{}` to access elements",
+                self.binding,
+                self.field,
+                self.mismatched_at,
+                self.bad_segment,
+                self.binding,
+                self.field,
+            ),
+            TypeExpr::Map(_) => format!(
+                "upstream_state `{}.{}` is declared as `{}` but `.{}` reads it as a struct; iterate the map with `for k, v in {}.{}` to access entries",
+                self.binding,
+                self.field,
+                self.mismatched_at,
+                self.bad_segment,
+                self.binding,
+                self.field,
+            ),
+            other => format!(
+                "upstream_state `{}.{}` is declared as `{}` (a scalar), but `.{}` reads it as a struct; scalars have no fields",
+                self.binding, self.field, other, self.bad_segment,
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for UpstreamAttributeAccessShapeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.location, self.diagnostic_message())
+    }
+}
+
+impl std::error::Error for UpstreamAttributeAccessShapeError {}
+
+/// Walk every `Value::ResourceRef` whose root is an `upstream_state`
+/// binding and whose `field_path` is non-empty, and emit an error
+/// whenever a path segment doesn't fit the declared upstream
+/// `TypeExpr`.
+///
+/// Skipped silently when:
+/// - the binding isn't in `exports` (already surfaced by
+///   `check_upstream_state_field_references` if it should be);
+/// - the field isn't exported (same — duplicate diagnostics hurt);
+/// - the export has no declared type (`account` without `: T`) — there's
+///   no upstream type to compare the path against;
+/// - the `field_path` is empty — that's a top-level field access,
+///   already handled by `check_upstream_state_field_types`.
+///
+/// Sibling of [`check_upstream_state_for_iterable_shapes`] from #2317;
+/// both surface "downstream usage doesn't fit upstream's declared
+/// shape" before apply.
+pub fn check_upstream_state_attribute_access_shapes(
+    parsed: &ParsedFile,
+    exports: &UpstreamExports,
+) -> Vec<UpstreamAttributeAccessShapeError> {
+    let mut errors: Vec<UpstreamAttributeAccessShapeError> = Vec::new();
+    for (ctx, resource) in parsed.iter_all_resources() {
+        for (attr_name, value) in resource.attributes.iter() {
+            if attr_name.starts_with('_') {
+                continue;
+            }
+            let location = match ctx {
+                ResourceContext::Direct => format!("{} attribute `{}`", resource.id, attr_name),
+                ResourceContext::Deferred(d) => format!(
+                    "for-body `{}` {} attribute `{}`",
+                    d.header, resource.id, attr_name
+                ),
+            };
+            visit_attribute_access(value, exports, &location, &mut errors);
+        }
+    }
+    // Module-call arguments and exports values are ResourceRef-bearing
+    // too — they aren't iterated by `iter_all_resources`. Walking them
+    // matches the reach of `check_upstream_state_field_references` /
+    // `_types`.
+    for export in &parsed.export_params {
+        if let Some(value) = &export.value {
+            visit_attribute_access(
+                value,
+                exports,
+                &format!("exports.{}", export.name),
+                &mut errors,
+            );
+        }
+    }
+    for call in &parsed.module_calls {
+        let caller = call.binding_name.as_deref().unwrap_or(&call.module_name);
+        for (arg_name, value) in call.arguments.iter() {
+            visit_attribute_access(
+                value,
+                exports,
+                &format!("module `{}` argument `{}`", caller, arg_name),
+                &mut errors,
+            );
+        }
+    }
+    errors.sort_by(|a, b| {
+        (a.location.as_str(), a.binding.as_str(), a.field.as_str()).cmp(&(
+            b.location.as_str(),
+            b.binding.as_str(),
+            b.field.as_str(),
+        ))
+    });
+    errors
+}
+
+/// Walk a Value tree, find every `ResourceRef` with a non-empty
+/// `field_path`, and check the path against the upstream's declared
+/// `TypeExpr`.
+fn visit_attribute_access(
+    value: &Value,
+    exports: &UpstreamExports,
+    location: &str,
+    errors: &mut Vec<UpstreamAttributeAccessShapeError>,
+) {
+    value.visit_refs(&mut |path| {
+        let field_path = path.field_path();
+        if field_path.is_empty() {
+            return;
+        }
+        let binding = path.binding();
+        let attribute = path.attribute();
+        let Some(fields) = exports.get(binding) else {
+            return;
+        };
+        let Some(Some(export_type)) = fields.get(attribute) else {
+            return;
+        };
+        if let Some((mismatched_at, bad_segment)) = walk_type_expr_path(export_type, field_path) {
+            errors.push(UpstreamAttributeAccessShapeError {
+                location: location.to_string(),
+                binding: binding.to_string(),
+                field: attribute.to_string(),
+                field_path: field_path.to_vec(),
+                mismatched_at: mismatched_at.clone(),
+                bad_segment: bad_segment.to_string(),
+            });
+        }
+    });
+}
+
+/// Walk `field_path` against `start`. Return
+/// `Some((mismatched_type, bad_segment))` for the first segment that
+/// can't be resolved; return `None` when the entire path resolves cleanly.
+///
+/// Walks by reference so deep struct paths don't pay an O(depth) clone
+/// chain — the caller clones once at the return site if it needs an
+/// owned copy.
+fn walk_type_expr_path<'a, 'b>(
+    start: &'a TypeExpr,
+    field_path: &'b [String],
+) -> Option<(&'a TypeExpr, &'b str)> {
+    let mut current = start;
+    for segment in field_path {
+        match current {
+            TypeExpr::Struct { fields } => match fields.iter().find(|(name, _)| name == segment) {
+                Some((_, ty)) => {
+                    current = ty;
+                }
+                None => return Some((current, segment.as_str())),
+            },
+            // Lists, maps, and scalars don't host `.field` access at all.
+            // The caller wants iteration / subscript / nothing,
+            // respectively. The mismatched type is the parent that was
+            // reached; the diagnostic builder turns that into the right
+            // suggestion.
+            _ => return Some((current, segment.as_str())),
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1623,5 +1840,424 @@ mod tests {
         )]);
         let errs = check_upstream_state_for_iterable_shapes(&parsed, &exports);
         assert!(errs.is_empty(), "missing field → silent, got: {errs:?}");
+    }
+
+    // ================================================================
+    // #1894 follow-up: attribute-access shape compatibility
+    // (`check_upstream_state_attribute_access_shapes`)
+    // ================================================================
+
+    #[test]
+    fn attribute_access_struct_with_known_field_is_ok() {
+        // Upstream exports `account: struct { id: String, region: String }`,
+        // downstream writes `orgs.account.id` — the `id` field is declared,
+        // shape check stays silent.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.account.id
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[(
+                "account",
+                TypeExpr::Struct {
+                    fields: vec![
+                        ("id".to_string(), TypeExpr::String),
+                        ("region".to_string(), TypeExpr::String),
+                    ],
+                },
+            )],
+        )]);
+        let errs = check_upstream_state_attribute_access_shapes(&parsed, &exports);
+        assert!(
+            errs.is_empty(),
+            "known struct field must pass, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn attribute_access_struct_with_unknown_field_flags_mismatch() {
+        // `orgs.account.region` against a struct that doesn't declare
+        // `region` is the canonical "downstream depends on upstream's
+        // schema and the upstream changed" failure.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.account.region
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[(
+                "account",
+                TypeExpr::Struct {
+                    fields: vec![("id".to_string(), TypeExpr::String)],
+                },
+            )],
+        )]);
+        let errs = check_upstream_state_attribute_access_shapes(&parsed, &exports);
+        assert_eq!(
+            errs.len(),
+            1,
+            "unknown struct field must fail, got: {errs:?}"
+        );
+        assert_eq!(errs[0].binding, "orgs");
+        assert_eq!(errs[0].field, "account");
+        assert_eq!(errs[0].field_path, vec!["region".to_string()]);
+        let msg = errs[0].diagnostic_message();
+        assert!(
+            msg.contains("region"),
+            "message must name the missing field: {msg}"
+        );
+    }
+
+    #[test]
+    fn attribute_access_against_list_export_flags_mismatch() {
+        // `orgs.accounts.foo` against `accounts: list(_)` is a category
+        // error — the user has to iterate first.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.accounts.foo
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[(
+                "accounts",
+                TypeExpr::List(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+            )],
+        )]);
+        let errs = check_upstream_state_attribute_access_shapes(&parsed, &exports);
+        assert_eq!(
+            errs.len(),
+            1,
+            "field access on list must fail, got: {errs:?}"
+        );
+        let msg = errs[0].diagnostic_message();
+        assert!(
+            msg.contains("list"),
+            "message must mention list shape: {msg}"
+        );
+    }
+
+    #[test]
+    fn attribute_access_against_map_export_flags_mismatch() {
+        // `orgs.accounts.alpha` against `accounts: map(_)` — same class
+        // of error. The carina parser does not currently accept
+        // subscript-after-field-access (see `parser/expressions/primary.rs`
+        // — `index access after field access is not supported`), so
+        // `accounts["alpha"]` and `accounts.alpha` are *both* errors
+        // today, just at different layers (parser vs. this check).
+        // Bare `.alpha` parses as struct-field access, which is what
+        // this check rejects against a map export.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.accounts.alpha
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[(
+                "accounts",
+                TypeExpr::Map(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+            )],
+        )]);
+        let errs = check_upstream_state_attribute_access_shapes(&parsed, &exports);
+        assert_eq!(
+            errs.len(),
+            1,
+            "field access on map must fail, got: {errs:?}"
+        );
+        let msg = errs[0].diagnostic_message();
+        assert!(msg.contains("map"), "message must mention map shape: {msg}");
+    }
+
+    #[test]
+    fn attribute_access_against_scalar_export_flags_mismatch() {
+        // `orgs.region.foo` against `region: String` — scalars have no
+        // fields.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.region.foo
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[("orgs", &[("region", TypeExpr::String)])]);
+        let errs = check_upstream_state_attribute_access_shapes(&parsed, &exports);
+        assert_eq!(
+            errs.len(),
+            1,
+            "field access on scalar must fail, got: {errs:?}"
+        );
+        let msg = errs[0].diagnostic_message();
+        assert!(
+            msg.contains("String"),
+            "message must show scalar export type: {msg}"
+        );
+    }
+
+    #[test]
+    fn attribute_access_skipped_when_export_has_no_declared_type() {
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.account.id
+                }
+            "#,
+            "test",
+        );
+        let mut exports = UpstreamExports::new();
+        let mut fields = HashMap::new();
+        fields.insert("account".to_string(), None);
+        exports.insert("orgs".to_string(), fields);
+        let errs = check_upstream_state_attribute_access_shapes(&parsed, &exports);
+        assert!(errs.is_empty(), "no annotation → silent, got: {errs:?}");
+    }
+
+    #[test]
+    fn attribute_access_skipped_when_binding_unknown() {
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.account.id
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[]);
+        let errs = check_upstream_state_attribute_access_shapes(&parsed, &exports);
+        assert!(errs.is_empty(), "missing binding → silent, got: {errs:?}");
+    }
+
+    #[test]
+    fn attribute_access_skipped_when_field_not_exported() {
+        // `orgs.NONEXISTENT.id` — field-name check already surfaces
+        // the missing top-level export; the shape check stays silent.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.NONEXISTENT.id
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[(
+                "account",
+                TypeExpr::Struct {
+                    fields: vec![("id".to_string(), TypeExpr::String)],
+                },
+            )],
+        )]);
+        let errs = check_upstream_state_attribute_access_shapes(&parsed, &exports);
+        assert!(errs.is_empty(), "missing field → silent, got: {errs:?}");
+    }
+
+    #[test]
+    fn attribute_access_skipped_when_field_path_empty() {
+        // `orgs.account` (no `.foo`) — that's just a top-level field
+        // ref, handled by `check_upstream_state_field_types`.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.account
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[(
+                "account",
+                TypeExpr::Struct {
+                    fields: vec![("id".to_string(), TypeExpr::String)],
+                },
+            )],
+        )]);
+        let errs = check_upstream_state_attribute_access_shapes(&parsed, &exports);
+        assert!(errs.is_empty(), "no field_path → silent, got: {errs:?}");
+    }
+
+    #[test]
+    fn attribute_access_nested_struct_field_walks_path() {
+        // `orgs.account.network.vpc_id` against
+        // `account: struct { network: struct { vpc_id: String } }` — the
+        // walker must descend into nested structs.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.account.network.vpc_id
+                }
+            "#,
+            "test",
+        );
+        let inner = TypeExpr::Struct {
+            fields: vec![("vpc_id".to_string(), TypeExpr::String)],
+        };
+        let outer = TypeExpr::Struct {
+            fields: vec![("network".to_string(), inner)],
+        };
+        let exports = mk_typed_exports(&[("orgs", &[("account", outer)])]);
+        let errs = check_upstream_state_attribute_access_shapes(&parsed, &exports);
+        assert!(
+            errs.is_empty(),
+            "nested struct path must pass, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn attribute_access_nested_struct_unknown_field_flagged() {
+        // Same fixture but the deep field is wrong — must still be
+        // caught.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.account.network.bad_field
+                }
+            "#,
+            "test",
+        );
+        let inner = TypeExpr::Struct {
+            fields: vec![("vpc_id".to_string(), TypeExpr::String)],
+        };
+        let outer = TypeExpr::Struct {
+            fields: vec![("network".to_string(), inner)],
+        };
+        let exports = mk_typed_exports(&[("orgs", &[("account", outer)])]);
+        let errs = check_upstream_state_attribute_access_shapes(&parsed, &exports);
+        assert_eq!(
+            errs.len(),
+            1,
+            "nested unknown field must fail, got: {errs:?}"
+        );
+        assert_eq!(
+            errs[0].field_path,
+            vec!["network".to_string(), "bad_field".to_string()]
+        );
+        assert_eq!(errs[0].bad_segment, "bad_field");
+        let msg = errs[0].diagnostic_message();
+        assert!(
+            msg.contains("bad_field"),
+            "message must name the missing leaf: {msg}"
+        );
+    }
+
+    #[test]
+    fn attribute_access_struct_containing_list_flags_at_list_position() {
+        // `account: struct { tags: list(String) }` — `orgs.account.tags`
+        // resolves cleanly (struct → list, no further `.field`); but
+        // `orgs.account.tags.foo` walks past the list and must flag
+        // there. The `mismatched_at` is the list, not the outer struct.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.account.tags.foo
+                }
+            "#,
+            "test",
+        );
+        let outer = TypeExpr::Struct {
+            fields: vec![(
+                "tags".to_string(),
+                TypeExpr::List(Box::new(TypeExpr::String)),
+            )],
+        };
+        let exports = mk_typed_exports(&[("orgs", &[("account", outer)])]);
+        let errs = check_upstream_state_attribute_access_shapes(&parsed, &exports);
+        assert_eq!(errs.len(), 1, "list-at-depth must flag, got: {errs:?}");
+        assert_eq!(errs[0].bad_segment, "foo");
+        assert!(
+            matches!(errs[0].mismatched_at, TypeExpr::List(_)),
+            "mismatched_at must be the inner list, got: {:?}",
+            errs[0].mismatched_at
+        );
+        let msg = errs[0].diagnostic_message();
+        assert!(
+            msg.contains("list") && msg.contains("for x in"),
+            "message must mention list and suggest iteration: {msg}"
+        );
+    }
+
+    #[test]
+    fn attribute_access_shape_check_against_real_directory_fixture() {
+        // Directory-scoped acceptance: upstream's `exports.crn` lives
+        // in a sibling directory and `resolve_upstream_exports` parses
+        // it off disk. Mirrors the parity test for the for-iterable
+        // sibling (`for_iterable_shape_check_against_real_directory_fixture`).
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream_dir = tmp.path().join("organizations");
+        fs::create_dir(&upstream_dir).unwrap();
+        write_crn(
+            &upstream_dir,
+            "exports.crn",
+            r#"exports {
+                accounts: list(String) = ["111111111111"]
+            }"#,
+        );
+        write_crn(
+            &upstream_dir,
+            "providers.crn",
+            "provider test {\n  source = 'x/y'\n  version = '0.1'\n  region = 'ap-northeast-1'\n}\n",
+        );
+        let base = tmp.path().join("downstream");
+        fs::create_dir(&base).unwrap();
+        write_crn(
+            &base,
+            "providers.crn",
+            "provider test {\n  source = 'x/y'\n  version = '0.1'\n  region = 'ap-northeast-1'\n}\n",
+        );
+        write_crn(
+            &base,
+            "main.crn",
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.accounts.foo
+                }
+            "#,
+        );
+        let parsed = parse_directory(&base, &ctx()).expect("parse_directory");
+        let (exports, resolve_errs) =
+            resolve_upstream_exports(&base, &parsed.upstream_states, &ctx());
+        assert!(
+            resolve_errs.is_empty(),
+            "unexpected resolve errors: {resolve_errs:?}"
+        );
+        let errs = check_upstream_state_attribute_access_shapes(&parsed, &exports);
+        assert_eq!(
+            errs.len(),
+            1,
+            "expected one shape mismatch from list export + .field access, got: {errs:?}"
+        );
+        assert_eq!(errs[0].field, "accounts");
+        assert_eq!(errs[0].bad_segment, "foo");
+        assert!(matches!(errs[0].mismatched_at, TypeExpr::List(_)));
     }
 }

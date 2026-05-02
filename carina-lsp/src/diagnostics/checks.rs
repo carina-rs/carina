@@ -470,6 +470,14 @@ impl DiagnosticEngine {
         let shape_errors = carina_core::upstream_exports::check_upstream_state_for_iterable_shapes(
             merged, &exports,
         );
+        // #1894 follow-up: cross-directory attribute-access shape check.
+        // Anchored at `binding.field` so the squiggle lands at the start
+        // of the access chain (the rest of `.foo.bar` is part of the
+        // diagnostic message rather than the range).
+        let attribute_access_errors =
+            carina_core::upstream_exports::check_upstream_state_attribute_access_shapes(
+                merged, &exports,
+            );
         let mut seen_count: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         self.push_upstream_ref_diagnostics(
@@ -493,6 +501,14 @@ impl DiagnosticEngine {
             &mut seen_count,
             &mut diagnostics,
             shape_errors
+                .iter()
+                .map(|e| (e.binding.as_str(), e.field.as_str(), e.diagnostic_message())),
+        );
+        self.push_upstream_ref_diagnostics(
+            doc,
+            &mut seen_count,
+            &mut diagnostics,
+            attribute_access_errors
                 .iter()
                 .map(|e| (e.binding.as_str(), e.field.as_str(), e.diagnostic_message())),
         );
