@@ -175,6 +175,7 @@ pub enum ValidatorType {
 /// so JSON payloads from older or minimal producers omit the field and
 /// fall back to `Managed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SchemaKind {
     #[default]
     Managed,
