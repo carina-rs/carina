@@ -381,6 +381,15 @@ pub fn validate_and_resolve_errors_with_factories(
             parsed,
             &upstream_exports,
         );
+        // #1894 follow-up: cross-directory attribute-access shape check.
+        // Catches `orgs.account.bad_field` / `orgs.list_field.foo` where
+        // the downstream's `.field` chain doesn't fit the upstream's
+        // declared `TypeExpr`.
+        let attribute_access_errors =
+            carina_core::upstream_exports::check_upstream_state_attribute_access_shapes(
+                parsed,
+                &upstream_exports,
+            );
         errors.extend(
             resolve_errors
                 .iter()
@@ -398,6 +407,11 @@ pub fn validate_and_resolve_errors_with_factories(
         );
         errors.extend(
             shape_errors
+                .iter()
+                .map(|e| AppError::Validation(e.to_string())),
+        );
+        errors.extend(
+            attribute_access_errors
                 .iter()
                 .map(|e| AppError::Validation(e.to_string())),
         );
