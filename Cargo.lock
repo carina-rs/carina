@@ -831,6 +831,7 @@ dependencies = [
  "aws-sdk-s3",
  "base64",
  "carina-core",
+ "carina-lsp",
  "carina-plugin-host",
  "carina-provider-mock",
  "carina-provider-resolver",
@@ -853,6 +854,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tower-lsp",
 ]
 
 [[package]]
