@@ -32,6 +32,57 @@ struct ValidateWarning {
     file: Option<String>,
 }
 
+/// Test-only entry point for the validate pipeline (#2247).
+///
+/// Runs the same pipeline `run_validate` runs (parse → resolve →
+/// schema-based validation) but with caller-supplied
+/// [`ProviderFactory`] instances. This lets e2e tests exercise the
+/// full CLI validation path against hand-built schemas without
+/// loading a WASM provider plugin — the LSP-side `e2e_typecheck`
+/// tests already do the equivalent for `DiagnosticEngine`, and this
+/// keeps the CLI side covered without requiring an `#[ignore]`-gated
+/// WASM build.
+///
+/// Returns the human-readable error strings the CLI would print to
+/// stderr (one per line of `Validating failed: ...`). Empty `Vec`
+/// means validation passed.
+///
+/// Not used outside test code.
+pub fn validate_with_factories(
+    path: &PathBuf,
+    factories: Vec<Box<dyn carina_core::provider::ProviderFactory>>,
+) -> Vec<String> {
+    let provider_context = ProviderContext::default();
+    let loaded = match load_configuration_with_config(path, &provider_context) {
+        Ok(l) => l,
+        Err(e) => return vec![e.to_string()],
+    };
+    let mut parsed = loaded.parsed;
+    let base_dir = get_base_dir(path);
+
+    let mut error_reports: Vec<String> = Vec::new();
+    error_reports.extend(
+        loaded
+            .identifier_scope_errors
+            .iter()
+            .map(ToString::to_string),
+    );
+
+    error_reports.extend(
+        super::validate_and_resolve_errors_with_factories(
+            &mut parsed,
+            base_dir,
+            false,
+            factories,
+            std::collections::HashMap::new(),
+        )
+        .iter()
+        .map(ToString::to_string),
+    );
+
+    error_reports
+}
+
 pub fn run_validate(
     path: &PathBuf,
     json: bool,

@@ -12,7 +12,7 @@ pub mod skills;
 pub mod state;
 pub mod validate;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -194,6 +194,32 @@ pub fn validate_and_resolve_errors(
     skip_resource_validation: bool,
 ) -> Vec<AppError> {
     let (factories, load_errors) = build_factories_from_providers(&parsed.providers, base_dir);
+    validate_and_resolve_errors_with_factories(
+        parsed,
+        base_dir,
+        skip_resource_validation,
+        factories,
+        load_errors,
+    )
+}
+
+/// Factory-injected variant of [`validate_and_resolve_errors`]. The CLI
+/// validation pipeline runs against caller-provided
+/// [`Box<dyn ProviderFactory>`] instances rather than building them from
+/// the parsed file's `provider` blocks.
+///
+/// Exposed so e2e tests can drive the full pipeline (parse → resolve →
+/// validate) against hand-built schemas without standing up a WASM
+/// provider plugin (#2247). The production path goes through the
+/// non-injecting wrapper above; this entry point is not used outside
+/// tests.
+pub fn validate_and_resolve_errors_with_factories(
+    parsed: &mut ParsedFile,
+    base_dir: &Path,
+    skip_resource_validation: bool,
+    factories: Vec<Box<dyn carina_core::provider::ProviderFactory>>,
+    load_errors: HashMap<String, String>,
+) -> Vec<AppError> {
     let ctx = WiringContext::new(factories);
 
     let mut errors: Vec<AppError> = Vec::new();
