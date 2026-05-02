@@ -739,28 +739,37 @@ impl AttributeType {
 
     /// Validate a `Union` variant: succeed if any member accepts the value.
     ///
-    /// Prefer a `Struct` member's structured error over generic
-    /// `TypeMismatch` when the value is a `Map` — that gives actionable
-    /// feedback (e.g. "unknown field 'aaa'") instead of
-    /// "expected Struct | String, got Map".
+    /// On failure, return the structurally-closest member's error rather
+    /// than a generic `TypeMismatch`. "Closest" is measured by
+    /// [`union_member_score`]: members whose outer constructor matches
+    /// the input's (Map↔Struct, List↔List, String↔StringEnum, scalar↔
+    /// scalar) outscore unrelated members. The first member at the
+    /// maximum score wins — declaration order is preserved by the
+    /// strict `>` comparison below, so the prior Map↔Struct preference
+    /// still holds when multiple Struct members tie. When no member
+    /// shares any structural similarity, fall through to `TypeMismatch`.
+    /// See #2219.
     fn validate_union(&self, value: &Value) -> Result<(), TypeError> {
         let AttributeType::Union(types) = self else {
             unreachable!("validate_union called on non-Union");
         };
-        let mut struct_error = None;
+        let mut best: Option<(u32, TypeError)> = None;
         for member in types {
             match member.validate(value) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    if matches!(value, Value::Map(_))
-                        && matches!(member, AttributeType::Struct { .. })
+                    let score = union_member_score(member, value);
+                    if score > 0
+                        && best
+                            .as_ref()
+                            .is_none_or(|(prev_score, _)| score > *prev_score)
                     {
-                        struct_error = Some(e);
+                        best = Some((score, e));
                     }
                 }
             }
         }
-        Err(struct_error.unwrap_or(TypeError::TypeMismatch {
+        Err(best.map(|(_, e)| e).unwrap_or(TypeError::TypeMismatch {
             expected: self.type_name(),
             got: value.type_name(),
         }))
@@ -906,6 +915,63 @@ impl AttributeType {
             (_non_custom, Custom { .. }) => false,
             (a, b) => a.type_name() == b.type_name(),
         }
+    }
+}
+
+/// Rank a Union member against a runtime value by structural distance:
+/// how close the member's outer constructor is to the input's. Higher
+/// is closer; 0 means no shared structure. Used by `validate_union`
+/// to pick which member's error message to surface on failure (#2219).
+///
+/// Map↔Struct stays the highest (preserves the prior heuristic). The
+/// other constructor pairs — Map↔Map, List↔List, String↔String /
+/// StringEnum, scalar↔scalar — get the next tier. `Custom` defers to
+/// its declared `base`, so a Union of `Int | positive_int()`
+/// validating an `Int` input still surfaces the predicate's message.
+/// `Union` members recurse and take the best inner score so nested
+/// unions still produce a meaningful error.
+///
+/// On a tie, the first member at the maximum wins — `validate_union`
+/// uses strict `>` so declaration order is preserved.
+fn union_member_score(member: &AttributeType, value: &Value) -> u32 {
+    use AttributeType as AT;
+    match (member, value) {
+        // Map↔Struct: the original heuristic. Highest score so a
+        // Struct member's "Unknown field 'x'" wins over a sibling's
+        // generic `TypeMismatch`.
+        (AT::Struct { .. }, Value::Map(_)) => 100,
+        // Same-constructor match — second tier.
+        (AT::Map { .. }, Value::Map(_))
+        | (AT::String, Value::String(_))
+        | (AT::Int, Value::Int(_))
+        | (AT::Float, Value::Float(_))
+        | (AT::Bool, Value::Bool(_))
+        | (AT::StringEnum { .. }, Value::String(_)) => 80,
+        // List↔List: peek at the first element's structural match
+        // against the member's inner type so `List<Struct>` outranks
+        // `List<String>` for an input like `[{...}]`. The inner
+        // contribution is halved so arbitrarily deep nesting can't
+        // exceed the Map↔Struct tier (100). Empty lists fall back to
+        // the bare same-constructor score.
+        (AT::List { inner, .. }, Value::List(items)) => {
+            let inner_bonus = items
+                .first()
+                .map(|first| union_member_score(inner, first) / 2)
+                .unwrap_or(0);
+            80 + inner_bonus
+        }
+        // Custom defers to its `base`. A Custom with a Struct/Int/
+        // String base ranks the same as that base would — its
+        // validator's `ValidationFailed` message is then the one
+        // `validate_union` surfaces on failure.
+        (AT::Custom { base, .. }, v) => union_member_score(base, v),
+        // Nested Union: recurse and take the best inner match.
+        (AT::Union(inner), v) => inner
+            .iter()
+            .map(|m| union_member_score(m, v))
+            .max()
+            .unwrap_or(0),
+        _ => 0,
     }
 }
 
