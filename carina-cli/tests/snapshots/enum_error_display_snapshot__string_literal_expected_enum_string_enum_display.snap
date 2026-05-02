@@ -1,0 +1,5 @@
+---
+source: carina-cli/tests/enum_error_display_snapshot.rs
+expression: "render_first_error(&schema, attrs, true)"
+---
+'target_type' (TargetType) expects an enum identifier, got a string literal "aaa". Use one of: awscc.sso.Assignment.TargetType.AWS_ACCOUNT, awscc.sso.Assignment.TargetType.GROUP

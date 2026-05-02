@@ -287,7 +287,14 @@ fn string_literal_expected_enum_formats_shape_message() {
         user_typed: "aaa".to_string(),
         attribute: Some("target_type".to_string()),
         type_name: "TargetType".to_string(),
-        expected: vec!["awscc.sso.Assignment.TargetType.AWS_ACCOUNT".to_string()],
+        expected: vec![ExpectedEnumVariant {
+            provider: Some("awscc".to_string()),
+            segments: vec!["sso".to_string(), "Assignment".to_string()],
+            type_name: "TargetType".to_string(),
+            value: "AWS_ACCOUNT".to_string(),
+            is_alias: false,
+        }],
+        extra_message: None,
     };
     let msg = err.to_string();
     assert!(
@@ -317,7 +324,13 @@ fn into_string_literal_diagnostic_reshapes_invalid_enum_variant() {
         value: "aaa".to_string(),
         attribute: Some("target_type".to_string()),
         type_name: Some("TargetType".to_string()),
-        expected: vec!["awscc.sso.Assignment.TargetType.AWS_ACCOUNT".to_string()],
+        expected: vec![ExpectedEnumVariant {
+            provider: Some("awscc".to_string()),
+            segments: vec!["sso".to_string(), "Assignment".to_string()],
+            type_name: "TargetType".to_string(),
+            value: "AWS_ACCOUNT".to_string(),
+            is_alias: false,
+        }],
     };
     let reshaped = original.into_string_literal_diagnostic();
     match reshaped {
@@ -326,14 +339,17 @@ fn into_string_literal_diagnostic_reshapes_invalid_enum_variant() {
             attribute,
             type_name,
             expected,
+            extra_message,
         } => {
             assert_eq!(user_typed, "aaa");
             assert_eq!(attribute.as_deref(), Some("target_type"));
             assert_eq!(type_name, "TargetType");
+            assert_eq!(expected.len(), 1);
             assert_eq!(
-                expected,
-                vec!["awscc.sso.Assignment.TargetType.AWS_ACCOUNT".to_string()]
+                expected[0].to_string(),
+                "awscc.sso.Assignment.TargetType.AWS_ACCOUNT"
             );
+            assert_eq!(extra_message, None);
         }
         other => panic!("expected StringLiteralExpectedEnum, got {other:?}"),
     }
@@ -2748,4 +2764,163 @@ mod validate_collect_tests {
             other => panic!("expected UnknownStructField with suggestion, got {other:?}"),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// #2220 — ExpectedEnumVariant structured candidates
+// ---------------------------------------------------------------------------
+
+#[test]
+fn expected_enum_variant_display_namespaced_matches_legacy_format() {
+    // The Display impl must reproduce the pre-#2220 rendered string
+    // byte-for-byte so existing CLI / LSP messages stay stable.
+    let v = ExpectedEnumVariant {
+        provider: Some("awscc".to_string()),
+        segments: vec!["sso".to_string(), "Assignment".to_string()],
+        type_name: "TargetType".to_string(),
+        value: "AWS_ACCOUNT".to_string(),
+        is_alias: false,
+    };
+    assert_eq!(v.to_string(), "awscc.sso.Assignment.TargetType.AWS_ACCOUNT");
+}
+
+#[test]
+fn expected_enum_variant_display_bare_when_no_provider() {
+    // Non-namespaced enums (`provider = None`) must render only the
+    // bare value — matching how the legacy formatter pushed `v.to_string()`
+    // when `namespace` was `None`.
+    let v = ExpectedEnumVariant {
+        provider: None,
+        segments: Vec::new(),
+        type_name: "Mode".to_string(),
+        value: "fast".to_string(),
+        is_alias: false,
+    };
+    assert_eq!(v.to_string(), "fast");
+}
+
+#[test]
+fn expected_enum_variant_construction_splits_namespace() {
+    // Namespace head becomes `provider`, the rest become `segments`.
+    let v = ExpectedEnumVariant::from_namespaced(
+        Some("aws.s3.Bucket"),
+        "VersioningStatus",
+        "Enabled",
+        false,
+    );
+    assert_eq!(v.provider.as_deref(), Some("aws"));
+    assert_eq!(v.segments, vec!["s3".to_string(), "Bucket".to_string()]);
+    assert_eq!(v.type_name, "VersioningStatus");
+    assert_eq!(v.value, "Enabled");
+    assert!(!v.is_alias);
+}
+
+#[test]
+fn expected_includes_to_dsl_aliases_with_alias_flag() {
+    // When the schema declares a `to_dsl` mapping, both the canonical
+    // value and the alias appear in `expected`. The alias must be
+    // marked `is_alias = true` so consumers (LSP code action) can
+    // prefer the canonical form.
+    fn lower(v: &str) -> String {
+        v.to_ascii_lowercase()
+    }
+    let t = AttributeType::StringEnum {
+        name: "VersioningStatus".to_string(),
+        values: vec!["Enabled".to_string(), "Suspended".to_string()],
+        namespace: Some("aws.s3.Bucket".to_string()),
+        to_dsl: Some(lower),
+    };
+    let err = t.validate(&Value::String("zzz".to_string())).unwrap_err();
+    let TypeError::InvalidEnumVariant { expected, .. } = err else {
+        panic!("expected InvalidEnumVariant, got {err:?}");
+    };
+    let canonical: Vec<_> = expected.iter().filter(|e| !e.is_alias).collect();
+    let aliases: Vec<_> = expected.iter().filter(|e| e.is_alias).collect();
+    assert_eq!(
+        canonical
+            .iter()
+            .map(|e| e.value.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Enabled", "Suspended"]
+    );
+    assert_eq!(
+        aliases.iter().map(|e| e.value.as_str()).collect::<Vec<_>>(),
+        vec!["enabled", "suspended"],
+        "to_dsl aliases must be present and tagged is_alias=true"
+    );
+    // Every entry round-trips through Display in the legacy form.
+    assert!(
+        canonical
+            .iter()
+            .all(|e| e.to_string().starts_with("aws.s3.Bucket.VersioningStatus."))
+    );
+}
+
+#[test]
+fn custom_namespaced_string_literal_routes_validator_text_to_extra_message() {
+    // For `AttributeType::Custom` namespaced types the validator
+    // produces an unstructured message. Pre-#2220 it rode in the
+    // `expected: Vec<String>` slot (as a single-element vec). After
+    // #2220 the variants slot is structured, so the validator's text
+    // moves to `extra_message`. The rendered Display output must stay
+    // byte-identical.
+    fn validate_mode(v: &Value) -> Result<(), String> {
+        match v {
+            Value::String(s) if s == "test.r.Mode.fast" => Ok(()),
+            Value::String(s) => Err(format!("invalid Mode '{}': expected fast", s)),
+            _ => Err("expected String".to_string()),
+        }
+    }
+    let schema = ResourceSchema::new("test.r.mode_holder").attribute(
+        AttributeSchema::new(
+            "mode",
+            AttributeType::Custom {
+                semantic_name: Some("Mode".to_string()),
+                base: Box::new(AttributeType::String),
+                pattern: None,
+                length: None,
+                validate: validate_mode,
+                namespace: Some("test.r".to_string()),
+                to_dsl: None,
+            },
+        )
+        .required(),
+    );
+    let mut attrs = HashMap::new();
+    attrs.insert("mode".to_string(), Value::String("aaa".to_string()));
+    let errs = schema
+        .validate_with_origins(&attrs, &|n| n == "mode")
+        .unwrap_err();
+    let reshaped = errs
+        .into_iter()
+        .find(|e| matches!(e, TypeError::StringLiteralExpectedEnum { .. }))
+        .expect("Custom-namespaced literal must reshape into StringLiteralExpectedEnum");
+    let TypeError::StringLiteralExpectedEnum {
+        expected,
+        extra_message,
+        ..
+    } = &reshaped
+    else {
+        unreachable!();
+    };
+    assert!(
+        expected.is_empty(),
+        "Custom-namespaced reshape leaves structured variants empty"
+    );
+    let msg = extra_message
+        .as_deref()
+        .expect("validator text must be carried on extra_message");
+    assert!(
+        msg.contains("invalid Mode") && msg.contains("expected fast"),
+        "extra_message must carry validator text, got: {msg}"
+    );
+    let rendered = reshaped.to_string();
+    assert!(
+        rendered.contains(msg),
+        "Display must surface extra_message text in tail, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("expects an enum identifier"),
+        "Display must keep the shape-mismatch wording, got: {rendered}"
+    );
 }

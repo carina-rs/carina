@@ -1,0 +1,5 @@
+---
+source: carina-cli/tests/enum_error_display_snapshot.rs
+expression: "render_first_error(&schema, attrs, true)"
+---
+'mode' (Mode) expects an enum identifier, got a string literal "aaa". Use one of: invalid Mode 'test.r.Mode.aaa': expected fast

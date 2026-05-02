@@ -1,0 +1,5 @@
+---
+source: carina-cli/tests/enum_error_display_snapshot.rs
+expression: "render_first_error(&schema, attrs, false)"
+---
+Invalid value 'aws.s3.Bucket.VersioningStatus.NotReal' for 'versioning' (VersioningStatus): expected one of aws.s3.Bucket.VersioningStatus.Enabled, aws.s3.Bucket.VersioningStatus.Suspended
