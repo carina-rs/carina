@@ -16,7 +16,6 @@ mod test_utils;
 #[cfg(test)]
 mod tui_snapshot_tests;
 
-use std::collections::HashMap;
 use std::io;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -26,7 +25,7 @@ use ratatui::prelude::*;
 
 use carina_core::module::FileSignature;
 use carina_core::plan::Plan;
-use carina_core::schema::ResourceSchema;
+use carina_core::schema::SchemaRegistry;
 
 pub use app::{App, FocusedPanel};
 pub use module_info_app::ModuleInfoApp;
@@ -187,7 +186,7 @@ pub fn run_module_info(signature: &FileSignature) -> io::Result<()> {
 /// When schemas are provided, the detail panel shows read-only attributes
 /// with `(known after apply)` and default values with `# default`,
 /// matching CLI `--detail full` behavior.
-pub fn run(plan: &Plan, schemas: &HashMap<String, ResourceSchema>) -> io::Result<()> {
+pub fn run(plan: &Plan, schemas: &SchemaRegistry) -> io::Result<()> {
     let mut app = App::new(plan, schemas);
     run_tui(ui::draw, handle_key, &mut app)
 }
@@ -233,7 +232,7 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(Effect::Create(Resource::new("s3.Bucket", "a")));
         plan.add(Effect::Create(Resource::new("s3.Bucket", "b")));
-        App::new(&plan, &HashMap::new())
+        App::new(&plan, &SchemaRegistry::new())
     }
 
     #[test]
@@ -293,7 +292,7 @@ mod tests {
                     ),
                 ),
         ));
-        App::new(&plan, &HashMap::new())
+        App::new(&plan, &SchemaRegistry::new())
     }
 
     #[test]
@@ -492,7 +491,7 @@ mod tests {
         plan.add(Effect::Create(
             Resource::with_provider("awscc", "s3.Bucket", "my-bucket").with_binding("bucket"),
         ));
-        App::new(&plan, &HashMap::new())
+        App::new(&plan, &SchemaRegistry::new())
     }
 
     #[test]

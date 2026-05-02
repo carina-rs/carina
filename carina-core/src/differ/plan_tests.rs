@@ -27,9 +27,9 @@ fn create_before_destroy_generates_temporary_name_for_name_attribute() {
         State::existing(ResourceId::new("s3.Bucket", "my-bucket"), attrs),
     );
 
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "s3.Bucket".to_string(),
+        "",
         ResourceSchema::new("s3.Bucket")
             .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only())
             .attribute(
@@ -105,9 +105,9 @@ fn create_before_destroy_generates_temporary_name_with_can_rename() {
         State::existing(ResourceId::new("logs.LogGroup", "my-log-group"), attrs),
     );
 
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "logs.LogGroup".to_string(),
+        "",
         ResourceSchema::new("logs.LogGroup")
             .attribute(
                 // log_group_name is NOT create-only in this test (can be renamed)
@@ -163,9 +163,9 @@ fn no_temporary_name_without_create_before_destroy() {
         State::existing(ResourceId::new("s3.Bucket", "my-bucket"), attrs),
     );
 
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "s3.Bucket".to_string(),
+        "",
         ResourceSchema::new("s3.Bucket")
             .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only())
             .attribute(
@@ -223,9 +223,9 @@ fn no_temporary_name_when_name_prefix_is_used() {
         State::existing(ResourceId::new("s3.Bucket", "my-bucket"), attrs),
     );
 
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "s3.Bucket".to_string(),
+        "",
         ResourceSchema::new("s3.Bucket")
             .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only())
             .attribute(
@@ -277,9 +277,9 @@ fn no_temporary_name_without_name_attribute_in_schema() {
         State::existing(ResourceId::new("ec2.Vpc", "my-vpc"), attrs),
     );
 
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "ec2.Vpc".to_string(),
+        "",
         ResourceSchema::new("ec2.Vpc")
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
         // No name_attribute set
@@ -332,9 +332,9 @@ fn no_temporary_name_when_name_attribute_changes() {
         State::existing(ResourceId::new("s3.Bucket", "my-bucket"), attrs),
     );
 
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "s3.Bucket".to_string(),
+        "",
         ResourceSchema::new("s3.Bucket")
             .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only())
             .attribute(
@@ -506,7 +506,7 @@ fn create_plan_detects_attribute_removal() {
         &resources,
         &current_states,
         &HashMap::new(),
-        &HashMap::new(),
+        &SchemaRegistry::new(),
         &HashMap::new(),
         &prev_desired_keys,
         &HashMap::new(),
@@ -556,9 +556,9 @@ fn create_plan_filters_non_removable_attribute_removal() {
 
     // Schema: tags is auto-removable (optional, not create-only),
     // region is explicitly non-removable (provider-inherited)
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "s3.Bucket".to_string(),
+        "",
         ResourceSchema::new("s3.Bucket")
             .attribute(AttributeSchema::new("region", AttributeType::String).non_removable())
             .attribute(AttributeSchema::new(
@@ -624,9 +624,9 @@ fn create_plan_skips_update_when_only_non_removable_removal() {
     );
 
     // Schema: region is explicitly non-removable, bucket is required
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "s3.Bucket".to_string(),
+        "",
         ResourceSchema::new("s3.Bucket")
             .attribute(AttributeSchema::new("bucket", AttributeType::String).required())
             .attribute(AttributeSchema::new("region", AttributeType::String).non_removable()),
@@ -707,7 +707,7 @@ fn prevent_destroy_blocks_delete_for_orphaned_resource() {
         &[], // no desired resources
         &current_states,
         &lifecycles,
-        &HashMap::new(),
+        &SchemaRegistry::new(),
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
@@ -757,9 +757,9 @@ fn prevent_destroy_blocks_replace() {
         State::existing(ResourceId::new("ec2.Vpc", "my-vpc"), attrs),
     );
 
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "ec2.Vpc".to_string(),
+        "",
         ResourceSchema::new("ec2.Vpc")
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
     );
@@ -819,7 +819,7 @@ fn prevent_destroy_does_not_block_update() {
         &resources,
         &current_states,
         &HashMap::new(),
-        &HashMap::new(),
+        &SchemaRegistry::new(),
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
@@ -854,7 +854,7 @@ fn prevent_destroy_does_not_block_create() {
         &resources,
         &HashMap::new(), // no current states (resource doesn't exist)
         &HashMap::new(),
-        &HashMap::new(),
+        &SchemaRegistry::new(),
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
@@ -893,7 +893,7 @@ fn without_prevent_destroy_delete_works_normally() {
         &[], // no desired resources
         &current_states,
         &HashMap::new(), // no lifecycles (default = prevent_destroy: false)
-        &HashMap::new(),
+        &SchemaRegistry::new(),
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
@@ -954,7 +954,7 @@ fn prevent_destroy_collects_multiple_errors() {
         &[],
         &current_states,
         &lifecycles,
-        &HashMap::new(),
+        &SchemaRegistry::new(),
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
@@ -990,7 +990,7 @@ fn virtual_resources_are_skipped_in_plan() {
         &resources,
         &HashMap::new(),
         &HashMap::new(),
-        &HashMap::new(),
+        &SchemaRegistry::new(),
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),

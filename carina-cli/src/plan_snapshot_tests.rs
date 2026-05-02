@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use carina_core::config_loader::load_configuration;
 use carina_core::resource::{ResourceId, State};
-use carina_core::schema::ResourceSchema;
+use carina_core::schema::SchemaRegistry;
 
 use crate::DetailLevel;
 use crate::display::{format_destroy_plan, format_plan};
@@ -26,7 +26,7 @@ fn build_plan_from_fixture(
     fixture_dir: &str,
 ) -> (
     carina_core::plan::Plan,
-    HashMap<String, ResourceSchema>,
+    SchemaRegistry,
     HashMap<ResourceId, ResourceId>,
 ) {
     let fp = build_plan_from_fixture_name(fixture_dir);
@@ -39,7 +39,7 @@ fn build_plan_and_states_from_fixture(
 ) -> (
     carina_core::plan::Plan,
     HashMap<ResourceId, State>,
-    HashMap<String, ResourceSchema>,
+    SchemaRegistry,
     HashMap<ResourceId, ResourceId>,
 ) {
     let fp = build_plan_from_fixture_name(fixture_dir);

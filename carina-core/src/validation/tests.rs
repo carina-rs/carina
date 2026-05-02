@@ -1,7 +1,7 @@
 use super::*;
 use crate::parser::{ParsedFile, ProviderContext};
 use crate::resource::Resource;
-use crate::schema::noop_validator;
+use crate::schema::{ResourceSchema, SchemaRegistry, noop_validator};
 
 fn empty_parsed() -> ParsedFile {
     ParsedFile {
@@ -415,15 +415,11 @@ fn make_schema(resource_type: &str, attrs: Vec<(&str, AttributeType)>) -> Resour
     }
 }
 
-fn test_schema_key_fn(r: &Resource) -> String {
-    r.id.resource_type.clone()
-}
-
 #[test]
 fn unknown_binding_reference_reports_error() {
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "ec2.Subnet".to_string(),
+        "awscc",
         make_schema("ec2.Subnet", vec![("vpc_id", AttributeType::String)]),
     );
 
@@ -435,8 +431,7 @@ fn unknown_binding_reference_reports_error() {
 
     let mut parsed = empty_parsed();
     parsed.resources.push(subnet); // allow: direct — fixture test inspection
-    let result =
-        validate_resource_ref_types(&parsed, &schemas, &test_schema_key_fn, &HashSet::new());
+    let result = validate_resource_ref_types(&parsed, &schemas, &HashSet::new());
     assert_eq!(
         result.unwrap_err(),
         "awscc.ec2.Subnet.web-subnet: unknown binding 'vpc' in reference vpc.vpc_id"
@@ -445,13 +440,13 @@ fn unknown_binding_reference_reports_error() {
 
 #[test]
 fn unknown_attribute_reference_reports_error() {
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "ec2.Vpc".to_string(),
+        "awscc",
         make_schema("ec2.Vpc", vec![("cidr_block", AttributeType::String)]),
     );
     schemas.insert(
-        "ec2.Subnet".to_string(),
+        "awscc",
         make_schema("ec2.Subnet", vec![("vpc_id", AttributeType::String)]),
     );
 
@@ -469,8 +464,7 @@ fn unknown_attribute_reference_reports_error() {
     let mut parsed = empty_parsed();
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
     parsed.resources.push(subnet); // allow: direct — fixture test inspection
-    let result =
-        validate_resource_ref_types(&parsed, &schemas, &test_schema_key_fn, &HashSet::new());
+    let result = validate_resource_ref_types(&parsed, &schemas, &HashSet::new());
     assert_eq!(
         result.unwrap_err(),
         "awscc.ec2.Subnet.web-subnet: unknown attribute 'nonexistent_attr' on 'vpc' in reference vpc.nonexistent_attr"
@@ -479,16 +473,16 @@ fn unknown_attribute_reference_reports_error() {
 
 #[test]
 fn unknown_attribute_reference_suggests_similar_name() {
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "ec2.internet_gateway".to_string(),
+        "awscc",
         make_schema(
             "ec2.internet_gateway",
             vec![("internet_gateway_id", AttributeType::String)],
         ),
     );
     schemas.insert(
-        "ec2.route".to_string(),
+        "awscc",
         make_schema(
             "ec2.route",
             vec![
@@ -513,8 +507,7 @@ fn unknown_attribute_reference_suggests_similar_name() {
     let mut parsed = empty_parsed();
     parsed.resources.push(igw); // allow: direct — fixture test inspection
     parsed.resources.push(route); // allow: direct — fixture test inspection
-    let result =
-        validate_resource_ref_types(&parsed, &schemas, &test_schema_key_fn, &HashSet::new());
+    let result = validate_resource_ref_types(&parsed, &schemas, &HashSet::new());
     let err = result.unwrap_err();
     assert!(
         err.contains("Did you mean 'internet_gateway_id'?"),
@@ -525,13 +518,13 @@ fn unknown_attribute_reference_suggests_similar_name() {
 
 #[test]
 fn unknown_attribute_reference_no_suggestion_when_too_different() {
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "ec2.Vpc".to_string(),
+        "awscc",
         make_schema("ec2.Vpc", vec![("cidr_block", AttributeType::String)]),
     );
     schemas.insert(
-        "ec2.Subnet".to_string(),
+        "awscc",
         make_schema("ec2.Subnet", vec![("vpc_id", AttributeType::String)]),
     );
 
@@ -550,8 +543,7 @@ fn unknown_attribute_reference_no_suggestion_when_too_different() {
     let mut parsed = empty_parsed();
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
     parsed.resources.push(subnet); // allow: direct — fixture test inspection
-    let result =
-        validate_resource_ref_types(&parsed, &schemas, &test_schema_key_fn, &HashSet::new());
+    let result = validate_resource_ref_types(&parsed, &schemas, &HashSet::new());
     let err = result.unwrap_err();
     assert!(
         !err.contains("Did you mean"),
@@ -579,20 +571,19 @@ fn ref_type_mismatch_inside_for_body_is_rejected() {
     "#;
     let parsed = crate::parser::parse(src, &ProviderContext::default()).unwrap();
 
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     // test.r.vpc exposes `vpc_id: Int`
     schemas.insert(
-        "r.vpc".to_string(),
+        "test",
         make_schema("r.vpc", vec![("vpc_id", AttributeType::Int)]),
     );
     // test.r.pool_user requires `pool_id: Bool` — incompatible with Int.
     schemas.insert(
-        "r.pool_user".to_string(),
+        "test",
         make_schema("r.pool_user", vec![("pool_id", AttributeType::Bool)]),
     );
 
-    let result =
-        validate_resource_ref_types(&parsed, &schemas, &test_schema_key_fn, &HashSet::new());
+    let result = validate_resource_ref_types(&parsed, &schemas, &HashSet::new());
     assert!(result.is_err(), "expected type-mismatch error in for body");
     let msg = result.unwrap_err();
     assert!(
@@ -1308,8 +1299,8 @@ fn attribute_param_ref_type_mismatch_detected() {
         },
     ));
 
-    let mut schemas = HashMap::new();
-    schemas.insert("iam.role".to_string(), role_schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", role_schema);
 
     let resources = vec![role];
 
@@ -1324,12 +1315,7 @@ fn attribute_param_ref_type_mismatch_detected() {
         )),
     }];
 
-    let result = validate_attribute_param_ref_types(
-        &params_mismatch,
-        &resources,
-        &schemas,
-        &|r: &Resource| r.id.resource_type.clone(),
-    );
+    let result = validate_attribute_param_ref_types(&params_mismatch, &resources, &schemas);
     assert!(
         result.is_err(),
         "Should reject String assigned to iam_role_arn"
@@ -1349,10 +1335,7 @@ fn attribute_param_ref_type_mismatch_detected() {
         )),
     }];
 
-    let result =
-        validate_attribute_param_ref_types(&params_match, &resources, &schemas, &|r: &Resource| {
-            r.id.resource_type.clone()
-        });
+    let result = validate_attribute_param_ref_types(&params_match, &resources, &schemas);
     assert!(
         result.is_ok(),
         "Should accept IamRoleArn assigned to iam_role_arn"
@@ -1579,9 +1562,9 @@ fn type_compat_plain_string_rejected_for_simple() {
 fn validate_export_param_ref_types_map_accepts_compatible_types() {
     use crate::parser::ExportParameter;
 
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "organizations.account".to_string(),
+        "awscc",
         make_schema(
             "organizations.account",
             vec![("account_id", AttributeType::String)],
@@ -1609,8 +1592,7 @@ fn validate_export_param_ref_types_map_accepts_compatible_types() {
         value: Some(Value::Map(map_value)),
     }];
 
-    let result =
-        validate_export_param_ref_types(&exports, &[registry_prod], &schemas, &test_schema_key_fn);
+    let result = validate_export_param_ref_types(&exports, &[registry_prod], &schemas);
     assert!(
         result.is_ok(),
         "map(String) = {{ prod = registry_prod.account_id (String) }} should pass, got: {:?}",
@@ -1622,9 +1604,9 @@ fn validate_export_param_ref_types_map_accepts_compatible_types() {
 fn validate_export_param_ref_types_map_rejects_type_mismatch() {
     use crate::parser::ExportParameter;
 
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "organizations.account".to_string(),
+        "awscc",
         make_schema(
             "organizations.account",
             vec![("account_id", AttributeType::String)],
@@ -1652,8 +1634,7 @@ fn validate_export_param_ref_types_map_rejects_type_mismatch() {
         value: Some(Value::Map(map_value)),
     }];
 
-    let result =
-        validate_export_param_ref_types(&exports, &[registry_prod], &schemas, &test_schema_key_fn);
+    let result = validate_export_param_ref_types(&exports, &[registry_prod], &schemas);
     assert!(
         result.is_err(),
         "map(Bool) = {{ prod = registry_prod.account_id }} (String) should be flagged as type mismatch"
@@ -1679,8 +1660,8 @@ fn validate_resources_rejects_missing_exclusive_required() {
     )
     .exclusive_required(&["cidr_block", "ipv4_ipam_pool_id"]);
 
-    let mut schemas = HashMap::new();
-    schemas.insert("ec2.Vpc".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
 
     let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc");
 
@@ -1689,7 +1670,7 @@ fn validate_resources_rejects_missing_exclusive_required() {
 
     let mut parsed = empty_parsed();
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
-    let err = validate_resources(&parsed, &schemas, &test_schema_key_fn, &known).unwrap_err();
+    let err = validate_resources(&parsed, &schemas, &known).unwrap_err();
     assert!(
         err.contains("Exactly one of [cidr_block, ipv4_ipam_pool_id] must be specified"),
         "expected exclusive_required error, got: {err}"
@@ -1714,9 +1695,9 @@ fn enum_membership_violation_in_for_body_is_flagged() {
     "#;
     let parsed = crate::parser::parse(src, &ProviderContext::default()).unwrap();
 
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "r.mode_holder".to_string(),
+        "test",
         make_schema(
             "r.mode_holder",
             vec![(
@@ -1734,7 +1715,7 @@ fn enum_membership_violation_in_for_body_is_flagged() {
     let mut known = HashSet::new();
     known.insert("test".to_string());
 
-    let result = validate_resources(&parsed, &schemas, &test_schema_key_fn, &known);
+    let result = validate_resources(&parsed, &schemas, &known);
     assert!(result.is_err(), "expected enum-mismatch error in for body");
     let err = result.unwrap_err();
     assert!(
@@ -1748,10 +1729,10 @@ fn enum_membership_violation_in_for_body_is_flagged() {
 ///   2. `mode = aaa`   (bare invalid)     → InvalidEnumVariant (unchanged)
 ///   3. `mode = fast`  (bare valid)       → pass (unchanged)
 ///   4. fully-qualified form              → pass (unchanged)
-fn mode_schema() -> HashMap<String, ResourceSchema> {
-    let mut schemas = HashMap::new();
+fn mode_schema() -> SchemaRegistry {
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "r.mode_holder".to_string(),
+        "test",
         make_schema(
             "r.mode_holder",
             vec![(
@@ -1789,8 +1770,7 @@ fn quoted_literal_enum_value_yields_string_literal_diagnostic() {
         }
         "#,
     );
-    let err = validate_resources(&parsed, &mode_schema(), &test_schema_key_fn, &mode_known())
-        .unwrap_err();
+    let err = validate_resources(&parsed, &mode_schema(), &mode_known()).unwrap_err();
     assert!(
         err.contains("got a string literal"),
         "quoted literal must emit the shape-mismatch diagnostic, got: {err}"
@@ -1817,8 +1797,7 @@ fn bare_invalid_enum_value_keeps_invalid_variant_diagnostic() {
         }
         "#,
     );
-    let err = validate_resources(&parsed, &mode_schema(), &test_schema_key_fn, &mode_known())
-        .unwrap_err();
+    let err = validate_resources(&parsed, &mode_schema(), &mode_known()).unwrap_err();
     assert!(
         !err.contains("got a string literal"),
         "bare identifier must NOT get the shape-mismatch diagnostic, got: {err}"
@@ -1841,7 +1820,7 @@ fn bare_valid_enum_value_passes() {
         "#,
     );
     assert!(
-        validate_resources(&parsed, &mode_schema(), &test_schema_key_fn, &mode_known()).is_ok(),
+        validate_resources(&parsed, &mode_schema(), &mode_known()).is_ok(),
         "bare valid identifier must pass"
     );
 }
@@ -1858,7 +1837,45 @@ fn fully_qualified_enum_value_passes() {
         "#,
     );
     assert!(
-        validate_resources(&parsed, &mode_schema(), &test_schema_key_fn, &mode_known()).is_ok(),
+        validate_resources(&parsed, &mode_schema(), &mode_known()).is_ok(),
         "fully-qualified identifier must pass"
+    );
+}
+
+/// `read` against a managed-only resource type emits a kind-specific error
+/// pointing the user at the fix (drop the `read` keyword).
+///
+/// Companion to the inverse direction — non-`read` against a data-source-only
+/// type — which the existing "is a data source and must be used with the
+/// `read` keyword" tests already cover.
+#[test]
+fn read_against_managed_only_type_is_rejected() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        make_schema("ec2.Vpc", vec![("cidr_block", AttributeType::String)]),
+    );
+
+    let parsed = crate::parser::parse(
+        r#"
+        let v = read awscc.ec2.Vpc {
+            cidr_block = "10.0.0.0/16"
+        }
+        "#,
+        &ProviderContext::default(),
+    )
+    .unwrap();
+
+    let mut known = HashSet::new();
+    known.insert("awscc".to_string());
+
+    let err = validate_resources(&parsed, &schemas, &known).unwrap_err();
+    assert!(
+        err.contains("is a managed resource, not a data source"),
+        "expected managed-only diagnostic, got: {err}"
+    );
+    assert!(
+        err.contains("Remove the `read` keyword"),
+        "expected fix hint, got: {err}"
     );
 }

@@ -22,7 +22,7 @@ use carina_core::provider::{
 };
 use carina_core::resolver::resolve_refs_with_state_and_remote;
 use carina_core::resource::{Resource, ResourceId, State, Value};
-use carina_core::schema::{ResourceSchema, resolve_block_names};
+use carina_core::schema::{SchemaRegistry, resolve_block_names};
 use carina_core::utils;
 use carina_core::validation;
 use carina_provider_mock::MockProvider;
@@ -54,7 +54,7 @@ pub struct PlanContext {
 /// `WiringContext` and pass it through the command execution path.
 pub struct WiringContext {
     factories: Arc<Vec<Box<dyn ProviderFactory>>>,
-    schemas: HashMap<String, ResourceSchema>,
+    schemas: SchemaRegistry,
 }
 
 impl WiringContext {
@@ -74,7 +74,7 @@ impl WiringContext {
         Arc::clone(&self.factories)
     }
 
-    pub fn schemas(&self) -> &HashMap<String, ResourceSchema> {
+    pub fn schemas(&self) -> &SchemaRegistry {
         &self.schemas
     }
 }
@@ -189,7 +189,6 @@ pub fn validate_resources_with_ctx(ctx: &WiringContext, parsed: &ParsedFile) -> 
     lift_validation_result(validation::validate_resources(
         parsed,
         ctx.schemas(),
-        &|r| provider_mod::schema_key_for_resource(ctx.factories(), r),
         &known_providers,
     ))
 }
@@ -202,7 +201,6 @@ pub fn validate_resource_ref_types_with_ctx(
     lift_validation_result(validation::validate_resource_ref_types(
         parsed,
         ctx.schemas(),
-        &|r| provider_mod::schema_key_for_resource(ctx.factories(), r),
         argument_names,
     ))
 }
@@ -216,15 +214,12 @@ pub fn validate_attribute_param_ref_types_with_ctx(
         attribute_params,
         resources,
         ctx.schemas(),
-        &|r| provider_mod::schema_key_for_resource(ctx.factories(), r),
     ))
 }
 
 /// Resolve block name aliases and attribute prefixes in one step.
 pub fn resolve_names_with_ctx(ctx: &WiringContext, resources: &mut [Resource]) -> Vec<AppError> {
-    let mut errors = lift_validation_result(resolve_block_names(resources, ctx.schemas(), |r| {
-        provider_mod::schema_key_for_resource(ctx.factories(), r)
-    }));
+    let mut errors = lift_validation_result(resolve_block_names(resources, ctx.schemas()));
     errors.extend(resolve_attr_prefixes_with_ctx(ctx, resources));
     errors
 }
@@ -233,11 +228,7 @@ pub fn resolve_attr_prefixes_with_ctx(
     ctx: &WiringContext,
     resources: &mut [Resource],
 ) -> Vec<AppError> {
-    lift_validation_result(identifier::resolve_attr_prefixes(
-        resources,
-        ctx.schemas(),
-        &|r| provider_mod::schema_key_for_resource(ctx.factories(), r),
-    ))
+    lift_validation_result(identifier::resolve_attr_prefixes(resources, ctx.schemas()))
 }
 
 pub fn reconcile_prefixed_names(resources: &mut [Resource], state_file: &Option<StateFile>) {
@@ -293,12 +284,14 @@ pub fn apply_anonymous_to_named_renames(
     let renames = identifier::detect_anonymous_to_named_renames(
         resources,
         ctx.schemas(),
-        &|r| provider_mod::schema_key_for_resource(ctx.factories(), r),
         &|provider, resource_type| {
-            let schema_key = format!("{}.{}", provider, resource_type);
             let create_only_attrs = ctx
                 .schemas()
-                .get(&schema_key)
+                .get(
+                    provider,
+                    resource_type,
+                    carina_core::schema::SchemaKind::Managed,
+                )
                 .map(|s| s.create_only_attributes())
                 .unwrap_or_default();
             sf.resources_by_type(provider, resource_type)
@@ -348,12 +341,14 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
     identifier::reconcile_anonymous_identifiers(
         resources,
         ctx.schemas(),
-        &|r| provider_mod::schema_key_for_resource(ctx.factories(), r),
         &|provider, resource_type| {
-            let schema_key = format!("{}.{}", provider, resource_type);
             let create_only_attrs = ctx
                 .schemas()
-                .get(&schema_key)
+                .get(
+                    provider,
+                    resource_type,
+                    carina_core::schema::SchemaKind::Managed,
+                )
                 .map(|s| s.create_only_attributes())
                 .unwrap_or_default();
 
@@ -385,13 +380,9 @@ pub fn compute_anonymous_identifiers_with_ctx(
     resources: &mut [Resource],
     providers: &[ProviderConfig],
 ) -> Vec<AppError> {
-    match identifier::compute_anonymous_identifiers(
-        resources,
-        providers,
-        ctx.schemas(),
-        &|r| provider_mod::schema_key_for_resource(ctx.factories(), r),
-        &|name| identity_attributes_for_provider(ctx, name),
-    ) {
+    match identifier::compute_anonymous_identifiers(resources, providers, ctx.schemas(), &|name| {
+        identity_attributes_for_provider(ctx, name)
+    }) {
         Ok(()) => Vec::new(),
         Err(msg) => vec![AppError::Config(msg)],
     }
@@ -622,7 +613,6 @@ pub fn validate_module_attribute_param_types(
             &module_parsed.attribute_params,
             &module_parsed.resources,
             ctx.schemas(),
-            &|r| provider_mod::schema_key_for_resource(ctx.factories(), r),
         ) {
             // Preserve the module-path prefix the legacy wrapper emitted
             // so diagnostics point at which imported module failed.
@@ -1172,7 +1162,7 @@ pub fn add_state_block_effects(
     state_blocks: &[StateBlock],
     state_file: &Option<StateFile>,
     moved_pairs: &[(ResourceId, ResourceId)],
-    schemas: &HashMap<String, ResourceSchema>,
+    registry: &SchemaRegistry,
 ) {
     // Collect resource IDs that are covered by removed blocks
     // to suppress orphan Delete effects
@@ -1190,7 +1180,7 @@ pub fn add_state_block_effects(
                 // resources via the schema's name_attribute. This lets users write
                 // `to = awscc.s3.Bucket 'carina-rs-state'` without needing the
                 // auto-generated hash name.
-                let effective_to = resolve_import_target(to, plan, state_file, schemas);
+                let effective_to = resolve_import_target(to, plan, state_file, registry);
 
                 // Skip if resource already exists in state
                 let already_in_state = state_file.as_ref().is_some_and(|sf| {
@@ -1269,10 +1259,14 @@ fn resolve_import_target(
     to: &ResourceId,
     plan: &Plan,
     state_file: &Option<StateFile>,
-    schemas: &HashMap<String, ResourceSchema>,
+    registry: &SchemaRegistry,
 ) -> ResourceId {
-    let name_attr = schemas
-        .get(&to.display_type())
+    let name_attr = registry
+        .get(
+            &to.provider,
+            &to.resource_type,
+            carina_core::schema::SchemaKind::Managed,
+        )
         .and_then(|s| s.name_attribute.as_deref());
 
     // Single pass: prefer exact id match, otherwise remember the first name_attribute match.

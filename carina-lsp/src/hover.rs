@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -8,7 +7,7 @@ use crate::document::Document;
 use carina_core::builtins;
 use carina_core::parser::ArgumentParameter;
 use carina_core::resource::Value;
-use carina_core::schema::{CompletionValue, ResourceSchema};
+use carina_core::schema::{CompletionValue, ResourceSchema, SchemaRegistry};
 
 /// Format a Value for hover display
 fn format_value_for_hover(value: &Value) -> String {
@@ -94,15 +93,12 @@ fn convert_markdown_links_to_plain_text(text: &str) -> String {
 }
 
 pub struct HoverProvider {
-    schemas: Arc<HashMap<String, ResourceSchema>>,
+    schemas: Arc<SchemaRegistry>,
     region_completions: Vec<CompletionValue>,
 }
 
 impl HoverProvider {
-    pub fn new(
-        schemas: Arc<HashMap<String, ResourceSchema>>,
-        region_completions: Vec<CompletionValue>,
-    ) -> Self {
+    pub fn new(schemas: Arc<SchemaRegistry>, region_completions: Vec<CompletionValue>) -> Self {
         Self {
             schemas,
             region_completions,
@@ -215,14 +211,27 @@ impl HoverProvider {
                         // Found opening brace, check if it's a module call
                         // Module calls: identifier { (not "let x = ..." or "provider." prefix)
                         // Check if any provider name prefix matches
+                        // Iterate registry entries but skip empty-provider ones —
+                        // the synthetic `format!("{}.", "")` would match every line
+                        // and block the resource-block path entirely.
                         let provider_prefixes: Vec<&str> = self
                             .schemas
-                            .keys()
-                            .filter_map(|k| k.split('.').next())
+                            .iter()
+                            .map(|(provider, _, _, _)| provider)
+                            .filter(|p| !p.is_empty())
                             .collect();
+                        // Treat schemas registered without a provider (e.g.
+                        // test fixtures with `ResourceSchema::new("ec2.X")` and
+                        // `insert("", ...)`) as ordinary resource lines too.
+                        let starts_with_known_resource_type = self
+                            .schemas
+                            .iter()
+                            .filter(|(p, _, _, _)| p.is_empty())
+                            .any(|(_, rt, _, _)| trimmed.starts_with(&format!("{} ", rt)));
                         let starts_with_provider = provider_prefixes
                             .iter()
-                            .any(|p| trimmed.starts_with(&format!("{}.", p)));
+                            .any(|p| trimmed.starts_with(&format!("{}.", p)))
+                            || starts_with_known_resource_type;
 
                         if !trimmed.starts_with("let ")
                             && !starts_with_provider
@@ -380,14 +389,27 @@ impl HoverProvider {
                         brace_depth -= 1;
                     } else {
                         // Found opening brace. Check if it's a module call.
+                        // Iterate registry entries but skip empty-provider ones —
+                        // the synthetic `format!("{}.", "")` would match every line
+                        // and block the resource-block path entirely.
                         let provider_prefixes: Vec<&str> = self
                             .schemas
-                            .keys()
-                            .filter_map(|k| k.split('.').next())
+                            .iter()
+                            .map(|(provider, _, _, _)| provider)
+                            .filter(|p| !p.is_empty())
                             .collect();
+                        // Treat schemas registered without a provider (e.g.
+                        // test fixtures with `ResourceSchema::new("ec2.X")` and
+                        // `insert("", ...)`) as ordinary resource lines too.
+                        let starts_with_known_resource_type = self
+                            .schemas
+                            .iter()
+                            .filter(|(p, _, _, _)| p.is_empty())
+                            .any(|(_, rt, _, _)| trimmed.starts_with(&format!("{} ", rt)));
                         let starts_with_provider = provider_prefixes
                             .iter()
-                            .any(|p| trimmed.starts_with(&format!("{}.", p)));
+                            .any(|p| trimmed.starts_with(&format!("{}.", p)))
+                            || starts_with_known_resource_type;
 
                         if !trimmed.starts_with("let ")
                             && !starts_with_provider
@@ -410,16 +432,19 @@ impl HoverProvider {
     }
 
     fn resource_type_hover(&self, word: &str) -> Option<Hover> {
-        // Check against all schema keys
-        for (resource_type, schema) in self.schemas.iter() {
-            if word == resource_type || word.contains(resource_type.as_str()) {
+        // Check against all schema keys (provider.resource_type)
+        for (provider, resource_type, _kind, schema) in self.schemas.iter() {
+            let key = if provider.is_empty() {
+                resource_type.to_string()
+            } else {
+                format!("{}.{}", provider, resource_type)
+            };
+            if word == key || word.contains(key.as_str()) {
                 // Avoid matching substrings like "vpc_id" for "vpc"
-                if word.contains(&format!("{}_", resource_type))
-                    || word.contains(&format!("_{}", resource_type))
-                {
+                if word.contains(&format!("{}_", key)) || word.contains(&format!("_{}", key)) {
                     continue;
                 }
-                return self.schema_hover(resource_type, schema);
+                return self.schema_hover(&key, schema);
             }
         }
         None
@@ -491,7 +516,19 @@ impl HoverProvider {
         let current_line = position.line as usize;
 
         // Build a list of schema keys sorted longest-first for correct matching
-        let mut schema_keys: Vec<&str> = self.schemas.keys().map(|s| s.as_str()).collect();
+        let mut schema_keys: Vec<String> = self
+            .schemas
+            .iter()
+            .map(|(provider, resource_type, _kind, _schema)| {
+                if provider.is_empty() {
+                    resource_type.to_string()
+                } else {
+                    format!("{}.{}", provider, resource_type)
+                }
+            })
+            .collect();
+        schema_keys.sort();
+        schema_keys.dedup();
         schema_keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
 
         let mut brace_depth: i32 = 0;
@@ -529,17 +566,34 @@ impl HoverProvider {
         // Falling back to a global scan would return a lookalike attribute from
         // an unrelated schema (nondeterministic via HashMap iteration order) —
         // see #1988.
-        if let Some(resource_type) = enclosing_resource {
-            return self
-                .schemas
-                .get(resource_type)
-                .and_then(|schema| schema.attributes.get(word))
-                .and_then(|attr| self.build_attribute_hover(attr));
-        }
-
-        // No enclosing-resource context (e.g., bare identifier at top level):
-        // we have nothing to anchor the lookup to, so do not guess.
-        None
+        let key = enclosing_resource?;
+        // Try splitting on the first dot first (`provider.resource_type`); if that
+        // doesn't resolve, fall back to treating the whole key as the resource type
+        // under the empty provider — some test fixtures register schemas that way.
+        let lookup = |provider: &str, resource_type: &str| {
+            self.schemas
+                .get(
+                    provider,
+                    resource_type,
+                    carina_core::schema::SchemaKind::Managed,
+                )
+                .or_else(|| {
+                    self.schemas.get(
+                        provider,
+                        resource_type,
+                        carina_core::schema::SchemaKind::DataSource,
+                    )
+                })
+        };
+        let schema = if let Some((provider, rest)) = key.split_once('.') {
+            lookup(provider, rest).or_else(|| lookup("", key))
+        } else {
+            lookup("", key)
+        }?;
+        schema
+            .attributes
+            .get(word)
+            .and_then(|attr| self.build_attribute_hover(attr))
     }
 
     fn build_attribute_hover(&self, attr: &carina_core::schema::AttributeSchema) -> Option<Hover> {
@@ -700,9 +754,9 @@ mod tests {
         resource_type: &str,
         description: &str,
     ) -> HoverProvider {
-        let mut schemas = HashMap::new();
+        let mut schemas = SchemaRegistry::new();
         let schema = ResourceSchema::new(resource_type).with_description(description);
-        schemas.insert(resource_type.to_string(), schema);
+        schemas.insert("", schema);
         HoverProvider::new(Arc::new(schemas), vec![])
     }
 
@@ -711,12 +765,12 @@ mod tests {
         attr_name: &str,
         attr_description: &str,
     ) -> HoverProvider {
-        let mut schemas = HashMap::new();
+        let mut schemas = SchemaRegistry::new();
         let schema = ResourceSchema::new(resource_type).attribute(
             AttributeSchema::new(attr_name, AttributeType::String)
                 .with_description(attr_description),
         );
-        schemas.insert(resource_type.to_string(), schema);
+        schemas.insert("", schema);
         HoverProvider::new(Arc::new(schemas), vec![])
     }
 
@@ -747,7 +801,10 @@ mod tests {
         let desc = "Specifies a virtual private cloud (VPC). To add an IPv6 CIDR block to the VPC, see [AWS::EC2::VPCCidrBlock](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-vpccidrblock.html).";
 
         let provider = create_hover_provider_with_description("ec2.Vpc", desc);
-        let schema = provider.schemas.get("ec2.Vpc").unwrap();
+        let schema = provider
+            .schemas
+            .get("", "ec2.Vpc", carina_core::schema::SchemaKind::Managed)
+            .unwrap();
         let hover = provider.schema_hover("ec2.Vpc", schema).unwrap();
 
         let content = match &hover.contents {
@@ -876,24 +933,21 @@ mod tests {
         // Two schemas both have "internet_gateway_id" but with different descriptions.
         // When hovering inside a vpc_gateway_attachment block, the hover should show
         // the description from vpc_gateway_attachment's schema, not internet_gateway's.
-        let mut schemas = HashMap::new();
+        let mut schemas = SchemaRegistry::new();
 
-        let igw_schema = ResourceSchema::new("awscc.ec2.internet_gateway").attribute(
+        let igw_schema = ResourceSchema::new("ec2.internet_gateway").attribute(
             AttributeSchema::new("internet_gateway_id", AttributeType::String)
                 .with_description("The ID of the internet gateway (from internet_gateway schema)."),
         );
-        schemas.insert("awscc.ec2.internet_gateway".to_string(), igw_schema);
+        schemas.insert("awscc", igw_schema);
 
-        let attachment_schema = ResourceSchema::new("awscc.ec2.vpc_gateway_attachment").attribute(
+        let attachment_schema = ResourceSchema::new("ec2.vpc_gateway_attachment").attribute(
             AttributeSchema::new("internet_gateway_id", AttributeType::String)
                 .with_description(
                     "The ID of the internet gateway attached to the VPC (from vpc_gateway_attachment schema).",
                 ),
         );
-        schemas.insert(
-            "awscc.ec2.vpc_gateway_attachment".to_string(),
-            attachment_schema,
-        );
+        schemas.insert("awscc", attachment_schema);
 
         let provider = HoverProvider::new(Arc::new(schemas), vec![]);
 
@@ -942,20 +996,20 @@ awscc.ec2.vpc_gateway_attachment {
         // Regression for #1988: when a word is NOT an attribute of the
         // enclosing resource, hover must return None — not fall back to a
         // lookalike attribute from an unrelated resource schema.
-        let mut schemas = HashMap::new();
+        let mut schemas = SchemaRegistry::new();
 
         // `account_id` lives on organizations.account only.
-        let account_schema = ResourceSchema::new("awscc.organizations.account").attribute(
+        let account_schema = ResourceSchema::new("organizations.account").attribute(
             AttributeSchema::new("account_id", AttributeType::String)
                 .with_description("The unique identifier (ID) of the new account."),
         );
-        schemas.insert("awscc.organizations.account".to_string(), account_schema);
+        schemas.insert("awscc", account_schema);
 
         // `awscc.sso.Assignment` intentionally has NO `account_id`.
-        let assignment_schema = ResourceSchema::new("awscc.sso.Assignment").attribute(
+        let assignment_schema = ResourceSchema::new("sso.Assignment").attribute(
             AttributeSchema::new("target_id", AttributeType::String).with_description("Target id."),
         );
-        schemas.insert("awscc.sso.Assignment".to_string(), assignment_schema);
+        schemas.insert("awscc", assignment_schema);
 
         let provider = HoverProvider::new(Arc::new(schemas), vec![]);
 
@@ -989,7 +1043,7 @@ awscc.ec2.vpc_gateway_attachment {
 
     #[test]
     fn test_builtin_function_hover_join() {
-        let provider = HoverProvider::new(Arc::new(HashMap::new()), vec![]);
+        let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
         let doc = Document::new("join".to_string(), Arc::new(ProviderContext::default()));
         let hover = provider
             .hover(&doc, Position::new(0, 1))
@@ -1018,7 +1072,7 @@ awscc.ec2.vpc_gateway_attachment {
 
     #[test]
     fn test_builtin_function_hover_cidr_subnet() {
-        let provider = HoverProvider::new(Arc::new(HashMap::new()), vec![]);
+        let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
         let doc = Document::new(
             "cidr_subnet".to_string(),
             Arc::new(ProviderContext::default()),
@@ -1041,7 +1095,7 @@ awscc.ec2.vpc_gateway_attachment {
 
     #[test]
     fn test_builtin_function_hover_unknown_returns_none() {
-        let provider = HoverProvider::new(Arc::new(HashMap::new()), vec![]);
+        let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
         let doc = Document::new(
             "not_a_function".to_string(),
             Arc::new(ProviderContext::default()),
@@ -1052,7 +1106,7 @@ awscc.ec2.vpc_gateway_attachment {
 
     #[test]
     fn test_all_builtin_functions_have_hover() {
-        let provider = HoverProvider::new(Arc::new(HashMap::new()), vec![]);
+        let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
         let names = [
             "cidr_subnet",
             "concat",
@@ -1089,7 +1143,7 @@ awscc.ec2.vpc_gateway_attachment {
     fn test_module_argument_hover_with_description() {
         use carina_core::parser::{ArgumentParameter, TypeExpr};
 
-        let provider = HoverProvider::new(Arc::new(HashMap::new()), vec![]);
+        let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
         let arg = ArgumentParameter {
             name: "vpc".to_string(),
             type_expr: TypeExpr::Ref(carina_core::parser::ResourceTypePath::new(
@@ -1135,7 +1189,7 @@ awscc.ec2.vpc_gateway_attachment {
     fn test_module_argument_hover_with_default() {
         use carina_core::parser::{ArgumentParameter, TypeExpr};
 
-        let provider = HoverProvider::new(Arc::new(HashMap::new()), vec![]);
+        let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
         let arg = ArgumentParameter {
             name: "port".to_string(),
             type_expr: TypeExpr::Int,
@@ -1169,7 +1223,7 @@ awscc.ec2.vpc_gateway_attachment {
     fn test_module_argument_hover_without_description() {
         use carina_core::parser::{ArgumentParameter, TypeExpr};
 
-        let provider = HoverProvider::new(Arc::new(HashMap::new()), vec![]);
+        let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
         let arg = ArgumentParameter {
             name: "env".to_string(),
             type_expr: TypeExpr::String,
@@ -1201,7 +1255,7 @@ awscc.ec2.vpc_gateway_attachment {
 
     #[test]
     fn test_no_builtin_hover_for_map_in_type_annotation() {
-        let provider = HoverProvider::new(Arc::new(HashMap::new()), vec![]);
+        let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
         // Line 1 (0-indexed): "  accounts: map(AwsAccountId) = {"
         // Position on "map" → should NOT show function hover
         let doc = Document::new(
@@ -1219,7 +1273,7 @@ awscc.ec2.vpc_gateway_attachment {
 
     #[test]
     fn test_builtin_hover_for_map_in_function_call() {
-        let provider = HoverProvider::new(Arc::new(HashMap::new()), vec![]);
+        let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
         // Normal function call (no preceding ':') — should show hover
         let doc = Document::new(
             "let x = map(\".id\", items)".to_string(),

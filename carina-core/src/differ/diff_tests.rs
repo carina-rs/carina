@@ -69,7 +69,7 @@ fn create_plan_from_resources() {
         &resources,
         &current_states,
         &HashMap::new(),
-        &HashMap::new(),
+        &SchemaRegistry::new(),
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
@@ -94,7 +94,7 @@ fn create_plan_with_read_only_resource() {
         &resources,
         &current_states,
         &HashMap::new(),
-        &HashMap::new(),
+        &SchemaRegistry::new(),
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
@@ -174,7 +174,7 @@ fn create_plan_detects_orphaned_resources_for_deletion() {
         &desired,
         &current_states,
         &HashMap::new(),
-        &HashMap::new(),
+        &SchemaRegistry::new(),
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
@@ -220,7 +220,7 @@ fn read_only_resource_always_generates_read_effect() {
         &resources,
         &current_states,
         &HashMap::new(),
-        &HashMap::new(),
+        &SchemaRegistry::new(),
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
@@ -277,9 +277,9 @@ fn replace_when_create_only_attr_changed() {
     );
 
     // Build schema with cidr_block marked as create-only
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "ec2.Vpc".to_string(),
+        "",
         crate::schema::ResourceSchema::new("ec2.Vpc")
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
     );
@@ -323,9 +323,9 @@ fn normal_update_when_non_create_only_attr_changed() {
     );
 
     // cidr_block is create-only, but enable_dns_support is not
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "ec2.Vpc".to_string(),
+        "",
         crate::schema::ResourceSchema::new("ec2.Vpc")
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only())
             .attribute(AttributeSchema::new(
@@ -384,9 +384,9 @@ fn replace_when_schema_force_replace() {
     );
 
     // Schema has force_replace=true (no create-only attributes)
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "ec2.internet_gateway".to_string(),
+        "",
         crate::schema::ResourceSchema::new("ec2.internet_gateway")
             .attribute(crate::schema::AttributeSchema::new(
                 "tags",
@@ -435,9 +435,9 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
         State::existing(ResourceId::new("ec2.Vpc", "my-vpc"), attrs),
     );
 
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "ec2.Vpc".to_string(),
+        "",
         crate::schema::ResourceSchema::new("ec2.Vpc")
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only())
             .attribute(AttributeSchema::new(
@@ -489,9 +489,9 @@ fn replace_carries_create_before_destroy_lifecycle() {
         State::existing(ResourceId::new("ec2.Vpc", "my-vpc"), attrs),
     );
 
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "ec2.Vpc".to_string(),
+        "",
         crate::schema::ResourceSchema::new("ec2.Vpc")
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
     );
@@ -582,11 +582,11 @@ fn replace_with_provider_prefixed_schema_key() {
         ),
     );
 
-    // Schema keyed with provider prefix (as in production)
-    let mut schemas = HashMap::new();
+    // Schema registered under provider "awscc"
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "awscc.ec2.Vpc".to_string(),
-        crate::schema::ResourceSchema::new("awscc.ec2.Vpc")
+        "awscc",
+        crate::schema::ResourceSchema::new("ec2.Vpc")
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
     );
 
@@ -862,7 +862,7 @@ fn orphan_delete_preserves_binding_and_dependencies() {
         &desired,
         &current_states,
         &HashMap::new(),
-        &HashMap::new(),
+        &SchemaRegistry::new(),
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),

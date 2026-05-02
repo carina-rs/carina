@@ -20,7 +20,7 @@ use std::path::Path;
 use crate::config_loader::{find_crn_files_in_dir, parse_directory};
 use crate::parser::{ParsedFile, ProviderContext, ResourceContext, TypeExpr, UpstreamState};
 use crate::resource::{Subscript, Value};
-use crate::schema::{AttributeType, ResourceSchema, suggest_similar_name};
+use crate::schema::{AttributeType, SchemaRegistry, suggest_similar_name};
 
 /// Exports declared by each `upstream_state` binding: binding name →
 /// (export name → declared type, or `None` if the export has no annotation).
@@ -440,13 +440,11 @@ impl UpstreamRefDiagnostic for UpstreamTypeError {
 pub fn check_upstream_state_field_types(
     parsed: &ParsedFile,
     exports: &UpstreamExports,
-    schemas: &HashMap<String, ResourceSchema>,
-    schema_key_fn: &dyn Fn(&crate::resource::Resource) -> String,
+    registry: &SchemaRegistry,
 ) -> Vec<UpstreamTypeError> {
     let mut errors: Vec<UpstreamTypeError> = Vec::new();
     for_each_resource_attr(parsed, |ctx, resource, attr_name, value| {
-        let key = schema_key_fn(resource);
-        let Some(schema) = schemas.get(&key) else {
+        let Some(schema) = registry.get_for(resource) else {
             return;
         };
         let Some(attr_schema) = schema.attributes.get(attr_name) else {
@@ -1511,17 +1509,17 @@ mod tests {
     }
 
     /// Minimal schema registry for test resources: `test.r.res` with a single
-    /// typed attribute.
+    /// typed attribute, registered under provider `test`.
     fn schema_with_attr(
         attr_name: &str,
         attr_type: crate::schema::AttributeType,
-    ) -> HashMap<String, crate::schema::ResourceSchema> {
+    ) -> SchemaRegistry {
         use crate::schema::{AttributeSchema, ResourceSchema};
         let schema =
-            ResourceSchema::new("test.r.res").attribute(AttributeSchema::new(attr_name, attr_type));
-        let mut map = HashMap::new();
-        map.insert("test.r.res".to_string(), schema);
-        map
+            ResourceSchema::new("r.res").attribute(AttributeSchema::new(attr_name, attr_type));
+        let mut registry = SchemaRegistry::new();
+        registry.insert("test", schema);
+        registry
     }
 
     fn parse_project_with_provider(source: &str, provider_name: &str) -> ParsedFile {
@@ -1548,9 +1546,7 @@ mod tests {
         );
         let exports = mk_typed_exports(&[("orgs", &[("count", TypeExpr::Int)])]);
         let schemas = schema_with_attr("name", crate::schema::AttributeType::String);
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas, &|r| {
-            format!("{}.{}", r.id.provider, r.id.resource_type)
-        });
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
         assert_eq!(errs.len(), 1, "unexpected: {errs:?}");
         assert_eq!(errs[0].binding, "orgs");
         assert_eq!(errs[0].field, "count");
@@ -1575,9 +1571,7 @@ mod tests {
         );
         let exports = mk_typed_exports(&[("orgs", &[("region", TypeExpr::String)])]);
         let schemas = schema_with_attr("name", crate::schema::AttributeType::String);
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas, &|r| {
-            format!("{}.{}", r.id.provider, r.id.resource_type)
-        });
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
 
@@ -1599,9 +1593,7 @@ mod tests {
         fields.insert("count".to_string(), None);
         exports.insert("orgs".to_string(), fields);
         let schemas = schema_with_attr("name", crate::schema::AttributeType::String);
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas, &|r| {
-            format!("{}.{}", r.id.provider, r.id.resource_type)
-        });
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
 
@@ -1620,9 +1612,7 @@ mod tests {
         );
         let exports = mk_typed_exports(&[("orgs", &[("count", TypeExpr::Int)])]);
         let schemas = schema_with_attr("name", crate::schema::AttributeType::String);
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas, &|r| {
-            format!("{}.{}", r.id.provider, r.id.resource_type)
-        });
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
 
@@ -1646,9 +1636,7 @@ mod tests {
             "name",
             crate::schema::AttributeType::list(crate::schema::AttributeType::String),
         );
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas, &|r| {
-            format!("{}.{}", r.id.provider, r.id.resource_type)
-        });
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
         assert_eq!(errs.len(), 1, "unexpected: {errs:?}");
     }
 
@@ -1673,9 +1661,7 @@ mod tests {
             ],
         )]);
         let schemas = schema_with_attr("name", crate::schema::AttributeType::String);
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas, &|r| {
-            format!("{}.{}", r.id.provider, r.id.resource_type)
-        });
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
         assert_eq!(
             errs.len(),
             1,
@@ -1719,9 +1705,7 @@ mod tests {
             to_dsl: None,
         };
         let schemas = schema_with_attr("name", kms_arn);
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas, &|r| {
-            format!("{}.{}", r.id.provider, r.id.resource_type)
-        });
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
         assert!(
             errs.is_empty(),
             "Custom type chain must accept base ancestor, got: {errs:?}"

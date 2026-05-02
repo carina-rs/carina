@@ -8,16 +8,17 @@ use crate::binding_index::BindingIndex;
 use crate::parser::{ModuleCall, ParsedFile, ProviderContext, TypeExpr, validate_custom_type};
 use crate::provider::ProviderFactory;
 use crate::resource::{Resource, Value};
-use crate::schema::{AttributeType, ResourceSchema, suggest_similar_name};
+use crate::schema::{AttributeType, SchemaRegistry, suggest_similar_name};
 
 /// Validate resources against their schemas.
 ///
-/// Checks that each resource's type is known, data sources use the `read` keyword,
-/// and all attributes pass schema validation.
+/// Two-sided check: a `read` resource requires a `DataSource` registry entry,
+/// and a non-`read` resource requires a `Managed` registry entry. If the
+/// wrong-kind entry is present (e.g. `read` against a managed-only type),
+/// emit a kind-specific error explaining the mismatch.
 pub fn validate_resources(
     parsed: &ParsedFile,
-    schemas: &HashMap<String, ResourceSchema>,
-    schema_key_fn: &dyn Fn(&Resource) -> String,
+    registry: &SchemaRegistry,
     known_providers: &HashSet<String>,
 ) -> Result<(), String> {
     let mut all_errors = Vec::new();
@@ -28,16 +29,8 @@ pub fn validate_resources(
             continue;
         }
 
-        let schema_key = schema_key_fn(resource);
-
-        match schemas.get(&schema_key) {
+        match registry.get_for(resource) {
             Some(schema) => {
-                if schema.is_data_source() && !resource.is_data_source() {
-                    all_errors.push(format!(
-                        "{} is a data source and must be used with the `read` keyword:\n  let <name> = read {} {{ }}",
-                        schema.resource_type, schema.resource_type
-                    ));
-                }
                 let is_string_literal = |attr: &str| resource.quoted_string_attrs.contains(attr);
                 if let Err(errors) = schema
                     .validate_with_origins(&resource.resolved_attributes(), &is_string_literal)
@@ -48,14 +41,37 @@ pub fn validate_resources(
                 }
             }
             None => {
-                // If no factory is registered for this provider, skip validation
-                // (schemas are simply not available)
-                if !resource.id.provider.is_empty()
-                    && !known_providers.contains(&resource.id.provider)
-                {
+                let provider = resource.id.provider.as_str();
+                let resource_type = resource.id.resource_type.as_str();
+
+                // No matching-kind entry. Skip if provider is not loaded —
+                // schemas are simply not available, not a configuration error.
+                if !provider.is_empty() && !known_providers.contains(provider) {
                     continue;
                 }
-                all_errors.push(format!("Unknown resource type: {}", schema_key));
+                let has_managed = registry.has_managed(provider, resource_type);
+                let has_data_source = registry.has_data_source(provider, resource_type);
+                let kind_label = if provider.is_empty() {
+                    resource_type.to_string()
+                } else {
+                    format!("{}.{}", provider, resource_type)
+                };
+
+                if resource.is_data_source() && has_managed {
+                    // `read` used against a managed-only type
+                    all_errors.push(format!(
+                        "{} is a managed resource, not a data source. Remove the `read` keyword:\n  let <name> = {} {{ }}",
+                        kind_label, kind_label
+                    ));
+                } else if !resource.is_data_source() && has_data_source {
+                    // No `read` against a data-source-only type
+                    all_errors.push(format!(
+                        "{} is a data source and must be used with the `read` keyword:\n  let <name> = read {} {{ }}",
+                        kind_label, kind_label
+                    ));
+                } else {
+                    all_errors.push(format!("Unknown resource type: {}", kind_label));
+                }
             }
         }
     }
@@ -73,8 +89,7 @@ pub fn validate_resources(
 /// a reference like `vpc.vpc_id` (which is `AwsResourceId`) should be an error.
 pub fn validate_resource_ref_types(
     parsed: &ParsedFile,
-    schemas: &HashMap<String, ResourceSchema>,
-    schema_key_fn: &dyn Fn(&Resource) -> String,
+    registry: &SchemaRegistry,
     argument_names: &HashSet<String>,
 ) -> Result<(), String> {
     let mut all_errors = Vec::new();
@@ -82,12 +97,10 @@ pub fn validate_resource_ref_types(
     // Single source of truth for `binding_name → (resource, schema)` —
     // shared with the LSP via `BindingIndex` so the two paths cannot drift
     // (#2231).
-    let bindings = BindingIndex::from_parsed(parsed, schemas, schema_key_fn);
+    let bindings = BindingIndex::from_parsed(parsed, registry);
 
     for (_ctx, resource) in parsed.iter_all_resources() {
-        let schema_key = schema_key_fn(resource);
-
-        let Some(schema) = schemas.get(&schema_key) else {
+        let Some(schema) = registry.get_for(resource) else {
             continue;
         };
 
@@ -180,8 +193,7 @@ pub fn validate_resource_ref_types(
 pub fn validate_attribute_param_ref_types(
     attribute_params: &[crate::parser::AttributeParameter],
     resources: &[Resource],
-    schemas: &HashMap<String, ResourceSchema>,
-    schema_key_fn: &dyn Fn(&Resource) -> String,
+    registry: &SchemaRegistry,
 ) -> Result<(), String> {
     let mut binding_map: HashMap<String, &Resource> = HashMap::new();
     for resource in resources {
@@ -217,8 +229,7 @@ pub fn validate_attribute_param_ref_types(
         let Some(ref_resource) = binding_map.get(&ref_binding) else {
             continue;
         };
-        let ref_schema_key = schema_key_fn(ref_resource);
-        let Some(ref_schema) = schemas.get(&ref_schema_key) else {
+        let Some(ref_schema) = registry.get_for(ref_resource) else {
             continue;
         };
         let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr.as_str()) else {
@@ -253,8 +264,7 @@ pub fn validate_attribute_param_ref_types(
 pub fn validate_export_param_ref_types(
     export_params: &[crate::parser::ExportParameter],
     resources: &[Resource],
-    schemas: &HashMap<String, ResourceSchema>,
-    schema_key_fn: &dyn Fn(&Resource) -> String,
+    registry: &SchemaRegistry,
 ) -> Result<(), String> {
     let mut binding_map: HashMap<String, &Resource> = HashMap::new();
     for resource in resources {
@@ -278,8 +288,7 @@ pub fn validate_export_param_ref_types(
             value,
             &param.name,
             &binding_map,
-            schemas,
-            schema_key_fn,
+            registry,
             &mut errors,
         );
     }
@@ -297,8 +306,7 @@ fn collect_ref_type_errors(
     value: &Value,
     param_name: &str,
     binding_map: &HashMap<String, &Resource>,
-    schemas: &HashMap<String, ResourceSchema>,
-    schema_key_fn: &dyn Fn(&Resource) -> String,
+    registry: &SchemaRegistry,
     errors: &mut Vec<String>,
 ) {
     use crate::parser::TypeExpr;
@@ -311,8 +319,7 @@ fn collect_ref_type_errors(
             let Some(ref_resource) = binding_map.get(ref_binding) else {
                 return;
             };
-            let ref_schema_key = schema_key_fn(ref_resource);
-            let Some(ref_schema) = schemas.get(&ref_schema_key) else {
+            let Some(ref_schema) = registry.get_for(ref_resource) else {
                 return;
             };
             let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr) else {
@@ -330,28 +337,12 @@ fn collect_ref_type_errors(
         }
         (TypeExpr::List(inner), Value::List(items)) => {
             for item in items {
-                collect_ref_type_errors(
-                    inner,
-                    item,
-                    param_name,
-                    binding_map,
-                    schemas,
-                    schema_key_fn,
-                    errors,
-                );
+                collect_ref_type_errors(inner, item, param_name, binding_map, registry, errors);
             }
         }
         (TypeExpr::Map(inner), Value::Map(map)) => {
             for value in map.values() {
-                collect_ref_type_errors(
-                    inner,
-                    value,
-                    param_name,
-                    binding_map,
-                    schemas,
-                    schema_key_fn,
-                    errors,
-                );
+                collect_ref_type_errors(inner, value, param_name, binding_map, registry, errors);
             }
         }
         (TypeExpr::Struct { fields }, Value::Map(map)) => {
@@ -362,8 +353,7 @@ fn collect_ref_type_errors(
                         value,
                         param_name,
                         binding_map,
-                        schemas,
-                        schema_key_fn,
+                        registry,
                         errors,
                     );
                 }

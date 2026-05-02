@@ -203,7 +203,12 @@ impl CompletionProvider {
         }
 
         // Generate resource type completions from schemas
-        for (resource_type, schema) in self.schemas.iter() {
+        for (provider, resource_type, _kind, schema) in self.schemas.iter() {
+            let key = if provider.is_empty() {
+                resource_type.to_string()
+            } else {
+                format!("{}.{}", provider, resource_type)
+            };
             let description = schema
                 .description
                 .as_deref()
@@ -211,7 +216,7 @@ impl CompletionProvider {
                 .to_string();
 
             // Build snippet with required attributes
-            let mut snippet = format!("{} {{\n", resource_type);
+            let mut snippet = format!("{} {{\n", key);
             let mut tab_stop = 1;
             for attr in schema.attributes.values() {
                 if attr.required {
@@ -222,7 +227,7 @@ impl CompletionProvider {
             snippet.push('}');
 
             completions.push(CompletionItem {
-                label: resource_type.clone(),
+                label: key.clone(),
                 kind: Some(CompletionItemKind::CLASS),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range: replacement_range,

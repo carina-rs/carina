@@ -1,20 +1,17 @@
 use super::*;
 use crate::resource::Resource;
-use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 use indexmap::IndexMap;
 
-fn make_s3_bucket_schema() -> (String, ResourceSchema) {
-    let schema = ResourceSchema::new("awscc.s3.Bucket")
-        .attribute(AttributeSchema::new("bucket_name", AttributeType::String));
-    ("awscc.s3.Bucket".to_string(), schema)
+fn make_s3_bucket_schema() -> ResourceSchema {
+    ResourceSchema::new("s3.Bucket")
+        .attribute(AttributeSchema::new("bucket_name", AttributeType::String))
 }
 
-fn schema_key_fn(resource: &Resource) -> String {
-    if resource.id.provider.is_empty() {
-        resource.id.resource_type.clone()
-    } else {
-        format!("{}.{}", resource.id.provider, resource.id.resource_type)
-    }
+fn registry_with_s3_bucket() -> SchemaRegistry {
+    let mut r = SchemaRegistry::new();
+    r.insert("awscc", make_s3_bucket_schema());
+    r
 }
 
 #[test]
@@ -32,10 +29,9 @@ fn test_resolve_attr_prefixes_extracts_prefix_and_generates_name() {
         Value::String("my-app-".to_string()),
     );
 
-    let schemas: HashMap<String, ResourceSchema> =
-        vec![make_s3_bucket_schema()].into_iter().collect();
+    let schemas = registry_with_s3_bucket();
     let mut resources = vec![resource];
-    resolve_attr_prefixes(&mut resources, &schemas, &schema_key_fn).unwrap();
+    resolve_attr_prefixes(&mut resources, &schemas).unwrap();
 
     // bucket_name_prefix should be removed
     assert!(!resources[0].attributes.contains_key("bucket_name_prefix"));
@@ -63,10 +59,9 @@ fn test_resolve_attr_prefixes_leaves_non_matching_prefix_alone() {
         Value::String("some-value".to_string()),
     );
 
-    let schemas: HashMap<String, ResourceSchema> =
-        vec![make_s3_bucket_schema()].into_iter().collect();
+    let schemas = registry_with_s3_bucket();
     let mut resources = vec![resource];
-    resolve_attr_prefixes(&mut resources, &schemas, &schema_key_fn).unwrap();
+    resolve_attr_prefixes(&mut resources, &schemas).unwrap();
 
     // nonexistent_attr_prefix should remain untouched
     assert!(
@@ -89,10 +84,9 @@ fn test_resolve_attr_prefixes_errors_when_both_prefix_and_attr_specified() {
         Value::String("my-actual-bucket".to_string()),
     );
 
-    let schemas: HashMap<String, ResourceSchema> =
-        vec![make_s3_bucket_schema()].into_iter().collect();
+    let schemas = registry_with_s3_bucket();
     let mut resources = vec![resource];
-    let result = resolve_attr_prefixes(&mut resources, &schemas, &schema_key_fn);
+    let result = resolve_attr_prefixes(&mut resources, &schemas);
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("cannot specify both"));
 }
@@ -105,10 +99,9 @@ fn test_resolve_attr_prefixes_errors_on_empty_prefix() {
         Value::String("".to_string()),
     );
 
-    let schemas: HashMap<String, ResourceSchema> =
-        vec![make_s3_bucket_schema()].into_iter().collect();
+    let schemas = registry_with_s3_bucket();
     let mut resources = vec![resource];
-    let result = resolve_attr_prefixes(&mut resources, &schemas, &schema_key_fn);
+    let result = resolve_attr_prefixes(&mut resources, &schemas);
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("cannot be empty"));
 }
@@ -201,12 +194,11 @@ fn test_reconcile_prefixed_names_keeps_generated_name_when_no_state() {
 fn test_reconcile_anonymous_id_partial_create_only_match() {
     // When one create-only property changes but another stays the same,
     // reconciliation should restore the state's identifier.
-    let schema = ResourceSchema::new("awscc.iam.role")
+    let schema = ResourceSchema::new("iam.role")
         .attribute(AttributeSchema::new("role_name", AttributeType::String).create_only())
         .attribute(AttributeSchema::new("path", AttributeType::String).create_only());
-    let schemas: HashMap<String, ResourceSchema> = vec![("awscc.iam.role".to_string(), schema)]
-        .into_iter()
-        .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: IndexMap::new(),
@@ -225,14 +217,7 @@ fn test_reconcile_anonymous_id_partial_create_only_match() {
     );
     r1.set_attr("path".to_string(), Value::String("/".to_string()));
     let mut resources1 = vec![r1];
-    compute_anonymous_identifiers(
-        &mut resources1,
-        &providers,
-        &schemas,
-        &schema_key_fn,
-        &identity_fn,
-    )
-    .unwrap();
+    compute_anonymous_identifiers(&mut resources1, &providers, &schemas, &identity_fn).unwrap();
     let step1_id = resources1[0].id.name_str().to_string();
 
     // Step 2: compute identifier with path="/carina/" (changed create-only)
@@ -243,14 +228,7 @@ fn test_reconcile_anonymous_id_partial_create_only_match() {
     );
     r2.set_attr("path".to_string(), Value::String("/carina/".to_string()));
     let mut resources2 = vec![r2];
-    compute_anonymous_identifiers(
-        &mut resources2,
-        &providers,
-        &schemas,
-        &schema_key_fn,
-        &identity_fn,
-    )
-    .unwrap();
+    compute_anonymous_identifiers(&mut resources2, &providers, &schemas, &identity_fn).unwrap();
     let step2_id = resources2[0].id.name_str().to_string();
 
     // Hash includes path, so identifiers differ
@@ -266,12 +244,9 @@ fn test_reconcile_anonymous_id_partial_create_only_match() {
         .into_iter()
         .collect(),
     }];
-    reconcile_anonymous_identifiers(
-        &mut resources2,
-        &schemas,
-        &schema_key_fn,
-        &|_provider, _rt| state_entries.clone(),
-    );
+    reconcile_anonymous_identifiers(&mut resources2, &schemas, &|_provider, _rt| {
+        state_entries.clone()
+    });
 
     // After reconciliation, step2 resource should have step1's identifier
     assert_eq!(resources2[0].id.name_str(), step1_id);
@@ -280,12 +255,11 @@ fn test_reconcile_anonymous_id_partial_create_only_match() {
 #[test]
 fn test_reconcile_anonymous_id_no_match_when_all_differ() {
     // When ALL create-only properties differ, no reconciliation (truly new resource)
-    let schema = ResourceSchema::new("awscc.iam.role")
+    let schema = ResourceSchema::new("iam.role")
         .attribute(AttributeSchema::new("role_name", AttributeType::String).create_only())
         .attribute(AttributeSchema::new("path", AttributeType::String).create_only());
-    let schemas: HashMap<String, ResourceSchema> = vec![("awscc.iam.role".to_string(), schema)]
-        .into_iter()
-        .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
 
     let mut resource = Resource::with_provider("awscc", "iam.role", "iam_role_aabbccdd");
     resource.set_attr(
@@ -307,12 +281,9 @@ fn test_reconcile_anonymous_id_no_match_when_all_differ() {
         .into_iter()
         .collect(),
     }];
-    reconcile_anonymous_identifiers(
-        &mut resources,
-        &schemas,
-        &schema_key_fn,
-        &|_provider, _rt| state_entries.clone(),
-    );
+    reconcile_anonymous_identifiers(&mut resources, &schemas, &|_provider, _rt| {
+        state_entries.clone()
+    });
 
     // Identifier should remain unchanged
     assert_eq!(resources[0].id.name_str(), original_id);
@@ -322,12 +293,11 @@ fn test_reconcile_anonymous_id_no_match_when_all_differ() {
 fn test_reconcile_anonymous_id_no_match_when_all_same() {
     // When ALL create-only properties match, the hash should also match,
     // so no reconciliation is needed (same identifier)
-    let schema = ResourceSchema::new("awscc.iam.role")
+    let schema = ResourceSchema::new("iam.role")
         .attribute(AttributeSchema::new("role_name", AttributeType::String).create_only())
         .attribute(AttributeSchema::new("path", AttributeType::String).create_only());
-    let schemas: HashMap<String, ResourceSchema> = vec![("awscc.iam.role".to_string(), schema)]
-        .into_iter()
-        .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
 
     let mut resource = Resource::with_provider("awscc", "iam.role", "iam_role_aabbccdd");
     resource.set_attr(
@@ -350,12 +320,9 @@ fn test_reconcile_anonymous_id_no_match_when_all_same() {
         .into_iter()
         .collect(),
     }];
-    reconcile_anonymous_identifiers(
-        &mut resources,
-        &schemas,
-        &schema_key_fn,
-        &|_provider, _rt| state_entries.clone(),
-    );
+    reconcile_anonymous_identifiers(&mut resources, &schemas, &|_provider, _rt| {
+        state_entries.clone()
+    });
 
     // Identifier should remain unchanged (all values match = no partial match)
     assert_eq!(resources[0].id.name_str(), original_id);
@@ -365,11 +332,10 @@ fn test_reconcile_anonymous_id_no_match_when_all_same() {
 fn test_reconcile_anonymous_id_single_create_only_no_reconcile() {
     // With only one create-only property, changing it means ALL changed,
     // so no reconciliation (matched=0 or mismatched=0)
-    let schema = ResourceSchema::new("awscc.ec2.Vpc")
+    let schema = ResourceSchema::new("ec2.Vpc")
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only());
-    let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.Vpc".to_string(), schema)]
-        .into_iter()
-        .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
 
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "ec2_vpc_aabbccdd");
     resource.set_attr(
@@ -386,12 +352,9 @@ fn test_reconcile_anonymous_id_single_create_only_no_reconcile() {
             .into_iter()
             .collect(),
     }];
-    reconcile_anonymous_identifiers(
-        &mut resources,
-        &schemas,
-        &schema_key_fn,
-        &|_provider, _rt| state_entries.clone(),
-    );
+    reconcile_anonymous_identifiers(&mut resources, &schemas, &|_provider, _rt| {
+        state_entries.clone()
+    });
 
     // No reconciliation: only one create-only prop and it changed
     assert_eq!(resources[0].id.name_str(), original_id);
@@ -400,15 +363,14 @@ fn test_reconcile_anonymous_id_single_create_only_no_reconcile() {
 #[test]
 fn test_anonymous_resource_no_create_only_properties() {
     // Resources with no create-only properties should still work as anonymous resources
-    let schema = ResourceSchema::new("awscc.ec2.eip")
+    let schema = ResourceSchema::new("ec2.eip")
         .attribute(AttributeSchema::new("domain", AttributeType::String))
         .attribute(AttributeSchema::new(
             "tags",
             AttributeType::map(AttributeType::String),
         ));
-    let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.eip".to_string(), schema)]
-        .into_iter()
-        .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: vec![(
@@ -428,14 +390,7 @@ fn test_anonymous_resource_no_create_only_properties() {
     r.set_attr("domain".to_string(), Value::String("vpc".to_string()));
 
     let mut resources = vec![r];
-    compute_anonymous_identifiers(
-        &mut resources,
-        &providers,
-        &schemas,
-        &schema_key_fn,
-        &identity_fn,
-    )
-    .unwrap();
+    compute_anonymous_identifiers(&mut resources, &providers, &schemas, &identity_fn).unwrap();
 
     // Should have computed an identifier
     assert!(!resources[0].id.name_str().is_empty());
@@ -445,11 +400,10 @@ fn test_anonymous_resource_no_create_only_properties() {
 #[test]
 fn test_anonymous_resource_no_create_only_deterministic() {
     // Same attributes should produce the same identifier
-    let schema = ResourceSchema::new("awscc.ec2.eip")
+    let schema = ResourceSchema::new("ec2.eip")
         .attribute(AttributeSchema::new("domain", AttributeType::String));
-    let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.eip".to_string(), schema)]
-        .into_iter()
-        .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: vec![(
@@ -473,22 +427,8 @@ fn test_anonymous_resource_no_create_only_deterministic() {
 
     let mut resources1 = vec![make_resource()];
     let mut resources2 = vec![make_resource()];
-    compute_anonymous_identifiers(
-        &mut resources1,
-        &providers,
-        &schemas,
-        &schema_key_fn,
-        &identity_fn,
-    )
-    .unwrap();
-    compute_anonymous_identifiers(
-        &mut resources2,
-        &providers,
-        &schemas,
-        &schema_key_fn,
-        &identity_fn,
-    )
-    .unwrap();
+    compute_anonymous_identifiers(&mut resources1, &providers, &schemas, &identity_fn).unwrap();
+    compute_anonymous_identifiers(&mut resources2, &providers, &schemas, &identity_fn).unwrap();
 
     assert_eq!(resources1[0].id.name_str(), resources2[0].id.name_str());
 }
@@ -496,11 +436,10 @@ fn test_anonymous_resource_no_create_only_deterministic() {
 #[test]
 fn test_anonymous_resource_no_create_only_collision() {
     // Two identical anonymous resources with no create-only properties should collide
-    let schema = ResourceSchema::new("awscc.ec2.eip")
+    let schema = ResourceSchema::new("ec2.eip")
         .attribute(AttributeSchema::new("domain", AttributeType::String));
-    let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.eip".to_string(), schema)]
-        .into_iter()
-        .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: IndexMap::new(),
@@ -518,13 +457,7 @@ fn test_anonymous_resource_no_create_only_collision() {
     r2.set_attr("domain".to_string(), Value::String("vpc".to_string()));
 
     let mut resources = vec![r1, r2];
-    let result = compute_anonymous_identifiers(
-        &mut resources,
-        &providers,
-        &schemas,
-        &schema_key_fn,
-        &identity_fn,
-    );
+    let result = compute_anonymous_identifiers(&mut resources, &providers, &schemas, &identity_fn);
 
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("collision"));
@@ -536,7 +469,7 @@ fn test_identity_attribute_prevents_collision() {
     // but different identity attrs should NOT collide.
     // This simulates route53.record_set where `name` is create-only (same)
     // but `type` is identity (A vs AAAA).
-    let schema = ResourceSchema::new("awscc.route53.record_set")
+    let schema = ResourceSchema::new("route53.record_set")
         .attribute(AttributeSchema::new("name", AttributeType::String).create_only())
         .attribute(AttributeSchema::new("hosted_zone_id", AttributeType::String).create_only())
         .attribute(AttributeSchema::new("type", AttributeType::String).identity())
@@ -545,10 +478,8 @@ fn test_identity_attribute_prevents_collision() {
             "resource_records",
             AttributeType::list(AttributeType::String),
         ));
-    let schemas: HashMap<String, ResourceSchema> =
-        vec![("awscc.route53.record_set".to_string(), schema)]
-            .into_iter()
-            .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: IndexMap::new(),
@@ -582,14 +513,8 @@ fn test_identity_attribute_prevents_collision() {
     r2.set_attr("type".to_string(), Value::String("AAAA".to_string()));
 
     let mut resources = vec![r1, r2];
-    compute_anonymous_identifiers(
-        &mut resources,
-        &providers,
-        &schemas,
-        &schema_key_fn,
-        &identity_fn,
-    )
-    .expect("should not collide when identity attrs differ");
+    compute_anonymous_identifiers(&mut resources, &providers, &schemas, &identity_fn)
+        .expect("should not collide when identity attrs differ");
 
     // Both should have identifiers assigned
     assert!(!resources[0].id.name_str().is_empty());
@@ -666,13 +591,12 @@ fn test_extract_hash_from_identifier() {
 fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
     // When schema has no create-only properties and an attribute changes,
     // Hamming distance reconciliation should match with the closest state entry.
-    let schema = ResourceSchema::new("awscc.ec2.eip")
+    let schema = ResourceSchema::new("ec2.eip")
         .attribute(AttributeSchema::new("domain", AttributeType::String))
         .attribute(AttributeSchema::new("tag_name", AttributeType::String))
         .attribute(AttributeSchema::new("tag_env", AttributeType::String));
-    let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.eip".to_string(), schema)]
-        .into_iter()
-        .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: vec![(
@@ -697,14 +621,7 @@ fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
         Value::String("production".to_string()),
     );
     let mut resources1 = vec![r1];
-    compute_anonymous_identifiers(
-        &mut resources1,
-        &providers,
-        &schemas,
-        &schema_key_fn,
-        &identity_fn,
-    )
-    .unwrap();
+    compute_anonymous_identifiers(&mut resources1, &providers, &schemas, &identity_fn).unwrap();
     let old_id = resources1[0].id.name_str().to_string();
 
     // Step 2: compute identifier with tag_env="staging" (one attribute changed)
@@ -713,14 +630,7 @@ fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
     r2.set_attr("tag_name".to_string(), Value::String("my-eip".to_string()));
     r2.set_attr("tag_env".to_string(), Value::String("staging".to_string()));
     let mut resources2 = vec![r2];
-    compute_anonymous_identifiers(
-        &mut resources2,
-        &providers,
-        &schemas,
-        &schema_key_fn,
-        &identity_fn,
-    )
-    .unwrap();
+    compute_anonymous_identifiers(&mut resources2, &providers, &schemas, &identity_fn).unwrap();
     let new_id = resources2[0].id.name_str().to_string();
 
     // Identifiers should differ (different attributes)
@@ -731,12 +641,9 @@ fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
         name: old_id.clone(),
         create_only_values: HashMap::new(),
     }];
-    reconcile_anonymous_identifiers(
-        &mut resources2,
-        &schemas,
-        &schema_key_fn,
-        &|_provider, _rt| state_entries.clone(),
-    );
+    reconcile_anonymous_identifiers(&mut resources2, &schemas, &|_provider, _rt| {
+        state_entries.clone()
+    });
 
     // After reconciliation, should have the old identifier (Hamming distance match)
     assert_eq!(resources2[0].id.name_str(), old_id);
@@ -745,11 +652,10 @@ fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
 #[test]
 fn test_reconcile_anonymous_id_no_create_only_no_match_when_distant() {
     // Completely different resources should not reconcile
-    let schema = ResourceSchema::new("awscc.ec2.eip")
+    let schema = ResourceSchema::new("ec2.eip")
         .attribute(AttributeSchema::new("domain", AttributeType::String));
-    let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.eip".to_string(), schema)]
-        .into_iter()
-        .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
 
     // Resource with a computed identifier
     let mut resource = Resource::with_provider("awscc", "ec2.eip", "ec2_eip_aabbccdd11223344");
@@ -763,12 +669,9 @@ fn test_reconcile_anonymous_id_no_create_only_no_match_when_distant() {
         name: "ec2_eip_5544332266778899".to_string(),
         create_only_values: HashMap::new(),
     }];
-    reconcile_anonymous_identifiers(
-        &mut resources,
-        &schemas,
-        &schema_key_fn,
-        &|_provider, _rt| state_entries.clone(),
-    );
+    reconcile_anonymous_identifiers(&mut resources, &schemas, &|_provider, _rt| {
+        state_entries.clone()
+    });
 
     // Identifier should remain unchanged (too distant)
     assert_eq!(resources[0].id.name_str(), original_id);
@@ -778,12 +681,11 @@ fn test_reconcile_anonymous_id_no_create_only_no_match_when_distant() {
 fn test_reconcile_anonymous_id_create_only_exists_but_none_set() {
     // Case A: Schema has create-only properties, but user didn't set any.
     // Should use SimHash-based Hamming distance reconciliation.
-    let schema = ResourceSchema::new("awscc.ec2.eip")
+    let schema = ResourceSchema::new("ec2.eip")
         .attribute(AttributeSchema::new("domain", AttributeType::String))
         .attribute(AttributeSchema::new("public_ipv4_pool", AttributeType::String).create_only());
-    let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.eip".to_string(), schema)]
-        .into_iter()
-        .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: IndexMap::new(),
@@ -798,14 +700,7 @@ fn test_reconcile_anonymous_id_create_only_exists_but_none_set() {
     let mut r1 = Resource::with_provider("awscc", "ec2.eip", "");
     r1.set_attr("domain".to_string(), Value::String("vpc".to_string()));
     let mut resources = vec![r1];
-    compute_anonymous_identifiers(
-        &mut resources,
-        &providers,
-        &schemas,
-        &schema_key_fn,
-        &identity_fn,
-    )
-    .unwrap();
+    compute_anonymous_identifiers(&mut resources, &providers, &schemas, &identity_fn).unwrap();
 
     // Should have computed an identifier (not errored)
     assert!(!resources[0].id.name_str().is_empty());
@@ -818,12 +713,9 @@ fn test_reconcile_anonymous_id_create_only_exists_but_none_set() {
         name: state_id,
         create_only_values: HashMap::new(),
     }];
-    reconcile_anonymous_identifiers(
-        &mut resources,
-        &schemas,
-        &schema_key_fn,
-        &|_provider, _rt| state_entries.clone(),
-    );
+    reconcile_anonymous_identifiers(&mut resources, &schemas, &|_provider, _rt| {
+        state_entries.clone()
+    });
 
     // Same identifier in state, no change needed
     assert_eq!(resources[0].id.name_str(), current_id);
@@ -968,14 +860,13 @@ fn test_simhash_all_attributes_changed_large_distance() {
 #[test]
 fn test_reconcile_no_create_only_picks_closest_among_multiple_state_entries() {
     // When multiple state entries exist, reconciliation should pick the closest one
-    let schema = ResourceSchema::new("awscc.ec2.eip")
+    let schema = ResourceSchema::new("ec2.eip")
         .attribute(AttributeSchema::new("domain", AttributeType::String))
         .attribute(AttributeSchema::new("tag_name", AttributeType::String))
         .attribute(AttributeSchema::new("tag_env", AttributeType::String))
         .attribute(AttributeSchema::new("tag_team", AttributeType::String));
-    let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.eip".to_string(), schema)]
-        .into_iter()
-        .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: IndexMap::new(),
@@ -998,38 +889,19 @@ fn test_reconcile_no_create_only_picks_closest_among_multiple_state_entries() {
 
     // Original: env=prod, team=infra
     let mut resources_orig = vec![make_resource("production", "infra")];
-    compute_anonymous_identifiers(
-        &mut resources_orig,
-        &providers,
-        &schemas,
-        &schema_key_fn,
-        &identity_fn,
-    )
-    .unwrap();
+    compute_anonymous_identifiers(&mut resources_orig, &providers, &schemas, &identity_fn).unwrap();
     let orig_id = resources_orig[0].id.name_str().to_string();
 
     // Distant: env=dev, team=frontend (2 attrs changed)
     let mut resources_distant = vec![make_resource("development", "frontend")];
-    compute_anonymous_identifiers(
-        &mut resources_distant,
-        &providers,
-        &schemas,
-        &schema_key_fn,
-        &identity_fn,
-    )
-    .unwrap();
+    compute_anonymous_identifiers(&mut resources_distant, &providers, &schemas, &identity_fn)
+        .unwrap();
     let distant_id = resources_distant[0].id.name_str().to_string();
 
     // Current: env=staging, team=infra (1 attr changed from orig)
     let mut resources_current = vec![make_resource("staging", "infra")];
-    compute_anonymous_identifiers(
-        &mut resources_current,
-        &providers,
-        &schemas,
-        &schema_key_fn,
-        &identity_fn,
-    )
-    .unwrap();
+    compute_anonymous_identifiers(&mut resources_current, &providers, &schemas, &identity_fn)
+        .unwrap();
 
     // State has both orig and distant entries
     let state_entries = vec![
@@ -1043,12 +915,9 @@ fn test_reconcile_no_create_only_picks_closest_among_multiple_state_entries() {
         },
     ];
 
-    reconcile_anonymous_identifiers(
-        &mut resources_current,
-        &schemas,
-        &schema_key_fn,
-        &|_provider, _rt| state_entries.clone(),
-    );
+    reconcile_anonymous_identifiers(&mut resources_current, &schemas, &|_provider, _rt| {
+        state_entries.clone()
+    });
 
     // Should match orig (closer: 1 attr changed) rather than distant (2 attrs changed)
     // Note: This depends on SimHash producing closer hashes for more similar inputs.
@@ -1077,11 +946,10 @@ fn test_reconcile_no_create_only_picks_closest_among_multiple_state_entries() {
 #[test]
 fn test_reconcile_no_create_only_same_id_in_state_no_change() {
     // If state already has the same identifier, no reconciliation needed
-    let schema = ResourceSchema::new("awscc.ec2.eip")
+    let schema = ResourceSchema::new("ec2.eip")
         .attribute(AttributeSchema::new("domain", AttributeType::String));
-    let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.eip".to_string(), schema)]
-        .into_iter()
-        .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: IndexMap::new(),
@@ -1095,14 +963,7 @@ fn test_reconcile_no_create_only_same_id_in_state_no_change() {
     let mut r = Resource::with_provider("awscc", "ec2.eip", "");
     r.set_attr("domain".to_string(), Value::String("vpc".to_string()));
     let mut resources = vec![r];
-    compute_anonymous_identifiers(
-        &mut resources,
-        &providers,
-        &schemas,
-        &schema_key_fn,
-        &identity_fn,
-    )
-    .unwrap();
+    compute_anonymous_identifiers(&mut resources, &providers, &schemas, &identity_fn).unwrap();
     let id = resources[0].id.name_str().to_string();
 
     // State has the exact same identifier
@@ -1110,12 +971,9 @@ fn test_reconcile_no_create_only_same_id_in_state_no_change() {
         name: id.clone(),
         create_only_values: HashMap::new(),
     }];
-    reconcile_anonymous_identifiers(
-        &mut resources,
-        &schemas,
-        &schema_key_fn,
-        &|_provider, _rt| state_entries.clone(),
-    );
+    reconcile_anonymous_identifiers(&mut resources, &schemas, &|_provider, _rt| {
+        state_entries.clone()
+    });
 
     // Should remain unchanged
     assert_eq!(resources[0].id.name_str(), id);
@@ -1124,23 +982,17 @@ fn test_reconcile_no_create_only_same_id_in_state_no_change() {
 #[test]
 fn test_reconcile_no_create_only_empty_state() {
     // No state entries = no reconciliation
-    let schema = ResourceSchema::new("awscc.ec2.eip")
+    let schema = ResourceSchema::new("ec2.eip")
         .attribute(AttributeSchema::new("domain", AttributeType::String));
-    let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.eip".to_string(), schema)]
-        .into_iter()
-        .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
 
     let mut resource = Resource::with_provider("awscc", "ec2.eip", "ec2_eip_aabbccdd11223344");
     resource.set_attr("domain".to_string(), Value::String("vpc".to_string()));
     let original_id = resource.id.name_str().to_string();
     let mut resources = vec![resource];
 
-    reconcile_anonymous_identifiers(
-        &mut resources,
-        &schemas,
-        &schema_key_fn,
-        &|_provider, _rt| vec![],
-    );
+    reconcile_anonymous_identifiers(&mut resources, &schemas, &|_provider, _rt| vec![]);
 
     assert_eq!(resources[0].id.name_str(), original_id);
 }
@@ -1148,14 +1000,12 @@ fn test_reconcile_no_create_only_empty_state() {
 #[test]
 fn test_compute_anonymous_id_uses_simhash_for_no_create_only() {
     // Verify that changing one attribute produces a different but nearby identifier
-    let schema = ResourceSchema::new("awscc.ec2.internet_gateway")
+    let schema = ResourceSchema::new("ec2.internet_gateway")
         .attribute(AttributeSchema::new("tag_name", AttributeType::String))
         .attribute(AttributeSchema::new("tag_env", AttributeType::String))
         .attribute(AttributeSchema::new("tag_team", AttributeType::String));
-    let schemas: HashMap<String, ResourceSchema> =
-        vec![("awscc.ec2.internet_gateway".to_string(), schema)]
-            .into_iter()
-            .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: IndexMap::new(),
@@ -1179,10 +1029,8 @@ fn test_compute_anonymous_id_uses_simhash_for_no_create_only() {
 
     let mut r1 = vec![make_resource("production")];
     let mut r2 = vec![make_resource("staging")];
-    compute_anonymous_identifiers(&mut r1, &providers, &schemas, &schema_key_fn, &identity_fn)
-        .unwrap();
-    compute_anonymous_identifiers(&mut r2, &providers, &schemas, &schema_key_fn, &identity_fn)
-        .unwrap();
+    compute_anonymous_identifiers(&mut r1, &providers, &schemas, &identity_fn).unwrap();
+    compute_anonymous_identifiers(&mut r2, &providers, &schemas, &identity_fn).unwrap();
 
     // Different identifiers
     assert_ne!(r1[0].id.name_str(), r2[0].id.name_str());
@@ -1203,18 +1051,15 @@ fn test_compute_anonymous_id_uses_simhash_for_no_create_only() {
 fn test_compute_anonymous_id_simhash_vs_create_only_hash_independent() {
     // Resources with create-only properties use standard hash,
     // resources without use SimHash. Verify both work side by side.
-    let schema_with_co = ResourceSchema::new("awscc.ec2.Vpc")
+    let schema_with_co = ResourceSchema::new("ec2.Vpc")
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only())
         .attribute(AttributeSchema::new("tag_name", AttributeType::String));
-    let schema_without_co = ResourceSchema::new("awscc.ec2.eip")
+    let schema_without_co = ResourceSchema::new("ec2.eip")
         .attribute(AttributeSchema::new("domain", AttributeType::String))
         .attribute(AttributeSchema::new("tag_name", AttributeType::String));
-    let schemas: HashMap<String, ResourceSchema> = vec![
-        ("awscc.ec2.Vpc".to_string(), schema_with_co),
-        ("awscc.ec2.eip".to_string(), schema_without_co),
-    ]
-    .into_iter()
-    .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema_with_co);
+    schemas.insert("awscc", schema_without_co);
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: IndexMap::new(),
@@ -1237,14 +1082,7 @@ fn test_compute_anonymous_id_simhash_vs_create_only_hash_independent() {
     eip.set_attr("tag_name".to_string(), Value::String("my-eip".to_string()));
 
     let mut resources = vec![vpc, eip];
-    compute_anonymous_identifiers(
-        &mut resources,
-        &providers,
-        &schemas,
-        &schema_key_fn,
-        &identity_fn,
-    )
-    .unwrap();
+    compute_anonymous_identifiers(&mut resources, &providers, &schemas, &identity_fn).unwrap();
 
     // Both should have identifiers computed
     assert!(resources[0].id.name_str().starts_with("ec2_vpc_"));
@@ -1261,12 +1099,11 @@ fn test_compute_anonymous_id_simhash_vs_create_only_hash_independent() {
 fn test_reconcile_create_only_path_unaffected_by_simhash_changes() {
     // Verify that resources WITH create-only properties still use the
     // existing partial-match reconciliation, not Hamming distance.
-    let schema = ResourceSchema::new("awscc.iam.role")
+    let schema = ResourceSchema::new("iam.role")
         .attribute(AttributeSchema::new("role_name", AttributeType::String).create_only())
         .attribute(AttributeSchema::new("path", AttributeType::String).create_only());
-    let schemas: HashMap<String, ResourceSchema> = vec![("awscc.iam.role".to_string(), schema)]
-        .into_iter()
-        .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
 
     // Resource with both create-only props set
     let mut resource = Resource::with_provider("awscc", "iam.role", "iam_role_aabbccdd");
@@ -1290,12 +1127,9 @@ fn test_reconcile_create_only_path_unaffected_by_simhash_changes() {
         .collect(),
     }];
 
-    reconcile_anonymous_identifiers(
-        &mut resources,
-        &schemas,
-        &schema_key_fn,
-        &|_provider, _rt| state_entries.clone(),
-    );
+    reconcile_anonymous_identifiers(&mut resources, &schemas, &|_provider, _rt| {
+        state_entries.clone()
+    });
 
     // Should reconcile via partial create-only match (not Hamming distance)
     assert_eq!(resources[0].id.name_str(), "iam_role_11223344");
@@ -1307,11 +1141,10 @@ fn test_compute_anonymous_id_stable_with_prefixed_create_only_attribute() {
     // When a create-only attribute has a prefix (e.g., bucket_name_prefix),
     // the anonymous identifier should be based on the prefix, not the
     // randomly generated name. This ensures the hash is stable across runs.
-    let schema = ResourceSchema::new("awscc.s3.Bucket")
+    let schema = ResourceSchema::new("s3.Bucket")
         .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only());
-    let schemas: HashMap<String, ResourceSchema> = vec![("awscc.s3.Bucket".to_string(), schema)]
-        .into_iter()
-        .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: IndexMap::new(),
@@ -1336,10 +1169,8 @@ fn test_compute_anonymous_id_stable_with_prefixed_create_only_attribute() {
 
     let mut r1 = vec![make_resource("my-app-abc12345")];
     let mut r2 = vec![make_resource("my-app-xyz98765")];
-    compute_anonymous_identifiers(&mut r1, &providers, &schemas, &schema_key_fn, &identity_fn)
-        .unwrap();
-    compute_anonymous_identifiers(&mut r2, &providers, &schemas, &schema_key_fn, &identity_fn)
-        .unwrap();
+    compute_anonymous_identifiers(&mut r1, &providers, &schemas, &identity_fn).unwrap();
+    compute_anonymous_identifiers(&mut r2, &providers, &schemas, &identity_fn).unwrap();
 
     // Same prefix should produce the same anonymous identifier
     assert_eq!(
@@ -1352,11 +1183,10 @@ fn test_compute_anonymous_id_stable_with_prefixed_create_only_attribute() {
 #[test]
 fn test_compute_anonymous_id_different_prefix_produces_different_id() {
     // Different prefixes should produce different anonymous identifiers
-    let schema = ResourceSchema::new("awscc.s3.Bucket")
+    let schema = ResourceSchema::new("s3.Bucket")
         .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only());
-    let schemas: HashMap<String, ResourceSchema> = vec![("awscc.s3.Bucket".to_string(), schema)]
-        .into_iter()
-        .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: IndexMap::new(),
@@ -1380,10 +1210,8 @@ fn test_compute_anonymous_id_different_prefix_produces_different_id() {
 
     let mut r1 = vec![make_resource("app-a-", "app-a-abc12345")];
     let mut r2 = vec![make_resource("app-b-", "app-b-xyz98765")];
-    compute_anonymous_identifiers(&mut r1, &providers, &schemas, &schema_key_fn, &identity_fn)
-        .unwrap();
-    compute_anonymous_identifiers(&mut r2, &providers, &schemas, &schema_key_fn, &identity_fn)
-        .unwrap();
+    compute_anonymous_identifiers(&mut r1, &providers, &schemas, &identity_fn).unwrap();
+    compute_anonymous_identifiers(&mut r2, &providers, &schemas, &identity_fn).unwrap();
 
     // Different prefixes should produce different identifiers
     assert_ne!(
@@ -1397,14 +1225,12 @@ fn test_compute_anonymous_id_different_prefix_produces_different_id() {
 fn test_reconcile_skips_let_bound_resources() {
     // Let-bound (named) resources should never be reconciled, even if their
     // name doesn't exist in state. The _binding attribute marks them as named.
-    let schema = ResourceSchema::new("aws.ec2.security_group_ingress")
+    let schema = ResourceSchema::new("ec2.security_group_ingress")
         .attribute(AttributeSchema::new("cidr_ip", AttributeType::String).create_only())
         .attribute(AttributeSchema::new("ip_protocol", AttributeType::String).create_only())
         .attribute(AttributeSchema::new("description", AttributeType::String).create_only());
-    let schemas: HashMap<String, ResourceSchema> =
-        vec![("aws.ec2.security_group_ingress".to_string(), schema)]
-            .into_iter()
-            .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("aws", schema);
 
     // A let-bound resource whose name does NOT exist in state
     let mut ingress_new =
@@ -1435,12 +1261,9 @@ fn test_reconcile_skips_let_bound_resources() {
         .collect(),
     }];
 
-    reconcile_anonymous_identifiers(
-        &mut resources,
-        &schemas,
-        &schema_key_fn,
-        &|_provider, _rt| state_entries.clone(),
-    );
+    reconcile_anonymous_identifiers(&mut resources, &schemas, &|_provider, _rt| {
+        state_entries.clone()
+    });
 
     // Named resource must keep its original name
     assert_eq!(
@@ -1455,14 +1278,12 @@ fn test_reconcile_skips_when_multiple_partial_matches() {
     // When multiple state entries partially match an anonymous resource,
     // reconciliation should skip rather than picking the first match.
     // This prevents a new SG rule from hijacking an unrelated state entry.
-    let schema = ResourceSchema::new("aws.ec2.security_group_ingress")
+    let schema = ResourceSchema::new("ec2.security_group_ingress")
         .attribute(AttributeSchema::new("cidr_ip", AttributeType::String).create_only())
         .attribute(AttributeSchema::new("ip_protocol", AttributeType::String).create_only())
         .attribute(AttributeSchema::new("description", AttributeType::String).create_only());
-    let schemas: HashMap<String, ResourceSchema> =
-        vec![("aws.ec2.security_group_ingress".to_string(), schema)]
-            .into_iter()
-            .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("aws", schema);
 
     // Anonymous resource with a new hash-derived identifier
     let mut new_rule = Resource::with_provider(
@@ -1508,12 +1329,9 @@ fn test_reconcile_skips_when_multiple_partial_matches() {
         },
     ];
 
-    reconcile_anonymous_identifiers(
-        &mut resources,
-        &schemas,
-        &schema_key_fn,
-        &|_provider, _rt| state_entries.clone(),
-    );
+    reconcile_anonymous_identifiers(&mut resources, &schemas, &|_provider, _rt| {
+        state_entries.clone()
+    });
 
     // With multiple partial matches, reconciliation should be skipped
     assert_eq!(
@@ -1529,7 +1347,7 @@ fn test_reconcile_eip_tag_update_with_unset_create_only_props() {
     // (address, ipam_pool_id, etc.) but user didn't set any. Only tags changed.
     // SimHash reconciliation should match the resource as an in-place update,
     // not a replace (delete+create).
-    let schema = ResourceSchema::new("awscc.ec2.eip")
+    let schema = ResourceSchema::new("ec2.eip")
         .attribute(AttributeSchema::new("domain", AttributeType::String))
         .attribute(AttributeSchema::new("address", AttributeType::String).create_only())
         .attribute(AttributeSchema::new("ipam_pool_id", AttributeType::String).create_only())
@@ -1541,9 +1359,8 @@ fn test_reconcile_eip_tag_update_with_unset_create_only_props() {
             "tags",
             AttributeType::map(AttributeType::String),
         ));
-    let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.eip".to_string(), schema)]
-        .into_iter()
-        .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
     let providers = vec![ProviderConfig {
         name: "awscc".to_string(),
         attributes: vec![(
@@ -1574,14 +1391,7 @@ fn test_reconcile_eip_tag_update_with_unset_create_only_props() {
     r1.set_attr("tags".to_string(), Value::Map(tags1));
 
     let mut resources1 = vec![r1];
-    compute_anonymous_identifiers(
-        &mut resources1,
-        &providers,
-        &schemas,
-        &schema_key_fn,
-        &identity_fn,
-    )
-    .unwrap();
+    compute_anonymous_identifiers(&mut resources1, &providers, &schemas, &identity_fn).unwrap();
     let step1_id = resources1[0].id.name_str().to_string();
 
     // Step 2: Change tag Environment=staging (only tags changed)
@@ -1599,14 +1409,7 @@ fn test_reconcile_eip_tag_update_with_unset_create_only_props() {
     r2.set_attr("tags".to_string(), Value::Map(tags2));
 
     let mut resources2 = vec![r2];
-    compute_anonymous_identifiers(
-        &mut resources2,
-        &providers,
-        &schemas,
-        &schema_key_fn,
-        &identity_fn,
-    )
-    .unwrap();
+    compute_anonymous_identifiers(&mut resources2, &providers, &schemas, &identity_fn).unwrap();
     let step2_id = resources2[0].id.name_str().to_string();
 
     // Identifiers should differ (different tag values)
@@ -1617,12 +1420,9 @@ fn test_reconcile_eip_tag_update_with_unset_create_only_props() {
         name: step1_id.clone(),
         create_only_values: HashMap::new(), // No create-only values in state either
     }];
-    reconcile_anonymous_identifiers(
-        &mut resources2,
-        &schemas,
-        &schema_key_fn,
-        &|_provider, _rt| state_entries.clone(),
-    );
+    reconcile_anonymous_identifiers(&mut resources2, &schemas, &|_provider, _rt| {
+        state_entries.clone()
+    });
 
     // After reconciliation, step2 should have step1's identifier (in-place update)
     assert_eq!(
@@ -1640,14 +1440,12 @@ fn test_reconcile_does_not_swap_named_resources_with_overlapping_create_only() {
     //
     // Both resources are named (let-bound) and already match state entries by name.
     // Reconciliation should leave them unchanged.
-    let schema = ResourceSchema::new("aws.ec2.security_group_ingress")
+    let schema = ResourceSchema::new("ec2.security_group_ingress")
         .attribute(AttributeSchema::new("cidr_ip", AttributeType::String).create_only())
         .attribute(AttributeSchema::new("ip_protocol", AttributeType::String).create_only())
         .attribute(AttributeSchema::new("description", AttributeType::String).create_only());
-    let schemas: HashMap<String, ResourceSchema> =
-        vec![("aws.ec2.security_group_ingress".to_string(), schema)]
-            .into_iter()
-            .collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("aws", schema);
 
     // Two named ingress resources with overlapping create-only attributes
     let mut ingress_http =
@@ -1700,12 +1498,9 @@ fn test_reconcile_does_not_swap_named_resources_with_overlapping_create_only() {
         },
     ];
 
-    reconcile_anonymous_identifiers(
-        &mut resources,
-        &schemas,
-        &schema_key_fn,
-        &|_provider, _rt| state_entries.clone(),
-    );
+    reconcile_anonymous_identifiers(&mut resources, &schemas, &|_provider, _rt| {
+        state_entries.clone()
+    });
 
     // Names must remain unchanged - no swapping
     assert_eq!(
@@ -1720,10 +1515,12 @@ fn test_reconcile_does_not_swap_named_resources_with_overlapping_create_only() {
     );
 }
 
-fn make_sso_instance_schema() -> (String, ResourceSchema) {
-    let schema = ResourceSchema::new("awscc.sso.Instance")
+fn make_sso_instance_registry() -> SchemaRegistry {
+    let schema = ResourceSchema::new("sso.Instance")
         .attribute(AttributeSchema::new("name", AttributeType::String).create_only());
-    ("awscc.sso.Instance".to_string(), schema)
+    let mut r = SchemaRegistry::new();
+    r.insert("awscc", schema);
+    r
 }
 
 #[test]
@@ -1732,8 +1529,7 @@ fn test_detect_rename_unique_match_by_create_only_attrs() {
     // DSL now defines it as a let-bound resource with the same name.
     // detect_anonymous_to_named_renames should emit a rename from the
     // anonymous hash name to the binding name.
-    let (key, schema) = make_sso_instance_schema();
-    let schemas: HashMap<String, ResourceSchema> = vec![(key, schema)].into_iter().collect();
+    let schemas = make_sso_instance_registry();
 
     let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso");
     resource.binding = Some("sso".to_string());
@@ -1750,7 +1546,6 @@ fn test_detect_rename_unique_match_by_create_only_attrs() {
     let renames = detect_anonymous_to_named_renames(
         &resources,
         &schemas,
-        &schema_key_fn,
         &|_provider, _rt| state_entries.clone(),
         &[],
         &|_provider| Vec::new(),
@@ -1764,8 +1559,7 @@ fn test_detect_rename_unique_match_by_create_only_attrs() {
 #[test]
 fn test_detect_rename_skips_when_binding_already_in_state() {
     // If state already has an entry for the binding name, nothing to rename.
-    let (key, schema) = make_sso_instance_schema();
-    let schemas: HashMap<String, ResourceSchema> = vec![(key, schema)].into_iter().collect();
+    let schemas = make_sso_instance_registry();
 
     let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso");
     resource.binding = Some("sso".to_string());
@@ -1782,7 +1576,6 @@ fn test_detect_rename_skips_when_binding_already_in_state() {
     let renames = detect_anonymous_to_named_renames(
         &resources,
         &schemas,
-        &schema_key_fn,
         &|_provider, _rt| state_entries.clone(),
         &[],
         &|_provider| Vec::new(),
@@ -1793,8 +1586,7 @@ fn test_detect_rename_skips_when_binding_already_in_state() {
 #[test]
 fn test_detect_rename_ignores_anonymous_resources() {
     // Anonymous resources (binding=None) are not candidates for this rename.
-    let (key, schema) = make_sso_instance_schema();
-    let schemas: HashMap<String, ResourceSchema> = vec![(key, schema)].into_iter().collect();
+    let schemas = make_sso_instance_registry();
 
     let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso_instance_new");
     // No binding set
@@ -1811,7 +1603,6 @@ fn test_detect_rename_ignores_anonymous_resources() {
     let renames = detect_anonymous_to_named_renames(
         &resources,
         &schemas,
-        &schema_key_fn,
         &|_provider, _rt| state_entries.clone(),
         &[],
         &|_provider| Vec::new(),
@@ -1822,8 +1613,7 @@ fn test_detect_rename_ignores_anonymous_resources() {
 #[test]
 fn test_detect_rename_skips_ambiguous_matches() {
     // Two orphan state entries match — skip to avoid rebinding the wrong one.
-    let (key, schema) = make_sso_instance_schema();
-    let schemas: HashMap<String, ResourceSchema> = vec![(key, schema)].into_iter().collect();
+    let schemas = make_sso_instance_registry();
 
     let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso");
     resource.binding = Some("sso".to_string());
@@ -1848,7 +1638,6 @@ fn test_detect_rename_skips_ambiguous_matches() {
     let renames = detect_anonymous_to_named_renames(
         &resources,
         &schemas,
-        &schema_key_fn,
         &|_provider, _rt| state_entries.clone(),
         &[],
         &|_provider| Vec::new(),
@@ -1860,8 +1649,7 @@ fn test_detect_rename_skips_ambiguous_matches() {
 fn test_detect_rename_ignores_non_hash_state_names() {
     // A state entry with a non-hash name (e.g., another let binding) is not
     // treated as an anonymous candidate and must not be silently renamed.
-    let (key, schema) = make_sso_instance_schema();
-    let schemas: HashMap<String, ResourceSchema> = vec![(key, schema)].into_iter().collect();
+    let schemas = make_sso_instance_registry();
 
     let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso");
     resource.binding = Some("sso".to_string());
@@ -1878,7 +1666,6 @@ fn test_detect_rename_ignores_non_hash_state_names() {
     let renames = detect_anonymous_to_named_renames(
         &resources,
         &schemas,
-        &schema_key_fn,
         &|_provider, _rt| state_entries.clone(),
         &[],
         &|_provider| Vec::new(),
@@ -1886,11 +1673,13 @@ fn test_detect_rename_ignores_non_hash_state_names() {
     assert!(renames.is_empty());
 }
 
-/// Schema with NO create-only attributes — like `awscc.sso.Instance`.
-fn make_sso_instance_schema_no_create_only() -> (String, ResourceSchema) {
-    let schema = ResourceSchema::new("awscc.sso.Instance")
+/// Registry with NO create-only attributes — like `awscc.sso.Instance`.
+fn make_sso_instance_registry_no_create_only() -> SchemaRegistry {
+    let schema = ResourceSchema::new("sso.Instance")
         .attribute(AttributeSchema::new("name", AttributeType::String));
-    ("awscc.sso.Instance".to_string(), schema)
+    let mut r = SchemaRegistry::new();
+    r.insert("awscc", schema);
+    r
 }
 
 #[test]
@@ -1900,8 +1689,7 @@ fn test_detect_rename_no_create_only_matches_by_simhash() {
     // anonymous → let-bound rename must still be detected so `carina plan`
     // shows a Move rather than Delete+Create, which would destroy the
     // Identity Center instance and all of its users/groups.
-    let (key, schema) = make_sso_instance_schema_no_create_only();
-    let schemas: HashMap<String, ResourceSchema> = vec![(key, schema)].into_iter().collect();
+    let schemas = make_sso_instance_registry_no_create_only();
     let providers: Vec<ProviderConfig> = Vec::new();
     let identity_fn = |_: &str| -> Vec<String> { Vec::new() };
 
@@ -1910,14 +1698,7 @@ fn test_detect_rename_no_create_only_matches_by_simhash() {
     let mut anon = Resource::with_provider("awscc", "sso.Instance", "");
     anon.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
     let mut anon_vec = vec![anon];
-    compute_anonymous_identifiers(
-        &mut anon_vec,
-        &providers,
-        &schemas,
-        &schema_key_fn,
-        &identity_fn,
-    )
-    .unwrap();
+    compute_anonymous_identifiers(&mut anon_vec, &providers, &schemas, &identity_fn).unwrap();
     let anonymous_name = anon_vec[0].id.name_str().to_string();
     assert!(
         anonymous_name.starts_with("sso_instance_"),
@@ -1940,7 +1721,6 @@ fn test_detect_rename_no_create_only_matches_by_simhash() {
     let renames = detect_anonymous_to_named_renames(
         &resources,
         &schemas,
-        &schema_key_fn,
         &|_provider, _rt| state_entries.clone(),
         &providers,
         &identity_fn,
@@ -1957,8 +1737,7 @@ fn test_detect_rename_no_create_only_skips_when_attributes_differ_too_much() {
     // Hamming threshold from any orphan, no rename is emitted and the
     // user falls back to delete+create (or a `moved` block if they want
     // to preserve state).
-    let (key, schema) = make_sso_instance_schema_no_create_only();
-    let schemas: HashMap<String, ResourceSchema> = vec![(key, schema)].into_iter().collect();
+    let schemas = make_sso_instance_registry_no_create_only();
     let providers: Vec<ProviderConfig> = Vec::new();
     let identity_fn = |_: &str| -> Vec<String> { Vec::new() };
 
@@ -1970,14 +1749,7 @@ fn test_detect_rename_no_create_only_skips_when_attributes_differ_too_much() {
     tags.insert("k2".to_string(), Value::String("v2".to_string()));
     anon.set_attr("tags".to_string(), Value::Map(tags));
     let mut anon_vec = vec![anon];
-    compute_anonymous_identifiers(
-        &mut anon_vec,
-        &providers,
-        &schemas,
-        &schema_key_fn,
-        &identity_fn,
-    )
-    .unwrap();
+    compute_anonymous_identifiers(&mut anon_vec, &providers, &schemas, &identity_fn).unwrap();
     let anonymous_name = anon_vec[0].id.name_str().to_string();
 
     // Let-bound resource with wildly different attributes.
@@ -2002,7 +1774,6 @@ fn test_detect_rename_no_create_only_skips_when_attributes_differ_too_much() {
     let renames = detect_anonymous_to_named_renames(
         &resources,
         &schemas,
-        &schema_key_fn,
         &|_provider, _rt| state_entries.clone(),
         &providers,
         &identity_fn,
@@ -2019,8 +1790,7 @@ fn test_detect_rename_no_create_only_picks_closest_among_multiple_candidates() {
     // Two orphans: one is an exact SimHash match, the other is off by a
     // few bits but still within the Hamming threshold. The exact match
     // must win — this exercises the `distance < d` branch of the picker.
-    let (key, schema) = make_sso_instance_schema_no_create_only();
-    let schemas: HashMap<String, ResourceSchema> = vec![(key, schema)].into_iter().collect();
+    let schemas = make_sso_instance_registry_no_create_only();
     let providers: Vec<ProviderConfig> = Vec::new();
     let identity_fn = |_: &str| -> Vec<String> { Vec::new() };
 
@@ -2028,14 +1798,7 @@ fn test_detect_rename_no_create_only_picks_closest_among_multiple_candidates() {
     let mut anon = Resource::with_provider("awscc", "sso.Instance", "");
     anon.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
     let mut anon_vec = vec![anon];
-    compute_anonymous_identifiers(
-        &mut anon_vec,
-        &providers,
-        &schemas,
-        &schema_key_fn,
-        &identity_fn,
-    )
-    .unwrap();
+    compute_anonymous_identifiers(&mut anon_vec, &providers, &schemas, &identity_fn).unwrap();
     let exact_name = anon_vec[0].id.name_str().to_string();
 
     // Construct a "close but not equal" orphan by flipping the last hex
@@ -2068,7 +1831,6 @@ fn test_detect_rename_no_create_only_picks_closest_among_multiple_candidates() {
     let renames = detect_anonymous_to_named_renames(
         &resources,
         &schemas,
-        &schema_key_fn,
         &|_provider, _rt| state_entries.clone(),
         &providers,
         &identity_fn,
@@ -2087,8 +1849,7 @@ fn test_detect_rename_no_create_only_skips_8_char_hash_entries() {
     // An 8-hex state entry (from the create-only hash path) must not
     // match against a 16-hex SimHash — the hashes use different schemes
     // and comparing them by Hamming distance is meaningless.
-    let (key, schema) = make_sso_instance_schema_no_create_only();
-    let schemas: HashMap<String, ResourceSchema> = vec![(key, schema)].into_iter().collect();
+    let schemas = make_sso_instance_registry_no_create_only();
     let providers: Vec<ProviderConfig> = Vec::new();
     let identity_fn = |_: &str| -> Vec<String> { Vec::new() };
 
@@ -2106,7 +1867,6 @@ fn test_detect_rename_no_create_only_skips_8_char_hash_entries() {
     let renames = detect_anonymous_to_named_renames(
         &resources,
         &schemas,
-        &schema_key_fn,
         &|_provider, _rt| state_entries.clone(),
         &providers,
         &identity_fn,
@@ -2122,8 +1882,7 @@ fn test_detect_rename_no_create_only_skips_8_char_hash_entries() {
 fn test_detect_rename_no_create_only_skips_when_two_orphans_tie_on_distance() {
     // Two orphans both within the Hamming threshold with identical distance
     // to the let-bound resource — ambiguous, must skip.
-    let (key, schema) = make_sso_instance_schema_no_create_only();
-    let schemas: HashMap<String, ResourceSchema> = vec![(key, schema)].into_iter().collect();
+    let schemas = make_sso_instance_registry_no_create_only();
     let providers: Vec<ProviderConfig> = Vec::new();
     let identity_fn = |_: &str| -> Vec<String> { Vec::new() };
 
@@ -2131,14 +1890,7 @@ fn test_detect_rename_no_create_only_skips_when_two_orphans_tie_on_distance() {
     let mut anon = Resource::with_provider("awscc", "sso.Instance", "");
     anon.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
     let mut anon_vec = vec![anon];
-    compute_anonymous_identifiers(
-        &mut anon_vec,
-        &providers,
-        &schemas,
-        &schema_key_fn,
-        &identity_fn,
-    )
-    .unwrap();
+    compute_anonymous_identifiers(&mut anon_vec, &providers, &schemas, &identity_fn).unwrap();
     let anonymous_name = anon_vec[0].id.name_str().to_string();
 
     // Two state entries with the exact same name hash → same distance (0).
@@ -2161,7 +1913,6 @@ fn test_detect_rename_no_create_only_skips_when_two_orphans_tie_on_distance() {
     let renames = detect_anonymous_to_named_renames(
         &resources,
         &schemas,
-        &schema_key_fn,
         &|_provider, _rt| state_entries.clone(),
         &providers,
         &identity_fn,

@@ -2057,11 +2057,9 @@ impl ResourceSchema {
 /// Collect all attribute_name -> block_name mappings from all schemas.
 /// This includes both top-level attributes and nested struct fields.
 /// Used by the formatter to convert `= [{...}]` to block syntax.
-pub fn collect_all_block_names(
-    schemas: &HashMap<String, ResourceSchema>,
-) -> HashMap<String, String> {
+pub fn collect_all_block_names(registry: &SchemaRegistry) -> HashMap<String, String> {
     let mut result = HashMap::new();
-    for schema in schemas.values() {
+    for (_provider, _resource_type, _kind, schema) in registry.iter() {
         for (attr_name, attr_schema) in &schema.attributes {
             if let Some(bn) = &attr_schema.block_name {
                 result.insert(attr_name.clone(), bn.clone());
@@ -2183,18 +2181,14 @@ fn resolve_block_names_in_map(
 /// (singular) and the canonical attribute name (plural) are present.
 ///
 /// Also recursively resolves block names in nested struct values.
-///
-/// The `schema_key_fn` closure computes the schema lookup key for a resource.
 pub fn resolve_block_names(
     resources: &mut [Resource],
-    schemas: &HashMap<String, ResourceSchema>,
-    schema_key_fn: impl Fn(&Resource) -> String,
+    registry: &SchemaRegistry,
 ) -> Result<(), String> {
     let mut all_errors = Vec::new();
 
     for resource in resources.iter_mut() {
-        let schema_key = schema_key_fn(resource);
-        let schema = match schemas.get(&schema_key) {
+        let schema = match registry.get_for(resource) {
             Some(s) => s,
             None => continue,
         };
@@ -2673,6 +2667,98 @@ fn validate_ipv6_group(group: &str, addr: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+// --- SchemaRegistry ---
+
+/// A registry that holds resource schemas keyed by `(provider, resource_type)`
+/// and `SchemaKind`. The same `(provider, resource_type)` may have **two
+/// independent entries** — a `Managed` one and a `DataSource` one — so that
+/// a type like `aws.s3.Bucket` can be used both for new-resource creation
+/// and for `read`-keyword lookup of existing infrastructure.
+///
+/// See `docs/specs/2026-05-02-resource-vs-data-source-design.md` (Decision 1-2).
+#[derive(Debug, Clone, Default)]
+pub struct SchemaRegistry {
+    managed: HashMap<(String, String), ResourceSchema>,
+    data_sources: HashMap<(String, String), ResourceSchema>,
+}
+
+impl SchemaRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert a schema under the given provider. The `kind` field on the
+    /// schema decides which sub-map it goes into.
+    pub fn insert(&mut self, provider: impl Into<String>, schema: ResourceSchema) {
+        let key = (provider.into(), schema.resource_type.clone());
+        match schema.kind {
+            SchemaKind::Managed => {
+                self.managed.insert(key, schema);
+            }
+            SchemaKind::DataSource => {
+                self.data_sources.insert(key, schema);
+            }
+        }
+    }
+
+    /// Look up a schema by explicit `(provider, resource_type, kind)`.
+    pub fn get(
+        &self,
+        provider: &str,
+        resource_type: &str,
+        kind: SchemaKind,
+    ) -> Option<&ResourceSchema> {
+        let key = (provider.to_string(), resource_type.to_string());
+        match kind {
+            SchemaKind::Managed => self.managed.get(&key),
+            SchemaKind::DataSource => self.data_sources.get(&key),
+        }
+    }
+
+    /// Look up the schema appropriate for a given `Resource`. Picks the
+    /// `Managed` entry for normal resources and the `DataSource` entry for
+    /// `read`-keyword resources (`ResourceKind::DataSource`).
+    pub fn get_for(&self, resource: &crate::resource::Resource) -> Option<&ResourceSchema> {
+        let kind = if resource.is_data_source() {
+            SchemaKind::DataSource
+        } else {
+            SchemaKind::Managed
+        };
+        self.get(&resource.id.provider, &resource.id.resource_type, kind)
+    }
+
+    pub fn has_managed(&self, provider: &str, resource_type: &str) -> bool {
+        self.get(provider, resource_type, SchemaKind::Managed)
+            .is_some()
+    }
+
+    pub fn has_data_source(&self, provider: &str, resource_type: &str) -> bool {
+        self.get(provider, resource_type, SchemaKind::DataSource)
+            .is_some()
+    }
+
+    /// Iterate every schema in the registry, yielding `(provider,
+    /// resource_type, kind, &ResourceSchema)`.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str, SchemaKind, &ResourceSchema)> + '_ {
+        self.managed
+            .iter()
+            .map(|((p, t), s)| (p.as_str(), t.as_str(), SchemaKind::Managed, s))
+            .chain(
+                self.data_sources
+                    .iter()
+                    .map(|((p, t), s)| (p.as_str(), t.as_str(), SchemaKind::DataSource, s)),
+            )
+    }
+
+    pub fn len(&self) -> usize {
+        self.managed.len() + self.data_sources.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.managed.is_empty() && self.data_sources.is_empty()
+    }
 }
 
 #[cfg(test)]

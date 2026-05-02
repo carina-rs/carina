@@ -3,7 +3,7 @@
 //! Renders the TUI to an in-memory buffer and snapshots the output,
 //! ensuring the plan viewer displays correctly.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -11,7 +11,7 @@ use ratatui::backend::TestBackend;
 use carina_core::effect::Effect;
 use carina_core::plan::Plan;
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
-use carina_core::schema::ResourceSchema;
+use carina_core::schema::SchemaRegistry;
 
 use crate::app::App;
 use crate::test_utils::buffer_to_string;
@@ -19,13 +19,13 @@ use crate::ui::draw;
 
 /// Render the TUI into a string, optionally selecting a specific node.
 fn render_tui(plan: &Plan, width: u16, height: u16, selection: usize) -> String {
-    render_tui_with_schemas(plan, &HashMap::new(), width, height, selection)
+    render_tui_with_schemas(plan, &SchemaRegistry::new(), width, height, selection)
 }
 
 /// Render the TUI into a string with schemas, optionally selecting a specific node.
 fn render_tui_with_schemas(
     plan: &Plan,
-    schemas: &HashMap<String, ResourceSchema>,
+    schemas: &SchemaRegistry,
     width: u16,
     height: u16,
     selection: usize,
@@ -203,7 +203,7 @@ fn snapshot_create_with_schema() {
             .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string())),
     ));
 
-    use carina_core::schema::{AttributeSchema, AttributeType};
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("ec2.Vpc")
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String).required())
@@ -220,8 +220,8 @@ fn snapshot_create_with_schema() {
             AttributeSchema::new("default_security_group_id", AttributeType::String).read_only(),
         );
 
-    let schemas: HashMap<String, ResourceSchema> =
-        [("ec2.Vpc".to_string(), schema)].into_iter().collect();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("", schema);
 
     let output = render_tui_with_schemas(&plan, &schemas, 120, 40, 0);
     insta::assert_snapshot!(output);
@@ -261,7 +261,7 @@ fn snapshot_detail_panel_third_node() {
 fn render_tui_with_search(plan: &Plan, width: u16, height: u16, query: &str) -> String {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
-    let mut app = App::new(plan, &HashMap::new());
+    let mut app = App::new(plan, &SchemaRegistry::new());
 
     // Simulate typing the search query and confirming with Enter
     app.search_active = true;

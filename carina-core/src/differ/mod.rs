@@ -21,7 +21,7 @@ use crate::plan::Plan;
 #[cfg(test)]
 use crate::resource::LifecycleConfig;
 #[cfg(test)]
-use crate::schema::AttributeType;
+use crate::schema::{AttributeType, SchemaRegistry};
 #[cfg(test)]
 use comparison::find_changed_attributes;
 #[cfg(test)]

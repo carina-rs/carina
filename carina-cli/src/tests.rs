@@ -11,7 +11,7 @@ use carina_core::parser::{ParsedFile, ProviderConfig};
 use carina_core::plan::Plan;
 use carina_core::provider::{BoxFuture, ProviderError, ProviderResult};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
-use carina_core::schema::ResourceSchema;
+use carina_core::schema::{ResourceSchema, SchemaRegistry};
 use carina_state::{BackendError, LockInfo, ResourceState, StateBackend, StateFile};
 
 use crate::commands::apply::{
@@ -143,7 +143,7 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
         plan: &Plan::new(),
         successfully_deleted: &HashSet::new(),
         failed_refreshes: &failed_refreshes,
-        schemas: &HashMap::new(),
+        schemas: &SchemaRegistry::new(),
     })
     .unwrap();
 
@@ -191,7 +191,7 @@ async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
         plan: &Plan::new(),
         successfully_deleted: &HashSet::new(),
         failed_refreshes: &failed_refreshes,
-        schemas: &HashMap::new(),
+        schemas: &SchemaRegistry::new(),
     })
     .unwrap();
 
@@ -238,7 +238,7 @@ async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refr
         plan: &Plan::new(),
         successfully_deleted: &HashSet::new(),
         failed_refreshes: &failed_refreshes,
-        schemas: &HashMap::new(),
+        schemas: &SchemaRegistry::new(),
     })
     .unwrap();
 
@@ -1260,7 +1260,7 @@ fn orphaned_state_resource_produces_delete_effect() {
         &desired,
         &current_states,
         &lifecycles,
-        &HashMap::new(),
+        &SchemaRegistry::new(),
         &saved_attrs,
         &prev_desired_keys,
         &HashMap::new(),
@@ -1390,7 +1390,7 @@ async fn lock_released_on_write_state_failure() {
         plan: &Plan::new(),
         backend: &backend,
         lock: Some(&lock),
-        schemas: &HashMap::new(),
+        schemas: &SchemaRegistry::new(),
         export_params: &[],
     })
     .await;
@@ -1523,7 +1523,7 @@ async fn finalize_apply_uses_write_state_locked() {
         plan: &Plan::new(),
         backend: &backend,
         lock: Some(&lock),
-        schemas: &HashMap::new(),
+        schemas: &SchemaRegistry::new(),
         export_params: &[],
     })
     .await;
@@ -2063,7 +2063,7 @@ async fn finalize_apply_without_lock_uses_write_state() {
         plan: &Plan::new(),
         backend: &backend,
         lock: None, // No lock
-        schemas: &HashMap::new(),
+        schemas: &SchemaRegistry::new(),
         export_params: &[],
     })
     .await;
@@ -2163,7 +2163,7 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
         &desired,
         &current_states,
         &lifecycles,
-        &HashMap::new(),
+        &SchemaRegistry::new(),
         &saved_attrs,
         &prev_desired_keys,
         &HashMap::new(),
@@ -2245,7 +2245,7 @@ fn refresh_false_uses_cached_state_from_state_file() {
         &desired,
         &current_states,
         &lifecycles,
-        &HashMap::new(),
+        &SchemaRegistry::new(),
         &saved_attrs,
         &prev_desired_keys,
         &HashMap::new(),
@@ -2291,7 +2291,7 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
         &desired,
         &current_states,
         &lifecycles,
-        &HashMap::new(),
+        &SchemaRegistry::new(),
         &saved_attrs,
         &prev_desired_keys,
         &HashMap::new(),
@@ -2335,7 +2335,7 @@ fn refresh_false_without_state_file_treats_resources_as_new() {
         &desired,
         &current_states,
         &HashMap::new(),
-        &HashMap::new(),
+        &SchemaRegistry::new(),
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
@@ -2400,7 +2400,7 @@ fn import_effect_preserves_resource_metadata_in_state() {
         plan: &plan,
         successfully_deleted: &HashSet::new(),
         failed_refreshes: &HashSet::new(),
-        schemas: &HashMap::new(),
+        schemas: &SchemaRegistry::new(),
     })
     .unwrap();
 
@@ -2465,9 +2465,9 @@ fn build_state_after_apply_persists_write_only_attributes() {
 
     // Build schema with write-only attribute.
     // Schema keys include the provider prefix (e.g., "awscc.ec2.Vpc").
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "awscc.ec2.Vpc".to_string(),
+        "awscc",
         ResourceSchema::new("ec2.Vpc")
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
             .attribute(
@@ -2547,9 +2547,9 @@ fn build_state_after_apply_write_only_detects_value_change() {
     old_rs.write_only_attributes = vec!["ipv4_netmask_length".to_string()];
     existing_state.upsert_resource(old_rs);
 
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "awscc.ec2.Vpc".to_string(),
+        "awscc",
         ResourceSchema::new("ec2.Vpc")
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
             .attribute(

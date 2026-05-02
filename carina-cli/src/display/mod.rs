@@ -19,7 +19,7 @@ use carina_core::plan_tree::{
     build_dependency_graph, build_single_parent_tree, extract_compact_hint,
 };
 use carina_core::resource::{ResourceId, Value};
-use carina_core::schema::ResourceSchema;
+use carina_core::schema::SchemaRegistry;
 #[cfg(test)]
 use carina_core::value::{format_value, format_value_with_key, is_list_of_maps, map_similarity};
 
@@ -185,7 +185,7 @@ pub fn print_plan(
     plan: &Plan,
     detail: DetailLevel,
     delete_attributes: &HashMap<ResourceId, HashMap<String, Value>>,
-    schemas: Option<&HashMap<String, ResourceSchema>>,
+    schemas: Option<&SchemaRegistry>,
     moved_origins: &HashMap<ResourceId, ResourceId>,
     export_changes: &[crate::commands::plan::ExportChange],
     deferred_for_expressions: &[carina_core::parser::DeferredForExpression],
@@ -212,7 +212,7 @@ pub fn format_plan(
     plan: &Plan,
     detail: DetailLevel,
     delete_attributes: &HashMap<ResourceId, HashMap<String, Value>>,
-    schemas: Option<&HashMap<String, ResourceSchema>>,
+    schemas: Option<&SchemaRegistry>,
     moved_origins: &HashMap<ResourceId, ResourceId>,
     export_changes: &[crate::commands::plan::ExportChange],
     deferred_for_expressions: &[carina_core::parser::DeferredForExpression],
@@ -373,7 +373,7 @@ struct TreeRenderContext<'a> {
     dependents: HashMap<usize, Vec<usize>>,
     detail: DetailLevel,
     delete_attributes: Option<&'a HashMap<ResourceId, HashMap<String, Value>>>,
-    schemas: Option<&'a HashMap<String, ResourceSchema>>,
+    schemas: Option<&'a SchemaRegistry>,
     moved_origins: &'a HashMap<ResourceId, ResourceId>,
     /// ResourceIds that are targets of Update or Replace effects.
     /// Used to skip Move line display when the move is already shown via annotation.
@@ -731,7 +731,7 @@ fn format_plan_tree(
     plan: &Plan,
     detail: DetailLevel,
     delete_attributes: Option<&HashMap<ResourceId, HashMap<String, Value>>>,
-    schemas: Option<&HashMap<String, ResourceSchema>>,
+    schemas: Option<&SchemaRegistry>,
     moved_origins: &HashMap<ResourceId, ResourceId>,
 ) -> String {
     // Build dependency graph from effects

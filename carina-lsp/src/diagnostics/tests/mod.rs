@@ -1,10 +1,10 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::*;
 use crate::document::Document;
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{self as provider_mod, ProviderFactory};
+use carina_core::schema::SchemaRegistry;
 
 mod basic;
 mod extended;
@@ -46,11 +46,11 @@ pub(super) fn test_engine_with_nested_structs() -> DiagnosticEngine {
         ],
     });
 
-    let schema = ResourceSchema::new("test.nested.resource")
+    let schema = ResourceSchema::new("nested.resource")
         .attribute(AttributeSchema::new("outer", outer_struct));
 
-    let mut schemas = HashMap::new();
-    schemas.insert("test.nested.resource".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
 
     DiagnosticEngine::new(
         Arc::new(schemas),
@@ -69,11 +69,11 @@ pub(super) fn test_engine_with_enum_attr() -> DiagnosticEngine {
         to_dsl: None,
     };
 
-    let schema = ResourceSchema::new("test.r.mode_holder")
-        .attribute(AttributeSchema::new("mode", mode_enum));
+    let schema =
+        ResourceSchema::new("r.mode_holder").attribute(AttributeSchema::new("mode", mode_enum));
 
-    let mut schemas = HashMap::new();
-    schemas.insert("test.r.mode_holder".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
 
     DiagnosticEngine::new(
         Arc::new(schemas),
@@ -96,11 +96,11 @@ pub(super) fn test_engine_with_namespaced_enum_attr() -> DiagnosticEngine {
         to_dsl: None,
     };
 
-    let schema = ResourceSchema::new("test.r.mode_holder")
-        .attribute(AttributeSchema::new("mode", mode_enum));
+    let schema =
+        ResourceSchema::new("r.mode_holder").attribute(AttributeSchema::new("mode", mode_enum));
 
-    let mut schemas = HashMap::new();
-    schemas.insert("test.r.mode_holder".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
 
     DiagnosticEngine::new(
         Arc::new(schemas),
@@ -138,11 +138,11 @@ pub(super) fn test_engine_with_custom_namespaced_attr() -> DiagnosticEngine {
         to_dsl: None,
     };
 
-    let schema = ResourceSchema::new("test.r.mode_holder")
-        .attribute(AttributeSchema::new("mode", mode_custom));
+    let schema =
+        ResourceSchema::new("r.mode_holder").attribute(AttributeSchema::new("mode", mode_custom));
 
-    let mut schemas = HashMap::new();
-    schemas.insert("test.r.mode_holder".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
 
     DiagnosticEngine::new(
         Arc::new(schemas),
@@ -171,11 +171,11 @@ pub(super) fn test_engine_with_block_name_nested() -> DiagnosticEngine {
         ],
     };
 
-    let schema = ResourceSchema::new("test.block.resource")
+    let schema = ResourceSchema::new("block.resource")
         .attribute(AttributeSchema::new("config", config_struct));
 
-    let mut schemas = HashMap::new();
-    schemas.insert("test.block.resource".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
 
     DiagnosticEngine::new(
         Arc::new(schemas),
@@ -184,15 +184,12 @@ pub(super) fn test_engine_with_block_name_nested() -> DiagnosticEngine {
     )
 }
 
-pub(super) fn custom_engine(
-    schemas: HashMap<String, carina_core::schema::ResourceSchema>,
-) -> DiagnosticEngine {
+pub(super) fn custom_engine(schemas: SchemaRegistry) -> DiagnosticEngine {
     let provider_names: Vec<String> = schemas
-        .keys()
-        .filter_map(|k| k.split('.').next())
+        .iter()
+        .map(|(provider, _, _, _)| provider.to_string())
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
-        .map(|s| s.to_string())
         .collect();
     DiagnosticEngine::new(Arc::new(schemas), provider_names, Arc::new(vec![]))
 }

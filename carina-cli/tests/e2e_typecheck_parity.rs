@@ -27,7 +27,7 @@ use carina_core::provider::{
 };
 use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::schema::{
-    AttributeSchema, AttributeType, ResourceSchema, StructField, legacy_validator,
+    AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField, legacy_validator,
 };
 use carina_lsp::diagnostics::DiagnosticEngine;
 use carina_lsp::document::Document;
@@ -46,30 +46,29 @@ fn write_fixture(files: &[(&str, &str)]) -> TempDir {
     dir
 }
 
-fn engine_with_schemas(schemas: HashMap<String, ResourceSchema>) -> DiagnosticEngine {
+fn engine_with_schemas(schemas: SchemaRegistry) -> DiagnosticEngine {
     let provider_names: Vec<String> = schemas
-        .keys()
-        .filter_map(|k| k.split('.').next())
+        .iter()
+        .map(|(provider, _, _, _)| provider.to_string())
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
-        .map(String::from)
         .collect();
     DiagnosticEngine::new(Arc::new(schemas), provider_names, Arc::new(vec![]))
 }
 
-fn single_schema_map(schema: ResourceSchema) -> HashMap<String, ResourceSchema> {
-    let mut schemas = HashMap::new();
-    schemas.insert(schema.resource_type.clone(), schema);
+fn single_schema_map(schema: ResourceSchema) -> SchemaRegistry {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
     schemas
 }
 
 /// Build a `ProviderFactory` set covering every provider name implied by
 /// the schemas. The CLI pipeline keys schemas by provider, so each
 /// distinct prefix (`test`, `aws`, ...) needs its own factory entry.
-fn factories_for(schemas: &HashMap<String, ResourceSchema>) -> Vec<Box<dyn ProviderFactory>> {
+fn factories_for(schemas: &SchemaRegistry) -> Vec<Box<dyn ProviderFactory>> {
     let mut by_provider: HashMap<String, Vec<ResourceSchema>> = HashMap::new();
-    for (key, schema) in schemas {
-        let provider = key.split('.').next().unwrap_or("test").to_string();
+    for (provider, _resource_type, _kind, schema) in schemas.iter() {
+        let provider = provider.to_string();
         by_provider
             .entry(provider)
             .or_default()
@@ -218,7 +217,7 @@ impl Provider for NoopProvider {
 // Scenario 1: StringEnum bare / TypeQualified / fully-qualified all pass
 // ============================================================================
 
-fn enum_schemas() -> HashMap<String, ResourceSchema> {
+fn enum_schemas() -> SchemaRegistry {
     let mode = AttributeType::StringEnum {
         name: "Mode".to_string(),
         values: vec!["fast".to_string(), "slow".to_string()],
@@ -226,7 +225,7 @@ fn enum_schemas() -> HashMap<String, ResourceSchema> {
         to_dsl: None,
     };
     single_schema_map(
-        ResourceSchema::new("test.r.mode_holder")
+        ResourceSchema::new("r.mode_holder")
             .attribute(AttributeSchema::new("name", AttributeType::String))
             .attribute(AttributeSchema::new("mode", mode)),
     )
@@ -302,7 +301,7 @@ test.r.mode_holder {
 // Scenario 2: Custom type with `to_dsl` normalization (Region-like)
 // ============================================================================
 
-fn region_schemas() -> HashMap<String, ResourceSchema> {
+fn region_schemas() -> SchemaRegistry {
     fn validate_region(v: &Value) -> Result<(), String> {
         const VALID: &[&str] = &["ap-northeast-1", "us-west-2"];
         if let Value::String(s) = v {
@@ -329,7 +328,7 @@ fn region_schemas() -> HashMap<String, ResourceSchema> {
     };
 
     single_schema_map(
-        ResourceSchema::new("test.r.region_holder")
+        ResourceSchema::new("r.region_holder")
             .attribute(AttributeSchema::new("name", AttributeType::String))
             .attribute(AttributeSchema::new("region", region_custom)),
     )
@@ -433,7 +432,7 @@ test.r.region_holder {
 // Scenario 3: nested-Struct field type mismatch
 // ============================================================================
 
-fn nested_struct_schemas() -> HashMap<String, ResourceSchema> {
+fn nested_struct_schemas() -> SchemaRegistry {
     let inner = AttributeType::Struct {
         name: "Inner".to_string(),
         fields: vec![StructField::new("leaf", AttributeType::Int)],
@@ -447,7 +446,7 @@ fn nested_struct_schemas() -> HashMap<String, ResourceSchema> {
     };
 
     single_schema_map(
-        ResourceSchema::new("test.r.nested")
+        ResourceSchema::new("r.nested")
             .attribute(AttributeSchema::new("name", AttributeType::String))
             .attribute(AttributeSchema::new("outer", outer)),
     )
@@ -485,10 +484,10 @@ test.r.nested {
 // Scenario 4: Union with multiple member candidates
 // ============================================================================
 
-fn union_schemas() -> HashMap<String, ResourceSchema> {
+fn union_schemas() -> SchemaRegistry {
     let union = AttributeType::Union(vec![AttributeType::Int, AttributeType::String]);
     single_schema_map(
-        ResourceSchema::new("test.r.union")
+        ResourceSchema::new("r.union")
             .attribute(AttributeSchema::new("name", AttributeType::String))
             .attribute(AttributeSchema::new("value", union)),
     )
@@ -553,16 +552,16 @@ test.r.union {
 // Scenario 5: ResourceRef across sibling files
 // ============================================================================
 
-fn resource_ref_schemas() -> HashMap<String, ResourceSchema> {
-    let producer = ResourceSchema::new("test.r.producer")
+fn resource_ref_schemas() -> SchemaRegistry {
+    let producer = ResourceSchema::new("r.producer")
         .attribute(AttributeSchema::new("name", AttributeType::String))
         .attribute(AttributeSchema::new("id", AttributeType::String).read_only());
-    let consumer = ResourceSchema::new("test.r.consumer")
+    let consumer = ResourceSchema::new("r.consumer")
         .attribute(AttributeSchema::new("name", AttributeType::String))
         .attribute(AttributeSchema::new("target_id", AttributeType::String));
-    let mut schemas = HashMap::new();
-    schemas.insert(producer.resource_type.clone(), producer);
-    schemas.insert(consumer.resource_type.clone(), consumer);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", producer);
+    schemas.insert("test", consumer);
     schemas
 }
 
@@ -618,7 +617,7 @@ let upstream = test.r.producer {
 #[test]
 fn unknown_attribute_emits_suggestion_parity() {
     let schemas = single_schema_map(
-        ResourceSchema::new("test.r.suggester")
+        ResourceSchema::new("r.suggester")
             .attribute(AttributeSchema::new("name", AttributeType::String))
             .attribute(AttributeSchema::new("description", AttributeType::String)),
     );
@@ -650,7 +649,7 @@ test.r.suggester {
 // Scenario 3b: List<Struct> with nested-Struct field error (#2249)
 // ============================================================================
 
-fn list_struct_schemas() -> HashMap<String, ResourceSchema> {
+fn list_struct_schemas() -> SchemaRegistry {
     let inner = AttributeType::Struct {
         name: "Inner".to_string(),
         fields: vec![StructField::new("leaf", AttributeType::Int)],
@@ -663,7 +662,7 @@ fn list_struct_schemas() -> HashMap<String, ResourceSchema> {
         ],
     });
     single_schema_map(
-        ResourceSchema::new("test.r.list_nested")
+        ResourceSchema::new("r.list_nested")
             .attribute(AttributeSchema::new("name", AttributeType::String))
             .attribute(AttributeSchema::new("outer", outer).with_block_name("outer")),
     )
@@ -703,13 +702,13 @@ test.r.list_nested {
     );
 }
 
-fn list_struct_renamed_block_schemas() -> HashMap<String, ResourceSchema> {
+fn list_struct_renamed_block_schemas() -> SchemaRegistry {
     let rule = AttributeType::list(AttributeType::Struct {
         name: "Rule".to_string(),
         fields: vec![StructField::new("days", AttributeType::Int)],
     });
     single_schema_map(
-        ResourceSchema::new("test.r.renamed_block")
+        ResourceSchema::new("r.renamed_block")
             .attribute(AttributeSchema::new("name", AttributeType::String))
             .attribute(AttributeSchema::new("rules", rule).with_block_name("rule")),
     )

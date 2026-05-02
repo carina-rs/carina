@@ -14,7 +14,6 @@ use carina_core::lint::{
 };
 use carina_core::module_resolver;
 use carina_core::parser::ProviderContext;
-use carina_core::provider::{self as provider_mod};
 
 use crate::error::AppError;
 use crate::wiring::{WiringContext, build_factories_from_providers};
@@ -37,7 +36,6 @@ pub fn run_lint(path: &PathBuf, provider_context: &ProviderContext) -> Result<()
 
     let (provider_factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
     let ctx = WiringContext::new(provider_factories);
-    let factories = ctx.factories();
     let schemas = ctx.schemas();
 
     // Collect source texts for each .crn file
@@ -57,8 +55,7 @@ pub fn run_lint(path: &PathBuf, provider_context: &ProviderContext) -> Result<()
     let mut all_list_struct_attrs: HashSet<String> = HashSet::new();
     let mut block_name_suggestions: HashMap<String, String> = HashMap::new();
     for resource in &parsed.resources {
-        let schema_key = provider_mod::schema_key_for_resource(factories, resource);
-        if let Some(schema) = schemas.get(&schema_key) {
+        if let Some(schema) = schemas.get_for(resource) {
             all_list_struct_attrs.extend(list_struct_attr_names(schema));
             for (attr_name, attr_schema) in &schema.attributes {
                 if let Some(bn) = &attr_schema.block_name {

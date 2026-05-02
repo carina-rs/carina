@@ -142,7 +142,6 @@ fn test_resolve_enum_aliases_in_struct_field() {
 fn test_normalize_state_prevents_false_enum_diff() {
     use carina_core::differ::create_plan;
     use carina_core::resource::LifecycleConfig;
-    use carina_core::schema::ResourceSchema;
 
     let ctx = WiringContext::new(vec![]);
 
@@ -167,7 +166,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
     // Without normalize_state, the differ would see a false diff
     let resources_without = vec![resource.clone()];
     let lifecycles: HashMap<ResourceId, LifecycleConfig> = HashMap::new();
-    let schemas: HashMap<String, ResourceSchema> = HashMap::new();
+    let schemas = SchemaRegistry::new();
     let saved_attrs = HashMap::new();
     let prev_desired_keys = HashMap::new();
     let orphan_deps = HashMap::new();
@@ -222,12 +221,12 @@ fn test_merge_default_tags_prevents_false_diff() {
 
     // Build a minimal schema that has a "tags" attribute.
     // merge_default_tags checks for the presence of "tags" in the schema.
-    let schema = ResourceSchema::new("awscc.s3.Bucket").attribute(AttributeSchema::new(
+    let schema = ResourceSchema::new("s3.Bucket").attribute(AttributeSchema::new(
         "tags",
         AttributeType::map(AttributeType::String),
     ));
-    let mut schemas: HashMap<String, ResourceSchema> = HashMap::new();
-    schemas.insert("awscc.s3.Bucket".to_string(), schema);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
 
     // Desired resource without explicit tags
     let resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket");
@@ -340,9 +339,9 @@ fn import_fallback_matches_anonymous_resource_by_name_attribute() {
     use carina_core::schema::ResourceSchema;
 
     // Schema with name_attribute = "bucket_name"
-    let bucket_schema = ResourceSchema::new("awscc.s3.Bucket").with_name_attribute("bucket_name");
-    let mut schemas = HashMap::new();
-    schemas.insert("awscc.s3.Bucket".to_string(), bucket_schema);
+    let bucket_schema = ResourceSchema::new("s3.Bucket").with_name_attribute("bucket_name");
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", bucket_schema);
 
     // Anonymous resource with hash name but bucket_name = "carina-rs-state"
     let mut resource = Resource::with_provider("awscc", "s3.Bucket", "s3_bucket_1d43a664");
@@ -388,9 +387,9 @@ fn import_fallback_skips_when_already_in_state_by_name_attribute() {
     use carina_core::schema::ResourceSchema;
     use carina_state::state::{ResourceState, StateFile};
 
-    let bucket_schema = ResourceSchema::new("awscc.s3.Bucket").with_name_attribute("bucket_name");
-    let mut schemas = HashMap::new();
-    schemas.insert("awscc.s3.Bucket".to_string(), bucket_schema);
+    let bucket_schema = ResourceSchema::new("s3.Bucket").with_name_attribute("bucket_name");
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", bucket_schema);
 
     // State has the resource under its anonymous hash name
     let mut state_file = StateFile::new();

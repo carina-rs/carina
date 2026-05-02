@@ -10,7 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
-use crate::schema::ResourceSchema;
+use crate::schema::SchemaRegistry;
 
 /// Error type for Provider operations
 #[derive(Debug)]
@@ -190,7 +190,7 @@ pub trait ProviderNormalizer: Send + Sync {
         &self,
         _resources: &mut [Resource],
         _default_tags: &IndexMap<String, Value>,
-        _schemas: &HashMap<String, ResourceSchema>,
+        _registry: &SchemaRegistry,
     ) {
     }
 }
@@ -212,7 +212,7 @@ pub fn merge_default_tags_for_provider(
     provider_name: &str,
     resources: &mut [Resource],
     default_tags: &IndexMap<String, Value>,
-    schemas: &HashMap<String, ResourceSchema>,
+    registry: &SchemaRegistry,
 ) {
     if default_tags.is_empty() {
         return;
@@ -224,9 +224,8 @@ pub fn merge_default_tags_for_provider(
         }
 
         // Check if the resource schema has a `tags` attribute
-        let schema_key = format!("{}.{}", provider_name, resource.id.resource_type);
-        let has_tags = schemas
-            .get(&schema_key)
+        let has_tags = registry
+            .get_for(resource)
             .is_some_and(|s| s.attributes.contains_key("tags"));
 
         if !has_tags {
@@ -387,10 +386,10 @@ impl ProviderNormalizer for ProviderRouter {
         &self,
         resources: &mut [Resource],
         default_tags: &IndexMap<String, Value>,
-        schemas: &HashMap<String, ResourceSchema>,
+        registry: &SchemaRegistry,
     ) {
         for ext in &self.normalizers {
-            ext.merge_default_tags(resources, default_tags, schemas);
+            ext.merge_default_tags(resources, default_tags, registry);
         }
     }
 }
@@ -454,12 +453,6 @@ pub trait ProviderFactory: Send + Sync {
     /// Get all resource schemas for this provider.
     fn schemas(&self) -> Vec<crate::schema::ResourceSchema>;
 
-    /// Format a schema lookup key from a resource type.
-    /// Default: prepends provider name (e.g., "awscc" + "ec2_vpc" → "awscc.ec2_vpc").
-    fn format_schema_key(&self, resource_type: &str) -> String {
-        format!("{}.{}", self.name(), resource_type)
-    }
-
     /// Attribute names (beyond schema create-only properties) that contribute
     /// to anonymous resource identity. For example, AWS providers return
     /// `["region"]` because the same resource type in different regions must
@@ -504,30 +497,32 @@ pub fn find_factory<'a>(
         .map(|f| f.as_ref())
 }
 
-/// Collect all resource schemas from the given factories into a single map.
-pub fn collect_schemas(
-    factories: &[Box<dyn ProviderFactory>],
-) -> HashMap<String, crate::schema::ResourceSchema> {
-    let mut all_schemas = HashMap::new();
+/// Collect all resource schemas from the given factories into a [`SchemaRegistry`].
+///
+/// Each schema is inserted under the factory's `name()` plus `schema.kind`,
+/// so a given `(provider, resource_type)` pair may have both a `Managed`
+/// and a `DataSource` entry registered side by side.
+pub fn collect_schemas(factories: &[Box<dyn ProviderFactory>]) -> SchemaRegistry {
+    let mut registry = SchemaRegistry::new();
     for factory in factories {
         for schema in factory.schemas() {
-            all_schemas.insert(schema.resource_type.clone(), schema);
+            registry.insert(factory.name(), schema);
         }
     }
-    all_schemas
+    registry
 }
 
-/// Extract custom type validators from collected schemas.
+/// Extract custom type validators from a registry.
 ///
-/// Walks all `AttributeType::Custom` types in the schema map and returns
-/// a map of (snake_case type name → validator function) suitable for
-/// populating `ProviderContext.validators`.
+/// Walks all `AttributeType::Custom` types in every registered schema and
+/// returns a map of (snake_case type name → validator function) suitable
+/// for populating `ProviderContext.validators`.
 pub fn collect_custom_type_validators(
-    schemas: &HashMap<String, crate::schema::ResourceSchema>,
+    registry: &SchemaRegistry,
 ) -> HashMap<String, crate::parser::ValidatorFn> {
     let mut validators: HashMap<String, crate::parser::ValidatorFn> = HashMap::new();
 
-    for schema in schemas.values() {
+    for (_provider, _resource_type, _kind, schema) in registry.iter() {
         for attr_schema in schema.attributes.values() {
             collect_validators_from_type(&attr_schema.attr_type, &mut validators);
         }
@@ -536,16 +531,14 @@ pub fn collect_custom_type_validators(
     validators
 }
 
-/// Collect custom type names from schemas without allocating validators.
+/// Collect custom type names from a registry without allocating validators.
 ///
 /// Cheaper than `collect_custom_type_validators` when only the type names
 /// are needed (e.g., for LSP completions).
-pub fn collect_custom_type_names(
-    schemas: &HashMap<String, crate::schema::ResourceSchema>,
-) -> Vec<String> {
+pub fn collect_custom_type_names(registry: &SchemaRegistry) -> Vec<String> {
     let mut names = std::collections::HashSet::new();
 
-    for schema in schemas.values() {
+    for (_provider, _resource_type, _kind, schema) in registry.iter() {
         for attr_schema in schema.attributes.values() {
             collect_type_names_from_type(&attr_schema.attr_type, &mut names);
         }
@@ -637,21 +630,6 @@ fn collect_type_names_from_type(
             }
         }
         _ => {}
-    }
-}
-
-/// Determine the schema lookup key for a resource based on its provider.
-pub fn schema_key_for_resource(
-    factories: &[Box<dyn ProviderFactory>],
-    resource: &Resource,
-) -> String {
-    if resource.id.provider.is_empty() {
-        return resource.id.resource_type.clone();
-    }
-    if let Some(factory) = find_factory(factories, &resource.id.provider) {
-        factory.format_schema_key(&resource.id.resource_type)
-    } else {
-        resource.id.resource_type.clone()
     }
 }
 
@@ -1018,42 +996,6 @@ mod tests {
         );
     }
 
-    // Mock ProviderFactory for testing schema_key_for_resource
-    struct MockProviderFactory;
-
-    impl ProviderFactory for MockProviderFactory {
-        fn name(&self) -> &str {
-            "mock"
-        }
-
-        fn display_name(&self) -> &str {
-            "Mock provider"
-        }
-
-        fn provider_config_attribute_types(&self) -> HashMap<String, crate::schema::AttributeType> {
-            HashMap::new()
-        }
-
-        fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
-            Ok(())
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "us-east-1".to_string()
-        }
-
-        fn create_provider(
-            &self,
-            _attributes: &IndexMap<String, Value>,
-        ) -> BoxFuture<'_, Box<dyn Provider>> {
-            Box::pin(async { Box::new(MockProvider) as Box<dyn Provider> })
-        }
-
-        fn schemas(&self) -> Vec<crate::schema::ResourceSchema> {
-            vec![]
-        }
-    }
-
     #[test]
     fn provider_normalizer_separate_from_runtime() {
         // Verify that ProviderNormalizer can be implemented independently from Provider.
@@ -1201,17 +1143,5 @@ mod tests {
             resources[0].get_attr("key"),
             Some(&Value::String("norm:val".to_string()))
         );
-    }
-
-    #[test]
-    fn schema_key_for_resource_uses_id_provider_not_attribute() {
-        let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(MockProviderFactory)];
-
-        // Resource with id.provider set but NO _provider attribute
-        let resource = Resource::with_provider("mock", "s3.Bucket", "my-bucket");
-        assert!(!resource.attributes.contains_key("_provider"));
-
-        let key = schema_key_for_resource(&factories, &resource);
-        assert_eq!(key, "mock.s3.Bucket");
     }
 }

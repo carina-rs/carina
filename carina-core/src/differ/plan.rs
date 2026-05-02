@@ -7,7 +7,7 @@ use crate::effect::{CascadingUpdate, Effect, TemporaryName};
 use crate::identifier::generate_random_suffix;
 use crate::plan::{Plan, PlanError};
 use crate::resource::{LifecycleConfig, Resource, ResourceId, ResourceKind, State, Value};
-use crate::schema::ResourceSchema;
+use crate::schema::{ResourceSchema, SchemaKind, SchemaRegistry};
 
 use super::{Diff, diff};
 
@@ -24,9 +24,9 @@ fn find_changed_create_only(
     provider: &str,
     resource_type: &str,
     changed_attributes: &[String],
-    schemas: &HashMap<String, ResourceSchema>,
+    registry: &SchemaRegistry,
 ) -> Vec<String> {
-    let Some(schema) = find_schema(provider, resource_type, schemas) else {
+    let Some(schema) = registry.get(provider, resource_type, SchemaKind::Managed) else {
         return Vec::new();
     };
 
@@ -47,9 +47,9 @@ fn filter_non_removable_removals(
     resource_type: &str,
     to: &Resource,
     changed_attributes: Vec<String>,
-    schemas: &HashMap<String, ResourceSchema>,
+    registry: &SchemaRegistry,
 ) -> Vec<String> {
-    let Some(schema) = find_schema(provider, resource_type, schemas) else {
+    let Some(schema) = registry.get(provider, resource_type, SchemaKind::Managed) else {
         // No schema available — keep all changes (conservative)
         return changed_attributes;
     };
@@ -67,21 +67,6 @@ fn filter_non_removable_removals(
             removable_attrs.contains(&attr.as_str())
         })
         .collect()
-}
-
-/// Look up the schema for a resource, trying both direct and provider-prefixed keys.
-fn find_schema<'a>(
-    provider: &str,
-    resource_type: &str,
-    schemas: &'a HashMap<String, ResourceSchema>,
-) -> Option<&'a ResourceSchema> {
-    schemas.get(resource_type).or_else(|| {
-        if !provider.is_empty() {
-            schemas.get(&format!("{}.{}", provider, resource_type))
-        } else {
-            None
-        }
-    })
 }
 
 /// Generate a temporary name for create-before-destroy replacement.
@@ -153,7 +138,7 @@ pub fn create_plan(
     desired: &[Resource],
     current_states: &HashMap<ResourceId, State>,
     lifecycles: &HashMap<ResourceId, LifecycleConfig>,
-    schemas: &HashMap<String, ResourceSchema>,
+    registry: &SchemaRegistry,
     saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
     prev_desired_keys: &HashMap<ResourceId, Vec<String>>,
     orphan_dependencies: &HashMap<ResourceId, BTreeSet<String>>,
@@ -184,7 +169,11 @@ pub fn create_plan(
 
         let saved = saved_attrs.get(&resource.id);
         let prev_keys = prev_desired_keys.get(&resource.id);
-        let schema = find_schema(&resource.id.provider, &resource.id.resource_type, schemas);
+        let schema = registry.get(
+            &resource.id.provider,
+            &resource.id.resource_type,
+            SchemaKind::Managed,
+        );
         let d = diff(
             resource,
             &current,
@@ -209,7 +198,7 @@ pub fn create_plan(
                     &resource.id.resource_type,
                     &to,
                     changed_attributes,
-                    schemas,
+                    registry,
                 );
 
                 if changed_attributes.is_empty() {
@@ -222,13 +211,17 @@ pub fn create_plan(
                     &resource.id.provider,
                     &resource.id.resource_type,
                     &changed_attributes,
-                    schemas,
+                    registry,
                 );
 
                 // Check if the resource type forces replacement (no update support)
-                let schema_force_replace =
-                    find_schema(&resource.id.provider, &resource.id.resource_type, schemas)
-                        .is_some_and(|s| s.force_replace);
+                let schema_force_replace = registry
+                    .get(
+                        &resource.id.provider,
+                        &resource.id.resource_type,
+                        SchemaKind::Managed,
+                    )
+                    .is_some_and(|s| s.force_replace);
 
                 if changed_create_only.is_empty() && !schema_force_replace {
                     plan.add(Effect::Update {
@@ -250,7 +243,12 @@ pub fn create_plan(
                     }
                     let lifecycle = resource.lifecycle.clone();
                     let temporary_name = if lifecycle.create_before_destroy {
-                        find_schema(&resource.id.provider, &resource.id.resource_type, schemas)
+                        registry
+                            .get(
+                                &resource.id.provider,
+                                &resource.id.resource_type,
+                                SchemaKind::Managed,
+                            )
                             .and_then(|schema| generate_temporary_name(&to, &from, schema))
                     } else {
                         None
@@ -370,18 +368,18 @@ pub fn create_plan(
 ///
 /// 1. Finds all Replace effects with create_before_destroy = true
 /// 2. Identifies dependent resources that reference the replaced resource's binding
-/// 3. If the referencing attribute is create-only on the dependent (per `schemas`),
+/// 3. If the referencing attribute is create-only on the dependent (per the registry),
 ///    promotes the dependent to its own Replace effect in the plan
 /// 4. Otherwise, adds a CascadingUpdate entry to the parent Replace effect
 ///
 /// `unresolved_resources` should be the resources BEFORE ref resolution (still containing
 /// ResourceRef values). `current_states` provides the `from` state for each dependent.
-/// `schemas` provides attribute metadata to detect create-only attributes.
+/// `registry` provides attribute metadata to detect create-only attributes.
 pub fn cascade_dependent_updates(
     plan: &mut Plan,
     unresolved_resources: &[Resource],
     current_states: &HashMap<ResourceId, State>,
-    schemas: &HashMap<String, ResourceSchema>,
+    registry: &SchemaRegistry,
 ) {
     // Build binding/key -> unresolved resource mapping.
     // Uses the same key logic as the dependent lookup below so anonymous resources
@@ -518,7 +516,7 @@ pub fn cascade_dependent_updates(
                 &resource.id.provider,
                 &resource.id.resource_type,
                 &ref_attrs,
-                schemas,
+                registry,
             );
 
             if !create_only_refs.is_empty() {
@@ -597,7 +595,7 @@ pub fn cascade_dependent_updates(
                     &unresolved.id.provider,
                     &unresolved.id.resource_type,
                     &ref_attrs,
-                    schemas,
+                    registry,
                 );
 
                 if create_only_refs.is_empty() {

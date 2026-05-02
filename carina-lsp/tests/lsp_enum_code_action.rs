@@ -14,16 +14,14 @@
 
 mod support;
 
-use std::collections::HashMap;
-
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 use carina_lsp::code_action::{
     EnumDiagnosticData, EnumDiagnosticKind, code_actions_for_diagnostic,
 };
 use support::fixture::{analyze, engine_with_schemas, write_fixture};
 use tower_lsp::lsp_types::{Diagnostic, Url};
 
-fn versioning_schema() -> HashMap<String, ResourceSchema> {
+fn versioning_schema() -> SchemaRegistry {
     fn lower(v: &str) -> String {
         v.to_ascii_lowercase()
     }
@@ -33,10 +31,10 @@ fn versioning_schema() -> HashMap<String, ResourceSchema> {
         namespace: Some("aws.s3.Bucket".to_string()),
         to_dsl: Some(lower),
     };
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "aws.s3.bucket".to_string(),
-        ResourceSchema::new("aws.s3.bucket")
+        "aws",
+        ResourceSchema::new("s3.bucket")
             .attribute(AttributeSchema::new("name", AttributeType::String))
             .attribute(AttributeSchema::new("versioning", versioning)),
     );
@@ -170,17 +168,17 @@ fn string_literal_emits_string_literal_kind_and_replaces_quotes() {
 // Scenario 3: non-namespaced StringEnum
 // ---------------------------------------------------------------------------
 
-fn bare_mode_schema() -> HashMap<String, ResourceSchema> {
+fn bare_mode_schema() -> SchemaRegistry {
     let mode = AttributeType::StringEnum {
         name: "Mode".to_string(),
         values: vec!["fast".to_string(), "slow".to_string()],
         namespace: None,
         to_dsl: None,
     };
-    let mut schemas = HashMap::new();
+    let mut schemas = SchemaRegistry::new();
     schemas.insert(
-        "test.r.mode_holder".to_string(),
-        ResourceSchema::new("test.r.mode_holder")
+        "test",
+        ResourceSchema::new("r.mode_holder")
             .attribute(AttributeSchema::new("name", AttributeType::String))
             .attribute(AttributeSchema::new("mode", mode)),
     );
