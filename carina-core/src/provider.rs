@@ -569,8 +569,11 @@ fn collect_validators_from_type(
         } => {
             let snake_name = crate::parser::pascal_to_snake(name);
             validators.entry(snake_name).or_insert_with(|| {
-                let validate_fn = *validate;
-                Box::new(move |s: &str| validate_fn(&crate::resource::Value::String(s.to_string())))
+                let validate_fn = validate.clone();
+                Box::new(move |s: &str| {
+                    validate_fn(&crate::resource::Value::String(s.to_string()))
+                        .map_err(|e| e.to_string())
+                })
             });
         }
         AttributeType::Custom {

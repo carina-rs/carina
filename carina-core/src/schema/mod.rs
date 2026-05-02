@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 
 use indexmap::IndexMap;
 
@@ -14,6 +15,43 @@ use crate::value::format_value_with_key;
 
 /// Type alias for resource validator functions
 pub type ResourceValidator = fn(&HashMap<String, Value>) -> Result<(), Vec<TypeError>>;
+
+/// Validator stored on `AttributeType::Custom`. Boxed as `Arc<dyn Fn>` so it
+/// can capture provider-side state (region, account ID, schema handles) and
+/// return a structured `TypeError` directly — both of which a bare `fn`
+/// pointer cannot do. See #2217.
+pub type CustomValidator = Arc<dyn Fn(&Value) -> Result<(), TypeError> + Send + Sync>;
+
+/// Build a [`CustomValidator`] from any closure that returns a structured
+/// [`TypeError`]. This is the preferred constructor: validators that emit
+/// `TypeError::InvalidEnumVariant` (or other structured variants) flow
+/// straight into the LSP's quick-fix path.
+pub fn validator<F>(f: F) -> CustomValidator
+where
+    F: Fn(&Value) -> Result<(), TypeError> + Send + Sync + 'static,
+{
+    Arc::new(f)
+}
+
+/// Build a [`CustomValidator`] from a closure that still uses the legacy
+/// `Result<(), String>` shape. The returned message is wrapped in
+/// `TypeError::ValidationFailed`. Use this for builtins that haven't yet
+/// been migrated to structured errors.
+pub fn legacy_validator<F>(f: F) -> CustomValidator
+where
+    F: Fn(&Value) -> Result<(), String> + Send + Sync + 'static,
+{
+    Arc::new(move |v| f(v).map_err(|message| TypeError::ValidationFailed { message }))
+}
+
+/// A [`CustomValidator`] that accepts every value. Useful for tests and
+/// for placeholder Custom types whose validation is delegated elsewhere
+/// (e.g. plugin-loaded providers route validation through
+/// `ProviderContext.validators`).
+pub fn noop_validator() -> CustomValidator {
+    validator(|_| Ok(()))
+}
+
 pub type StringEnumParts<'a> = (
     &'a str,
     &'a [String],
@@ -73,7 +111,7 @@ impl StructField {
 }
 
 /// Attribute type
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum AttributeType {
     /// String
     String,
@@ -101,7 +139,7 @@ pub enum AttributeType {
         pattern: Option<String>,
         /// Optional length bounds (min, max).
         length: Option<(Option<u64>, Option<u64>)>,
-        validate: fn(&Value) -> Result<(), String>,
+        validate: CustomValidator,
         /// Namespace for resolving shorthand enum values (e.g., "aws.vpc")
         /// When set, allows `dedicated` to be resolved to `aws.vpc.InstanceTenancy.dedicated`
         namespace: Option<String>,
@@ -133,6 +171,66 @@ pub enum AttributeType {
     },
     /// Union of multiple types (value is valid if it matches any member)
     Union(Vec<AttributeType>),
+}
+
+impl fmt::Debug for AttributeType {
+    // Hand-written so that `Custom.validate` (an `Arc<dyn Fn>`, which does
+    // not implement `Debug`) can be rendered as a placeholder. Every other
+    // variant matches what `#[derive(Debug)]` would produce.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AttributeType::String => f.write_str("String"),
+            AttributeType::Int => f.write_str("Int"),
+            AttributeType::Float => f.write_str("Float"),
+            AttributeType::Bool => f.write_str("Bool"),
+            AttributeType::StringEnum {
+                name,
+                values,
+                namespace,
+                to_dsl,
+            } => f
+                .debug_struct("StringEnum")
+                .field("name", name)
+                .field("values", values)
+                .field("namespace", namespace)
+                .field("to_dsl", to_dsl)
+                .finish(),
+            AttributeType::Custom {
+                semantic_name,
+                base,
+                pattern,
+                length,
+                namespace,
+                to_dsl,
+                validate: _,
+            } => f
+                .debug_struct("Custom")
+                .field("semantic_name", semantic_name)
+                .field("base", base)
+                .field("pattern", pattern)
+                .field("length", length)
+                .field("namespace", namespace)
+                .field("to_dsl", to_dsl)
+                .field("validate", &"<closure>")
+                .finish(),
+            AttributeType::List { inner, ordered } => f
+                .debug_struct("List")
+                .field("inner", inner)
+                .field("ordered", ordered)
+                .finish(),
+            AttributeType::Map { key, value } => f
+                .debug_struct("Map")
+                .field("key", key)
+                .field("value", value)
+                .finish(),
+            AttributeType::Struct { name, fields } => f
+                .debug_struct("Struct")
+                .field("name", name)
+                .field("fields", fields)
+                .finish(),
+            AttributeType::Union(types) => f.debug_tuple("Union").field(types).finish(),
+        }
+    }
 }
 
 /// One step in a [`FieldPath`]. Either a struct field name or a list
@@ -619,7 +717,7 @@ impl AttributeType {
         let name_for_resolve = semantic_name.as_deref().unwrap_or("");
         let resolved_value =
             Self::resolve_enum_input(name_for_resolve, namespace.as_deref(), value);
-        validate(&resolved_value).map_err(|msg| TypeError::ValidationFailed { message: msg })
+        validate(&resolved_value)
     }
 
     /// Validate a `List` variant by validating each item with the inner type.
@@ -1214,7 +1312,7 @@ pub struct ExpectedEnumVariant {
 impl ExpectedEnumVariant {
     /// `namespace` head becomes `provider`; the rest become `segments`.
     /// `None` produces a bare-form variant.
-    fn from_namespaced(
+    pub fn from_namespaced(
         namespace: Option<&str>,
         type_name: &str,
         value: &str,
@@ -2183,7 +2281,7 @@ pub mod types {
             base: Box::new(AttributeType::Int),
             pattern: None,
             length: None,
-            validate: |value| {
+            validate: legacy_validator(|value| {
                 if let Value::Int(n) = value {
                     if *n > 0 {
                         Ok(())
@@ -2193,7 +2291,7 @@ pub mod types {
                 } else {
                     Err("Expected integer".to_string())
                 }
-            },
+            }),
             namespace: None,
             to_dsl: None,
         }
@@ -2206,13 +2304,13 @@ pub mod types {
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,
-            validate: |value| {
+            validate: legacy_validator(|value| {
                 if let Value::String(s) = value {
                     validate_ipv4_cidr(s)
                 } else {
                     Err("Expected string".to_string())
                 }
-            },
+            }),
             namespace: None,
             to_dsl: None,
         }
@@ -2225,13 +2323,13 @@ pub mod types {
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,
-            validate: |value| {
+            validate: legacy_validator(|value| {
                 if let Value::String(s) = value {
                     validate_ipv4_address(s)
                 } else {
                     Err("Expected string".to_string())
                 }
-            },
+            }),
             namespace: None,
             to_dsl: None,
         }
@@ -2244,13 +2342,13 @@ pub mod types {
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,
-            validate: |value| {
+            validate: legacy_validator(|value| {
                 if let Value::String(s) = value {
                     validate_ipv6_address(s)
                 } else {
                     Err("Expected string".to_string())
                 }
-            },
+            }),
             namespace: None,
             to_dsl: None,
         }
@@ -2263,13 +2361,13 @@ pub mod types {
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,
-            validate: |value| {
+            validate: legacy_validator(|value| {
                 if let Value::String(s) = value {
                     validate_ipv6_cidr(s)
                 } else {
                     Err("Expected string".to_string())
                 }
-            },
+            }),
             namespace: None,
             to_dsl: None,
         }
@@ -2291,13 +2389,13 @@ pub mod types {
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,
-            validate: |value| {
+            validate: legacy_validator(|value| {
                 if let Value::String(s) = value {
                     validate_email(s)
                 } else {
                     Err("Expected string".to_string())
                 }
-            },
+            }),
             namespace: None,
             to_dsl: None,
         }

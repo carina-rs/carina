@@ -501,13 +501,13 @@ impl DiagnosticEngine {
                                     );
 
                                     // Use schema's validate function for all Custom types
-                                    validate(&resolved_value).err().map(|inner_msg| {
+                                    validate(&resolved_value).err().map(|inner_err| {
                                         // For namespaced Custom types (enum-like), mirror
                                         // the CLI shape-mismatch diagnostic when the user
-                                        // wrote a quoted string literal. The Custom
-                                        // validator itself returns a free-form string, so
-                                        // we wrap its message rather than reshape a
-                                        // TypeError. See #2094.
+                                        // wrote a quoted string literal. The validator
+                                        // returns a structured `TypeError`; render it as a
+                                        // string when wrapping for the LSP message. See #2094.
+                                        let inner_msg = inner_err.to_string();
                                         if namespace.is_some()
                                             && matches!(value, Value::String(s) if !s.contains('.'))
                                             && resource.quoted_string_attrs.contains(attr_name)

@@ -1,6 +1,7 @@
 use super::*;
 use crate::parser::{ParsedFile, ProviderContext};
 use crate::resource::Resource;
+use crate::schema::noop_validator;
 
 fn empty_parsed() -> ParsedFile {
     ParsedFile {
@@ -1301,7 +1302,7 @@ fn attribute_param_ref_type_mismatch_detected() {
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,
-            validate: |_| Ok(()),
+            validate: noop_validator(),
             namespace: None,
             to_dsl: None,
         },
@@ -1454,13 +1455,13 @@ fn type_compat_subtype_accepted() {
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,
-            validate: |_| Ok(()),
+            validate: noop_validator(),
             namespace: None,
             to_dsl: None,
         }),
         pattern: None,
         length: None,
-        validate: |_| Ok(()),
+        validate: noop_validator(),
         namespace: None,
         to_dsl: None,
     };
@@ -1480,13 +1481,13 @@ fn type_compat_sibling_rejected() {
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,
-            validate: |_| Ok(()),
+            validate: noop_validator(),
             namespace: None,
             to_dsl: None,
         }),
         pattern: None,
         length: None,
-        validate: |_| Ok(()),
+        validate: noop_validator(),
         namespace: None,
         to_dsl: None,
     };
@@ -1506,13 +1507,13 @@ fn type_compat_resource_id_subtype() {
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,
-            validate: |_| Ok(()),
+            validate: noop_validator(),
             namespace: None,
             to_dsl: None,
         }),
         pattern: None,
         length: None,
-        validate: |_| Ok(()),
+        validate: noop_validator(),
         namespace: None,
         to_dsl: None,
     };
@@ -1532,13 +1533,13 @@ fn type_compat_resource_id_siblings_rejected() {
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,
-            validate: |_| Ok(()),
+            validate: noop_validator(),
             namespace: None,
             to_dsl: None,
         }),
         pattern: None,
         length: None,
-        validate: |_| Ok(()),
+        validate: noop_validator(),
         namespace: None,
         to_dsl: None,
     };
@@ -1555,7 +1556,7 @@ fn type_compat_exact_match() {
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
-        validate: |_| Ok(()),
+        validate: noop_validator(),
         namespace: None,
         to_dsl: None,
     };

@@ -8,7 +8,7 @@ use tower_lsp::lsp_types::{
 
 use carina_core::builtins;
 use carina_core::parser::snake_to_pascal;
-use carina_core::schema::AttributeType;
+use carina_core::schema::{AttributeType, legacy_validator};
 
 use super::{CompletionProvider, DslSource};
 
@@ -1385,7 +1385,7 @@ fn parse_exports_type_text(text: &str) -> Option<AttributeType> {
                 base: Box::new(AttributeType::String),
                 pattern: None,
                 length: None,
-                validate: noop_validate,
+                validate: legacy_validator(noop_validate),
                 namespace: None,
                 to_dsl: None,
             })

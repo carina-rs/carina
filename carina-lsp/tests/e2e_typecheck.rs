@@ -17,7 +17,9 @@ mod support;
 
 use std::collections::HashMap;
 
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+use carina_core::schema::{
+    AttributeSchema, AttributeType, ResourceSchema, StructField, legacy_validator,
+};
 use support::fixture::{analyze, engine_with_schemas, single_schema_map, write_fixture};
 
 fn count_with(diags: &[tower_lsp::lsp_types::Diagnostic], substring: &str) -> usize {
@@ -137,7 +139,7 @@ fn region_schemas() -> HashMap<String, ResourceSchema> {
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
-        validate: validate_region,
+        validate: legacy_validator(validate_region),
         namespace: Some("test".to_string()),
         to_dsl: Some(to_dsl),
     };
