@@ -92,7 +92,11 @@ pub(crate) fn parse_resource_address(
         .to_string();
     let name_pair = next_pair(&mut inner, "resource name", "resource address")?;
     // The name is a string literal - extract value from quotes
-    let name = parse_string_literal(name_pair)?;
+    let raw_name = parse_string_literal(name_pair)?;
+    // Normalize map-key trailing segment so all three input shapes
+    // (`binding.key`, `binding['key']`, `binding["key"]`) collapse
+    // to the canonical form before state lookup. See #1903.
+    let name = crate::utils::canonicalize_map_key_address(&raw_name);
 
     // Split namespaced id into provider and resource_type
     let (provider, resource_type) = split_namespaced_id(&namespaced);
