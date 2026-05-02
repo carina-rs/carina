@@ -464,6 +464,12 @@ impl DiagnosticEngine {
                 carina_core::provider::schema_key_for_resource(&self.factories, r)
             },
         );
+        // #1894 (option 2): cross-directory `for`-iterable shape check.
+        // Anchored at the same `binding.field` ref occurrence so the
+        // editor squiggle lands on the iterable expression.
+        let shape_errors = carina_core::upstream_exports::check_upstream_state_for_iterable_shapes(
+            merged, &exports,
+        );
         let mut seen_count: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         self.push_upstream_ref_diagnostics(
@@ -479,6 +485,14 @@ impl DiagnosticEngine {
             &mut seen_count,
             &mut diagnostics,
             type_errors
+                .iter()
+                .map(|e| (e.binding.as_str(), e.field.as_str(), e.diagnostic_message())),
+        );
+        self.push_upstream_ref_diagnostics(
+            doc,
+            &mut seen_count,
+            &mut diagnostics,
+            shape_errors
                 .iter()
                 .map(|e| (e.binding.as_str(), e.field.as_str(), e.diagnostic_message())),
         );
