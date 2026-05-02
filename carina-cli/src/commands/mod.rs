@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use carina_core::module_resolver;
 use carina_core::parser::{BackendConfig, ParsedFile, ProviderContext};
+use carina_core::upstream_exports::UpstreamRefDiagnostic;
 use carina_state::BackendLock;
 use carina_state::backend::BackendConfig as StateBackendConfig;
 
@@ -395,24 +396,23 @@ pub fn validate_and_resolve_errors_with_factories(
                 .iter()
                 .map(|e| AppError::Validation(e.to_string())),
         );
+        // The four upstream-ref checks return distinct concrete types
+        // but share `UpstreamRefDiagnostic`. Chain them through the
+        // trait (`Display` supertrait gives the canonical
+        // `"location: message"` form — the per-type `Display` impl is
+        // the single source of truth) so adding a fifth check is one
+        // extra `chain(...)`.
         errors.extend(
             field_errors
                 .iter()
-                .map(|e| AppError::Validation(e.to_string())),
-        );
-        errors.extend(
-            type_errors
-                .iter()
-                .map(|e| AppError::Validation(e.to_string())),
-        );
-        errors.extend(
-            shape_errors
-                .iter()
-                .map(|e| AppError::Validation(e.to_string())),
-        );
-        errors.extend(
-            attribute_access_errors
-                .iter()
+                .map(|e| e as &dyn UpstreamRefDiagnostic)
+                .chain(type_errors.iter().map(|e| e as &dyn UpstreamRefDiagnostic))
+                .chain(shape_errors.iter().map(|e| e as &dyn UpstreamRefDiagnostic))
+                .chain(
+                    attribute_access_errors
+                        .iter()
+                        .map(|e| e as &dyn UpstreamRefDiagnostic),
+                )
                 .map(|e| AppError::Validation(e.to_string())),
         );
     }
