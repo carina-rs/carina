@@ -191,6 +191,100 @@ pub fn resolve_upstream_exports(
     (out, errors)
 }
 
+/// Format the location string for an attribute on a resource, with the
+/// `for-body` prefix when the resource is a deferred-for template.
+/// Three checks emit the same string; centralized here so a future
+/// tweak to the wording lands in one place.
+fn resource_attr_location(
+    ctx: ResourceContext<'_>,
+    resource: &crate::resource::Resource,
+    attr_name: &str,
+) -> String {
+    match ctx {
+        ResourceContext::Direct => format!("{} attribute `{}`", resource.id, attr_name),
+        ResourceContext::Deferred(d) => format!(
+            "for-body `{}` {} attribute `{}`",
+            d.header, resource.id, attr_name
+        ),
+    }
+}
+
+/// Walk every resource attribute in the project (Direct + deferred-for
+/// templates), yielding `(ResourceContext, &Resource, attr_name, &Value)`
+/// for each non-internal attribute (skips `_*` keys). Used by all three
+/// upstream-ref checks; centralized so the iter_all_resources walk and
+/// the `_*` skip are written once.
+fn for_each_resource_attr<F>(parsed: &ParsedFile, mut f: F)
+where
+    F: FnMut(ResourceContext<'_>, &crate::resource::Resource, &str, &Value),
+{
+    for (ctx, resource) in parsed.iter_all_resources() {
+        for (attr_name, value) in resource.attributes.iter() {
+            if attr_name.starts_with('_') {
+                continue;
+            }
+            f(ctx, resource, attr_name, value);
+        }
+    }
+}
+
+/// Walk every ref-bearing value outside resources — `let` bindings,
+/// `attributes` parameter defaults, `exports` values, and module-call
+/// arguments — yielding `(value, location_string)`. Used by
+/// [`check_upstream_state_field_references`] and
+/// [`check_upstream_state_attribute_access_shapes`]; centralized so a
+/// fifth check that wants the same reach gets it for free.
+///
+/// `scope` controls which subset is walked, mirroring what each
+/// existing caller walks today. See [`NonResourceScope`] for the two
+/// shapes.
+fn for_each_non_resource_value<F>(parsed: &ParsedFile, scope: NonResourceScope, mut f: F)
+where
+    F: FnMut(&Value, &str),
+{
+    if matches!(scope, NonResourceScope::All) {
+        for (name, value) in parsed.variables.iter() {
+            f(value, &format!("let {}", name));
+        }
+        for attr in &parsed.attribute_params {
+            if let Some(value) = &attr.value {
+                f(value, &format!("attributes.{}", attr.name));
+            }
+        }
+    }
+    for export in &parsed.export_params {
+        if let Some(value) = &export.value {
+            f(value, &format!("exports.{}", export.name));
+        }
+    }
+    for call in &parsed.module_calls {
+        let caller = call.binding_name.as_deref().unwrap_or(&call.module_name);
+        for (arg_name, value) in call.arguments.iter() {
+            f(
+                value,
+                &format!("module `{}` argument `{}`", caller, arg_name),
+            );
+        }
+    }
+}
+
+/// Which non-resource scopes a check walks today. The variants are not
+/// a generic taxonomy — they pin the existing per-caller asymmetry so
+/// the refactor stays behavior-preserving. Whether
+/// [`check_upstream_state_attribute_access_shapes`] *should* widen to
+/// `All` (i.e. also walk `let`/attribute_params, like field-references
+/// does) is an open question for a follow-up; until then,
+/// `ExportsAndModules` exists to preserve the historical reach.
+#[derive(Debug, Clone, Copy)]
+enum NonResourceScope {
+    /// Variables (`let`), attribute_params, export_params, module_calls
+    /// — what `check_upstream_state_field_references` walks today.
+    All,
+    /// Just export_params and module_calls — what
+    /// `check_upstream_state_attribute_access_shapes` walks today.
+    ExportsAndModules,
+}
+
 /// Walk a parsed project and return an error for every reference whose root
 /// binding is in `exports` but whose field isn't in its declared key set.
 /// Also covers deferred for-iterables (e.g. `for _ in orgs.accounts`), which
@@ -238,43 +332,16 @@ pub fn check_upstream_state_field_references(
             });
         };
 
-        for (name, value) in parsed.variables.iter() {
-            check(value, &format!("let {}", name));
-        }
         // Direct resources and deferred for-body template resources share
-        // one walk via `iter_all_resources`. Location strings use the
-        // `ResourceContext::Deferred` branch to mention the for header so
-        // users can tell body errors from top-level ones.
-        for (ctx, resource) in parsed.iter_all_resources() {
-            for (attr_name, value) in resource.attributes.iter() {
-                let location = match ctx {
-                    ResourceContext::Direct => {
-                        format!("{} attribute `{}`", resource.id, attr_name)
-                    }
-                    ResourceContext::Deferred(d) => format!(
-                        "for-body `{}` {} attribute `{}`",
-                        d.header, resource.id, attr_name
-                    ),
-                };
-                check(value, &location);
-            }
-        }
-        for attr in &parsed.attribute_params {
-            if let Some(value) = &attr.value {
-                check(value, &format!("attributes.{}", attr.name));
-            }
-        }
-        for export in &parsed.export_params {
-            if let Some(value) = &export.value {
-                check(value, &format!("exports.{}", export.name));
-            }
-        }
-        for call in &parsed.module_calls {
-            let caller = call.binding_name.as_deref().unwrap_or(&call.module_name);
-            for (arg_name, v) in call.arguments.iter() {
-                check(v, &format!("module `{}` argument `{}`", caller, arg_name));
-            }
-        }
+        // one walk via `iter_all_resources` (helper). Location strings
+        // use the `ResourceContext::Deferred` branch to mention the for
+        // header so users can tell body errors from top-level ones.
+        for_each_resource_attr(parsed, |ctx, resource, attr_name, value| {
+            check(value, &resource_attr_location(ctx, resource, attr_name));
+        });
+        for_each_non_resource_value(parsed, NonResourceScope::All, |value, location| {
+            check(value, location);
+        });
     }
 
     // Deferred for-expression iterables are a direct
@@ -376,34 +443,23 @@ pub fn check_upstream_state_field_types(
     schema_key_fn: &dyn Fn(&crate::resource::Resource) -> String,
 ) -> Vec<UpstreamTypeError> {
     let mut errors: Vec<UpstreamTypeError> = Vec::new();
-    for (ctx, resource) in parsed.iter_all_resources() {
+    for_each_resource_attr(parsed, |ctx, resource, attr_name, value| {
         let key = schema_key_fn(resource);
         let Some(schema) = schemas.get(&key) else {
-            continue;
+            return;
         };
-        for (attr_name, value) in resource.attributes.iter() {
-            if attr_name.starts_with('_') {
-                continue;
-            }
-            let Some(attr_schema) = schema.attributes.get(attr_name) else {
-                continue;
-            };
-            let location = match ctx {
-                ResourceContext::Direct => format!("{} attribute `{}`", resource.id, attr_name),
-                ResourceContext::Deferred(d) => format!(
-                    "for-body `{}` {} attribute `{}`",
-                    d.header, resource.id, attr_name
-                ),
-            };
-            check_ref_against_type(
-                value,
-                &attr_schema.attr_type,
-                exports,
-                &location,
-                &mut errors,
-            );
-        }
-    }
+        let Some(attr_schema) = schema.attributes.get(attr_name) else {
+            return;
+        };
+        let location = resource_attr_location(ctx, resource, attr_name);
+        check_ref_against_type(
+            value,
+            &attr_schema.attr_type,
+            exports,
+            &location,
+            &mut errors,
+        );
+    });
     errors.sort_by(|a, b| {
         (a.location.as_str(), a.binding.as_str(), a.field.as_str()).cmp(&(
             b.location.as_str(),
@@ -719,46 +775,25 @@ pub fn check_upstream_state_attribute_access_shapes(
     exports: &UpstreamExports,
 ) -> Vec<UpstreamAttributeAccessShapeError> {
     let mut errors: Vec<UpstreamAttributeAccessShapeError> = Vec::new();
-    for (ctx, resource) in parsed.iter_all_resources() {
-        for (attr_name, value) in resource.attributes.iter() {
-            if attr_name.starts_with('_') {
-                continue;
-            }
-            let location = match ctx {
-                ResourceContext::Direct => format!("{} attribute `{}`", resource.id, attr_name),
-                ResourceContext::Deferred(d) => format!(
-                    "for-body `{}` {} attribute `{}`",
-                    d.header, resource.id, attr_name
-                ),
-            };
-            visit_attribute_access(value, exports, &location, &mut errors);
-        }
-    }
-    // Module-call arguments and exports values are ResourceRef-bearing
+    for_each_resource_attr(parsed, |ctx, resource, attr_name, value| {
+        visit_attribute_access(
+            value,
+            exports,
+            &resource_attr_location(ctx, resource, attr_name),
+            &mut errors,
+        );
+    });
+    // Module-call arguments and export values are ResourceRef-bearing
     // too — they aren't iterated by `iter_all_resources`. Walking them
-    // matches the reach of `check_upstream_state_field_references` /
-    // `_types`.
-    for export in &parsed.export_params {
-        if let Some(value) = &export.value {
-            visit_attribute_access(
-                value,
-                exports,
-                &format!("exports.{}", export.name),
-                &mut errors,
-            );
-        }
-    }
-    for call in &parsed.module_calls {
-        let caller = call.binding_name.as_deref().unwrap_or(&call.module_name);
-        for (arg_name, value) in call.arguments.iter() {
-            visit_attribute_access(
-                value,
-                exports,
-                &format!("module `{}` argument `{}`", caller, arg_name),
-                &mut errors,
-            );
-        }
-    }
+    // (via the helper) matches the reach of
+    // `check_upstream_state_field_references` for those scopes.
+    for_each_non_resource_value(
+        parsed,
+        NonResourceScope::ExportsAndModules,
+        |value, location| {
+            visit_attribute_access(value, exports, location, &mut errors);
+        },
+    );
     errors.sort_by(|a, b| {
         (a.location.as_str(), a.binding.as_str(), a.field.as_str()).cmp(&(
             b.location.as_str(),
