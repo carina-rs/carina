@@ -268,11 +268,14 @@ pub(super) fn rewrite_intra_module_refs(
 ) -> Value {
     match value {
         Value::ResourceRef { path } if intra_module_bindings.contains(path.binding()) => {
-            Value::resource_ref(
-                format!("{}.{}", instance_prefix, path.binding()),
-                path.attribute().to_string(),
-                path.field_path().to_vec(),
-            )
+            Value::ResourceRef {
+                path: crate::resource::AccessPath::with_fields_and_subscripts(
+                    format!("{}.{}", instance_prefix, path.binding()),
+                    path.attribute().to_string(),
+                    path.field_path().to_vec(),
+                    path.subscripts().to_vec(),
+                ),
+            }
         }
         Value::List(items) => Value::List(
             items
@@ -526,11 +529,14 @@ fn rewrite_ref_prefixes(
                 && let Some(&target) = remap.get(&(module.to_string(), simhash))
             {
                 let new_binding = format!("{}_{:016x}.{}", module, target, rest);
-                return Value::resource_ref(
-                    new_binding,
-                    path.attribute().to_string(),
-                    path.field_path().to_vec(),
-                );
+                return Value::ResourceRef {
+                    path: crate::resource::AccessPath::with_fields_and_subscripts(
+                        new_binding,
+                        path.attribute().to_string(),
+                        path.field_path().to_vec(),
+                        path.subscripts().to_vec(),
+                    ),
+                };
             }
             value.clone()
         }

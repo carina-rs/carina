@@ -3229,6 +3229,176 @@ fn parse_index_access_with_chained_fields() {
 }
 
 #[test]
+fn parse_subscript_after_field_access_with_integer() {
+    // `orgs.accounts[0]` — subscript after `binding.field`. Issue #2318.
+    let input = r#"
+        let orgs = upstream_state { source = "../organizations" }
+
+        awscc.ec2.Subnet {
+            name = "test"
+            cidr_block = orgs.accounts[0]
+        }
+    "#;
+
+    let result = parse(input, &ProviderContext::default()).unwrap();
+    let subnet = result.resources.last().expect("subnet");
+    let value = subnet.get_attr("cidr_block").expect("cidr_block");
+    match value {
+        Value::ResourceRef { path } => {
+            assert_eq!(path.binding(), "orgs");
+            assert_eq!(path.attribute(), "accounts");
+            assert!(path.field_path().is_empty());
+            assert_eq!(
+                path.subscripts(),
+                [crate::resource::Subscript::Int { index: 0 }]
+            );
+            assert_eq!(path.to_dot_string(), "orgs.accounts[0]");
+        }
+        other => panic!("Expected ResourceRef with subscript, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_subscript_after_field_access_with_string_key() {
+    // `orgs.accounts["alpha"]` — subscript after `binding.field`. Issue #2318.
+    let input = r#"
+        let orgs = upstream_state { source = "../organizations" }
+
+        awscc.ec2.Subnet {
+            name = "test"
+            cidr_block = orgs.accounts["alpha"]
+        }
+    "#;
+
+    let result = parse(input, &ProviderContext::default()).unwrap();
+    let subnet = result.resources.last().expect("subnet");
+    let value = subnet.get_attr("cidr_block").expect("cidr_block");
+    match value {
+        Value::ResourceRef { path } => {
+            assert_eq!(path.binding(), "orgs");
+            assert_eq!(path.attribute(), "accounts");
+            assert!(path.field_path().is_empty());
+            assert_eq!(
+                path.subscripts(),
+                [crate::resource::Subscript::Str {
+                    key: "alpha".to_string()
+                }]
+            );
+            assert_eq!(path.to_dot_string(), "orgs.accounts[\"alpha\"]");
+        }
+        other => panic!("Expected ResourceRef with subscript, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_chained_subscripts_after_field_access() {
+    // `orgs.matrix[0][1]` — multiple subscripts after field access.
+    // The shape check relies on the AST exposing them in source order.
+    let input = r#"
+        let orgs = upstream_state { source = "../organizations" }
+
+        awscc.ec2.Subnet {
+            name = "test"
+            cidr_block = orgs.matrix[0][1]
+        }
+    "#;
+
+    let result = parse(input, &ProviderContext::default()).unwrap();
+    let subnet = result.resources.last().expect("subnet");
+    let value = subnet.get_attr("cidr_block").expect("cidr_block");
+    match value {
+        Value::ResourceRef { path } => {
+            assert_eq!(path.binding(), "orgs");
+            assert_eq!(path.attribute(), "matrix");
+            assert!(path.field_path().is_empty());
+            assert_eq!(
+                path.subscripts(),
+                [
+                    crate::resource::Subscript::Int { index: 0 },
+                    crate::resource::Subscript::Int { index: 1 },
+                ]
+            );
+        }
+        other => panic!("Expected ResourceRef, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_negative_subscript_is_rejected() {
+    // `orgs.accounts[-1]` — the DSL has no `[-1]` "from end" semantic.
+    // Rejecting at parse time avoids the validator passing and the
+    // resolver silently falling back to an unresolved ref.
+    let input = r#"
+        let orgs = upstream_state { source = "../organizations" }
+
+        awscc.ec2.Subnet {
+            name = "test"
+            cidr_block = orgs.accounts[-1]
+        }
+    "#;
+    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    let msg = format!("{:?}", err);
+    assert!(
+        msg.contains("non-negative"),
+        "expected non-negative rejection, got: {msg}"
+    );
+}
+
+#[test]
+fn parse_field_after_subscript_after_field_is_rejected() {
+    // `a.b[0].c` — once a subscript appears after a field, no more
+    // fields are allowed. Runtime list-indexing of arbitrary structs
+    // isn't representable today.
+    let input = r#"
+        let orgs = upstream_state { source = "../organizations" }
+
+        awscc.ec2.Subnet {
+            name = "test"
+            cidr_block = orgs.accounts[0].id
+        }
+    "#;
+    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    let msg = format!("{:?}", err);
+    assert!(
+        msg.contains("field access after index access")
+            || msg.contains("field_access after index_access")
+            || msg.contains("InvalidExpression")
+            || msg.contains("Syntax"),
+        "expected rejection of `a.b[0].c`, got: {msg}"
+    );
+}
+
+#[test]
+fn parse_subscript_after_nested_field_access() {
+    // `orgs.account.accounts[0]` — subscript after a multi-level field
+    // chain. Should populate both `field_path` and `subscripts`.
+    let input = r#"
+        let orgs = upstream_state { source = "../organizations" }
+
+        awscc.ec2.Subnet {
+            name = "test"
+            cidr_block = orgs.account.accounts[0]
+        }
+    "#;
+
+    let result = parse(input, &ProviderContext::default()).unwrap();
+    let subnet = result.resources.last().expect("subnet");
+    let value = subnet.get_attr("cidr_block").expect("cidr_block");
+    match value {
+        Value::ResourceRef { path } => {
+            assert_eq!(path.binding(), "orgs");
+            assert_eq!(path.attribute(), "account");
+            assert_eq!(path.field_path(), vec!["accounts"]);
+            assert_eq!(
+                path.subscripts(),
+                [crate::resource::Subscript::Int { index: 0 }]
+            );
+        }
+        other => panic!("Expected ResourceRef, got {:?}", other),
+    }
+}
+
+#[test]
 fn parse_import_block() {
     let input = r#"
         import {

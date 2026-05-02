@@ -156,18 +156,61 @@ impl std::fmt::Display for ResourceId {
     }
 }
 
+/// A `[index]` subscript appended to an `AccessPath`'s field chain.
+///
+/// `binding.field[0]` and `binding.field["k"]` parse into the same
+/// `binding` + `attribute` + `field_path` as `binding.field`, plus a
+/// trailing `Subscript` capturing the `[…]` form. Distinguishing
+/// integer from string at this layer lets cross-directory shape checks
+/// reject `[0]` against a `map(_)` export and `["k"]` against a
+/// `list(_)` export with type-aware diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Subscript {
+    /// Integer subscript: `[0]`. Valid against `list(_)` exports.
+    Int { index: i64 },
+    /// String subscript: `["k"]`. Valid against `map(_)` exports.
+    Str { key: String },
+}
+
+impl Subscript {
+    /// Append this subscript to `out` in source-form: `[0]` or `["k"]`.
+    /// String keys go through `{:?}` so embedded quotes/backslashes
+    /// round-trip as valid DSL source — the same form is used by
+    /// diagnostic messages so escapes matter there too.
+    pub fn append_to_dot_string(&self, out: &mut String) {
+        use std::fmt::Write as _;
+        match self {
+            Subscript::Int { index } => {
+                let _ = write!(out, "[{}]", index);
+            }
+            Subscript::Str { key } => {
+                let _ = write!(out, "[{:?}]", key);
+            }
+        }
+    }
+}
+
 /// A typed access path representing a `ResourceRef` target.
 ///
-/// The path always carries a binding name and an attribute name; nested field
-/// access (e.g., `web.network.vpc_id`) is captured in `field_path`. The
-/// "binding + attribute is mandatory" invariant is enforced by the type system
-/// — there is no way to construct an `AccessPath` without both.
+/// The path always carries a binding name and an attribute name; nested
+/// field access (e.g., `web.network.vpc_id`) is captured in
+/// `field_path`, and any trailing `[index]` subscripts in `subscripts`.
+/// The grammar accepts only `binding.field[…]…`, never `binding[…].field`,
+/// so the two chains never interleave — pre-field index access is folded
+/// into the binding name string by the parser as before.
+///
+/// The "binding + attribute is mandatory" invariant is enforced by the
+/// type system — there is no way to construct an `AccessPath` without
+/// both.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AccessPath {
     binding: String,
     attribute: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     field_path: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    subscripts: Vec<Subscript>,
 }
 
 impl AccessPath {
@@ -177,6 +220,7 @@ impl AccessPath {
             binding: binding.into(),
             attribute: attribute.into(),
             field_path: Vec::new(),
+            subscripts: Vec::new(),
         }
     }
 
@@ -190,6 +234,24 @@ impl AccessPath {
             binding: binding.into(),
             attribute: attribute.into(),
             field_path,
+            subscripts: Vec::new(),
+        }
+    }
+
+    /// Create an `AccessPath` with both a field chain and trailing
+    /// `[index]` subscripts. Used by the parser when source contains
+    /// `binding.field[idx]` or `binding.field.subfield[idx]…`.
+    pub fn with_fields_and_subscripts(
+        binding: impl Into<String>,
+        attribute: impl Into<String>,
+        field_path: Vec<String>,
+        subscripts: Vec<Subscript>,
+    ) -> Self {
+        Self {
+            binding: binding.into(),
+            attribute: attribute.into(),
+            field_path,
+            subscripts,
         }
     }
 
@@ -209,7 +271,14 @@ impl AccessPath {
         &self.field_path
     }
 
-    /// Returns the path as `binding.attribute[.field...]`.
+    /// Returns the trailing `[index]` subscripts (empty if the
+    /// reference doesn't subscript past the field chain).
+    pub fn subscripts(&self) -> &[Subscript] {
+        &self.subscripts
+    }
+
+    /// Returns the path in source-form: `binding.attribute` followed by
+    /// `.field…[idx]…` segments as written.
     pub fn to_dot_string(&self) -> String {
         let mut out = String::with_capacity(
             self.binding.len()
@@ -223,6 +292,9 @@ impl AccessPath {
         for field in &self.field_path {
             out.push('.');
             out.push_str(field);
+        }
+        for sub in &self.subscripts {
+            sub.append_to_dot_string(&mut out);
         }
         out
     }

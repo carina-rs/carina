@@ -479,11 +479,13 @@ impl DiagnosticEngine {
             carina_core::upstream_exports::check_upstream_state_attribute_access_shapes(
                 merged, &exports,
             );
+        let subscript_errors =
+            carina_core::upstream_exports::check_upstream_state_subscript_shapes(merged, &exports);
         let mut seen_count: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
-        // The four upstream-ref checks return distinct concrete types
+        // The five upstream-ref checks return distinct concrete types
         // but share `UpstreamRefDiagnostic`; chain them through the
-        // trait so adding a fifth check is one extra `chain(...)`.
+        // trait so adding a sixth check is one extra `chain(...)`.
         self.push_upstream_ref_diagnostics(
             doc,
             &mut seen_count,
@@ -495,6 +497,11 @@ impl DiagnosticEngine {
                 .chain(shape_errors.iter().map(|e| e as &dyn UpstreamRefDiagnostic))
                 .chain(
                     attribute_access_errors
+                        .iter()
+                        .map(|e| e as &dyn UpstreamRefDiagnostic),
+                )
+                .chain(
+                    subscript_errors
                         .iter()
                         .map(|e| e as &dyn UpstreamRefDiagnostic),
                 )

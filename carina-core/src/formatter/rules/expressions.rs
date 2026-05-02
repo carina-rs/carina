@@ -263,6 +263,23 @@ impl Formatter {
         }
     }
 
+    pub(in crate::formatter) fn format_subscripted_id(&mut self, node: &CstNode) {
+        // `binding.field[idx]…` — the namespaced_id portion is a single
+        // token (the `@{ }` rule produces no inner pairs), and each
+        // `index_access` child carries its own `[` / expression / `]`.
+        for child in &node.children {
+            match child {
+                CstChild::Token(token) => {
+                    self.write_token(&token.text);
+                }
+                CstChild::Node(n) if n.kind == NodeKind::IndexAccess => {
+                    self.format_index_access(n);
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn format_field_access(&mut self, node: &CstNode) {
         self.write(".");
         for child in &node.children {

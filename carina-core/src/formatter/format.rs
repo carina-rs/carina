@@ -197,6 +197,7 @@ impl Formatter {
             NodeKind::ComposeExpr => self.format_compose_expr(node),
             NodeKind::FunctionCall => self.format_function_call(node),
             NodeKind::VariableRef => self.format_variable_ref(node),
+            NodeKind::SubscriptedId => self.format_subscripted_id(node),
             NodeKind::List => self.format_list(node),
             NodeKind::Map => self.format_map(node),
             NodeKind::MapEntry => self.format_map_entry(node),

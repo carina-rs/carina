@@ -674,6 +674,35 @@ fn resource_module_source_typed_field() {
 }
 
 #[test]
+fn access_path_subscripts_render_with_escapes() {
+    use crate::resource::{AccessPath, Subscript};
+
+    // Integer subscript renders as `[N]`.
+    let int_path = AccessPath::with_fields_and_subscripts(
+        "orgs",
+        "accounts",
+        Vec::new(),
+        vec![Subscript::Int { index: 0 }],
+    );
+    assert_eq!(int_path.to_dot_string(), "orgs.accounts[0]");
+
+    // String subscript with embedded quote escapes through {:?}.
+    let str_path = AccessPath::with_fields_and_subscripts(
+        "orgs",
+        "accounts",
+        Vec::new(),
+        vec![Subscript::Str {
+            key: "a\"b".to_string(),
+        }],
+    );
+    let rendered = str_path.to_dot_string();
+    assert!(
+        rendered.contains("\\\""),
+        "embedded quote must escape, got: {rendered}"
+    );
+}
+
+#[test]
 fn access_path_new() {
     let path = AccessPath::new("vpc", "id");
     assert_eq!(path.binding(), "vpc");

@@ -98,6 +98,39 @@ pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<V
                     }
                 }
 
+                // Descend into the resolved value by each post-field
+                // subscript (`orgs.accounts[0]`, `orgs.matrix[0][1]`).
+                // The validate-time shape check
+                // (`check_upstream_state_subscript_shapes`) already
+                // rejects kind mismatches against typed exports, so by
+                // the time we get here the subscripts should fit the
+                // shape — but the resolver still has to handle the
+                // happy path and bail out cleanly when an out-of-range
+                // index or missing key is encountered (e.g. resources
+                // produced by `for` whose count differs from the
+                // upstream's declared length).
+                use crate::resource::Subscript;
+                for sub in path.subscripts() {
+                    match (resolved, sub) {
+                        (Value::List(items), Subscript::Int { index }) => {
+                            let idx = usize::try_from(*index).ok().filter(|i| *i < items.len());
+                            match idx {
+                                Some(i) => {
+                                    resolved = resolve_ref_value(&items[i], bindings)?;
+                                }
+                                None => return Ok(value.clone()),
+                            }
+                        }
+                        (Value::Map(map), Subscript::Str { key }) => match map.get(key) {
+                            Some(nested) => {
+                                resolved = resolve_ref_value(nested, bindings)?;
+                            }
+                            None => return Ok(value.clone()),
+                        },
+                        _ => return Ok(value.clone()),
+                    }
+                }
+
                 return Ok(resolved);
             }
             // Keep as-is if not found
@@ -204,6 +237,76 @@ mod tests {
             })
             .collect();
         ResolvedBindings::from_resources_with_state(&resources, &HashMap::new(), &HashMap::new())
+    }
+
+    #[test]
+    fn test_resolve_subscript_descends_into_list() {
+        // `orgs.accounts[0]` against `accounts: [a, b]` resolves to `a`.
+        let bindings = bindings_from(vec![(
+            "orgs",
+            vec![(
+                "accounts",
+                Value::List(vec![
+                    Value::String("alpha".to_string()),
+                    Value::String("beta".to_string()),
+                ]),
+            )],
+        )]);
+        let path = crate::resource::AccessPath::with_fields_and_subscripts(
+            "orgs",
+            "accounts",
+            Vec::new(),
+            vec![crate::resource::Subscript::Int { index: 0 }],
+        );
+        let ref_value = Value::ResourceRef { path };
+        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        assert_eq!(resolved, Value::String("alpha".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_subscript_descends_into_map() {
+        // `orgs.accounts["alpha"]` against `accounts: { alpha = "1", beta = "2" }`
+        // resolves to `"1"`.
+        let map: indexmap::IndexMap<String, Value> = vec![
+            ("alpha".to_string(), Value::String("1".to_string())),
+            ("beta".to_string(), Value::String("2".to_string())),
+        ]
+        .into_iter()
+        .collect();
+        let bindings = bindings_from(vec![("orgs", vec![("accounts", Value::Map(map))])]);
+        let path = crate::resource::AccessPath::with_fields_and_subscripts(
+            "orgs",
+            "accounts",
+            Vec::new(),
+            vec![crate::resource::Subscript::Str {
+                key: "alpha".to_string(),
+            }],
+        );
+        let ref_value = Value::ResourceRef { path };
+        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        assert_eq!(resolved, Value::String("1".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_subscript_out_of_range_keeps_ref() {
+        // `orgs.accounts[5]` against a 2-element list — out of range,
+        // keep as-is so the planner can surface the unresolved ref.
+        let bindings = bindings_from(vec![(
+            "orgs",
+            vec![(
+                "accounts",
+                Value::List(vec![Value::String("a".to_string())]),
+            )],
+        )]);
+        let path = crate::resource::AccessPath::with_fields_and_subscripts(
+            "orgs",
+            "accounts",
+            Vec::new(),
+            vec![crate::resource::Subscript::Int { index: 5 }],
+        );
+        let ref_value = Value::ResourceRef { path: path.clone() };
+        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        assert_eq!(resolved, ref_value);
     }
 
     #[test]
