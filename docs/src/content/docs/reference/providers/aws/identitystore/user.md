@@ -35,12 +35,12 @@ The user's user name. Provide either user_id or user_name.
 - **Type:** String
 - **Read-only**
 
-<p>The display name of the user.</p>
+Display name of the user.
 
 ### `emails`
 
-- **Type:** Email
+- **Type:** String
 - **Read-only**
 
-<p>The email address of the user.</p>
+Email addresses associated with the user.
 
