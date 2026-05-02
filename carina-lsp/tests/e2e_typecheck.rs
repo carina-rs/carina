@@ -13,67 +13,12 @@
 //! provider plugin that is not built in this repo. These LSP-side tests
 //! still pin the parse → resolve → validate pipeline end-to-end.
 
+mod support;
+
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
-use carina_lsp::diagnostics::DiagnosticEngine;
-use carina_lsp::document::Document;
-use tempfile::TempDir;
-
-/// Lay a multi-file fixture mirroring `infra/aws/management/<dir>/`:
-/// `main.crn`, `exports.crn`, `providers.crn`. Returns the temp dir
-/// (kept alive by the caller) plus the absolute path it sits at.
-fn write_fixture(files: &[(&str, &str)]) -> TempDir {
-    let dir = tempfile::tempdir().expect("tempdir");
-    for (name, body) in files {
-        std::fs::write(dir.path().join(name), body).expect("write fixture file");
-    }
-    dir
-}
-
-/// Build a `Document` from one file inside the fixture and feed it through
-/// the engine with `base_path` set so directory-scoped checks see the
-/// sibling files.
-fn analyze(
-    engine: &DiagnosticEngine,
-    fixture: &TempDir,
-    file_name: &str,
-) -> Vec<tower_lsp::lsp_types::Diagnostic> {
-    let path = fixture.path().join(file_name);
-    let text = std::fs::read_to_string(&path).expect("read fixture file");
-    let doc = Document::new(
-        text,
-        Arc::new(carina_core::parser::ProviderContext::default()),
-    );
-    engine.analyze_with_filename(&doc, Some(file_name), Some(fixture.path()))
-}
-
-// Mirrors `custom_engine` in `carina-lsp/src/diagnostics/tests/mod.rs`. The
-// in-crate test helpers there are `pub(super)` and not reachable from
-// `tests/`, so an integration test has to redefine this. Keep the two
-// shapes in sync if either one grows fields.
-fn engine_with_schemas(schemas: HashMap<String, ResourceSchema>) -> DiagnosticEngine {
-    let provider_names: Vec<String> = schemas
-        .keys()
-        .filter_map(|k| k.split('.').next())
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .map(String::from)
-        .collect();
-    DiagnosticEngine::new(Arc::new(schemas), provider_names, Arc::new(vec![]))
-}
-
-/// Wrap one `ResourceSchema` in a `HashMap` keyed by its `resource_type`,
-/// so each scenario only has to spell `"test.r.<thing>"` once. The
-/// double-spelling is a real footgun: an off-by-one between the key and
-/// `ResourceSchema::new` argument silently makes the engine treat the
-/// resource as unknown.
-fn single_schema_map(schema: ResourceSchema) -> HashMap<String, ResourceSchema> {
-    let mut schemas = HashMap::new();
-    schemas.insert(schema.resource_type.clone(), schema);
-    schemas
-}
+use support::fixture::{analyze, engine_with_schemas, single_schema_map, write_fixture};
 
 fn count_with(diags: &[tower_lsp::lsp_types::Diagnostic], substring: &str) -> usize {
     diags

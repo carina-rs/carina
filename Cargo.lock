@@ -889,6 +889,7 @@ dependencies = [
  "log",
  "pest",
  "ropey",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

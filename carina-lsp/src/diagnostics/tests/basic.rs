@@ -713,3 +713,125 @@ awscc.ec2.SecurityGroup {
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+// ---------------------------------------------------------------------------
+// #2309 — find_attribute_value_range coverage
+// ---------------------------------------------------------------------------
+
+#[test]
+fn value_range_covers_dotted_identifier() {
+    let engine = super::test_engine();
+    let doc = super::create_document(
+        "let _ = aws.s3.Bucket {\n  versioning = aws.s3.VersioningStatus.NotReal\n}\n",
+    );
+    let range = engine
+        .find_attribute_value_range(&doc, "versioning", None)
+        .expect("range located");
+    assert_eq!(range.start.line, 1);
+    // Compute expected columns from the line text directly so the
+    // assertion stays robust to incidental indentation tweaks.
+    let text = doc.text();
+    let line = text.lines().nth(1).unwrap();
+    let value_start = line.find("aws.s3.VersioningStatus.NotReal").unwrap() as u32;
+    let value_end = value_start + "aws.s3.VersioningStatus.NotReal".len() as u32;
+    assert_eq!(range.start.character, value_start);
+    assert_eq!(range.end.character, value_end);
+}
+
+#[test]
+fn value_range_includes_quotes_for_string_literal() {
+    // Code action for `StringLiteralExpectedEnum` replaces the quoted
+    // literal *with* its surrounding quotes — applying the fix drops
+    // the quotes and writes the bare identifier.
+    let engine = super::test_engine();
+    let doc =
+        super::create_document("awscc.sso.Assignment {\n  target_type = \"AWS_ACCOUNT\"\n}\n");
+    let range = engine
+        .find_attribute_value_range(&doc, "target_type", None)
+        .expect("range located");
+    let text = doc.text();
+    let line = text.lines().nth(1).unwrap();
+    let value_start = line.find('"').unwrap() as u32;
+    let value_end = (line.rfind('"').unwrap() + 1) as u32;
+    assert_eq!(range.start.line, 1);
+    assert_eq!(range.start.character, value_start);
+    assert_eq!(range.end.character, value_end);
+}
+
+#[test]
+fn value_range_returns_none_for_block_syntax_value() {
+    // `attr = { ... }` has no single offending identifier — the code
+    // action declines to fix it (no range, hence no quick-fix).
+    let engine = super::test_engine();
+    let doc = super::create_document("aws.s3.Bucket {\n  tags = { Env = \"prod\" }\n}\n");
+    assert!(
+        engine
+            .find_attribute_value_range(&doc, "tags", None)
+            .is_none()
+    );
+}
+
+#[test]
+fn value_range_uses_character_offsets_for_multibyte_literal() {
+    // LSP `Position.character` is a UTF-16/codepoint offset, not a byte
+    // offset. Quoted-literal values that contain multi-byte chars
+    // (e.g. `"あ"`) must still produce a `Range` whose `end.character`
+    // equals the codepoint count, not the UTF-8 byte length — otherwise
+    // an editor applying the quick-fix would corrupt surrounding text.
+    let engine = super::test_engine();
+    let doc = super::create_document("aws.s3.Bucket {\n  versioning = \"あ\"\n}\n");
+    let range = engine
+        .find_attribute_value_range(&doc, "versioning", None)
+        .expect("range located");
+    let text = doc.text();
+    let line = text.lines().nth(1).unwrap();
+    // The literal `"あ"` is 3 codepoints: `"`, `あ`, `"`.
+    let value_start_chars = line.chars().take_while(|c| *c != '"').count() as u32;
+    assert_eq!(range.start.line, 1);
+    assert_eq!(range.start.character, value_start_chars);
+    assert_eq!(range.end.character, value_start_chars + 3);
+}
+
+#[test]
+fn string_enum_with_non_string_value_still_emits_diagnostic() {
+    // Regression: when #2309 routed StringEnum through
+    // `build_string_enum_diagnostic`, the fall-back match arm for
+    // StringEnum was removed. That hid `TypeError::TypeMismatch`
+    // diagnostics when the user typed a non-string value (e.g. an
+    // integer) against an enum-typed attribute. The fall-through
+    // generic-message arm restored it; this test pins the behavior.
+    let engine = super::test_engine_with_enum_attr();
+    let doc = super::create_document("test.r.mode_holder {\n  name = \"a\"\n  mode = 42\n}\n");
+    let diagnostics = engine.analyze(&doc, None);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.to_ascii_lowercase().contains("type mismatch")
+                || d.message.to_ascii_lowercase().contains("expected")),
+        "non-string value against StringEnum must still produce a diagnostic, got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn value_range_locates_value_separated_by_tabs() {
+    // Round 4 widened the separator handling in `find_attribute_value_range`
+    // from spaces-only to spaces *or* tabs so a hand-formatted buffer
+    // (or one mid-edit, before the formatter has run) still surfaces
+    // the quick-fix. Pin the behavior so a future tightening can't
+    // silently regress it.
+    let engine = super::test_engine();
+    let doc = super::create_document(
+        "let _ = aws.s3.Bucket {\n\tversioning\t=\taws.s3.VersioningStatus.NotReal\n}\n",
+    );
+    let range = engine
+        .find_attribute_value_range(&doc, "versioning", None)
+        .expect("range located even with tab separators");
+    assert_eq!(range.start.line, 1);
+    let text = doc.text();
+    let line = text.lines().nth(1).unwrap();
+    let value_start = line.find("aws.s3.VersioningStatus.NotReal").unwrap() as u32;
+    let value_end = value_start + "aws.s3.VersioningStatus.NotReal".len() as u32;
+    assert_eq!(range.start.character, value_start);
+    assert_eq!(range.end.character, value_end);
+}

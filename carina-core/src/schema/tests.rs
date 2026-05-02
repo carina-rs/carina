@@ -2924,3 +2924,33 @@ fn custom_namespaced_string_literal_routes_validator_text_to_extra_message() {
         "Display must keep the shape-mismatch wording, got: {rendered}"
     );
 }
+
+#[test]
+fn expected_enum_variant_serde_round_trip() {
+    // The LSP carries `Vec<ExpectedEnumVariant>` through
+    // `Diagnostic.data` (an opaque JSON value) and reads it back on
+    // `textDocument/codeAction` requests. Lock the serde shape so a
+    // refactor that renames a field cannot silently break the LSP
+    // payload contract. See #2309.
+    let original = ExpectedEnumVariant {
+        provider: Some("awscc".to_string()),
+        segments: vec!["sso".to_string(), "Assignment".to_string()],
+        type_name: "TargetType".to_string(),
+        value: "AWS_ACCOUNT".to_string(),
+        is_alias: false,
+    };
+    let json = serde_json::to_value(&original).expect("serialize");
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "provider": "awscc",
+            "segments": ["sso", "Assignment"],
+            "type_name": "TargetType",
+            "value": "AWS_ACCOUNT",
+            "is_alias": false,
+        }),
+        "JSON shape changed — LSP payload contract is at risk"
+    );
+    let round: ExpectedEnumVariant = serde_json::from_value(json).expect("deserialize");
+    assert_eq!(round, original);
+}

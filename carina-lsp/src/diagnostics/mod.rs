@@ -403,6 +403,29 @@ impl DiagnosticEngine {
                                 }
                             }
 
+                            // #2309: when the attribute schema is a StringEnum and
+                            // validation fails, emit a Diagnostic with the structured
+                            // candidate list on `Diagnostic.data` and a range that
+                            // covers the offending value text — both prerequisites
+                            // for the `textDocument/codeAction` quick-fix. Falls
+                            // through to the generic match below for everything
+                            // else (and when the StringEnum branch can't locate a
+                            // value range).
+                            if let carina_core::schema::AttributeType::StringEnum { .. } =
+                                &attr_schema.attr_type
+                                && let Some(diag) = build_string_enum_diagnostic(
+                                    &attr_schema.attr_type,
+                                    attr_value,
+                                    attr_name,
+                                    resource.quoted_string_attrs.contains(attr_name),
+                                    self.find_attribute_value_range(doc, attr_name, scope),
+                                )
+                            {
+                                diagnostics.push(diag);
+                                // Continue past the generic match: this attribute
+                                // is already reported with the richer diagnostic.
+                                continue;
+                            }
                             let type_error = match (&attr_schema.attr_type, attr_value) {
                                 // Bool type should not receive String
                                 (carina_core::schema::AttributeType::Bool, Value::String(s)) => {
@@ -437,15 +460,19 @@ impl DiagnosticEngine {
                                     path.binding(),
                                     path.attribute(),
                                 ),
-                                // Custom type validation (all Custom types use their validate fn)
+                                // StringEnum: the structured-payload path
+                                // above handles `InvalidEnumVariant` /
+                                // `StringLiteralExpectedEnum` and
+                                // `continue`s past this match. We only
+                                // reach this arm when that path declined
+                                // (e.g. `TypeMismatch` from a non-string
+                                // value, or `ValidationFailed` from the
+                                // namespace-shape fallback) — surface the
+                                // plain message so the user still sees a
+                                // diagnostic, just without the quick-fix.
                                 (carina_core::schema::AttributeType::StringEnum { .. }, value) => {
                                     attr_schema.attr_type.validate(value).err().map(|e| {
                                         let tagged = e.with_attribute(attr_name);
-                                        // Mirror PR 2 (#2112) diagnostic parity in the LSP:
-                                        // if the parser tagged this attribute as a quoted
-                                        // string literal, reshape the enum-variant error
-                                        // into the shape-mismatch variant so editor hovers
-                                        // match CLI output. See #2094.
                                         let reshaped =
                                             if resource.quoted_string_attrs.contains(attr_name) {
                                                 tagged.into_string_literal_diagnostic()
@@ -896,6 +923,129 @@ impl DiagnosticEngine {
         }
         None
     }
+
+    /// Locate the value side of `attr_name = <value>` and return the
+    /// `Range` covering the value token. For a quoted string literal
+    /// the range covers both surrounding quote characters; for a
+    /// dotted identifier the range covers the whole identifier
+    /// (including any `.` separators) up to the first whitespace or
+    /// line-terminator.
+    ///
+    /// Used by code-action diagnostics so the editor's quick-fix
+    /// `WorkspaceEdit` overwrites just the offending value, not the
+    /// whole line.
+    ///
+    /// Returns `None` for value shapes the LSP code action does not
+    /// support: block-syntax `attr = { ... }`, multi-line lists, or
+    /// missing-value lines.
+    fn find_attribute_value_range(
+        &self,
+        doc: &Document,
+        attr_name: &str,
+        scope: Option<(u32, u32)>,
+    ) -> Option<tower_lsp::lsp_types::Range> {
+        use tower_lsp::lsp_types::{Position, Range};
+        let text = doc.text();
+        let (start, end) = scope.unwrap_or((0, u32::MAX));
+
+        for (line_idx, line) in text.lines().enumerate() {
+            let line_idx_u32 = line_idx as u32;
+            if line_idx_u32 < start {
+                continue;
+            }
+            if line_idx_u32 >= end {
+                break;
+            }
+            let leading = position::leading_whitespace_chars(line) as usize;
+            let trimmed = &line[leading..];
+            if !trimmed.starts_with(attr_name) {
+                continue;
+            }
+            let after_attr = &trimmed[attr_name.len()..];
+            if !after_attr.starts_with(' ')
+                && !after_attr.starts_with('\t')
+                && !after_attr.starts_with('=')
+            {
+                continue;
+            }
+            // Skip past `name`, optional whitespace, `=`, optional whitespace.
+            // Carina's formatter standardizes spaces, but accept tabs too so
+            // a hand-formatted buffer (e.g. mid-edit) still surfaces the
+            // quick-fix instead of silently dropping it.
+            let mut col = leading + attr_name.len();
+            let bytes = line.as_bytes();
+            while col < bytes.len() && (bytes[col] == b' ' || bytes[col] == b'\t') {
+                col += 1;
+            }
+            if col >= bytes.len() || bytes[col] != b'=' {
+                return None;
+            }
+            col += 1; // past `=`
+            while col < bytes.len() && (bytes[col] == b' ' || bytes[col] == b'\t') {
+                col += 1;
+            }
+            if col >= bytes.len() {
+                return None;
+            }
+            let value_start = col;
+            let value_end = if bytes[col] == b'"' {
+                // Quoted string literal: include both quotes. Bail
+                // (return None) if the closing quote is missing rather
+                // than guess at a range.
+                let mut i = col + 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    // Skip a backslash-escaped char so an inner `\"`
+                    // doesn't terminate the literal early.
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    return None;
+                }
+                i + 1
+            } else if bytes[col] == b'{' || bytes[col] == b'[' {
+                // Block-syntax / list-syntax values are out of scope
+                // for this code action — there's no single offending
+                // identifier to replace.
+                return None;
+            } else {
+                // Bare identifier (possibly dotted, e.g.
+                // `aws.s3.Bucket.VersioningStatus.Enabled`). Read up
+                // to whitespace or a comment.
+                let mut i = col;
+                while i < bytes.len()
+                    && bytes[i] != b' '
+                    && bytes[i] != b'\t'
+                    && bytes[i] != b'#'
+                    && bytes[i] != b','
+                {
+                    i += 1;
+                }
+                i
+            };
+            // LSP `Position.character` is a UTF-16/codepoint offset, not
+            // a byte offset. The byte-walk above is safe up to
+            // `value_start` (only ASCII attr-name / whitespace / `=`
+            // precede it on the line) but the value itself can contain
+            // multi-byte chars (e.g. `attr = "あ"`), so convert both
+            // ends through `byte_offset_to_char_offset` before handing
+            // them to the LSP client.
+            return Some(Range {
+                start: Position {
+                    line: line_idx_u32,
+                    character: position::byte_offset_to_char_offset(line, value_start),
+                },
+                end: Position {
+                    line: line_idx_u32,
+                    character: position::byte_offset_to_char_offset(line, value_end),
+                },
+            });
+        }
+        None
+    }
 }
 
 /// Derive the source line range (0-indexed, half-open) of a resource block.
@@ -982,6 +1132,57 @@ fn strip_line_comment(line: &str) -> &str {
         i += 1;
     }
     line
+}
+
+/// Build a `Diagnostic` for a failed `StringEnum` attribute validation,
+/// carrying the structured candidate list on `Diagnostic.data` and a
+/// range over the offending value text. Returns `None` when validation
+/// passed, when the value range can't be located (block-syntax,
+/// missing value), or when the failing error isn't an enum-variant
+/// shape (e.g. a `TypeMismatch` from a non-string `Value`).
+///
+/// See #2309. The structured payload is consumed by
+/// [`crate::code_action::code_actions_for_diagnostic`].
+fn build_string_enum_diagnostic(
+    attr_type: &carina_core::schema::AttributeType,
+    attr_value: &Value,
+    attr_name: &str,
+    is_quoted_literal: bool,
+    value_range: Option<tower_lsp::lsp_types::Range>,
+) -> Option<Diagnostic> {
+    use crate::code_action::{EnumDiagnosticData, EnumDiagnosticKind};
+    let err = attr_type.validate(attr_value).err()?;
+    let tagged = err.with_attribute(attr_name);
+    // Reshape into the shape-mismatch diagnostic when the value came
+    // from a quoted string literal — mirrors CLI behavior (#2094).
+    let reshaped = if is_quoted_literal {
+        tagged.into_string_literal_diagnostic()
+    } else {
+        tagged
+    };
+    let (kind, expected_variants) = match &reshaped {
+        carina_core::schema::TypeError::InvalidEnumVariant { expected, .. } => {
+            (EnumDiagnosticKind::BareInvalid, expected.clone())
+        }
+        carina_core::schema::TypeError::StringLiteralExpectedEnum { expected, .. } => {
+            (EnumDiagnosticKind::StringLiteral, expected.clone())
+        }
+        // The error wasn't an enum-variant mismatch (e.g. TypeMismatch
+        // when a non-string Value was passed to StringEnum). Skip the
+        // structured payload — the generic match below will surface a
+        // plain message instead.
+        _ => return None,
+    };
+    let range = value_range?;
+    let data = EnumDiagnosticData::new(kind, expected_variants);
+    Some(Diagnostic {
+        range,
+        severity: Some(DiagnosticSeverity::WARNING),
+        source: Some("carina".to_string()),
+        message: reshaped.to_string(),
+        data: Some(serde_json::to_value(data).expect("EnumDiagnosticData serialize")),
+        ..Default::default()
+    })
 }
 
 /// Check whether a ResourceRef value is type-compatible with the expected attribute type.

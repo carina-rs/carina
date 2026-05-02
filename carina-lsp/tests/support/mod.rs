@@ -4,6 +4,7 @@
 //! `mod support;` — the standard Cargo convention for cross-test code.
 
 pub mod byte_helpers;
+pub mod fixture;
 pub mod test_client;
 
 #[allow(unused_imports)]
