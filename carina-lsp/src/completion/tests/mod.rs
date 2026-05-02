@@ -4,7 +4,9 @@ use super::*;
 use crate::document::Document;
 use carina_core::parser::ProviderContext;
 use carina_core::provider::ProviderFactory;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+use carina_core::schema::{
+    AttributeSchema, AttributeType, ResourceSchema, StructField, legacy_validator,
+};
 
 mod basic;
 mod extended;
@@ -218,7 +220,7 @@ pub(super) fn test_provider_with_custom_semantic_attr() -> CompletionProvider {
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
-        validate: noop_validate,
+        validate: legacy_validator(noop_validate),
         namespace: None,
         to_dsl: None,
     };

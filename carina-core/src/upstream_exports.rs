@@ -1029,10 +1029,7 @@ mod tests {
         // Consumer attribute is `Custom { name: "KmsKeyArn", base: Arn }`;
         // export declares plain `TypeExpr::Simple("arn")`. The type checker
         // walks Custom's base chain, so `arn` accepts `KmsKeyArn`.
-        use crate::schema::AttributeType;
-        fn noop_validate(_v: &crate::resource::Value) -> Result<(), String> {
-            Ok(())
-        }
+        use crate::schema::{AttributeType, noop_validator};
         let parsed = parse_project_with_provider(
             r#"
                 let orgs = upstream_state { source = "../organizations" }
@@ -1051,13 +1048,13 @@ mod tests {
                 base: Box::new(AttributeType::String),
                 pattern: None,
                 length: None,
-                validate: noop_validate,
+                validate: noop_validator(),
                 namespace: None,
                 to_dsl: None,
             }),
             pattern: None,
             length: None,
-            validate: noop_validate,
+            validate: noop_validator(),
             namespace: None,
             to_dsl: None,
         };

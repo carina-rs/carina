@@ -2509,7 +2509,7 @@ exports {
 /// the issue spec.
 #[test]
 fn exports_map_value_offers_matching_resource_refs() {
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
     use std::collections::HashMap;
     fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
@@ -2519,7 +2519,7 @@ fn exports_map_value_offers_matching_resource_refs() {
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
-        validate: validate_noop,
+        validate: legacy_validator(validate_noop),
         namespace: None,
         to_dsl: None,
     };
@@ -2594,7 +2594,7 @@ fn exports_list_value_position_filters_by_element_type() {
 /// expect matching resource-ref refs.
 #[test]
 fn exports_map_value_multiple_entries_returns_refs() {
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
     use std::collections::HashMap;
     fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
@@ -2604,7 +2604,7 @@ fn exports_map_value_multiple_entries_returns_refs() {
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
-        validate: validate_noop,
+        validate: legacy_validator(validate_noop),
         namespace: None,
         to_dsl: None,
     };
@@ -2652,7 +2652,7 @@ exports {
 /// scanning sibling `.crn` files, not just the current buffer.
 #[test]
 fn exports_map_value_includes_bindings_from_sibling_files() {
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
     use std::collections::HashMap;
     fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
@@ -2662,7 +2662,7 @@ fn exports_map_value_includes_bindings_from_sibling_files() {
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
-        validate: validate_noop,
+        validate: legacy_validator(validate_noop),
         namespace: None,
         to_dsl: None,
     };
@@ -2710,7 +2710,7 @@ exports {
 /// `registry_prod.account_id`.
 #[test]
 fn custom_type_value_ref_includes_sibling_file_bindings() {
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
     use std::collections::HashMap;
     fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
@@ -2720,7 +2720,7 @@ fn custom_type_value_ref_includes_sibling_file_bindings() {
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
-        validate: validate_noop,
+        validate: legacy_validator(validate_noop),
         namespace: None,
         to_dsl: None,
     };
@@ -2814,7 +2814,7 @@ let b = awscc.s3.Bucket {
 /// `main.crn`.
 #[test]
 fn binding_dot_completion_resolves_sibling_file_binding() {
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
     use std::collections::HashMap;
     fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
@@ -2824,7 +2824,7 @@ fn binding_dot_completion_resolves_sibling_file_binding() {
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
-        validate: validate_noop,
+        validate: legacy_validator(validate_noop),
         namespace: None,
         to_dsl: None,
     };

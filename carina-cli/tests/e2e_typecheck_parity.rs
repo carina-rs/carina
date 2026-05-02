@@ -26,7 +26,9 @@ use carina_core::provider::{
     BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer,
 };
 use carina_core::resource::{Resource, ResourceId, State, Value};
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+use carina_core::schema::{
+    AttributeSchema, AttributeType, ResourceSchema, StructField, legacy_validator,
+};
 use carina_lsp::diagnostics::DiagnosticEngine;
 use carina_lsp::document::Document;
 use indexmap::IndexMap;
@@ -321,7 +323,7 @@ fn region_schemas() -> HashMap<String, ResourceSchema> {
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
-        validate: validate_region,
+        validate: legacy_validator(validate_region),
         namespace: Some("test".to_string()),
         to_dsl: Some(to_dsl),
     };

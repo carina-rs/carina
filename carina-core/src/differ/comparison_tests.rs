@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::schema::noop_validator;
 use indexmap::IndexMap;
 
 #[test]
@@ -95,7 +96,7 @@ fn type_aware_custom_delegates_to_base() {
         base: Box::new(AttributeType::Float),
         pattern: None,
         length: None,
-        validate: |_| Ok(()),
+        validate: noop_validator(),
         namespace: None,
         to_dsl: None,
     };
@@ -316,7 +317,7 @@ fn type_aware_struct_ignores_default_custom_type() {
                     base: Box::new(AttributeType::Int),
                     pattern: None,
                     length: None,
-                    validate: |_| Ok(()),
+                    validate: noop_validator(),
                     namespace: None,
                     to_dsl: None,
                 },

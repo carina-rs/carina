@@ -112,7 +112,7 @@ pub(super) fn test_engine_with_namespaced_enum_attr() -> DiagnosticEngine {
 /// Engine whose `mode` attribute is a `Custom` type with a namespace — the
 /// other shape #2094 wants to treat as "expects an enum identifier".
 pub(super) fn test_engine_with_custom_namespaced_attr() -> DiagnosticEngine {
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
 
     fn validate_mode(v: &carina_core::resource::Value) -> Result<(), String> {
         match v {
@@ -133,7 +133,7 @@ pub(super) fn test_engine_with_custom_namespaced_attr() -> DiagnosticEngine {
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
-        validate: validate_mode,
+        validate: legacy_validator(validate_mode),
         namespace: Some("test.r".to_string()),
         to_dsl: None,
     };

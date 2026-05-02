@@ -1282,7 +1282,7 @@ attributes {
 fn resource_ref_type_check_helper_regression() {
     // Regression test for refactoring: all three ResourceRef type-checking paths
     // (Union, StringEnum, Custom) must produce consistent "Type mismatch" diagnostics.
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
 
     fn dummy_validate(v: &carina_core::resource::Value) -> Result<(), String> {
         match v {
@@ -1301,7 +1301,7 @@ fn resource_ref_type_check_helper_regression() {
                 base: Box::new(AttributeType::String),
                 pattern: None,
                 length: None,
-                validate: dummy_validate,
+                validate: legacy_validator(dummy_validate),
                 namespace: Some("test".to_string()),
                 to_dsl: None,
             },
@@ -1329,7 +1329,7 @@ fn resource_ref_type_check_helper_regression() {
                 base: Box::new(AttributeType::String),
                 pattern: None,
                 length: None,
-                validate: dummy_validate,
+                validate: legacy_validator(dummy_validate),
                 namespace: Some("test".to_string()),
                 to_dsl: None,
             },
@@ -1738,7 +1738,7 @@ fn distinct_semantic_customs_are_rejected() {
     // (AwsAccountId vs TargetId) are NOT assignable. The previous permissive
     // rule (#1795) collapsed all String-based Customs into one compatibility
     // class, which silently accepted `target_id = sso.identity_store_id`.
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
 
     fn validate_account_id(v: &carina_core::resource::Value) -> Result<(), String> {
         match v {
@@ -1762,7 +1762,7 @@ fn distinct_semantic_customs_are_rejected() {
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,
-            validate: validate_account_id,
+            validate: legacy_validator(validate_account_id),
             namespace: Some("aws".to_string()),
             to_dsl: None,
         },
@@ -1776,7 +1776,7 @@ fn distinct_semantic_customs_are_rejected() {
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,
-            validate: validate_target_id,
+            validate: legacy_validator(validate_target_id),
             namespace: Some("awscc".to_string()),
             to_dsl: None,
         },
@@ -1820,14 +1820,14 @@ fn exports_cross_file_ref_no_false_positive() {
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
-        validate: |v| match v {
+        validate: carina_core::schema::legacy_validator(|v| match v {
             Value::String(s) if s.len() == 12 && s.chars().all(|c| c.is_ascii_digit()) => Ok(()),
             Value::String(s) => Err(format!(
                 "must be exactly 12 digits, got {} characters",
                 s.len()
             )),
             _ => Err("expected string".to_string()),
-        },
+        }),
         namespace: None,
         to_dsl: None,
     };

@@ -464,7 +464,7 @@ fn schema_validate_with_origins_reshapes_custom_namespaced_type() {
                 base: Box::new(AttributeType::String),
                 pattern: None,
                 length: None,
-                validate: validate_mode,
+                validate: legacy_validator(validate_mode),
                 namespace: Some("test.r".to_string()),
                 to_dsl: None,
             },
@@ -1337,7 +1337,7 @@ fn validate_union_type() {
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
-        validate: |value| {
+        validate: legacy_validator(|value| {
             if let Value::String(s) = value {
                 if s.starts_with("a-") {
                     Ok(())
@@ -1347,7 +1347,7 @@ fn validate_union_type() {
             } else {
                 Err("Expected string".to_string())
             }
-        },
+        }),
         namespace: None,
         to_dsl: None,
     };
@@ -1356,7 +1356,7 @@ fn validate_union_type() {
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
-        validate: |value| {
+        validate: legacy_validator(|value| {
             if let Value::String(s) = value {
                 if s.starts_with("b-") {
                     Ok(())
@@ -1366,7 +1366,7 @@ fn validate_union_type() {
             } else {
                 Err("Expected string".to_string())
             }
-        },
+        }),
         namespace: None,
         to_dsl: None,
     };
@@ -1442,7 +1442,7 @@ fn union_type_name() {
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
-        validate: |_| Ok(()),
+        validate: noop_validator(),
         namespace: None,
         to_dsl: None,
     };
@@ -1451,7 +1451,7 @@ fn union_type_name() {
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
-        validate: |_| Ok(()),
+        validate: noop_validator(),
         namespace: None,
         to_dsl: None,
     };
@@ -1467,7 +1467,7 @@ fn union_accepts_type_name() {
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
-        validate: |_| Ok(()),
+        validate: noop_validator(),
         namespace: None,
         to_dsl: None,
     };
@@ -1476,7 +1476,7 @@ fn union_accepts_type_name() {
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
-        validate: |_| Ok(()),
+        validate: noop_validator(),
         namespace: None,
         to_dsl: None,
     };
@@ -2158,7 +2158,7 @@ fn make_custom(name: &str, base: AttributeType) -> AttributeType {
         base: Box::new(base),
         pattern: None,
         length: None,
-        validate: |_| Ok(()),
+        validate: noop_validator(),
         namespace: None,
         to_dsl: None,
     }
@@ -2170,7 +2170,7 @@ fn make_custom_anon_pattern(pattern: &str) -> AttributeType {
         base: Box::new(AttributeType::String),
         pattern: Some(pattern.to_string()),
         length: None,
-        validate: |_| Ok(()),
+        validate: noop_validator(),
         namespace: None,
         to_dsl: None,
     }
@@ -2182,7 +2182,7 @@ fn make_custom_anon_len(min: u64, max: u64) -> AttributeType {
         base: Box::new(AttributeType::String),
         pattern: None,
         length: Some((Some(min), Some(max))),
-        validate: |_| Ok(()),
+        validate: noop_validator(),
         namespace: None,
         to_dsl: None,
     }
@@ -2220,7 +2220,7 @@ fn assignable_narrow_to_anonymous_unconstrained_sink() {
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
-        validate: |_| Ok(()),
+        validate: noop_validator(),
         namespace: None,
         to_dsl: None,
     };
@@ -2273,7 +2273,7 @@ fn assignable_union_source_requires_all_members_assignable() {
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
-        validate: |_| Ok(()),
+        validate: noop_validator(),
         namespace: None,
         to_dsl: None,
     };
@@ -2299,7 +2299,7 @@ fn semantic_custom_assigns_to_anonymous_unconstrained_sink() {
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
-        validate: |_| Ok(()),
+        validate: noop_validator(),
         namespace: None,
         to_dsl: None,
     };
@@ -2339,7 +2339,7 @@ fn make_custom_anon_pattern_and_len(
         base: Box::new(AttributeType::String),
         pattern: pattern.map(str::to_string),
         length,
-        validate: |_| Ok(()),
+        validate: noop_validator(),
         namespace: None,
         to_dsl: None,
     }
@@ -2450,7 +2450,7 @@ fn custom_carries_semantic_name_pattern_length() {
         base: Box::new(AttributeType::String),
         pattern: Some("^vpc-[a-f0-9]+$".to_string()),
         length: Some((Some(8), Some(21))),
-        validate: |_| Ok(()),
+        validate: noop_validator(),
         namespace: None,
         to_dsl: None,
     };
@@ -2476,7 +2476,7 @@ fn custom_type_name_anonymous_pattern_only() {
         base: Box::new(AttributeType::String),
         pattern: Some("^foo$".to_string()),
         length: None,
-        validate: |_| Ok(()),
+        validate: noop_validator(),
         namespace: None,
         to_dsl: None,
     };
@@ -2490,7 +2490,7 @@ fn custom_type_name_anonymous_length_only() {
         base: Box::new(AttributeType::String),
         pattern: None,
         length: Some((Some(1), Some(64))),
-        validate: |_| Ok(()),
+        validate: noop_validator(),
         namespace: None,
         to_dsl: None,
     };
@@ -2504,7 +2504,7 @@ fn custom_type_name_anonymous_pattern_and_length() {
         base: Box::new(AttributeType::String),
         pattern: Some("^.*$".to_string()),
         length: Some((Some(1), Some(64))),
-        validate: |_| Ok(()),
+        validate: noop_validator(),
         namespace: None,
         to_dsl: None,
     };
@@ -2879,7 +2879,7 @@ fn custom_namespaced_string_literal_routes_validator_text_to_extra_message() {
                 base: Box::new(AttributeType::String),
                 pattern: None,
                 length: None,
-                validate: validate_mode,
+                validate: legacy_validator(validate_mode),
                 namespace: Some("test.r".to_string()),
                 to_dsl: None,
             },
@@ -3038,7 +3038,7 @@ fn union_string_vs_custom_picks_custom_error_for_string_input() {
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,
-            validate: must_be_arn,
+            validate: legacy_validator(must_be_arn),
             namespace: None,
             to_dsl: None,
         },
@@ -3099,7 +3099,7 @@ fn union_custom_with_int_base_picks_custom_error_for_int_input() {
             base: Box::new(AttributeType::Int),
             pattern: None,
             length: None,
-            validate: must_be_positive,
+            validate: legacy_validator(must_be_positive),
             namespace: None,
             to_dsl: None,
         },
@@ -3142,4 +3142,93 @@ fn union_struct_member_still_wins_for_map_input_regression() {
         msg.contains("typo") && msg.contains("Principal"),
         "Struct member must still win for Map input, got: {msg}"
     );
+}
+
+#[test]
+fn custom_validator_can_capture_external_state() {
+    // The validator closes over `allowed_region`, captured from the
+    // surrounding scope. A `fn` pointer cannot do this; only a
+    // closure-capable validator can. This is the core acceptance for
+    // #2217 (closure-capable Custom validator).
+    let allowed_region = "ap-northeast-1".to_string();
+    let attr = AttributeType::Custom {
+        semantic_name: Some("Region".to_string()),
+        base: Box::new(AttributeType::String),
+        pattern: None,
+        length: None,
+        validate: validator(move |v| match v {
+            Value::String(s) if s == &allowed_region => Ok(()),
+            Value::String(s) => Err(TypeError::ValidationFailed {
+                message: format!("expected region {}, got {}", allowed_region, s),
+            }),
+            other => Err(TypeError::TypeMismatch {
+                expected: "String".to_string(),
+                got: other.type_name(),
+            }),
+        }),
+        namespace: None,
+        to_dsl: None,
+    };
+    assert!(
+        attr.validate(&Value::String("ap-northeast-1".to_string()))
+            .is_ok()
+    );
+    let err = attr
+        .validate(&Value::String("us-east-1".to_string()))
+        .unwrap_err();
+    match err {
+        TypeError::ValidationFailed { message } => {
+            assert!(message.contains("ap-northeast-1") && message.contains("us-east-1"));
+        }
+        other => panic!("expected ValidationFailed, got: {other:?}"),
+    }
+}
+
+#[test]
+fn custom_validator_returns_structured_type_error_directly() {
+    // The validator returns `TypeError::InvalidEnumVariant` directly,
+    // bypassing the legacy `String -> ValidationFailed` round-trip.
+    // This is what unlocks LSP code-action quick-fixes for Custom-typed
+    // attributes (see #2220 / #2309 for the structured-error path).
+    let attr = AttributeType::Custom {
+        semantic_name: Some("Mode".to_string()),
+        base: Box::new(AttributeType::String),
+        pattern: None,
+        length: None,
+        validate: validator(|v| match v {
+            Value::String(s) if s == "fast" || s == "slow" => Ok(()),
+            Value::String(s) => Err(TypeError::InvalidEnumVariant {
+                value: s.clone(),
+                attribute: None,
+                type_name: Some("Mode".to_string()),
+                expected: vec![
+                    ExpectedEnumVariant::from_namespaced(None, "Mode", "fast", false),
+                    ExpectedEnumVariant::from_namespaced(None, "Mode", "slow", false),
+                ],
+            }),
+            other => Err(TypeError::TypeMismatch {
+                expected: "String".to_string(),
+                got: other.type_name(),
+            }),
+        }),
+        namespace: None,
+        to_dsl: None,
+    };
+    let err = attr
+        .validate(&Value::String("medium".to_string()))
+        .unwrap_err();
+    match err {
+        TypeError::InvalidEnumVariant {
+            value,
+            type_name,
+            expected,
+            ..
+        } => {
+            assert_eq!(value, "medium");
+            assert_eq!(type_name.as_deref(), Some("Mode"));
+            let values: Vec<&str> = expected.iter().map(|e| e.value.as_str()).collect();
+            assert_eq!(values, vec!["fast", "slow"]);
+        }
+        other => panic!("expected InvalidEnumVariant, got: {other:?}"),
+    }
 }

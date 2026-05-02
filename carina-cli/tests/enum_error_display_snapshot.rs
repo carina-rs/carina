@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
 
 fn render_first_error(
     schema: &ResourceSchema,
@@ -123,7 +123,7 @@ fn string_literal_expected_enum_custom_namespaced_display() {
                 base: Box::new(AttributeType::String),
                 pattern: None,
                 length: None,
-                validate: validate_mode,
+                validate: legacy_validator(validate_mode),
                 namespace: Some("test.r".to_string()),
                 to_dsl: None,
             },

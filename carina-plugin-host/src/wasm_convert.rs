@@ -8,7 +8,7 @@ use carina_core::resource::{
 };
 use carina_core::schema::{
     AttributeSchema as CoreAttributeSchema, AttributeType as CoreAttributeType,
-    ResourceSchema as CoreResourceSchema, StructField as CoreStructField,
+    ResourceSchema as CoreResourceSchema, StructField as CoreStructField, noop_validator,
 };
 
 use carina_provider_protocol::types as proto;
@@ -386,7 +386,7 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
             base: Box::new(proto_attr_type_to_core(base)),
             pattern: None,
             length: None,
-            validate: |_| Ok(()), // Validation is handled via ProviderContext.validators
+            validate: noop_validator(), // Validation is handled via ProviderContext.validators
             namespace: namespace.clone(),
             to_dsl: None,
         },
