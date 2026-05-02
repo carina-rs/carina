@@ -2954,3 +2954,192 @@ fn expected_enum_variant_serde_round_trip() {
     let round: ExpectedEnumVariant = serde_json::from_value(json).expect("deserialize");
     assert_eq!(round, original);
 }
+
+// ---------------------------------------------------------------------------
+// #2219 — Union member-match scoring
+// ---------------------------------------------------------------------------
+// On a Union failure, surface the closest-matching member's error rather
+// than a generic TypeMismatch. "Closest" is measured by structural
+// distance: same outer constructor (Map↔Struct, List↔List, String↔
+// StringEnum/Custom) wins over an unrelated member. Tie-broken by
+// declaration order, so the existing Map/Struct case continues to pick
+// the Struct member's error first.
+
+#[test]
+fn union_string_vs_string_enum_picks_enum_error_for_string_input() {
+    // Acceptance #2 from #2219: `Int | StringEnum` with a string input
+    // that doesn't match any enum variant must surface the
+    // `InvalidEnumVariant` error (so the user sees `expected one of:
+    // fast, slow`), not a generic `TypeMismatch`.
+    let union_type = AttributeType::Union(vec![
+        AttributeType::Int,
+        AttributeType::StringEnum {
+            name: "Mode".to_string(),
+            values: vec!["fast".to_string(), "slow".to_string()],
+            namespace: None,
+            to_dsl: None,
+        },
+    ]);
+    let err = union_type
+        .validate(&Value::String("zzz".to_string()))
+        .unwrap_err();
+    match err {
+        TypeError::InvalidEnumVariant { ref expected, .. } => {
+            let rendered: Vec<String> = expected.iter().map(ToString::to_string).collect();
+            assert!(
+                rendered.iter().any(|s| s == "fast"),
+                "expected `fast` in candidate list, got: {rendered:?}"
+            );
+        }
+        other => panic!("expected InvalidEnumVariant from the StringEnum member, got: {other:?}"),
+    }
+}
+
+#[test]
+fn union_list_vs_list_struct_picks_inner_struct_error() {
+    // List<String> | List<Struct{...}>: input is a List of Maps where
+    // one Map has an unknown field. The List<Struct> member's nested
+    // `UnknownStructField { field: "typo", ... }` error should surface
+    // — the user has to know that "typo" isn't a valid field on Item.
+    let union_type = AttributeType::Union(vec![
+        AttributeType::list(AttributeType::String),
+        AttributeType::list(AttributeType::Struct {
+            name: "Item".to_string(),
+            fields: vec![StructField::new("name", AttributeType::String)],
+        }),
+    ]);
+    let mut bad = IndexMap::new();
+    bad.insert("name".to_string(), Value::String("x".to_string()));
+    bad.insert("typo".to_string(), Value::String("y".to_string()));
+    let value = Value::List(vec![Value::Map(bad)]);
+    let err = union_type.validate(&value).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("typo"),
+        "expected the inner Unknown-field error to mention `typo`, got: {msg}"
+    );
+}
+
+#[test]
+fn union_string_vs_custom_picks_custom_error_for_string_input() {
+    // String | Custom { base = String, validate = predicate }:
+    // a string input that fails the Custom predicate should surface
+    // the Custom validator's message, not a generic TypeMismatch.
+    fn must_be_arn(v: &Value) -> Result<(), String> {
+        match v {
+            Value::String(s) if s.starts_with("arn:") => Ok(()),
+            _ => Err("must start with 'arn:'".to_string()),
+        }
+    }
+    let union_type = AttributeType::Union(vec![
+        AttributeType::Int,
+        AttributeType::Custom {
+            semantic_name: Some("Arn".to_string()),
+            base: Box::new(AttributeType::String),
+            pattern: None,
+            length: None,
+            validate: must_be_arn,
+            namespace: None,
+            to_dsl: None,
+        },
+    ]);
+    let err = union_type
+        .validate(&Value::String("not-an-arn".to_string()))
+        .unwrap_err();
+    match err {
+        TypeError::ValidationFailed { ref message } => {
+            assert!(
+                message.contains("must start with 'arn:'"),
+                "expected the Custom validator's actual message, got: {message}"
+            );
+        }
+        other => {
+            panic!("expected ValidationFailed from the Custom member's predicate, got: {other:?}")
+        }
+    }
+}
+
+#[test]
+fn union_falls_through_to_type_mismatch_when_no_member_matches_shape() {
+    // Int | Bool: input is a Map. Neither member shares a constructor
+    // with Map. The result is a generic TypeMismatch — there's no
+    // "closer" candidate to surface.
+    let union_type = AttributeType::Union(vec![AttributeType::Int, AttributeType::Bool]);
+    let mut map = IndexMap::new();
+    map.insert("k".to_string(), Value::String("v".to_string()));
+    let err = union_type.validate(&Value::Map(map)).unwrap_err();
+    match err {
+        TypeError::TypeMismatch { .. } => {}
+        other => panic!("expected TypeMismatch, got: {other:?}"),
+    }
+}
+
+#[test]
+fn union_custom_with_int_base_picks_custom_error_for_int_input() {
+    // Custom { base = Int, validate = predicate }: a `Custom` Union
+    // member whose declared `base` is `Int` (not `String`) must still
+    // be reachable. With an `Int | positive_int()` Union and a
+    // negative integer input, the Custom validator's
+    // `ValidationFailed` message must surface — not the generic
+    // `TypeMismatch` from the bare `Int` member's success path.
+    fn must_be_positive(v: &Value) -> Result<(), String> {
+        match v {
+            Value::Int(n) if *n > 0 => Ok(()),
+            _ => Err("must be positive".to_string()),
+        }
+    }
+    // Flip the order so the bare `Int` arm doesn't accept the value
+    // first — both members run validate(). Bare `Int::validate`
+    // accepts any `Value::Int`, so we have to keep it second; bind
+    // through a Custom on top so the actual reachable failure path
+    // is the `Custom` one.
+    let union_type = AttributeType::Union(vec![
+        AttributeType::Custom {
+            semantic_name: Some("PositiveInt".to_string()),
+            base: Box::new(AttributeType::Int),
+            pattern: None,
+            length: None,
+            validate: must_be_positive,
+            namespace: None,
+            to_dsl: None,
+        },
+        AttributeType::Bool,
+    ]);
+    let err = union_type.validate(&Value::Int(-5)).unwrap_err();
+    match err {
+        TypeError::ValidationFailed { ref message } => {
+            assert!(
+                message.contains("must be positive"),
+                "expected the Custom validator's actual message, got: {message}"
+            );
+        }
+        other => {
+            panic!("expected ValidationFailed from the Custom-with-Int-base member, got: {other:?}")
+        }
+    }
+}
+
+#[test]
+fn union_struct_member_still_wins_for_map_input_regression() {
+    // Regression for the original heuristic: Map input + Struct member
+    // surfaces the Struct's "Unknown field" error. This test mirrors
+    // `union_struct_unknown_field_shows_specific_error` but is kept
+    // here so a future scoring tweak that drops this case fails
+    // immediately.
+    let union_type = AttributeType::Union(vec![
+        AttributeType::Struct {
+            name: "Principal".to_string(),
+            fields: vec![StructField::new("service", AttributeType::String)],
+        },
+        AttributeType::String,
+    ]);
+    let mut map = IndexMap::new();
+    map.insert("service".to_string(), Value::String("x".to_string()));
+    map.insert("typo".to_string(), Value::String("y".to_string()));
+    let err = union_type.validate(&Value::Map(map)).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("typo") && msg.contains("Principal"),
+        "Struct member must still win for Map input, got: {msg}"
+    );
+}

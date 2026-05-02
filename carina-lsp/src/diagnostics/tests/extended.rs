@@ -372,12 +372,19 @@ mode = "invalid_mode"
 
     let diagnostics = engine.analyze(&doc, None);
 
-    let type_error = diagnostics
-        .iter()
-        .find(|d| d.message.contains("Type mismatch"));
+    // After #2219 the Union error surfaces the closest member's
+    // structured error rather than a generic `Type mismatch`. For a
+    // string input that fails `StringEnum | Int`, the StringEnum
+    // member's "Invalid value 'invalid_mode' ... expected one of
+    // active, passive" is the right message.
+    let invalid_value_error = diagnostics.iter().find(|d| {
+        d.message.contains("invalid_mode")
+            && d.message.contains("active")
+            && d.message.contains("passive")
+    });
     assert!(
-        type_error.is_some(),
-        "Should warn about invalid Union value. Got diagnostics: {:?}",
+        invalid_value_error.is_some(),
+        "Should warn about invalid Union value with the StringEnum member's variant list. Got diagnostics: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
