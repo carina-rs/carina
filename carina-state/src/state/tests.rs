@@ -1025,3 +1025,40 @@ fn build_remote_bindings_ignores_resource_bindings() {
         "resource bindings should not be exposed"
     );
 }
+
+#[test]
+fn check_and_migrate_canonicalizes_legacy_map_key_addresses() {
+    // State files written by older Carina builds embed the map key in
+    // `binding["key"]` form. After #1903 the canonical address is the
+    // dot form for identifier-safe keys; non-identifier-safe keys move
+    // from double quotes to single. The `check_and_migrate` load path
+    // rewrites these so existing state resolves against new emissions
+    // without a `moved` block.
+    let json = format!(
+        r#"{{
+            "version": {ver},
+            "serial": 1,
+            "lineage": "abc",
+            "carina_version": "test",
+            "resources": [
+                {{
+                    "resource_type": "sso.Assignment",
+                    "name": "_accounts[\"registry_prod\"]",
+                    "provider": "awscc",
+                    "identifier": "x",
+                    "attributes": {{}},
+                    "binding": "_accounts[\"registry_prod\"]",
+                    "dependency_bindings": ["other[\"a\"]", "_envs[\"prod-east\"]"]
+                }}
+            ]
+        }}"#,
+        ver = StateFile::CURRENT_VERSION,
+    );
+    let state = check_and_migrate(&json).expect("load state");
+    let r = &state.resources[0];
+    assert_eq!(r.name, "_accounts.registry_prod");
+    assert_eq!(r.binding.as_deref(), Some("_accounts.registry_prod"));
+    let deps: Vec<&str> = r.dependency_bindings.iter().map(String::as_str).collect();
+    assert!(deps.contains(&"other.a"));
+    assert!(deps.contains(&"_envs['prod-east']"));
+}

@@ -514,7 +514,7 @@ impl ParsedFile {
                     keys.sort();
                     for key in keys {
                         let val = &map[key];
-                        let address = format!("{}[\"{}\"]", deferred.binding_name, key);
+                        let address = crate::utils::map_key_address(&deferred.binding_name, key);
                         let mut resource = deferred.template_resource.clone();
                         resource.id.set_name(address.clone());
                         resource.binding = Some(address);

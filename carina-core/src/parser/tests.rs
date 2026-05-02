@@ -2931,14 +2931,15 @@ fn parse_for_expression_over_map() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(result.resources.len(), 2);
 
-    // Map iteration produces map-keyed addresses
+    // Map iteration produces map-keyed addresses in canonical dot
+    // form (#1903) — both keys here are identifier-safe.
     let names: Vec<&str> = result
         .resources
         .iter()
         .map(|r| r.id.name.as_str())
         .collect();
-    assert!(names.contains(&r#"networks["prod"]"#));
-    assert!(names.contains(&r#"networks["staging"]"#));
+    assert!(names.contains(&"networks.prod"));
+    assert!(names.contains(&"networks.staging"));
 }
 
 #[test]
@@ -2985,14 +2986,15 @@ fn parse_for_expression_with_module_call() {
     // for expression with module call should produce module calls, not resources
     assert_eq!(result.module_calls.len(), 2);
 
-    // Module calls should have binding names like webs["prod"] and webs["staging"]
+    // Module calls have canonical dot-form binding names (#1903) —
+    // both keys here are identifier-safe.
     let binding_names: Vec<&str> = result
         .module_calls
         .iter()
         .map(|c| c.binding_name.as_deref().unwrap())
         .collect();
-    assert!(binding_names.contains(&r#"webs["prod"]"#));
-    assert!(binding_names.contains(&r#"webs["staging"]"#));
+    assert!(binding_names.contains(&"webs.prod"));
+    assert!(binding_names.contains(&"webs.staging"));
 
     // Each module call should have the loop variable substituted in arguments
     for call in &result.module_calls {
@@ -3004,7 +3006,7 @@ fn parse_for_expression_with_module_call() {
     let prod_call = result
         .module_calls
         .iter()
-        .find(|c| c.binding_name.as_deref() == Some(r#"webs["prod"]"#))
+        .find(|c| c.binding_name.as_deref() == Some("webs.prod"))
         .unwrap();
     assert_eq!(
         prod_call.arguments.get("vpc_cidr"),
@@ -3014,7 +3016,7 @@ fn parse_for_expression_with_module_call() {
     let staging_call = result
         .module_calls
         .iter()
-        .find(|c| c.binding_name.as_deref() == Some(r#"webs["staging"]"#))
+        .find(|c| c.binding_name.as_deref() == Some("webs.staging"))
         .unwrap();
     assert_eq!(
         staging_call.arguments.get("vpc_cidr"),
@@ -3151,7 +3153,10 @@ fn parse_index_access_with_integer() {
 
 #[test]
 fn parse_index_access_with_string_key() {
-    // networks["prod"].vpc_id should parse as ResourceRef with binding_name=r#networks["prod"]#
+    // `networks["prod"].vpc_id` parses as a ResourceRef whose binding
+    // name is the canonical dot form `networks.prod` (#1903) — the
+    // index-access syntax with an identifier-safe string key
+    // collapses to the same address that `for`-iteration emits.
     let input = r#"
         let cidrs = {
             prod    = "10.0.0.0/16"
@@ -3178,7 +3183,7 @@ fn parse_index_access_with_string_key() {
             let binding_name = path.binding();
             let attribute_name = path.attribute();
             let field_path = path.field_path();
-            assert_eq!(binding_name, r#"networks["prod"]"#);
+            assert_eq!(binding_name, "networks.prod");
             assert_eq!(attribute_name, "vpc_id");
             assert!(field_path.is_empty());
         }
@@ -3215,7 +3220,7 @@ fn parse_index_access_with_chained_fields() {
             let binding_name = path.binding();
             let attribute_name = path.attribute();
             let field_path = path.field_path();
-            assert_eq!(binding_name, r#"webs["prod"]"#);
+            assert_eq!(binding_name, "webs.prod");
             assert_eq!(attribute_name, "security_group");
             assert_eq!(field_path, vec!["id"]);
         }
@@ -3287,6 +3292,102 @@ fn parse_moved_block() {
         }
         other => panic!("Expected Moved, got {:?}", other),
     }
+}
+
+#[test]
+fn moved_block_accepts_three_map_key_address_forms() {
+    // #1903: a `moved` block addresses a map-keyed resource. All three
+    // input shapes — bare dot, single-quoted bracket, double-quoted
+    // bracket — must collapse to the canonical form so existing state
+    // (which may have been written under any historical shape) still
+    // resolves.
+    // The DSL has two string-literal forms. We pair each input shape
+    // with the outer quoting that lets the inner shape sit unescaped:
+    // - dot form: any outer
+    // - `['key']`: outer `"`-delimited
+    // - `["key"]`: outer `'`-delimited
+    let cases = [
+        (
+            "dot",
+            r#"to = awscc.sso.Assignment "_accounts.registry_prod""#,
+        ),
+        (
+            "single-quote bracket",
+            r#"to = awscc.sso.Assignment "_accounts['registry_prod']""#,
+        ),
+        (
+            "double-quote bracket",
+            r#"to = awscc.sso.Assignment '_accounts["registry_prod"]'"#,
+        ),
+    ];
+    for (label, to_clause) in cases {
+        let input = format!(
+            r#"
+                moved {{
+                    from = awscc.sso.Assignment "_accounts[0]"
+                    {}
+                }}
+            "#,
+            to_clause
+        );
+        let result = parse(&input, &ProviderContext::default())
+            .unwrap_or_else(|e| panic!("parse failed for {label}: {e:?}"));
+        assert_eq!(result.state_blocks.len(), 1);
+        match &result.state_blocks[0] {
+            StateBlock::Moved { to, .. } => {
+                assert_eq!(
+                    to.name_str(),
+                    "_accounts.registry_prod",
+                    "input shape {label} must canonicalize to dot form",
+                );
+            }
+            other => panic!("Expected Moved, got {:?}", other),
+        }
+    }
+}
+
+#[test]
+fn moved_block_keeps_non_identifier_safe_key_in_quoted_form() {
+    // Keys with hyphens, spaces, or leading digits are not
+    // identifier-safe — the canonical form keeps them in single-quoted
+    // brackets. Both legacy `["..."]` and `['...']` collapse to
+    // single-quoted.
+    let input = r#"
+        moved {
+            from = awscc.sso.Assignment "_accounts[0]"
+            to   = awscc.sso.Assignment '_envs["prod-east"]'
+        }
+    "#;
+    let result = parse(input, &ProviderContext::default()).unwrap();
+    match &result.state_blocks[0] {
+        StateBlock::Moved { to, .. } => {
+            assert_eq!(to.name_str(), "_envs['prod-east']");
+        }
+        other => panic!("Expected Moved, got {:?}", other),
+    }
+}
+
+#[test]
+fn for_expression_over_map_uses_canonical_dot_form() {
+    // The emit side mirrors the canonicalizer: a map iteration where
+    // every key is identifier-safe must produce `binding.key` addresses
+    // — no embedded quotes — so `moved`/`removed` blocks targeting
+    // those resources can stay quote-free.
+    let input = r#"
+        let envs = {
+            prod = "p"
+            dev  = "d"
+        }
+
+        let resources = for key, val in envs {
+            awscc.ec2.Subnet {
+                name = key
+            }
+        }
+    "#;
+    let result = parse(input, &ProviderContext::default()).unwrap();
+    let names: Vec<&str> = result.resources.iter().map(|r| r.id.name_str()).collect();
+    assert_eq!(names, vec!["resources.dev", "resources.prod"]);
 }
 
 #[test]

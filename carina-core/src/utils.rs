@@ -533,6 +533,88 @@ pub fn convert_region_value(value: &str) -> String {
     value.to_string()
 }
 
+/// Build the canonical address for a map-iteration key — used at every
+/// `for ... in <map>` emit site. Identifier-safe keys produce
+/// `binding.key`; everything else is single-quoted so the outer
+/// `moved` / `removed` string can stay double-quoted without escape
+/// juggling. See #1903.
+pub fn map_key_address(binding: &str, key: &str) -> String {
+    if is_identifier_safe(key) {
+        format!("{}.{}", binding, key)
+    } else {
+        format!("{}['{}']", binding, key)
+    }
+}
+
+/// Canonicalize the trailing map-key segment of a resource address so
+/// `for`-expression iteration over a map and the user-written address
+/// in `moved` / `removed` blocks share one shape. See #1903.
+///
+/// Rules:
+/// - `binding["key"]` / `binding['key']` with an identifier-safe key
+///   (`[A-Za-z_][A-Za-z0-9_]*`) → `binding.key`.
+/// - `binding["key with space"]` (or any non-identifier-safe key) →
+///   `binding['key with space']` (single quotes preferred to match the
+///   DSL string convention).
+/// - `binding[N]` for an integer `N` → unchanged (list index).
+/// - Inputs without a trailing `[...]` segment → returned unchanged.
+///
+/// Only the *last* `[...]` segment is canonicalized — the parser
+/// itself only emits a single trailing key per `for`-iteration, so a
+/// single-pass rewrite is sufficient.
+pub fn canonicalize_map_key_address(name: &str) -> String {
+    // Find the final `[`. Nothing to do when the trailing segment isn't
+    // a bracket form.
+    let Some(open) = name.rfind('[') else {
+        return name.to_string();
+    };
+    if !name.ends_with(']') {
+        return name.to_string();
+    }
+    let prefix = &name[..open];
+    let inside = &name[open + 1..name.len() - 1];
+
+    // Numeric index — list iteration. Leave alone.
+    if !inside.is_empty() && inside.bytes().all(|b| b.is_ascii_digit()) {
+        return name.to_string();
+    }
+
+    // Strip surrounding quotes when present so legacy `["key"]` and
+    // `['key']` collapse to the same canonical form. The `len < 2`
+    // guard keeps `&inside[1..inside.len() - 1]` from panicking when
+    // `inside` is a single quote char (e.g. a malformed `binding["]`)
+    // — `'"'` satisfies both starts_with and ends_with checks.
+    let key = if (inside.starts_with('"') && inside.ends_with('"'))
+        || (inside.starts_with('\'') && inside.ends_with('\''))
+    {
+        if inside.len() < 2 {
+            return name.to_string();
+        }
+        &inside[1..inside.len() - 1]
+    } else {
+        inside
+    };
+
+    if is_identifier_safe(key) {
+        format!("{}.{}", prefix, key)
+    } else {
+        format!("{}['{}']", prefix, key)
+    }
+}
+
+/// True when `s` is a valid Carina identifier: starts with `[A-Za-z_]`
+/// and continues with `[A-Za-z0-9_]*`. The same rule the parser uses
+/// for `let` bindings, struct field names, and (after #1903) map keys
+/// that can be embedded in a resource address without quoting.
+pub fn is_identifier_safe(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1139,5 +1221,69 @@ mod tests {
             let actual = expand_enum_shorthand(input, name, *ns);
             assert_eq!(actual, *expected, "input={input:?} name={name:?} ns={ns:?}",);
         }
+    }
+
+    #[test]
+    fn canonicalize_drops_quotes_for_identifier_safe_key() {
+        // The legacy emit form `["key"]` and the alt form `['key']`
+        // both collapse to `binding.key` — see #1903.
+        assert_eq!(
+            canonicalize_map_key_address("_accounts[\"registry_prod\"]"),
+            "_accounts.registry_prod"
+        );
+        assert_eq!(
+            canonicalize_map_key_address("_accounts['registry_prod']"),
+            "_accounts.registry_prod"
+        );
+    }
+
+    #[test]
+    fn canonicalize_keeps_already_canonical_dot_form() {
+        assert_eq!(
+            canonicalize_map_key_address("_accounts.registry_prod"),
+            "_accounts.registry_prod"
+        );
+    }
+
+    #[test]
+    fn canonicalize_uses_single_quotes_for_non_identifier_safe_key() {
+        // Hyphen, space, leading digit, and dot are all non-safe — the
+        // canonical form keeps them in single-quoted brackets so the
+        // outer `moved`/`removed` string can stay double-quoted without
+        // escape juggling.
+        assert_eq!(
+            canonicalize_map_key_address("_envs[\"prod-east\"]"),
+            "_envs['prod-east']"
+        );
+        assert_eq!(
+            canonicalize_map_key_address("_envs[\"key with space\"]"),
+            "_envs['key with space']"
+        );
+        assert_eq!(
+            canonicalize_map_key_address("_envs[\"3rd-region\"]"),
+            "_envs['3rd-region']"
+        );
+        assert_eq!(
+            canonicalize_map_key_address("_envs[\"a.b\"]"),
+            "_envs['a.b']"
+        );
+    }
+
+    #[test]
+    fn canonicalize_leaves_numeric_list_index_unchanged() {
+        assert_eq!(canonicalize_map_key_address("_accounts[0]"), "_accounts[0]");
+        assert_eq!(
+            canonicalize_map_key_address("_accounts[42]"),
+            "_accounts[42]"
+        );
+    }
+
+    #[test]
+    fn canonicalize_returns_input_when_no_trailing_bracket() {
+        assert_eq!(canonicalize_map_key_address("my_bucket"), "my_bucket");
+        assert_eq!(
+            canonicalize_map_key_address("explicit-name-with-hyphens"),
+            "explicit-name-with-hyphens"
+        );
     }
 }

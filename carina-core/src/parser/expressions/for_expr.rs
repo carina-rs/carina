@@ -206,7 +206,7 @@ pub(crate) fn parse_for_expr(
             keys.sort();
             for key in keys {
                 let val = &map[key];
-                let address = format!("{}[\"{}\"]", binding_name, key);
+                let address = crate::utils::map_key_address(binding_name, key);
                 let mut iter_ctx = ctx.clone();
                 bind(&mut iter_ctx, key_var, Value::String(key.clone()));
                 bind(&mut iter_ctx, val_var, val.clone());

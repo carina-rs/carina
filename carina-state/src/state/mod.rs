@@ -270,6 +270,27 @@ impl StateFile {
             .collect()
     }
 
+    /// Rewrite every map-key address in the state to its canonical
+    /// shape (#1903). State files written by older Carina builds may
+    /// store `binding["key"]`; new emissions use `binding.key` (or
+    /// `binding['key']` for non-identifier-safe keys). Running this on
+    /// load lets old state resolve against new desired-state addresses
+    /// without a `moved` block.
+    pub fn canonicalize_addresses(&mut self) {
+        use carina_core::utils::canonicalize_map_key_address;
+        for r in &mut self.resources {
+            r.name = canonicalize_map_key_address(&r.name);
+            if let Some(b) = r.binding.as_ref() {
+                r.binding = Some(canonicalize_map_key_address(b));
+            }
+            r.dependency_bindings = r
+                .dependency_bindings
+                .iter()
+                .map(|d| canonicalize_map_key_address(d))
+                .collect();
+        }
+    }
+
     /// Remove a resource from the state
     pub fn remove_resource(
         &mut self,
@@ -313,14 +334,17 @@ pub fn check_and_migrate(content: &str) -> Result<StateFile, BackendError> {
     let check: VersionCheck = serde_json::from_str(content)
         .map_err(|e| BackendError::InvalidState(format!("Failed to parse state version: {}", e)))?;
 
-    match check.version {
-        v if v == StateFile::CURRENT_VERSION => serde_json::from_str(content)
-            .map_err(|e| BackendError::InvalidState(format!("Failed to parse state file: {}", e))),
-        v if v > StateFile::CURRENT_VERSION => Err(BackendError::InvalidState(format!(
-            "State file version {} is newer than supported version {}. Please upgrade Carina.",
-            v,
-            StateFile::CURRENT_VERSION
-        ))),
+    let mut state: StateFile = match check.version {
+        v if v == StateFile::CURRENT_VERSION => serde_json::from_str(content).map_err(|e| {
+            BackendError::InvalidState(format!("Failed to parse state file: {}", e))
+        })?,
+        v if v > StateFile::CURRENT_VERSION => {
+            return Err(BackendError::InvalidState(format!(
+                "State file version {} is newer than supported version {}. Please upgrade Carina.",
+                v,
+                StateFile::CURRENT_VERSION
+            )));
+        }
         v => {
             // Older version — for now, try to deserialize with serde defaults.
             // In the future, add explicit migration functions here.
@@ -336,9 +360,14 @@ pub fn check_and_migrate(content: &str) -> Result<StateFile, BackendError> {
                 ))
             })?;
             state.version = StateFile::CURRENT_VERSION;
-            Ok(state)
+            state
         }
-    }
+    };
+    // Map-key addresses written under the legacy `["..."]` shape are
+    // rewritten to the canonical form on read so existing state files
+    // resolve cleanly against new emissions. See #1903.
+    state.canonicalize_addresses();
+    Ok(state)
 }
 
 /// Deserialize a state file from a byte slice, checking the version and

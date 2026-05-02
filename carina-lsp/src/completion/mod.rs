@@ -933,11 +933,7 @@ fn parse_trailing_dotted_segments(prefix: &str, n: usize) -> Option<Vec<&str>> {
 }
 
 fn is_identifier(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    carina_core::utils::is_identifier_safe(s)
 }
 
 /// Look up the `source = '...'` path for `binding` declared in any

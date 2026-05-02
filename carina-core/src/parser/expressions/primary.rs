@@ -254,7 +254,7 @@ pub(crate) fn parse_primary_eval(
                                     binding_name = format!("{}[{}]", binding_name, n);
                                 }
                                 Value::String(s) => {
-                                    binding_name = format!("{}[\"{}\"]", binding_name, s);
+                                    binding_name = crate::utils::map_key_address(&binding_name, s);
                                 }
                                 other => {
                                     return Err(ParseError::InvalidExpression {
