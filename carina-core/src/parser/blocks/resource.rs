@@ -54,7 +54,7 @@ pub(in crate::parser) fn parse_anonymous_resource(
     Ok(Resource {
         id,
         attributes: attributes.into_iter().collect(),
-        kind: ResourceKind::Real,
+        kind: ResourceKind::Managed,
         lifecycle,
         prefixes: HashMap::new(),
         binding: None,
@@ -215,7 +215,7 @@ pub(crate) fn parse_resource_expr(
     Ok(Resource {
         id,
         attributes: attributes.into_iter().collect(),
-        kind: ResourceKind::Real,
+        kind: ResourceKind::Managed,
         lifecycle,
         prefixes: HashMap::new(),
         binding: Some(binding_name.to_string()),

@@ -271,7 +271,10 @@ fn proto_schema_to_core(s: &proto::ResourceSchema) -> CoreResourceSchema {
             .collect(),
         description: s.description.clone(),
         validator: build_validator_from_types(&s.validators),
-        data_source: s.data_source,
+        kind: match s.kind {
+            proto::SchemaKind::Managed => carina_core::schema::SchemaKind::Managed,
+            proto::SchemaKind::DataSource => carina_core::schema::SchemaKind::DataSource,
+        },
         name_attribute: s.name_attribute.clone(),
         force_replace: s.force_replace,
         operation_config: s.operation_config.as_ref().map(|c| {
@@ -670,7 +673,6 @@ mod tests {
           {
             "resource_type": "ec2.SecurityGroup",
             "description": "EC2 Security Group",
-            "data_source": false,
             "name_attribute": "group_name",
             "force_replace": true,
             "attributes": {
@@ -754,7 +756,7 @@ mod tests {
         let schema = &schemas[0];
         assert_eq!(schema.resource_type, "ec2.SecurityGroup");
         assert_eq!(schema.description.as_deref(), Some("EC2 Security Group"));
-        assert!(!schema.data_source);
+        assert!(!schema.is_data_source());
         assert_eq!(schema.name_attribute.as_deref(), Some("group_name"));
         assert!(schema.force_replace);
 
@@ -881,7 +883,7 @@ mod tests {
             resource_type: "awscc.s3.Bucket".to_string(),
             attributes: HashMap::new(),
             description: None,
-            data_source: false,
+            kind: proto::SchemaKind::Managed,
             name_attribute: None,
             force_replace: false,
             operation_config: None,
@@ -898,7 +900,7 @@ mod tests {
             resource_type: "awscc.s3.Bucket".to_string(),
             attributes: HashMap::new(),
             description: None,
-            data_source: false,
+            kind: proto::SchemaKind::Managed,
             name_attribute: None,
             force_replace: false,
             operation_config: None,
@@ -917,7 +919,7 @@ mod tests {
             resource_type: "awscc.ec2.Vpc".to_string(),
             attributes: HashMap::new(),
             description: None,
-            data_source: false,
+            kind: proto::SchemaKind::Managed,
             name_attribute: None,
             force_replace: false,
             operation_config: None,
@@ -955,7 +957,7 @@ mod tests {
             resource_type: "awscc.ec2.Vpc".to_string(),
             attributes: HashMap::new(),
             description: None,
-            data_source: false,
+            kind: proto::SchemaKind::Managed,
             name_attribute: None,
             force_replace: false,
             operation_config: None,
@@ -977,7 +979,7 @@ mod tests {
             resource_type: "awscc.s3.Bucket".to_string(),
             attributes: HashMap::new(),
             description: None,
-            data_source: false,
+            kind: proto::SchemaKind::Managed,
             name_attribute: None,
             force_replace: false,
             operation_config: None,

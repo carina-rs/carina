@@ -163,6 +163,24 @@ pub enum ValidatorType {
     TagsKeyValueCheck,
 }
 
+/// Classification of a schema in the provider protocol: managed (full CRUD
+/// lifecycle) vs data source (read-only lookup of existing infrastructure).
+///
+/// Mirror of `carina_core::schema::SchemaKind`. Defined here independently to
+/// keep `carina-provider-protocol` free of a dependency on `carina-core`
+/// (the protocol crate is the lightweight contract layer that providers
+/// link against).
+///
+/// `Default` is derived to back `#[serde(default)]` on `ResourceSchema::kind`,
+/// so JSON payloads from older or minimal producers omit the field and
+/// fall back to `Managed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SchemaKind {
+    #[default]
+    Managed,
+    DataSource,
+}
+
 /// Schema types for resource validation and completion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceSchema {
@@ -171,7 +189,7 @@ pub struct ResourceSchema {
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
-    pub data_source: bool,
+    pub kind: SchemaKind,
     #[serde(default)]
     pub name_attribute: Option<String>,
     #[serde(default)]

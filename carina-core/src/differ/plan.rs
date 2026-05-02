@@ -339,7 +339,7 @@ pub fn create_plan(
                     // matter (it only feeds the dependency walker), so
                     // a plain clone-through `wrap_map` is fine.
                     attributes: state.attributes.clone().into_iter().collect(),
-                    kind: ResourceKind::Real,
+                    kind: ResourceKind::Managed,
                     lifecycle: lifecycle.clone(),
                     prefixes: HashMap::new(),
                     binding: None,

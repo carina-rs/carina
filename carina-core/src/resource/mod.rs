@@ -929,9 +929,9 @@ impl ModuleSource {
 /// Classification of a resource in the IR
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub enum ResourceKind {
-    /// A real infrastructure resource managed by a provider
+    /// A managed infrastructure resource with full CRUD lifecycle.
     #[default]
-    Real,
+    Managed,
     /// A virtual resource created by the module resolver to expose module attributes.
     /// Virtual resources are not sent to providers; they exist only in the IR.
     Virtual {
@@ -953,7 +953,7 @@ pub struct Resource {
     /// re-renders attributes — diagnostic messages, formatter output,
     /// plan display, snapshot tests — depends on this stability (#2222).
     pub attributes: IndexMap<String, Value>,
-    /// Classification of this resource (real, virtual, or data source)
+    /// Classification of this resource (managed, virtual, or data source)
     #[serde(default)]
     pub kind: ResourceKind,
     /// Lifecycle meta-argument configuration
@@ -1000,7 +1000,7 @@ impl Resource {
         Self {
             id: ResourceId::new(resource_type, name),
             attributes: IndexMap::new(),
-            kind: ResourceKind::Real,
+            kind: ResourceKind::Managed,
             lifecycle: LifecycleConfig::default(),
             prefixes: HashMap::new(),
             binding: None,
@@ -1018,7 +1018,7 @@ impl Resource {
         Self {
             id: ResourceId::with_provider(provider, resource_type, name),
             attributes: IndexMap::new(),
-            kind: ResourceKind::Real,
+            kind: ResourceKind::Managed,
             lifecycle: LifecycleConfig::default(),
             prefixes: HashMap::new(),
             binding: None,
