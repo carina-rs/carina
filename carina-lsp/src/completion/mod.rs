@@ -56,6 +56,15 @@ impl CompletionProvider {
     ) -> Vec<CompletionItem> {
         let text = doc.text();
 
+        // `<binding>.<key>.<partial>` (depth-2) is checked first because
+        // its prefix shape also matches the depth-1 walker's tail (which
+        // would treat `<key>` as the binding and decline). #2041.
+        if let Some(m) = detect_upstream_state_depth2_dot(&text, position, base_path) {
+            return self.upstream_state_depth2_dot_completions(
+                &m.binding, &m.key, &m.partial, &m.source, position, base_path,
+            );
+        }
+
         // `<binding>.<partial>` where `<binding>` is an `upstream_state` is
         // matched ahead of the block-context walk: the same prefix would
         // otherwise be interpreted as `AfterEquals` (dot-after-binding inside
@@ -830,33 +839,118 @@ fn detect_upstream_state_dot(
     let current_line = text.lines().nth(line_idx)?;
     let col = position.character as usize;
     let prefix: String = current_line.chars().take(col).collect();
-    let dot_rel = prefix.rfind('.')?;
-    let before_dot = &prefix[..dot_rel];
-    let after_dot = &prefix[dot_rel + 1..];
-    if !after_dot
+    let segs = parse_trailing_dotted_segments(&prefix, 2)?;
+    let [binding, partial] = segs.as_slice() else {
+        unreachable!("parse_trailing_dotted_segments returns exactly the requested count");
+    };
+    let source = resolve_upstream_state_source(text, base_path, binding)?;
+    Some((binding.to_string(), partial.to_string(), source))
+}
+
+/// Match on `<binding>.<key>.<partial>` (depth-2), where `<binding>` is
+/// an `upstream_state` and `<key>` is one of its declared exports. The
+/// caller uses the export's `TypeExpr` to descend (struct fields,
+/// future map-key recursion, etc.). See #2041.
+///
+/// Returns `None` when the prefix isn't depth-2 shape or when
+/// `<binding>` isn't a known upstream-state — in which case the
+/// dispatcher falls through to the depth-1 detector or further down.
+fn detect_upstream_state_depth2_dot(
+    text: &str,
+    position: Position,
+    base_path: Option<&std::path::Path>,
+) -> Option<UpstreamDepth2Match> {
+    let line_idx = position.line as usize;
+    let current_line = text.lines().nth(line_idx)?;
+    let col = position.character as usize;
+    let prefix: String = current_line.chars().take(col).collect();
+    let segs = parse_trailing_dotted_segments(&prefix, 3)?;
+    let [binding, key, partial] = segs.as_slice() else {
+        unreachable!("parse_trailing_dotted_segments returns exactly the requested count");
+    };
+    let source = resolve_upstream_state_source(text, base_path, binding)?;
+    Some(UpstreamDepth2Match {
+        binding: binding.to_string(),
+        key: key.to_string(),
+        partial: partial.to_string(),
+        source,
+    })
+}
+
+/// Result of [`detect_upstream_state_depth2_dot`]. Named fields keep
+/// the four positional `String`s from being reordered at call sites.
+struct UpstreamDepth2Match {
+    binding: String,
+    key: String,
+    partial: String,
+    source: String,
+}
+
+/// Walk back from the end of `prefix` collecting the trailing run of
+/// `<id>(.<id>)*<.partial>` (where `partial` may be empty after a
+/// trailing `.`). Returns exactly `n` segments — earliest first — or
+/// `None` if the run is too short, contains non-identifier characters,
+/// or any non-trailing segment is empty / starts with a digit. The
+/// trailing segment (`partial`) is allowed to be empty so completion
+/// fires the moment the user types the dot.
+fn parse_trailing_dotted_segments(prefix: &str, n: usize) -> Option<Vec<&str>> {
+    debug_assert!(n >= 2, "trailing-dot parse needs at least one dot");
+    // Walk back across `n - 1` dots, validating identifier chars between
+    // them. The trailing segment is allowed to be empty.
+    let last_dot = prefix.rfind('.')?;
+    let trailing = &prefix[last_dot + 1..];
+    if !trailing
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_')
     {
         return None;
     }
-    let binding_start = before_dot
+    let mut segments_rev: Vec<&str> = vec![trailing];
+    let mut cursor = &prefix[..last_dot];
+    while segments_rev.len() < n - 1 {
+        let dot = cursor.rfind('.')?;
+        let seg = &cursor[dot + 1..];
+        if !is_identifier(seg) {
+            return None;
+        }
+        segments_rev.push(seg);
+        cursor = &cursor[..dot];
+    }
+    // The first segment is whatever non-identifier-bounded run sits at
+    // the tail of `cursor` — the binding name. Its leading char must
+    // start an identifier; any non-identifier before it is fine.
+    let first_start = cursor
         .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .map(|i| i + 1)
         .unwrap_or(0);
-    let binding = &before_dot[binding_start..];
-    if binding.is_empty()
-        || !binding
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-    {
+    let first = &cursor[first_start..];
+    if !is_identifier(first) {
         return None;
     }
+    segments_rev.push(first);
+    segments_rev.reverse();
+    Some(segments_rev)
+}
+
+fn is_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Look up the `source = '...'` path for `binding` declared in any
+/// sibling `.crn` file under `base_path`. Returns `None` when the
+/// binding isn't declared as an `upstream_state` anywhere visible.
+fn resolve_upstream_state_source(
+    text: &str,
+    base_path: Option<&std::path::Path>,
+    binding: &str,
+) -> Option<String> {
     let mut src_buf = String::new();
     let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
-    let bindings = collect_upstream_state_bindings(src);
-    let source = bindings.get(binding)?.clone();
-    Some((binding.to_string(), after_dot.to_string(), source))
+    collect_upstream_state_bindings(src).get(binding).cloned()
 }
 
 /// Return every `let <name> = upstream_state { source = '...' }` declared

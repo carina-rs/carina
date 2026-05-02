@@ -614,19 +614,7 @@ impl CompletionProvider {
         position: Position,
         base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {
-        let Some(base) = base_path else {
-            return Vec::new();
-        };
-        let upstream = carina_core::parser::UpstreamState {
-            binding: binding.to_string(),
-            source: std::path::PathBuf::from(source),
-        };
-        let (exports, _errors) = carina_core::upstream_exports::resolve_upstream_exports(
-            base,
-            &[upstream],
-            &Default::default(),
-        );
-        let Some(keys) = exports.get(binding) else {
+        let Some(keys) = resolve_upstream_export_keys(binding, source, base_path) else {
             return Vec::new();
         };
 
@@ -659,6 +647,64 @@ impl CompletionProvider {
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range,
                     new_text: key.clone(),
+                })),
+                ..Default::default()
+            })
+            .collect();
+        items.sort_by(|a, b| a.label.cmp(&b.label));
+        items
+    }
+
+    /// Completions for `<binding>.<key>.<partial>` — depth-2 descent
+    /// into an `upstream_state` export's declared `TypeExpr`.
+    ///
+    /// When the export's type is `TypeExpr::Struct`, every field name
+    /// is offered with the field type rendered into `detail`. Other
+    /// type variants (`Map`, `List`, scalars, `Simple`, `Ref`,
+    /// `SchemaType`) have no named child positions at this depth and
+    /// produce an empty list. Map-key recursion via the runtime
+    /// `Value` is intentionally deferred per #2041.
+    pub(super) fn upstream_state_depth2_dot_completions(
+        &self,
+        binding: &str,
+        key: &str,
+        partial: &str,
+        source: &str,
+        position: Position,
+        base_path: Option<&Path>,
+    ) -> Vec<CompletionItem> {
+        let Some(keys) = resolve_upstream_export_keys(binding, source, base_path) else {
+            return Vec::new();
+        };
+        let Some(Some(type_expr)) = keys.get(key) else {
+            // Untyped or unknown key: we have no fields to descend into.
+            return Vec::new();
+        };
+        let carina_core::parser::TypeExpr::Struct { fields } = type_expr else {
+            // Map / List / scalars: depth-2 names are runtime values, not
+            // part of the type. Suggest nothing rather than something
+            // potentially invalid (#2041).
+            return Vec::new();
+        };
+
+        let partial_chars = partial.chars().count() as u32;
+        let range = Range {
+            start: Position {
+                line: position.line,
+                character: position.character.saturating_sub(partial_chars),
+            },
+            end: position,
+        };
+
+        let mut items: Vec<CompletionItem> = fields
+            .iter()
+            .map(|(name, field_type)| CompletionItem {
+                label: name.clone(),
+                kind: Some(CompletionItemKind::FIELD),
+                detail: Some(format!("{}: {}", name, field_type)),
+                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                    range,
+                    new_text: name.clone(),
                 })),
                 ..Default::default()
             })
@@ -1145,6 +1191,29 @@ impl CompletionProvider {
                 .collect(),
         }
     }
+}
+
+/// Resolve the export name → `TypeExpr` map for an `upstream_state`
+/// binding. Returns `None` when `base_path` is missing or the upstream
+/// directory has no export entry for `binding`. Both depth-1 and
+/// depth-2 dot completion build on this — they only differ in how
+/// they consume the resulting map.
+fn resolve_upstream_export_keys(
+    binding: &str,
+    source: &str,
+    base_path: Option<&Path>,
+) -> Option<std::collections::HashMap<String, Option<carina_core::parser::TypeExpr>>> {
+    let base = base_path?;
+    let upstream = carina_core::parser::UpstreamState {
+        binding: binding.to_string(),
+        source: std::path::PathBuf::from(source),
+    };
+    let (mut exports, _errors) = carina_core::upstream_exports::resolve_upstream_exports(
+        base,
+        &[upstream],
+        &Default::default(),
+    );
+    exports.remove(binding)
 }
 
 /// Infer the static type of a for-loop binding by resolving its iterable
