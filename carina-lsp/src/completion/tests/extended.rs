@@ -1908,6 +1908,162 @@ fn upstream_state_dot_completion_detail_shows_type_expr() {
 }
 
 // =====================================================================
+// upstream_state depth-2 completion: dot after the export key (#2041)
+// =====================================================================
+// `orgs.config.<HERE>` — the export's declared `TypeExpr::Struct` lets
+// us recurse into its named fields. `TypeExpr::Map(_)` / `List(_)` /
+// scalars have no named children at this depth and produce no
+// completions (deferred per #2041 umbrella discussion).
+
+#[test]
+fn upstream_state_depth2_dot_completion_lists_struct_fields() {
+    let provider = test_provider();
+    let (_tmp, base) = set_up_upstream_project(
+        "exports {\n  config: struct { name: String, region: String } = { name = \"x\", region = \"ap-northeast-1\" }\n}\n",
+        "let orgs = upstream_state { source = '../organizations' }\nlet x = orgs.config.\n",
+    );
+    let main_src = std::fs::read_to_string(base.join("main.crn")).unwrap();
+    let doc = create_document(&main_src);
+    let position = Position {
+        line: 1,
+        character: "let x = orgs.config.".chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&base));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"name") && labels.contains(&"region"),
+        "expected struct fields `name` and `region` in completions, got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn upstream_state_depth2_dot_completion_detail_shows_field_type() {
+    let provider = test_provider();
+    let (_tmp, base) = set_up_upstream_project(
+        "exports {\n  config: struct { region: String, replicas: Int } = { region = \"x\", replicas = 1 }\n}\n",
+        "let orgs = upstream_state { source = '../organizations' }\nlet x = orgs.config.\n",
+    );
+    let main_src = std::fs::read_to_string(base.join("main.crn")).unwrap();
+    let doc = create_document(&main_src);
+    let position = Position {
+        line: 1,
+        character: "let x = orgs.config.".chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&base));
+    let region = completions
+        .iter()
+        .find(|c| c.label == "region")
+        .expect("expected `region` field");
+    let detail = region.detail.as_deref().unwrap_or("");
+    assert!(
+        detail.contains("String"),
+        "field detail must surface the field's TypeExpr, got: {:?}",
+        detail
+    );
+    let replicas = completions
+        .iter()
+        .find(|c| c.label == "replicas")
+        .expect("expected `replicas` field");
+    let detail = replicas.detail.as_deref().unwrap_or("");
+    assert!(
+        detail.contains("Int"),
+        "Int field detail must surface as `Int`, got: {:?}",
+        detail
+    );
+}
+
+#[test]
+fn upstream_state_depth2_dot_completion_text_edit_replaces_partial() {
+    // `orgs.config.na<cursor>` — the TextEdit must replace just the
+    // `na` partial so accepting `name` lands as `orgs.config.name`,
+    // not `orgs.config.naname`.
+    let provider = test_provider();
+    let (_tmp, base) = set_up_upstream_project(
+        "exports {\n  config: struct { name: String } = { name = \"x\" }\n}\n",
+        "let orgs = upstream_state { source = '../organizations' }\nlet x = orgs.config.na\n",
+    );
+    let main_src = std::fs::read_to_string(base.join("main.crn")).unwrap();
+    let doc = create_document(&main_src);
+    let position = Position {
+        line: 1,
+        character: "let x = orgs.config.na".chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&base));
+    let name = completions
+        .iter()
+        .find(|c| c.label == "name")
+        .expect("expected `name` completion");
+    match name.text_edit.as_ref() {
+        Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) => {
+            assert_eq!(edit.new_text, "name");
+            // `let x = orgs.config.` occupies cols 0..20; `na` at col 20.
+            let line_one = "let x = orgs.config.";
+            let prefix_len = line_one.chars().count() as u32;
+            assert_eq!(edit.range.start.line, 1);
+            assert_eq!(edit.range.start.character, prefix_len);
+            assert_eq!(edit.range.end.character, prefix_len + 2);
+        }
+        other => panic!("expected TextEdit::Edit, got {:?}", other),
+    }
+}
+
+#[test]
+fn upstream_state_depth2_dot_completion_skips_map_typed_export() {
+    // `accounts: map(string)` — depth-2 completion has no named keys to
+    // suggest (the map's runtime keys aren't part of the type). Falling
+    // through to no-op is the documented behavior, deferred per #2041.
+    let provider = test_provider();
+    let (_tmp, base) = set_up_upstream_project(
+        "exports {\n  accounts: map(String) = \"x\"\n}\n",
+        "let orgs = upstream_state { source = '../organizations' }\nlet x = orgs.accounts.\n",
+    );
+    let main_src = std::fs::read_to_string(base.join("main.crn")).unwrap();
+    let doc = create_document(&main_src);
+    let position = Position {
+        line: 1,
+        character: "let x = orgs.accounts.".chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&base));
+    assert!(
+        completions.is_empty(),
+        "depth-2 completion on a map(_) export must yield nothing, got: {:?}",
+        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn upstream_state_depth2_dot_completion_unknown_key_returns_empty() {
+    // `orgs.unknown.<HERE>` where `unknown` is not declared in
+    // `exports { }`. The depth-2 detector should decline (no key →
+    // no type to descend into) and fall through to nothing useful;
+    // we assert no spurious top-level keywords leak out.
+    let provider = test_provider();
+    let (_tmp, base) = set_up_upstream_project(
+        "exports {\n  config: struct { name: String } = { name = \"x\" }\n}\n",
+        "let orgs = upstream_state { source = '../organizations' }\nlet x = orgs.unknown.\n",
+    );
+    let main_src = std::fs::read_to_string(base.join("main.crn")).unwrap();
+    let doc = create_document(&main_src);
+    let position = Position {
+        line: 1,
+        character: "let x = orgs.unknown.".chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&base));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        !labels.contains(&"name"),
+        "unknown key must not bleed in fields from an unrelated export, got: {:?}",
+        labels
+    );
+}
+
+// =====================================================================
 // exports block: type-aware value-position completion (#1993)
 // =====================================================================
 
