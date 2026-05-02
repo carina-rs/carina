@@ -383,6 +383,148 @@ fn check_ref_against_type(
     });
 }
 
+/// A `for` expression iterates an `upstream_state` field whose declared
+/// export type doesn't match the binding pattern's expected shape:
+/// `for x in ...` requires a list, `for k, v in ...` requires a map.
+///
+/// This is the shape side of #1894 — surfacing pending upstream
+/// `list ↔ map` migrations in the downstream's plan/validate output
+/// instead of letting them blow up at apply time.
+#[derive(Debug, Clone)]
+pub struct UpstreamForIterableShapeError {
+    pub location: String,
+    pub binding: String,
+    pub field: String,
+    /// Declared export type — what the upstream's `exports.crn` says.
+    pub export_type: TypeExpr,
+    /// What kind of binding the downstream `for` introduces.
+    pub binding_kind: ForIterableBindingKind,
+}
+
+/// Coarse classification of a `ForBinding` for cross-directory shape
+/// compatibility. `Simple`/`Indexed` both require a list; `Map` requires
+/// a map. The full `ForBinding` is intentionally not stored here — the
+/// diagnostic only cares about the shape, not the variable names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForIterableBindingKind {
+    /// `for x in ...` or `for (i, x) in ...` — both consume a list.
+    List,
+    /// `for k, v in ...` — consumes a map.
+    Map,
+}
+
+impl ForIterableBindingKind {
+    fn from_for_binding(binding: &crate::parser::ForBinding) -> Self {
+        use crate::parser::ForBinding;
+        match binding {
+            ForBinding::Simple(_) | ForBinding::Indexed(_, _) => ForIterableBindingKind::List,
+            ForBinding::Map(_, _) => ForIterableBindingKind::Map,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            ForIterableBindingKind::List => "list",
+            ForIterableBindingKind::Map => "map",
+        }
+    }
+}
+
+impl UpstreamForIterableShapeError {
+    pub fn diagnostic_message(&self) -> String {
+        // Suggestion text depends on what the upstream actually exports,
+        // not just on what the binding expected: a `for x in scalar` has
+        // no valid binding form to suggest at all.
+        let suggested = match (&self.export_type, self.binding_kind) {
+            (TypeExpr::List(_), ForIterableBindingKind::Map) => {
+                "; use `for x in ...` to iterate the list"
+            }
+            (TypeExpr::Map(_), ForIterableBindingKind::List) => {
+                "; use `for k, v in ...` to iterate the map"
+            }
+            // Scalar exports can't be iterated at all; saying nothing is
+            // honest. The upstream contract has to change first.
+            _ => "",
+        };
+        format!(
+            "upstream_state `{}.{}` is declared as `{}` but `{}` requires a {} iterable{}",
+            self.binding,
+            self.field,
+            self.export_type,
+            self.location,
+            self.binding_kind.as_str(),
+            suggested,
+        )
+    }
+}
+
+impl std::fmt::Display for UpstreamForIterableShapeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.location, self.diagnostic_message())
+    }
+}
+
+impl std::error::Error for UpstreamForIterableShapeError {}
+
+/// Walk every `for` expression that iterates an `upstream_state` field
+/// reference and emit an error when the export's declared type
+/// (`list(...)` vs `map(...)`) doesn't match the binding pattern's
+/// expected shape.
+///
+/// Skipped silently when:
+/// - the binding isn't in `exports` (already surfaced by
+///   `check_upstream_state_field_references` if it should be);
+/// - the field isn't exported (same — duplicate diagnostics hurt);
+/// - the export has no declared type (`accounts` without `: T`) — there's
+///   no upstream type to compare against, and the field-name path
+///   handles existence.
+///
+/// This is the type-level sibling of the runtime check in
+/// `parser::ParsedFile::expand_deferred_for_expressions` (`parser/ast.rs`).
+/// Both flag `(ForBinding × shape)` mismatches; this one fires at
+/// validate time off the upstream's *declared* type, the parser-side
+/// one fires at expansion time off the *resolved* `Value`.
+pub fn check_upstream_state_for_iterable_shapes(
+    parsed: &ParsedFile,
+    exports: &UpstreamExports,
+) -> Vec<UpstreamForIterableShapeError> {
+    let mut errors: Vec<UpstreamForIterableShapeError> = Vec::new();
+    for deferred in &parsed.deferred_for_expressions {
+        let Some(fields) = exports.get(deferred.iterable_binding.as_str()) else {
+            continue;
+        };
+        let Some(Some(export_type)) = fields.get(&deferred.iterable_attr) else {
+            continue;
+        };
+        let binding_kind = ForIterableBindingKind::from_for_binding(&deferred.binding);
+        let export_kind = match export_type {
+            TypeExpr::List(_) => Some(ForIterableBindingKind::List),
+            TypeExpr::Map(_) => Some(ForIterableBindingKind::Map),
+            _ => None,
+        };
+        // Scalars feeding a `for` are a different kind of bug; the
+        // shape-check fires on them too because no kind matches.
+        if export_kind == Some(binding_kind) {
+            continue;
+        }
+        errors.push(UpstreamForIterableShapeError {
+            location: format!("for-expression `{}`", deferred.header),
+            binding: deferred.iterable_binding.clone(),
+            field: deferred.iterable_attr.clone(),
+            export_type: export_type.clone(),
+            binding_kind,
+        });
+    }
+    errors.sort_by(|a, b| {
+        (a.location.as_str(), a.binding.as_str(), a.field.as_str()).cmp(&(
+            b.location.as_str(),
+            b.binding.as_str(),
+            b.field.as_str(),
+        ))
+    });
+    errors
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1066,5 +1208,420 @@ mod tests {
             errs.is_empty(),
             "Custom type chain must accept base ancestor, got: {errs:?}"
         );
+    }
+
+    // ================================================================
+    // #1894: for-iterable shape compatibility
+    // (`check_upstream_state_for_iterable_shapes`)
+    // ================================================================
+
+    #[test]
+    fn for_iterable_simple_binding_against_list_export_is_ok() {
+        // `for x in orgs.accounts` over a `list(...)` export — fine.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+
+                for account_id in orgs.accounts {
+                    test.r.res {
+                        name = account_id
+                    }
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[(
+                "accounts",
+                TypeExpr::List(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+            )],
+        )]);
+        let errs = check_upstream_state_for_iterable_shapes(&parsed, &exports);
+        assert!(
+            errs.is_empty(),
+            "list export + simple binding must pass, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn for_iterable_map_binding_against_map_export_is_ok() {
+        // `for k, v in orgs.accounts` over a `map(...)` export — fine.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+
+                for name, account_id in orgs.accounts {
+                    test.r.res {
+                        name = name
+                    }
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[(
+                "accounts",
+                TypeExpr::Map(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+            )],
+        )]);
+        let errs = check_upstream_state_for_iterable_shapes(&parsed, &exports);
+        assert!(
+            errs.is_empty(),
+            "map export + map binding must pass, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn for_iterable_simple_binding_against_map_export_flags_mismatch() {
+        // Upstream changed `accounts: list(_)` to `map(_)`. Downstream
+        // still iterates as `for x in ...` — old shape. The check must
+        // flag this so the cross-directory refactor surfaces in the
+        // downstream plan/validate output rather than blowing up at
+        // apply time. This is the canonical #1894 repro.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+
+                for account_id in orgs.accounts {
+                    test.r.res {
+                        name = account_id
+                    }
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[(
+                "accounts",
+                TypeExpr::Map(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+            )],
+        )]);
+        let errs = check_upstream_state_for_iterable_shapes(&parsed, &exports);
+        assert_eq!(
+            errs.len(),
+            1,
+            "map export + simple binding must fail, got: {errs:?}"
+        );
+        assert_eq!(errs[0].binding, "orgs");
+        assert_eq!(errs[0].field, "accounts");
+        assert_eq!(errs[0].binding_kind, ForIterableBindingKind::List);
+        let msg = errs[0].diagnostic_message();
+        assert!(
+            msg.contains("map(AwsAccountId)") && msg.contains("requires a list"),
+            "message must show map export and list-iterable expectation: {msg}"
+        );
+        assert!(
+            msg.contains("for k, v in"),
+            "message must suggest the map binding form: {msg}"
+        );
+    }
+
+    #[test]
+    fn for_iterable_map_binding_against_list_export_flags_mismatch() {
+        // Inverse of the above: downstream uses `for k, v in ...` but
+        // upstream still exports a list. Same class of bug.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+
+                for name, account_id in orgs.accounts {
+                    test.r.res {
+                        name = name
+                    }
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[(
+                "accounts",
+                TypeExpr::List(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+            )],
+        )]);
+        let errs = check_upstream_state_for_iterable_shapes(&parsed, &exports);
+        assert_eq!(
+            errs.len(),
+            1,
+            "list export + map binding must fail, got: {errs:?}"
+        );
+        assert_eq!(errs[0].field, "accounts");
+        assert_eq!(errs[0].binding_kind, ForIterableBindingKind::Map);
+        let msg = errs[0].diagnostic_message();
+        assert!(
+            msg.contains("list(AwsAccountId)") && msg.contains("requires a map"),
+            "message must show list export and map-iterable expectation: {msg}"
+        );
+        assert!(
+            msg.contains("for x in"),
+            "message must suggest the list binding form: {msg}"
+        );
+    }
+
+    #[test]
+    fn for_iterable_skipped_when_export_has_no_declared_type() {
+        // `accounts` declared without `: T` annotation — nothing to
+        // compare against, the field-name check still runs but the
+        // shape check stays silent.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+
+                for account_id in orgs.accounts {
+                    test.r.res {
+                        name = account_id
+                    }
+                }
+            "#,
+            "test",
+        );
+        let mut exports = UpstreamExports::new();
+        let mut fields = HashMap::new();
+        fields.insert("accounts".to_string(), None);
+        exports.insert("orgs".to_string(), fields);
+        let errs = check_upstream_state_for_iterable_shapes(&parsed, &exports);
+        assert!(errs.is_empty(), "no annotation → silent, got: {errs:?}");
+    }
+
+    #[test]
+    fn for_iterable_skipped_when_binding_unknown() {
+        // The binding isn't in `exports` at all (resolve failed
+        // upstream). Field-name check handles that case via
+        // UpstreamFieldError; the shape check stays silent so the
+        // user only sees one diagnostic.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+
+                for account_id in orgs.accounts {
+                    test.r.res {
+                        name = account_id
+                    }
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[]);
+        let errs = check_upstream_state_for_iterable_shapes(&parsed, &exports);
+        assert!(errs.is_empty(), "missing binding → silent, got: {errs:?}");
+    }
+
+    #[test]
+    fn for_iterable_shape_check_against_real_directory_fixture() {
+        // Directory-scoped acceptance: upstream's `exports.crn` lives in
+        // a sibling directory and `resolve_upstream_exports` parses it
+        // off disk, then the shape check fires when downstream's
+        // `for` binding doesn't match the exported `list ↔ map`. This
+        // is the realistic shape of #1894 (cross-directory refactor).
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream_dir = tmp.path().join("organizations");
+        fs::create_dir(&upstream_dir).unwrap();
+        write_crn(
+            &upstream_dir,
+            "exports.crn",
+            r#"exports {
+                accounts: map(String) = {
+                    alpha = "111111111111"
+                }
+            }"#,
+        );
+        write_crn(
+            &upstream_dir,
+            "providers.crn",
+            "provider test {\n  source = 'x/y'\n  version = '0.1'\n  region = 'ap-northeast-1'\n}\n",
+        );
+        let base = tmp.path().join("downstream");
+        fs::create_dir(&base).unwrap();
+        write_crn(
+            &base,
+            "providers.crn",
+            "provider test {\n  source = 'x/y'\n  version = '0.1'\n  region = 'ap-northeast-1'\n}\n",
+        );
+        write_crn(
+            &base,
+            "main.crn",
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                for account_id in orgs.accounts {
+                    test.r.res {
+                        name = account_id
+                    }
+                }
+            "#,
+        );
+        let parsed = parse_directory(&base, &ctx()).expect("parse_directory");
+        let (exports, resolve_errs) =
+            resolve_upstream_exports(&base, &parsed.upstream_states, &ctx());
+        assert!(
+            resolve_errs.is_empty(),
+            "unexpected resolve errors: {resolve_errs:?}"
+        );
+        let errs = check_upstream_state_for_iterable_shapes(&parsed, &exports);
+        assert_eq!(
+            errs.len(),
+            1,
+            "expected one shape mismatch from list↔map upstream change, got: {errs:?}"
+        );
+        assert_eq!(errs[0].field, "accounts");
+        assert_eq!(errs[0].binding_kind, ForIterableBindingKind::List);
+    }
+
+    #[test]
+    fn for_iterable_against_scalar_export_flags_mismatch() {
+        // Upstream exports a scalar (e.g. `accounts: String`); downstream
+        // tries to iterate. There is no valid binding form to suggest —
+        // the upstream contract has to change first. The check fires
+        // and the message stays honest by omitting the suggestion.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+
+                for account_id in orgs.accounts {
+                    test.r.res {
+                        name = account_id
+                    }
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[("orgs", &[("accounts", TypeExpr::String)])]);
+        let errs = check_upstream_state_for_iterable_shapes(&parsed, &exports);
+        assert_eq!(
+            errs.len(),
+            1,
+            "scalar export + for must fail, got: {errs:?}"
+        );
+        let msg = errs[0].diagnostic_message();
+        assert!(
+            msg.contains("String"),
+            "message must show scalar export type: {msg}"
+        );
+        assert!(
+            msg.contains("requires a list"),
+            "message must say list expected: {msg}"
+        );
+        assert!(
+            !msg.contains("for k, v in") && !msg.contains("for x in"),
+            "scalar export must not suggest a binding form: {msg}"
+        );
+    }
+
+    #[test]
+    fn for_iterable_indexed_binding_classified_as_list() {
+        // `for (i, x) in orgs.accounts` is a *list* iterable — the
+        // 2-name binding pattern is `(index, value)`, not `(key, value)`.
+        // The kind classifier must collapse Simple+Indexed into List.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+
+                for (i, account_id) in orgs.accounts {
+                    test.r.res {
+                        name = account_id
+                    }
+                }
+            "#,
+            "test",
+        );
+        // List export — indexed binding is fine.
+        let list_exports = mk_typed_exports(&[(
+            "orgs",
+            &[(
+                "accounts",
+                TypeExpr::List(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+            )],
+        )]);
+        assert!(
+            check_upstream_state_for_iterable_shapes(&parsed, &list_exports).is_empty(),
+            "indexed binding against list export must pass"
+        );
+        // Map export — indexed binding is the wrong shape.
+        let map_exports = mk_typed_exports(&[(
+            "orgs",
+            &[(
+                "accounts",
+                TypeExpr::Map(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+            )],
+        )]);
+        let errs = check_upstream_state_for_iterable_shapes(&parsed, &map_exports);
+        assert_eq!(
+            errs.len(),
+            1,
+            "indexed binding + map export must fail, got: {errs:?}"
+        );
+        assert_eq!(errs[0].binding_kind, ForIterableBindingKind::List);
+    }
+
+    #[test]
+    fn for_iterable_errors_sort_stably() {
+        // Two `for` expressions in a single project produce errors in
+        // a deterministic order regardless of the underlying parse order.
+        // Mirrors the existing sort guarantee on `UpstreamFieldError`.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+
+                for account_id in orgs.alpha_accounts {
+                    test.r.res {
+                        name = account_id
+                    }
+                }
+
+                for account_id in orgs.beta_accounts {
+                    test.r.res {
+                        name = account_id
+                    }
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[
+                (
+                    "alpha_accounts",
+                    TypeExpr::Map(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+                ),
+                (
+                    "beta_accounts",
+                    TypeExpr::Map(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+                ),
+            ],
+        )]);
+        let errs = check_upstream_state_for_iterable_shapes(&parsed, &exports);
+        assert_eq!(errs.len(), 2, "expected two errors, got: {errs:?}");
+        assert_eq!(errs[0].field, "alpha_accounts");
+        assert_eq!(errs[1].field, "beta_accounts");
+    }
+
+    #[test]
+    fn for_iterable_skipped_when_field_not_exported() {
+        // The binding exists but the iterable field isn't exported.
+        // `UpstreamFieldError` already surfaces this; shape check
+        // stays silent to avoid duplicate diagnostics.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+
+                for account_id in orgs.NONEXISTENT {
+                    test.r.res {
+                        name = account_id
+                    }
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[(
+                "accounts",
+                TypeExpr::List(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+            )],
+        )]);
+        let errs = check_upstream_state_for_iterable_shapes(&parsed, &exports);
+        assert!(errs.is_empty(), "missing field → silent, got: {errs:?}");
     }
 }

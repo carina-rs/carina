@@ -374,6 +374,13 @@ pub fn validate_and_resolve_errors_with_factories(
                 carina_core::provider::schema_key_for_resource(ctx.factories(), r)
             },
         );
+        // #1894 (option 2): cross-directory `for`-iterable shape check.
+        // Surfaces pending `list ↔ map` migrations in the upstream's
+        // `exports.crn` before they hit apply.
+        let shape_errors = carina_core::upstream_exports::check_upstream_state_for_iterable_shapes(
+            parsed,
+            &upstream_exports,
+        );
         errors.extend(
             resolve_errors
                 .iter()
@@ -386,6 +393,11 @@ pub fn validate_and_resolve_errors_with_factories(
         );
         errors.extend(
             type_errors
+                .iter()
+                .map(|e| AppError::Validation(e.to_string())),
+        );
+        errors.extend(
+            shape_errors
                 .iter()
                 .map(|e| AppError::Validation(e.to_string())),
         );
