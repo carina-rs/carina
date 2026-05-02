@@ -558,28 +558,28 @@ impl AttributeType {
             if matches_canonical || matches_alias {
                 Ok(())
             } else {
-                // Build the allowed-values list in the form the user
-                // should type — fully-qualified for namespaced enums,
-                // bare otherwise. Also include `to_dsl` aliases so
-                // the message covers every shape validation accepts.
-                let mut expected: Vec<String> = Vec::new();
-                let mut push = |v: &str| {
-                    let rendered = match namespace.as_deref() {
-                        Some(ns) => format!("{}.{}.{}", ns, name, v),
-                        None => v.to_string(),
-                    };
-                    if !expected.contains(&rendered) {
-                        expected.push(rendered);
+                // Aliases produced by `to_dsl` are tagged `is_alias = true`
+                // so LSP code actions can prefer the canonical form.
+                let mut expected: Vec<ExpectedEnumVariant> = Vec::new();
+                let mut push = |variant_value: &str, is_alias: bool| {
+                    let entry = ExpectedEnumVariant::from_namespaced(
+                        namespace.as_deref(),
+                        name,
+                        variant_value,
+                        is_alias,
+                    );
+                    if !expected.contains(&entry) {
+                        expected.push(entry);
                     }
                 };
                 for v in values {
-                    push(v);
+                    push(v, false);
                 }
                 if let Some(f) = to_dsl {
                     for v in values {
                         let alias = f(v);
                         if alias != *v {
-                            push(&alias);
+                            push(&alias, true);
                         }
                     }
                 }
@@ -1029,9 +1029,10 @@ fn reshape_for_string_literal(
     // Namespaced Custom: manually build the shape-mismatch diagnostic from
     // the semantic name. `ValidationFailed` has no attribute slot so
     // `with_attribute` is a no-op; we thread the attribute name in
-    // explicitly. `expected` is left empty — custom validators don't
-    // enumerate variants — but we carry the original validator message in
-    // it so its detail (which often lists valid forms) stays visible.
+    // explicitly. `expected` stays empty — custom validators don't
+    // enumerate variants — and the original validator message rides on
+    // `extra_message` so its detail (which often lists valid forms)
+    // stays visible without polluting the structured candidates list.
     if let AttributeType::Custom {
         semantic_name: Some(name),
         namespace: Some(_),
@@ -1044,27 +1045,45 @@ fn reshape_for_string_literal(
             user_typed: typed.clone(),
             attribute: Some(attr_name.to_string()),
             type_name: name.clone(),
-            expected: vec![message.clone()],
+            expected: Vec::new(),
+            extra_message: Some(message.clone()),
         };
     }
 
     tagged
 }
 
+fn join_expected(expected: &[ExpectedEnumVariant]) -> String {
+    expected
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn format_string_literal_expected_enum(
     user_typed: &str,
     attribute: Option<&str>,
     type_name: &str,
-    expected: &[String],
+    expected: &[ExpectedEnumVariant],
+    extra_message: Option<&str>,
 ) -> String {
     let target = match attribute {
         Some(a) => format!("'{}' ({})", a, type_name),
         None => type_name.to_string(),
     };
-    let joined = expected.join(", ");
+    // When `expected` is empty (Custom-namespaced reshape path) the
+    // validator's own message stands in for the variants list, so the
+    // tail reads "Use one of: <validator message>" — byte-identical to
+    // the pre-#2220 string-vec rendering.
+    let tail = if expected.is_empty() {
+        extra_message.unwrap_or("").to_string()
+    } else {
+        join_expected(expected)
+    };
     format!(
         "{} expects an enum identifier, got a string literal \"{}\". Use one of: {}",
-        target, user_typed, joined
+        target, user_typed, tail
     )
 }
 
@@ -1072,9 +1091,9 @@ fn format_invalid_enum(
     value: &str,
     attribute: Option<&str>,
     type_name: Option<&str>,
-    expected: &[String],
+    expected: &[ExpectedEnumVariant],
 ) -> String {
-    let joined = expected.join(", ");
+    let joined = join_expected(expected);
     let qualifier = match (attribute, type_name) {
         (Some(a), Some(t)) => format!(" for '{}' ({})", a, t),
         (Some(a), None) => format!(" for '{}'", a),
@@ -1091,6 +1110,76 @@ fn format_invalid_enum(
             "Invalid value '{}'{}: expected one of {}",
             value, qualifier, joined
         )
+    }
+}
+
+/// One candidate variant carried by `TypeError::InvalidEnumVariant` and
+/// `TypeError::StringLiteralExpectedEnum`. Splits a fully-qualified enum
+/// identifier into structured pieces so IDE / LSP code actions can
+/// synthesize a fix without re-parsing the rendered string. The `Display`
+/// impl re-renders the same form the user should type — fully-qualified
+/// (`awscc.sso.Assignment.TargetType.AWS_ACCOUNT`) when `provider` is set,
+/// bare (`fast`) otherwise. See #2220.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedEnumVariant {
+    /// Provider segment of the namespace (`"awscc"` for
+    /// `awscc.sso.Assignment.TargetType.AWS_ACCOUNT`). `None` for
+    /// non-namespaced enums whose variants are bare identifiers.
+    pub provider: Option<String>,
+    /// Service / resource segments between the provider and the enum
+    /// type name (`["sso", "Assignment"]` for the example above). Empty
+    /// for non-namespaced enums.
+    pub segments: Vec<String>,
+    /// Name of the enum type (`"TargetType"`).
+    pub type_name: String,
+    /// The variant value as the provider declared it (`"AWS_ACCOUNT"`,
+    /// or `"Enabled"`).
+    pub value: String,
+    /// `true` when this entry came from a `to_dsl` alias rather than the
+    /// canonical provider-side variant. Code actions should prefer the
+    /// canonical form (`is_alias = false`) when offering a fix.
+    pub is_alias: bool,
+}
+
+impl ExpectedEnumVariant {
+    /// `namespace` head becomes `provider`; the rest become `segments`.
+    /// `None` produces a bare-form variant.
+    fn from_namespaced(
+        namespace: Option<&str>,
+        type_name: &str,
+        value: &str,
+        is_alias: bool,
+    ) -> Self {
+        let (provider, segments) = match namespace {
+            Some(ns) => {
+                let mut parts = ns.split('.').map(String::from);
+                let head = parts.next();
+                (head, parts.collect())
+            }
+            None => (None, Vec::new()),
+        };
+        Self {
+            provider,
+            segments,
+            type_name: type_name.to_string(),
+            value: value.to_string(),
+            is_alias,
+        }
+    }
+}
+
+impl fmt::Display for ExpectedEnumVariant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.provider {
+            Some(provider) => {
+                write!(f, "{}", provider)?;
+                for seg in &self.segments {
+                    write!(f, ".{}", seg)?;
+                }
+                write!(f, ".{}.{}", self.type_name, self.value)
+            }
+            None => write!(f, "{}", self.value),
+        }
     }
 }
 
@@ -1115,10 +1204,12 @@ pub enum TypeError {
         /// tell the reader which enum is expected; None for callers that
         /// build the error by hand without type context.
         type_name: Option<String>,
-        /// Allowed variants in the form the user should type — i.e.
-        /// fully-qualified (`awscc.sso.Assignment.TargetType.AWS_ACCOUNT`)
-        /// for namespaced enums, bare (`fast`, `slow`) otherwise.
-        expected: Vec<String>,
+        /// Allowed variants as structured records. The `Display` impl on
+        /// each entry renders the form the user should type
+        /// (fully-qualified for namespaced enums, bare otherwise);
+        /// programmatic consumers (LSP code actions, `carina explain-error`)
+        /// can read the structured fields directly. See #2220.
+        expected: Vec<ExpectedEnumVariant>,
     },
 
     /// The value was written in the source as a quoted string literal
@@ -1130,7 +1221,7 @@ pub enum TypeError {
     /// See #2094.
     #[error(
         "{}",
-        format_string_literal_expected_enum(user_typed, attribute.as_deref(), type_name, expected)
+        format_string_literal_expected_enum(user_typed, attribute.as_deref(), type_name, expected, extra_message.as_deref())
     )]
     StringLiteralExpectedEnum {
         /// The string the user actually typed between the quotes
@@ -1142,9 +1233,18 @@ pub enum TypeError {
         /// (e.g. `"TargetType"`). Always set for this variant — callers
         /// only build it when they already know the enum type.
         type_name: String,
-        /// Allowed variants in their canonical, user-typeable form
-        /// (fully-qualified for namespaced enums, bare otherwise).
-        expected: Vec<String>,
+        /// Allowed variants as structured records. Same shape as
+        /// `InvalidEnumVariant.expected`. May be empty when the upstream
+        /// schema is `Custom` and the validator does not enumerate
+        /// variants — in that case `extra_message` carries the
+        /// validator's text instead. See #2220.
+        expected: Vec<ExpectedEnumVariant>,
+        /// Free-form text used as the message tail **only when
+        /// `expected` is empty** — i.e. the `Custom` namespaced reshape
+        /// path, where the validator does not enumerate variants. When
+        /// `expected` is non-empty, this field is silently ignored by
+        /// the renderer; callers should not set both at once.
+        extra_message: Option<String>,
     },
 
     #[error("Validation failed: {message}")]
@@ -1241,6 +1341,7 @@ impl TypeError {
                 attribute,
                 type_name,
                 expected,
+                extra_message: None,
             },
             other => other,
         }

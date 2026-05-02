@@ -1,0 +1,5 @@
+---
+source: carina-cli/tests/enum_error_display_snapshot.rs
+expression: err.to_string()
+---
+Invalid value 'zzz' for Mode: expected one of fast, slow

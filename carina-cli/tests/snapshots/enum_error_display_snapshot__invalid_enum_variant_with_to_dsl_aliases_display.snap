@@ -1,0 +1,5 @@
+---
+source: carina-cli/tests/enum_error_display_snapshot.rs
+expression: err.to_string()
+---
+Invalid value 'zzz' for VersioningStatus: expected one of aws.s3.Bucket.VersioningStatus.Enabled, aws.s3.Bucket.VersioningStatus.Suspended, aws.s3.Bucket.VersioningStatus.enabled, aws.s3.Bucket.VersioningStatus.suspended
