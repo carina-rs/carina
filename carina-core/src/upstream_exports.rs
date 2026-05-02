@@ -19,7 +19,7 @@ use std::path::Path;
 
 use crate::config_loader::{find_crn_files_in_dir, parse_directory};
 use crate::parser::{ParsedFile, ProviderContext, ResourceContext, TypeExpr, UpstreamState};
-use crate::resource::Value;
+use crate::resource::{Subscript, Value};
 use crate::schema::{AttributeType, ResourceSchema, suggest_similar_name};
 
 /// Exports declared by each `upstream_state` binding: binding name →
@@ -33,13 +33,14 @@ pub type UpstreamExports = HashMap<String, HashMap<String, Option<TypeExpr>>>;
 /// A diagnostic about a `binding.field` reference whose downstream usage
 /// doesn't fit the upstream's exports.
 ///
-/// Four error types share this shape — name-not-exported
+/// Five error types share this shape — name-not-exported
 /// ([`UpstreamFieldError`]), top-level type mismatch
 /// ([`UpstreamTypeError`]), `for`-iterable shape mismatch
-/// ([`UpstreamForIterableShapeError`]), and attribute-access shape
-/// mismatch ([`UpstreamAttributeAccessShapeError`]). They share their CLI
-/// and LSP wirings through this trait so adding a fifth check is one
-/// `impl`, not three identical extends/loops.
+/// ([`UpstreamForIterableShapeError`]), attribute-access shape
+/// mismatch ([`UpstreamAttributeAccessShapeError`]), and subscript
+/// shape mismatch ([`UpstreamSubscriptShapeError`]). They share their
+/// CLI and LSP wirings through this trait so adding a sixth check is
+/// one `impl`, not three identical extends/loops.
 ///
 /// Excludes [`UpstreamResolveError`] on purpose: a resolve failure
 /// doesn't have a `(binding, field)` pair (the upstream source itself
@@ -826,7 +827,7 @@ fn visit_attribute_access(
         let Some(Some(export_type)) = fields.get(attribute) else {
             return;
         };
-        if let Some((mismatched_at, bad_segment)) = walk_type_expr_path(export_type, field_path) {
+        if let Err((mismatched_at, bad_segment)) = walk_type_expr_path(export_type, field_path) {
             errors.push(UpstreamAttributeAccessShapeError {
                 location: location.to_string(),
                 binding: binding.to_string(),
@@ -839,9 +840,12 @@ fn visit_attribute_access(
     });
 }
 
-/// Walk `field_path` against `start`. Return
-/// `Some((mismatched_type, bad_segment))` for the first segment that
-/// can't be resolved; return `None` when the entire path resolves cleanly.
+/// Walk `field_path` against `start`. Return `Ok(tail_type)` on a
+/// clean walk and `Err((mismatched_type, bad_segment))` for the first
+/// segment that can't be resolved. Lists, maps, and scalars never host
+/// `.field` access — the parent type they reach is the right anchor
+/// for the diagnostic builder's "use iteration / subscript / nothing"
+/// suggestion.
 ///
 /// Walks by reference so deep struct paths don't pay an O(depth) clone
 /// chain — the caller clones once at the return site if it needs an
@@ -849,7 +853,7 @@ fn visit_attribute_access(
 fn walk_type_expr_path<'a, 'b>(
     start: &'a TypeExpr,
     field_path: &'b [String],
-) -> Option<(&'a TypeExpr, &'b str)> {
+) -> Result<&'a TypeExpr, (&'a TypeExpr, &'b str)> {
     let mut current = start;
     for segment in field_path {
         match current {
@@ -857,17 +861,186 @@ fn walk_type_expr_path<'a, 'b>(
                 Some((_, ty)) => {
                     current = ty;
                 }
-                None => return Some((current, segment.as_str())),
+                None => return Err((current, segment.as_str())),
             },
-            // Lists, maps, and scalars don't host `.field` access at all.
-            // The caller wants iteration / subscript / nothing,
-            // respectively. The mismatched type is the parent that was
-            // reached; the diagnostic builder turns that into the right
-            // suggestion.
-            _ => return Some((current, segment.as_str())),
+            _ => return Err((current, segment.as_str())),
         }
     }
-    None
+    Ok(current)
+}
+
+/// A `[index]` subscript reads an `upstream_state` export at a depth
+/// where the declared `TypeExpr` doesn't permit that subscript shape:
+/// integer subscript against `map(_)` / `Struct{...}` / scalar, or
+/// string subscript against `list(_)` / `Struct{...}` / scalar.
+#[derive(Debug, Clone)]
+pub struct UpstreamSubscriptShapeError {
+    pub location: String,
+    pub binding: String,
+    pub field: String,
+    /// Field-chain segments between `binding.field` and the offending
+    /// subscript. Empty when the subscript sits directly on the
+    /// top-level export (`orgs.accounts[0]`).
+    pub field_path: Vec<String>,
+    /// What the upstream declared at the position the bad subscript
+    /// reads. For `orgs.accounts[0]` against `accounts: map(_)` this
+    /// is the `map(_)`; for `orgs.region[0]` it's the scalar.
+    pub mismatched_at: TypeExpr,
+    /// The literal subscript the user wrote — preserved so the
+    /// diagnostic echoes their own syntax (`[0]` / `["alpha"]`)
+    /// rather than a placeholder.
+    pub bad_subscript: Subscript,
+}
+
+impl UpstreamSubscriptShapeError {
+    pub fn diagnostic_message(&self) -> String {
+        let mut access = format!("{}.{}", self.binding, self.field);
+        for seg in &self.field_path {
+            access.push('.');
+            access.push_str(seg);
+        }
+        let mut bad = String::new();
+        self.bad_subscript.append_to_dot_string(&mut bad);
+        let suggestion = match (&self.mismatched_at, &self.bad_subscript) {
+            (TypeExpr::List(_), Subscript::Str { .. }) => {
+                "; integer subscript `[i]` reads list elements"
+            }
+            (TypeExpr::Map(_), Subscript::Int { .. }) => {
+                "; string subscript `[\"k\"]` reads map entries"
+            }
+            // Struct/scalar don't host any subscript form, so the
+            // "use the other syntax" hint would be misleading. Stay
+            // silent and let the caller show the declared type.
+            _ => "",
+        };
+        format!(
+            "upstream_state `{}` is declared as `{}`; `{}{}` does not fit{}",
+            access, self.mismatched_at, access, bad, suggestion,
+        )
+    }
+}
+
+impl std::fmt::Display for UpstreamSubscriptShapeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.location, self.diagnostic_message())
+    }
+}
+
+impl std::error::Error for UpstreamSubscriptShapeError {}
+
+impl UpstreamRefDiagnostic for UpstreamSubscriptShapeError {
+    fn location(&self) -> &str {
+        &self.location
+    }
+    fn binding(&self) -> &str {
+        &self.binding
+    }
+    fn field(&self) -> &str {
+        &self.field
+    }
+    fn diagnostic_message(&self) -> String {
+        UpstreamSubscriptShapeError::diagnostic_message(self)
+    }
+}
+
+/// Walk every `Value::ResourceRef` whose root is an `upstream_state`
+/// binding and whose `subscripts` chain is non-empty, and emit an error
+/// whenever a subscript's kind (integer vs string) doesn't fit the
+/// declared upstream `TypeExpr` at that depth.
+///
+/// Skipped silently when:
+/// - the binding isn't in `exports` (already surfaced by
+///   `check_upstream_state_field_references` if it should be);
+/// - the field isn't exported (same — duplicate diagnostics hurt);
+/// - the export has no declared type (`accounts` without `: T`) — there's
+///   no upstream type to compare the subscript against;
+/// - the leading `field_path` already mismatches the declared shape
+///   (already handled by `check_upstream_state_attribute_access_shapes`)
+///   — in that case the field-walk diagnostic is enough.
+pub fn check_upstream_state_subscript_shapes(
+    parsed: &ParsedFile,
+    exports: &UpstreamExports,
+) -> Vec<UpstreamSubscriptShapeError> {
+    let mut errors: Vec<UpstreamSubscriptShapeError> = Vec::new();
+    for_each_resource_attr(parsed, |ctx, resource, attr_name, value| {
+        visit_subscript_access(
+            value,
+            exports,
+            &resource_attr_location(ctx, resource, attr_name),
+            &mut errors,
+        );
+    });
+    for_each_non_resource_value(
+        parsed,
+        NonResourceScope::ExportsAndModules,
+        |value, location| {
+            visit_subscript_access(value, exports, location, &mut errors);
+        },
+    );
+    errors.sort_by(|a, b| {
+        (a.location.as_str(), a.binding.as_str(), a.field.as_str()).cmp(&(
+            b.location.as_str(),
+            b.binding.as_str(),
+            b.field.as_str(),
+        ))
+    });
+    errors
+}
+
+/// Walk a Value tree, find every `ResourceRef` with a non-empty
+/// `subscripts` chain, and check each subscript's kind against the
+/// upstream's declared `TypeExpr` at that depth.
+fn visit_subscript_access(
+    value: &Value,
+    exports: &UpstreamExports,
+    location: &str,
+    errors: &mut Vec<UpstreamSubscriptShapeError>,
+) {
+    value.visit_refs(&mut |path| {
+        let subscripts = path.subscripts();
+        if subscripts.is_empty() {
+            return;
+        }
+        let binding = path.binding();
+        let attribute = path.attribute();
+        let Some(fields) = exports.get(binding) else {
+            return;
+        };
+        let Some(Some(export_type)) = fields.get(attribute) else {
+            return;
+        };
+        // If the field path itself doesn't resolve, the
+        // attribute-access check will already report it. Skip here so
+        // we don't double-fire.
+        let field_path = path.field_path();
+        let Ok(at_field_end) = walk_type_expr_path(export_type, field_path) else {
+            return;
+        };
+        // Step through each subscript, descending into the element
+        // type when it fits and emitting at the first kind mismatch.
+        let mut current = at_field_end;
+        for sub in subscripts {
+            match (current, sub) {
+                (TypeExpr::List(inner), Subscript::Int { .. }) => {
+                    current = inner.as_ref();
+                }
+                (TypeExpr::Map(inner), Subscript::Str { .. }) => {
+                    current = inner.as_ref();
+                }
+                (mismatched_at, bad) => {
+                    errors.push(UpstreamSubscriptShapeError {
+                        location: location.to_string(),
+                        binding: binding.to_string(),
+                        field: attribute.to_string(),
+                        field_path: field_path.to_vec(),
+                        mismatched_at: mismatched_at.clone(),
+                        bad_subscript: bad.clone(),
+                    });
+                    return;
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -2390,11 +2563,327 @@ mod tests {
     }
 
     // ================================================================
+    // #2318: subscript-after-field shape compatibility
+    // (`check_upstream_state_subscript_shapes`)
+    // ================================================================
+
+    #[test]
+    fn subscript_int_against_list_export_is_ok() {
+        // `orgs.accounts[0]` against `accounts: list(String)` — integer
+        // subscripts read list elements; shape check stays silent.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.accounts[0]
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[("accounts", TypeExpr::List(Box::new(TypeExpr::String)))],
+        )]);
+        let errs = check_upstream_state_subscript_shapes(&parsed, &exports);
+        assert!(errs.is_empty(), "[int] on list(_) must pass, got: {errs:?}");
+    }
+
+    #[test]
+    fn subscript_str_against_map_export_is_ok() {
+        // `orgs.accounts["alpha"]` against `accounts: map(String)` —
+        // string subscripts read map entries; shape check stays silent.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.accounts["alpha"]
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[("accounts", TypeExpr::Map(Box::new(TypeExpr::String)))],
+        )]);
+        let errs = check_upstream_state_subscript_shapes(&parsed, &exports);
+        assert!(
+            errs.is_empty(),
+            "[\"k\"] on map(_) must pass, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn subscript_int_against_map_export_flags_mismatch() {
+        // `orgs.accounts[0]` against `accounts: map(String)` — wrong
+        // syntax; should fire with a hint to use `["k"]`.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.accounts[0]
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[("accounts", TypeExpr::Map(Box::new(TypeExpr::String)))],
+        )]);
+        let errs = check_upstream_state_subscript_shapes(&parsed, &exports);
+        assert_eq!(errs.len(), 1, "[int] on map must fail, got: {errs:?}");
+        assert_eq!(errs[0].binding, "orgs");
+        assert_eq!(errs[0].field, "accounts");
+        assert!(matches!(errs[0].bad_subscript, Subscript::Int { index: 0 }));
+        let msg = errs[0].diagnostic_message();
+        assert!(msg.contains("map"), "message must mention map shape: {msg}");
+        assert!(
+            msg.contains("[0]"),
+            "message must echo the user's literal subscript, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn subscript_str_against_list_export_flags_mismatch() {
+        // `orgs.accounts["alpha"]` against `accounts: list(String)` —
+        // wrong syntax; should fire with a hint to use `[i]`.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.accounts["alpha"]
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[("accounts", TypeExpr::List(Box::new(TypeExpr::String)))],
+        )]);
+        let errs = check_upstream_state_subscript_shapes(&parsed, &exports);
+        assert_eq!(errs.len(), 1, "[\"k\"] on list must fail, got: {errs:?}");
+        assert!(matches!(errs[0].bad_subscript, Subscript::Str { .. }));
+        let msg = errs[0].diagnostic_message();
+        assert!(
+            msg.contains("list"),
+            "message must mention list shape: {msg}"
+        );
+    }
+
+    #[test]
+    fn subscript_against_struct_export_flags_mismatch() {
+        // `orgs.account[0]` against `account: struct {...}` — structs
+        // don't host any subscript form. The diagnostic stays silent on
+        // the "use the other syntax" hint because neither would help.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.account[0]
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[(
+                "account",
+                TypeExpr::Struct {
+                    fields: vec![("id".to_string(), TypeExpr::String)],
+                },
+            )],
+        )]);
+        let errs = check_upstream_state_subscript_shapes(&parsed, &exports);
+        assert_eq!(
+            errs.len(),
+            1,
+            "subscript on struct must fail, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn subscript_against_scalar_export_flags_mismatch() {
+        // `orgs.region[0]` against `region: String` — scalars are not
+        // subscriptable.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.region[0]
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[("orgs", &[("region", TypeExpr::String)])]);
+        let errs = check_upstream_state_subscript_shapes(&parsed, &exports);
+        assert_eq!(
+            errs.len(),
+            1,
+            "subscript on scalar must fail, got: {errs:?}"
+        );
+        let msg = errs[0].diagnostic_message();
+        assert!(
+            msg.contains("String"),
+            "message must show scalar export type: {msg}"
+        );
+    }
+
+    #[test]
+    fn subscript_after_struct_field_walks_path() {
+        // `orgs.account.children[0]` against
+        // `account: struct { children: list(String) }` — the walker
+        // must descend through the struct field before checking the
+        // subscript.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.account.children[0]
+                }
+            "#,
+            "test",
+        );
+        let outer = TypeExpr::Struct {
+            fields: vec![(
+                "children".to_string(),
+                TypeExpr::List(Box::new(TypeExpr::String)),
+            )],
+        };
+        let exports = mk_typed_exports(&[("orgs", &[("account", outer)])]);
+        let errs = check_upstream_state_subscript_shapes(&parsed, &exports);
+        assert!(
+            errs.is_empty(),
+            "subscript after struct field walks path, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn subscript_skipped_when_export_has_no_declared_type() {
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.accounts[0]
+                }
+            "#,
+            "test",
+        );
+        let mut exports = UpstreamExports::new();
+        let mut fields = HashMap::new();
+        fields.insert("accounts".to_string(), None);
+        exports.insert("orgs".to_string(), fields);
+        let errs = check_upstream_state_subscript_shapes(&parsed, &exports);
+        assert!(errs.is_empty(), "no annotation → silent, got: {errs:?}");
+    }
+
+    #[test]
+    fn subscript_skipped_when_binding_unknown() {
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.accounts[0]
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[]);
+        let errs = check_upstream_state_subscript_shapes(&parsed, &exports);
+        assert!(errs.is_empty(), "missing binding → silent, got: {errs:?}");
+    }
+
+    #[test]
+    fn subscript_skipped_when_field_path_mismatches() {
+        // `orgs.account.bad[0]` — the `.bad` already mismatches the
+        // declared struct type. Don't double-fire on the subscript;
+        // the attribute-access check owns that diagnostic.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.account.bad[0]
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[(
+                "account",
+                TypeExpr::Struct {
+                    fields: vec![("id".to_string(), TypeExpr::String)],
+                },
+            )],
+        )]);
+        let errs = check_upstream_state_subscript_shapes(&parsed, &exports);
+        assert!(
+            errs.is_empty(),
+            "field-path mismatch is the attribute-access check's job, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn subscript_chained_descends_into_inner_type() {
+        // `orgs.matrix[0][1]` against `matrix: list(list(String))` —
+        // each integer subscript peels one `list(_)` layer.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.matrix[0][1]
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[(
+                "matrix",
+                TypeExpr::List(Box::new(TypeExpr::List(Box::new(TypeExpr::String)))),
+            )],
+        )]);
+        let errs = check_upstream_state_subscript_shapes(&parsed, &exports);
+        assert!(
+            errs.is_empty(),
+            "list(list(_))[0][1] must pass, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn subscript_chained_flags_inner_mismatch() {
+        // `orgs.matrix[0]["k"]` against `matrix: list(list(String))` —
+        // first `[0]` peels to `list(String)`; second `["k"]` then
+        // mismatches.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.matrix[0]["k"]
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[(
+                "matrix",
+                TypeExpr::List(Box::new(TypeExpr::List(Box::new(TypeExpr::String)))),
+            )],
+        )]);
+        let errs = check_upstream_state_subscript_shapes(&parsed, &exports);
+        assert_eq!(
+            errs.len(),
+            1,
+            "second subscript mismatch must fire, got: {errs:?}"
+        );
+        assert!(matches!(errs[0].bad_subscript, Subscript::Str { .. }));
+    }
+
+    // ================================================================
     // #2319: UpstreamRefDiagnostic trait
     // ================================================================
 
     #[test]
-    fn upstream_ref_diagnostic_trait_covers_all_four_error_types() {
+    fn upstream_ref_diagnostic_trait_covers_all_five_error_types() {
         // Building a `Vec<&dyn UpstreamRefDiagnostic>` proves each type
         // implements the trait and that the LSP/CLI can iterate them
         // uniformly. The CLI/LSP wirings rely on this being possible.
@@ -2428,6 +2917,14 @@ mod tests {
             },
             bad_segment: "bad".to_string(),
         };
+        let subscript_err = UpstreamSubscriptShapeError {
+            location: "loc-e".to_string(),
+            binding: "orgs".to_string(),
+            field: "accounts".to_string(),
+            field_path: vec![],
+            mismatched_at: TypeExpr::Map(Box::new(TypeExpr::String)),
+            bad_subscript: Subscript::Int { index: 0 },
+        };
         // Tuples of (dyn-trait reference, expected location, expected
         // binding, expected field, expected diagnostic_message). Looping
         // catches a future struct that silently desyncs trait impls
@@ -2460,6 +2957,13 @@ mod tests {
                 "orgs",
                 "account",
                 attr_err.diagnostic_message(),
+            ),
+            (
+                &subscript_err,
+                "loc-e",
+                "orgs",
+                "accounts",
+                subscript_err.diagnostic_message(),
             ),
         ];
         for (d, expected_location, expected_binding, expected_field, expected_message) in cases {

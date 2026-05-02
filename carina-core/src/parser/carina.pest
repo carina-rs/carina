@@ -187,6 +187,13 @@ identifier = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 // Segments after the first dot can also be digit-only (e.g., "Type.ipsec.1")
 namespaced_id = @{ identifier ~ ("." ~ (identifier | ASCII_DIGIT+))+ }
 
+// Namespaced identifier followed by one or more `[index]` subscripts:
+// `orgs.accounts[0]`, `orgs.account.children["alpha"]`. Captured as a
+// distinct rule so the namespaced_id arm doesn't have to introspect for
+// trailing subscripts and so the grammar matches the issue-#2318
+// surface (post-field index access) explicitly.
+subscripted_id = { namespaced_id ~ index_access+ }
+
 // Expression
 expression = { coalesce_expr }
 
@@ -217,6 +224,7 @@ primary = {
   | function_call        // Must come before variable_ref so "func(...)" is parsed as function call
   | list
   | map
+  | subscripted_id      // Must come before namespaced_id so "a.b[0]" doesn't bottom out as "a.b"
   | namespaced_id
   | boolean
   | float

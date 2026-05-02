@@ -220,6 +220,12 @@ identifier = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 // Namespaced identifier: aws.s3_bucket, aws.Region.ap_northeast_1, Type.ipsec.1
 namespaced_id = @{ identifier ~ ("." ~ (identifier | ASCII_DIGIT+))+ }
 
+// Namespaced identifier with trailing `[index]` subscripts:
+// `orgs.accounts[0]`, `orgs.account.children["alpha"]`. Mirrors the
+// canonical parser's `subscripted_id` so post-field index access
+// formats round-trip.
+subscripted_id = { namespaced_id ~ (trivia* ~ index_access)+ }
+
 // Expression
 expression = { pipe_expr }
 
@@ -258,6 +264,7 @@ primary = {
   | function_call
   | list
   | map
+  | subscripted_id      // Must come before namespaced_id so "a.b[0]" doesn't bottom out as "a.b"
   | namespaced_id
   | boolean
   | float

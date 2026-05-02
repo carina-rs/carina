@@ -93,6 +93,7 @@ pub enum NodeKind {
     FunctionCall,
     VariableRef,
     NamespacedId,
+    SubscriptedId,
     Identifier,
     String,
     Number,

@@ -228,6 +228,9 @@ impl<'a> CstBuilder<'a> {
             Rule::variable_ref => {
                 Some(CstChild::Node(self.build_node(NodeKind::VariableRef, pair)))
             }
+            Rule::subscripted_id => Some(CstChild::Node(
+                self.build_node(NodeKind::SubscriptedId, pair),
+            )),
 
             // Atoms - these become tokens
             Rule::namespaced_id => {

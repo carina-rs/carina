@@ -391,16 +391,20 @@ pub fn validate_and_resolve_errors_with_factories(
                 parsed,
                 &upstream_exports,
             );
+        let subscript_errors = carina_core::upstream_exports::check_upstream_state_subscript_shapes(
+            parsed,
+            &upstream_exports,
+        );
         errors.extend(
             resolve_errors
                 .iter()
                 .map(|e| AppError::Validation(e.to_string())),
         );
-        // The four upstream-ref checks return distinct concrete types
+        // The five upstream-ref checks return distinct concrete types
         // but share `UpstreamRefDiagnostic`. Chain them through the
         // trait (`Display` supertrait gives the canonical
         // `"location: message"` form — the per-type `Display` impl is
-        // the single source of truth) so adding a fifth check is one
+        // the single source of truth) so adding a sixth check is one
         // extra `chain(...)`.
         errors.extend(
             field_errors
@@ -410,6 +414,11 @@ pub fn validate_and_resolve_errors_with_factories(
                 .chain(shape_errors.iter().map(|e| e as &dyn UpstreamRefDiagnostic))
                 .chain(
                     attribute_access_errors
+                        .iter()
+                        .map(|e| e as &dyn UpstreamRefDiagnostic),
+                )
+                .chain(
+                    subscript_errors
                         .iter()
                         .map(|e| e as &dyn UpstreamRefDiagnostic),
                 )

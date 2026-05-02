@@ -12,8 +12,90 @@ use crate::parser::{
     ParseContext, ParseError, Rule, evaluate_user_function, extract_key_string, first_inner,
     is_static_value, next_pair, parse_block_contents, parse_expression, parse_expression_eval,
 };
-use crate::resource::Value;
+use crate::resource::{AccessPath, Subscript, Value};
 use indexmap::IndexMap;
+
+/// Convert an index-expression value into a `Subscript`. Only
+/// non-negative integer and string keys are legal subscripts; anything
+/// else is a parse error. Negative integers are rejected here rather
+/// than at validate time because the DSL has no `[-1]` "from end"
+/// semantic — accepting them would let the validator pass and the
+/// resolver silently fall back to the unresolved ref.
+fn subscript_from_value(value: Value) -> Result<Subscript, ParseError> {
+    match value {
+        Value::Int(n) if n < 0 => Err(ParseError::InvalidExpression {
+            line: 0,
+            message: format!("index access key must be non-negative, got {}", n),
+        }),
+        Value::Int(n) => Ok(Subscript::Int { index: n }),
+        Value::String(s) => Ok(Subscript::Str { key: s }),
+        other => Err(ParseError::InvalidExpression {
+            line: 0,
+            message: format!(
+                "index access key must be an integer or string, got {:?}",
+                other
+            ),
+        }),
+    }
+}
+
+/// Lower a `namespaced_id` pair to its `EvalValue`, attaching any
+/// trailing subscripts collected by the caller (the `subscripted_id`
+/// arm). String-form enum shorthands like `aws.Region.ap_northeast_1`
+/// have no `AccessPath` to host subscripts — those reject outright.
+fn parse_namespaced_id_value(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+    subscripts: Vec<Subscript>,
+) -> Result<EvalValue, ParseError> {
+    let full_str = pair.as_str();
+    let parts: Vec<&str> = full_str.split('.').collect();
+    // Pest's `namespaced_id = @{ identifier ~ ("." ~ ...)+ }` rule
+    // guarantees ≥2 parts; a future grammar tweak that loosened it
+    // would silently start panicking on `parts[1]` below.
+    debug_assert!(
+        parts.len() >= 2,
+        "namespaced_id parsed without a `.` segment: {:?}",
+        full_str
+    );
+
+    if ctx.is_resource_binding(parts[0]) {
+        let attribute = parts[1].to_string();
+        let field_path = parts[2..].iter().map(|s| s.to_string()).collect();
+        let path = AccessPath::with_fields_and_subscripts(
+            parts[0].to_string(),
+            attribute,
+            field_path,
+            subscripts,
+        );
+        return Ok(EvalValue::from_value(Value::ResourceRef { path }));
+    }
+
+    if !subscripts.is_empty() {
+        return Err(ParseError::InvalidExpression {
+            line: 0,
+            message: format!(
+                "cannot subscript `{}` — it is not a known resource binding",
+                full_str
+            ),
+        });
+    }
+
+    if parts.len() == 2
+        && ctx.get_variable(parts[0]).is_some()
+        && !ctx.is_resource_binding(parts[0])
+    {
+        return Err(ParseError::InvalidExpression {
+            line: 0,
+            message: format!(
+                "'{}' is not a resource, cannot access attribute '{}'",
+                parts[0], parts[1]
+            ),
+        });
+    }
+
+    Ok(EvalValue::from_value(Value::String(full_str.to_string())))
+}
 
 pub(crate) fn parse_primary_eval(
     pair: pest::iterators::Pair<Rule>,
@@ -76,51 +158,25 @@ pub(crate) fn parse_primary_eval(
             }
             Ok(EvalValue::from_value(Value::Map(map)))
         }
-        Rule::namespaced_id => {
-            // Namespaced identifier (e.g., aws.Region.ap_northeast_1)
-            // or resource reference (e.g., bucket.name)
-            // or arguments reference in module context (e.g., arguments.vpc_id)
-            let full_str = inner.as_str();
-            let parts: Vec<&str> = full_str.split('.').collect();
-
-            if parts.len() == 2 {
-                // Two-part identifier: could be resource reference or variable access
-                if ctx.get_variable(parts[0]).is_some() && !ctx.is_resource_binding(parts[0]) {
-                    // Variable exists but trying to access attribute on non-resource
-                    Err(ParseError::InvalidExpression {
-                        line: 0,
-                        message: format!(
-                            "'{}' is not a resource, cannot access attribute '{}'",
-                            parts[0], parts[1]
-                        ),
-                    })
-                } else if ctx.is_resource_binding(parts[0]) {
-                    // Known resource binding: treat as resource reference
-                    Ok(EvalValue::from_value(Value::resource_ref(
-                        parts[0].to_string(),
-                        parts[1].to_string(),
-                        vec![],
-                    )))
-                } else {
-                    // Unknown 2-part identifier: could be TypeName.value enum shorthand
-                    // Will be resolved during schema validation
-                    Ok(EvalValue::from_value(Value::String(format!(
-                        "{}.{}",
-                        parts[0], parts[1]
-                    ))))
+        Rule::namespaced_id => parse_namespaced_id_value(inner, ctx, Vec::new()),
+        Rule::subscripted_id => {
+            // `binding.field[idx]` / `binding.field.subfield[idx]…` —
+            // the namespaced_id portion behaves like a plain
+            // namespaced_id (identifier shorthand or resource ref), and
+            // any trailing `[idx]` subscripts are folded onto the
+            // resulting `AccessPath`.
+            let mut parts = inner.into_inner();
+            let head = next_pair(&mut parts, "namespaced_id", "subscripted_id")?;
+            let mut subscripts: Vec<Subscript> = Vec::new();
+            for index_pair in parts {
+                if !matches!(index_pair.as_rule(), Rule::index_access) {
+                    continue;
                 }
-            } else if ctx.is_resource_binding(parts[0]) {
-                // 3+ part identifier where first part is a resource binding:
-                // chained field access (e.g., web.network.vpc_id)
-                Ok(EvalValue::from_value(Value::resource_ref(
-                    parts[0].to_string(),
-                    parts[1].to_string(),
-                    parts[2..].iter().map(|s| s.to_string()).collect(),
-                )))
-            } else {
-                // 3+ part identifier is a namespaced type (aws.Region.ap_northeast_1)
-                Ok(EvalValue::from_value(Value::String(full_str.to_string())))
+                let index_expr_pair = first_inner(index_pair, "index expression", "index access")?;
+                let index_value = parse_expression(index_expr_pair, ctx)?;
+                subscripts.push(subscript_from_value(index_value)?);
             }
+            parse_namespaced_id_value(head, ctx, subscripts)
         }
         Rule::boolean => {
             let b = inner.as_str() == "true";
@@ -225,49 +281,63 @@ pub(crate) fn parse_primary_eval(
                     ))),
                 }
             } else {
-                // Build binding_name, attribute_name, and field_path from access steps.
-                // Index access (e.g., [0] or ["key"]) composes the binding name.
-                // Field access after the binding gives attribute_name and field_path.
+                // Build binding_name, attribute_name, field_path, and
+                // post-field subscripts from the access steps. There are
+                // two index phases:
+                //
+                //   * **pre-field** — index access *before* any field
+                //     access. The legacy convention folds these into the
+                //     binding name string (`subnets[0]`,
+                //     `networks.prod`), preserved here unchanged so
+                //     `for`-iteration addresses round-trip.
+                //   * **post-field** — index access *after* field access
+                //     (`orgs.accounts[0]`, `orgs.account.children[0]`).
+                //     Captured structurally on `AccessPath::subscripts`
+                //     so cross-directory shape checks can tell `[0]`
+                //     from `.0` (#2318).
+                //
+                // The two never interleave: once a field segment is
+                // seen, every later index becomes post-field. A second
+                // field after a post-field subscript (e.g.
+                // `a.b[0].c`) is rejected — runtime list-indexing of
+                // arbitrary structs isn't representable today.
                 let mut binding_name = first_ident.to_string();
                 let mut field_names: Vec<String> = Vec::new();
+                let mut subscripts: Vec<Subscript> = Vec::new();
                 let mut in_field_phase = false;
 
                 for step in access_steps {
                     match step.as_rule() {
                         Rule::index_access => {
-                            if in_field_phase {
-                                // Index access after field access is not yet supported
-                                // (e.g., a.b[0] — would need runtime list indexing)
-                                return Err(ParseError::InvalidExpression {
-                                    line: 0,
-                                    message: "index access after field access is not supported"
-                                        .to_string(),
-                                });
-                            }
-                            // Parse the index expression
                             let index_expr_pair =
                                 first_inner(step, "index expression", "index access")?;
                             let index_value = parse_expression(index_expr_pair, ctx)?;
-                            // Compose the binding name: name[0] or name["key"]
-                            match &index_value {
-                                Value::Int(n) => {
-                                    binding_name = format!("{}[{}]", binding_name, n);
-                                }
-                                Value::String(s) => {
-                                    binding_name = crate::utils::map_key_address(&binding_name, s);
-                                }
-                                other => {
-                                    return Err(ParseError::InvalidExpression {
-                                        line: 0,
-                                        message: format!(
-                                            "index access key must be an integer or string, got {:?}",
-                                            other
-                                        ),
-                                    });
-                                }
+                            let subscript = subscript_from_value(index_value)?;
+                            if in_field_phase {
+                                subscripts.push(subscript);
+                            } else {
+                                // Pre-field index — fold into the
+                                // binding name string per the legacy
+                                // convention so `for`-iteration
+                                // addresses round-trip.
+                                binding_name = match subscript {
+                                    Subscript::Int { index } => {
+                                        format!("{}[{}]", binding_name, index)
+                                    }
+                                    Subscript::Str { key } => {
+                                        crate::utils::map_key_address(&binding_name, &key)
+                                    }
+                                };
                             }
                         }
                         Rule::field_access => {
+                            if !subscripts.is_empty() {
+                                return Err(ParseError::InvalidExpression {
+                                    line: 0,
+                                    message: "field access after index access is not supported"
+                                        .to_string(),
+                                });
+                            }
                             in_field_phase = true;
                             let field_ident =
                                 first_inner(step, "field identifier", "field access")?;
@@ -278,27 +348,27 @@ pub(crate) fn parse_primary_eval(
                 }
 
                 if field_names.is_empty() {
-                    // Index access only, no field access (e.g., subnets[0])
-                    // Check if the composed binding name is a known variable
+                    // No field access: subscripts is empty by
+                    // construction (the post-field bucket only fills
+                    // after a field). Pre-field subscripts have already
+                    // been folded into binding_name above.
                     match ctx.get_variable(&binding_name) {
                         Some(val) => Ok(val.clone()),
-                        None => {
-                            // Return as ResourceRef with empty attribute_name
-                            // (will be resolved later)
-                            Ok(EvalValue::from_value(Value::resource_ref(
-                                binding_name,
-                                String::new(),
-                                vec![],
-                            )))
-                        }
+                        None => Ok(EvalValue::from_value(Value::resource_ref(
+                            binding_name,
+                            String::new(),
+                            vec![],
+                        ))),
                     }
                 } else {
                     let attribute_name = field_names.remove(0);
-                    Ok(EvalValue::from_value(Value::resource_ref(
+                    let path = AccessPath::with_fields_and_subscripts(
                         binding_name,
                         attribute_name,
                         field_names,
-                    )))
+                        subscripts,
+                    );
+                    Ok(EvalValue::from_value(Value::ResourceRef { path }))
                 }
             }
         }
