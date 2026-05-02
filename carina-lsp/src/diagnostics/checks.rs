@@ -10,6 +10,7 @@ use carina_core::builtins;
 use carina_core::parser::{ArgumentParameter, ParsedFile, TypeExpr};
 use carina_core::resource::{Resource, Value};
 use carina_core::schema::{ResourceSchema, suggest_similar_name};
+use carina_core::upstream_exports::UpstreamRefDiagnostic;
 
 use super::{DiagnosticEngine, carina_diagnostic};
 
@@ -480,37 +481,24 @@ impl DiagnosticEngine {
             );
         let mut seen_count: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
+        // The four upstream-ref checks return distinct concrete types
+        // but share `UpstreamRefDiagnostic`; chain them through the
+        // trait so adding a fifth check is one extra `chain(...)`.
         self.push_upstream_ref_diagnostics(
             doc,
             &mut seen_count,
             &mut diagnostics,
             field_errors
                 .iter()
-                .map(|e| (e.binding.as_str(), e.field.as_str(), e.diagnostic_message())),
-        );
-        self.push_upstream_ref_diagnostics(
-            doc,
-            &mut seen_count,
-            &mut diagnostics,
-            type_errors
-                .iter()
-                .map(|e| (e.binding.as_str(), e.field.as_str(), e.diagnostic_message())),
-        );
-        self.push_upstream_ref_diagnostics(
-            doc,
-            &mut seen_count,
-            &mut diagnostics,
-            shape_errors
-                .iter()
-                .map(|e| (e.binding.as_str(), e.field.as_str(), e.diagnostic_message())),
-        );
-        self.push_upstream_ref_diagnostics(
-            doc,
-            &mut seen_count,
-            &mut diagnostics,
-            attribute_access_errors
-                .iter()
-                .map(|e| (e.binding.as_str(), e.field.as_str(), e.diagnostic_message())),
+                .map(|e| e as &dyn UpstreamRefDiagnostic)
+                .chain(type_errors.iter().map(|e| e as &dyn UpstreamRefDiagnostic))
+                .chain(shape_errors.iter().map(|e| e as &dyn UpstreamRefDiagnostic))
+                .chain(
+                    attribute_access_errors
+                        .iter()
+                        .map(|e| e as &dyn UpstreamRefDiagnostic),
+                )
+                .map(|e| (e.binding(), e.field(), e.diagnostic_message())),
         );
 
         diagnostics

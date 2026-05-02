@@ -30,6 +30,39 @@ use crate::schema::{AttributeType, ResourceSchema, suggest_similar_name};
 /// for shape compatibility.
 pub type UpstreamExports = HashMap<String, HashMap<String, Option<TypeExpr>>>;
 
+/// A diagnostic about a `binding.field` reference whose downstream usage
+/// doesn't fit the upstream's exports.
+///
+/// Four error types share this shape — name-not-exported
+/// ([`UpstreamFieldError`]), top-level type mismatch
+/// ([`UpstreamTypeError`]), `for`-iterable shape mismatch
+/// ([`UpstreamForIterableShapeError`]), and attribute-access shape
+/// mismatch ([`UpstreamAttributeAccessShapeError`]). They share their CLI
+/// and LSP wirings through this trait so adding a fifth check is one
+/// `impl`, not three identical extends/loops.
+///
+/// Excludes [`UpstreamResolveError`] on purpose: a resolve failure
+/// doesn't have a `(binding, field)` pair (the upstream source itself
+/// failed to parse) so the LSP anchoring path can't render it the same
+/// way.
+///
+/// `Display` is required so `to_string()` produces the canonical
+/// `"location: message"` form for the CLI's combined-error path —
+/// keeping the format in one place (the per-type `Display` impl)
+/// instead of letting the CLI reimplement it inline.
+pub trait UpstreamRefDiagnostic: std::fmt::Display {
+    /// Where in the downstream project the bad reference appears
+    /// (e.g. `"aws.s3.Bucket.main attribute `name`"`).
+    fn location(&self) -> &str;
+    /// Root binding name (e.g. `"orgs"`).
+    fn binding(&self) -> &str;
+    /// Top-level field on the upstream's exports (e.g. `"accounts"`).
+    fn field(&self) -> &str;
+    /// User-facing diagnostic body, location-free. The LSP diagnostic
+    /// range carries the *where*; the message says *what*.
+    fn diagnostic_message(&self) -> String;
+}
+
 /// An `upstream_state` binding whose source directory exists but couldn't
 /// be parsed. Downstream field-reference checks against this binding are
 /// skipped (we don't know what it exports), but the failure itself must be
@@ -90,6 +123,21 @@ impl std::fmt::Display for UpstreamFieldError {
 }
 
 impl std::error::Error for UpstreamFieldError {}
+
+impl UpstreamRefDiagnostic for UpstreamFieldError {
+    fn location(&self) -> &str {
+        &self.location
+    }
+    fn binding(&self) -> &str {
+        &self.binding
+    }
+    fn field(&self) -> &str {
+        &self.field
+    }
+    fn diagnostic_message(&self) -> String {
+        UpstreamFieldError::diagnostic_message(self)
+    }
+}
 
 /// Statically resolve each `upstream_state` binding's declared exports.
 ///
@@ -300,6 +348,21 @@ impl std::fmt::Display for UpstreamTypeError {
 
 impl std::error::Error for UpstreamTypeError {}
 
+impl UpstreamRefDiagnostic for UpstreamTypeError {
+    fn location(&self) -> &str {
+        &self.location
+    }
+    fn binding(&self) -> &str {
+        &self.binding
+    }
+    fn field(&self) -> &str {
+        &self.field
+    }
+    fn diagnostic_message(&self) -> String {
+        UpstreamTypeError::diagnostic_message(self)
+    }
+}
+
 /// For each resource attribute whose value is an `upstream_state` field
 /// reference, compare the export's declared type against the attribute's
 /// expected type and emit an error when they don't fit.
@@ -466,6 +529,21 @@ impl std::fmt::Display for UpstreamForIterableShapeError {
 
 impl std::error::Error for UpstreamForIterableShapeError {}
 
+impl UpstreamRefDiagnostic for UpstreamForIterableShapeError {
+    fn location(&self) -> &str {
+        &self.location
+    }
+    fn binding(&self) -> &str {
+        &self.binding
+    }
+    fn field(&self) -> &str {
+        &self.field
+    }
+    fn diagnostic_message(&self) -> String {
+        UpstreamForIterableShapeError::diagnostic_message(self)
+    }
+}
+
 /// Walk every `for` expression that iterates an `upstream_state` field
 /// reference and emit an error when the export's declared type
 /// (`list(...)` vs `map(...)`) doesn't match the binding pattern's
@@ -603,6 +681,21 @@ impl std::fmt::Display for UpstreamAttributeAccessShapeError {
 }
 
 impl std::error::Error for UpstreamAttributeAccessShapeError {}
+
+impl UpstreamRefDiagnostic for UpstreamAttributeAccessShapeError {
+    fn location(&self) -> &str {
+        &self.location
+    }
+    fn binding(&self) -> &str {
+        &self.binding
+    }
+    fn field(&self) -> &str {
+        &self.field
+    }
+    fn diagnostic_message(&self) -> String {
+        UpstreamAttributeAccessShapeError::diagnostic_message(self)
+    }
+}
 
 /// Walk every `Value::ResourceRef` whose root is an `upstream_state`
 /// binding and whose `field_path` is non-empty, and emit an error
@@ -2259,5 +2352,93 @@ mod tests {
         assert_eq!(errs[0].field, "accounts");
         assert_eq!(errs[0].bad_segment, "foo");
         assert!(matches!(errs[0].mismatched_at, TypeExpr::List(_)));
+    }
+
+    // ================================================================
+    // #2319: UpstreamRefDiagnostic trait
+    // ================================================================
+
+    #[test]
+    fn upstream_ref_diagnostic_trait_covers_all_four_error_types() {
+        // Building a `Vec<&dyn UpstreamRefDiagnostic>` proves each type
+        // implements the trait and that the LSP/CLI can iterate them
+        // uniformly. The CLI/LSP wirings rely on this being possible.
+        let field_err = UpstreamFieldError {
+            location: "loc-a".to_string(),
+            binding: "orgs".to_string(),
+            field: "missing".to_string(),
+            suggestion: Some("accounts".to_string()),
+        };
+        let type_err = UpstreamTypeError {
+            location: "loc-b".to_string(),
+            binding: "orgs".to_string(),
+            field: "count".to_string(),
+            export_type: TypeExpr::Int,
+            expected_type: crate::schema::AttributeType::String,
+        };
+        let shape_err = UpstreamForIterableShapeError {
+            location: "for-expression `for x in orgs.accounts`".to_string(),
+            binding: "orgs".to_string(),
+            field: "accounts".to_string(),
+            export_type: TypeExpr::Map(Box::new(TypeExpr::String)),
+            binding_kind: ForIterableBindingKind::List,
+        };
+        let attr_err = UpstreamAttributeAccessShapeError {
+            location: "loc-d".to_string(),
+            binding: "orgs".to_string(),
+            field: "account".to_string(),
+            field_path: vec!["bad".to_string()],
+            mismatched_at: TypeExpr::Struct {
+                fields: vec![("id".to_string(), TypeExpr::String)],
+            },
+            bad_segment: "bad".to_string(),
+        };
+        // Tuples of (dyn-trait reference, expected location, expected
+        // binding, expected field, expected diagnostic_message). Looping
+        // catches a future struct that silently desyncs trait impls
+        // from inherent fields.
+        let cases: Vec<(&dyn UpstreamRefDiagnostic, &str, &str, &str, String)> = vec![
+            (
+                &field_err,
+                "loc-a",
+                "orgs",
+                "missing",
+                field_err.diagnostic_message(),
+            ),
+            (
+                &type_err,
+                "loc-b",
+                "orgs",
+                "count",
+                type_err.diagnostic_message(),
+            ),
+            (
+                &shape_err,
+                "for-expression `for x in orgs.accounts`",
+                "orgs",
+                "accounts",
+                shape_err.diagnostic_message(),
+            ),
+            (
+                &attr_err,
+                "loc-d",
+                "orgs",
+                "account",
+                attr_err.diagnostic_message(),
+            ),
+        ];
+        for (d, expected_location, expected_binding, expected_field, expected_message) in cases {
+            assert_eq!(d.location(), expected_location);
+            assert_eq!(d.binding(), expected_binding);
+            assert_eq!(d.field(), expected_field);
+            assert_eq!(d.diagnostic_message(), expected_message);
+            // `Display` supertrait must produce the canonical
+            // `"location: message"` form — the CLI's combined-error
+            // path relies on this format.
+            assert_eq!(
+                d.to_string(),
+                format!("{}: {}", d.location(), d.diagnostic_message())
+            );
+        }
     }
 }
