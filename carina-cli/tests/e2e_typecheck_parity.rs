@@ -105,6 +105,13 @@ fn cli_diagnostics(factories: Vec<Box<dyn ProviderFactory>>, fixture: &TempDir) 
     carina_cli::commands::validate::validate_with_factories(&path, factories)
 }
 
+// NOTE: case-sensitive `contains`. LSP and CLI surfaces sometimes
+// differ in casing (e.g. "Type mismatch" vs "type mismatch") because
+// some diagnostics originate in carina-lsp and others in carina-core.
+// When an assertion needs to bind to both surfaces uniformly use
+// `lsp_messages_contain_ci` / `cli_messages_contain_ci` below — a
+// case-sensitive miss against one surface silently makes the assertion
+// half-empty.
 fn lsp_messages_contain(diags: &[tower_lsp::lsp_types::Diagnostic], substring: &str) -> bool {
     diags.iter().any(|d| d.message.contains(substring))
 }
@@ -122,6 +129,25 @@ fn lsp_messages_count(diags: &[tower_lsp::lsp_types::Diagnostic], substring: &st
 
 fn cli_messages_count(diags: &[String], substring: &str) -> usize {
     diags.iter().filter(|m| m.contains(substring)).count()
+}
+
+// LSP and CLI diagnostic wording differs in casing — LSP says
+// "Type mismatch" (capital T) while CLI says "type mismatch". A
+// case-sensitive `contains` against either spelling silently misses
+// the other side. Use lowercase comparisons when the assertion needs
+// to bind to both surfaces uniformly.
+fn lsp_messages_contain_ci(diags: &[tower_lsp::lsp_types::Diagnostic], substring: &str) -> bool {
+    let needle = substring.to_ascii_lowercase();
+    diags
+        .iter()
+        .any(|d| d.message.to_ascii_lowercase().contains(&needle))
+}
+
+fn cli_messages_contain_ci(diags: &[String], substring: &str) -> bool {
+    let needle = substring.to_ascii_lowercase();
+    diags
+        .iter()
+        .any(|m| m.to_ascii_lowercase().contains(&needle))
 }
 
 // ============================================================================
@@ -980,6 +1006,229 @@ awsccmock.ec2.subnet {
     assert_eq!(
         bad_count, 2,
         "CLI must report a diagnostic per bad list item, got {:?}",
+        cli_diags,
+    );
+}
+
+// ============================================================================
+// Scenario: generic-String → specific Custom downcast (#2358)
+//
+// `vpc_id: String = main.vpc_id` declares a `String`-typed export of a
+// value whose actual type is `Custom { semantic_name: VpcId }`. The
+// declaration drops the specific identity, so any downstream consumer
+// receives `String` and can no longer be type-checked against a
+// `Custom { VpcId }` receiver. Validation, LSP diagnostics, and
+// completion must all reject the unsafe direction (`TypeExpr::String`
+// against a Custom-with-`semantic_name` receiver) while keeping the
+// safe direction (specific Custom export → same Custom receiver) and
+// literal-value assignment (`vpc_id = 'vpc-12345678'`) working.
+// ============================================================================
+
+// `vpc-` prefix validator — mirrors how the awscc plugin attaches its
+// real `prefixed` validators. Used by #2358 fixtures so the literal-
+// assignment test can prove the schema-attached `validate` closure
+// actually runs (a noop validator would let the test pass for the
+// wrong reason).
+fn vpc_id_validate_2358(v: &Value) -> Result<(), String> {
+    match v {
+        Value::String(s) if s.starts_with("vpc-") => Ok(()),
+        Value::String(s) => Err(format!("Invalid vpc_id '{}': must start with 'vpc-'", s)),
+        _ => Ok(()),
+    }
+}
+
+fn vpc_id_custom_type_2358() -> AttributeType {
+    AttributeType::Custom {
+        semantic_name: Some("VpcId".to_string()),
+        pattern: None,
+        length: None,
+        base: Box::new(AttributeType::String),
+        validate: legacy_validator(vpc_id_validate_2358),
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
+fn vpc_resource_schema_2358() -> ResourceSchema {
+    ResourceSchema::new("ec2.Vpc")
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
+        .attribute(AttributeSchema::new("vpc_id", vpc_id_custom_type_2358()))
+}
+
+fn security_group_schema_2358() -> ResourceSchema {
+    ResourceSchema::new("ec2.SecurityGroup")
+        .attribute(AttributeSchema::new(
+            "group_description",
+            AttributeType::String,
+        ))
+        .attribute(AttributeSchema::new("vpc_id", vpc_id_custom_type_2358()))
+}
+
+fn schemas_2358() -> SchemaRegistry {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc2358", vpc_resource_schema_2358());
+    schemas.insert("awscc2358", security_group_schema_2358());
+    schemas
+}
+
+fn factories_2358() -> Vec<Box<dyn ProviderFactory>> {
+    vec![Box::new(WasmStyleProviderFactory {
+        name: "awscc2358".to_string(),
+        schemas: vec![vpc_resource_schema_2358(), security_group_schema_2358()],
+    }) as Box<dyn ProviderFactory>]
+}
+
+fn engine_2358() -> DiagnosticEngine {
+    DiagnosticEngine::new(
+        Arc::new(schemas_2358()),
+        vec!["awscc2358".to_string()],
+        Arc::new(factories_2358()),
+    )
+}
+
+#[test]
+fn export_string_annotation_of_custom_value_rejected_parity() {
+    // The export declares `: String` but the rhs `main.vpc_id` carries
+    // type `Custom { VpcId }`. The export's narrowed declaration is the
+    // unsafe step — both validate and LSP diagnostics must surface a
+    // type-mismatch error here.
+    let fixture = write_fixture(&[(
+        "main.crn",
+        r#"
+let main = awscc2358.ec2.Vpc {
+    cidr_block = "10.0.0.0/16"
+}
+
+exports {
+    vpc_id: String = main.vpc_id
+}
+"#,
+    )]);
+
+    let lsp_diags = lsp_diagnostics(&engine_2358(), &fixture, "main.crn");
+    let cli_diags = cli_diagnostics(factories_2358(), &fixture);
+
+    // Pin both that the export name (`vpc_id`) appears in the message
+    // *and* that the carina-core mismatch wording surfaces verbatim
+    // ("expected String, got VpcId"). The two surfaces share the same
+    // format string from carina-core, so case-insensitive `mismatch`
+    // catches both `"type mismatch"` and any future `"Type mismatch"`.
+    assert!(
+        lsp_messages_contain(&lsp_diags, "vpc_id")
+            && lsp_messages_contain_ci(&lsp_diags, "mismatch")
+            && lsp_messages_contain(&lsp_diags, "VpcId"),
+        "LSP must diagnose generic-String export of Custom-typed value, got {:?}",
+        lsp_diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+    );
+    assert!(
+        cli_messages_contain(&cli_diags, "vpc_id")
+            && cli_messages_contain_ci(&cli_diags, "mismatch")
+            && cli_messages_contain(&cli_diags, "VpcId"),
+        "CLI must diagnose generic-String export of Custom-typed value, got {:?}",
+        cli_diags,
+    );
+}
+
+#[test]
+fn export_vpcid_annotation_of_custom_value_accepted_parity() {
+    // Safe direction: the export declares `: VpcId`, matching the
+    // rhs's actual type. Both validate and LSP must stay quiet.
+    let fixture = write_fixture(&[(
+        "main.crn",
+        r#"
+let main = awscc2358.ec2.Vpc {
+    cidr_block = "10.0.0.0/16"
+}
+
+exports {
+    vpc_id: VpcId = main.vpc_id
+}
+"#,
+    )]);
+
+    let lsp_diags = lsp_diagnostics(&engine_2358(), &fixture, "main.crn");
+    let cli_diags = cli_diagnostics(factories_2358(), &fixture);
+
+    assert!(
+        !lsp_messages_contain_ci(&lsp_diags, "mismatch"),
+        "LSP must not flag a same-type export as a mismatch, got {:?}",
+        lsp_diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+    );
+    assert!(
+        !cli_messages_contain_ci(&cli_diags, "mismatch"),
+        "CLI must not flag a same-type export as a mismatch, got {:?}",
+        cli_diags,
+    );
+}
+
+#[test]
+fn literal_valid_string_assignment_to_custom_receiver_still_validates() {
+    // Existing `awscc.ec2.SecurityGroup { vpc_id = 'vpc-12345678' }`
+    // pattern remains valid: a literal string in source becomes
+    // `Value::String(...)`, which validation handles via the schema-
+    // attached `validate` closure on the Custom type — not via
+    // `is_type_expr_compatible_with_schema`. The strictness fix must
+    // not regress this path.
+    //
+    // The fixture's validator requires a `vpc-` prefix; a well-formed
+    // value must pass. Paired with the malformed-literal test below
+    // this proves the `validate` closure is actually being run (a
+    // silent noop validator would let either test pass for the wrong
+    // reason).
+    let fixture = write_fixture(&[(
+        "main.crn",
+        r#"
+awscc2358.ec2.SecurityGroup {
+    group_description = "web sg"
+    vpc_id            = "vpc-12345678"
+}
+"#,
+    )]);
+
+    let lsp_diags = lsp_diagnostics(&engine_2358(), &fixture, "main.crn");
+    let cli_diags = cli_diagnostics(factories_2358(), &fixture);
+
+    assert!(
+        !lsp_messages_contain_ci(&lsp_diags, "vpc_id"),
+        "LSP must not flag a well-formed literal vpc_id, got {:?}",
+        lsp_diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+    );
+    assert!(
+        !cli_messages_contain_ci(&cli_diags, "vpc_id"),
+        "CLI must not flag a well-formed literal vpc_id, got {:?}",
+        cli_diags,
+    );
+}
+
+#[test]
+fn literal_malformed_string_assignment_still_runs_attached_validator() {
+    // Companion to the well-formed test above. A malformed literal
+    // (`'bad'` — no `vpc-` prefix) must trip the schema-attached
+    // `validate` closure and surface in both surfaces. Together the
+    // pair proves the literal-assignment path is genuinely intact:
+    // the well-formed test is meaningful only because this one shows
+    // the validator can fail.
+    let fixture = write_fixture(&[(
+        "main.crn",
+        r#"
+awscc2358.ec2.SecurityGroup {
+    group_description = "web sg"
+    vpc_id            = "bad"
+}
+"#,
+    )]);
+
+    let lsp_diags = lsp_diagnostics(&engine_2358(), &fixture, "main.crn");
+    let cli_diags = cli_diagnostics(factories_2358(), &fixture);
+
+    assert!(
+        lsp_messages_contain_ci(&lsp_diags, "vpc-"),
+        "LSP must surface the vpc_id validator's prefix complaint, got {:?}",
+        lsp_diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+    );
+    assert!(
+        cli_messages_contain_ci(&cli_diags, "vpc-"),
+        "CLI must surface the vpc_id validator's prefix complaint, got {:?}",
         cli_diags,
     );
 }
