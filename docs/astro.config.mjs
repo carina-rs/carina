@@ -15,9 +15,11 @@ export default defineConfig({
   integrations: [
     starlight({
       title: 'Carina',
+      disable404Route: true,
       components: {
         Hero: './src/components/Hero.astro',
         Head: './src/components/Head.astro',
+        Footer: './src/components/Footer.astro',
       },
       favicon: '/favicon.png',
       head: [],

@@ -1,0 +1,141 @@
+---
+import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
+---
+
+<StarlightPage
+  frontmatter={{
+    title: '404 — Off the chart',
+    template: 'splash',
+    pagefind: false,
+  }}
+>
+  <div class="lost-stage">
+    <span class="nav-star" style="top:8%; left:12%;"></span>
+    <span class="nav-star" style="top:14%; left:78%;"></span>
+    <span class="nav-star bright" style="top:22%; left:30%;"></span>
+    <span class="nav-star" style="top:28%; left:64%;"></span>
+    <span class="nav-star" style="top:42%; left:8%;"></span>
+    <span class="nav-star bright" style="top:48%; left:88%;"></span>
+    <span class="nav-star" style="top:60%; left:18%;"></span>
+    <span class="nav-star" style="top:68%; left:72%;"></span>
+    <span class="nav-star bright" style="top:78%; left:42%;"></span>
+    <span class="nav-star" style="top:84%; left:26%;"></span>
+    <span class="nav-star" style="top:88%; left:82%;"></span>
+    <span class="nav-star" style="top:18%; left:48%;"></span>
+    <span class="nav-star" style="top:90%; left:14%;"></span>
+    <span class="nav-star" style="top:6%; left:62%;"></span>
+
+    <p class="lost-eyebrow">Lost in the constellation</p>
+    <h1 class="lost-title">404 — Off the chart</h1>
+    <p class="lost-sub">This star is not on our map. Maybe it drifted, or maybe it never existed.</p>
+
+    <div class="lost-actions">
+      <a href="/" class="lost-btn primary">Back to Carina</a>
+      <a href="https://github.com/carina-rs/carina/issues" class="lost-btn secondary">Report it</a>
+    </div>
+
+    <p class="lost-mono">CARINA · α <span class="accent">CANOPUS</span> · MAG -0.74</p>
+  </div>
+</StarlightPage>
+
+<style>
+  .lost-stage {
+    position: relative;
+    min-height: 60vh;
+    padding: 4rem 1.5rem;
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background:
+      radial-gradient(ellipse 60% 50% at 50% 35%, rgba(251, 191, 36, 0.08) 0%, transparent 60%),
+      radial-gradient(ellipse 80% 60% at 50% 100%, rgba(8, 145, 178, 0.06) 0%, transparent 70%);
+  }
+
+  .nav-star {
+    position: absolute;
+    width: 2px;
+    height: 2px;
+    border-radius: 50%;
+    background: var(--sl-color-gray-5);
+    pointer-events: none;
+  }
+  .nav-star.bright {
+    width: 3px;
+    height: 3px;
+    background: #fde68a;
+    box-shadow: 0 0 6px #fde68a;
+  }
+
+  .lost-eyebrow {
+    font-family: var(--carina-font-display, var(--sl-font));
+    font-size: var(--sl-text-xs);
+    font-weight: 700;
+    letter-spacing: 0.28em;
+    text-transform: uppercase;
+    color: #fbbf24;
+    margin: 0 0 1rem;
+    z-index: 1;
+  }
+
+  .lost-title {
+    font-family: var(--carina-font-display, var(--sl-font));
+    font-size: clamp(2rem, 6vw, 3.5rem);
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    color: var(--sl-color-white);
+    margin: 0 0 0.875rem;
+    z-index: 1;
+  }
+
+  .lost-sub {
+    font-size: var(--sl-text-base);
+    color: var(--sl-color-gray-3);
+    margin: 0 0 1.75rem;
+    max-width: 32rem;
+    z-index: 1;
+  }
+
+  .lost-actions {
+    display: flex;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+    justify-content: center;
+    z-index: 1;
+  }
+
+  .lost-btn {
+    padding: 0.5rem 1.125rem;
+    border-radius: 0.375rem;
+    font-size: var(--sl-text-sm);
+    font-weight: 600;
+    text-decoration: none;
+    transition: background-color 0.15s, border-color 0.15s, color 0.15s;
+  }
+
+  .lost-btn.primary {
+    background: #fbbf24;
+    color: #0f172a;
+  }
+  .lost-btn.primary:hover { background: #fde68a; }
+
+  .lost-btn.secondary {
+    border: 1px solid #475569;
+    color: var(--sl-color-gray-3);
+  }
+  .lost-btn.secondary:hover {
+    border-color: #64748b;
+    color: var(--sl-color-white);
+  }
+
+  .lost-mono {
+    margin-top: 1.75rem;
+    font-family: var(--__sl-font-mono);
+    font-size: 0.6875rem;
+    color: var(--sl-color-gray-5);
+    letter-spacing: 0.1em;
+    z-index: 1;
+  }
+  .lost-mono .accent { color: #fbbf24; }
+</style>

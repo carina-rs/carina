@@ -541,3 +541,16 @@ input.pagefind-ui__search-input:focus {
   --carina-aside-accent: #f87171;
   --carina-aside-bg: color-mix(in oklab, #f87171 9%, var(--sl-color-bg));
 }
+
+/* ============================================================
+   Sidebar — active item contrast fix
+   The active sidebar link uses a gold background; text must
+   be dark navy for readability instead of white.
+   ============================================================ */
+
+.sidebar-pane a[aria-current="page"],
+.sidebar-pane a[aria-current="page"]:hover,
+.sidebar-pane a[aria-current="page"]:focus {
+  color: #0f172a !important;
+  font-weight: 600;
+}
