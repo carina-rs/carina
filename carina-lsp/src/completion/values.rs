@@ -126,24 +126,57 @@ impl CompletionProvider {
             );
         }
 
-        // Type-based resource reference completions:
-        // Look up the attribute's type from the schema. If it's a Custom type,
-        // find bindings whose resource schema has an attribute with the same Custom type name.
+        // Cache resolved upstream `exports` maps for the lifetime of this
+        // call. The upstream-binding REFERENCE pass below and the
+        // for-binding type-inference pass further down both call
+        // `resolve_upstream_exports`, which re-parses the upstream
+        // directory on each invocation — sharing one cache holds the
+        // cost to a single parse per upstream binding per keystroke.
+        let upstream_sources = super::collect_upstream_state_bindings(src);
+        let mut exports_cache: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, Option<carina_core::parser::TypeExpr>>,
+        > = std::collections::HashMap::new();
+
+        // Type-based reference completions: walk every binding in scope and
+        // emit `<binding>.<field>` candidates whose type matches the target
+        // attribute. Two binding sources contribute, sharing the same
+        // schema lookup but using different matching strategies:
+        //
+        //   - Resource bindings: each binding's resource schema is queried
+        //     directly. A field is offered when its `Custom`-type name
+        //     equals the target attribute's `Custom`-type name. This is a
+        //     string compare — adequate because both ends sit inside the
+        //     compiled provider schema and share a closed type vocabulary.
+        //
+        //   - `upstream_state` bindings (#2353): exports are declared by
+        //     the user with a `TypeExpr` that lives in a different type
+        //     system than the schema's `AttributeType`, so name equality
+        //     does not apply. `is_type_expr_compatible_with_schema`
+        //     bridges the two — it walks `Custom` base chains and accepts
+        //     structural shapes (list/map/struct), so e.g. an export
+        //     declared `: String` matches a schema attribute typed
+        //     `Custom { semantic_name: "Arn", base: String, .. }`.
+        //
+        // Resource bindings skip self-references (`current_binding`) because
+        // their own attributes are accessible by bare attribute name within
+        // the block. Upstream bindings have no such bare-name shortcut — the
+        // only way to reference an export is `<binding>.<export>` — and a
+        // resource block being edited can never be an `upstream_state`
+        // block (the dispatcher routes those through
+        // `InsideUpstreamStateBlock`), so the self-skip is unreachable
+        // for upstream bindings and intentionally omitted.
         if let Some(schema) = self.lookup_schema(resource_type)
             && let Some(attr_schema) = schema.attributes.get(attr_name)
         {
-            let target_type_name = Self::extract_custom_type_name(&attr_schema.attr_type);
-            if let Some(target_name) = target_type_name {
+            if let Some(target_name) = Self::extract_custom_type_name(&attr_schema.attr_type) {
                 for (binding_name, binding_resource_type) in &self.extract_resource_bindings(src) {
                     if binding_resource_type.is_empty() {
                         continue;
                     }
-                    // Skip self-references: don't suggest the current resource's own binding
                     if current_binding.is_some_and(|cb| cb == binding_name) {
                         continue;
                     }
-                    // Look up the binding's resource schema and find attributes
-                    // with matching Custom type name
                     if let Some(binding_schema) = self.lookup_schema(binding_resource_type) {
                         for binding_attr in binding_schema.attributes.values() {
                             if let Some(binding_type_name) =
@@ -169,6 +202,37 @@ impl CompletionProvider {
                             }
                         }
                     }
+                }
+            }
+
+            for (binding, source) in &upstream_sources {
+                let exports =
+                    resolve_upstream_exports_cached(binding, source, base_path, &mut exports_cache);
+                for (export_name, export_type) in exports {
+                    let Some(export_type) = export_type else {
+                        continue;
+                    };
+                    if !carina_core::validation::is_type_expr_compatible_with_schema(
+                        export_type,
+                        &attr_schema.attr_type,
+                    ) {
+                        continue;
+                    }
+                    let full_ref = format!("{}.{}", binding, export_name);
+                    completions.push(CompletionItem {
+                        label: full_ref.clone(),
+                        kind: Some(CompletionItemKind::REFERENCE),
+                        detail: Some(format!(
+                            "export from upstream_state `{}` ({})",
+                            binding,
+                            self.format_type_expr(export_type)
+                        )),
+                        text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                            range: ref_edit_range,
+                            new_text: full_ref,
+                        })),
+                        ..Default::default()
+                    });
                 }
             }
         }
@@ -199,19 +263,6 @@ impl CompletionProvider {
             .and_then(|s| s.attributes.get(attr_name))
             .map(|a| &a.attr_type);
         let for_bindings = super::top_level::extract_for_bindings_in_scope(text, position);
-        // Cache the resolved exports per upstream. Without this, each
-        // for-binding re-parses the upstream project every keystroke.
-        // The sibling scan itself reuses the already-resolved `src`.
-        let upstream_sources: std::collections::HashMap<String, String> =
-            if for_bindings.iter().any(|b| b.iterable.is_some()) {
-                super::collect_upstream_state_bindings(src)
-            } else {
-                std::collections::HashMap::new()
-            };
-        let mut exports_cache: std::collections::HashMap<
-            String,
-            std::collections::HashMap<String, Option<carina_core::parser::TypeExpr>>,
-        > = std::collections::HashMap::new();
         for binding in &for_bindings {
             if let Some(attr_type) = attr_type_for_for_filter
                 && let Some(element_type) = infer_for_binding_type(
@@ -1201,6 +1252,10 @@ impl CompletionProvider {
 /// directory has no export entry for `binding`. Both depth-1 and
 /// depth-2 dot completion build on this — they only differ in how
 /// they consume the resulting map.
+///
+/// Use [`resolve_upstream_exports_cached`] instead when calling from
+/// `value_completions_for_attr`, which has multiple consumers and pays
+/// for re-parsing without a shared cache.
 fn resolve_upstream_export_keys(
     binding: &str,
     source: &str,
@@ -1217,6 +1272,33 @@ fn resolve_upstream_export_keys(
         &Default::default(),
     );
     exports.remove(binding)
+}
+
+/// Cached variant of [`resolve_upstream_export_keys`] for use inside a
+/// single `value_completions_for_attr` call. Differences from the
+/// non-cached form:
+///
+/// - **Returns `&HashMap`, never `None`.** A failed resolution (missing
+///   `base_path`, missing source directory, parse error) is collapsed
+///   to an empty map so callers can iterate uniformly with the
+///   resolved-but-empty case. Callers that need to distinguish failure
+///   from "resolved with zero exports" must use [`resolve_upstream_export_keys`].
+/// - **Caches per binding name.** A failed lookup poisons the cache
+///   entry to an empty map for the lifetime of the call, which is
+///   intentional — every keystroke creates a fresh cache, and re-trying
+///   the same failing parse mid-call would be wasted work.
+fn resolve_upstream_exports_cached<'a>(
+    binding: &str,
+    source: &str,
+    base_path: Option<&Path>,
+    cache: &'a mut std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, Option<carina_core::parser::TypeExpr>>,
+    >,
+) -> &'a std::collections::HashMap<String, Option<carina_core::parser::TypeExpr>> {
+    cache.entry(binding.to_string()).or_insert_with(|| {
+        resolve_upstream_export_keys(binding, source, base_path).unwrap_or_default()
+    })
 }
 
 /// Infer the static type of a for-loop binding by resolving its iterable
