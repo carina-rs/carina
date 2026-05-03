@@ -268,6 +268,7 @@ pub fn validate_attribute_param_ref_types(
 pub fn validate_export_param_ref_types(
     export_params: &[crate::parser::ExportParameter],
     resources: &[Resource],
+    upstream_states: &[crate::parser::UpstreamState],
     registry: &SchemaRegistry,
 ) -> Result<(), String> {
     let mut binding_map: HashMap<String, &Resource> = HashMap::new();
@@ -276,19 +277,43 @@ pub fn validate_export_param_ref_types(
             binding_map.insert(binding_name.clone(), resource);
         }
     }
+    // The inference helper consults both resource bindings and
+    // `upstream_state` bindings — the latter tagged so the inferer
+    // can distinguish "known but non-inferable" from a typo. Their
+    // export's type is resolved by the consumer-side typecheck
+    // instead of here.
+    let inference_bindings = inference::bindings_from_parts(resources, upstream_states);
 
     let mut errors = Vec::new();
 
     for param in export_params {
-        let Some(ref type_expr) = param.type_expr else {
-            continue;
-        };
         let Some(ref value) = param.value else {
             continue;
         };
 
+        // Resolve the effective type — explicit annotation wins; if
+        // omitted, infer from rhs. Inference failure surfaces as a
+        // "type annotation required" error so the unannotated +
+        // un-inferable shape can no longer slip through (#2361).
+        let effective_type = match inference::infer_type_expr(
+            param.type_expr.as_ref(),
+            param.value.as_ref(),
+            &inference_bindings,
+            registry,
+        ) {
+            Ok(Some(t)) => t,
+            Ok(None) => continue,
+            Err(reason) => {
+                errors.push(format!(
+                    "export '{}': type annotation required: {}",
+                    param.name, reason
+                ));
+                continue;
+            }
+        };
+
         collect_ref_type_errors(
-            type_expr,
+            &effective_type,
             value,
             &param.name,
             &binding_map,
@@ -867,6 +892,8 @@ fn validate_struct_fields(
     }
     None
 }
+
+pub mod inference;
 
 #[cfg(test)]
 mod tests;

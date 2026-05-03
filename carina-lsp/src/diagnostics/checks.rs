@@ -421,11 +421,13 @@ impl DiagnosticEngine {
         merged: &ParsedFile,
         base_path: &std::path::Path,
     ) -> Vec<Diagnostic> {
-        let (exports, resolve_errors) = carina_core::upstream_exports::resolve_upstream_exports(
-            base_path,
-            &merged.upstream_states,
-            &self.provider_context,
-        );
+        let (exports, resolve_errors) =
+            carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
+                base_path,
+                &merged.upstream_states,
+                &self.provider_context,
+                Some(&self.schemas),
+            );
 
         let mut diagnostics = Vec::new();
         let text = doc.text();
@@ -1273,6 +1275,7 @@ impl DiagnosticEngine {
         if let Err(ref_errors) = carina_core::validation::validate_export_param_ref_types(
             &parsed.export_params,
             resources,
+            &parsed.upstream_states,
             &self.schemas,
         ) {
             for error_msg in ref_errors.split('\n') {

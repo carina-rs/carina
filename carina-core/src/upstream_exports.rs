@@ -160,6 +160,22 @@ pub fn resolve_upstream_exports(
     upstream_states: &[UpstreamState],
     config: &ProviderContext,
 ) -> (UpstreamExports, Vec<UpstreamResolveError>) {
+    resolve_upstream_exports_with_schemas(base_dir, upstream_states, config, None)
+}
+
+/// As [`resolve_upstream_exports`], but consult `schemas` to infer
+/// missing `type_expr` annotations from each export's rhs (#2361).
+/// When `schemas` is `None` the behavior is identical to the legacy
+/// entry point — the export's `type_expr` is forwarded as-is. Production
+/// callers (CLI validate, LSP diagnostics, LSP completion) thread the
+/// real schema registry so unannotated exports become typed before
+/// downstream type-checks see them.
+pub fn resolve_upstream_exports_with_schemas(
+    base_dir: &Path,
+    upstream_states: &[UpstreamState],
+    config: &ProviderContext,
+    schemas: Option<&crate::schema::SchemaRegistry>,
+) -> (UpstreamExports, Vec<UpstreamResolveError>) {
     let mut out: UpstreamExports = HashMap::new();
     let mut errors: Vec<UpstreamResolveError> = Vec::new();
     for us in upstream_states {
@@ -173,10 +189,36 @@ pub fn resolve_upstream_exports(
         }
         match parse_directory(&source_abs, config) {
             Ok(parsed) => {
+                // Infer-on-failure semantics here are deliberate: any
+                // inference error is silently dropped to `e.type_expr`
+                // (often `None` itself). The downstream consumer's
+                // typecheck is what surfaces a "type annotation
+                // required" diagnostic — the upstream's own validate
+                // run (via `validate_export_param_ref_types`) already
+                // gates the upstream side, so re-emitting the same
+                // error from this resolver would double-report.
+                let bindings =
+                    schemas.map(|_| crate::validation::inference::bindings_from_parsed(&parsed));
                 let keys: HashMap<String, Option<TypeExpr>> = parsed
                     .export_params
                     .iter()
-                    .map(|e| (e.name.clone(), e.type_expr.clone()))
+                    .map(|e| {
+                        let inferred = match (schemas, bindings.as_ref()) {
+                            (Some(s), Some(b)) => crate::validation::inference::infer_type_expr(
+                                e.type_expr.as_ref(),
+                                e.value.as_ref(),
+                                b,
+                                s,
+                            )
+                            .ok()
+                            .flatten()
+                            .or_else(|| e.type_expr.clone()),
+                            // `schemas` is None (legacy entry point) —
+                            // forward the declared type unchanged.
+                            _ => e.type_expr.clone(),
+                        };
+                        (e.name.clone(), inferred)
+                    })
                     .collect();
                 out.insert(us.binding.clone(), keys);
             }
