@@ -1,6 +1,6 @@
 ---
 title: "awscc.logs.LogGroup"
-description: "AWSCC LOGS LogGroup resource reference"
+description: "AWSCC CloudWatch Logs LogGroup resource reference"
 ---
 
 
@@ -27,17 +27,9 @@ awscc.logs.LogGroup {
 
 ## Argument Reference
 
-### `bearer_token_authentication_enabled`
-
-- **Type:** Bool
-- **Required:** No
-- **Default:** `false`
-
-Indicates whether bearer token authentication is enabled for this log group. When enabled, bearer token authentication is allowed on operations until it is explicitly disabled.
-
 ### `data_protection_policy`
 
-- **Type:** Map(String)
+- **Type:** `Map<String, String>`
 - **Required:** No
 
 Creates a data protection policy and assigns it to the log group. A data protection policy can help safeguard sensitive data that's ingested by the log group by auditing and masking the sensitive log data. When a user who does not have permission to view masked data views a log event that includes masked data, the sensitive data is replaced by asterisks.
@@ -96,7 +88,7 @@ The number of days to retain the log events in the specified log group. Possible
 
 ### `tags`
 
-- **Type:** Map(String)
+- **Type:** `Map<String, String>`
 - **Required:** No
 
 An array of key-value pairs to apply to the log group. For more information, see [Tag](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-resource-tags.html).

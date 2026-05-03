@@ -1,6 +1,6 @@
 ---
 title: "awscc.organizations.Account"
-description: "AWSCC ORGANIZATIONS Account resource reference"
+description: "AWSCC Organizations Account resource reference"
 ---
 
 
@@ -42,7 +42,7 @@ The name of an IAM role that AWS Organizations automatically preconfigures in th
 
 ### `tags`
 
-- **Type:** Map(String)
+- **Type:** `Map<String, String>`
 - **Required:** No
 
 A list of tags that you want to attach to the newly created account. For each tag in the list, you must specify both a tag key and a value.

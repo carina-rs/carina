@@ -154,7 +154,7 @@ The hostname type for EC2 instances launched into this subnet and how DNS A and 
 
 ### `tags`
 
-- **Type:** Map(String)
+- **Type:** `Map<String, String>`
 - **Required:** No
 
 Any tags assigned to the subnet.

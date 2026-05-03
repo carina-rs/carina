@@ -1,6 +1,6 @@
 ---
 title: "awscc.sso.Instance"
-description: "AWSCC SSO Instance resource reference"
+description: "AWSCC IAM Identity Center Instance resource reference"
 ---
 
 
@@ -19,7 +19,7 @@ The name you want to assign to this Identity Center (SSO) Instance
 
 ### `tags`
 
-- **Type:** Map(String)
+- **Type:** `Map<String, String>`
 - **Required:** No
 
 ## Enum Values

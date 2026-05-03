@@ -52,7 +52,7 @@ The options for the transit gateway vpc attachment.
 
 ### `tags`
 
-- **Type:** Map(String)
+- **Type:** `Map<String, String>`
 - **Required:** No
 
 ### `transit_gateway_id`

@@ -82,7 +82,7 @@ awscc.ec2.TransitGateway {
 
 ### `tags`
 
-- **Type:** Map(String)
+- **Type:** `Map<String, String>`
 - **Required:** No
 
 ### `transit_gateway_cidr_blocks`

@@ -76,7 +76,7 @@ The netmask length of the IPv4 CIDR you want to allocate to this VPC from an Ama
 
 ### `tags`
 
-- **Type:** Map(String)
+- **Type:** `Map<String, String>`
 - **Required:** No
 
 The tags for the VPC.
