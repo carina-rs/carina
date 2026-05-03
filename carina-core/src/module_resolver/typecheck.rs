@@ -143,5 +143,9 @@ pub(super) fn check_type_match(
             }
             TypeCheckResult::Ok
         }
+        // Sentinel for failed inference (#2360 stage 2). Module signatures
+        // are user-declared and should never carry Unknown — reaching this
+        // arm is a defensive fallthrough, treated as a mismatch.
+        TypeExpr::Unknown => TypeCheckResult::Mismatch,
     }
 }

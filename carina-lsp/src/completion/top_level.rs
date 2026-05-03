@@ -386,6 +386,7 @@ impl CompletionProvider {
             }
             schema_type @ parser::TypeExpr::SchemaType { .. } => schema_type.to_string(),
             struct_type @ parser::TypeExpr::Struct { .. } => struct_type.to_string(),
+            parser::TypeExpr::Unknown => "<unknown>".to_string(),
         }
     }
 

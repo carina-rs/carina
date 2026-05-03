@@ -1270,12 +1270,30 @@ impl DiagnosticEngine {
             }
         }
 
-        // Schema-level ref type checking for ResourceRef values in exports
+        // Schema-level ref type checking for ResourceRef values in exports.
+        // `infer_export_params` borrows `parsed` (avoiding the per-keystroke
+        // deep clone the full `apply_inference` would force) so the LSP
+        // can derive the post-inference shape without rebuilding the
+        // whole `InferredFile`.
         let resources = all_resources.unwrap_or(&parsed.resources);
+        let (inferred_export_params, inference_errors) =
+            carina_core::validation::inference::infer_export_params(parsed, &self.schemas);
+        // Surface inference failures as "type annotation required"
+        // diagnostics, anchored at the export name.
+        for (name, err) in &inference_errors {
+            if let Some((line, col)) = self.find_exports_param_position(doc, name) {
+                diagnostics.push(carina_diagnostic(
+                    line,
+                    col,
+                    col + name.len() as u32,
+                    DiagnosticSeverity::WARNING,
+                    carina_core::validation::inference::format_inference_error(name, err),
+                ));
+            }
+        }
         if let Err(ref_errors) = carina_core::validation::validate_export_param_ref_types(
-            &parsed.export_params,
+            &inferred_export_params,
             resources,
-            &parsed.upstream_states,
             &self.schemas,
         ) {
             for error_msg in ref_errors.split('\n') {

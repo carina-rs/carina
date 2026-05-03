@@ -17,7 +17,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use carina_core::module_resolver;
-use carina_core::parser::{BackendConfig, ParsedFile, ProviderContext};
+use carina_core::parser::{BackendConfig, ProviderContext};
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 use carina_state::BackendLock;
 use carina_state::backend::BackendConfig as StateBackendConfig;
@@ -127,7 +127,7 @@ pub fn ensure_backend_lock(
 /// name resolution and identifier computation without full schema validation.
 #[allow(dead_code)] // Used by snapshot tests
 pub fn validate_and_resolve(
-    parsed: &mut ParsedFile,
+    parsed: &mut carina_core::parser::InferredFile,
     base_dir: &Path,
     skip_resource_validation: bool,
 ) -> Result<(), AppError> {
@@ -174,7 +174,7 @@ pub(crate) fn collapse_errors(errors: Vec<AppError>) -> AppError {
 }
 
 pub fn validate_and_resolve_with_config(
-    parsed: &mut ParsedFile,
+    parsed: &mut carina_core::parser::InferredFile,
     base_dir: &Path,
     skip_resource_validation: bool,
 ) -> Result<(), AppError> {
@@ -190,7 +190,7 @@ pub fn validate_and_resolve_with_config(
 /// uses it to fold findings into its own accumulator; the `Result`-returning
 /// wrapper above flushes through `collapse_errors` for the rest of the CLI.
 pub fn validate_and_resolve_errors(
-    parsed: &mut ParsedFile,
+    parsed: &mut carina_core::parser::InferredFile,
     base_dir: &Path,
     skip_resource_validation: bool,
 ) -> Vec<AppError> {
@@ -215,7 +215,7 @@ pub fn validate_and_resolve_errors(
 /// non-injecting wrapper above; this entry point is not used outside
 /// tests.
 pub fn validate_and_resolve_errors_with_factories(
-    parsed: &mut ParsedFile,
+    parsed: &mut carina_core::parser::InferredFile,
     base_dir: &Path,
     skip_resource_validation: bool,
     factories: Vec<Box<dyn carina_core::provider::ProviderFactory>>,
@@ -323,7 +323,6 @@ pub fn validate_and_resolve_errors_with_factories(
         if let Err(msg) = carina_core::validation::validate_export_param_ref_types(
             &parsed.export_params,
             &parsed.resources,
-            &parsed.upstream_states,
             ctx.schemas(),
         ) {
             errors.extend(split_validation_message(&msg));
@@ -443,7 +442,7 @@ mod tests {
     use carina_core::parser::ProviderConfig;
     use carina_core::resource::Value;
     use indexmap::IndexMap;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
     fn s3_backend_config(bucket: &str, region: &str) -> BackendConfig {
         let mut attributes = HashMap::new();
@@ -544,25 +543,8 @@ mod tests {
         assert!(result2.is_ok());
     }
 
-    fn empty_parsed_file() -> ParsedFile {
-        ParsedFile {
-            providers: vec![],
-            resources: vec![],
-            variables: IndexMap::new(),
-            uses: vec![],
-            module_calls: vec![],
-            arguments: vec![],
-            attribute_params: vec![],
-            export_params: vec![],
-            backend: None,
-            state_blocks: vec![],
-            user_functions: HashMap::new(),
-            upstream_states: vec![],
-            requires: vec![],
-            structural_bindings: HashSet::new(),
-            warnings: vec![],
-            deferred_for_expressions: vec![],
-        }
+    fn empty_parsed_file() -> carina_core::parser::InferredFile {
+        carina_core::parser::InferredFile::default()
     }
 
     #[test]
@@ -655,6 +637,7 @@ exports {
         let loaded = carina_core::config_loader::load_configuration_with_config(
             &base,
             &ProviderContext::default(),
+            &carina_core::schema::SchemaRegistry::new(),
         )
         .expect("load");
         let mut parsed = loaded.parsed;

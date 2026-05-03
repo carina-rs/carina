@@ -48,7 +48,12 @@ pub async fn run_destroy(
     reconfigure: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let mut parsed = load_configuration_with_config(path, provider_context)?.parsed;
+    let mut parsed = load_configuration_with_config(
+        path,
+        provider_context,
+        &carina_core::schema::SchemaRegistry::new(),
+    )?
+    .parsed;
 
     let base_dir = get_base_dir(path);
     validate_and_resolve_with_config(&mut parsed, base_dir, true)?;
@@ -127,7 +132,7 @@ pub async fn run_destroy(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_destroy_locked(
-    parsed: &mut carina_core::parser::ParsedFile,
+    parsed: &mut carina_core::parser::InferredFile,
     auto_approve: bool,
     backend: &dyn StateBackend,
     protected_bucket: Option<String>,

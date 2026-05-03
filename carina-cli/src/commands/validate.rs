@@ -53,7 +53,11 @@ pub fn validate_with_factories(
     factories: Vec<Box<dyn carina_core::provider::ProviderFactory>>,
 ) -> Vec<String> {
     let provider_context = ProviderContext::default();
-    let loaded = match load_configuration_with_config(path, &provider_context) {
+    let loaded = match load_configuration_with_config(
+        path,
+        &provider_context,
+        &carina_core::schema::SchemaRegistry::new(),
+    ) {
         Ok(l) => l,
         Err(e) => return vec![e.to_string()],
     };
@@ -67,6 +71,11 @@ pub fn validate_with_factories(
             .iter()
             .map(ToString::to_string),
     );
+    // Surface inference failures from `apply_inference` (#2360 stage 2).
+    // Each `Unknown` sentinel in `parsed.export_params` has a paired
+    // entry here; reporting the underlying reason gives the user the
+    // actionable "type annotation required" guidance.
+    error_reports.extend(format_inference_errors(&loaded.inference_errors));
 
     error_reports.extend(
         super::validate_and_resolve_errors_with_factories(
@@ -83,12 +92,29 @@ pub fn validate_with_factories(
     error_reports
 }
 
+/// Format `LoadedConfig.inference_errors` into "export '<name>': type
+/// annotation required: <reason>" strings via the shared
+/// `inference::format_inference_error` helper so the CLI and LSP keep
+/// emitting the same wording.
+fn format_inference_errors(
+    errors: &[(String, carina_core::validation::inference::InferenceError)],
+) -> Vec<String> {
+    errors
+        .iter()
+        .map(|(name, err)| carina_core::validation::inference::format_inference_error(name, err))
+        .collect()
+}
+
 pub fn run_validate(
     path: &PathBuf,
     json: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let loaded = load_configuration_with_config(path, provider_context)?;
+    let loaded = load_configuration_with_config(
+        path,
+        provider_context,
+        &carina_core::schema::SchemaRegistry::new(),
+    )?;
     let mut parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
@@ -103,6 +129,7 @@ pub fn run_validate(
             .iter()
             .map(ToString::to_string),
     );
+    error_reports.extend(format_inference_errors(&loaded.inference_errors));
     if let Err(AppError::Validation(msg)) =
         check_upstream_state_sources(base_dir, &parsed.upstream_states)
     {

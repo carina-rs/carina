@@ -436,7 +436,7 @@ fn format_duration_zero() {
 
 #[test]
 fn resolve_exports_resolves_cross_file_dot_notation_strings() {
-    use carina_core::parser::ExportParameter;
+    use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
     use carina_core::resource::Value;
     use carina_state::StateFile;
 
@@ -469,7 +469,7 @@ fn resolve_exports_resolves_cross_file_dot_notation_strings() {
     // the let binding in main.crn, so the parser emits a plain string)
     let export_params = vec![ExportParameter {
         name: "account_id".to_string(),
-        type_expr: None,
+        type_expr: TypeExpr::Unknown,
         value: Some(Value::String("registry_prod.account_id".to_string())),
     }];
 

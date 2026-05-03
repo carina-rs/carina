@@ -39,7 +39,6 @@
 //! }
 //! ```
 
-use crate::parser::ParsedFile;
 use crate::resource::{Resource, ResourceId, State, Value};
 use crate::schema::{ResourceSchema, SchemaRegistry};
 use std::collections::HashMap;
@@ -77,7 +76,10 @@ impl<'a> BindingIndex<'a> {
     /// skipped — callers (validation / LSP) treat unknown resource types
     /// as a separate diagnostic, so reporting them again here would
     /// double-count.
-    pub fn from_parsed(parsed: &'a ParsedFile, registry: &'a SchemaRegistry) -> Self {
+    pub fn from_parsed<E>(
+        parsed: &'a crate::parser::File<E>,
+        registry: &'a SchemaRegistry,
+    ) -> Self {
         let mut entries = HashMap::new();
         let mut known_names = std::collections::HashSet::new();
         // Walk top-level resources only. The parser auto-generates a
@@ -210,7 +212,7 @@ impl BindingNameSet {
     /// — keeps `Variable` last because `parsed.variables` is the
     /// catch-all "any `let`-RHS placeholder lives here" map, while the
     /// preceding sources are narrower declaration forms.
-    pub fn from_parsed(parsed: &ParsedFile) -> Self {
+    pub fn from_parsed<E>(parsed: &crate::parser::File<E>) -> Self {
         let mut by_name: HashMap<String, BindingNameKind> = HashMap::new();
 
         for resource in &parsed.resources {
@@ -910,7 +912,7 @@ mod resolved_bindings_tests {
 #[cfg(test)]
 mod binding_name_set_tests {
     use super::*;
-    use crate::parser::parse;
+    use crate::parser::{ParsedFile, parse};
 
     fn parsed_with(src: &str) -> ParsedFile {
         parse(src, &Default::default()).expect("parse")

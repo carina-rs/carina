@@ -335,7 +335,7 @@ pub(crate) async fn persist_exports_only(
     backend: &dyn StateBackend,
     lock: Option<&LockInfo>,
     state_file: Option<StateFile>,
-    export_params: &[carina_core::parser::ExportParameter],
+    export_params: &[carina_core::parser::InferredExportParam],
 ) -> Result<(), AppError> {
     let mut state = state_file.unwrap_or_default();
     let exports = resolve_exports(export_params, &state);
@@ -463,7 +463,11 @@ pub async fn run_apply(
     reconfigure: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let loaded = load_configuration_with_config(path, provider_context)?;
+    let loaded = load_configuration_with_config(
+        path,
+        provider_context,
+        &carina_core::schema::SchemaRegistry::new(),
+    )?;
     let mut parsed = loaded.parsed;
     let backend_file = loaded.backend_file;
 
@@ -621,7 +625,12 @@ pub async fn run_apply(
                     );
 
                     // Re-parse the updated configuration to include the new resource
-                    parsed = load_configuration_with_config(path, provider_context)?.parsed;
+                    parsed = load_configuration_with_config(
+                        path,
+                        provider_context,
+                        &carina_core::schema::SchemaRegistry::new(),
+                    )?
+                    .parsed;
                     if let Err(e) = module_resolver::resolve_modules_with_config(
                         &mut parsed,
                         get_base_dir(path),
@@ -706,7 +715,7 @@ pub async fn run_apply(
 
 async fn run_apply_locked(
     ctx: &WiringContext,
-    parsed: &mut carina_core::parser::ParsedFile,
+    parsed: &mut carina_core::parser::InferredFile,
     auto_approve: bool,
     backend: &dyn StateBackend,
     lock: Option<&LockInfo>,

@@ -26,7 +26,12 @@ struct LintWarning {
 }
 
 pub fn run_lint(path: &PathBuf, provider_context: &ProviderContext) -> Result<(), AppError> {
-    let mut parsed = load_configuration_with_config(path, provider_context)?.parsed;
+    let mut parsed = load_configuration_with_config(
+        path,
+        provider_context,
+        &carina_core::schema::SchemaRegistry::new(),
+    )?
+    .parsed;
 
     let base_dir = get_base_dir(path);
 
@@ -202,8 +207,8 @@ pub fn run_lint(path: &PathBuf, provider_context: &ProviderContext) -> Result<()
 /// `import net = './modules/network'` uses alias `net` but dir `network`).
 /// Modules are directory-scoped (#1997), so only directory imports that are
 /// actually called from the root config are scanned.
-fn collect_tag_keys_from_modules(
-    parsed: &carina_core::parser::ParsedFile,
+fn collect_tag_keys_from_modules<E>(
+    parsed: &carina_core::parser::File<E>,
     base_dir: &std::path::Path,
 ) -> Vec<(PathBuf, TagKeyEntry)> {
     let aliases_used: HashSet<&str> = parsed

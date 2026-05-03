@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::parser::{ParsedFile, ResourceTypePath, TypeExpr};
+use crate::parser::{ResourceTypePath, TypeExpr};
 use crate::resource::Value;
 
 /// Dependency between resources
@@ -334,7 +334,7 @@ pub struct ModuleCallInfo {
 
 impl RootConfigSignature {
     /// Build a root config signature from a parsed file
-    pub fn from_parsed_file(parsed: &ParsedFile, file_name: &str) -> Self {
+    pub fn from_parsed_file<E>(parsed: &crate::parser::File<E>, file_name: &str) -> Self {
         // Build imports
         let imports: Vec<ImportInfo> = parsed
             .uses
@@ -666,7 +666,7 @@ impl FileSignature {
     /// Create from a parsed file
     /// For directory-based modules (files with top-level arguments/attributes blocks),
     /// the module name is derived from the directory name or file name.
-    pub fn from_parsed_file(parsed: &ParsedFile, file_name: &str) -> Self {
+    pub fn from_parsed_file<E>(parsed: &crate::parser::File<E>, file_name: &str) -> Self {
         // Check for directory-based module (has top-level arguments or attribute_params)
         if !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty() {
             return FileSignature::Module(ModuleSignature::from_directory_module(
@@ -680,7 +680,10 @@ impl FileSignature {
 
     /// Create from a parsed file with a specific module name
     /// Use this when you know the module name (e.g., from directory structure)
-    pub fn from_parsed_file_with_name(parsed: &ParsedFile, module_name: &str) -> Self {
+    pub fn from_parsed_file_with_name<E>(
+        parsed: &crate::parser::File<E>,
+        module_name: &str,
+    ) -> Self {
         // Check for directory-based module (has top-level arguments or attribute_params)
         if !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty() {
             return FileSignature::Module(ModuleSignature::from_directory_module(
@@ -719,7 +722,7 @@ pub struct ModuleSignature {
 
 impl ModuleSignature {
     /// Build a module signature from a directory-based module (ParsedFile with top-level arguments/attributes)
-    pub fn from_directory_module(parsed: &ParsedFile, module_name: &str) -> Self {
+    pub fn from_directory_module<E>(parsed: &crate::parser::File<E>, module_name: &str) -> Self {
         // Build requires (typed inputs)
         let requires: Vec<TypedArgument> = parsed
             .arguments

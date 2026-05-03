@@ -1241,6 +1241,46 @@ fn is_type_expr_compatible_struct_rejects_map_with_wrong_element_type() {
 // `String` constraint cannot prove it satisfies the more specific
 // invariants the receiver demands.
 #[test]
+fn is_type_expr_compatible_unknown_rejects_all_concrete_receivers() {
+    // Sentinel for failed inference (#2360 stage 2): never matches any
+    // concrete receiver — the inference_errors channel surfaces the
+    // actionable "type annotation required" instead.
+    assert!(!is_type_expr_compatible_with_schema(
+        &TypeExpr::Unknown,
+        &AttributeType::String,
+    ));
+    assert!(!is_type_expr_compatible_with_schema(
+        &TypeExpr::Unknown,
+        &AttributeType::Int,
+    ));
+    assert!(!is_type_expr_compatible_with_schema(
+        &TypeExpr::Unknown,
+        &AttributeType::Bool,
+    ));
+}
+
+#[test]
+fn is_type_expr_compatible_unknown_rejects_custom_receiver() {
+    use crate::schema::legacy_validator;
+    fn noop(_v: &crate::resource::Value) -> Result<(), String> {
+        Ok(())
+    }
+    let custom = AttributeType::Custom {
+        semantic_name: Some("VpcId".to_string()),
+        pattern: None,
+        length: None,
+        base: Box::new(AttributeType::String),
+        validate: legacy_validator(noop),
+        namespace: None,
+        to_dsl: None,
+    };
+    assert!(!is_type_expr_compatible_with_schema(
+        &TypeExpr::Unknown,
+        &custom,
+    ));
+}
+
+#[test]
 fn is_type_expr_compatible_string_rejects_custom_with_semantic_name() {
     use crate::schema::legacy_validator;
     fn noop(_v: &crate::resource::Value) -> Result<(), String> {
@@ -1491,12 +1531,12 @@ fn attribute_param_ref_type_mismatch_detected() {
 
 #[test]
 fn validate_export_params_rejects_invalid_custom_type() {
-    use crate::parser::ExportParameter;
+    use crate::parser::InferredExportParam;
 
     let config = context_with_iam_policy_arn_validator();
-    let exports = vec![ExportParameter {
+    let exports = vec![InferredExportParam {
         name: "policy".to_string(),
-        type_expr: Some(TypeExpr::Simple("iam_policy_arn".to_string())),
+        type_expr: TypeExpr::Simple("iam_policy_arn".to_string()),
         value: Some(Value::String("not-an-arn".to_string())),
     }];
     let result = validate_export_params(&exports, &config);
@@ -1508,14 +1548,12 @@ fn validate_export_params_rejects_invalid_custom_type() {
 
 #[test]
 fn validate_export_params_rejects_invalid_list_element() {
-    use crate::parser::ExportParameter;
+    use crate::parser::InferredExportParam;
 
     let config = context_with_iam_policy_arn_validator();
-    let exports = vec![ExportParameter {
+    let exports = vec![InferredExportParam {
         name: "policies".to_string(),
-        type_expr: Some(TypeExpr::List(Box::new(TypeExpr::Simple(
-            "iam_policy_arn".to_string(),
-        )))),
+        type_expr: TypeExpr::List(Box::new(TypeExpr::Simple("iam_policy_arn".to_string()))),
         value: Some(Value::List(vec![
             Value::String("arn:aws:iam::123456789012:policy/valid".to_string()),
             Value::String("garbage".to_string()),
@@ -1530,12 +1568,12 @@ fn validate_export_params_rejects_invalid_list_element() {
 
 #[test]
 fn validate_export_params_accepts_valid_values() {
-    use crate::parser::ExportParameter;
+    use crate::parser::InferredExportParam;
 
     let config = context_with_iam_policy_arn_validator();
-    let exports = vec![ExportParameter {
+    let exports = vec![InferredExportParam {
         name: "policy".to_string(),
-        type_expr: Some(TypeExpr::Simple("iam_policy_arn".to_string())),
+        type_expr: TypeExpr::Simple("iam_policy_arn".to_string()),
         value: Some(Value::String(
             "arn:aws:iam::123456789012:policy/admin".to_string(),
         )),
@@ -1545,13 +1583,16 @@ fn validate_export_params_accepts_valid_values() {
 }
 
 #[test]
-fn validate_export_params_skips_no_type_annotation() {
-    use crate::parser::ExportParameter;
+fn validate_export_params_skips_unknown_sentinel() {
+    use crate::parser::InferredExportParam;
 
+    // Stage 2 (#2360): exports with `TypeExpr::Unknown` are skipped —
+    // the loader's `inference_errors` channel reports the missing
+    // annotation, so re-checking here would double-report.
     let config = ProviderContext::default();
-    let exports = vec![ExportParameter {
+    let exports = vec![InferredExportParam {
         name: "raw".to_string(),
-        type_expr: None,
+        type_expr: TypeExpr::Unknown,
         value: Some(Value::String("anything".to_string())),
     }];
     let result = validate_export_params(&exports, &config);
@@ -1560,12 +1601,12 @@ fn validate_export_params_skips_no_type_annotation() {
 
 #[test]
 fn validate_export_params_rejects_type_mismatch() {
-    use crate::parser::ExportParameter;
+    use crate::parser::InferredExportParam;
 
     let config = ProviderContext::default();
-    let exports = vec![ExportParameter {
+    let exports = vec![InferredExportParam {
         name: "flag".to_string(),
-        type_expr: Some(TypeExpr::Bool),
+        type_expr: TypeExpr::Bool,
         value: Some(Value::String("not-a-bool".to_string())),
     }];
     let result = validate_export_params(&exports, &config);
@@ -1707,7 +1748,7 @@ fn type_compat_plain_string_rejected_for_simple() {
 
 #[test]
 fn validate_export_param_ref_types_map_accepts_compatible_types() {
-    use crate::parser::ExportParameter;
+    use crate::parser::InferredExportParam;
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -1732,14 +1773,14 @@ fn validate_export_param_ref_types_map_accepts_compatible_types() {
         ),
     );
 
-    let exports = vec![ExportParameter {
+    let exports = vec![InferredExportParam {
         name: "accounts".to_string(),
         // declared as map(string), and values are String-typed — should pass
-        type_expr: Some(TypeExpr::Map(Box::new(TypeExpr::String))),
+        type_expr: TypeExpr::Map(Box::new(TypeExpr::String)),
         value: Some(Value::Map(map_value)),
     }];
 
-    let result = validate_export_param_ref_types(&exports, &[registry_prod], &[], &schemas);
+    let result = validate_export_param_ref_types(&exports, &[registry_prod], &schemas);
     assert!(
         result.is_ok(),
         "map(String) = {{ prod = registry_prod.account_id (String) }} should pass, got: {:?}",
@@ -1749,7 +1790,7 @@ fn validate_export_param_ref_types_map_accepts_compatible_types() {
 
 #[test]
 fn validate_export_param_ref_types_map_rejects_type_mismatch() {
-    use crate::parser::ExportParameter;
+    use crate::parser::InferredExportParam;
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -1774,14 +1815,14 @@ fn validate_export_param_ref_types_map_rejects_type_mismatch() {
         ),
     );
 
-    let exports = vec![ExportParameter {
+    let exports = vec![InferredExportParam {
         name: "accounts".to_string(),
         // declared as map(bool) — values should be rejected as they are strings
-        type_expr: Some(TypeExpr::Map(Box::new(TypeExpr::Bool))),
+        type_expr: TypeExpr::Map(Box::new(TypeExpr::Bool)),
         value: Some(Value::Map(map_value)),
     }];
 
-    let result = validate_export_param_ref_types(&exports, &[registry_prod], &[], &schemas);
+    let result = validate_export_param_ref_types(&exports, &[registry_prod], &schemas);
     assert!(
         result.is_err(),
         "map(Bool) = {{ prod = registry_prod.account_id }} (String) should be flagged as type mismatch"
@@ -1791,6 +1832,62 @@ fn validate_export_param_ref_types_map_rejects_type_mismatch() {
         err.contains("accounts") && err.contains("type mismatch"),
         "error should mention the export name and type mismatch, got: {err}"
     );
+}
+
+#[test]
+fn validate_export_param_ref_types_skips_unknown_sentinel() {
+    use crate::parser::InferredExportParam;
+
+    // Sentinel-bearing exports are surfaced via `inference_errors`,
+    // so the ref-type validator must skip them silently — emitting a
+    // duplicate diagnostic here would double-report the same issue.
+    let exports = vec![InferredExportParam {
+        name: "zone_id".to_string(),
+        type_expr: TypeExpr::Unknown,
+        value: Some(Value::String("ignored".to_string())),
+    }];
+
+    let result = validate_export_param_ref_types(&exports, &[], &SchemaRegistry::new());
+    assert!(
+        result.is_ok(),
+        "Unknown sentinel must be skipped, got {:?}",
+        result
+    );
+}
+
+#[test]
+fn validate_export_param_ref_types_against_inferred_inputs() {
+    use crate::parser::{InferredExportParam, UpstreamState};
+
+    // Smoke test: a happy-path post-inference shape (bare TypeExpr,
+    // matching attribute type) typechecks cleanly through the new
+    // signature.
+    let registry_prod = Resource::with_provider("awscc", "organizations.account", "prod")
+        .with_binding("registry_prod")
+        .with_attribute("account_id", Value::String("111".to_string()));
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        make_schema(
+            "organizations.account",
+            vec![("account_id", AttributeType::String)],
+        ),
+    );
+
+    let exports = vec![InferredExportParam {
+        name: "id".to_string(),
+        type_expr: TypeExpr::String,
+        value: Some(Value::resource_ref(
+            "registry_prod".to_string(),
+            "account_id".to_string(),
+            vec![],
+        )),
+    }];
+
+    let _: &[UpstreamState] = &[]; // signature no longer takes upstream_states; doc only.
+    let result = validate_export_param_ref_types(&exports, &[registry_prod], &schemas);
+    assert!(result.is_ok(), "got {:?}", result);
 }
 
 /// `validate_resources` must reject a resource whose schema declares an

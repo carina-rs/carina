@@ -1,4 +1,5 @@
 use super::*;
+use carina_core::parser::ParsedFile;
 
 #[test]
 #[ignore = "requires provider binary for enum alias resolution"]

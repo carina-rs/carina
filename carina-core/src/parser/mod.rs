@@ -18,9 +18,10 @@ mod util;
 
 pub use ast::{
     ArgumentParameter, AttributeParameter, BackendConfig, DEFERRED_UPSTREAM_PLACEHOLDER,
-    DeferredForExpression, ExportParameter, FnParam, ModuleCall, ParsedFile, ProviderConfig,
-    RequireBlock, ResourceContext, ResourceTypePath, StateBlock, TypeExpr, UpstreamState,
-    UseStatement, UserFunction, UserFunctionBody, ValidateExpr, ValidationBlock,
+    DeferredForExpression, ExportParamLike, ExportParameter, File, FnParam, InferredExportParam,
+    InferredFile, ModuleCall, ParsedExportParam, ParsedFile, ProviderConfig, RequireBlock,
+    ResourceContext, ResourceTypePath, StateBlock, TypeExpr, UpstreamState, UseStatement,
+    UserFunction, UserFunctionBody, ValidateExpr, ValidationBlock,
 };
 pub use config::{DecryptorFn, ProviderContext, ValidatorFn};
 pub use entry::{parse, parse_and_resolve};

@@ -70,12 +70,12 @@ pub(crate) struct FinalizeApplyInput<'a> {
     pub backend: &'a dyn StateBackend,
     pub lock: Option<&'a LockInfo>,
     pub schemas: &'a SchemaRegistry,
-    pub export_params: &'a [carina_core::parser::ExportParameter],
+    pub export_params: &'a [carina_core::parser::InferredExportParam],
 }
 
 /// Resolve export expressions using bindings built from applied state.
 pub(crate) fn resolve_exports(
-    export_params: &[carina_core::parser::ExportParameter],
+    export_params: &[carina_core::parser::InferredExportParam],
     state: &StateFile,
 ) -> HashMap<String, serde_json::Value> {
     use carina_core::binding_index::{BindingValueSource, ResolvedBindings};

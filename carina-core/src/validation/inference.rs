@@ -1,15 +1,16 @@
-//! Rhs-driven type inference for `exports { }` and `attributes { }`
-//! declarations whose `type_expr` annotation is omitted.
+//! Rhs-driven type inference for `exports { }` declarations whose
+//! `type_expr` annotation is omitted.
 //!
-//! Stage 1 of #2360 (issue #2361). Until this lands, an unannotated
-//! declaration sits in the AST as `type_expr: None` and every
-//! type-checking predicate skips it via `if let Some(type_expr) = ...`,
-//! reopening the same downcast hole #2358 closed for the annotated
-//! direction. This module synthesizes a `TypeExpr` from the rhs `Value`
-//! whenever it can, so callers downstream of resolution always see a
-//! typed declaration (or a hard parse-style error if inference fails).
+//! [`apply_inference`] is the bridge from `ParsedFile` (where exports
+//! carry `Option<TypeExpr>`) to `InferredFile` (where every export
+//! carries a bare `TypeExpr`, possibly the [`TypeExpr::Unknown`]
+//! sentinel for a failure paired with a `(name, InferenceError)` entry
+//! on the side). The loader runs this once per directory load so
+//! downstream consumers (CLI validate, LSP diagnostics, LSP
+//! completion) see a definitive type per export instead of having to
+//! re-derive it. See `docs/specs/2026-05-03-typeexpr-stage2-design.md`.
 //!
-//! Inference rules — from #2360 / #2361 decisions:
+//! Inference rules:
 //!
 //! - `Value::String/Int/Bool/Float` → corresponding `TypeExpr` primitive.
 //! - `Value::List(items)` → `List(T)` where `T` is the unified element
@@ -51,7 +52,7 @@ pub enum InferenceError {
     /// Binding is known but inference can't proceed through it —
     /// today this is only `upstream_state` bindings (the export's
     /// type lives in the upstream's `parsed.export_params`, which the
-    /// inferer doesn't recursively resolve in stage 1). Distinct from
+    /// inferer doesn't recursively resolve today, see #2357). Distinct from
     /// `UnknownBinding` so callers can swallow this case (the
     /// downstream consumer's typecheck will still gate the use)
     /// while a true typo bubbles up as a hard error.
@@ -90,7 +91,7 @@ impl std::fmt::Display for InferenceError {
 /// One entry in the binding map. Resource bindings (`let <name> = <provider>.<resource> { ... }`)
 /// carry the provider/resource type and are inferred through; `upstream_state`
 /// bindings are recognized by name but cannot be projected to a `TypeExpr`
-/// in stage 1 (the export's type lives in the upstream's `parsed.export_params`,
+/// today (the export's type lives in the upstream's `parsed.export_params`,
 /// which the inferer doesn't recursively resolve here). Distinguishing the
 /// two lets the inferer turn a true typo (`mian.vpc_id`) into a hard error
 /// while still passing through `upstream_state`-derived references.
@@ -472,6 +473,90 @@ fn infer_function_call(name: &str) -> Result<TypeExpr, InferenceError> {
     }
 }
 
+/// Phase transition (#2360 stage 2): walk every `ParsedExportParam` in
+/// `parsed`, resolve its effective `TypeExpr` (annotation wins;
+/// otherwise infer from rhs), and emit an `InferredFile` with bare
+/// `TypeExpr` on every export. Failed inferences are *not* dropped —
+/// they are kept with `type_expr: TypeExpr::Unknown` and accompanied
+/// by an entry in the returned `Vec<InferenceError>`. The
+/// sentinel-over-exclude shape prevents cascading "missing export"
+/// diagnostics; the inference error is the single point of truth for
+/// "this needs an annotation".
+pub fn apply_inference(
+    parsed: crate::parser::ParsedFile,
+    schemas: &SchemaRegistry,
+) -> (crate::parser::InferredFile, Vec<(String, InferenceError)>) {
+    let (inferred_exports, errors) = infer_export_params(&parsed, schemas);
+    (
+        crate::parser::InferredFile {
+            providers: parsed.providers,
+            resources: parsed.resources,
+            variables: parsed.variables,
+            uses: parsed.uses,
+            module_calls: parsed.module_calls,
+            arguments: parsed.arguments,
+            attribute_params: parsed.attribute_params,
+            export_params: inferred_exports,
+            backend: parsed.backend,
+            state_blocks: parsed.state_blocks,
+            user_functions: parsed.user_functions,
+            upstream_states: parsed.upstream_states,
+            requires: parsed.requires,
+            structural_bindings: parsed.structural_bindings,
+            warnings: parsed.warnings,
+            deferred_for_expressions: parsed.deferred_for_expressions,
+        },
+        errors,
+    )
+}
+
+/// Borrowing variant of [`apply_inference`] that returns just the
+/// inferred export parameters and any inference errors. The full
+/// `InferredFile` reconstruction in `apply_inference` clones every
+/// non-export field; consumers that only need the export-side typecheck
+/// (LSP diagnostics, in particular) should use this instead to avoid
+/// the per-keystroke deep-clone.
+pub fn infer_export_params(
+    parsed: &crate::parser::ParsedFile,
+    schemas: &SchemaRegistry,
+) -> (
+    Vec<crate::parser::InferredExportParam>,
+    Vec<(String, InferenceError)>,
+) {
+    let bindings = bindings_from_parts(&parsed.resources, &parsed.upstream_states);
+    let mut errors = Vec::new();
+    let inferred_exports: Vec<crate::parser::InferredExportParam> = parsed
+        .export_params
+        .iter()
+        .map(|p| {
+            let type_expr =
+                match infer_type_expr(p.type_expr.as_ref(), p.value.as_ref(), &bindings, schemas) {
+                    Ok(Some(ty)) => ty,
+                    Ok(None) => TypeExpr::Unknown,
+                    Err(e) => {
+                        errors.push((p.name.clone(), e));
+                        TypeExpr::Unknown
+                    }
+                };
+            crate::parser::InferredExportParam {
+                name: p.name.clone(),
+                type_expr,
+                value: p.value.clone(),
+            }
+        })
+        .collect();
+    (inferred_exports, errors)
+}
+
+/// Format an inference error pointing at the offending export. The CLI
+/// (`carina-cli/src/commands/validate.rs`) and the LSP
+/// (`carina-lsp/src/diagnostics/checks.rs`) both surface this same
+/// "type annotation required" wording so editor and command line stay
+/// in parity (the existing e2e parity tests pin this).
+pub fn format_inference_error(name: &str, err: &InferenceError) -> String {
+    format!("export '{}': type annotation required: {}", name, err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -805,8 +890,8 @@ mod tests {
     #[test]
     fn resource_ref_through_upstream_state_binding_returns_non_inferable() {
         // `network.vpc_id` where `network` is a `let network = upstream_state { ... }`
-        // — known binding but stage 1 cannot project upstream exports
-        // recursively. Distinct from `UnknownBinding` (typo) so the
+        // — known binding but the inferer cannot project upstream
+        // exports recursively (see #2357). Distinct from `UnknownBinding` (typo) so the
         // outer `infer_type_expr` can pass through cleanly while a real
         // typo bubbles up.
         let mut bindings = InferenceBindings::new();
@@ -989,5 +1074,85 @@ mod tests {
             &SchemaRegistry::new(),
         );
         assert!(matches!(r, Err(InferenceError::UnknownType { .. })));
+    }
+
+    #[test]
+    fn apply_inference_fills_inferable_export_with_inferred_type() {
+        let mut parsed = crate::parser::ParsedFile::default();
+        let res = crate::resource::Resource::with_provider("awscc", "ec2.Vpc", "main")
+            .with_binding("main");
+        parsed.resources.push(res);
+        parsed.export_params.push(crate::parser::ParsedExportParam {
+            name: "vpc_id".to_string(),
+            type_expr: None,
+            value: Some(Value::resource_ref(
+                "main".to_string(),
+                "vpc_id".to_string(),
+                vec![],
+            )),
+        });
+
+        let (inferred, errors) = apply_inference(parsed, &schemas_with_vpc());
+        assert!(errors.is_empty(), "no errors expected, got {:?}", errors);
+        assert_eq!(inferred.export_params.len(), 1);
+        assert_eq!(
+            inferred.export_params[0].type_expr,
+            TypeExpr::Simple("vpc_id".to_string())
+        );
+    }
+
+    #[test]
+    fn apply_inference_substitutes_unknown_for_failed_inference() {
+        let mut parsed = crate::parser::ParsedFile::default();
+        parsed.export_params.push(crate::parser::ParsedExportParam {
+            name: "zone_id".to_string(),
+            type_expr: None,
+            // `lookup` returns Any: inference fails, sentinel produced.
+            value: Some(Value::FunctionCall {
+                name: "lookup".to_string(),
+                args: vec![],
+            }),
+        });
+
+        let (inferred, errors) = apply_inference(parsed, &SchemaRegistry::new());
+        assert_eq!(inferred.export_params.len(), 1);
+        assert_eq!(inferred.export_params[0].type_expr, TypeExpr::Unknown);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, "zone_id");
+        assert!(matches!(errors[0].1, InferenceError::UnknownType { .. }));
+    }
+
+    #[test]
+    fn apply_inference_preserves_explicit_annotation() {
+        let mut parsed = crate::parser::ParsedFile::default();
+        parsed.export_params.push(crate::parser::ParsedExportParam {
+            name: "vpc_id".to_string(),
+            type_expr: Some(TypeExpr::Simple("vpc_id".to_string())),
+            value: Some(Value::String("vpc-abc".to_string())),
+        });
+
+        let (inferred, errors) = apply_inference(parsed, &SchemaRegistry::new());
+        assert!(errors.is_empty(), "no errors expected, got {:?}", errors);
+        assert_eq!(
+            inferred.export_params[0].type_expr,
+            TypeExpr::Simple("vpc_id".to_string())
+        );
+    }
+
+    #[test]
+    fn apply_inference_substitutes_unknown_for_export_without_value() {
+        // Export with no value and no annotation: nothing to infer from
+        // → Unknown sentinel, no error (the value-less shape is the
+        // parser-tombstoned state, not an inference failure).
+        let mut parsed = crate::parser::ParsedFile::default();
+        parsed.export_params.push(crate::parser::ParsedExportParam {
+            name: "vpc_id".to_string(),
+            type_expr: None,
+            value: None,
+        });
+
+        let (inferred, errors) = apply_inference(parsed, &SchemaRegistry::new());
+        assert!(errors.is_empty());
+        assert_eq!(inferred.export_params[0].type_expr, TypeExpr::Unknown);
     }
 }
