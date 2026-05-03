@@ -110,7 +110,7 @@
       "patterns": [
         {
           "name": "entity.name.type.resource.crn",
-          "match": "\\b(awscc|aws)\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*\\b"
+          "match": "\\b(awscc|aws)\\.[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)*\\b"
         },
         {
           "name": "variable.other.crn",
