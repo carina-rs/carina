@@ -485,3 +485,59 @@ input.pagefind-ui__search-input:focus {
 .sl-markdown-content a > code {
   color: inherit;
 }
+
+/* ============================================================
+   Asides — Carina brand tones
+   Restyles Starlight's :::note / :::tip / :::caution / :::danger
+   - note:    cyan   (neutral information)
+   - tip:     gold   (brand-aligned helpful info)
+   - caution: amber  (be careful)
+   - danger:  red    (destructive)
+   ============================================================ */
+
+.starlight-aside {
+  border-radius: 0.5rem;
+  border-left: 3px solid var(--carina-aside-accent, #fbbf24);
+  background: var(--carina-aside-bg, rgba(251, 191, 36, 0.07));
+  padding: 1rem 1.25rem;
+}
+
+.starlight-aside__title {
+  font-family: var(--carina-font-display, var(--sl-font));
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--carina-aside-accent, #fbbf24);
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.starlight-aside__icon { color: var(--carina-aside-accent, #fbbf24); }
+
+.starlight-aside__content { color: var(--sl-color-gray-2); }
+
+/* Note — cyan, neutral information */
+.starlight-aside--note {
+  --carina-aside-accent: #22d3ee;
+  --carina-aside-bg: color-mix(in oklab, #22d3ee 8%, var(--sl-color-bg));
+}
+
+/* Tip — gold, brand-aligned helpful info */
+.starlight-aside--tip {
+  --carina-aside-accent: #fbbf24;
+  --carina-aside-bg: color-mix(in oklab, #fbbf24 7%, var(--sl-color-bg));
+}
+
+/* Caution — amber, "be careful" */
+.starlight-aside--caution {
+  --carina-aside-accent: #f59e0b;
+  --carina-aside-bg: color-mix(in oklab, #f59e0b 8%, var(--sl-color-bg));
+}
+
+/* Danger — red, destructive */
+.starlight-aside--danger {
+  --carina-aside-accent: #f87171;
+  --carina-aside-bg: color-mix(in oklab, #f87171 9%, var(--sl-color-bg));
+}
