@@ -1232,3 +1232,163 @@ awscc2358.ec2.SecurityGroup {
         cli_diags,
     );
 }
+
+// ============================================================================
+// Scenario: rhs-driven inference for unannotated exports (#2361, stage 1
+// of #2360)
+//
+// Closes the unannotated half of the soundness hole #2358 / PR #2359
+// only partially closed: previously `exports { vpc_id = main.vpc_id }`
+// (no annotation) was skipped by every type-checking predicate, so a
+// downstream `vpc_id = network.vpc_id` against a `Custom{VpcId}`
+// receiver passed through unchecked. After this stage, the inferer
+// fills in the missing `type_expr` from the rhs whenever it can; if
+// it cannot (e.g. dynamic builtin, heterogeneous list), validation
+// surfaces a "type annotation required" error.
+// ============================================================================
+
+#[test]
+fn unannotated_export_of_resource_ref_inferred_and_typechecked() {
+    // `vpc_id = main.vpc_id` infers `VpcId` from the `Vpc` schema,
+    // which makes the export carry that type even though the user
+    // wrote no annotation. Both surfaces stay quiet.
+    let fixture = write_fixture(&[(
+        "main.crn",
+        r#"
+let main = awscc2358.ec2.Vpc {
+    cidr_block = "10.0.0.0/16"
+}
+
+exports {
+    vpc_id = main.vpc_id
+}
+"#,
+    )]);
+
+    let lsp_diags = lsp_diagnostics(&engine_2358(), &fixture, "main.crn");
+    let cli_diags = cli_diagnostics(factories_2358(), &fixture);
+
+    assert!(
+        !lsp_messages_contain_ci(&lsp_diags, "mismatch"),
+        "LSP must not flag a same-type unannotated export, got {:?}",
+        lsp_diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+    );
+    assert!(
+        !cli_messages_contain_ci(&cli_diags, "mismatch"),
+        "CLI must not flag a same-type unannotated export, got {:?}",
+        cli_diags,
+    );
+    assert!(
+        !cli_messages_contain_ci(&cli_diags, "annotation required"),
+        "CLI must infer the type and not demand annotation, got {:?}",
+        cli_diags,
+    );
+}
+
+#[test]
+fn unannotated_export_of_dynamic_lookup_demands_annotation() {
+    // `lookup` is a `BuiltinReturnType::Any` builtin — the return type
+    // depends on arguments. Unannotated, the inferer cannot determine
+    // a static type and must surface "type annotation required".
+    let fixture = write_fixture(&[(
+        "main.crn",
+        r#"
+exports {
+    zone_id = lookup({a = "1"}, "a", "default")
+}
+"#,
+    )]);
+
+    let lsp_diags = lsp_diagnostics(&engine_2358(), &fixture, "main.crn");
+    let cli_diags = cli_diagnostics(factories_2358(), &fixture);
+    assert!(
+        cli_messages_contain_ci(&cli_diags, "annotation required"),
+        "CLI must demand a type annotation for an Any-returning builtin, got {:?}",
+        cli_diags,
+    );
+    assert!(
+        cli_messages_contain_ci(&cli_diags, "zone_id"),
+        "diagnostic must name the offending export, got {:?}",
+        cli_diags,
+    );
+    // validate / LSP parity: the same diagnostic must surface in-editor.
+    assert!(
+        lsp_messages_contain_ci(&lsp_diags, "annotation required"),
+        "LSP must demand a type annotation for an Any-returning builtin, got {:?}",
+        lsp_diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+    );
+    assert!(
+        lsp_messages_contain_ci(&lsp_diags, "zone_id"),
+        "LSP diagnostic must name the offending export, got {:?}",
+        lsp_diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn unannotated_export_of_literal_inferred_as_primitive() {
+    // A literal-only rhs is inferable to its primitive type. The
+    // export typechecks without annotation and without spurious
+    // diagnostics.
+    let fixture = write_fixture(&[(
+        "main.crn",
+        r#"
+exports {
+    name = "carina"
+    count = 3
+    enabled = true
+}
+"#,
+    )]);
+
+    let cli_diags = cli_diagnostics(factories_2358(), &fixture);
+    assert!(
+        !cli_messages_contain_ci(&cli_diags, "annotation required"),
+        "literals must infer cleanly, got {:?}",
+        cli_diags,
+    );
+    assert!(
+        !cli_messages_contain_ci(&cli_diags, "mismatch"),
+        "literals must not flag a mismatch, got {:?}",
+        cli_diags,
+    );
+}
+
+#[test]
+fn explicit_annotation_is_not_overwritten_by_inference() {
+    // With an explicit `: VpcId` the export keeps that declared type
+    // even though the rhs is also `Custom{VpcId}` — confirm inference
+    // doesn't race against user intent.
+    let fixture = write_fixture(&[(
+        "main.crn",
+        r#"
+let main = awscc2358.ec2.Vpc {
+    cidr_block = "10.0.0.0/16"
+}
+
+exports {
+    vpc_id: VpcId = main.vpc_id
+}
+"#,
+    )]);
+
+    let cli_diags = cli_diagnostics(factories_2358(), &fixture);
+    assert!(
+        !cli_messages_contain_ci(&cli_diags, "mismatch"),
+        "annotated same-type export must stay clean, got {:?}",
+        cli_diags,
+    );
+    assert!(
+        !cli_messages_contain_ci(&cli_diags, "annotation required"),
+        "annotation is present — must not demand one, got {:?}",
+        cli_diags,
+    );
+}
+
+// Note: typo-binding detection is exercised at the unit-test layer
+// (`carina-core/src/validation/inference.rs::resource_ref_typo_binding_errors_loudly`).
+// At the CLI surface, `check_identifier_scope` runs upstream of the
+// inferer and is the original gate — the inferer's `UnknownBinding`
+// arm is the secondary gate that fires only if the upstream check is
+// ever weakened. The two must stay in agreement, but the CLI-side
+// e2e path is dominated by the upstream check and adds no extra
+// signal beyond the unit test's coverage of the inferer itself.

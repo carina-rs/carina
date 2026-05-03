@@ -206,8 +206,13 @@ impl CompletionProvider {
             }
 
             for (binding, source) in &upstream_sources {
-                let exports =
-                    resolve_upstream_exports_cached(binding, source, base_path, &mut exports_cache);
+                let exports = resolve_upstream_exports_cached(
+                    binding,
+                    source,
+                    base_path,
+                    &self.schemas,
+                    &mut exports_cache,
+                );
                 for (export_name, export_type) in exports {
                     let Some(export_type) = export_type else {
                         continue;
@@ -269,6 +274,7 @@ impl CompletionProvider {
                     binding,
                     &upstream_sources,
                     base_path,
+                    &self.schemas,
                     &mut exports_cache,
                 )
                 && !carina_core::validation::is_type_expr_compatible_with_schema(
@@ -664,7 +670,8 @@ impl CompletionProvider {
         position: Position,
         base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {
-        let Some(keys) = resolve_upstream_export_keys(binding, source, base_path) else {
+        let Some(keys) = resolve_upstream_export_keys(binding, source, base_path, &self.schemas)
+        else {
             return Vec::new();
         };
 
@@ -723,7 +730,8 @@ impl CompletionProvider {
         position: Position,
         base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {
-        let Some(keys) = resolve_upstream_export_keys(binding, source, base_path) else {
+        let Some(keys) = resolve_upstream_export_keys(binding, source, base_path, &self.schemas)
+        else {
             return Vec::new();
         };
         let Some(Some(type_expr)) = keys.get(key) else {
@@ -1260,17 +1268,20 @@ fn resolve_upstream_export_keys(
     binding: &str,
     source: &str,
     base_path: Option<&Path>,
+    schemas: &carina_core::schema::SchemaRegistry,
 ) -> Option<std::collections::HashMap<String, Option<carina_core::parser::TypeExpr>>> {
     let base = base_path?;
     let upstream = carina_core::parser::UpstreamState {
         binding: binding.to_string(),
         source: std::path::PathBuf::from(source),
     };
-    let (mut exports, _errors) = carina_core::upstream_exports::resolve_upstream_exports(
-        base,
-        &[upstream],
-        &Default::default(),
-    );
+    let (mut exports, _errors) =
+        carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
+            base,
+            &[upstream],
+            &Default::default(),
+            Some(schemas),
+        );
     exports.remove(binding)
 }
 
@@ -1291,13 +1302,14 @@ fn resolve_upstream_exports_cached<'a>(
     binding: &str,
     source: &str,
     base_path: Option<&Path>,
+    schemas: &carina_core::schema::SchemaRegistry,
     cache: &'a mut std::collections::HashMap<
         String,
         std::collections::HashMap<String, Option<carina_core::parser::TypeExpr>>,
     >,
 ) -> &'a std::collections::HashMap<String, Option<carina_core::parser::TypeExpr>> {
     cache.entry(binding.to_string()).or_insert_with(|| {
-        resolve_upstream_export_keys(binding, source, base_path).unwrap_or_default()
+        resolve_upstream_export_keys(binding, source, base_path, schemas).unwrap_or_default()
     })
 }
 
@@ -1319,6 +1331,7 @@ fn infer_for_binding_type(
     binding: &super::top_level::ForScopeBinding,
     upstream_sources: &std::collections::HashMap<String, String>,
     base_path: Option<&Path>,
+    schemas: &carina_core::schema::SchemaRegistry,
     exports_cache: &mut std::collections::HashMap<
         String,
         std::collections::HashMap<String, Option<carina_core::parser::TypeExpr>>,
@@ -1338,11 +1351,13 @@ fn infer_for_binding_type(
                 binding: iterable.binding.clone(),
                 source: std::path::PathBuf::from(source),
             };
-            let (resolved, _errors) = carina_core::upstream_exports::resolve_upstream_exports(
-                base,
-                &[upstream],
-                &Default::default(),
-            );
+            let (resolved, _errors) =
+                carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
+                    base,
+                    &[upstream],
+                    &Default::default(),
+                    Some(schemas),
+                );
             resolved.get(&iterable.binding).cloned().unwrap_or_default()
         });
     let export_type = exports.get(&iterable.export)?.as_ref()?;

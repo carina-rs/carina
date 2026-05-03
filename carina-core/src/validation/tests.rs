@@ -1739,7 +1739,7 @@ fn validate_export_param_ref_types_map_accepts_compatible_types() {
         value: Some(Value::Map(map_value)),
     }];
 
-    let result = validate_export_param_ref_types(&exports, &[registry_prod], &schemas);
+    let result = validate_export_param_ref_types(&exports, &[registry_prod], &[], &schemas);
     assert!(
         result.is_ok(),
         "map(String) = {{ prod = registry_prod.account_id (String) }} should pass, got: {:?}",
@@ -1781,7 +1781,7 @@ fn validate_export_param_ref_types_map_rejects_type_mismatch() {
         value: Some(Value::Map(map_value)),
     }];
 
-    let result = validate_export_param_ref_types(&exports, &[registry_prod], &schemas);
+    let result = validate_export_param_ref_types(&exports, &[registry_prod], &[], &schemas);
     assert!(
         result.is_err(),
         "map(Bool) = {{ prod = registry_prod.account_id }} (String) should be flagged as type mismatch"

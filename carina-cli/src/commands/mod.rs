@@ -323,6 +323,7 @@ pub fn validate_and_resolve_errors_with_factories(
         if let Err(msg) = carina_core::validation::validate_export_param_ref_types(
             &parsed.export_params,
             &parsed.resources,
+            &parsed.upstream_states,
             ctx.schemas(),
         ) {
             errors.extend(split_validation_message(&msg));
@@ -350,10 +351,11 @@ pub fn validate_and_resolve_errors_with_factories(
     // files directly.
     if !skip_resource_validation {
         let (upstream_exports, resolve_errors) =
-            carina_core::upstream_exports::resolve_upstream_exports(
+            carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
                 base_dir,
                 &parsed.upstream_states,
                 &enriched_context,
+                Some(ctx.schemas()),
             );
         let field_errors = carina_core::upstream_exports::check_upstream_state_field_references(
             parsed,
