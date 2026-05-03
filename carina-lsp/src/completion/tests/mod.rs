@@ -207,6 +207,37 @@ pub(super) fn test_provider_with_nameless_enum() -> CompletionProvider {
     CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![])
 }
 
+/// Provider whose `awscc.ec2.Vpc` schema mirrors the real one as far
+/// as #2357 is concerned: a `vpc_id` attribute typed
+/// `Custom { semantic_name: "VpcId", base: String }`. Pairs with
+/// `awscc.ec2.SecurityGroup`'s `vpc_id` (same `Custom { VpcId }`) so
+/// the upstream-export REFERENCE pass has a typed receiver to match
+/// against.
+pub(super) fn test_provider_with_vpc_and_security_group() -> CompletionProvider {
+    fn noop_validate(_v: &carina_core::resource::Value) -> Result<(), String> {
+        Ok(())
+    }
+    let vpc_id_custom = AttributeType::Custom {
+        semantic_name: Some("VpcId".to_string()),
+        base: Box::new(AttributeType::String),
+        pattern: None,
+        length: None,
+        validate: legacy_validator(noop_validate),
+        namespace: None,
+        to_dsl: None,
+    };
+    let vpc = ResourceSchema::new("ec2.Vpc")
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
+        .attribute(AttributeSchema::new("vpc_id", vpc_id_custom.clone()));
+    let security_group = ResourceSchema::new("ec2.SecurityGroup")
+        .attribute(AttributeSchema::new("vpc_id", vpc_id_custom));
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", vpc);
+    schemas.insert("awscc", security_group);
+    CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![])
+}
+
 /// Provider exposing both a namespaced `StringEnum` (`principal_type`) and a
 /// `Custom` semantic subtype (`target_id` → `aws_account_id`) on the same
 /// resource. Used to reproduce the two value-position completion leaks
