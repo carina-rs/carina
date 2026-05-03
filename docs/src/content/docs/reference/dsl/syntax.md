@@ -168,13 +168,13 @@ let _ = awscc.ec2.VpcGatewayAttachment {
 Use the `read` keyword to query existing cloud resources without managing them:
 
 ```crn
-let identity = read aws.sts.caller_identity {}
+let identity = read aws.sts.CallerIdentity {}
 ```
 
 The returned value can be referenced like any other bound resource:
 
 ```crn
-let identity = read aws.sts.caller_identity {}
+let identity = read aws.sts.CallerIdentity {}
 
 awscc.ec2.IpamPool {
   source_resource = {

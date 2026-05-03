@@ -1,6 +1,6 @@
 ---
 title: "LSP Setup"
-description: "Set up the Carina Language Server for editor integration with autocompletion, diagnostics, hover information, semantic highlighting, and formatting."
+description: "Set up the Carina Language Server for editor integration with autocompletion, diagnostics, hover information, semantic highlighting, code actions, and formatting."
 ---
 
 Carina includes a Language Server Protocol (LSP) implementation that provides a rich editing experience for `.crn` files. This guide covers how to set it up and what features are available.
@@ -10,9 +10,10 @@ Carina includes a Language Server Protocol (LSP) implementation that provides a 
 The Carina LSP (`carina-lsp`) provides:
 
 - **Autocompletion** -- resource types, attributes, attribute values, keywords, and built-in function names
-- **Diagnostics** -- parse errors, type validation, unknown resource types, and module validation
+- **Diagnostics** -- parse errors, type validation, unknown resource types, module validation, and cross-directory upstream-reference shape checks
 - **Hover information** -- documentation for resource attributes and types on hover
-- **Semantic tokens** -- syntax highlighting for keywords, resource types, regions, and identifiers
+- **Semantic tokens** -- syntax highlighting for resource types, regions, and identifiers
+- **Code actions** -- quick fixes for diagnostics (e.g. inserting the canonical enum identifier when an attribute value does not match any variant)
 - **Document formatting** -- automatic formatting of `.crn` files
 
 ## Installation
@@ -80,7 +81,7 @@ vim.filetype.add({
 
 The LSP provides context-aware completions:
 
-- **Top-level keywords**: `provider`, `backend`, `let`, `import`, `fn`, `for`, `if`, `arguments`, `attributes`, `moved`, `removed`, `require`, `read`
+- **Top-level keywords**: `provider`, `backend`, `let`, `let use`, `import`, `read`, `fn`, `arguments`, `attributes`, `exports`, `moved`, `removed`, `require`, `upstream_state`
 - **Resource types**: Type `awscc.` to see available services, then `awscc.ec2.` to see resource types
 - **Attributes**: Inside a resource block, get completions for all valid attributes
 - **Attribute values**: For enum-typed attributes, get valid value completions
@@ -102,13 +103,20 @@ The LSP reports errors and warnings as you type:
 
 Hover over a resource attribute to see its documentation, including the expected type and description from the provider schema.
 
+## Code actions
+
+The LSP offers quick fixes for selected diagnostics. Open the code-actions menu (in VS Code: light-bulb / `Ctrl+.`) on a diagnostic to apply one.
+
+- **Insert canonical enum identifier** -- when an attribute's value does not match any variant of its enum type, the LSP offers one code action per candidate that replaces the offending value with the canonical namespaced identifier (e.g. `aws.s3.Bucket.VersioningStatus.enabled`). Both bare-identifier mismatches and quoted string literals are supported.
+
 ## Semantic tokens
 
-The LSP provides semantic token information for enhanced syntax highlighting:
+The LSP emits semantic tokens for richer syntax highlighting beyond what the TextMate grammar can express:
 
-- **Keywords**: `provider`, `backend`, `let`, `fn`, `for`, `if`, `else`, `import`, `arguments`, `attributes`, `moved`, `removed`, `require`, `read`
-- **Types**: Resource types and region identifiers
+- **Types**: PascalCase resource type segments (e.g. the `Vpc` in `awscc.ec2.Vpc`) and region identifiers
 - **Functions**: Built-in and user-defined function names
+
+DSL keywords (`provider`, `let`, `fn`, `for`, `if`, …) are intentionally **not** emitted as semantic tokens — the bundled TextMate grammar handles them with finer-grained scopes (#1948).
 
 ## Document formatting
 

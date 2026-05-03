@@ -298,7 +298,7 @@ secret(value: Any) -> Secret
 ```
 
 ```crn
-awscc.rds.db_instance {
+awscc.rds.DbInstance {
   master_user_password = secret(env('DB_PASSWORD'))
 }
 ```
@@ -319,7 +319,7 @@ let password = decrypt('AQICAHh...')
 let password = decrypt('AQICAHh...', 'alias/my-key')
 
 # Combined with secret() to prevent storing the decrypted value in state
-awscc.rds.db_instance {
+awscc.rds.DbInstance {
   master_user_password = secret(decrypt('AQICAHh...'))
 }
 ```
