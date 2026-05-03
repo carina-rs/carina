@@ -20,7 +20,7 @@ use carina_core::provider::{
     self as provider_mod, Provider, ProviderError, ProviderFactory, ProviderNormalizer,
     ProviderRouter,
 };
-use carina_core::resolver::resolve_refs_with_state_and_remote;
+use carina_core::resolver::{resolve_refs_for_plan, resolve_refs_with_state_and_remote};
 use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::schema::{SchemaRegistry, resolve_block_names};
 use carina_core::utils;
@@ -1044,9 +1044,13 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
         HashMap::new()
     };
 
-    // Resolve ResourceRef values and enum identifiers using AWS state
+    // Resolve ResourceRef values and enum identifiers using AWS state.
+    // Plan-only: surviving upstream refs are stamped for display as
+    // `(known after upstream apply: <ref>)` (#2366). `apply` calls
+    // `resolve_refs_with_state_and_remote` and still errors on
+    // unresolved upstream references.
     let mut resources = sorted_resources.clone();
-    resolve_refs_with_state_and_remote(&mut resources, &current_states, remote_bindings)?;
+    resolve_refs_for_plan(&mut resources, &current_states, remote_bindings)?;
 
     // Run the normalization pipeline: normalize_desired → normalize_state →
     // merge_default_tags → resolve_enum_aliases (order matters).

@@ -38,6 +38,31 @@ pub fn resolve_refs_with_state_and_remote(
     current_states: &HashMap<ResourceId, State>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
 ) -> Result<(), String> {
+    resolve_refs_inner(resources, current_states, remote_bindings, false)
+}
+
+/// Plan-only counterpart used when an upstream's state file is missing or
+/// its export is absent. Behaves like
+/// [`resolve_refs_with_state_and_remote`], but any surviving
+/// `Value::ResourceRef` whose root binding is named in `remote_bindings`
+/// is replaced with a marker `Value::String` (built via
+/// `crate::parser::encode_unresolved_upstream_marker`) so plan display
+/// can render it as `(known after upstream apply: <ref>)` instead of the
+/// raw dot-form. `apply` continues to call the strict variant. See #2366.
+pub fn resolve_refs_for_plan(
+    resources: &mut [Resource],
+    current_states: &HashMap<ResourceId, State>,
+    remote_bindings: &HashMap<String, HashMap<String, Value>>,
+) -> Result<(), String> {
+    resolve_refs_inner(resources, current_states, remote_bindings, true)
+}
+
+fn resolve_refs_inner(
+    resources: &mut [Resource],
+    current_states: &HashMap<ResourceId, State>,
+    remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    mark_unresolved_upstream: bool,
+) -> Result<(), String> {
     // Save dependency bindings before resolution destroys ResourceRef values.
     // This metadata is used by plan tree building to recover parent-child
     // relationships (see build_plan_tree in display.rs and app.rs).
@@ -51,17 +76,84 @@ pub fn resolve_refs_with_state_and_remote(
     let bindings =
         ResolvedBindings::from_resources_with_state(resources, current_states, remote_bindings);
 
+    let upstream_binding_names: std::collections::HashSet<&str> = if mark_unresolved_upstream {
+        remote_bindings.keys().map(String::as_str).collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
     // Resolve ResourceRef values in all resources. Stay in `IndexMap`
     // so the user's authored attribute order survives resolution
     // (#2222).
     for resource in resources.iter_mut() {
         let mut resolved_attrs: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
         for (key, value) in &resource.attributes {
-            resolved_attrs.insert(key.clone(), resolve_ref_value(value, &bindings)?);
+            let resolved = resolve_ref_value(value, &bindings)?;
+            let final_value = if mark_unresolved_upstream {
+                stamp_unresolved_upstream(resolved, &upstream_binding_names)
+            } else {
+                resolved
+            };
+            resolved_attrs.insert(key.clone(), final_value);
         }
         resource.attributes = resolved_attrs;
     }
     Ok(())
+}
+
+/// Replace any `Value::ResourceRef` whose root binding is in
+/// `upstream_binding_names` with the unresolved-upstream marker string.
+/// Recurses through `List` / `Map` / `Interpolation` / `FunctionCall` /
+/// `Secret` so nested upstream refs (e.g. inside a `tags` map) are also
+/// stamped. Subtrees containing no upstream refs are returned by move
+/// without rebuilding.
+fn stamp_unresolved_upstream(
+    value: Value,
+    upstream_binding_names: &std::collections::HashSet<&str>,
+) -> Value {
+    match value {
+        Value::ResourceRef { ref path } if upstream_binding_names.contains(path.binding()) => {
+            Value::String(crate::parser::encode_unresolved_upstream_marker(
+                &path.to_dot_string(),
+            ))
+        }
+        Value::List(items) => Value::List(
+            items
+                .into_iter()
+                .map(|v| stamp_unresolved_upstream(v, upstream_binding_names))
+                .collect(),
+        ),
+        Value::Map(map) => {
+            let mut out: IndexMap<String, Value> = IndexMap::new();
+            for (k, v) in map {
+                out.insert(k, stamp_unresolved_upstream(v, upstream_binding_names));
+            }
+            Value::Map(out)
+        }
+        Value::Interpolation(parts) => Value::Interpolation(
+            parts
+                .into_iter()
+                .map(|p| match p {
+                    InterpolationPart::Expr(v) => InterpolationPart::Expr(
+                        stamp_unresolved_upstream(v, upstream_binding_names),
+                    ),
+                    other => other,
+                })
+                .collect(),
+        ),
+        Value::FunctionCall { name, args } => Value::FunctionCall {
+            name,
+            args: args
+                .into_iter()
+                .map(|a| stamp_unresolved_upstream(a, upstream_binding_names))
+                .collect(),
+        },
+        Value::Secret(inner) => Value::Secret(Box::new(stamp_unresolved_upstream(
+            *inner,
+            upstream_binding_names,
+        ))),
+        other => other,
+    }
 }
 
 /// Recursively resolve a single Value, replacing ResourceRef with the referenced value.
@@ -741,5 +833,197 @@ mod tests {
             resources[0].get_attr("vpc_id"),
             Some(Value::ResourceRef { .. })
         ));
+    }
+
+    /// `resolve_refs_for_plan` stamps any surviving `ResourceRef` whose
+    /// root binding is in `remote_bindings.keys()` with the unresolved-
+    /// upstream marker. Plan display detects the marker via
+    /// `parser::decode_unresolved_upstream_marker`.
+    #[test]
+    fn test_resolve_refs_for_plan_stamps_top_level_unresolved_upstream() {
+        let mut resources = vec![make_resource(
+            "web-sg",
+            None,
+            vec![(
+                "vpc_id",
+                Value::resource_ref(
+                    "network".to_string(),
+                    "vpc".to_string(),
+                    vec!["vpc_id".to_string()],
+                ),
+            )],
+        )];
+        let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        remote_bindings.insert("network".to_string(), HashMap::new());
+
+        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings).unwrap();
+
+        match resources[0].get_attr("vpc_id") {
+            Some(Value::String(s)) => {
+                let payload = crate::parser::decode_unresolved_upstream_marker(s)
+                    .expect("expected marker prefix");
+                assert_eq!(payload, "network.vpc.vpc_id");
+            }
+            other => panic!("expected marker String, got {:?}", other),
+        }
+    }
+
+    /// The apply-side `resolve_refs_with_state_and_remote` must leave a
+    /// surviving upstream `ResourceRef` intact (no marker String). Apply
+    /// still requires every upstream value to be resolved at apply time;
+    /// the resolver-level guarantee is "no stamping unless `for_plan`".
+    #[test]
+    fn test_resolve_refs_with_state_and_remote_leaves_unresolved_ref_intact() {
+        let mut resources = vec![make_resource(
+            "web-sg",
+            None,
+            vec![(
+                "vpc_id",
+                Value::resource_ref(
+                    "network".to_string(),
+                    "vpc".to_string(),
+                    vec!["vpc_id".to_string()],
+                ),
+            )],
+        )];
+        let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        remote_bindings.insert("network".to_string(), HashMap::new());
+
+        resolve_refs_with_state_and_remote(&mut resources, &HashMap::new(), &remote_bindings)
+            .unwrap();
+
+        assert!(matches!(
+            resources[0].get_attr("vpc_id"),
+            Some(Value::ResourceRef { .. })
+        ));
+    }
+
+    /// Refs to non-upstream bindings must not be marked, so existing
+    /// diagnostics for in-DSL `let` typos keep working.
+    #[test]
+    fn test_resolve_refs_for_plan_leaves_non_upstream_refs() {
+        let mut resources = vec![make_resource(
+            "web-sg",
+            None,
+            vec![(
+                "vpc_id",
+                Value::resource_ref("main".to_string(), "vpc_id".to_string(), Vec::new()),
+            )],
+        )];
+        let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+
+        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings).unwrap();
+
+        assert!(matches!(
+            resources[0].get_attr("vpc_id"),
+            Some(Value::ResourceRef { .. })
+        ));
+    }
+
+    /// Upstream refs nested inside a `List` must be reached too — e.g.
+    /// `security_group_ids = [network.public_sg, network.private_sg]`.
+    #[test]
+    fn test_resolve_refs_for_plan_stamps_inside_list() {
+        let mut resources = vec![make_resource(
+            "instance",
+            None,
+            vec![(
+                "security_group_ids",
+                Value::List(vec![
+                    Value::resource_ref("network".to_string(), "public_sg".to_string(), Vec::new()),
+                    Value::resource_ref(
+                        "network".to_string(),
+                        "private_sg".to_string(),
+                        Vec::new(),
+                    ),
+                ]),
+            )],
+        )];
+        let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        remote_bindings.insert("network".to_string(), HashMap::new());
+
+        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings).unwrap();
+
+        match resources[0].get_attr("security_group_ids") {
+            Some(Value::List(items)) => {
+                assert_eq!(items.len(), 2);
+                for (idx, item) in items.iter().enumerate() {
+                    match item {
+                        Value::String(s) => assert!(
+                            crate::parser::decode_unresolved_upstream_marker(s).is_some(),
+                            "list[{}] should be marker String, got {:?}",
+                            idx,
+                            s
+                        ),
+                        other => panic!("list[{}] should be marker String, got {:?}", idx, other),
+                    }
+                }
+            }
+            other => panic!("expected List, got {:?}", other),
+        }
+    }
+
+    /// Stamping must not destroy the `dependency_bindings` saved by the
+    /// resolver before stamping. Plan-tree building and `Delete` effect
+    /// linkage rely on this metadata; without it, a deleted resource that
+    /// referenced an unresolved upstream would lose the parent-child link.
+    #[test]
+    fn test_resolve_refs_for_plan_preserves_dependency_bindings() {
+        let mut resources = vec![make_resource(
+            "web-sg",
+            None,
+            vec![(
+                "vpc_id",
+                Value::resource_ref(
+                    "network".to_string(),
+                    "vpc".to_string(),
+                    vec!["vpc_id".to_string()],
+                ),
+            )],
+        )];
+        let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        remote_bindings.insert("network".to_string(), HashMap::new());
+
+        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings).unwrap();
+
+        assert!(
+            resources[0].dependency_bindings.contains("network"),
+            "dependency_bindings must record the upstream binding even after stamping"
+        );
+    }
+
+    /// Upstream refs nested inside `Map` must be reached — a
+    /// `tags = { id = network.vpc.vpc_id }` attribute would otherwise
+    /// render the raw dot-form when only the top level gets stamped.
+    #[test]
+    fn test_resolve_refs_for_plan_recurses_into_collections() {
+        let inner = Value::resource_ref(
+            "network".to_string(),
+            "vpc".to_string(),
+            vec!["vpc_id".to_string()],
+        );
+        let mut tag_map: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
+        tag_map.insert("VpcId".to_string(), inner);
+        let mut resources = vec![make_resource(
+            "web-sg",
+            None,
+            vec![("tags", Value::Map(tag_map))],
+        )];
+        let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        remote_bindings.insert("network".to_string(), HashMap::new());
+
+        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings).unwrap();
+
+        match resources[0].get_attr("tags") {
+            Some(Value::Map(m)) => match m.get("VpcId") {
+                Some(Value::String(s)) => assert!(
+                    crate::parser::decode_unresolved_upstream_marker(s).is_some(),
+                    "expected marker prefix, got {:?}",
+                    s
+                ),
+                other => panic!("nested entry should be marker String, got {:?}", other),
+            },
+            other => panic!("expected Map, got {:?}", other),
+        }
     }
 }

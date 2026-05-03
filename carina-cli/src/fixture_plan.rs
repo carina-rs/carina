@@ -11,7 +11,7 @@ use carina_core::config_loader::{get_base_dir, load_configuration};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
 use carina_core::plan::Plan;
-use carina_core::resolver::resolve_refs_with_state_and_remote;
+use carina_core::resolver::resolve_refs_for_plan;
 use carina_core::resource::{ResourceId, State, Value};
 use carina_core::schema::SchemaRegistry;
 use carina_state::{StateFile, check_and_migrate};
@@ -100,6 +100,10 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         }
     }
 
+    // Insert every upstream binding — even when the state file is
+    // unreadable — so `resolve_refs_for_plan` knows the binding name
+    // and can stamp surviving refs as `(known after upstream apply: <ref>)`
+    // instead of leaving the raw dot-form (#2366).
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     for us in &parsed.upstream_states {
         let dir = if us.source.is_absolute() {
@@ -108,15 +112,20 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             base_dir.join(&us.source)
         };
         let state_path = dir.join(carina_state::LocalBackend::DEFAULT_STATE_FILE);
-        if let Ok(content) = std::fs::read_to_string(&state_path)
-            && let Ok(sf) = check_and_migrate(&content)
-        {
-            remote_bindings.insert(us.binding.clone(), sf.build_remote_bindings());
-        }
+        let bindings = std::fs::read_to_string(&state_path)
+            .ok()
+            .and_then(|content| check_and_migrate(&content).ok())
+            .map(|sf| sf.build_remote_bindings())
+            .unwrap_or_default();
+        remote_bindings.insert(us.binding.clone(), bindings);
     }
 
+    // Plan-only resolution: stamps surviving upstream refs for display
+    // as `(known after upstream apply: <ref>)` (#2366). The fixture
+    // loader is already lenient about missing upstream state files (see
+    // the loop above that silently skips them).
     let mut resources = sorted_resources.clone();
-    resolve_refs_with_state_and_remote(&mut resources, &current_states, &remote_bindings)
+    resolve_refs_for_plan(&mut resources, &current_states, &remote_bindings)
         .expect("Failed to resolve refs with state");
 
     normalize_desired_with_ctx(&wiring, &mut resources);
