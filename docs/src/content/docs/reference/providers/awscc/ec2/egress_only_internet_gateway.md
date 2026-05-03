@@ -28,7 +28,7 @@ awscc.ec2.EgressOnlyInternetGateway {
 
 ### `tags`
 
-- **Type:** Map(String)
+- **Type:** `Map<String, String>`
 - **Required:** No
 
 Any tags assigned to the egress only internet gateway.

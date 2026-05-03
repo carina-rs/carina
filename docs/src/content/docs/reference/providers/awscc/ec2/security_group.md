@@ -73,7 +73,7 @@ The inbound rules associated with the security group. There is a short interrupt
 
 ### `tags`
 
-- **Type:** Map(String)
+- **Type:** `Map<String, String>`
 - **Required:** No
 
 Any tags assigned to the security group.

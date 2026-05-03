@@ -22,7 +22,7 @@ awscc.ec2.InternetGateway {
 
 ### `tags`
 
-- **Type:** Map(String)
+- **Type:** `Map<String, String>`
 - **Required:** No
 
 Any tags to assign to the internet gateway.

@@ -69,7 +69,7 @@ The minimum allowed netmask length for allocations made from this pool.
 
 ### `allocation_resource_tags`
 
-- **Type:** `List<Map(String)>`
+- **Type:** `List<Map<String, String>>`
 - **Required:** No
 
 When specified, an allocation will not be allowed unless a resource has a matching set of tags.
@@ -149,7 +149,7 @@ The Id of this pool's source. If set, all space provisioned in this pool must be
 
 ### `tags`
 
-- **Type:** Map(String)
+- **Type:** `Map<String, String>`
 - **Required:** No
 
 An array of key-value pairs to apply to this resource.
