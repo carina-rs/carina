@@ -7,8 +7,6 @@ hero:
   tagline: ''
 ---
 
-import { CardGrid, LinkCard } from '@astrojs/starlight/components';
-
 <div class="why-carina not-content">
   <h2>Why Carina?</h2>
   <div class="why-grid">
@@ -48,7 +46,21 @@ import { CardGrid, LinkCard } from '@astrojs/starlight/components';
 
 ## Providers
 
-<CardGrid>
-  <LinkCard title="AWSCC Provider" description="AWS Cloud Control API — EC2, S3, IAM, Logs, Organizations, Route53, Identity Store, SSO" href="/reference/providers/awscc/" />
-  <LinkCard title="AWS Provider" description="AWS SDK — EC2, S3, IAM, STS, Logs, Organizations, Route53, Identity Store" href="/reference/providers/aws/" />
-</CardGrid>
+<ul class="provider-cards not-content">
+  <li>
+    <a class="provider-card" href="/reference/providers/awscc/">
+      <p class="eyebrow">Provider</p>
+      <h3 class="title">awscc <span class="arrow">→</span></h3>
+      <p class="desc">AWS Cloud Control API. Strongly-typed coverage of dozens of AWS resources.</p>
+      <div class="resources"><span>ec2</span><span>s3</span><span>iam</span><span>logs</span><span>+12 more</span></div>
+    </a>
+  </li>
+  <li>
+    <a class="provider-card" href="/reference/providers/aws/">
+      <p class="eyebrow">Provider</p>
+      <h3 class="title">aws <span class="arrow">→</span></h3>
+      <p class="desc">AWS SDK — direct API access for EC2, S3, STS.</p>
+      <div class="resources"><span>ec2</span><span>s3</span><span>sts</span></div>
+    </a>
+  </li>
+</ul>
