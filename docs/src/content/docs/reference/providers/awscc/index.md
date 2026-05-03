@@ -17,7 +17,7 @@ provider awscc {
 Resources are defined using the `awscc.<service>.<resource_type>` syntax:
 
 ```crn
-let vpc = awscc.ec2.vpc {
+let vpc = awscc.ec2.Vpc {
   name       = 'my-vpc'
   cidr_block = '10.0.0.0/16'
   tags = {
@@ -29,7 +29,7 @@ let vpc = awscc.ec2.vpc {
 Named resources (using `let`) can be referenced by other resources:
 
 ```crn
-let subnet = awscc.ec2.subnet {
+let subnet = awscc.ec2.Subnet {
   name              = 'my-subnet'
   vpc_id            = vpc.vpc_id
   cidr_block        = '10.0.1.0/24'
@@ -43,4 +43,4 @@ Some attributes accept enum values. These can be specified in three formats:
 
 - **Bare value**: `instance_tenancy = default`
 - **TypeName.value**: `instance_tenancy = InstanceTenancy.default`
-- **Full namespace**: `instance_tenancy = awscc.ec2.vpc.InstanceTenancy.default`
+- **Full namespace**: `instance_tenancy = awscc.ec2.Vpc.InstanceTenancy.default`
