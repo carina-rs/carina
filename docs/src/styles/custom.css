@@ -459,3 +459,29 @@ input.pagefind-ui__search-input:focus {
   padding: 1px 6px;
   border-radius: 3px;
 }
+
+/* ============================================================
+   Inline code — Carina brand tint
+   Applies to <code> in body text (markdown backticks).
+   Excludes code blocks (which are styled by Expressive Code).
+   ============================================================ */
+:root {
+  --carina-inline-code-color: #fbbf24;
+  --carina-inline-code-bg: rgba(251, 191, 36, 0.07);
+}
+
+.sl-markdown-content :not(pre) > code {
+  font-family: var(--__sl-font-mono);
+  font-size: 0.88em;
+  color: var(--carina-inline-code-color);
+  background: var(--carina-inline-code-bg);
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 0;
+}
+
+/* Ensure links containing inline code keep the underline/link color
+   on the surrounding link, not the code itself. */
+.sl-markdown-content a > code {
+  color: inherit;
+}
