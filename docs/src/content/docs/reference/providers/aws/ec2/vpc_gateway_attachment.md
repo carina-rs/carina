@@ -1,6 +1,6 @@
 ---
 title: "aws.ec2.VpcGatewayAttachment"
-description: "AWS EC2 vpc_gateway_attachment resource reference"
+description: "AWS EC2 VpcGatewayAttachment resource reference"
 ---
 
 
@@ -10,7 +10,7 @@ CloudFormation Type: `AWS::EC2::VPCGatewayAttachment`
 
 ### `internet_gateway_id`
 
-- **Type:** internet_gateway_id
+- **Type:** InternetGatewayId
 - **Required:** Yes
 
 The ID of the internet gateway.

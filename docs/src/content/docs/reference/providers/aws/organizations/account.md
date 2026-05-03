@@ -1,6 +1,6 @@
 ---
 title: "aws.organizations.Account"
-description: "AWS ORGANIZATIONS account resource reference"
+description: "AWS Organizations Account resource reference"
 ---
 
 

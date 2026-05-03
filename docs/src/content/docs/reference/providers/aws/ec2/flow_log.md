@@ -1,6 +1,6 @@
 ---
 title: "aws.ec2.FlowLog"
-description: "AWS EC2 flow_log resource reference"
+description: "AWS EC2 FlowLog resource reference"
 ---
 
 

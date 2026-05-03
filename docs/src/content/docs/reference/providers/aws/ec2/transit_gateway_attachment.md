@@ -1,6 +1,6 @@
 ---
 title: "aws.ec2.TransitGatewayAttachment"
-description: "AWS EC2 transit_gateway_attachment resource reference"
+description: "AWS EC2 TransitGatewayAttachment resource reference"
 ---
 
 
@@ -26,7 +26,7 @@ The IDs of one or more subnets. You can specify only one subnet per Availability
 
 ### `transit_gateway_id`
 
-- **Type:** transit_gateway_id
+- **Type:** TransitGatewayId
 - **Required:** Yes
 
 The ID of the transit gateway.
@@ -51,10 +51,10 @@ The tags for the resource.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `appliance_mode_support` | [Enum (ApplianceModeSupport)](#appliance_mode_support-appliancemodesupport) | No | Enable or disable support for appliance mode. If enabled, a traffic flow between a source and destin... |
+| `appliance_mode_support` | [Enum (ApplianceModeSupport)](#appliance_mode_support-appliancemodesupport) | No | Enable or disable support for appliance mode. If enabled, a traffic flow between a source and destination uses the same Availability Zone for the VPC attachment for the lifetime of that flow. The default is disable. |
 | `dns_support` | [Enum (DnsSupport)](#dns_support-dnssupport) | No | Enable or disable DNS support. The default is enable. |
 | `ipv6_support` | [Enum (Ipv6Support)](#ipv6_support-ipv6support) | No | Enable or disable IPv6 support. The default is disable. |
-| `security_group_referencing_support` | [Enum (SecurityGroupReferencingSupport)](#security_group_referencing_support-securitygroupreferencingsupport) | No | Enables you to reference a security group across VPCs attached to a transit gateway to simplify secu... |
+| `security_group_referencing_support` | [Enum (SecurityGroupReferencingSupport)](#security_group_referencing_support-securitygroupreferencingsupport) | No | Enables you to reference a security group across VPCs attached to a transit gateway to simplify security group management. This option is set to enable by default. However, at the transit gateway level the default is set to disable. For more information about security group referencing, see Security group referencing in the Amazon Web Services Transit Gateways Guide. |
 
 ## Attribute Reference
 

@@ -1,6 +1,6 @@
 ---
 title: "aws.ec2.VpnGateway"
-description: "AWS EC2 vpn_gateway resource reference"
+description: "AWS EC2 VpnGateway resource reference"
 ---
 
 
@@ -52,5 +52,5 @@ Shorthand formats: `ipsec.1` or `Type.ipsec.1`
 
 ### `vpn_gateway_id`
 
-- **Type:** vpn_gateway_id
+- **Type:** VpnGatewayId
 

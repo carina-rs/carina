@@ -1,6 +1,6 @@
 ---
 title: "aws.ec2.SecurityGroupIngress"
-description: "AWS EC2 security_group_ingress resource reference"
+description: "AWS EC2 SecurityGroupIngress resource reference"
 ---
 
 
