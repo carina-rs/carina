@@ -3038,3 +3038,66 @@ test.foo.bar {
         labels
     );
 }
+
+/// Issue #2358: a `: String` upstream export must NOT be offered as a
+/// candidate at a receiver typed `Custom { semantic_name: Some(_) }`.
+/// Pinned alongside the validation-side fix because completion shares
+/// the same `is_type_expr_compatible_with_schema` predicate — a future
+/// edit that loosens the predicate would silently regress the popup
+/// even if validation still catches the bad code at apply time.
+#[test]
+fn upstream_state_string_export_not_offered_to_specific_custom_receiver() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
+
+    fn noop(_v: &carina_core::resource::Value) -> Result<(), String> {
+        Ok(())
+    }
+    let vpc_id_type = AttributeType::Custom {
+        semantic_name: Some("VpcId".to_string()),
+        pattern: None,
+        length: None,
+        base: Box::new(AttributeType::String),
+        validate: legacy_validator(noop),
+        namespace: None,
+        to_dsl: None,
+    };
+    let schema = ResourceSchema::new("ec2.SecurityGroup")
+        .attribute(AttributeSchema::new("vpc_id", vpc_id_type));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
+    let provider =
+        CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("network")).unwrap();
+    std::fs::create_dir_all(root.join("web")).unwrap();
+    std::fs::write(
+        root.join("network/main.crn"),
+        "exports {\n  vpc_id: String = 'vpc-abc'\n}\n",
+    )
+    .unwrap();
+    let main_src = "\
+let network = upstream_state {
+  source = '../network'
+}
+
+awscc.ec2.SecurityGroup {
+  vpc_id =
+}
+";
+    std::fs::write(root.join("web/main.crn"), main_src).unwrap();
+
+    let doc = create_document(main_src);
+    let position = Position {
+        line: 5,
+        character: "  vpc_id = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, Some(&root.join("web")));
+    let labels: Vec<String> = completions.iter().map(|c| c.label.clone()).collect();
+    assert!(
+        !labels.iter().any(|l| l == "network.vpc_id"),
+        "generic-String export must not be offered at a specific Custom receiver. Got: {:?}",
+        labels
+    );
+}

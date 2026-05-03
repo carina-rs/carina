@@ -1235,6 +1235,153 @@ fn is_type_expr_compatible_struct_rejects_map_with_wrong_element_type() {
     assert!(!is_type_expr_compatible_with_schema(&expr, &schema));
 }
 
+// Issue #2358: a generic `TypeExpr::String` declaration must not satisfy
+// a receiver typed as `Custom { semantic_name: Some(_) }`. The receiver
+// names a specific type (e.g. `VpcId`); a value carrying only the
+// `String` constraint cannot prove it satisfies the more specific
+// invariants the receiver demands.
+#[test]
+fn is_type_expr_compatible_string_rejects_custom_with_semantic_name() {
+    use crate::schema::legacy_validator;
+    fn noop(_v: &crate::resource::Value) -> Result<(), String> {
+        Ok(())
+    }
+    let schema = AttributeType::Custom {
+        semantic_name: Some("VpcId".to_string()),
+        pattern: None,
+        length: None,
+        base: Box::new(AttributeType::String),
+        validate: legacy_validator(noop),
+        namespace: None,
+        to_dsl: None,
+    };
+    assert!(
+        !is_type_expr_compatible_with_schema(&TypeExpr::String, &schema),
+        "TypeExpr::String must not satisfy Custom{{semantic_name:VpcId}}"
+    );
+}
+
+// Companion: a Custom receiver with no semantic_name (anonymous Custom,
+// e.g. a bare `String` enriched with pattern/length but no semantic
+// label) keeps accepting `TypeExpr::String` — it has no specific
+// identity to demand.
+#[test]
+fn is_type_expr_compatible_string_accepts_custom_without_semantic_name() {
+    use crate::schema::legacy_validator;
+    fn noop(_v: &crate::resource::Value) -> Result<(), String> {
+        Ok(())
+    }
+    let schema = AttributeType::Custom {
+        semantic_name: None,
+        pattern: Some("^.+$".to_string()),
+        length: None,
+        base: Box::new(AttributeType::String),
+        validate: legacy_validator(noop),
+        namespace: None,
+        to_dsl: None,
+    };
+    assert!(
+        is_type_expr_compatible_with_schema(&TypeExpr::String, &schema),
+        "TypeExpr::String must satisfy Custom with no semantic_name"
+    );
+}
+
+// Issue #2358 Union descent: a `TypeExpr::String` declaration must not
+// satisfy a `Union` receiver that contains *any* `Custom { semantic_name }`
+// alternative — the value might end up flowing into the specific
+// branch, and `String` cannot prove that branch's invariants.
+#[test]
+fn is_type_expr_compatible_string_rejects_union_containing_specific_custom() {
+    use crate::schema::legacy_validator;
+    fn noop(_v: &crate::resource::Value) -> Result<(), String> {
+        Ok(())
+    }
+    let schema = AttributeType::Union(vec![
+        AttributeType::String,
+        AttributeType::Custom {
+            semantic_name: Some("VpcId".to_string()),
+            pattern: None,
+            length: None,
+            base: Box::new(AttributeType::String),
+            validate: legacy_validator(noop),
+            namespace: None,
+            to_dsl: None,
+        },
+    ]);
+    assert!(
+        !is_type_expr_compatible_with_schema(&TypeExpr::String, &schema),
+        "TypeExpr::String must not satisfy a Union containing Custom{{semantic}}"
+    );
+}
+
+// Companion: a Union of *only* specific Custom alternatives is even
+// more clearly String-incompatible — every branch demands a specific
+// identity that String can't prove.
+#[test]
+fn is_type_expr_compatible_string_rejects_union_of_only_specific_customs() {
+    use crate::schema::legacy_validator;
+    fn noop(_v: &crate::resource::Value) -> Result<(), String> {
+        Ok(())
+    }
+    let mk = |name: &str| AttributeType::Custom {
+        semantic_name: Some(name.to_string()),
+        pattern: None,
+        length: None,
+        base: Box::new(AttributeType::String),
+        validate: legacy_validator(noop),
+        namespace: None,
+        to_dsl: None,
+    };
+    let schema = AttributeType::Union(vec![mk("VpcId"), mk("SubnetId")]);
+    assert!(
+        !is_type_expr_compatible_with_schema(&TypeExpr::String, &schema),
+        "TypeExpr::String must not satisfy a Union of only specific-Custom alternatives"
+    );
+}
+
+// Companion: a Union of only string-shaped, non-specific types must
+// keep accepting `TypeExpr::String` (no specific-Custom alternative
+// exists, so the value can safely flow into any branch).
+#[test]
+fn is_type_expr_compatible_string_accepts_union_of_only_strings() {
+    let schema = AttributeType::Union(vec![
+        AttributeType::String,
+        AttributeType::StringEnum {
+            name: "Mode".to_string(),
+            values: vec!["A".to_string(), "B".to_string()],
+            namespace: None,
+            to_dsl: None,
+        },
+    ]);
+    assert!(
+        is_type_expr_compatible_with_schema(&TypeExpr::String, &schema),
+        "TypeExpr::String must satisfy a Union of only string-shaped non-specific types"
+    );
+}
+
+// Companion: the safe direction — a specific Custom-typed export must
+// continue to satisfy a receiver of the same Custom type. Pin so the
+// strictness fix doesn't accidentally reject the correct direction.
+#[test]
+fn is_type_expr_compatible_simple_vpcid_accepts_custom_vpcid() {
+    use crate::schema::legacy_validator;
+    fn noop(_v: &crate::resource::Value) -> Result<(), String> {
+        Ok(())
+    }
+    let schema = AttributeType::Custom {
+        semantic_name: Some("VpcId".to_string()),
+        pattern: None,
+        length: None,
+        base: Box::new(AttributeType::String),
+        validate: legacy_validator(noop),
+        namespace: None,
+        to_dsl: None,
+    };
+    // Parser normalizes `: VpcId` to TypeExpr::Simple("vpc_id") (snake).
+    let expr = TypeExpr::Simple("vpc_id".to_string());
+    assert!(is_type_expr_compatible_with_schema(&expr, &schema));
+}
+
 #[test]
 fn validate_module_calls_rejects_custom_type() {
     use crate::parser::ArgumentParameter;

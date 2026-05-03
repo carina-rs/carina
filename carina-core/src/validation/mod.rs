@@ -375,7 +375,25 @@ pub fn is_type_expr_compatible_with_schema(
     use crate::parser::TypeExpr;
 
     match type_expr {
-        TypeExpr::String => is_string_compatible_type(attr_type),
+        // A bare `TypeExpr::String` must not satisfy a receiver typed as
+        // `Custom { semantic_name: Some(_) }` — the receiver names a
+        // specific identity (e.g. `VpcId`) that a generic `String`
+        // cannot prove. Descends into `Union` members so a polymorphic
+        // receiver like `Union<[String, Custom{VpcId}]>` is rejected
+        // too: every alternative the value might end up satisfying
+        // must be reachable from `String`. The symmetric *narrowing*
+        // case — a specific `: VpcId` export against a less specific
+        // receiver — is handled by the `Simple(name)` arm below: it
+        // walks the receiver's `Custom` base chain looking for a
+        // matching identity, returning `true` only when the receiver
+        // is at least as specific as (or more general than) the
+        // declared type. Issue #2358.
+        TypeExpr::String => {
+            if attr_type_demands_specific_custom(attr_type) {
+                return false;
+            }
+            is_string_compatible_type(attr_type)
+        }
         TypeExpr::Bool => matches!(attr_type, AttributeType::Bool),
         TypeExpr::Int => matches!(attr_type, AttributeType::Int),
         TypeExpr::Float => matches!(attr_type, AttributeType::Float),
@@ -451,6 +469,37 @@ pub fn is_string_compatible_type(attr_type: &AttributeType) -> bool {
             true
         }
         AttributeType::Union(types) => types.iter().all(is_string_compatible_type),
+        _ => false,
+    }
+}
+
+/// Recursive check used by the `TypeExpr::String` arm of
+/// `is_type_expr_compatible_with_schema`: returns `true` when
+/// `attr_type` carries a `Custom { semantic_name: Some(_) }` either at
+/// the top level or anywhere inside a `Union`. A schema attribute that
+/// names a specific identity (`VpcId`, `Arn`, …) cannot accept a value
+/// known only as `String`. Issue #2358.
+///
+/// Scope:
+/// - Looks at the outer `semantic_name` only — does **not** walk
+///   `Custom.base` chains. Real provider schemas keep `semantic_name`
+///   on the outer wrapper, so an anonymous `Custom` wrapping a
+///   specific `Custom` does not occur in practice. If a future schema
+///   introduces that shape, this helper would need to walk the base
+///   chain too.
+/// - Only `String`-shaped specifics are guarded today. Provider
+///   schemas currently express every named-identity Custom as a
+///   `String`-base wrapper, so `TypeExpr::Int/Bool/Float` arms have
+///   no analogous strictness. If a future schema adds e.g. a
+///   `Custom { semantic_name: "Port", base: Int }`, those arms will
+///   also need to consult this helper (or a sibling).
+fn attr_type_demands_specific_custom(attr_type: &AttributeType) -> bool {
+    match attr_type {
+        AttributeType::Custom {
+            semantic_name: Some(_),
+            ..
+        } => true,
+        AttributeType::Union(types) => types.iter().any(attr_type_demands_specific_custom),
         _ => false,
     }
 }
