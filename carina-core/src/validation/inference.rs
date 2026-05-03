@@ -1081,7 +1081,7 @@ mod tests {
         let mut parsed = crate::parser::ParsedFile::default();
         let res = crate::resource::Resource::with_provider("awscc", "ec2.Vpc", "main")
             .with_binding("main");
-        parsed.resources.push(res);
+        parsed.resources.push(res); // allow: direct — fixture test inspection
         parsed.export_params.push(crate::parser::ParsedExportParam {
             name: "vpc_id".to_string(),
             type_expr: None,
