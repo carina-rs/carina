@@ -1,0 +1,88 @@
+---
+// Carina-branded page footer.
+// Renders at the bottom of every page.
+---
+
+<footer class="carina-footer">
+  <div class="carina-footer-star" aria-hidden="true"></div>
+  <p class="carina-footer-quote">
+    Named after the keel of <span class="accent">Argo Navis</span> — the structural backbone of the ship.
+  </p>
+  <div class="carina-footer-meta">
+    <a href="https://github.com/carina-rs/carina">GitHub</a>
+    <span class="sep">·</span>
+    <a href="https://crates.io/crates/carina">crates.io</a>
+    <span class="sep">·</span>
+    <span>MIT License</span>
+    <span class="sep">·</span>
+    <span>Built with Astro &amp; Starlight</span>
+  </div>
+</footer>
+
+<style>
+  .carina-footer {
+    position: relative;
+    margin-top: 4rem;
+    padding: 2.25rem 1rem 1.75rem;
+    text-align: center;
+  }
+
+  .carina-footer::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 15%;
+    right: 15%;
+    height: 1px;
+    background: linear-gradient(
+      90deg,
+      transparent 0%,
+      #0891b2 50%,
+      transparent 100%
+    );
+    opacity: 0.5;
+  }
+
+  .carina-footer-star {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: #fef3c7;
+    box-shadow: 0 0 8px #fde68a, 0 0 22px rgba(253, 230, 138, 0.35);
+    margin: 0 auto 0.75rem;
+  }
+
+  .carina-footer-quote {
+    font-family: var(--carina-font-display, var(--sl-font));
+    font-size: 0.8125rem;
+    font-style: italic;
+    color: var(--sl-color-gray-3);
+    margin: 0 0 1rem;
+    letter-spacing: 0.005em;
+  }
+
+  .carina-footer-quote .accent {
+    color: #fbbf24;
+    font-style: normal;
+    font-weight: 600;
+  }
+
+  .carina-footer-meta {
+    display: flex;
+    justify-content: center;
+    gap: 1.125rem;
+    font-size: 0.75rem;
+    color: var(--sl-color-gray-4);
+    flex-wrap: wrap;
+  }
+
+  .carina-footer-meta a {
+    color: var(--sl-color-gray-3);
+    text-decoration: none;
+    transition: color 0.15s ease;
+  }
+
+  .carina-footer-meta a:hover { color: #fbbf24; }
+
+  .carina-footer-meta .sep { color: var(--sl-color-gray-5); }
+</style>
