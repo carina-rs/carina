@@ -14,10 +14,10 @@ provider aws {
 
 ## Usage
 
-Resources are defined using the `aws.<resource_type>` syntax:
+Resources are defined using the `aws.<service>.<resource_type>` syntax:
 
 ```crn
-let vpc = aws.ec2_vpc {
+let vpc = aws.ec2.Vpc {
   name       = 'my-vpc'
   cidr_block = '10.0.0.0/16'
   tags = {
@@ -29,7 +29,7 @@ let vpc = aws.ec2_vpc {
 Named resources (using `let`) can be referenced by other resources:
 
 ```crn
-let subnet = aws.ec2_subnet {
+let subnet = aws.ec2.Subnet {
   name              = 'my-subnet'
   vpc_id            = vpc.vpc_id
   cidr_block        = '10.0.1.0/24'
@@ -43,4 +43,4 @@ Some attributes accept enum values. These can be specified in three formats:
 
 - **Bare value**: `instance_tenancy = default`
 - **TypeName.value**: `instance_tenancy = InstanceTenancy.default`
-- **Full namespace**: `instance_tenancy = aws.ec2_vpc.InstanceTenancy.default`
+- **Full namespace**: `instance_tenancy = aws.ec2.Vpc.InstanceTenancy.default`
