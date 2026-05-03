@@ -20,8 +20,10 @@ pub fn validate_resources(
     parsed: &ParsedFile,
     registry: &SchemaRegistry,
     known_providers: &HashSet<String>,
+    provider_context: &ProviderContext,
 ) -> Result<(), String> {
     let mut all_errors = Vec::new();
+    let lookup = crate::parser::provider_context_lookup(provider_context);
 
     for (_ctx, resource) in parsed.iter_all_resources() {
         // Skip virtual resources (module attribute containers)
@@ -32,9 +34,11 @@ pub fn validate_resources(
         match registry.get_for(resource) {
             Some(schema) => {
                 let is_string_literal = |attr: &str| resource.quoted_string_attrs.contains(attr);
-                if let Err(errors) = schema
-                    .validate_with_origins(&resource.resolved_attributes(), &is_string_literal)
-                {
+                if let Err(errors) = schema.validate_with_origins_and_lookup(
+                    &resource.resolved_attributes(),
+                    &is_string_literal,
+                    &lookup,
+                ) {
                     for error in errors {
                         all_errors.push(format!("{}: {}", resource.id, error));
                     }

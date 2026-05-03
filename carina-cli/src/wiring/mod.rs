@@ -180,7 +180,11 @@ fn lift_validation_result(res: Result<(), String>) -> Vec<AppError> {
         .collect()
 }
 
-pub fn validate_resources_with_ctx(ctx: &WiringContext, parsed: &ParsedFile) -> Vec<AppError> {
+pub fn validate_resources_with_ctx(
+    ctx: &WiringContext,
+    parsed: &ParsedFile,
+    provider_context: &carina_core::parser::ProviderContext,
+) -> Vec<AppError> {
     let known_providers: HashSet<String> = ctx
         .factories()
         .iter()
@@ -190,6 +194,7 @@ pub fn validate_resources_with_ctx(ctx: &WiringContext, parsed: &ParsedFile) -> 
         parsed,
         ctx.schemas(),
         &known_providers,
+        provider_context,
     ))
 }
 
@@ -1404,7 +1409,11 @@ pub fn validate_resources(resources: &[Resource]) -> Result<(), AppError> {
         resources: resources.to_vec(),
         ..ParsedFile::default()
     };
-    errors_to_legacy_result(validate_resources_with_ctx(&ctx, &parsed))
+    errors_to_legacy_result(validate_resources_with_ctx(
+        &ctx,
+        &parsed,
+        &carina_core::parser::ProviderContext::default(),
+    ))
 }
 
 #[cfg(test)]

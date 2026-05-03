@@ -52,6 +52,108 @@ pub fn noop_validator() -> CustomValidator {
     validator(|_| Ok(()))
 }
 
+/// External validator looked up by `AttributeType::Custom.semantic_name`
+/// at validation time. Used to bridge to provider-supplied validators
+/// (the `ProviderContext.validators` map and WASM factory's
+/// `validate_custom_type`) that the schema itself cannot carry across
+/// the WASM boundary — see #2354.
+///
+/// Implementors normalize the type name as needed (typically PascalCase
+/// → snake_case via `parser::pascal_to_snake`) before looking up the
+/// real validator.
+pub type CustomTypeLookup<'a> =
+    &'a (dyn Fn(&str, &Value) -> Result<(), TypeError> + Send + Sync + 'a);
+
+/// A [`CustomTypeLookup`] that approves every value. Pass to
+/// `validate_with_origins_and_lookup` from contexts that have no
+/// `ProviderContext` (snapshot tests, schema unit tests). The
+/// schema-attached `validate` closure still runs for built-in
+/// validators registered directly on the type.
+pub fn no_lookup() -> CustomTypeLookup<'static> {
+    &|_name, _value| Ok(())
+}
+
+/// Walk an [`AttributeType`] and apply `lookup` to every `Custom` node
+/// reached. Pushes any returned error into `errors`, tagged with
+/// `attr_name` so it points back at the user-visible attribute. Used
+/// by `ResourceSchema::validate_inner` to bridge provider-supplied
+/// validators that the schema's own closure cannot carry (e.g. WASM
+/// plugins, where the schema arrives with `noop_validator()` and the
+/// real validator lives behind the factory's `validate_custom_type`).
+fn walk_custom_lookup(
+    attr_type: &AttributeType,
+    value: &Value,
+    attr_name: &str,
+    lookup: CustomTypeLookup<'_>,
+    errors: &mut Vec<TypeError>,
+) {
+    // Values that resolve at runtime are skipped — the same convention
+    // the schema-attached `validate` closure follows.
+    if matches!(
+        value,
+        Value::FunctionCall { .. }
+            | Value::Secret(_)
+            | Value::ResourceRef { .. }
+            | Value::Interpolation(_)
+    ) {
+        return;
+    }
+    match attr_type {
+        AttributeType::Custom { semantic_name, .. } => {
+            if let Some(name) = semantic_name
+                && let Err(e) = lookup(name, value)
+            {
+                // Re-wrap as `ResourceValidationFailed` so the attribute
+                // slot survives. `with_attribute` only enriches the two
+                // enum-variant errors; bare `ValidationFailed` would
+                // arrive at the LSP without a position hint and get
+                // filtered out by the resource-level dedup.
+                let message = match e {
+                    TypeError::ValidationFailed { message } => message,
+                    other => other.to_string(),
+                };
+                errors.push(TypeError::ResourceValidationFailed {
+                    message,
+                    attribute: Some(attr_name.to_string()),
+                });
+            }
+        }
+        AttributeType::List { inner, .. } => {
+            if let Value::List(items) = value {
+                for item in items {
+                    walk_custom_lookup(inner, item, attr_name, lookup, errors);
+                }
+            }
+        }
+        AttributeType::Map { value: inner, .. } => {
+            if let Value::Map(map) = value {
+                for v in map.values() {
+                    walk_custom_lookup(inner, v, attr_name, lookup, errors);
+                }
+            }
+        }
+        AttributeType::Struct { fields, .. } => {
+            if let Value::Map(map) = value {
+                for f in fields {
+                    if let Some(v) = map.get(&f.name) {
+                        walk_custom_lookup(&f.field_type, v, attr_name, lookup, errors);
+                    }
+                }
+            }
+        }
+        AttributeType::Union(members) => {
+            for member in members {
+                walk_custom_lookup(member, value, attr_name, lookup, errors);
+            }
+        }
+        AttributeType::String
+        | AttributeType::Int
+        | AttributeType::Float
+        | AttributeType::Bool
+        | AttributeType::StringEnum { .. } => {}
+    }
+}
+
 pub type StringEnumParts<'a> = (
     &'a str,
     &'a [String],
@@ -1952,7 +2054,7 @@ impl ResourceSchema {
     /// knows which attributes were written as quoted string literals
     /// (see #2094).
     pub fn validate(&self, attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
-        self.validate_inner(attributes, &|_attr_name| false)
+        self.validate_inner(attributes, &|_attr_name| false, no_lookup())
     }
 
     /// Validate resource attributes, reshaping enum-variant errors into
@@ -1970,13 +2072,27 @@ impl ResourceSchema {
         attributes: &HashMap<String, Value>,
         is_string_literal: &dyn Fn(&str) -> bool,
     ) -> Result<(), Vec<TypeError>> {
-        self.validate_inner(attributes, is_string_literal)
+        self.validate_inner(attributes, is_string_literal, no_lookup())
+    }
+
+    /// As [`validate_with_origins`], but also runs `lookup` on every
+    /// `AttributeType::Custom` value reached during traversal so
+    /// provider-supplied validators that the schema itself cannot
+    /// carry (WASM plugin path) still get to reject bad values.
+    pub fn validate_with_origins_and_lookup(
+        &self,
+        attributes: &HashMap<String, Value>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+        lookup: CustomTypeLookup<'_>,
+    ) -> Result<(), Vec<TypeError>> {
+        self.validate_inner(attributes, is_string_literal, lookup)
     }
 
     fn validate_inner(
         &self,
         attributes: &HashMap<String, Value>,
         is_string_literal: &dyn Fn(&str) -> bool,
+        lookup: CustomTypeLookup<'_>,
     ) -> Result<(), Vec<TypeError>> {
         let mut errors = Vec::new();
 
@@ -2022,6 +2138,7 @@ impl ResourceSchema {
                     };
                     errors.push(reshaped);
                 }
+                walk_custom_lookup(&schema.attr_type, value, name, lookup, &mut errors);
             } else {
                 let suggestion = suggest_similar_name(name, &known);
                 errors.push(TypeError::UnknownAttribute {

@@ -493,7 +493,8 @@ fn validate_resources_with_ctx_returns_each_error_as_app_error() {
         ..ParsedFile::default()
     };
 
-    let errors = validate_resources_with_ctx(&ctx, &parsed);
+    let provider_ctx = carina_core::parser::ProviderContext::default();
+    let errors = validate_resources_with_ctx(&ctx, &parsed, &provider_ctx);
     assert_eq!(errors.len(), 2, "got {errors:?}");
     for err in &errors {
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");

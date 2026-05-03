@@ -290,7 +290,7 @@ pub fn validate_and_resolve_errors_with_factories(
     }
 
     if !skip_resource_validation {
-        errors.extend(validate_resources_with_ctx(&ctx, parsed));
+        errors.extend(validate_resources_with_ctx(&ctx, parsed, &enriched_context));
         let mut argument_names: HashSet<String> =
             parsed.arguments.iter().map(|a| a.name.clone()).collect();
         // Upstream state bindings are resolved at plan time, skip type validation
