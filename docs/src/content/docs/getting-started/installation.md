@@ -16,9 +16,9 @@ This installs both `carina` (CLI) and `carina-lsp` (Language Server).
 Download pre-built binaries from [GitHub Releases](https://github.com/carina-rs/carina/releases/latest). Available for macOS (aarch64, x86_64) and Linux (aarch64, x86_64). Each archive contains both `carina` and `carina-lsp`.
 
 ```bash
-# macOS (Apple Silicon)
-curl -LO https://github.com/carina-rs/carina/releases/latest/download/carina-0.4.0-macos-aarch64.tar.gz
-tar xzf carina-0.4.0-macos-aarch64.tar.gz
+# macOS (Apple Silicon) — replace <VERSION> with the latest release tag (e.g. 0.5.0)
+curl -LO https://github.com/carina-rs/carina/releases/download/v<VERSION>/carina-<VERSION>-macos-aarch64.tar.gz
+tar xzf carina-<VERSION>-macos-aarch64.tar.gz
 sudo mv carina carina-lsp /usr/local/bin/
 ```
 

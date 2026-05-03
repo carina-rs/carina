@@ -109,7 +109,7 @@ awscc.ec2.Subnet {
 Query existing resources without managing them:
 
 ```crn
-let caller = read aws.sts.caller_identity {}
+let caller = read aws.sts.CallerIdentity {}
 ```
 
 ### Lifecycle blocks

@@ -154,7 +154,7 @@ awscc.ec2.Vpc {
 To look up an existing resource without managing it, use the `read` keyword:
 
 ```crn
-let caller = read aws.sts.caller_identity {}
+let caller = read aws.sts.CallerIdentity {}
 ```
 
 The `read` expression fetches resource data from the provider at plan/apply time. You can then reference its attributes just like a managed resource.
