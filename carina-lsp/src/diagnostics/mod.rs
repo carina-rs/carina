@@ -494,8 +494,20 @@ impl DiagnosticEngine {
                                         namespace.as_deref(),
                                     );
 
-                                    // Use schema's validate function for all Custom types
-                                    validate(&resolved_value).err().map(|inner_err| {
+                                    // Run the schema-attached validator first; for WASM-plugin
+                                    // types it is a noop, so fall back to the provider-context
+                                    // lookup which reaches the factory's `validate_custom_type`.
+                                    let lookup = carina_core::parser::provider_context_lookup(
+                                        &self.provider_context,
+                                    );
+                                    validate(&resolved_value)
+                                        .err()
+                                        .or_else(|| {
+                                            (!name.is_empty())
+                                                .then(|| lookup(name, &resolved_value).err())
+                                                .flatten()
+                                        })
+                                        .map(|inner_err| {
                                         // For namespaced Custom types (enum-like), mirror
                                         // the CLI shape-mismatch diagnostic when the user
                                         // wrote a quoted string literal. The validator
@@ -613,7 +625,15 @@ impl DiagnosticEngine {
 
                     // Run resource-level validator (e.g., mutually exclusive required fields)
                     let resolved_attrs = resource.resolved_attributes();
-                    if let Err(errors) = schema.validate(&resolved_attrs) {
+                    let lookup =
+                        carina_core::parser::provider_context_lookup(&self.provider_context);
+                    let is_string_literal =
+                        |attr: &str| resource.quoted_string_attrs.contains(attr);
+                    if let Err(errors) = schema.validate_with_origins_and_lookup(
+                        &resolved_attrs,
+                        &is_string_literal,
+                        &lookup,
+                    ) {
                         for error in errors {
                             // Skip errors that are already reported with precise positions
                             // by the attribute-level checks above.

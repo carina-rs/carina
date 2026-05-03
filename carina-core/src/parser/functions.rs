@@ -193,6 +193,22 @@ pub(super) fn prepare_user_function_call<'cfg>(
     Ok((child_ctx, substitutions))
 }
 
+/// Adapter that turns a [`ProviderContext`] into the
+/// [`crate::schema::CustomTypeLookup`] shape consumed by the schema-walk
+/// validator. PascalCase semantic names (e.g. `VpcId`) are normalized to
+/// snake_case (`vpc_id`) before lookup, then [`validate_custom_type`]
+/// runs the registered validator chain. The returned closure may be
+/// hoisted out of any per-resource loop — it borrows the context only.
+pub fn provider_context_lookup(
+    ctx: &ProviderContext,
+) -> impl Fn(&str, &Value) -> Result<(), crate::schema::TypeError> + use<'_> {
+    move |type_name, value| {
+        let key = pascal_to_snake(type_name);
+        validate_custom_type(&key, value, ctx)
+            .map_err(|message| crate::schema::TypeError::ValidationFailed { message })
+    }
+}
+
 /// Validate a value against a custom type (ipv4_cidr, ipv4_address, etc.).
 /// Returns Ok(()) if the value passes validation or cannot be validated statically
 /// (e.g., ResourceRef, FunctionCall, Interpolation are deferred).

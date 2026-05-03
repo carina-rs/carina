@@ -28,6 +28,7 @@ use carina_core::provider::{
 use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField, legacy_validator,
+    noop_validator,
 };
 use carina_lsp::diagnostics::DiagnosticEngine;
 use carina_lsp::document::Document;
@@ -742,6 +743,243 @@ test.r.renamed_block {
     assert!(
         any(&|s| cli_messages_contain(&cli_diags, s)),
         "CLI must diagnose rule.days int mismatch, got {:?}",
+        cli_diags,
+    );
+}
+
+// ============================================================================
+// Scenario: WASM-plugin Custom validator bridge (#2354)
+//
+// A schema produced via the WASM plugin path carries `validate: noop_validator()`
+// on every `AttributeType::Custom`, with the real validator behind the
+// factory's `validate_custom_type`. The validation pipeline must reach
+// through `ProviderContext.custom_type_validator` so a bad `vpc_id`
+// value is rejected.
+// ============================================================================
+
+struct WasmStyleProviderFactory {
+    name: String,
+    schemas: Vec<ResourceSchema>,
+}
+
+impl ProviderFactory for WasmStyleProviderFactory {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn display_name(&self) -> &str {
+        "WASM-style test provider"
+    }
+    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+        HashMap::new()
+    }
+    fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+        Ok(())
+    }
+    fn validate_custom_type(&self, type_name: &str, value: &str) -> Result<(), String> {
+        // Mirror awscc's `prefixed` validator family: vpc_id must start
+        // with "vpc-".
+        if type_name == "vpc_id" && !value.starts_with("vpc-") {
+            return Err(format!(
+                "Invalid vpc_id '{}': must start with 'vpc-'",
+                value
+            ));
+        }
+        Ok(())
+    }
+    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+        "us-east-1".to_string()
+    }
+    fn create_provider(
+        &self,
+        _attributes: &IndexMap<String, Value>,
+    ) -> BoxFuture<'_, Box<dyn Provider>> {
+        Box::pin(async { Box::new(NoopProvider) as Box<dyn Provider> })
+    }
+    fn create_normalizer(
+        &self,
+        _attributes: &IndexMap<String, Value>,
+    ) -> BoxFuture<'_, Box<dyn ProviderNormalizer>> {
+        Box::pin(async { Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer> })
+    }
+    fn schemas(&self) -> Vec<ResourceSchema> {
+        self.schemas.clone()
+    }
+}
+
+fn wasm_style_vpc_schema() -> ResourceSchema {
+    let vpc_id_type = AttributeType::Custom {
+        semantic_name: Some("VpcId".to_string()),
+        pattern: None,
+        length: None,
+        base: Box::new(AttributeType::String),
+        validate: noop_validator(),
+        namespace: None,
+        to_dsl: None,
+    };
+    ResourceSchema::new("ec2.security_group")
+        .attribute(AttributeSchema::new(
+            "group_description",
+            AttributeType::String,
+        ))
+        .attribute(AttributeSchema::new("vpc_id", vpc_id_type))
+}
+
+fn wasm_style_schemas() -> SchemaRegistry {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awsccmock", wasm_style_vpc_schema());
+    schemas
+}
+
+fn wasm_style_factories() -> Vec<Box<dyn ProviderFactory>> {
+    vec![Box::new(WasmStyleProviderFactory {
+        name: "awsccmock".to_string(),
+        schemas: vec![wasm_style_vpc_schema()],
+    }) as Box<dyn ProviderFactory>]
+}
+
+fn wasm_style_engine() -> DiagnosticEngine {
+    let schemas = wasm_style_schemas();
+    let factories: Vec<Box<dyn ProviderFactory>> = wasm_style_factories();
+    let provider_names = vec!["awsccmock".to_string()];
+    DiagnosticEngine::new(Arc::new(schemas), provider_names, Arc::new(factories))
+}
+
+#[test]
+fn wasm_plugin_custom_validator_rejects_invalid_vpc_id_parity() {
+    let fixture = write_fixture(&[(
+        "main.crn",
+        r#"
+awsccmock.ec2.security_group {
+    group_description = "web sg"
+    vpc_id            = "test"
+}
+"#,
+    )]);
+
+    let lsp_diags = lsp_diagnostics(&wasm_style_engine(), &fixture, "main.crn");
+    let cli_diags = cli_diagnostics(wasm_style_factories(), &fixture);
+
+    assert!(
+        lsp_messages_contain(&lsp_diags, "vpc_id") || lsp_messages_contain(&lsp_diags, "vpc-"),
+        "LSP must diagnose invalid vpc_id, got {:?}",
+        lsp_diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+    );
+    assert!(
+        cli_messages_contain(&cli_diags, "vpc_id") || cli_messages_contain(&cli_diags, "vpc-"),
+        "CLI must diagnose invalid vpc_id, got {:?}",
+        cli_diags,
+    );
+}
+
+#[test]
+fn wasm_plugin_custom_validator_accepts_valid_vpc_id_parity() {
+    let fixture = write_fixture(&[(
+        "main.crn",
+        r#"
+awsccmock.ec2.security_group {
+    group_description = "web sg"
+    vpc_id            = "vpc-12345678"
+}
+"#,
+    )]);
+
+    let lsp_diags = lsp_diagnostics(&wasm_style_engine(), &fixture, "main.crn");
+    let cli_diags = cli_diagnostics(wasm_style_factories(), &fixture);
+
+    assert!(
+        !lsp_messages_contain(&lsp_diags, "vpc-"),
+        "LSP must not diagnose a valid vpc_id, got {:?}",
+        lsp_diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+    );
+    assert!(
+        !cli_messages_contain(&cli_diags, "vpc-"),
+        "CLI must not diagnose a valid vpc_id, got {:?}",
+        cli_diags,
+    );
+}
+
+fn wasm_style_subnet_schema() -> ResourceSchema {
+    let vpc_id_type = AttributeType::Custom {
+        semantic_name: Some("VpcId".to_string()),
+        pattern: None,
+        length: None,
+        base: Box::new(AttributeType::String),
+        validate: noop_validator(),
+        namespace: None,
+        to_dsl: None,
+    };
+    ResourceSchema::new("ec2.subnet").attribute(AttributeSchema::new(
+        "vpc_ids",
+        AttributeType::list(vpc_id_type),
+    ))
+}
+
+fn wasm_style_subnet_schemas() -> SchemaRegistry {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awsccmock", wasm_style_subnet_schema());
+    schemas
+}
+
+fn wasm_style_subnet_factories() -> Vec<Box<dyn ProviderFactory>> {
+    vec![Box::new(WasmStyleProviderFactory {
+        name: "awsccmock".to_string(),
+        schemas: vec![wasm_style_subnet_schema()],
+    }) as Box<dyn ProviderFactory>]
+}
+
+#[test]
+fn wasm_plugin_custom_validator_rejects_invalid_vpc_id_inside_list_parity() {
+    let fixture = write_fixture(&[(
+        "main.crn",
+        r#"
+awsccmock.ec2.subnet {
+    vpc_ids = ["vpc-good", "bogus"]
+}
+"#,
+    )]);
+    let schemas = wasm_style_subnet_schemas();
+    let provider_names = vec!["awsccmock".to_string()];
+    let engine = DiagnosticEngine::new(
+        Arc::new(schemas),
+        provider_names,
+        Arc::new(wasm_style_subnet_factories()),
+    );
+
+    let lsp_diags = lsp_diagnostics(&engine, &fixture, "main.crn");
+    let cli_diags = cli_diagnostics(wasm_style_subnet_factories(), &fixture);
+
+    assert!(
+        cli_messages_contain(&cli_diags, "bogus") || cli_messages_contain(&cli_diags, "vpc-"),
+        "CLI must diagnose invalid vpc_id inside list, got {:?}",
+        cli_diags,
+    );
+    assert!(
+        lsp_messages_contain(&lsp_diags, "bogus") || lsp_messages_contain(&lsp_diags, "vpc-"),
+        "LSP must diagnose invalid vpc_id inside list, got {:?}",
+        lsp_diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn wasm_plugin_custom_validator_reports_every_bad_item_in_list() {
+    // Multi-item failure case: walk_custom_lookup should accumulate one
+    // diagnostic per bad item instead of stopping at the first.
+    let fixture = write_fixture(&[(
+        "main.crn",
+        r#"
+awsccmock.ec2.subnet {
+    vpc_ids = ["bad-1", "bad-2"]
+}
+"#,
+    )]);
+    let cli_diags = cli_diagnostics(wasm_style_subnet_factories(), &fixture);
+    let bad_count = cli_diags
+        .iter()
+        .filter(|m| m.contains("bad-1") || m.contains("bad-2"))
+        .count();
+    assert_eq!(
+        bad_count, 2,
+        "CLI must report a diagnostic per bad list item, got {:?}",
         cli_diags,
     );
 }

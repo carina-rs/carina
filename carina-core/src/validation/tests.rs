@@ -1670,7 +1670,8 @@ fn validate_resources_rejects_missing_exclusive_required() {
 
     let mut parsed = empty_parsed();
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
-    let err = validate_resources(&parsed, &schemas, &known).unwrap_err();
+    let err =
+        validate_resources(&parsed, &schemas, &known, &ProviderContext::default()).unwrap_err();
     assert!(
         err.contains("Exactly one of [cidr_block, ipv4_ipam_pool_id] must be specified"),
         "expected exclusive_required error, got: {err}"
@@ -1715,7 +1716,7 @@ fn enum_membership_violation_in_for_body_is_flagged() {
     let mut known = HashSet::new();
     known.insert("test".to_string());
 
-    let result = validate_resources(&parsed, &schemas, &known);
+    let result = validate_resources(&parsed, &schemas, &known, &ProviderContext::default());
     assert!(result.is_err(), "expected enum-mismatch error in for body");
     let err = result.unwrap_err();
     assert!(
@@ -1770,7 +1771,13 @@ fn quoted_literal_enum_value_yields_string_literal_diagnostic() {
         }
         "#,
     );
-    let err = validate_resources(&parsed, &mode_schema(), &mode_known()).unwrap_err();
+    let err = validate_resources(
+        &parsed,
+        &mode_schema(),
+        &mode_known(),
+        &ProviderContext::default(),
+    )
+    .unwrap_err();
     assert!(
         err.contains("got a string literal"),
         "quoted literal must emit the shape-mismatch diagnostic, got: {err}"
@@ -1797,7 +1804,13 @@ fn bare_invalid_enum_value_keeps_invalid_variant_diagnostic() {
         }
         "#,
     );
-    let err = validate_resources(&parsed, &mode_schema(), &mode_known()).unwrap_err();
+    let err = validate_resources(
+        &parsed,
+        &mode_schema(),
+        &mode_known(),
+        &ProviderContext::default(),
+    )
+    .unwrap_err();
     assert!(
         !err.contains("got a string literal"),
         "bare identifier must NOT get the shape-mismatch diagnostic, got: {err}"
@@ -1820,7 +1833,13 @@ fn bare_valid_enum_value_passes() {
         "#,
     );
     assert!(
-        validate_resources(&parsed, &mode_schema(), &mode_known()).is_ok(),
+        validate_resources(
+            &parsed,
+            &mode_schema(),
+            &mode_known(),
+            &ProviderContext::default()
+        )
+        .is_ok(),
         "bare valid identifier must pass"
     );
 }
@@ -1837,7 +1856,13 @@ fn fully_qualified_enum_value_passes() {
         "#,
     );
     assert!(
-        validate_resources(&parsed, &mode_schema(), &mode_known()).is_ok(),
+        validate_resources(
+            &parsed,
+            &mode_schema(),
+            &mode_known(),
+            &ProviderContext::default()
+        )
+        .is_ok(),
         "fully-qualified identifier must pass"
     );
 }
@@ -1869,7 +1894,8 @@ fn read_against_managed_only_type_is_rejected() {
     let mut known = HashSet::new();
     known.insert("awscc".to_string());
 
-    let err = validate_resources(&parsed, &schemas, &known).unwrap_err();
+    let err =
+        validate_resources(&parsed, &schemas, &known, &ProviderContext::default()).unwrap_err();
     assert!(
         err.contains("is a managed resource, not a data source"),
         "expected managed-only diagnostic, got: {err}"

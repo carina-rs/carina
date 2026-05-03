@@ -27,7 +27,7 @@ pub use entry::{parse, parse_and_resolve};
 pub(crate) use entry::{parse_expression, parse_expression_eval};
 pub use error::{ParseError, ParseWarning};
 pub(crate) use functions::evaluate_user_function;
-pub use functions::validate_custom_type;
+pub use functions::{provider_context_lookup, validate_custom_type};
 pub use resolve::{
     check_identifier_scope, collect_known_bindings_merged, resolve_resource_refs,
     resolve_resource_refs_with_config,
