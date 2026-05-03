@@ -272,11 +272,13 @@ pub async fn run_plan(
     }
 
     let mut cycle_guard = seed_cycle_guard(base_dir);
+    // #2366: plan tolerates missing upstream state; apply still strict.
     let remote_bindings = load_upstream_states(
         &parsed.upstream_states,
         base_dir,
         provider_context,
         &mut cycle_guard,
+        UpstreamMissingStatePolicy::Lenient,
     )
     .await?;
 
@@ -324,6 +326,14 @@ pub async fn run_plan(
         .collect();
 
     if json {
+        // Refuse to serialize a plan whose attributes contain stamped
+        // unresolved-upstream markers. The marker is plan-display only;
+        // letting it leak into JSON or `--out plan.json` would either
+        // confuse JSON consumers (NUL-prefixed sentinel) or — worse —
+        // round-trip through `apply --plan plan.json` and reach the
+        // provider as a literal string. Force the user to apply the
+        // upstreams first. See #2366.
+        check_no_unresolved_upstream_in_plan(&ctx.plan)?;
         let plan_file = build_plan_file(path, &parsed, &state_file, &ctx);
         let json_str = serde_json::to_string_pretty(&plan_file)
             .map_err(|e| format!("Failed to serialize plan: {}", e))?;
@@ -356,6 +366,10 @@ pub async fn run_plan(
 
     // Save plan to file if --out was specified
     if let Some(out_path) = out {
+        // See `check_no_unresolved_upstream_in_plan` and the matching
+        // gate above the `--json` branch for why an unresolved-upstream
+        // marker must not be persisted (#2366).
+        check_no_unresolved_upstream_in_plan(&ctx.plan)?;
         let plan_file = build_plan_file(path, &parsed, &state_file, &ctx);
         let json_out = serde_json::to_string_pretty(&plan_file)
             .map_err(|e| format!("Failed to serialize plan: {}", e))?;
@@ -539,6 +553,81 @@ pub fn compute_export_diffs(
     changes
 }
 
+/// Refuse to persist a plan whose attributes carry the unresolved-
+/// upstream marker stamped by `resolve_refs_for_plan`. The marker is
+/// plan-display only; serializing it would either confuse JSON consumers
+/// (NUL-prefixed sentinel) or, via `apply --plan plan.json`, hand the
+/// literal sentinel to a provider as if it were a real attribute value.
+/// See #2366.
+fn check_no_unresolved_upstream_in_plan(plan: &carina_core::plan::Plan) -> Result<(), AppError> {
+    let mut offending: Vec<String> = plan
+        .effects()
+        .iter()
+        .filter_map(unresolved_marker_in_effect)
+        .collect();
+    if offending.is_empty() {
+        return Ok(());
+    }
+    offending.sort();
+    offending.dedup();
+    Err(AppError::Config(format!(
+        "Cannot save plan: it depends on upstream values that are not yet \
+         applied ({}). Apply the upstream module(s) first, then re-run \
+         `carina plan --out` (or `--json`).",
+        offending.join(", ")
+    )))
+}
+
+fn unresolved_marker_in_effect(effect: &Effect) -> Option<String> {
+    let mut resources: Vec<&Resource> = Vec::new();
+    match effect {
+        Effect::Read { resource } | Effect::Create(resource) => resources.push(resource),
+        Effect::Update { to, .. } => resources.push(to),
+        Effect::Replace {
+            to,
+            cascading_updates,
+            ..
+        } => {
+            resources.push(to);
+            // `cascading_updates[*].to` carries the dependent resource's
+            // full attribute map verbatim. A cascade-triggered dependent
+            // that itself references an unapplied upstream would
+            // otherwise round-trip the marker through the persisted
+            // plan (#2366 round-5 finding).
+            for cu in cascading_updates {
+                resources.push(&cu.to);
+            }
+        }
+        Effect::Delete { .. }
+        | Effect::Import { .. }
+        | Effect::Remove { .. }
+        | Effect::Move { .. } => return None,
+    }
+    for resource in resources {
+        for value in resource.attributes.values() {
+            if let Some(reference) = first_unresolved_marker(value) {
+                return Some(reference.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn first_unresolved_marker(value: &Value) -> Option<&str> {
+    match value {
+        Value::String(s) => carina_core::parser::decode_unresolved_upstream_marker(s),
+        Value::List(items) => items.iter().find_map(first_unresolved_marker),
+        Value::Map(map) => map.values().find_map(first_unresolved_marker),
+        Value::Interpolation(parts) => parts.iter().find_map(|p| match p {
+            carina_core::resource::InterpolationPart::Expr(v) => first_unresolved_marker(v),
+            _ => None,
+        }),
+        Value::FunctionCall { args, .. } => args.iter().find_map(first_unresolved_marker),
+        Value::Secret(inner) => first_unresolved_marker(inner),
+        _ => None,
+    }
+}
+
 /// Seed a cycle guard with the caller's own base directory so that a chain
 /// ending back at the root is detected as a cycle.
 pub(crate) fn seed_cycle_guard(base_dir: &Path) -> HashSet<PathBuf> {
@@ -549,17 +638,39 @@ pub(crate) fn seed_cycle_guard(base_dir: &Path) -> HashSet<PathBuf> {
     guard
 }
 
+/// How a missing upstream state file is handled while loading upstreams.
+/// `apply` and recursive walks for cycle detection use [`Strict`] (error);
+/// `plan` uses [`Lenient`] so a missing state demotes to a warning and
+/// the upstream binding is recorded with no values (#2366).
+///
+/// [`Strict`]: UpstreamMissingStatePolicy::Strict
+/// [`Lenient`]: UpstreamMissingStatePolicy::Lenient
+#[derive(Clone, Copy)]
+pub(crate) enum UpstreamMissingStatePolicy {
+    Strict,
+    Lenient,
+}
+
 /// Resolve and read each upstream's published exports by parsing its source
 /// directory, deriving its backend, and pulling the state through that backend.
 ///
 /// `cycle_guard` holds canonicalized absolute paths of directories currently
 /// being resolved. An upstream whose source canonicalizes to a path already in
 /// the guard is a cycle (A → B → A) and produces an error naming the path.
+///
+/// `policy` controls only the "state file is missing" case and propagates
+/// through the recursive cycle-walk so a chained upstream (A → B → C) that
+/// is partially unapplied still produces warnings + display markers under
+/// `Lenient` instead of a hard error. Cycle detection, source-path
+/// resolution failures, upstream `.crn` parse errors, and backend I/O
+/// errors remain hard errors regardless — they indicate structural
+/// problems the user must fix before plan output can mean anything.
 pub(crate) async fn load_upstream_states(
     upstream_states: &[UpstreamState],
     base_dir: &Path,
     provider_context: &ProviderContext,
     cycle_guard: &mut HashSet<PathBuf>,
+    policy: UpstreamMissingStatePolicy,
 ) -> Result<HashMap<String, HashMap<String, Value>>, AppError> {
     let mut result = HashMap::new();
 
@@ -581,22 +692,50 @@ pub(crate) async fn load_upstream_states(
             )));
         }
 
-        let load_result =
-            load_upstream_bindings_at(us, &source_abs, provider_context, cycle_guard).await;
+        let backend_result =
+            build_upstream_backend(us, &source_abs, provider_context, cycle_guard, policy).await;
         cycle_guard.remove(&source_abs);
-        let bindings = load_result?;
+        let backend = backend_result?;
+
+        let state_file = backend.read_state().await.map_err(AppError::Backend)?;
+        let bindings = match (state_file, policy) {
+            (Some(sf), _) => sf.build_remote_bindings(),
+            (None, UpstreamMissingStatePolicy::Strict) => {
+                return Err(AppError::Config(format!(
+                    "upstream_state '{}': no state found at {}",
+                    us.binding,
+                    source_abs.display()
+                )));
+            }
+            (None, UpstreamMissingStatePolicy::Lenient) => {
+                let msg = format!(
+                    "Warning: upstream_state '{}': no state found at {}; \
+                     dependent values will display as `(known after upstream apply: ...)`",
+                    us.binding,
+                    source_abs.display()
+                );
+                eprintln!("{}", msg.yellow());
+                HashMap::new()
+            }
+        };
         result.insert(us.binding.clone(), bindings);
     }
 
     Ok(result)
 }
 
-async fn load_upstream_bindings_at(
+/// Resolve an upstream's backend: parse its `.crn`, walk its own upstream
+/// chain (cycle detection), then build the backend honoring local-path
+/// anchoring. Shared between strict and lenient upstream loaders so the
+/// only behavioral difference is how a `None` from `read_state()` is
+/// handled.
+async fn build_upstream_backend(
     us: &UpstreamState,
     source_abs: &Path,
     provider_context: &ProviderContext,
     cycle_guard: &mut HashSet<PathBuf>,
-) -> Result<HashMap<String, Value>, AppError> {
+    policy: UpstreamMissingStatePolicy,
+) -> Result<Box<dyn StateBackend>, AppError> {
     let loaded = load_configuration_with_config(
         &source_abs.to_path_buf(),
         provider_context,
@@ -607,11 +746,14 @@ async fn load_upstream_bindings_at(
     // Walk the upstream's own upstream_state blocks so cycles are detected
     // even when the chain is longer than one hop. The returned bindings are
     // discarded; the downstream only needs this upstream's own exports.
+    // Propagate `policy` so a chained upstream that is itself unapplied
+    // produces a warning under Lenient instead of breaking the plan (#2366).
     Box::pin(load_upstream_states(
         &loaded.parsed.upstream_states,
         source_abs,
         provider_context,
         cycle_guard,
+        policy,
     ))
     .await?;
 
@@ -639,19 +781,7 @@ async fn load_upstream_bindings_at(
         )),
     };
 
-    let state_file = backend
-        .read_state()
-        .await
-        .map_err(AppError::Backend)?
-        .ok_or_else(|| {
-            AppError::Config(format!(
-                "upstream_state '{}': no state found at {}",
-                us.binding,
-                source_abs.display()
-            ))
-        })?;
-
-    Ok(state_file.build_remote_bindings())
+    Ok(backend)
 }
 
 #[cfg(test)]
@@ -692,6 +822,7 @@ mod load_upstream_states_tests {
             base_dir,
             &ProviderContext::default(),
             &mut HashSet::new(),
+            UpstreamMissingStatePolicy::Strict,
         )
         .await
         .unwrap();
@@ -733,6 +864,7 @@ mod load_upstream_states_tests {
             &dir_a,
             &ProviderContext::default(),
             &mut guard,
+            UpstreamMissingStatePolicy::Strict,
         )
         .await
         .unwrap_err();
@@ -750,6 +882,7 @@ mod load_upstream_states_tests {
             Path::new("/"),
             &ProviderContext::default(),
             &mut HashSet::new(),
+            UpstreamMissingStatePolicy::Strict,
         )
         .await
         .unwrap_err();
@@ -757,6 +890,81 @@ mod load_upstream_states_tests {
             err.to_string().contains("orgs"),
             "error should name the binding: {}",
             err
+        );
+    }
+
+    /// Strict policy with a parseable upstream that has *no* `carina.state.json`
+    /// must error with `"no state found at <path>"` — this is the contract
+    /// `apply` relies on (#2366).
+    #[tokio::test]
+    async fn load_upstream_states_strict_errors_when_state_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("main.crn"),
+            r#"backend local { path = "carina.state.json" }"#,
+        )
+        .unwrap();
+        // Intentionally do NOT write carina.state.json.
+
+        let upstream_states = vec![UpstreamState {
+            binding: "orgs".to_string(),
+            source: dir.path().to_path_buf(),
+        }];
+        let base_dir = dir.path().parent().unwrap();
+        let err = load_upstream_states(
+            &upstream_states,
+            base_dir,
+            &ProviderContext::default(),
+            &mut HashSet::new(),
+            UpstreamMissingStatePolicy::Strict,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no state found at"),
+            "expected `no state found at`, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("orgs"),
+            "error should name the binding: {}",
+            msg
+        );
+    }
+
+    /// Lenient policy with the same setup must NOT error — it warns and
+    /// returns an empty binding so downstream display can stamp the marker.
+    #[tokio::test]
+    async fn load_upstream_states_lenient_returns_empty_when_state_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("main.crn"),
+            r#"backend local { path = "carina.state.json" }"#,
+        )
+        .unwrap();
+
+        let upstream_states = vec![UpstreamState {
+            binding: "orgs".to_string(),
+            source: dir.path().to_path_buf(),
+        }];
+        let base_dir = dir.path().parent().unwrap();
+        let result = load_upstream_states(
+            &upstream_states,
+            base_dir,
+            &ProviderContext::default(),
+            &mut HashSet::new(),
+            UpstreamMissingStatePolicy::Lenient,
+        )
+        .await
+        .expect("lenient must not error");
+        assert!(
+            result.contains_key("orgs"),
+            "binding name must be present so display can stamp the marker"
+        );
+        assert!(
+            result["orgs"].is_empty(),
+            "no exports available, so the inner map must be empty"
         );
     }
 }
@@ -831,6 +1039,7 @@ exports { region: String = "ap-northeast-1" }"#,
             &dir_b,
             &ProviderContext::default(),
             &mut guard,
+            UpstreamMissingStatePolicy::Strict,
         )
         .await
         .expect("upstream bindings");
@@ -838,6 +1047,99 @@ exports { region: String = "ap-northeast-1" }"#,
             bindings["a"]["region"],
             Value::String("ap-northeast-1".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod unresolved_marker_persistence_tests {
+    use super::*;
+    use carina_core::effect::Effect;
+    use carina_core::parser::encode_unresolved_upstream_marker;
+    use carina_core::plan::Plan;
+    use carina_core::resource::Resource;
+
+    fn make_plan_with(attrs: Vec<(&str, Value)>) -> Plan {
+        let mut r = Resource::new("test.resource", "name");
+        for (k, v) in attrs {
+            r.attributes.insert(k.to_string(), v);
+        }
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(r));
+        plan
+    }
+
+    #[test]
+    fn check_no_unresolved_upstream_in_plan_passes_when_clean() {
+        let plan = make_plan_with(vec![("vpc_id", Value::String("vpc-123".to_string()))]);
+        assert!(check_no_unresolved_upstream_in_plan(&plan).is_ok());
+    }
+
+    #[test]
+    fn check_no_unresolved_upstream_in_plan_errors_on_top_level_marker() {
+        let plan = make_plan_with(vec![(
+            "vpc_id",
+            Value::String(encode_unresolved_upstream_marker("network.vpc.vpc_id")),
+        )]);
+        let err = check_no_unresolved_upstream_in_plan(&plan).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("network.vpc.vpc_id"), "got: {}", msg);
+        assert!(msg.contains("upstream"), "got: {}", msg);
+    }
+
+    #[test]
+    fn check_no_unresolved_upstream_in_plan_recurses_into_lists_and_maps() {
+        let inner = Value::String(encode_unresolved_upstream_marker("network.public_sg"));
+        let plan = make_plan_with(vec![(
+            "security_group_ids",
+            Value::List(vec![Value::String("sg-1".to_string()), inner]),
+        )]);
+        let err = check_no_unresolved_upstream_in_plan(&plan).unwrap_err();
+        assert!(
+            err.to_string().contains("network.public_sg"),
+            "got: {}",
+            err
+        );
+    }
+
+    /// `Effect::Replace::cascading_updates[*].to` carries the dependent
+    /// resource's full attribute map. A cascade dependent that references
+    /// an unapplied upstream must also block plan persistence (#2366).
+    #[test]
+    fn check_no_unresolved_upstream_in_plan_scans_replace_cascading_updates() {
+        use carina_core::effect::CascadingUpdate;
+        use carina_core::resource::{LifecycleConfig, State};
+
+        let mut top = Resource::new("test.resource", "primary");
+        top.attributes
+            .insert("name".to_string(), Value::String("clean".to_string()));
+        let top_id = top.id.clone();
+
+        let mut dep = Resource::new("test.resource", "dependent");
+        dep.attributes.insert(
+            "vpc_id".to_string(),
+            Value::String(encode_unresolved_upstream_marker("network.vpc_id")),
+        );
+        let dep_id = dep.id.clone();
+        let cascade = CascadingUpdate {
+            id: dep_id.clone(),
+            from: Box::new(State::not_found(dep_id)),
+            to: dep,
+        };
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Replace {
+            id: top_id.clone(),
+            from: Box::new(State::not_found(top_id)),
+            to: top,
+            lifecycle: LifecycleConfig::default(),
+            changed_create_only: Vec::new(),
+            cascading_updates: vec![cascade],
+            temporary_name: None,
+            cascade_ref_hints: Vec::new(),
+        });
+
+        let err = check_no_unresolved_upstream_in_plan(&plan).unwrap_err();
+        assert!(err.to_string().contains("network.vpc_id"), "got: {}", err);
     }
 }
 

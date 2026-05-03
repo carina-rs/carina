@@ -1,0 +1,13 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: stripped
+---
+Execution Plan:
+
+  + awscc.ec2.SecurityGroup 
+      group_description: "Web security group"
+      tags:
+        Name: "web-sg"
+      vpc_id: (known after upstream apply: network.vpc.vpc_id)
+
+Plan: 1 to add, 0 to change, 0 to destroy.

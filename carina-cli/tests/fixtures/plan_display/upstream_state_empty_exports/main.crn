@@ -1,0 +1,21 @@
+# Test upstream_state when the state file is present but the referenced
+# export value is absent (e.g. upstream module declared but not yet
+# applied). Plan must render the dependent attribute as
+# `(known after upstream apply: <ref>)` instead of the raw dot-form.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let network = upstream_state {
+  source = "./network"
+}
+
+awscc.ec2.SecurityGroup {
+  group_description = 'Web security group'
+  vpc_id            = network.vpc.vpc_id
+
+  tags = {
+    Name = 'web-sg'
+  }
+}

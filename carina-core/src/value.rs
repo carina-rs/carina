@@ -188,6 +188,12 @@ pub fn format_value_with_key(value: &Value, _key: Option<&str>) -> String {
             if s.starts_with(SECRET_PREFIX) {
                 return "(secret)".to_string();
             }
+            // Unresolved upstream_state references stamped by
+            // `resolve_refs_for_plan` — render unquoted as
+            // `(known after upstream apply: <ref>)`.
+            if let Some(rest) = crate::parser::decode_unresolved_upstream_marker(s) {
+                return format!("(known after upstream apply: {})", rest);
+            }
             // DSL enum format (namespaced identifiers) - resolve to provider value
             if is_dsl_enum_format(s) {
                 let resolved = convert_enum_value(s);
@@ -728,6 +734,21 @@ mod tests {
     fn test_format_value_resource_ref() {
         let v = Value::resource_ref("vpc", "id", vec![]);
         assert_eq!(format_value(&v), "vpc.id");
+    }
+
+    /// `Value::String` carrying the upstream-unresolved marker prefix
+    /// renders unquoted as `(known after upstream apply: <ref>)`. The
+    /// marker is stamped by `resolve_refs_for_plan` and detected here by
+    /// `format_value_with_key` (#2366).
+    #[test]
+    fn test_format_value_unresolved_upstream_marker() {
+        let v = Value::String(crate::parser::encode_unresolved_upstream_marker(
+            "network.vpc.vpc_id",
+        ));
+        assert_eq!(
+            format_value(&v),
+            "(known after upstream apply: network.vpc.vpc_id)"
+        );
     }
 
     #[test]

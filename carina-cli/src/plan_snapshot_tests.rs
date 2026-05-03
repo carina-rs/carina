@@ -528,6 +528,57 @@ fn plan_snapshot_upstream_state() {
     insta::assert_snapshot!(strip_ansi(&output));
 }
 
+/// When an upstream_state's state file is missing, the plan must render
+/// the unresolved attribute as `(known after upstream apply: <ref>)`
+/// instead of leaving the raw dot-form (`network.vpc.vpc_id`) which
+/// looks like a string literal. See issue #2366.
+#[test]
+fn plan_snapshot_upstream_state_unresolved() {
+    let (plan, schemas, moved_origins) = build_plan_from_fixture("upstream_state_unresolved");
+    let output = format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &moved_origins,
+        &[],
+        &[],
+    );
+    let stripped = strip_ansi(&output);
+    assert!(
+        stripped.contains("(known after upstream apply: network.vpc.vpc_id)"),
+        "expected unresolved upstream ref to render as `(known after upstream apply: ...)`, got:\n{}",
+        stripped
+    );
+    insta::assert_snapshot!(stripped);
+}
+
+/// Companion to `plan_snapshot_upstream_state_unresolved`: state file is
+/// present but `exports` is empty (upstream module declared but not yet
+/// applied). The same `(known after upstream apply: <ref>)` rendering
+/// must apply, with no warning since the state file was readable. See
+/// issue #2366.
+#[test]
+fn plan_snapshot_upstream_state_empty_exports() {
+    let (plan, schemas, moved_origins) = build_plan_from_fixture("upstream_state_empty_exports");
+    let output = format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &moved_origins,
+        &[],
+        &[],
+    );
+    let stripped = strip_ansi(&output);
+    assert!(
+        stripped.contains("(known after upstream apply: network.vpc.vpc_id)"),
+        "expected empty-exports upstream ref to render as `(known after upstream apply: ...)`, got:\n{}",
+        stripped
+    );
+    insta::assert_snapshot!(stripped);
+}
+
 #[test]
 fn plan_snapshot_exports() {
     use crate::commands::plan::ExportChange;

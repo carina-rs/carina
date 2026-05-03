@@ -104,6 +104,7 @@ async fn verify_upstream_snapshot(
         base_dir,
         &provider_context,
         &mut cycle_guard,
+        super::plan::UpstreamMissingStatePolicy::Strict,
     )
     .await?;
 
@@ -751,6 +752,7 @@ async fn run_apply_locked(
         base_dir,
         provider_context,
         &mut cycle_guard,
+        super::plan::UpstreamMissingStatePolicy::Strict,
     )
     .await?;
 

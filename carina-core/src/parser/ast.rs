@@ -13,6 +13,55 @@ use std::collections::{HashMap, HashSet};
 
 /// Placeholder text for values that depend on an upstream apply.
 pub const DEFERRED_UPSTREAM_PLACEHOLDER: &str = "(known after upstream apply)";
+/// Internal marker stamped onto an `upstream_state` reference that survived
+/// resolution (state file missing, or export value absent). Plan display
+/// detects this prefix and renders the value as
+/// `(known after upstream apply: <ref>)`. The leading NUL byte keeps the
+/// marker disjoint from any user-authored string and from
+/// `DEFERRED_UPSTREAM_KEY_PLACEHOLDER` / `DEFERRED_UPSTREAM_INDEX_PLACEHOLDER`,
+/// which share the human-readable `(known after upstream apply: ...)`
+/// shape. Use [`encode_unresolved_upstream_marker`] /
+/// [`decode_unresolved_upstream_marker`] instead of inlining the prefix.
+/// See issue #2366.
+pub(crate) const UPSTREAM_UNRESOLVED_MARKER_PREFIX: &str = "\0upstream_unresolved:";
+
+/// Encode `<ref>` (e.g. `network.vpc.vpc_id`) into the marker string
+/// stamped into a `Value::String` by `resolver::resolve_refs_for_plan`.
+pub fn encode_unresolved_upstream_marker(reference: &str) -> String {
+    format!("{}{}", UPSTREAM_UNRESOLVED_MARKER_PREFIX, reference)
+}
+
+/// If `s` carries the unresolved-upstream marker, return the original
+/// `<ref>` payload; otherwise `None`. Used by plan display to detect
+/// stamped values without inlining the prefix.
+pub fn decode_unresolved_upstream_marker(s: &str) -> Option<&str> {
+    s.strip_prefix(UPSTREAM_UNRESOLVED_MARKER_PREFIX)
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::*;
+
+    #[test]
+    fn encode_decode_roundtrip() {
+        let encoded = encode_unresolved_upstream_marker("network.vpc.vpc_id");
+        assert_eq!(
+            decode_unresolved_upstream_marker(&encoded),
+            Some("network.vpc.vpc_id")
+        );
+    }
+
+    #[test]
+    fn decode_returns_none_for_user_strings() {
+        assert_eq!(decode_unresolved_upstream_marker(""), None);
+        assert_eq!(decode_unresolved_upstream_marker("vpc-abc123"), None);
+        assert_eq!(
+            decode_unresolved_upstream_marker("(known after upstream apply: key)"),
+            None,
+            "must not collide with DEFERRED_UPSTREAM_KEY_PLACEHOLDER"
+        );
+    }
+}
 /// Placeholder reserved for map-binding key variables. Distinct from the
 /// value-var placeholder so expansion can substitute each correctly.
 pub(crate) const DEFERRED_UPSTREAM_KEY_PLACEHOLDER: &str = "(known after upstream apply: key)";
