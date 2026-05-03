@@ -3101,3 +3101,136 @@ awscc.ec2.SecurityGroup {
         labels
     );
 }
+
+/// Build the upstream-state completion fixture used by the #2357
+/// regression tests below. Writes the supplied `network_files`
+/// (typically `[("main.crn", ...)]` or split across `main.crn` +
+/// `exports.crn`) and a fixed `web/main.crn` whose
+/// `awscc.ec2.SecurityGroup` has a `vpc_id =` cursor at line 5.
+/// Returns the cursor `Position` and the `web/` directory.
+fn write_upstream_export_fixture(
+    tmp: &tempfile::TempDir,
+    network_files: &[(&str, &str)],
+) -> (Position, std::path::PathBuf, Document) {
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("network")).unwrap();
+    std::fs::create_dir_all(root.join("web")).unwrap();
+    for (name, body) in network_files {
+        std::fs::write(root.join("network").join(name), body).unwrap();
+    }
+    let main_src = "\
+let network = upstream_state {
+  source = '../network'
+}
+
+awscc.ec2.SecurityGroup {
+  vpc_id =
+}
+";
+    std::fs::write(root.join("web/main.crn"), main_src).unwrap();
+
+    (
+        Position {
+            line: 5,
+            character: "  vpc_id = ".chars().count() as u32,
+        },
+        root.join("web"),
+        create_document(main_src),
+    )
+}
+
+/// Issue #2357. An unannotated upstream export whose rhs is a
+/// `ResourceRef` to a typed attribute (`exports { vpc_id = main.vpc_id }`,
+/// where `main` is a `let main = awscc.ec2.Vpc { ... }`) must surface
+/// as a REFERENCE candidate at a downstream `vpc_id =` cursor — the
+/// rhs alone determines the export's type via `apply_inference` so
+/// the user does not have to repeat `: VpcId` redundantly.
+///
+/// This PR is test-only: the inference path was wired into completion
+/// by stage 1 (#2362) and structurally guaranteed by stage 2
+/// (#2360 / #2364). These tests pin the issue's exact scenario as
+/// regression coverage so a future refactor can't silently regress it.
+#[test]
+fn unannotated_upstream_export_with_resource_ref_rhs_is_typed_for_completion() {
+    let provider = test_provider_with_vpc_and_security_group();
+    let tmp = tempfile::tempdir().unwrap();
+    let (position, web_dir, doc) = write_upstream_export_fixture(
+        &tmp,
+        &[(
+            "main.crn",
+            "\
+let main = awscc.ec2.Vpc {
+  cidr_block = '10.0.0.0/16'
+}
+
+exports {
+  vpc_id = main.vpc_id
+}
+",
+        )],
+    );
+    let completions = provider.complete(&doc, position, Some(&web_dir));
+    let labels: Vec<String> = completions.iter().map(|c| c.label.clone()).collect();
+    assert!(
+        labels.iter().any(|l| l == "network.vpc_id"),
+        "rhs-inferred VpcId export must be offered at the matching SecurityGroup.vpc_id receiver. Got: {:?}",
+        labels
+    );
+}
+
+/// Issue #2357 directory-shape acceptance. The reproduction in the
+/// issue body mentions a `network/exports.crn` sibling-file variant —
+/// the same `let main = awscc.ec2.Vpc` + unannotated `vpc_id = main.vpc_id`
+/// shape, but with the `let` and `exports` blocks split across two
+/// files in the same directory. The merged-directory parse should
+/// reach the same inference outcome and surface the candidate.
+#[test]
+fn unannotated_upstream_export_works_with_split_exports_file() {
+    let provider = test_provider_with_vpc_and_security_group();
+    let tmp = tempfile::tempdir().unwrap();
+    let (position, web_dir, doc) = write_upstream_export_fixture(
+        &tmp,
+        &[
+            (
+                "main.crn",
+                "\
+let main = awscc.ec2.Vpc {
+  cidr_block = '10.0.0.0/16'
+}
+",
+            ),
+            ("exports.crn", "exports {\n  vpc_id = main.vpc_id\n}\n"),
+        ],
+    );
+    let completions = provider.complete(&doc, position, Some(&web_dir));
+    let labels: Vec<String> = completions.iter().map(|c| c.label.clone()).collect();
+    assert!(
+        labels.iter().any(|l| l == "network.vpc_id"),
+        "rhs-inferred VpcId export must be offered even when `let` and `exports` live in sibling files. Got: {:?}",
+        labels
+    );
+}
+
+/// Issue #2357 negative-acceptance. An export whose rhs is a
+/// `Value::FunctionCall` (e.g. `lookup`) cannot be statically typed —
+/// it must stay un-offered, matching the conservative behavior the
+/// stage-1 inference inherited.
+#[test]
+fn unannotated_upstream_export_with_function_call_rhs_is_not_offered() {
+    let provider = test_provider_with_vpc_and_security_group();
+    let tmp = tempfile::tempdir().unwrap();
+    let (position, web_dir, doc) = write_upstream_export_fixture(
+        &tmp,
+        &[(
+            "main.crn",
+            "exports {\n  vpc_id = lookup({a = '1'}, 'a', 'default')\n}\n",
+        )],
+    );
+    let completions = provider.complete(&doc, position, Some(&web_dir));
+    let labels: Vec<String> = completions.iter().map(|c| c.label.clone()).collect();
+    assert!(
+        !labels.iter().any(|l| l == "network.vpc_id"),
+        "Any-returning builtin rhs must not produce a typed candidate. Got: {:?}",
+        labels
+    );
+}
