@@ -1,6 +1,6 @@
 ---
 title: "aws.ec2.SecurityGroup"
-description: "AWS EC2 security_group resource reference"
+description: "AWS EC2 SecurityGroup resource reference"
 ---
 
 

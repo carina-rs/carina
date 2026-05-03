@@ -1,6 +1,6 @@
 ---
 title: "aws.ec2.VpcEndpoint"
-description: "AWS EC2 vpc_endpoint resource reference"
+description: "AWS EC2 VpcEndpoint resource reference"
 ---
 
 
@@ -33,7 +33,7 @@ The Amazon Resource Name (ARN) of a resource configuration that will be associat
 
 ### `route_table_ids`
 
-- **Type:** `List<route_table_id>`
+- **Type:** `List<RouteTableId>`
 - **Required:** No
 
 (Gateway endpoint) The route table IDs.
@@ -61,7 +61,7 @@ The Amazon Resource Name (ARN) of a service network that will be associated with
 
 ### `service_region`
 
-- **Type:** aws_region
+- **Type:** AwsRegion
 - **Required:** No
 
 The Region where the service is hosted. The default is the current Region.
@@ -112,5 +112,5 @@ Shorthand formats: `Gateway` or `VpcEndpointType.Gateway`
 
 ### `vpc_endpoint_id`
 
-- **Type:** vpc_endpoint_id
+- **Type:** VpcEndpointId
 

@@ -1,6 +1,6 @@
 ---
 title: "aws.ec2.InternetGateway"
-description: "AWS EC2 internet_gateway resource reference"
+description: "AWS EC2 InternetGateway resource reference"
 ---
 
 
@@ -48,5 +48,5 @@ The tags for the resource.
 
 ### `internet_gateway_id`
 
-- **Type:** internet_gateway_id
+- **Type:** InternetGatewayId
 

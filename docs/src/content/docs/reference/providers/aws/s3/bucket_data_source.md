@@ -1,6 +1,6 @@
 ---
 title: "aws.s3.Bucket"
-description: "AWS S3 bucket_data_source resource reference"
+description: "AWS S3 Bucket resource reference"
 ---
 
 

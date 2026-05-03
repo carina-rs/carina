@@ -17,7 +17,7 @@ Resource Type definition for AWS::IAM::OIDCProvider
 
 ### `tags`
 
-- **Type:** Map(String)
+- **Type:** `Map<String, String>`
 - **Required:** No
 
 ### `thumbprint_list`

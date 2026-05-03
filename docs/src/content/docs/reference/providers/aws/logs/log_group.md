@@ -1,6 +1,6 @@
 ---
 title: "aws.logs.LogGroup"
-description: "AWS LOGS log_group resource reference"
+description: "AWS CloudWatch Logs LogGroup resource reference"
 ---
 
 
@@ -26,7 +26,7 @@ The Amazon Resource Name (ARN) of the KMS key to use when encrypting log data. F
 
 ### `log_group_class`
 
-- **Type:** [Enum (logGroupClass)](#log_group_class-loggroupclass)
+- **Type:** [Enum (LogGroupClass)](#log_group_class-loggroupclass)
 - **Required:** No
 
 Use this parameter to specify the log group class for this log group. There are three classes: The Standard log class supports all CloudWatch Logs features. The Infrequent Access log class supports a subset of CloudWatch Logs features and incurs lower costs. Use the Delivery log class only for delivering Lambda logs to store in Amazon S3 or Amazon Data Firehose. Log events in log groups in the Delivery class are kept in CloudWatch Logs for only one day. This log class doesn't offer rich CloudWatch Logs capabilities such as CloudWatch Logs Insights queries. If you omit this parameter, the default of STANDARD is used. The value of logGroupClass can't be changed after a log group is created. For details about the features supported by each class, see Log classes
@@ -61,13 +61,13 @@ The tags for the resource.
 
 ## Enum Values
 
-### log_group_class (logGroupClass)
+### log_group_class (LogGroupClass)
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `DELIVERY` | `aws.logs.LogGroup.logGroupClass.DELIVERY` |
-| `INFREQUENT_ACCESS` | `aws.logs.LogGroup.logGroupClass.INFREQUENT_ACCESS` |
-| `STANDARD` | `aws.logs.LogGroup.logGroupClass.STANDARD` |
+| `DELIVERY` | `aws.logs.LogGroup.LogGroupClass.DELIVERY` |
+| `INFREQUENT_ACCESS` | `aws.logs.LogGroup.LogGroupClass.INFREQUENT_ACCESS` |
+| `STANDARD` | `aws.logs.LogGroup.LogGroupClass.STANDARD` |
 
-Shorthand formats: `DELIVERY` or `logGroupClass.DELIVERY`
+Shorthand formats: `DELIVERY` or `LogGroupClass.DELIVERY`
 

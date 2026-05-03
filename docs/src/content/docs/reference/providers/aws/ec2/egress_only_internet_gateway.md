@@ -1,6 +1,6 @@
 ---
 title: "aws.ec2.EgressOnlyInternetGateway"
-description: "AWS EC2 egress_only_internet_gateway resource reference"
+description: "AWS EC2 EgressOnlyInternetGateway resource reference"
 ---
 
 
@@ -28,5 +28,5 @@ The tags for the resource.
 
 ### `egress_only_internet_gateway_id`
 
-- **Type:** egress_only_internet_gateway_id
+- **Type:** InternetGatewayId
 

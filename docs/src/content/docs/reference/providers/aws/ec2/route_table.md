@@ -1,6 +1,6 @@
 ---
 title: "aws.ec2.RouteTable"
-description: "AWS EC2 route_table resource reference"
+description: "AWS EC2 RouteTable resource reference"
 ---
 
 
@@ -48,5 +48,5 @@ The tags for the resource.
 
 ### `route_table_id`
 
-- **Type:** route_table_id
+- **Type:** RouteTableId
 

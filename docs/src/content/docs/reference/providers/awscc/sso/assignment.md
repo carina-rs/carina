@@ -1,6 +1,6 @@
 ---
 title: "awscc.sso.Assignment"
-description: "AWSCC SSO Assignment resource reference"
+description: "AWSCC IAM Identity Center Assignment resource reference"
 ---
 
 

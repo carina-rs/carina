@@ -1,6 +1,6 @@
 ---
 title: "aws.ec2.SubnetRouteTableAssociation"
-description: "AWS EC2 subnet_route_table_association resource reference"
+description: "AWS EC2 SubnetRouteTableAssociation resource reference"
 ---
 
 
@@ -19,7 +19,7 @@ The ID of a public IPv4 pool. A public IPv4 pool is a pool of IPv4 addresses tha
 
 ### `route_table_id`
 
-- **Type:** route_table_id
+- **Type:** RouteTableId
 - **Required:** Yes
 
 The ID of the route table.

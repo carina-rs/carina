@@ -1,6 +1,6 @@
 ---
 title: "aws.organizations.Organization"
-description: "AWS ORGANIZATIONS organization resource reference"
+description: "AWS Organizations Organization resource reference"
 ---
 
 

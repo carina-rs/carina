@@ -1,6 +1,6 @@
 ---
 title: "awscc.organizations.Organization"
-description: "AWSCC ORGANIZATIONS Organization resource reference"
+description: "AWSCC Organizations Organization resource reference"
 ---
 
 

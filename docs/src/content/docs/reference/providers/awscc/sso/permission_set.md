@@ -1,6 +1,6 @@
 ---
 title: "awscc.sso.PermissionSet"
-description: "AWSCC SSO PermissionSet resource reference"
+description: "AWSCC IAM Identity Center PermissionSet resource reference"
 ---
 
 
@@ -24,7 +24,7 @@ The permission set description.
 
 ### `inline_policy`
 
-- **Type:** Map(String)
+- **Type:** `Map<String, String>`
 - **Required:** No
 
 The inline policy to put in permission set.
@@ -71,7 +71,7 @@ The length of time that a user can be signed in to an AWS account.
 
 ### `tags`
 
-- **Type:** Map(String)
+- **Type:** `Map<String, String>`
 - **Required:** No
 
 ## Struct Definitions

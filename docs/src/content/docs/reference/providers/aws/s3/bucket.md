@@ -1,6 +1,6 @@
 ---
 title: "aws.s3.Bucket"
-description: "AWS S3 bucket resource reference"
+description: "AWS S3 Bucket resource reference"
 ---
 
 
@@ -45,35 +45,35 @@ Specifies the namespace where you want to create your general purpose bucket. Wh
 
 ### `grant_full_control`
 
-- **Type:** s3_grantee
+- **Type:** S3Grantee
 - **Required:** No
 
 Allows grantee the read, write, read ACP, and write ACP permissions on the bucket. This functionality is not supported for directory buckets.
 
 ### `grant_read`
 
-- **Type:** s3_grantee
+- **Type:** S3Grantee
 - **Required:** No
 
 Allows grantee to list the objects in the bucket. This functionality is not supported for directory buckets.
 
 ### `grant_read_acp`
 
-- **Type:** s3_grantee
+- **Type:** S3Grantee
 - **Required:** No
 
 Allows grantee to read the bucket ACL. This functionality is not supported for directory buckets.
 
 ### `grant_write`
 
-- **Type:** s3_grantee
+- **Type:** S3Grantee
 - **Required:** No
 
 Allows grantee to create new objects in the bucket. For the bucket and object owners of existing objects, also allows deletions and overwrites of those objects. This functionality is not supported for directory buckets.
 
 ### `grant_write_acp`
 
-- **Type:** s3_grantee
+- **Type:** S3Grantee
 - **Required:** No
 
 Allows grantee to write the ACL for the applicable bucket. This functionality is not supported for directory buckets.

@@ -121,7 +121,7 @@ The ID of the subnet in which the NAT gateway is located.
 
 ### `tags`
 
-- **Type:** Map(String)
+- **Type:** `Map<String, String>`
 - **Required:** No
 
 The tags for the NAT gateway.
