@@ -1,6 +1,6 @@
 ---
 title: "aws.ec2.Vpc"
-description: "AWS EC2 vpc resource reference"
+description: "AWS EC2 Vpc resource reference"
 ---
 
 

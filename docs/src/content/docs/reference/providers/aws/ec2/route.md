@@ -1,6 +1,6 @@
 ---
 title: "aws.ec2.Route"
-description: "AWS EC2 route resource reference"
+description: "AWS EC2 Route resource reference"
 ---
 
 
@@ -60,14 +60,14 @@ The ID of an internet gateway or virtual private gateway attached to your VPC.
 
 ### `nat_gateway_id`
 
-- **Type:** nat_gateway_id
+- **Type:** NatGatewayId
 - **Required:** No
 
 [IPv4 traffic only] The ID of a NAT gateway.
 
 ### `route_table_id`
 
-- **Type:** route_table_id
+- **Type:** RouteTableId
 - **Required:** Yes
 
 The ID of the route table for the route.

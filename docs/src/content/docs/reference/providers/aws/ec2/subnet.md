@@ -1,6 +1,6 @@
 ---
 title: "aws.ec2.Subnet"
-description: "AWS EC2 subnet resource reference"
+description: "AWS EC2 Subnet resource reference"
 ---
 
 
@@ -159,7 +159,7 @@ The tags for the resource.
 |-------|------|----------|-------------|
 | `enable_resource_name_dns_aaaa_record` | Bool | No | Indicates whether to respond to DNS queries for instance hostname with DNS AAAA records. |
 | `enable_resource_name_dns_a_record` | Bool | No | Indicates whether to respond to DNS queries for instance hostnames with DNS A records. |
-| `hostname_type` | [Enum (HostnameType)](#hostname_type-hostnametype) | No | The type of hostname for EC2 instances. For IPv4 only subnets, an instance DNS name must be based on... |
+| `hostname_type` | [Enum (HostnameType)](#hostname_type-hostnametype) | No | The type of hostname for EC2 instances. For IPv4 only subnets, an instance DNS name must be based on the instance IPv4 address. For IPv6 only subnets, an instance DNS name must be based on the instance ID. For dual-stack subnets, you can specify whether DNS names use the instance IPv4 address or the instance ID. |
 
 ## Attribute Reference
 

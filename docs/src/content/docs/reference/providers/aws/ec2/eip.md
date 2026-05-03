@@ -1,6 +1,6 @@
 ---
 title: "aws.ec2.Eip"
-description: "AWS EC2 eip resource reference"
+description: "AWS EC2 Eip resource reference"
 ---
 
 

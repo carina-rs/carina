@@ -1,6 +1,6 @@
 ---
 title: "aws.ec2.VpcPeeringConnection"
-description: "AWS EC2 vpc_peering_connection resource reference"
+description: "AWS EC2 VpcPeeringConnection resource reference"
 ---
 
 
@@ -42,5 +42,5 @@ The tags for the resource.
 
 ### `vpc_peering_connection_id`
 
-- **Type:** vpc_peering_connection_id
+- **Type:** VpcPeeringConnectionId
 
