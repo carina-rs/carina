@@ -257,7 +257,12 @@ table td, table th { border-color: var(--sl-color-hairline-light); }
   box-shadow: 0 0 6px rgba(251, 191, 36, 0.6);
 }
 
-/* ---------- B. Expressive Code title bars (terminal style) ---------- */
+/* ---------- B. Expressive Code title bars ----------
+   - All titled blocks: gold mono filename + slate bar
+   - Terminal blocks (bash/sh/zsh/console/shell, or title containing
+     "terminal"): also show the three traffic-light dots
+*/
+
 .expressive-code .frame .header {
   display: flex !important;
   align-items: center;
@@ -267,8 +272,22 @@ table td, table th { border-color: var(--sl-color-hairline-light); }
   border-bottom: 1px solid #334155 !important;
 }
 
-/* Add traffic-light dots before the filename */
-.expressive-code .frame .header::before {
+.expressive-code .frame .header .title,
+.expressive-code .frame .header > span:not(.copy) {
+  font-family: var(--sl-font-system-mono) !important;
+  color: #fbbf24 !important;
+  font-size: 0.75rem !important;
+  font-weight: 600 !important;
+  letter-spacing: 0 !important;
+}
+
+/* Traffic-light dots — only on terminal-flavoured frames */
+.expressive-code .frame.is-terminal .header::before,
+.expressive-code .frame[data-language="bash"] .header::before,
+.expressive-code .frame[data-language="sh"] .header::before,
+.expressive-code .frame[data-language="zsh"] .header::before,
+.expressive-code .frame[data-language="shell"] .header::before,
+.expressive-code .frame[data-language="console"] .header::before {
   content: '';
   display: inline-flex;
   width: 2.5rem;
@@ -278,16 +297,7 @@ table td, table th { border-color: var(--sl-color-hairline-light); }
     radial-gradient(circle at 1.125rem center, #f59e0b 0.25rem, transparent 0.26rem),
     radial-gradient(circle at 2rem center, #10b981 0.25rem, transparent 0.26rem);
   background-repeat: no-repeat;
-}
-
-/* Make the filename gold + mono */
-.expressive-code .frame .header .title,
-.expressive-code .frame .header > span:not(.copy) {
-  font-family: var(--sl-font-system-mono) !important;
-  color: #fbbf24 !important;
-  font-size: 0.75rem !important;
-  font-weight: 600 !important;
-  letter-spacing: 0 !important;
+  margin-right: 0.25rem;
 }
 
 /* ---------- C. Search box & Pagefind results ---------- */
