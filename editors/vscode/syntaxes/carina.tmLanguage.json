@@ -6,8 +6,8 @@
   "patterns": [
     { "include": "#comments" },
     { "include": "#keywords" },
-    { "include": "#resource-types" },
     { "include": "#regions" },
+    { "include": "#resource-types" },
     { "include": "#types" },
     { "include": "#strings" },
     { "include": "#numbers" },
@@ -54,7 +54,7 @@
       "patterns": [
         {
           "name": "support.class.carina",
-          "match": "(aws|awscc|gcp|azure)\\.[a-z][a-z0-9_]*\\.[a-z][a-z0-9_]*"
+          "match": "\\b(aws|awscc|gcp|azure)\\.[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)*\\b"
         }
       ]
     },
