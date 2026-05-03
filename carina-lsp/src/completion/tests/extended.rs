@@ -2862,3 +2862,179 @@ let attach = awscc.organizations.policy_target_attachment {
         labels
     );
 }
+
+/// Issue #2353: in attribute value position, an `upstream_state` binding's
+/// typed `exports { ... }` field whose type matches the target attribute
+/// must surface as `<binding>.<export>` — symmetric with the existing
+/// resource-binding Custom-type matching path.
+#[test]
+fn upstream_state_export_suggested_in_value_position() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let schema = ResourceSchema::new("foo.bar")
+        .attribute(AttributeSchema::new("attr", AttributeType::String));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
+    let provider =
+        CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("network")).unwrap();
+    std::fs::create_dir_all(root.join("web")).unwrap();
+    std::fs::write(
+        root.join("network/main.crn"),
+        "exports {\n  vpc_id: String = 'vpc-abc'\n}\n",
+    )
+    .unwrap();
+    let main_src = "\
+let network = upstream_state {
+  source = '../network'
+}
+
+test.foo.bar {
+  attr =
+}
+";
+    std::fs::write(root.join("web/main.crn"), main_src).unwrap();
+
+    let doc = create_document(main_src);
+    let position = Position {
+        line: 5,
+        character: "  attr = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, Some(&root.join("web")));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"network.vpc_id"),
+        "upstream_state export with matching type must be offered as '<binding>.<export>'. Got: {:?}",
+        labels
+    );
+}
+
+/// Issue #2353: an `upstream_state` export whose declared type does not
+/// match the target attribute must NOT be offered. Mirrors the
+/// type-filtering behavior of the existing Custom-type matching path
+/// for resource bindings.
+#[test]
+fn upstream_state_export_filtered_by_attribute_type() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let schema = ResourceSchema::new("foo.bar")
+        .attribute(AttributeSchema::new("attr", AttributeType::String));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
+    let provider =
+        CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("network")).unwrap();
+    std::fs::create_dir_all(root.join("web")).unwrap();
+    std::fs::write(
+        root.join("network/main.crn"),
+        "exports {\n  vpc_id: String = 'vpc-abc'\n  count: Int = 3\n}\n",
+    )
+    .unwrap();
+    let main_src = "\
+let network = upstream_state {
+  source = '../network'
+}
+
+test.foo.bar {
+  attr =
+}
+";
+    std::fs::write(root.join("web/main.crn"), main_src).unwrap();
+
+    let doc = create_document(main_src);
+    let position = Position {
+        line: 5,
+        character: "  attr = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, Some(&root.join("web")));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    // Positive companion: prove the upstream pass actually ran by asserting
+    // the matching-type export is offered. Otherwise the negative assertion
+    // could pass for the wrong reason (pass never executed at all).
+    assert!(
+        labels.contains(&"network.vpc_id"),
+        "matching-type export must be offered (sanity: confirms the upstream pass ran). Got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.contains(&"network.count"),
+        "upstream_state export with non-matching type must not be offered. Got: {:?}",
+        labels
+    );
+}
+
+/// Issue #2353: exercise the directory-scoped path that matters in real
+/// `infra/` projects — exports declared in a sibling `exports.crn`, not
+/// `main.crn` — and confirm two distinct `upstream_state` bindings each
+/// surface their own typed exports independently. Without this fixture
+/// a future regression that swapped `parse_directory` for a single-file
+/// read would silently break production while the prior tests stayed
+/// green.
+#[test]
+fn upstream_state_export_multiple_bindings_and_sibling_exports_file() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let schema = ResourceSchema::new("foo.bar")
+        .attribute(AttributeSchema::new("attr", AttributeType::String));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
+    let provider =
+        CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("network")).unwrap();
+    std::fs::create_dir_all(root.join("shared")).unwrap();
+    std::fs::create_dir_all(root.join("web")).unwrap();
+    // network: exports split into a sibling `exports.crn`, `main.crn` empty.
+    std::fs::write(root.join("network/main.crn"), "").unwrap();
+    std::fs::write(
+        root.join("network/exports.crn"),
+        "exports {\n  vpc_id: String = 'vpc-abc'\n}\n",
+    )
+    .unwrap();
+    // shared: exports in `main.crn`.
+    std::fs::write(
+        root.join("shared/main.crn"),
+        "exports {\n  hosted_zone_id: String = 'Z123'\n}\n",
+    )
+    .unwrap();
+    let main_src = "\
+let network = upstream_state {
+  source = '../network'
+}
+
+let shared = upstream_state {
+  source = '../shared'
+}
+
+test.foo.bar {
+  attr =
+}
+";
+    std::fs::write(root.join("web/main.crn"), main_src).unwrap();
+
+    let doc = create_document(main_src);
+    let position = Position {
+        line: 9,
+        character: "  attr = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, Some(&root.join("web")));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"network.vpc_id"),
+        "exports declared in sibling `exports.crn` must be discovered. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"shared.hosted_zone_id"),
+        "second upstream_state binding must surface its exports independently. Got: {:?}",
+        labels
+    );
+}
