@@ -13,17 +13,33 @@ import { CardGrid, LinkCard } from '@astrojs/starlight/components';
   <h2>Why Carina?</h2>
   <div class="why-grid">
     <div class="why-item">
-      <div class="why-icon">🔒</div>
+      <div class="why-icon">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12 2 4 6v6c0 5 3.4 8.7 8 10 4.6-1.3 8-5 8-10V6l-8-4z"/>
+          <path d="m9 12 2 2 4-4"/>
+        </svg>
+      </div>
       <h3>Type Safe</h3>
       <p>DSL validates at parse time. Catch errors before any infrastructure is touched.</p>
     </div>
     <div class="why-item">
-      <div class="why-icon">📋</div>
+      <div class="why-icon">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <rect x="4" y="3" width="16" height="18" rx="2"/>
+          <path d="M8 8h8M8 12h8M8 16h5"/>
+        </svg>
+      </div>
       <h3>Effects as Values</h3>
       <p>Side effects are data. Inspect your Plan before execution, not after.</p>
     </div>
     <div class="why-item">
-      <div class="why-icon">🔌</div>
+      <div class="why-icon">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M9 2v6M15 2v6"/>
+          <rect x="6" y="8" width="12" height="6" rx="1"/>
+          <path d="M12 14v4M9 22h6"/>
+        </svg>
+      </div>
       <h3>Pluggable Providers</h3>
       <p>AWS Cloud Control API, native AWS SDK, and more. One DSL, multiple backends.</p>
     </div>
