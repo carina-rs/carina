@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use indexmap::IndexMap;
 
 use crate::binding_index::BindingIndex;
-use crate::parser::{ModuleCall, ParsedFile, ProviderContext, TypeExpr, validate_custom_type};
+use crate::parser::{ModuleCall, ProviderContext, TypeExpr, validate_custom_type};
 use crate::provider::ProviderFactory;
 use crate::resource::{Resource, Value};
 use crate::schema::{AttributeType, SchemaRegistry, suggest_similar_name};
@@ -16,8 +16,8 @@ use crate::schema::{AttributeType, SchemaRegistry, suggest_similar_name};
 /// and a non-`read` resource requires a `Managed` registry entry. If the
 /// wrong-kind entry is present (e.g. `read` against a managed-only type),
 /// emit a kind-specific error explaining the mismatch.
-pub fn validate_resources(
-    parsed: &ParsedFile,
+pub fn validate_resources<E>(
+    parsed: &crate::parser::File<E>,
     registry: &SchemaRegistry,
     known_providers: &HashSet<String>,
     provider_context: &ProviderContext,
@@ -91,8 +91,8 @@ pub fn validate_resources(
 ///
 /// For example, if `ipv4_ipam_pool_id` expects `IpamPoolId` type,
 /// a reference like `vpc.vpc_id` (which is `AwsResourceId`) should be an error.
-pub fn validate_resource_ref_types(
-    parsed: &ParsedFile,
+pub fn validate_resource_ref_types<E>(
+    parsed: &crate::parser::File<E>,
     registry: &SchemaRegistry,
     argument_names: &HashSet<String>,
 ) -> Result<(), String> {
@@ -266,9 +266,8 @@ pub fn validate_attribute_param_ref_types(
 /// This catches mismatches like `exports { x: list(bool) = [vpc.vpc_id] }` where
 /// `vpc_id` is a string attribute but the export declares `bool`.
 pub fn validate_export_param_ref_types(
-    export_params: &[crate::parser::ExportParameter],
+    export_params: &[crate::parser::InferredExportParam],
     resources: &[Resource],
-    upstream_states: &[crate::parser::UpstreamState],
     registry: &SchemaRegistry,
 ) -> Result<(), String> {
     let mut binding_map: HashMap<String, &Resource> = HashMap::new();
@@ -277,12 +276,6 @@ pub fn validate_export_param_ref_types(
             binding_map.insert(binding_name.clone(), resource);
         }
     }
-    // The inference helper consults both resource bindings and
-    // `upstream_state` bindings — the latter tagged so the inferer
-    // can distinguish "known but non-inferable" from a typo. Their
-    // export's type is resolved by the consumer-side typecheck
-    // instead of here.
-    let inference_bindings = inference::bindings_from_parts(resources, upstream_states);
 
     let mut errors = Vec::new();
 
@@ -290,30 +283,15 @@ pub fn validate_export_param_ref_types(
         let Some(ref value) = param.value else {
             continue;
         };
-
-        // Resolve the effective type — explicit annotation wins; if
-        // omitted, infer from rhs. Inference failure surfaces as a
-        // "type annotation required" error so the unannotated +
-        // un-inferable shape can no longer slip through (#2361).
-        let effective_type = match inference::infer_type_expr(
-            param.type_expr.as_ref(),
-            param.value.as_ref(),
-            &inference_bindings,
-            registry,
-        ) {
-            Ok(Some(t)) => t,
-            Ok(None) => continue,
-            Err(reason) => {
-                errors.push(format!(
-                    "export '{}': type annotation required: {}",
-                    param.name, reason
-                ));
-                continue;
-            }
-        };
+        // Skip the `Unknown` sentinel — the loader's `inference_errors`
+        // channel already reports the missing annotation; emitting a
+        // "type mismatch" here would be a duplicate.
+        if matches!(&param.type_expr, crate::parser::TypeExpr::Unknown) {
+            continue;
+        }
 
         collect_ref_type_errors(
-            &effective_type,
+            &param.type_expr,
             value,
             &param.name,
             &binding_map,
@@ -483,6 +461,10 @@ pub fn is_type_expr_compatible_with_schema(
                 .all(|(_, ty)| is_type_expr_compatible_with_schema(ty, schema_inner)),
             _ => false,
         },
+        // Sentinel for failed inference (#2360 stage 2). Never matches a
+        // concrete receiver — the inference_errors channel reports the
+        // underlying "type annotation required" instead.
+        TypeExpr::Unknown => false,
         _ => true, // Ref, SchemaType — conservatively accept
     }
 }
@@ -541,7 +523,7 @@ fn attr_type_demands_specific_custom(attr_type: &AttributeType) -> bool {
 /// the user is validating in isolation. We only flag the misplaced block
 /// when a `backend` or `provider` block is also present, since both are
 /// root-only constructs and unambiguously identify a root configuration.
-pub fn validate_no_arguments_in_root(parsed: &ParsedFile) -> Result<(), String> {
+pub fn validate_no_arguments_in_root<E>(parsed: &crate::parser::File<E>) -> Result<(), String> {
     let is_root = parsed.backend.is_some() || !parsed.providers.is_empty();
     if !parsed.arguments.is_empty() && is_root {
         return Err(
@@ -555,7 +537,7 @@ pub fn validate_no_arguments_in_root(parsed: &ParsedFile) -> Result<(), String> 
 ///
 /// Provider configuration should only be defined at the root configuration level,
 /// not inside modules (files with `arguments` or `attributes` blocks).
-pub fn validate_no_provider_in_module(parsed: &ParsedFile) -> Result<(), String> {
+pub fn validate_no_provider_in_module<E>(parsed: &crate::parser::File<E>) -> Result<(), String> {
     let is_module = !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty();
     if is_module && !parsed.providers.is_empty() {
         return Err(
@@ -573,8 +555,8 @@ pub fn validate_no_provider_in_module(parsed: &ParsedFile) -> Result<(), String>
 /// provider-specific semantic checks. Keeping format validation
 /// (namespace structure, enum membership) on the host side means fixes
 /// in `carina-core` take effect without rebuilding provider binaries.
-pub fn validate_provider_config(
-    parsed: &ParsedFile,
+pub fn validate_provider_config<E>(
+    parsed: &crate::parser::File<E>,
     factories: &[Box<dyn ProviderFactory>],
 ) -> Result<(), String> {
     for provider in &parsed.providers {
@@ -636,15 +618,23 @@ pub fn validate_module_calls(
 ///
 /// For each export with both a `type_expr` and a `value`, validates the value
 /// using `validate_type_expr_value`. Accumulates all errors.
+///
+/// Accepts post-inference [`InferredExportParam`]s (#2360 stage 2):
+/// `type_expr` is bare. Sentinel-bearing exports
+/// (`TypeExpr::Unknown`) are skipped — the loader's `inference_errors`
+/// channel surfaces those, and re-checking would double-report.
 pub fn validate_export_params(
-    export_params: &[crate::parser::ExportParameter],
+    export_params: &[crate::parser::InferredExportParam],
     config: &ProviderContext,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
 
     for param in export_params {
-        if let (Some(type_expr), Some(value)) = (&param.type_expr, &param.value)
-            && let Some(error) = validate_type_expr_value(type_expr, value, config)
+        if matches!(&param.type_expr, crate::parser::TypeExpr::Unknown) {
+            continue;
+        }
+        if let Some(value) = &param.value
+            && let Some(error) = validate_type_expr_value(&param.type_expr, value, config)
         {
             errors.push(format!("export '{}': {}", param.name, error));
         }
@@ -661,7 +651,13 @@ pub fn validate_export_params(
 ///
 /// A binding is unused if its name never appears as a `ResourceRef.binding_name`
 /// in any resource attribute, module call argument, or attribute parameter value.
-pub fn check_unused_bindings(parsed: &ParsedFile) -> Vec<String> {
+///
+/// Generic over the export-parameter shape so both `ParsedFile` (parser
+/// phase) and `InferredFile` (post-loader phase) can drive it without
+/// duplicating the binding walk.
+pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
+    parsed: &crate::parser::File<E>,
+) -> Vec<String> {
     // Collect all defined binding names (skip discard pattern `_`).
     // Walk top-level and for-body resources so bindings declared inside a
     // `for` template are also tracked.
@@ -713,7 +709,7 @@ pub fn check_unused_bindings(parsed: &ParsedFile) -> Vec<String> {
         }
     }
     for export_param in &parsed.export_params {
-        if let Some(value) = &export_param.value {
+        if let Some(value) = export_param.value() {
             collect_resource_refs(value, &mut referenced);
             // Cross-file: when exports.crn is parsed without the binding context,
             // "vpc.vpc_id" becomes String("vpc.vpc_id") instead of ResourceRef.

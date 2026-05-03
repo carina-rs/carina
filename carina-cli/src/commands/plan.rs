@@ -89,9 +89,9 @@ pub struct CurrentStateEntry {
     pub state: State,
 }
 
-fn build_plan_file(
+fn build_plan_file<E>(
     path: &Path,
-    parsed: &carina_core::parser::ParsedFile,
+    parsed: &carina_core::parser::File<E>,
     state_file: &Option<StateFile>,
     ctx: &crate::wiring::PlanContext,
 ) -> PlanFile {
@@ -141,7 +141,12 @@ pub async fn run_plan(
     reconfigure: bool,
     provider_context: &ProviderContext,
 ) -> Result<bool, AppError> {
-    let mut parsed = load_configuration_with_config(path, provider_context)?.parsed;
+    let mut parsed = load_configuration_with_config(
+        path,
+        provider_context,
+        &carina_core::schema::SchemaRegistry::new(),
+    )?
+    .parsed;
 
     let base_dir = get_base_dir(path);
     validate_and_resolve_with_config(&mut parsed, base_dir, false)?;
@@ -384,10 +389,10 @@ pub async fn run_plan(
 /// and values are `Value::Map` of that resource's attributes.
 /// Resolve export value expressions for plan display.
 pub(crate) fn resolve_export_values_for_display(
-    export_params: &[carina_core::parser::ExportParameter],
+    export_params: &[carina_core::parser::InferredExportParam],
     resources: &[Resource],
     current_states: &HashMap<ResourceId, State>,
-) -> Vec<carina_core::parser::ExportParameter> {
+) -> Vec<carina_core::parser::InferredExportParam> {
     let bindings = carina_core::binding_index::ResolvedBindings::from_resources_with_state(
         resources,
         current_states,
@@ -401,7 +406,7 @@ pub(crate) fn resolve_export_values_for_display(
                 .value
                 .as_ref()
                 .map(|v| resolve_export_value(v, &bindings));
-            carina_core::parser::ExportParameter {
+            carina_core::parser::InferredExportParam {
                 name: param.name.clone(),
                 type_expr: param.type_expr.clone(),
                 value: resolved_value,
@@ -486,7 +491,7 @@ impl ExportChange {
 /// current resource states. `current_exports` is the JSON-serialized map
 /// from `StateFile.exports`.
 pub fn compute_export_diffs(
-    resolved_params: &[carina_core::parser::ExportParameter],
+    resolved_params: &[carina_core::parser::InferredExportParam],
     current_exports: &HashMap<String, serde_json::Value>,
 ) -> Vec<ExportChange> {
     let mut changes = Vec::new();
@@ -497,11 +502,15 @@ pub fn compute_export_diffs(
         let Some(ref value) = param.value else {
             continue;
         };
+        // Unknown sentinels carry no usable type information for the
+        // plan display; surface as `None` so the diff prints without
+        // a type tag.
+        let type_expr = param.type_expr.clone().into_known();
         let new_json = crate::commands::shared::state_writeback::dsl_value_to_json(value);
         match (current_exports.get(&param.name), new_json) {
             (None, _) => changes.push(ExportChange::Added {
                 name: param.name.clone(),
-                type_expr: param.type_expr.clone(),
+                type_expr: type_expr.clone(),
                 new_value: value.clone(),
             }),
             (Some(old), Some(new)) if old == &new => {
@@ -509,7 +518,7 @@ pub fn compute_export_diffs(
             }
             (Some(old), _) => changes.push(ExportChange::Modified {
                 name: param.name.clone(),
-                type_expr: param.type_expr.clone(),
+                type_expr,
                 old_json: old.clone(),
                 new_value: value.clone(),
             }),
@@ -588,8 +597,12 @@ async fn load_upstream_bindings_at(
     provider_context: &ProviderContext,
     cycle_guard: &mut HashSet<PathBuf>,
 ) -> Result<HashMap<String, Value>, AppError> {
-    let loaded = load_configuration_with_config(&source_abs.to_path_buf(), provider_context)
-        .map_err(|e| AppError::Config(format!("upstream_state '{}': {}", us.binding, e)))?;
+    let loaded = load_configuration_with_config(
+        &source_abs.to_path_buf(),
+        provider_context,
+        &carina_core::schema::SchemaRegistry::new(),
+    )
+    .map_err(|e| AppError::Config(format!("upstream_state '{}': {}", us.binding, e)))?;
 
     // Walk the upstream's own upstream_state blocks so cycles are detected
     // even when the chain is longer than one hop. The returned bindings are
@@ -808,6 +821,7 @@ exports { region: String = "ap-northeast-1" }"#,
         let parsed = carina_core::config_loader::load_configuration_with_config(
             &dir_b,
             &ProviderContext::default(),
+            &carina_core::schema::SchemaRegistry::new(),
         )
         .expect("load config")
         .parsed;
@@ -830,12 +844,12 @@ exports { region: String = "ap-northeast-1" }"#,
 #[cfg(test)]
 mod export_diff_tests {
     use super::*;
-    use carina_core::parser::ExportParameter;
+    use carina_core::parser::{InferredExportParam, TypeExpr};
 
-    fn param(name: &str, value: Value) -> ExportParameter {
-        ExportParameter {
+    fn param(name: &str, value: Value) -> InferredExportParam {
+        InferredExportParam {
             name: name.to_string(),
-            type_expr: None,
+            type_expr: TypeExpr::Unknown,
             value: Some(value),
         }
     }

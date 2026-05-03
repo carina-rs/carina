@@ -14,7 +14,7 @@ use carina_core::differ::{cascade_dependent_updates, create_plan};
 use carina_core::effect::Effect;
 use carina_core::identifier::{self, AnonymousIdStateInfo, PrefixStateInfo};
 use carina_core::module_resolver;
-use carina_core::parser::{ParsedFile, ProviderConfig, StateBlock};
+use carina_core::parser::{ProviderConfig, StateBlock};
 use carina_core::plan::Plan;
 use carina_core::provider::{
     self as provider_mod, Provider, ProviderError, ProviderFactory, ProviderNormalizer,
@@ -180,9 +180,9 @@ fn lift_validation_result(res: Result<(), String>) -> Vec<AppError> {
         .collect()
 }
 
-pub fn validate_resources_with_ctx(
+pub fn validate_resources_with_ctx<E>(
     ctx: &WiringContext,
-    parsed: &ParsedFile,
+    parsed: &carina_core::parser::File<E>,
     provider_context: &carina_core::parser::ProviderContext,
 ) -> Vec<AppError> {
     let known_providers: HashSet<String> = ctx
@@ -198,9 +198,9 @@ pub fn validate_resources_with_ctx(
     ))
 }
 
-pub fn validate_resource_ref_types_with_ctx(
+pub fn validate_resource_ref_types_with_ctx<E>(
     ctx: &WiringContext,
-    parsed: &ParsedFile,
+    parsed: &carina_core::parser::File<E>,
     argument_names: &HashSet<String>,
 ) -> Vec<AppError> {
     lift_validation_result(validation::validate_resource_ref_types(
@@ -566,13 +566,15 @@ fn resolve_value_alias(
     }
 }
 
-pub fn check_unused_bindings(parsed: &ParsedFile) -> Vec<String> {
+pub fn check_unused_bindings<E: carina_core::parser::ExportParamLike>(
+    parsed: &carina_core::parser::File<E>,
+) -> Vec<String> {
     validation::check_unused_bindings(parsed)
 }
 
-pub fn validate_provider_region_with_ctx(
+pub fn validate_provider_region_with_ctx<E>(
     ctx: &WiringContext,
-    parsed: &ParsedFile,
+    parsed: &carina_core::parser::File<E>,
 ) -> Vec<AppError> {
     lift_validation_result(validation::validate_provider_config(
         parsed,
@@ -580,8 +582,8 @@ pub fn validate_provider_region_with_ctx(
     ))
 }
 
-pub fn validate_module_calls(
-    parsed: &ParsedFile,
+pub fn validate_module_calls<E>(
+    parsed: &carina_core::parser::File<E>,
     base_dir: &Path,
     config: &carina_core::parser::ProviderContext,
 ) -> Vec<AppError> {
@@ -600,9 +602,9 @@ pub fn validate_module_calls(
     ))
 }
 
-pub fn validate_module_attribute_param_types(
+pub fn validate_module_attribute_param_types<E>(
     ctx: &WiringContext,
-    parsed: &ParsedFile,
+    parsed: &carina_core::parser::File<E>,
     base_dir: &Path,
 ) -> Vec<AppError> {
     let mut errors = Vec::new();
@@ -633,9 +635,9 @@ pub fn validate_module_attribute_param_types(
     errors
 }
 
-pub async fn get_provider_with_ctx(
+pub async fn get_provider_with_ctx<E>(
     ctx: &WiringContext,
-    parsed: &ParsedFile,
+    parsed: &carina_core::parser::File<E>,
     base_dir: &Path,
 ) -> ProviderRouter {
     let mut router = ProviderRouter::new();
@@ -780,8 +782,8 @@ pub async fn create_providers_from_configs(
 /// This is a convenience wrapper around `create_plan_from_parsed_with_upstream`
 /// for callers that don't use upstream_state blocks.
 #[allow(dead_code)]
-pub async fn create_plan_from_parsed(
-    parsed: &ParsedFile,
+pub async fn create_plan_from_parsed<E>(
+    parsed: &carina_core::parser::File<E>,
     state_file: &Option<StateFile>,
     refresh: bool,
     base_dir: &Path,
@@ -790,8 +792,8 @@ pub async fn create_plan_from_parsed(
         .await
 }
 
-pub async fn create_plan_from_parsed_with_upstream(
-    parsed: &ParsedFile,
+pub async fn create_plan_from_parsed_with_upstream<E>(
+    parsed: &carina_core::parser::File<E>,
     state_file: &Option<StateFile>,
     refresh: bool,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
@@ -1404,6 +1406,7 @@ pub(crate) fn resolve_data_source_refs_for_refresh(
 /// which is acceptable in test code where the overhead is negligible.
 #[cfg(test)]
 pub fn validate_resources(resources: &[Resource]) -> Result<(), AppError> {
+    use carina_core::parser::ParsedFile;
     let ctx = WiringContext::new(vec![]);
     let parsed = ParsedFile {
         resources: resources.to_vec(),

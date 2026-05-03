@@ -136,6 +136,28 @@ pub enum TypeExpr {
     Struct {
         fields: Vec<(String, TypeExpr)>,
     },
+    /// Sentinel for inference failure: an unannotated export whose
+    /// rhs could not be statically typed. Produced *only* by
+    /// `apply_inference`, never by the parser. Type-comparison
+    /// predicates reject `Unknown` against any concrete receiver, so
+    /// the `inference_errors` channel surfaces the actionable
+    /// "type annotation required" message instead of a cascade of
+    /// "missing export" diagnostics. See #2360 stage 2.
+    Unknown,
+}
+
+impl TypeExpr {
+    /// Project away the [`TypeExpr::Unknown`] sentinel: returns
+    /// `Some(self)` for any concrete type, `None` for `Unknown`. Used
+    /// when a downstream consumer has no use for sentinel-bearing
+    /// entries (plan display, upstream-export forwarding) and prefers
+    /// the legacy "no static type" `None` shape.
+    pub fn into_known(self) -> Option<TypeExpr> {
+        match self {
+            TypeExpr::Unknown => None,
+            other => Some(other),
+        }
+    }
 }
 
 impl std::fmt::Display for TypeExpr {
@@ -168,6 +190,7 @@ impl std::fmt::Display for TypeExpr {
                     write!(f, " }}")
                 }
             }
+            TypeExpr::Unknown => write!(f, "<unknown>"),
         }
     }
 }
@@ -243,13 +266,42 @@ pub struct AttributeParameter {
     pub value: Option<Value>,
 }
 
-/// An export parameter in an `exports { }` block.
-/// Publishes a named value for `upstream_state` consumers.
+/// An export parameter in an `exports { }` block, as produced by the
+/// parser before any inference runs.
+///
+/// `type_expr` is `Option<TypeExpr>` here because the user may have
+/// omitted the annotation. The loader then runs `apply_inference`
+/// (#2360 stage 2) to resolve the effective type and emits
+/// [`InferredExportParam`] downstream.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ExportParameter {
+pub struct ParsedExportParam {
     pub name: String,
     pub type_expr: Option<TypeExpr>,
     pub value: Option<Value>,
+}
+
+/// Alias kept so the parser's own construct sites (which always
+/// produce the parser-phase shape) read naturally as
+/// `ExportParameter`; downstream consumers should use the explicit
+/// [`ParsedExportParam`] / [`InferredExportParam`] names.
+pub type ExportParameter = ParsedExportParam;
+
+/// Phase-agnostic accessor over an export parameter. Implemented by both
+/// [`ParsedExportParam`] (parser phase) and [`InferredExportParam`]
+/// (post-loader phase) so helpers like `check_unused_bindings` work
+/// uniformly across both shapes.
+pub trait ExportParamLike {
+    fn name(&self) -> &str;
+    fn value(&self) -> Option<&Value>;
+}
+
+impl ExportParamLike for ParsedExportParam {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn value(&self) -> Option<&Value> {
+        self.value.as_ref()
+    }
 }
 
 /// State manipulation block (import, removed, moved)
@@ -373,9 +425,39 @@ pub struct UpstreamState {
     pub source: std::path::PathBuf,
 }
 
-/// Parse result
-#[derive(Debug, Clone, Default)]
-pub struct ParsedFile {
+/// An export parameter as seen post-inference (#2360 stage 2).
+///
+/// `type_expr` is bare `TypeExpr` because every export carries a
+/// definitive type by construction: the loader runs `apply_inference`
+/// after parse + resolve, which fills in either the user's annotation,
+/// the rhs-inferred type, or the [`TypeExpr::Unknown`] sentinel for
+/// failed inference (paired with an entry in `LoadedConfig.inference_errors`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct InferredExportParam {
+    pub name: String,
+    pub type_expr: TypeExpr,
+    pub value: Option<Value>,
+}
+
+impl ExportParamLike for InferredExportParam {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn value(&self) -> Option<&Value> {
+        self.value.as_ref()
+    }
+}
+
+/// Parse result, generic over the export-parameter shape.
+///
+/// Two phases share this struct via aliases (see [`ParsedFile`] and
+/// [`InferredFile`]): the parser produces `File<ParsedExportParam>`
+/// where `type_expr` is `Option<TypeExpr>`; the loader runs
+/// `apply_inference` and yields `File<InferredExportParam>` where every
+/// export's `type_expr` is bare. Every other field is identical between
+/// phases. See `docs/specs/2026-05-03-typeexpr-stage2-design.md`.
+#[derive(Debug, Clone)]
+pub struct File<E> {
     pub providers: Vec<ProviderConfig>,
     pub resources: Vec<Resource>,
     pub variables: IndexMap<String, Value>,
@@ -387,8 +469,9 @@ pub struct ParsedFile {
     pub arguments: Vec<ArgumentParameter>,
     /// Top-level attribute parameters (directory-based module style)
     pub attribute_params: Vec<AttributeParameter>,
-    /// Top-level export parameters (published to upstream_state consumers)
-    pub export_params: Vec<ExportParameter>,
+    /// Top-level export parameters (published to upstream_state consumers).
+    /// Element type varies by phase — see [`ParsedExportParam`] / [`InferredExportParam`].
+    pub export_params: Vec<E>,
     /// Backend configuration for state storage
     pub backend: Option<BackendConfig>,
     /// State manipulation blocks (import, removed, moved)
@@ -408,7 +491,37 @@ pub struct ParsedFile {
     pub deferred_for_expressions: Vec<DeferredForExpression>,
 }
 
-impl ParsedFile {
+/// Parse-phase file: exports retain their `Option<TypeExpr>` shape.
+pub type ParsedFile = File<ParsedExportParam>;
+
+/// Post-inference file: every export carries a bare [`TypeExpr`]
+/// (possibly [`TypeExpr::Unknown`] for inference failures).
+pub type InferredFile = File<InferredExportParam>;
+
+impl<E> Default for File<E> {
+    fn default() -> Self {
+        Self {
+            providers: Vec::new(),
+            resources: Vec::new(),
+            variables: IndexMap::new(),
+            uses: Vec::new(),
+            module_calls: Vec::new(),
+            arguments: Vec::new(),
+            attribute_params: Vec::new(),
+            export_params: Vec::new(),
+            backend: None,
+            state_blocks: Vec::new(),
+            user_functions: HashMap::new(),
+            upstream_states: Vec::new(),
+            requires: Vec::new(),
+            structural_bindings: HashSet::new(),
+            warnings: Vec::new(),
+            deferred_for_expressions: Vec::new(),
+        }
+    }
+}
+
+impl<E> File<E> {
     /// Iterate every resource reachable from the parsed file — both
     /// top-level `resources` and the `template_resource` of each deferred
     /// for-expression — tagged with its origin context.

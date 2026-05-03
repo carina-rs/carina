@@ -26,7 +26,12 @@ pub async fn run_export(
     format: OutputFormat,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let parsed = load_configuration_with_config(path, provider_context)?.parsed;
+    let parsed = load_configuration_with_config(
+        path,
+        provider_context,
+        &carina_core::schema::SchemaRegistry::new(),
+    )?
+    .parsed;
 
     let backend: Box<dyn StateBackend> = resolve_backend(parsed.backend.as_ref())
         .await

@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::config_loader::{find_crn_files_in_dir, parse_directory};
-use crate::parser::{ParsedFile, ProviderContext, ResourceContext, TypeExpr, UpstreamState};
+use crate::parser::{ProviderContext, ResourceContext, TypeExpr, UpstreamState};
 use crate::resource::{Subscript, Value};
 use crate::schema::{AttributeType, SchemaRegistry, suggest_similar_name};
 
@@ -189,37 +189,37 @@ pub fn resolve_upstream_exports_with_schemas(
         }
         match parse_directory(&source_abs, config) {
             Ok(parsed) => {
-                // Infer-on-failure semantics here are deliberate: any
-                // inference error is silently dropped to `e.type_expr`
-                // (often `None` itself). The downstream consumer's
-                // typecheck is what surfaces a "type annotation
-                // required" diagnostic — the upstream's own validate
-                // run (via `validate_export_param_ref_types`) already
-                // gates the upstream side, so re-emitting the same
-                // error from this resolver would double-report.
-                let bindings =
-                    schemas.map(|_| crate::validation::inference::bindings_from_parsed(&parsed));
-                let keys: HashMap<String, Option<TypeExpr>> = parsed
-                    .export_params
-                    .iter()
-                    .map(|e| {
-                        let inferred = match (schemas, bindings.as_ref()) {
-                            (Some(s), Some(b)) => crate::validation::inference::infer_type_expr(
-                                e.type_expr.as_ref(),
-                                e.value.as_ref(),
-                                b,
-                                s,
-                            )
-                            .ok()
-                            .flatten()
-                            .or_else(|| e.type_expr.clone()),
-                            // `schemas` is None (legacy entry point) —
-                            // forward the declared type unchanged.
-                            _ => e.type_expr.clone(),
-                        };
-                        (e.name.clone(), inferred)
-                    })
-                    .collect();
+                // When schemas are available, hoist the upstream parse
+                // through `apply_inference` so every export carries a
+                // bare `TypeExpr` (possibly the `Unknown` sentinel for
+                // failures) — the same pipeline the loader runs on the
+                // current directory (#2360 stage 2). Inference errors
+                // are silently dropped here: the upstream's own
+                // validate run reports them, and re-emitting from this
+                // resolver would double-report.
+                let keys: HashMap<String, Option<TypeExpr>> = match schemas {
+                    Some(s) => {
+                        let (inferred, _errors) =
+                            crate::validation::inference::apply_inference(parsed, s);
+                        inferred
+                            .export_params
+                            .into_iter()
+                            // Preserve the legacy "no static type"
+                            // surface for sentinels — Unknown carries
+                            // nothing worth forwarding to the consumer.
+                            .map(|e| (e.name, e.type_expr.into_known()))
+                            .collect()
+                    }
+                    // `schemas` is None (legacy entry point) — forward
+                    // the declared type unchanged. Note that without
+                    // schemas there is no way to run inference, so
+                    // unannotated exports stay `None`.
+                    None => parsed
+                        .export_params
+                        .into_iter()
+                        .map(|e| (e.name, e.type_expr))
+                        .collect(),
+                };
                 out.insert(us.binding.clone(), keys);
             }
             Err(reason) => {
@@ -257,7 +257,7 @@ fn resource_attr_location(
 /// for each non-internal attribute (skips `_*` keys). Used by all three
 /// upstream-ref checks; centralized so the iter_all_resources walk and
 /// the `_*` skip are written once.
-fn for_each_resource_attr<F>(parsed: &ParsedFile, mut f: F)
+fn for_each_resource_attr<E, F>(parsed: &crate::parser::File<E>, mut f: F)
 where
     F: FnMut(ResourceContext<'_>, &crate::resource::Resource, &str, &Value),
 {
@@ -281,8 +281,12 @@ where
 /// `scope` controls which subset is walked, mirroring what each
 /// existing caller walks today. See [`NonResourceScope`] for the two
 /// shapes.
-fn for_each_non_resource_value<F>(parsed: &ParsedFile, scope: NonResourceScope, mut f: F)
-where
+fn for_each_non_resource_value<E, F>(
+    parsed: &crate::parser::File<E>,
+    scope: NonResourceScope,
+    mut f: F,
+) where
+    E: crate::parser::ExportParamLike,
     F: FnMut(&Value, &str),
 {
     if matches!(scope, NonResourceScope::All) {
@@ -296,8 +300,8 @@ where
         }
     }
     for export in &parsed.export_params {
-        if let Some(value) = &export.value {
-            f(value, &format!("exports.{}", export.name));
+        if let Some(value) = export.value() {
+            f(value, &format!("exports.{}", export.name()));
         }
     }
     for call in &parsed.module_calls {
@@ -335,8 +339,8 @@ enum NonResourceScope {
 ///
 /// Bindings absent from `exports` are skipped — the caller decides what to
 /// do about unresolved upstreams.
-pub fn check_upstream_state_field_references(
-    parsed: &ParsedFile,
+pub fn check_upstream_state_field_references<E: crate::parser::ExportParamLike>(
+    parsed: &crate::parser::File<E>,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamFieldError> {
     let mut errors: Vec<UpstreamFieldError> = Vec::new();
@@ -479,8 +483,8 @@ impl UpstreamRefDiagnostic for UpstreamTypeError {
 ///
 /// Exports without a declared type (no `: T` annotation) are skipped —
 /// there's nothing to compare.
-pub fn check_upstream_state_field_types(
-    parsed: &ParsedFile,
+pub fn check_upstream_state_field_types<E>(
+    parsed: &crate::parser::File<E>,
     exports: &UpstreamExports,
     registry: &SchemaRegistry,
 ) -> Vec<UpstreamTypeError> {
@@ -659,8 +663,8 @@ impl UpstreamRefDiagnostic for UpstreamForIterableShapeError {
 /// Both flag `(ForBinding × shape)` mismatches; this one fires at
 /// validate time off the upstream's *declared* type, the parser-side
 /// one fires at expansion time off the *resolved* `Value`.
-pub fn check_upstream_state_for_iterable_shapes(
-    parsed: &ParsedFile,
+pub fn check_upstream_state_for_iterable_shapes<E>(
+    parsed: &crate::parser::File<E>,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamForIterableShapeError> {
     let mut errors: Vec<UpstreamForIterableShapeError> = Vec::new();
@@ -811,8 +815,8 @@ impl UpstreamRefDiagnostic for UpstreamAttributeAccessShapeError {
 /// Sibling of [`check_upstream_state_for_iterable_shapes`] from #2317;
 /// both surface "downstream usage doesn't fit upstream's declared
 /// shape" before apply.
-pub fn check_upstream_state_attribute_access_shapes(
-    parsed: &ParsedFile,
+pub fn check_upstream_state_attribute_access_shapes<E: crate::parser::ExportParamLike>(
+    parsed: &crate::parser::File<E>,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamAttributeAccessShapeError> {
     let mut errors: Vec<UpstreamAttributeAccessShapeError> = Vec::new();
@@ -997,8 +1001,8 @@ impl UpstreamRefDiagnostic for UpstreamSubscriptShapeError {
 /// - the leading `field_path` already mismatches the declared shape
 ///   (already handled by `check_upstream_state_attribute_access_shapes`)
 ///   — in that case the field-walk diagnostic is enough.
-pub fn check_upstream_state_subscript_shapes(
-    parsed: &ParsedFile,
+pub fn check_upstream_state_subscript_shapes<E: crate::parser::ExportParamLike>(
+    parsed: &crate::parser::File<E>,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamSubscriptShapeError> {
     let mut errors: Vec<UpstreamSubscriptShapeError> = Vec::new();
@@ -1086,6 +1090,7 @@ fn visit_subscript_access(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::ParsedFile;
     use std::fs;
     use std::path::PathBuf;
 
@@ -3005,5 +3010,35 @@ mod tests {
                 format!("{}: {}", d.location(), d.diagnostic_message())
             );
         }
+    }
+
+    #[test]
+    fn resolve_upstream_exports_with_schemas_uses_inference_for_unannotated() {
+        // Stage 2 (#2360): the resolver hoists the upstream parse
+        // through `apply_inference`, so an unannotated literal export
+        // surfaces as a typed entry to consumers without the user
+        // having to write `: String`.
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream_dir = tmp.path().join("upstream");
+        fs::create_dir(&upstream_dir).unwrap();
+        write_crn(
+            &upstream_dir,
+            "main.crn",
+            "exports {\n  region = \"us-east-1\"\n}\n",
+        );
+
+        let upstream_state = upstream("ups", "upstream");
+        let (exports, _errors) = resolve_upstream_exports_with_schemas(
+            tmp.path(),
+            &[upstream_state],
+            &ctx(),
+            Some(&crate::schema::SchemaRegistry::new()),
+        );
+        let region_type = exports
+            .get("ups")
+            .and_then(|m| m.get("region"))
+            .and_then(|t| t.as_ref())
+            .expect("region should be inferred");
+        assert_eq!(region_type, &TypeExpr::String);
     }
 }

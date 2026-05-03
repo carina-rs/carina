@@ -324,6 +324,8 @@ fn check_fn_arg_type(
             }
         }
         TypeExpr::Struct { .. } => matches!(value, Value::Map(_)),
+        // Inference sentinel: never matches a concrete value.
+        TypeExpr::Unknown => false,
     };
     if !type_matches {
         let actual_type = value_type_name(value);
@@ -387,6 +389,8 @@ fn check_fn_return_type(
             }
         }
         TypeExpr::Struct { .. } => matches!(value, Value::Map(_)),
+        // Inference sentinel: never matches a concrete value.
+        TypeExpr::Unknown => false,
     };
     if !type_matches {
         let actual_type = value_type_name(value);

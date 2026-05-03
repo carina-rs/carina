@@ -1965,26 +1965,12 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
     let backend = RefreshTestBackend::new(state);
 
     // Config only has "keep-bucket" -- "orphan-bucket" was removed from .crn
-    let mut parsed = ParsedFile {
-        providers: vec![],
-        backend: None,
+    let mut parsed = carina_core::parser::InferredFile {
         resources: vec![
             Resource::new("s3.Bucket", "keep-bucket")
                 .with_attribute("bucket", Value::String("keep-bucket".to_string())),
         ],
-        variables: IndexMap::new(),
-        uses: vec![],
-        module_calls: vec![],
-        arguments: vec![],
-        attribute_params: vec![],
-        export_params: vec![],
-        state_blocks: vec![],
-        user_functions: HashMap::new(),
-        upstream_states: vec![],
-        requires: vec![],
-        structural_bindings: HashSet::new(),
-        warnings: vec![],
-        deferred_for_expressions: vec![],
+        ..carina_core::parser::InferredFile::default()
     };
 
     // MockProvider returns not_found for both resources (simulates external deletion)
@@ -2728,7 +2714,7 @@ async fn persist_exports_only_clears_state_exports_when_params_empty() {
 
 #[tokio::test]
 async fn persist_exports_only_writes_state_with_new_exports() {
-    use carina_core::parser::ExportParameter;
+    use carina_core::parser::{InferredExportParam, TypeExpr};
     use carina_core::resource::Value;
 
     let captured = Arc::new(Mutex::new(None));
@@ -2737,9 +2723,9 @@ async fn persist_exports_only_writes_state_with_new_exports() {
     };
     let lock = LockInfo::new("apply");
 
-    let export_params = vec![ExportParameter {
+    let export_params = vec![InferredExportParam {
         name: "account_id".to_string(),
-        type_expr: None,
+        type_expr: TypeExpr::Unknown,
         value: Some(Value::String("123456789012".to_string())),
     }];
 

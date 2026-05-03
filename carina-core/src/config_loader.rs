@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::parser::{self, ParsedFile, ProviderContext};
+use crate::parser::{self, InferredFile, ParsedFile, ProviderContext};
+use crate::schema::SchemaRegistry;
+use crate::validation::inference::InferenceError;
 
 /// Result of loading configuration, includes the file path containing backend block.
 ///
@@ -14,10 +16,15 @@ use crate::parser::{self, ParsedFile, ProviderContext};
 /// findings (#2102). Blocking errors (bad parse, missing modules) still
 /// come back as `Err` from the loader.
 pub struct LoadedConfig {
-    pub parsed: ParsedFile,
+    /// Post-inference file: every export carries a bare `TypeExpr`
+    /// (possibly the `TypeExpr::Unknown` sentinel for failed inference,
+    /// in which case a matching entry appears in `inference_errors`).
+    pub parsed: InferredFile,
     /// Resources before reference resolution, for unused binding detection.
     /// After `resolve_resource_refs`, intermediate `ResourceRef` values are resolved away,
     /// so this preserves the original references for accurate unused binding analysis.
+    /// Stays as `ParsedFile` because nothing downstream of this field
+    /// reads `export_params.type_expr`.
     pub unresolved_parsed: ParsedFile,
     pub backend_file: Option<PathBuf>,
     /// Identifier-scope errors surfaced by [`parser::check_identifier_scope`]
@@ -27,11 +34,18 @@ pub struct LoadedConfig {
     /// directory-wide binding set. The loader does not short-circuit on
     /// these so that later validators can also run in a single pass.
     pub identifier_scope_errors: Vec<parser::ParseError>,
+    /// Inference errors collected by `apply_inference` (#2360 stage 2):
+    /// one entry per `exports { ... }` declaration whose type could not
+    /// be statically resolved. The corresponding entry in `parsed.export_params`
+    /// carries `TypeExpr::Unknown` so downstream consumers can keep
+    /// looking the export up by name without spawning cascading
+    /// "missing export" diagnostics.
+    pub inference_errors: Vec<(String, InferenceError)>,
 }
 
 /// Load configuration from a directory containing .crn files
 pub fn load_configuration(path: &PathBuf) -> Result<LoadedConfig, String> {
-    load_configuration_with_config(path, &ProviderContext::default())
+    load_configuration_with_config(path, &ProviderContext::default(), &SchemaRegistry::new())
 }
 
 /// Load configuration from a directory containing .crn files.
@@ -40,6 +54,7 @@ pub fn load_configuration(path: &PathBuf) -> Result<LoadedConfig, String> {
 pub fn load_configuration_with_config(
     path: &PathBuf,
     config: &ProviderContext,
+    schemas: &SchemaRegistry,
 ) -> Result<LoadedConfig, String> {
     if path.is_file() {
         Err(format!("expected directory, got file: {}", path.display()))
@@ -169,11 +184,18 @@ pub fn load_configuration_with_config(
         // static error in one pass (#2102, #2126, #2138).
         let identifier_scope_errors = parser::check_identifier_scope(&merged);
 
+        // Phase transition: post-resolve, run rhs-driven inference over
+        // every `exports { ... }` declaration so downstream consumers
+        // see a definitive `TypeExpr` per export (#2360 stage 2).
+        let (inferred, inference_errors) =
+            crate::validation::inference::apply_inference(merged, schemas);
+
         Ok(LoadedConfig {
-            parsed: merged,
+            parsed: inferred,
             unresolved_parsed: unresolved_merged,
             backend_file,
             identifier_scope_errors,
+            inference_errors,
         })
     } else {
         Err(format!("Path not found: {}", path.display()))
@@ -543,6 +565,58 @@ mod tests {
     }
 
     // ========== load_configuration tests ==========
+
+    #[test]
+    fn load_configuration_runs_inference_and_surfaces_errors() {
+        // Stage 2 (#2360): an unannotated dynamic-rhs export
+        // (`lookup` returns Any) becomes a sentinel + an inference
+        // error rather than slipping through unchecked.
+        let dir = create_temp_dir("load_inference_failure");
+        fs::write(
+            dir.join("main.crn"),
+            "exports {\n  zone_id = lookup({a = \"1\"}, \"a\", \"default\")\n}\n",
+        )
+        .unwrap();
+
+        let loaded = load_configuration_with_config(
+            &dir,
+            &ProviderContext::default(),
+            &SchemaRegistry::new(),
+        )
+        .unwrap();
+        cleanup(&dir);
+        assert_eq!(loaded.parsed.export_params.len(), 1);
+        assert_eq!(
+            loaded.parsed.export_params[0].type_expr,
+            crate::parser::TypeExpr::Unknown,
+        );
+        assert_eq!(loaded.inference_errors.len(), 1);
+    }
+
+    #[test]
+    fn load_configuration_keeps_inferable_export_typed() {
+        // String-literal rhs is statically inferable; no annotation
+        // required, no inference error.
+        let dir = create_temp_dir("load_inferable_literal");
+        fs::write(dir.join("main.crn"), "exports {\n  name = \"carina\"\n}\n").unwrap();
+
+        let loaded = load_configuration_with_config(
+            &dir,
+            &ProviderContext::default(),
+            &SchemaRegistry::new(),
+        )
+        .unwrap();
+        cleanup(&dir);
+        assert!(
+            loaded.inference_errors.is_empty(),
+            "no inference errors expected, got {:?}",
+            loaded.inference_errors,
+        );
+        assert_eq!(
+            loaded.parsed.export_params[0].type_expr,
+            crate::parser::TypeExpr::String,
+        );
+    }
 
     #[test]
     fn load_configuration_directory_with_provider() {
@@ -943,8 +1017,12 @@ awscc.ec2.SecurityGroup {
 "#,
         )
         .unwrap();
-        let loaded = load_configuration_with_config(&dir2, &ProviderContext::default())
-            .expect("load_configuration should not short-circuit on identifier-scope errors");
+        let loaded = load_configuration_with_config(
+            &dir2,
+            &ProviderContext::default(),
+            &SchemaRegistry::new(),
+        )
+        .expect("load_configuration should not short-circuit on identifier-scope errors");
         cleanup(&dir2);
         assert_eq!(
             loaded.identifier_scope_errors.len(),
@@ -981,8 +1059,12 @@ awscc.ec2.SecurityGroup {
         )
         .unwrap();
 
-        let loaded = load_configuration_with_config(&dir, &ProviderContext::default())
-            .expect("directory with cross-file ResourceRef must load without error");
+        let loaded = load_configuration_with_config(
+            &dir,
+            &ProviderContext::default(),
+            &SchemaRegistry::new(),
+        )
+        .expect("directory with cross-file ResourceRef must load without error");
         cleanup(&dir);
         assert!(
             loaded.identifier_scope_errors.is_empty(),

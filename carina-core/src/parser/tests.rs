@@ -7638,3 +7638,51 @@ fn nested_block_value_map_preserves_insertion_order() {
         "nested block Value::Map must preserve source key order; got {keys:?}"
     );
 }
+
+#[test]
+fn type_expr_unknown_displays_as_unknown_marker() {
+    let u = TypeExpr::Unknown;
+    assert_eq!(format!("{}", u), "<unknown>");
+}
+
+#[test]
+fn type_expr_unknown_serde_round_trips() {
+    let u = TypeExpr::Unknown;
+    let json = serde_json::to_string(&u).unwrap();
+    let back: TypeExpr = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, u);
+}
+
+#[test]
+fn parsed_export_param_keeps_optional_type_expr() {
+    let p = ParsedExportParam {
+        name: "vpc_id".to_string(),
+        type_expr: None,
+        value: None,
+    };
+    assert!(p.type_expr.is_none());
+}
+
+#[test]
+fn parsed_file_is_file_of_parsed_export_param() {
+    fn _coerce(p: ParsedFile) -> File<ParsedExportParam> {
+        p
+    }
+    fn _back(f: File<ParsedExportParam>) -> ParsedFile {
+        f
+    }
+}
+
+#[test]
+fn inferred_file_holds_inferred_export_param() {
+    let one = InferredExportParam {
+        name: "vpc_id".to_string(),
+        type_expr: TypeExpr::String,
+        value: None,
+    };
+    let f: InferredFile = InferredFile {
+        export_params: vec![one],
+        ..Default::default()
+    };
+    assert_eq!(f.export_params[0].type_expr, TypeExpr::String);
+}

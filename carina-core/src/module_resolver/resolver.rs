@@ -208,8 +208,12 @@ pub fn resolve_modules(parsed: &mut ParsedFile, base_dir: &Path) -> Result<(), M
 }
 
 /// Resolve all modules in a parsed file with the given parser configuration.
-pub fn resolve_modules_with_config(
-    parsed: &mut ParsedFile,
+///
+/// Generic over the export-parameter shape so callers can pass either
+/// `ParsedFile` (parser phase) or `InferredFile` (post-loader phase) —
+/// the resolver only touches `uses`, `module_calls`, and `resources`.
+pub fn resolve_modules_with_config<E>(
+    parsed: &mut crate::parser::File<E>,
     base_dir: &Path,
     config: &ProviderContext,
 ) -> Result<(), ModuleError> {

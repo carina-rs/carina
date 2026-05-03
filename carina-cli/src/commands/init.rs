@@ -23,8 +23,12 @@ pub fn run_init(path: &Path, upgrade: bool, locked: bool) -> Result<(), String> 
     let path_buf = path.to_path_buf();
 
     let provider_context = ProviderContext::default();
-    let loaded = load_configuration_with_config(&path_buf, &provider_context)
-        .map_err(|e| format!("Failed to load configuration: {e}"))?;
+    let loaded = load_configuration_with_config(
+        &path_buf,
+        &provider_context,
+        &carina_core::schema::SchemaRegistry::new(),
+    )
+    .map_err(|e| format!("Failed to load configuration: {e}"))?;
 
     let missing_source: Vec<String> = loaded
         .parsed
