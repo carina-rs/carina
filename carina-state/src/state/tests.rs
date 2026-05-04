@@ -1062,3 +1062,35 @@ fn check_and_migrate_canonicalizes_legacy_map_key_addresses() {
     assert!(deps.contains(&"other.a"));
     assert!(deps.contains(&"_envs['prod-east']"));
 }
+
+/// RFC #2371 #2385: state writeback rejects unresolved `Value` variants
+/// surfaced from a buggy provider that returns a `Value::ResourceRef`
+/// in `state.attributes`. Provider-returned states must be concrete; a
+/// resolver / provider bug produces a typed `UnresolvedResourceRef`
+/// error rather than a debug-formatted string in state JSON.
+#[test]
+fn from_provider_state_rejects_resource_ref_in_provider_attributes() {
+    use carina_core::resource::{AccessPath, Resource, State as ProviderState, Value};
+
+    let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket");
+    let provider_state = ProviderState {
+        id: resource.id.clone(),
+        identifier: Some("my-bucket".to_string()),
+        attributes: [(
+            "owner".to_string(),
+            Value::ResourceRef {
+                path: AccessPath::with_fields("net", "vpc", vec!["vpc_id".into()]),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        exists: true,
+        dependency_bindings: BTreeSet::new(),
+    };
+
+    let err = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap_err();
+    assert!(
+        err.contains("unresolved reference") && err.contains("net.vpc.vpc_id"),
+        "expected UnresolvedResourceRef diagnostic in error, got: {err}"
+    );
+}
