@@ -5,8 +5,27 @@ use std::collections::HashMap;
 use argon2::Argon2;
 use indexmap::IndexMap;
 
-use crate::resource::{InterpolationPart, Value};
+use crate::resource::{InterpolationPart, UnknownReason, Value};
 use crate::utils::{convert_enum_value, is_dsl_enum_format};
+
+/// Render an `UnknownReason` to its plan-display string. See RFC #2371.
+///
+/// `pub(crate)` for stage 1: only same-crate callers (stage 2 will route
+/// `format_value_with_key` through here). Promote to `pub` in stage 3
+/// when the carina-cli display layer migrates. `#[allow(dead_code)]` is
+/// the explicit acknowledgement that no caller exists *yet* — stage 2
+/// removes the attribute when `format_value_with_key` calls in.
+#[allow(dead_code)]
+pub(crate) fn render_unknown(reason: &UnknownReason) -> String {
+    match reason {
+        UnknownReason::UpstreamRef { path } => {
+            format!("(known after upstream apply: {})", path.to_dot_string())
+        }
+        UnknownReason::ForKey => "(known after upstream apply: key)".to_string(),
+        UnknownReason::ForIndex => "(known after upstream apply: index)".to_string(),
+        UnknownReason::ForValue => "(known after upstream apply)".to_string(),
+    }
+}
 
 /// Secret value prefix used in state serialization.
 pub const SECRET_PREFIX: &str = "_secret:argon2:";
@@ -141,6 +160,9 @@ pub fn value_to_json_with_context(
                 "{SECRET_PREFIX}{hash_hex}",
             )))
         }
+        Value::Unknown(_) => {
+            unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
+        }
     }
 }
 
@@ -240,6 +262,9 @@ pub fn format_value_with_key(value: &Value, _key: Option<&str>) -> String {
             format!("{}({})", name, arg_strs.join(", "))
         }
         Value::Secret(_) => "(secret)".to_string(),
+        Value::Unknown(_) => {
+            unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
+        }
     }
 }
 
@@ -353,6 +378,13 @@ pub fn redact_secrets_in_value(value: &Value) -> Value {
             Value::Map(redacted)
         }
         Value::List(items) => Value::List(items.iter().map(redact_secrets_in_value).collect()),
+        // RFC #2371: `Value::Unknown` is plan-display only and must
+        // never reach a serialized output (state file, plan file). The
+        // `other` arm below would silently pass it through; reject
+        // explicitly so a stage-2/3 producer bug surfaces here.
+        Value::Unknown(_) => {
+            unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
+        }
         other => other.clone(),
     }
 }
@@ -499,6 +531,75 @@ pub fn map_similarity(a: &Value, b: &Value) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_unknown_upstream_ref() {
+        use crate::resource::AccessPath;
+        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
+        let r = UnknownReason::UpstreamRef { path };
+        assert_eq!(
+            render_unknown(&r),
+            "(known after upstream apply: network.vpc.vpc_id)"
+        );
+    }
+
+    #[test]
+    fn render_unknown_upstream_ref_with_subscript() {
+        use crate::resource::{AccessPath, Subscript};
+        let path = AccessPath::with_fields_and_subscripts(
+            "network",
+            "accounts",
+            Vec::new(),
+            vec![Subscript::Int { index: 0 }],
+        );
+        let r = UnknownReason::UpstreamRef { path };
+        assert_eq!(
+            render_unknown(&r),
+            "(known after upstream apply: network.accounts[0])"
+        );
+    }
+
+    #[test]
+    fn render_unknown_upstream_ref_with_string_subscript() {
+        use crate::resource::{AccessPath, Subscript};
+        let path = AccessPath::with_fields_and_subscripts(
+            "vpc",
+            "tags",
+            Vec::new(),
+            vec![Subscript::Str {
+                key: "Name".to_string(),
+            }],
+        );
+        let r = UnknownReason::UpstreamRef { path };
+        assert_eq!(
+            render_unknown(&r),
+            "(known after upstream apply: vpc.tags[\"Name\"])"
+        );
+    }
+
+    #[test]
+    fn render_unknown_for_key() {
+        assert_eq!(
+            render_unknown(&UnknownReason::ForKey),
+            "(known after upstream apply: key)"
+        );
+    }
+
+    #[test]
+    fn render_unknown_for_index() {
+        assert_eq!(
+            render_unknown(&UnknownReason::ForIndex),
+            "(known after upstream apply: index)"
+        );
+    }
+
+    #[test]
+    fn render_unknown_for_value() {
+        assert_eq!(
+            render_unknown(&UnknownReason::ForValue),
+            "(known after upstream apply)"
+        );
+    }
 
     #[test]
     fn test_value_to_json_string() {

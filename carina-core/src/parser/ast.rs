@@ -811,6 +811,13 @@ pub(super) fn substitute_placeholder(
         Value::Secret(inner) => {
             substitute_placeholder(inner, index, key, value);
         }
+        // Stage 3 (RFC #2371) replaces this whole function with an
+        // enum-match on `Value::Unknown(UnknownReason::{ForKey, ForIndex,
+        // ForValue})` instead of the string sentinel above. Until then,
+        // no producer creates `Value::Unknown`, so this arm is dead.
+        Value::Unknown(_) => {
+            unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
+        }
         _ => {}
     }
 }

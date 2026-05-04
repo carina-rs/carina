@@ -196,6 +196,9 @@ fn deterministic_value_string(value: &Value) -> String {
         Value::Secret(inner) => {
             format!("Secret({})", deterministic_value_string(inner))
         }
+        Value::Unknown(_) => {
+            unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
+        }
     }
 }
 

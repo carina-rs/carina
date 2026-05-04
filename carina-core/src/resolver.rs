@@ -152,6 +152,13 @@ fn stamp_unresolved_upstream(
             *inner,
             upstream_binding_names,
         ))),
+        // Stage 2 (RFC #2371) replaces this whole function — the
+        // current `Value::String("\0upstream_unresolved:...")` output
+        // becomes `Value::Unknown(UnknownReason::UpstreamRef { ... })`.
+        // Until then no producer creates `Value::Unknown`.
+        Value::Unknown(_) => {
+            unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
+        }
         other => other,
     }
 }
@@ -300,6 +307,11 @@ pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<V
         Value::Secret(inner) => {
             let resolved_inner = resolve_ref_value(inner, bindings)?;
             Ok(Value::Secret(Box::new(resolved_inner)))
+        }
+        // RFC #2371: stage 1 has no producer; stage 2 will route the
+        // `Value::Unknown` cases through this resolver explicitly.
+        Value::Unknown(_) => {
+            unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
         }
         _ => Ok(value.clone()),
     }

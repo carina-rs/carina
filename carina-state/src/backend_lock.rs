@@ -151,6 +151,13 @@ fn value_to_json(value: &carina_core::resource::Value) -> serde_json::Value {
         Value::String(s) => serde_json::Value::String(s.clone()),
         Value::Bool(b) => serde_json::Value::Bool(*b),
         Value::Int(i) => serde_json::Value::Number((*i).into()),
+        // RFC #2371: `Value::Unknown` is plan-display only and must
+        // never reach a state file. The wildcard below would silently
+        // map it to `null`; reject explicitly so a stage-2/3 producer
+        // bug surfaces here instead of silently corrupting the lock.
+        Value::Unknown(_) => {
+            unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
+        }
         _ => serde_json::Value::Null,
     }
 }
