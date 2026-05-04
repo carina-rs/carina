@@ -485,22 +485,28 @@ impl DiagnosticEngine {
                                     },
                                     value,
                                 ) => {
-                                    let name = semantic_name.as_deref().unwrap_or("");
-                                    // Handle bare/shorthand enum identifiers by expanding to full namespace format.
-                                    // These are String values like "dedicated" or "InstanceTenancy.dedicated".
-                                    let resolved_value = carina_core::utils::expand_enum_shorthand(
-                                        value,
-                                        name,
-                                        namespace.as_deref(),
-                                    );
+                                    // `Value::Unknown` resolves at upstream apply — skip,
+                                    // matching the CLI's `walk_custom_lookup` behavior.
+                                    if matches!(value, carina_core::resource::Value::Unknown(_)) {
+                                        None
+                                    } else {
+                                        let name = semantic_name.as_deref().unwrap_or("");
+                                        // Handle bare/shorthand enum identifiers by expanding to full namespace format.
+                                        // These are String values like "dedicated" or "InstanceTenancy.dedicated".
+                                        let resolved_value =
+                                            carina_core::utils::expand_enum_shorthand(
+                                                value,
+                                                name,
+                                                namespace.as_deref(),
+                                            );
 
-                                    // Run the schema-attached validator first; for WASM-plugin
-                                    // types it is a noop, so fall back to the provider-context
-                                    // lookup which reaches the factory's `validate_custom_type`.
-                                    let lookup = carina_core::parser::provider_context_lookup(
-                                        &self.provider_context,
-                                    );
-                                    validate(&resolved_value)
+                                        // Run the schema-attached validator first; for WASM-plugin
+                                        // types it is a noop, so fall back to the provider-context
+                                        // lookup which reaches the factory's `validate_custom_type`.
+                                        let lookup = carina_core::parser::provider_context_lookup(
+                                            &self.provider_context,
+                                        );
+                                        validate(&resolved_value)
                                         .err()
                                         .or_else(|| {
                                             (!name.is_empty())
@@ -530,6 +536,7 @@ impl DiagnosticEngine {
                                             inner_msg
                                         }
                                     })
+                                    }
                                 }
                                 // String type - check for bare resource binding
                                 (carina_core::schema::AttributeType::String, Value::String(s)) => {

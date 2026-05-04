@@ -228,6 +228,7 @@ pub fn validate_custom_type(
         (_, Value::ResourceRef { .. }) => Ok(()), // will be resolved later
         (_, Value::FunctionCall { .. }) => Ok(()), // will be resolved later
         (_, Value::Interpolation(_)) => Ok(()),   // will be resolved later
+        (_, Value::Unknown(_)) => Ok(()),         // resolved at upstream apply
         (name, Value::String(s)) => {
             // Check custom validators from config (schema-extracted)
             if let Some(validator) = config.validators.get(name) {
@@ -256,6 +257,12 @@ fn check_fn_arg_type(
     value: &Value,
     ctx: &ParseContext,
 ) -> Result<(), ParseError> {
+    // `Value::Unknown` resolves at upstream apply; the concrete type
+    // is unknowable at parse time. Skip the type check — same convention
+    // the schema validator follows.
+    if matches!(value, Value::Unknown(_)) {
+        return Ok(());
+    }
     let type_matches = match type_expr {
         TypeExpr::String => matches!(
             value,
@@ -343,6 +350,11 @@ fn check_fn_return_type(
     value: &Value,
     config: &ProviderContext,
 ) -> Result<(), ParseError> {
+    // Same skip as `check_fn_arg_type`: a `Value::Unknown` propagated
+    // through a typed user fn carries no concrete type at parse time.
+    if matches!(value, Value::Unknown(_)) {
+        return Ok(());
+    }
     let type_matches = match type_expr {
         TypeExpr::String => matches!(
             value,

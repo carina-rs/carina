@@ -6,20 +6,10 @@ use super::error::ParseWarning;
 use super::expressions::for_expr::ForBinding;
 use super::expressions::validate_expr::CompareOp;
 use super::util::snake_to_pascal;
-use crate::resource::{Resource, ResourceId, Value};
+use crate::resource::{Resource, ResourceId, UnknownReason, Value};
 use crate::version_constraint::VersionConstraint;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
-
-/// Placeholder text for values that depend on an upstream apply.
-pub const DEFERRED_UPSTREAM_PLACEHOLDER: &str = "(known after upstream apply)";
-/// Placeholder reserved for map-binding key variables. Distinct from the
-/// value-var placeholder so expansion can substitute each correctly.
-pub(crate) const DEFERRED_UPSTREAM_KEY_PLACEHOLDER: &str = "(known after upstream apply: key)";
-/// Placeholder reserved for indexed-binding index variables — distinct from
-/// key and value placeholders so `for (i, x) in list` expansion can
-/// substitute `i` with the integer index.
-pub(crate) const DEFERRED_UPSTREAM_INDEX_PLACEHOLDER: &str = "(known after upstream apply: index)";
 
 /// A for-expression whose iterable is unresolved (e.g., upstream_state not yet available).
 /// Captures the structural shape of the loop body so the plan can show what
@@ -710,13 +700,16 @@ fn substitute_attrs(
 
 /// Substitute deferred-for-expression placeholders in a Value tree.
 ///
-/// Replaces `DEFERRED_UPSTREAM_PLACEHOLDER` with `value`. If `index` is
-/// supplied (indexed-binding expansion), replaces
-/// `DEFERRED_UPSTREAM_INDEX_PLACEHOLDER` with the integer index. If `key`
-/// is supplied (map-binding expansion), replaces
-/// `DEFERRED_UPSTREAM_KEY_PLACEHOLDER` with the key string. Recurses into
-/// all compound Value variants so placeholders nested inside
+/// Replaces `Value::Unknown(UnknownReason::ForValue)` with `value`. If
+/// `index` is supplied (indexed-binding expansion), replaces
+/// `Value::Unknown(UnknownReason::ForIndex)` with the integer index. If
+/// `key` is supplied (map-binding expansion), replaces
+/// `Value::Unknown(UnknownReason::ForKey)` with the key string. Recurses
+/// into all compound Value variants so placeholders nested inside
 /// interpolations / function calls / secrets are reached.
+///
+/// `UnknownReason::UpstreamRef` is the upstream-attribute marker, not a
+/// for-binding placeholder, so it is preserved unchanged.
 pub(super) fn substitute_placeholder(
     v: &mut Value,
     index: Option<i64>,
@@ -724,19 +717,22 @@ pub(super) fn substitute_placeholder(
     value: &Value,
 ) {
     match v {
-        Value::String(s) if s == DEFERRED_UPSTREAM_PLACEHOLDER => {
+        Value::Unknown(UnknownReason::ForValue) => {
             *v = value.clone();
         }
-        Value::String(s) if s == DEFERRED_UPSTREAM_KEY_PLACEHOLDER => {
+        Value::Unknown(UnknownReason::ForKey) => {
             if let Some(k) = key {
                 *v = Value::String(k.to_string());
             }
         }
-        Value::String(s) if s == DEFERRED_UPSTREAM_INDEX_PLACEHOLDER => {
+        Value::Unknown(UnknownReason::ForIndex) => {
             if let Some(i) = index {
                 *v = Value::Int(i);
             }
         }
+        // Explicit arm (not wildcard) so a new `UnknownReason` variant
+        // forces a compile-error decision here.
+        Value::Unknown(UnknownReason::UpstreamRef { .. }) => {}
         Value::List(items) => {
             for item in items.iter_mut() {
                 substitute_placeholder(item, index, key, value);
@@ -762,13 +758,97 @@ pub(super) fn substitute_placeholder(
         Value::Secret(inner) => {
             substitute_placeholder(inner, index, key, value);
         }
-        // Stage 3 (RFC #2371) replaces this whole function with an
-        // enum-match on `Value::Unknown(UnknownReason::{ForKey, ForIndex,
-        // ForValue})` instead of the string sentinel above. In stage 2,
-        // an Unknown that flows through here is `UpstreamRef` (stamped
-        // by `stamp_unresolved_upstream`); it is not a for-binding
-        // placeholder and must not be substituted.
-        Value::Unknown(_) => {}
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod substitute_placeholder_tests {
+    use super::*;
+    use crate::resource::{AccessPath, InterpolationPart, UnknownReason, Value};
+
+    #[test]
+    fn replaces_for_value_with_bound_value() {
+        let mut v = Value::Unknown(UnknownReason::ForValue);
+        substitute_placeholder(&mut v, None, None, &Value::String("acct-1".into()));
+        assert_eq!(v, Value::String("acct-1".into()));
+    }
+
+    #[test]
+    fn replaces_for_key_with_key_string() {
+        let mut v = Value::Unknown(UnknownReason::ForKey);
+        substitute_placeholder(&mut v, None, Some("east"), &Value::String("ignored".into()));
+        assert_eq!(v, Value::String("east".into()));
+    }
+
+    #[test]
+    fn replaces_for_index_with_integer_index() {
+        let mut v = Value::Unknown(UnknownReason::ForIndex);
+        substitute_placeholder(&mut v, Some(7), None, &Value::String("ignored".into()));
+        assert_eq!(v, Value::Int(7));
+    }
+
+    #[test]
+    fn leaves_upstream_ref_unchanged() {
+        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
+        let mut v = Value::Unknown(UnknownReason::UpstreamRef { path: path.clone() });
+        substitute_placeholder(
+            &mut v,
+            Some(0),
+            Some("k"),
+            &Value::String("anything".into()),
+        );
+        // `Value::Unknown` never compares equal (see `impl PartialEq for Value`),
+        // so destructure to verify the path survives.
+        match v {
+            Value::Unknown(UnknownReason::UpstreamRef { path: p }) => assert_eq!(p, path),
+            other => panic!("UpstreamRef must pass through unchanged, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn recurses_into_compound_values() {
+        let mut v = Value::List(vec![
+            Value::Unknown(UnknownReason::ForValue),
+            Value::Map({
+                let mut m = indexmap::IndexMap::new();
+                m.insert("k".into(), Value::Unknown(UnknownReason::ForValue));
+                m
+            }),
+            Value::Interpolation(vec![InterpolationPart::Expr(Value::Unknown(
+                UnknownReason::ForValue,
+            ))]),
+        ]);
+        substitute_placeholder(&mut v, None, None, &Value::String("X".into()));
+        match &v {
+            Value::List(items) => {
+                assert_eq!(items[0], Value::String("X".into()));
+                match &items[1] {
+                    Value::Map(m) => {
+                        assert_eq!(m["k"], Value::String("X".into()));
+                    }
+                    other => panic!("expected Map, got {:?}", other),
+                }
+                match &items[2] {
+                    Value::Interpolation(parts) => match &parts[0] {
+                        InterpolationPart::Expr(inner) => {
+                            assert_eq!(*inner, Value::String("X".into()));
+                        }
+                        _ => panic!("expected Expr part"),
+                    },
+                    other => panic!("expected Interpolation, got {:?}", other),
+                }
+            }
+            other => panic!("expected List, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn legacy_string_sentinel_is_no_longer_recognised() {
+        // Only `Value::Unknown(For*)` is substituted. A bare string that
+        // happens to match the historical sentinel must be left alone.
+        let mut v = Value::String("(known after upstream apply)".into());
+        substitute_placeholder(&mut v, None, None, &Value::String("X".into()));
+        assert_eq!(v, Value::String("(known after upstream apply)".into()));
     }
 }

@@ -3301,3 +3301,64 @@ fn schema_registry_has_managed_only_does_not_imply_data_source() {
     assert!(registry.has_managed("aws", "s3.Bucket"));
     assert!(!registry.has_data_source("aws", "s3.Bucket"));
 }
+
+#[test]
+fn validate_skips_value_unknown_for_primitive_types() {
+    // `Value::Unknown` carries no concrete type at plan time, so it
+    // takes the same skip path as `FunctionCall` and `Secret`. Without
+    // this, a `for x in upstream.list { ... attr = x ... }` body fails
+    // parse-time validation with `expected <type>, got unknown`.
+    use crate::resource::{AccessPath, UnknownReason};
+    let unknown = Value::Unknown(UnknownReason::ForValue);
+    assert!(AttributeType::String.validate(&unknown).is_ok());
+    assert!(AttributeType::Int.validate(&unknown).is_ok());
+    assert!(AttributeType::Bool.validate(&unknown).is_ok());
+
+    let upstream = Value::Unknown(UnknownReason::UpstreamRef {
+        path: AccessPath::with_fields("net", "vpc", vec!["vpc_id".into()]),
+    });
+    assert!(AttributeType::String.validate(&upstream).is_ok());
+    assert!(AttributeType::Int.validate(&upstream).is_ok());
+}
+
+#[test]
+fn walk_custom_lookup_skips_value_unknown() {
+    // Custom-typed attributes (e.g. AWS resource-id types like `vpc_id`)
+    // run through `walk_custom_lookup` instead of `validate`. Skip
+    // `Value::Unknown` here too, otherwise a custom-typed attribute
+    // bound from a for-expression element fails plan with
+    // `expected vpc_id, got unknown`.
+    use crate::resource::UnknownReason;
+
+    let always_fail = validator(|_v: &Value| {
+        Err(TypeError::ValidationFailed {
+            message: "validator must not run for Value::Unknown".to_string(),
+        })
+    });
+    let custom_type = AttributeType::Custom {
+        base: Box::new(AttributeType::String),
+        validate: always_fail,
+        semantic_name: Some("vpc_id".to_string()),
+        namespace: None,
+        pattern: None,
+        length: None,
+        to_dsl: None,
+    };
+
+    let mut errors = Vec::new();
+    walk_custom_lookup(
+        &custom_type,
+        &Value::Unknown(UnknownReason::ForValue),
+        "vpc_id",
+        &|_, _| {
+            Err(TypeError::ValidationFailed {
+                message: "should never be called".to_string(),
+            })
+        },
+        &mut errors,
+    );
+    assert!(
+        errors.is_empty(),
+        "Value::Unknown must not invoke the custom validator, got: {errors:?}"
+    );
+}

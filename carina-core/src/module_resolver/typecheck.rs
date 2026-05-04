@@ -43,8 +43,8 @@ pub(super) fn check_type_match(
     config: &ProviderContext,
 ) -> TypeCheckResult {
     match type_expr {
-        // FunctionCall results are not known statically; defer validation
-        _ if matches!(value, Value::FunctionCall { .. }) => TypeCheckResult::Ok,
+        // Deferred-resolution values: type unknown at parse time.
+        _ if matches!(value, Value::FunctionCall { .. } | Value::Unknown(_)) => TypeCheckResult::Ok,
         TypeExpr::String => {
             if matches!(
                 value,

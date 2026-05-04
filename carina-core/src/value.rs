@@ -8,12 +8,8 @@ use indexmap::IndexMap;
 use crate::resource::{InterpolationPart, UnknownReason, Value};
 use crate::utils::{convert_enum_value, is_dsl_enum_format};
 
-/// Render an `UnknownReason` to its plan-display string. See RFC #2371.
-///
-/// `pub(crate)` because stage 2 only needs same-crate callers
-/// (`format_value_with_key`). Stage 3 promotes to `pub` when carina-cli's
-/// display layer migrates.
-pub(crate) fn render_unknown(reason: &UnknownReason) -> String {
+/// Render an `UnknownReason` to its plan-display string.
+pub fn render_unknown(reason: &UnknownReason) -> String {
     match reason {
         UnknownReason::UpstreamRef { path } => {
             format!("(known after upstream apply: {})", path.to_dot_string())

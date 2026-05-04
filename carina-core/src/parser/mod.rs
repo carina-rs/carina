@@ -17,11 +17,11 @@ mod types;
 mod util;
 
 pub use ast::{
-    ArgumentParameter, AttributeParameter, BackendConfig, DEFERRED_UPSTREAM_PLACEHOLDER,
-    DeferredForExpression, ExportParamLike, ExportParameter, File, FnParam, InferredExportParam,
-    InferredFile, ModuleCall, ParsedExportParam, ParsedFile, ProviderConfig, RequireBlock,
-    ResourceContext, ResourceTypePath, StateBlock, TypeExpr, UpstreamState, UseStatement,
-    UserFunction, UserFunctionBody, ValidateExpr, ValidationBlock,
+    ArgumentParameter, AttributeParameter, BackendConfig, DeferredForExpression, ExportParamLike,
+    ExportParameter, File, FnParam, InferredExportParam, InferredFile, ModuleCall,
+    ParsedExportParam, ParsedFile, ProviderConfig, RequireBlock, ResourceContext, ResourceTypePath,
+    StateBlock, TypeExpr, UpstreamState, UseStatement, UserFunction, UserFunctionBody,
+    ValidateExpr, ValidationBlock,
 };
 pub use config::{DecryptorFn, ProviderContext, ValidatorFn};
 pub use entry::{parse, parse_and_resolve};
@@ -36,7 +36,6 @@ pub use resolve::{
 pub(crate) use util::{eval_type_name, value_type_name};
 pub use util::{pascal_to_snake, snake_to_pascal};
 
-pub(crate) use ast::{DEFERRED_UPSTREAM_INDEX_PLACEHOLDER, DEFERRED_UPSTREAM_KEY_PLACEHOLDER};
 pub(crate) use blocks::module_call::parse_module_call;
 pub(crate) use blocks::resource::{
     parse_block_contents, parse_read_resource_expr, parse_resource_expr,
