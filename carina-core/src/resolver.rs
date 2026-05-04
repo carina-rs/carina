@@ -45,10 +45,10 @@ pub fn resolve_refs_with_state_and_remote(
 /// its export is absent. Behaves like
 /// [`resolve_refs_with_state_and_remote`], but any surviving
 /// `Value::ResourceRef` whose root binding is named in `remote_bindings`
-/// is replaced with a marker `Value::String` (built via
-/// `crate::parser::encode_unresolved_upstream_marker`) so plan display
-/// can render it as `(known after upstream apply: <ref>)` instead of the
-/// raw dot-form. `apply` continues to call the strict variant. See #2366.
+/// is replaced with `Value::Unknown(UnknownReason::UpstreamRef { path })`
+/// so plan display can render it as `(known after upstream apply: <ref>)`
+/// instead of the raw dot-form. `apply` continues to call the strict
+/// variant. See #2366 / RFC #2371.
 pub fn resolve_refs_for_plan(
     resources: &mut [Resource],
     current_states: &HashMap<ResourceId, State>,
@@ -112,10 +112,8 @@ fn stamp_unresolved_upstream(
     upstream_binding_names: &std::collections::HashSet<&str>,
 ) -> Value {
     match value {
-        Value::ResourceRef { ref path } if upstream_binding_names.contains(path.binding()) => {
-            Value::String(crate::parser::encode_unresolved_upstream_marker(
-                &path.to_dot_string(),
-            ))
+        Value::ResourceRef { path } if upstream_binding_names.contains(path.binding()) => {
+            Value::Unknown(crate::resource::UnknownReason::UpstreamRef { path })
         }
         Value::List(items) => Value::List(
             items
@@ -152,13 +150,9 @@ fn stamp_unresolved_upstream(
             *inner,
             upstream_binding_names,
         ))),
-        // Stage 2 (RFC #2371) replaces this whole function — the
-        // current `Value::String("\0upstream_unresolved:...")` output
-        // becomes `Value::Unknown(UnknownReason::UpstreamRef { ... })`.
-        // Until then no producer creates `Value::Unknown`.
-        Value::Unknown(_) => {
-            unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
-        }
+        // An already-stamped `Value::Unknown` (from an earlier pass)
+        // is passed through unchanged — it cannot be resolved further.
+        other @ Value::Unknown(_) => other,
         other => other,
     }
 }
@@ -308,11 +302,9 @@ pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<V
             let resolved_inner = resolve_ref_value(inner, bindings)?;
             Ok(Value::Secret(Box::new(resolved_inner)))
         }
-        // RFC #2371: stage 1 has no producer; stage 2 will route the
-        // `Value::Unknown` cases through this resolver explicitly.
-        Value::Unknown(_) => {
-            unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
-        }
+        // `Value::Unknown` is the result of stamping a previously-
+        // unresolved upstream ref; it cannot be resolved further.
+        Value::Unknown(_) => Ok(value.clone()),
         _ => Ok(value.clone()),
     }
 }
@@ -848,11 +840,11 @@ mod tests {
     }
 
     /// `resolve_refs_for_plan` stamps any surviving `ResourceRef` whose
-    /// root binding is in `remote_bindings.keys()` with the unresolved-
-    /// upstream marker. Plan display detects the marker via
-    /// `parser::decode_unresolved_upstream_marker`.
+    /// root binding is in `remote_bindings.keys()` as
+    /// `Value::Unknown(UnknownReason::UpstreamRef { path })`.
     #[test]
     fn test_resolve_refs_for_plan_stamps_top_level_unresolved_upstream() {
+        use crate::resource::UnknownReason;
         let mut resources = vec![make_resource(
             "web-sg",
             None,
@@ -871,12 +863,10 @@ mod tests {
         resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings).unwrap();
 
         match resources[0].get_attr("vpc_id") {
-            Some(Value::String(s)) => {
-                let payload = crate::parser::decode_unresolved_upstream_marker(s)
-                    .expect("expected marker prefix");
-                assert_eq!(payload, "network.vpc.vpc_id");
+            Some(Value::Unknown(UnknownReason::UpstreamRef { path })) => {
+                assert_eq!(path.to_dot_string(), "network.vpc.vpc_id");
             }
-            other => panic!("expected marker String, got {:?}", other),
+            other => panic!("expected Value::Unknown(UpstreamRef), got {:?}", other),
         }
     }
 
@@ -960,15 +950,12 @@ mod tests {
             Some(Value::List(items)) => {
                 assert_eq!(items.len(), 2);
                 for (idx, item) in items.iter().enumerate() {
-                    match item {
-                        Value::String(s) => assert!(
-                            crate::parser::decode_unresolved_upstream_marker(s).is_some(),
-                            "list[{}] should be marker String, got {:?}",
-                            idx,
-                            s
-                        ),
-                        other => panic!("list[{}] should be marker String, got {:?}", idx, other),
-                    }
+                    assert!(
+                        matches!(item, Value::Unknown(_)),
+                        "list[{}] should be Value::Unknown, got {:?}",
+                        idx,
+                        item
+                    );
                 }
             }
             other => panic!("expected List, got {:?}", other),
@@ -1028,12 +1015,8 @@ mod tests {
 
         match resources[0].get_attr("tags") {
             Some(Value::Map(m)) => match m.get("VpcId") {
-                Some(Value::String(s)) => assert!(
-                    crate::parser::decode_unresolved_upstream_marker(s).is_some(),
-                    "expected marker prefix, got {:?}",
-                    s
-                ),
-                other => panic!("nested entry should be marker String, got {:?}", other),
+                Some(Value::Unknown(_)) => {}
+                other => panic!("nested entry should be Value::Unknown, got {:?}", other),
             },
             other => panic!("expected Map, got {:?}", other),
         }

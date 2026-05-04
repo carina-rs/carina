@@ -546,3 +546,131 @@ fn module_and_provider_wrappers_return_vec_app_error() {
         "module_attribute_param_types: got {errors:?}",
     );
 }
+
+// ----- RFC #2371 stage 2 (#2377): strip-and-restore round trip -----
+
+#[test]
+fn strip_and_restore_unknown_attributes_round_trip() {
+    use carina_core::resource::{AccessPath, UnknownReason, Value};
+    use indexmap::IndexMap;
+
+    let mut r = carina_core::resource::Resource::new("test.t", "n");
+    let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
+    r.attributes
+        .insert("group_description".into(), Value::String("web".into()));
+    r.attributes.insert(
+        "vpc_id".into(),
+        Value::Unknown(UnknownReason::UpstreamRef { path: path.clone() }),
+    );
+    let mut tags: IndexMap<String, Value> = IndexMap::new();
+    tags.insert("Name".into(), Value::String("web-sg".into()));
+    r.attributes.insert("tags".into(), Value::Map(tags));
+    r.attributes.insert(
+        "nested_unknown".into(),
+        Value::List(vec![Value::Unknown(UnknownReason::UpstreamRef { path })]),
+    );
+    let mut resources = vec![r];
+    let order_before: Vec<String> = resources[0].attributes.keys().cloned().collect();
+
+    let stripped = super::strip_unknown_attributes(&mut resources);
+    // After strip: vpc_id and nested_unknown removed.
+    let after_strip: Vec<String> = resources[0].attributes.keys().cloned().collect();
+    assert_eq!(
+        after_strip,
+        vec!["group_description".to_string(), "tags".to_string()]
+    );
+    // Stripped record contains both attributes.
+    assert_eq!(stripped.len(), 1);
+    let entries = stripped.values().next().unwrap();
+    assert_eq!(entries.len(), 2);
+
+    super::restore_unknown_attributes(&mut resources, stripped);
+    let order_after: Vec<String> = resources[0].attributes.keys().cloned().collect();
+    assert_eq!(
+        order_after, order_before,
+        "restore must put attributes back at their original index"
+    );
+    // The restored Unknown values are still typed (not coerced to string).
+    assert!(matches!(
+        resources[0].get_attr("vpc_id"),
+        Some(Value::Unknown(_))
+    ));
+    match resources[0].get_attr("nested_unknown") {
+        Some(Value::List(items)) => {
+            assert!(matches!(items[0], Value::Unknown(_)));
+        }
+        other => panic!(
+            "nested_unknown should still be Value::List, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn value_contains_unknown_recurses() {
+    use carina_core::resource::{AccessPath, InterpolationPart, UnknownReason, Value};
+    let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
+    let unknown = || Value::Unknown(UnknownReason::UpstreamRef { path: path.clone() });
+
+    assert!(super::value_contains_unknown(&unknown()));
+    assert!(super::value_contains_unknown(&Value::List(vec![unknown()])));
+    assert!(super::value_contains_unknown(&Value::Map({
+        let mut m = indexmap::IndexMap::new();
+        m.insert("k".into(), unknown());
+        m
+    })));
+    assert!(super::value_contains_unknown(&Value::Interpolation(vec![
+        InterpolationPart::Expr(unknown()),
+    ])));
+    assert!(super::value_contains_unknown(&Value::FunctionCall {
+        name: "f".into(),
+        args: vec![unknown()],
+    }));
+    assert!(super::value_contains_unknown(&Value::Secret(Box::new(
+        unknown()
+    ))));
+
+    assert!(!super::value_contains_unknown(&Value::String("x".into())));
+    assert!(!super::value_contains_unknown(&Value::Int(1)));
+}
+
+#[test]
+fn restore_unknown_attributes_after_normalize_injection() {
+    // When `normalize_desired` injects new attributes between strip and
+    // restore, the originally-stripped Unknown attributes still land at
+    // their original `insert_index`; injected attributes end up
+    // trailing them. Verifies that `min(len)` clamping doesn't reorder
+    // the originals when the post-normalize map has different length.
+    use carina_core::resource::{AccessPath, UnknownReason, Value};
+
+    let mut r = carina_core::resource::Resource::new("test.t", "n");
+    let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
+    r.attributes
+        .insert("a".into(), Value::String("a-val".into()));
+    r.attributes.insert(
+        "b".into(),
+        Value::Unknown(UnknownReason::UpstreamRef { path: path.clone() }),
+    );
+    r.attributes
+        .insert("c".into(), Value::String("c-val".into()));
+    let mut resources = vec![r];
+
+    let stripped = super::strip_unknown_attributes(&mut resources);
+    // After strip: ["a", "c"]. Simulate normalize injecting "z".
+    resources[0]
+        .attributes
+        .insert("z".into(), Value::String("z-val".into()));
+    super::restore_unknown_attributes(&mut resources, stripped);
+
+    let order: Vec<String> = resources[0].attributes.keys().cloned().collect();
+    assert_eq!(
+        order,
+        vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "z".to_string()
+        ],
+        "originals must keep their indices; injected attrs trail them"
+    );
+}

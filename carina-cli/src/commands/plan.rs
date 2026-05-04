@@ -326,13 +326,10 @@ pub async fn run_plan(
         .collect();
 
     if json {
-        // Refuse to serialize a plan whose attributes contain stamped
-        // unresolved-upstream markers. The marker is plan-display only;
-        // letting it leak into JSON or `--out plan.json` would either
-        // confuse JSON consumers (NUL-prefixed sentinel) or — worse —
-        // round-trip through `apply --plan plan.json` and reach the
-        // provider as a literal string. Force the user to apply the
-        // upstreams first. See #2366.
+        // RFC #2371: `Value::Unknown` cannot be serialized (stage-2
+        // serialization-boundary panics + `#[serde(skip)]` on the
+        // variant). Detect it here so the user sees an actionable
+        // error instead of a panic backtrace.
         check_no_unresolved_upstream_in_plan(&ctx.plan)?;
         let plan_file = build_plan_file(path, &parsed, &state_file, &ctx);
         let json_str = serde_json::to_string_pretty(&plan_file)
@@ -366,9 +363,7 @@ pub async fn run_plan(
 
     // Save plan to file if --out was specified
     if let Some(out_path) = out {
-        // See `check_no_unresolved_upstream_in_plan` and the matching
-        // gate above the `--json` branch for why an unresolved-upstream
-        // marker must not be persisted (#2366).
+        // See the `--json` branch above for why this gate exists.
         check_no_unresolved_upstream_in_plan(&ctx.plan)?;
         let plan_file = build_plan_file(path, &parsed, &state_file, &ctx);
         let json_out = serde_json::to_string_pretty(&plan_file)
@@ -553,17 +548,17 @@ pub fn compute_export_diffs(
     changes
 }
 
-/// Refuse to persist a plan whose attributes carry the unresolved-
-/// upstream marker stamped by `resolve_refs_for_plan`. The marker is
-/// plan-display only; serializing it would either confuse JSON consumers
-/// (NUL-prefixed sentinel) or, via `apply --plan plan.json`, hand the
-/// literal sentinel to a provider as if it were a real attribute value.
-/// See #2366.
+/// Refuse to persist a plan whose attributes carry `Value::Unknown`
+/// (RFC #2371 stage 2). The serialization paths panic on Unknown by
+/// design (`#[serde(skip)]` + explicit `unimplemented!()` arms in
+/// `value_to_json` / `dsl_value_to_json` / `core_to_wit_value`); this
+/// check exists so the user sees an actionable "apply upstreams first"
+/// message instead of a panic backtrace from `--out` or `--json`.
 fn check_no_unresolved_upstream_in_plan(plan: &carina_core::plan::Plan) -> Result<(), AppError> {
     let mut offending: Vec<String> = plan
         .effects()
         .iter()
-        .filter_map(unresolved_marker_in_effect)
+        .filter_map(unresolved_upstream_ref_in_effect)
         .collect();
     if offending.is_empty() {
         return Ok(());
@@ -578,7 +573,7 @@ fn check_no_unresolved_upstream_in_plan(plan: &carina_core::plan::Plan) -> Resul
     )))
 }
 
-fn unresolved_marker_in_effect(effect: &Effect) -> Option<String> {
+fn unresolved_upstream_ref_in_effect(effect: &Effect) -> Option<String> {
     let mut resources: Vec<&Resource> = Vec::new();
     match effect {
         Effect::Read { resource } | Effect::Create(resource) => resources.push(resource),
@@ -589,11 +584,6 @@ fn unresolved_marker_in_effect(effect: &Effect) -> Option<String> {
             ..
         } => {
             resources.push(to);
-            // `cascading_updates[*].to` carries the dependent resource's
-            // full attribute map verbatim. A cascade-triggered dependent
-            // that itself references an unapplied upstream would
-            // otherwise round-trip the marker through the persisted
-            // plan (#2366 round-5 finding).
             for cu in cascading_updates {
                 resources.push(&cu.to);
             }
@@ -605,25 +595,27 @@ fn unresolved_marker_in_effect(effect: &Effect) -> Option<String> {
     }
     for resource in resources {
         for value in resource.attributes.values() {
-            if let Some(reference) = first_unresolved_marker(value) {
-                return Some(reference.to_string());
+            if let Some(reference) = first_unresolved_upstream_ref(value) {
+                return Some(reference);
             }
         }
     }
     None
 }
 
-fn first_unresolved_marker(value: &Value) -> Option<&str> {
+fn first_unresolved_upstream_ref(value: &Value) -> Option<String> {
+    use carina_core::resource::{InterpolationPart, UnknownReason};
     match value {
-        Value::String(s) => carina_core::parser::decode_unresolved_upstream_marker(s),
-        Value::List(items) => items.iter().find_map(first_unresolved_marker),
-        Value::Map(map) => map.values().find_map(first_unresolved_marker),
+        Value::Unknown(UnknownReason::UpstreamRef { path }) => Some(path.to_dot_string()),
+        Value::Unknown(_) => Some("for-expression placeholder".to_string()),
+        Value::List(items) => items.iter().find_map(first_unresolved_upstream_ref),
+        Value::Map(map) => map.values().find_map(first_unresolved_upstream_ref),
         Value::Interpolation(parts) => parts.iter().find_map(|p| match p {
-            carina_core::resource::InterpolationPart::Expr(v) => first_unresolved_marker(v),
+            InterpolationPart::Expr(v) => first_unresolved_upstream_ref(v),
             _ => None,
         }),
-        Value::FunctionCall { args, .. } => args.iter().find_map(first_unresolved_marker),
-        Value::Secret(inner) => first_unresolved_marker(inner),
+        Value::FunctionCall { args, .. } => args.iter().find_map(first_unresolved_upstream_ref),
+        Value::Secret(inner) => first_unresolved_upstream_ref(inner),
         _ => None,
     }
 }
@@ -1051,99 +1043,6 @@ exports { region: String = "ap-northeast-1" }"#,
 }
 
 #[cfg(test)]
-mod unresolved_marker_persistence_tests {
-    use super::*;
-    use carina_core::effect::Effect;
-    use carina_core::parser::encode_unresolved_upstream_marker;
-    use carina_core::plan::Plan;
-    use carina_core::resource::Resource;
-
-    fn make_plan_with(attrs: Vec<(&str, Value)>) -> Plan {
-        let mut r = Resource::new("test.resource", "name");
-        for (k, v) in attrs {
-            r.attributes.insert(k.to_string(), v);
-        }
-        let mut plan = Plan::new();
-        plan.add(Effect::Create(r));
-        plan
-    }
-
-    #[test]
-    fn check_no_unresolved_upstream_in_plan_passes_when_clean() {
-        let plan = make_plan_with(vec![("vpc_id", Value::String("vpc-123".to_string()))]);
-        assert!(check_no_unresolved_upstream_in_plan(&plan).is_ok());
-    }
-
-    #[test]
-    fn check_no_unresolved_upstream_in_plan_errors_on_top_level_marker() {
-        let plan = make_plan_with(vec![(
-            "vpc_id",
-            Value::String(encode_unresolved_upstream_marker("network.vpc.vpc_id")),
-        )]);
-        let err = check_no_unresolved_upstream_in_plan(&plan).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("network.vpc.vpc_id"), "got: {}", msg);
-        assert!(msg.contains("upstream"), "got: {}", msg);
-    }
-
-    #[test]
-    fn check_no_unresolved_upstream_in_plan_recurses_into_lists_and_maps() {
-        let inner = Value::String(encode_unresolved_upstream_marker("network.public_sg"));
-        let plan = make_plan_with(vec![(
-            "security_group_ids",
-            Value::List(vec![Value::String("sg-1".to_string()), inner]),
-        )]);
-        let err = check_no_unresolved_upstream_in_plan(&plan).unwrap_err();
-        assert!(
-            err.to_string().contains("network.public_sg"),
-            "got: {}",
-            err
-        );
-    }
-
-    /// `Effect::Replace::cascading_updates[*].to` carries the dependent
-    /// resource's full attribute map. A cascade dependent that references
-    /// an unapplied upstream must also block plan persistence (#2366).
-    #[test]
-    fn check_no_unresolved_upstream_in_plan_scans_replace_cascading_updates() {
-        use carina_core::effect::CascadingUpdate;
-        use carina_core::resource::{LifecycleConfig, State};
-
-        let mut top = Resource::new("test.resource", "primary");
-        top.attributes
-            .insert("name".to_string(), Value::String("clean".to_string()));
-        let top_id = top.id.clone();
-
-        let mut dep = Resource::new("test.resource", "dependent");
-        dep.attributes.insert(
-            "vpc_id".to_string(),
-            Value::String(encode_unresolved_upstream_marker("network.vpc_id")),
-        );
-        let dep_id = dep.id.clone();
-        let cascade = CascadingUpdate {
-            id: dep_id.clone(),
-            from: Box::new(State::not_found(dep_id)),
-            to: dep,
-        };
-
-        let mut plan = Plan::new();
-        plan.add(Effect::Replace {
-            id: top_id.clone(),
-            from: Box::new(State::not_found(top_id)),
-            to: top,
-            lifecycle: LifecycleConfig::default(),
-            changed_create_only: Vec::new(),
-            cascading_updates: vec![cascade],
-            temporary_name: None,
-            cascade_ref_hints: Vec::new(),
-        });
-
-        let err = check_no_unresolved_upstream_in_plan(&plan).unwrap_err();
-        assert!(err.to_string().contains("network.vpc_id"), "got: {}", err);
-    }
-}
-
-#[cfg(test)]
 mod export_diff_tests {
     use super::*;
     use carina_core::parser::{InferredExportParam, TypeExpr};
@@ -1208,5 +1107,132 @@ mod export_diff_tests {
         assert_eq!(changes[0].name(), "added");
         assert_eq!(changes[1].name(), "modified");
         assert_eq!(changes[2].name(), "removed");
+    }
+}
+
+#[cfg(test)]
+mod check_no_unresolved_upstream_in_plan_tests {
+    use super::*;
+    use carina_core::effect::{CascadingUpdate, Effect};
+    use carina_core::plan::Plan;
+    use carina_core::resource::{
+        AccessPath, LifecycleConfig, Resource, ResourceId, State, UnknownReason, Value,
+    };
+
+    fn unknown_value() -> Value {
+        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
+        Value::Unknown(UnknownReason::UpstreamRef { path })
+    }
+
+    fn make_plan_with(attrs: Vec<(&str, Value)>) -> Plan {
+        let mut r = Resource::new("test.resource", "name");
+        for (k, v) in attrs {
+            r.attributes.insert(k.to_string(), v);
+        }
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(r));
+        plan
+    }
+
+    #[test]
+    fn passes_when_clean() {
+        let plan = make_plan_with(vec![("vpc_id", Value::String("vpc-123".into()))]);
+        assert!(check_no_unresolved_upstream_in_plan(&plan).is_ok());
+    }
+
+    #[test]
+    fn errors_on_top_level_unknown() {
+        let plan = make_plan_with(vec![("vpc_id", unknown_value())]);
+        let err = check_no_unresolved_upstream_in_plan(&plan).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("network.vpc.vpc_id"), "got: {}", msg);
+        assert!(msg.contains("upstream"), "got: {}", msg);
+    }
+
+    #[test]
+    fn errors_on_unknown_inside_list_or_map() {
+        let plan = make_plan_with(vec![(
+            "tags",
+            Value::List(vec![Value::String("a".into()), unknown_value()]),
+        )]);
+        assert!(check_no_unresolved_upstream_in_plan(&plan).is_err());
+
+        let mut m: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
+        m.insert("Name".into(), unknown_value());
+        let plan = make_plan_with(vec![("tags", Value::Map(m))]);
+        assert!(check_no_unresolved_upstream_in_plan(&plan).is_err());
+    }
+
+    /// Cascade dependents of a Replace also carry attribute maps that
+    /// must be checked — a dependent referencing an unapplied upstream
+    /// must block plan persistence.
+    #[test]
+    fn errors_on_unknown_in_cascading_update() {
+        let mut top = Resource::new("test.resource", "primary");
+        top.attributes
+            .insert("name".into(), Value::String("clean".into()));
+        let top_id = top.id.clone();
+
+        let mut dep = Resource::new("test.resource", "dependent");
+        dep.attributes.insert("vpc_id".into(), unknown_value());
+        let dep_id = dep.id.clone();
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Replace {
+            id: top_id.clone(),
+            from: Box::new(State::not_found(top_id)),
+            to: top,
+            lifecycle: LifecycleConfig::default(),
+            changed_create_only: Vec::new(),
+            cascading_updates: vec![CascadingUpdate {
+                id: dep_id.clone(),
+                from: Box::new(State::not_found(dep_id)),
+                to: dep,
+            }],
+            temporary_name: None,
+            cascade_ref_hints: Vec::new(),
+        });
+        assert!(check_no_unresolved_upstream_in_plan(&plan).is_err());
+    }
+
+    /// Delete / Import / Remove / Move effects do not carry attribute
+    /// maps that need checking; they must be skipped silently.
+    #[test]
+    fn delete_import_remove_move_effects_are_skipped() {
+        let id = ResourceId::new("test", "name");
+        let mut plan = Plan::new();
+        plan.add(Effect::Delete {
+            id: id.clone(),
+            identifier: "x".into(),
+            lifecycle: LifecycleConfig::default(),
+            binding: None,
+            dependencies: std::collections::HashSet::new(),
+        });
+        plan.add(Effect::Import {
+            id: id.clone(),
+            identifier: "x".into(),
+        });
+        plan.add(Effect::Remove { id: id.clone() });
+        plan.add(Effect::Move {
+            from: id.clone(),
+            to: id,
+        });
+        assert!(check_no_unresolved_upstream_in_plan(&plan).is_ok());
+    }
+
+    /// Multiple effects with the same Unknown ref dedup in the message.
+    #[test]
+    fn dedup_same_reference_across_effects() {
+        let mut plan = Plan::new();
+        for n in ["a", "b"] {
+            let mut r = Resource::new("test.resource", n);
+            r.attributes.insert("vpc_id".into(), unknown_value());
+            plan.add(Effect::Create(r));
+        }
+        let err = check_no_unresolved_upstream_in_plan(&plan).unwrap_err();
+        let msg = err.to_string();
+        // The reference should appear only once in the comma-separated list.
+        let count = msg.matches("network.vpc.vpc_id").count();
+        assert_eq!(count, 1, "ref must dedup, got: {}", msg);
     }
 }

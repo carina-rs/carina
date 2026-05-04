@@ -307,7 +307,7 @@ impl std::fmt::Display for AccessPath {
 }
 
 /// Attribute value of a resource
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Value {
     String(String),
     Int(i64),
@@ -340,6 +340,17 @@ pub enum Value {
     Secret(Box<Value>),
     /// A value not known at plan time. Plan-display only — must never
     /// reach `apply`, state files, or provider plugins. See RFC #2371.
+    ///
+    /// `#[serde(skip)]` blocks both serialization (returns `Err`) and
+    /// deserialization (the variant is unreachable from any JSON input).
+    /// This is the type-system enforcement of RFC constraints b and c:
+    /// even a hand-edited state/plan file cannot resurrect a
+    /// `Value::Unknown` and route it past the explicit `unimplemented!()`
+    /// guards in `value_to_json` / `dsl_value_to_json` /
+    /// `core_to_wit_value`. Stage 4 may further tighten by replacing
+    /// the panics with `Result::Err`, but the deserialization seal
+    /// already covers the round-trip attack surface today.
+    #[serde(skip)]
     Unknown(UnknownReason),
 }
 
@@ -373,6 +384,36 @@ pub enum InterpolationPart {
     Literal(String),
     /// An expression to be evaluated and converted to string
     Expr(Value),
+}
+
+/// `PartialEq` for `Value` is hand-rolled (not derived) to enforce one
+/// invariant the differ depends on: **`Value::Unknown` is never equal
+/// to anything**, including another `Value::Unknown` with the same
+/// reason. An unresolved value is, by definition, unknown — two
+/// independently-unresolved attributes are not the "same value", so a
+/// derived `PartialEq` would silently suppress real diffs in
+/// `merge_lists_hashed` and `semantically_equal`. See RFC #2371.
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            // Constraint: Unknown is never equal to anything.
+            (Value::Unknown(_), _) | (_, Value::Unknown(_)) => false,
+            (Value::String(a), Value::String(b)) => a == b,
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::List(a), Value::List(b)) => a == b,
+            (Value::Map(a), Value::Map(b)) => a == b,
+            (Value::ResourceRef { path: a }, Value::ResourceRef { path: b }) => a == b,
+            (Value::Interpolation(a), Value::Interpolation(b)) => a == b,
+            (
+                Value::FunctionCall { name: an, args: aa },
+                Value::FunctionCall { name: bn, args: ba },
+            ) => an == bn && aa == ba,
+            (Value::Secret(a), Value::Secret(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 /// Body of `Value::canonicalize_in_place` for the `Interpolation` arm:
@@ -555,9 +596,12 @@ impl Value {
             }
             Value::Secret(inner) => inner.visit_refs(f),
             Value::String(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_) => {}
-            Value::Unknown(_) => {
-                unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
-            }
+            // `Value::Unknown` is what a previously-unresolved
+            // `ResourceRef` was *replaced with* by `stamp_unresolved_upstream`.
+            // It carries an `AccessPath` for display, but it is no longer
+            // a live reference to walk — dependency analysis happens
+            // upstream of the stamping pass.
+            Value::Unknown(_) => {}
         }
     }
 }
@@ -669,13 +713,27 @@ impl Value {
             Value::Secret(inner) => {
                 inner.hash_into(hasher);
             }
-            // Stage 2 must replace this with deterministic hashing before
-            // any producer ships — `merge_lists_hashed` calls
-            // `canonical_hash` → `hash_into`, so a `Value::Unknown` inside
-            // a list element would panic before the planned plan/apply
-            // boundary checks land in stage 4 (RFC #2371).
-            Value::Unknown(_) => {
-                unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
+            Value::Unknown(reason) => {
+                // `Value::Unknown` reaches `merge_lists_hashed` → this
+                // function whenever a list element is unresolved. Hash
+                // deterministically: the outer `discriminant(self)`
+                // already separates `Unknown` from concrete variants;
+                // here we add the reason discriminant + payload so two
+                // structurally-identical `Unknown`s produce the same
+                // hash. Note: `PartialEq for Value` still returns
+                // `false` between any two `Unknown`s (RFC #2371) — the
+                // `a == b ⇒ hash(a) == hash(b)` precondition only
+                // matters between concrete values.
+                std::mem::discriminant(reason).hash(hasher);
+                match reason {
+                    // Reuse `AccessPath`'s native `Hash` impl (matches
+                    // the `ResourceRef` arm above) — no per-call String
+                    // allocation.
+                    UnknownReason::UpstreamRef { path } => path.hash(hasher),
+                    // `For{Key,Index,Value}` carry no payload; the
+                    // discriminant alone already distinguishes them.
+                    UnknownReason::ForKey | UnknownReason::ForIndex | UnknownReason::ForValue => {}
+                }
             }
         }
     }

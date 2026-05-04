@@ -1012,3 +1012,109 @@ fn canonicalize_is_idempotent() {
         assert_eq!(once, twice, "canonicalize must be idempotent for {:?}", v);
     }
 }
+
+// ----- RFC #2371 stage 2 (#2377): Value::Unknown semantics -----
+
+#[test]
+fn unknown_never_equals_unknown() {
+    // Two Value::Unknown must compare unequal even when their reasons
+    // are identical — an unknown value is, by definition, not equal to
+    // anything (including itself). Without this, the differ would
+    // suppress real diffs between two attributes that both happen to
+    // be "unresolved upstream" of the same binding.
+    let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
+    let a = Value::Unknown(UnknownReason::UpstreamRef { path: path.clone() });
+    let b = Value::Unknown(UnknownReason::UpstreamRef { path });
+    assert_ne!(a, b, "two `Value::Unknown`s must never compare equal");
+}
+
+#[test]
+fn unknown_never_equals_concrete() {
+    let a = Value::Unknown(UnknownReason::ForKey);
+    let b = Value::String("anything".into());
+    assert_ne!(a, b);
+    assert_ne!(b, a);
+}
+
+#[test]
+fn unknown_for_variants_never_equal() {
+    assert_ne!(
+        Value::Unknown(UnknownReason::ForKey),
+        Value::Unknown(UnknownReason::ForKey)
+    );
+    assert_ne!(
+        Value::Unknown(UnknownReason::ForIndex),
+        Value::Unknown(UnknownReason::ForValue)
+    );
+}
+
+#[test]
+fn unknown_hash_is_deterministic_per_path() {
+    use std::hash::Hasher;
+    fn hash_of(v: &Value) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        v.hash_into(&mut h);
+        h.finish()
+    }
+    let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
+    let a = Value::Unknown(UnknownReason::UpstreamRef { path: path.clone() });
+    let b = Value::Unknown(UnknownReason::UpstreamRef { path });
+    assert_eq!(
+        hash_of(&a),
+        hash_of(&b),
+        "same UpstreamRef path must hash to the same value"
+    );
+}
+
+#[test]
+fn unknown_hash_differs_per_path() {
+    use std::hash::Hasher;
+    fn hash_of(v: &Value) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        v.hash_into(&mut h);
+        h.finish()
+    }
+    let p1 = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
+    let p2 = AccessPath::with_fields("network", "vpc", vec!["cidr_block".into()]);
+    let a = Value::Unknown(UnknownReason::UpstreamRef { path: p1 });
+    let b = Value::Unknown(UnknownReason::UpstreamRef { path: p2 });
+    assert_ne!(hash_of(&a), hash_of(&b));
+}
+
+#[test]
+fn unknown_hash_does_not_panic_for_for_variants() {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    Value::Unknown(UnknownReason::ForKey).hash_into(&mut h);
+    Value::Unknown(UnknownReason::ForIndex).hash_into(&mut h);
+    Value::Unknown(UnknownReason::ForValue).hash_into(&mut h);
+    let _ = h.finish();
+}
+
+#[test]
+fn unknown_cannot_round_trip_through_serde_json() {
+    // RFC #2371 constraint c: `Value::Unknown` must never reach state
+    // files / plan files / providers. The variant has `#[serde(skip)]`
+    // so attempting to serialize it returns Err — even a hand-edited
+    // JSON cannot resurrect the variant via deserialization.
+    let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
+    let v = Value::Unknown(UnknownReason::UpstreamRef { path });
+
+    // Serialization must fail.
+    let r = serde_json::to_string(&v);
+    assert!(
+        r.is_err(),
+        "serializing Value::Unknown must error, got Ok({:?})",
+        r
+    );
+
+    // Deserialization of `{"Unknown": {...}}` must fail (the variant is
+    // effectively absent from the externally-tagged enum).
+    let payload = r#"{"Unknown":{"UpstreamRef":{"path":{"binding":"x","attribute":"y","field_path":[],"subscripts":[]}}}}"#;
+    let r: Result<Value, _> = serde_json::from_str(payload);
+    assert!(
+        r.is_err(),
+        "deserializing Value::Unknown must error, got Ok({:?})",
+        r
+    );
+}
