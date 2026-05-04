@@ -24,9 +24,7 @@ use carina_core::provider::{
     BoxFuture, Provider, ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult,
     SavedAttrs,
 };
-use carina_core::resource::{
-    LifecycleConfig, Resource, ResourceId, State, Value, contains_resource_ref,
-};
+use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use carina_core::schema::{CompletionValue, ResourceSchema};
 use carina_core::value::SerializationError;
 
@@ -43,13 +41,17 @@ fn early_provider_err<T: 'static>(e: SerializationError) -> BoxFuture<'static, P
     Box::pin(async move { Err(ProviderError::new(msg)) })
 }
 
-/// Unwrap a `core_to_wit_*` result that **must** succeed by invariant
-/// (state/saved attrs are post-apply concrete values; normalize_desired
-/// runs after `PlanPreprocessor::strip_unknown_attributes`). Embeds the
-/// failing `SerializationError` in the panic message so a stripping-pass
-/// regression surfaces with the actual `UnknownReason` + context.
-fn expect_no_unknown<T>(r: Result<T, SerializationError>, what: &'static str) -> T {
-    r.unwrap_or_else(|e| panic!("{what} must not see Value::Unknown ({e})"))
+/// Unwrap a `core_to_wit_*` result that **must** succeed by invariant.
+/// `core_to_wit_*` rejects every `Value` variant the WASM provider
+/// boundary cannot serialize — `Unknown`, `ResourceRef`,
+/// `Interpolation`, and `FunctionCall`. State and saved attrs are
+/// post-apply concrete values, and `normalize_desired` runs after
+/// `PlanPreprocessor::prepare`'s strip-and-restore pass, so reaching
+/// any of these arms is a producer-side bug. Embeds the failing
+/// `SerializationError` in the panic message so the regression
+/// surfaces with the actual variant + context.
+fn expect_unresolvable_absent<T>(r: Result<T, SerializationError>, what: &'static str) -> T {
+    r.unwrap_or_else(|e| panic!("{what} must not see an unserializable Value ({e})"))
 }
 
 // -- HTTP allow-list hooks --
@@ -1512,7 +1514,7 @@ unsafe impl Sync for WasmProviderNormalizer {}
 
 impl ProviderNormalizer for WasmProviderNormalizer {
     fn normalize_desired(&self, resources: &mut [Resource]) {
-        let wit_resources: Vec<_> = expect_no_unknown(
+        let wit_resources: Vec<_> = expect_unresolvable_absent(
             resources
                 .iter()
                 .map(wasm_convert::core_to_wit_resource)
@@ -1533,19 +1535,16 @@ impl ProviderNormalizer for WasmProviderNormalizer {
 
         match result {
             Ok(result) => {
+                // `PlanPreprocessor::prepare` strips every attribute that
+                // recursively contains `Value::ResourceRef` (alongside
+                // `Value::Unknown`) before this normalizer runs and
+                // restores them afterwards (#2387), so we can blindly
+                // accept everything the WASM normalizer returns — the
+                // pre-#2387 `contains_resource_ref` overwrite-skip
+                // workaround is no longer reachable.
                 for (core_res, wit_res) in resources.iter_mut().zip(result.iter()) {
                     let resolved = wasm_convert::wit_to_core_value_map(&wit_res.attributes);
                     for (key, value) in resolved {
-                        // Skip attributes whose original value contains a ResourceRef.
-                        // The WIT roundtrip converts ResourceRef to a debug string
-                        // (e.g., "ResourceRef { path: ... }") because the WIT Value type
-                        // has no ResourceRef variant. Overwriting would destroy the ref
-                        // and prevent resolution at apply time.
-                        if let Some(original) = core_res.attributes.get(&key)
-                            && contains_resource_ref(original)
-                        {
-                            continue;
-                        }
                         core_res.attributes.insert(key, value);
                     }
                 }
@@ -1558,8 +1557,10 @@ impl ProviderNormalizer for WasmProviderNormalizer {
         let wit_states: Vec<(String, _)> = current_states
             .iter()
             .map(|(id, state)| {
-                let wit =
-                    expect_no_unknown(wasm_convert::core_to_wit_state(state), "normalize_state");
+                let wit = expect_unresolvable_absent(
+                    wasm_convert::core_to_wit_state(state),
+                    "normalize_state",
+                );
                 (id.to_string(), wit)
             })
             .collect();
@@ -1597,7 +1598,7 @@ impl ProviderNormalizer for WasmProviderNormalizer {
         let wit_states: Vec<(String, _)> = current_states
             .iter()
             .map(|(id, state)| {
-                let wit = expect_no_unknown(
+                let wit = expect_unresolvable_absent(
                     wasm_convert::core_to_wit_state(state),
                     "hydrate_read_state (current_states)",
                 );
@@ -1608,7 +1609,7 @@ impl ProviderNormalizer for WasmProviderNormalizer {
         let wit_saved: Vec<(String, Vec<(String, _)>)> = saved_attrs
             .iter()
             .map(|(id, attrs)| {
-                let wit = expect_no_unknown(
+                let wit = expect_unresolvable_absent(
                     wasm_convert::core_to_wit_value_map(attrs),
                     "hydrate_read_state (saved_attrs)",
                 );

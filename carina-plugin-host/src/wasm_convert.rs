@@ -23,19 +23,21 @@ use crate::wasm_bindings::carina::provider::types as wit;
 /// List and Map values are serialized to JSON strings because WIT does
 /// not support recursive types.
 ///
-/// Returns `Err(SerializationError)` for `Value::Unknown` —
-/// `PlanPreprocessor::strip_unknown_attributes` must remove it before
-/// reaching this boundary.
+/// Returns `Err(SerializationError)` for `Value::Unknown`,
+/// `Value::ResourceRef`, `Value::Interpolation`, and
+/// `Value::FunctionCall`. The plan-time pipeline strips every attribute
+/// that recursively contains one of these via
+/// `PlanPreprocessor::prepare`'s strip-and-restore pass, so reaching
+/// any of these arms is a producer-side bug — the diagnostic identifies
+/// which variant leaked. See RFC #2371 stage 2 (#2378) for `Unknown`
+/// and #2387 for `ResourceRef` / `Interpolation` / `FunctionCall`.
 ///
-/// `ResourceRef`, `Interpolation`, `FunctionCall`, and `Secret` variants
-/// fall back to `format!("{v:?}")`. The fallback is *intentional* for
-/// managed-to-managed refs (e.g. `admins.group_id`) — those genuinely
-/// arrive unresolved at plan time and get resolved by the executor at
-/// apply time. Data source refs are resolved during refresh phase 2
-/// (#1683). The asymmetry with `Value::Unknown` (which is stripped
-/// before this point) is tracked by #2387 — extending the strip-and-
-/// restore pass to `ResourceRef` will let this fallback become an
-/// `UnresolvedResourceRef` Err too.
+/// `Value::Secret` still falls back to debug format here because the
+/// WASM provider needs to receive the *value* (so a creator like
+/// `aws.iam.User` can pass a generated password to the cloud API). The
+/// strip pass takes secrets-of-refs out of this path; a plain
+/// `Secret(String)` reaches the boundary intentionally. Tightening the
+/// secret path is out of scope for #2387.
 pub fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, SerializationError> {
     match v {
         CoreValue::String(s) => Ok(wit::Value::StrVal(s.clone())),
@@ -62,11 +64,20 @@ pub fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, SerializationError
             reason: reason.clone(),
             context: SerializationContext::WasmBoundary,
         }),
-        // Managed-to-managed refs (e.g. `admins.group_id`) are expected
-        // here at plan time — they get resolved at apply time by the
-        // executor. Data source refs should have been resolved during
-        // refresh phase 2 (#1683).
-        _ => Ok(wit::Value::StrVal(format!("{v:?}"))),
+        CoreValue::ResourceRef { path } => Err(SerializationError::UnresolvedResourceRef {
+            path: path.to_dot_string(),
+            context: SerializationContext::WasmBoundary,
+        }),
+        CoreValue::Interpolation(_) => Err(SerializationError::UnresolvedInterpolation {
+            context: SerializationContext::WasmBoundary,
+        }),
+        CoreValue::FunctionCall { name, .. } => Err(SerializationError::UnresolvedFunctionCall {
+            name: name.clone(),
+            context: SerializationContext::WasmBoundary,
+        }),
+        // `Value::Secret(inner)` is expected at the WASM boundary for
+        // plain secret values — see the function doc for scope.
+        CoreValue::Secret(_) => Ok(wit::Value::StrVal(format!("{v:?}"))),
     }
 }
 
@@ -95,10 +106,9 @@ pub fn wit_to_core_value(v: &wit::Value) -> CoreValue {
 
 /// Helper: convert a core Value to a serde_json::Value for JSON
 /// encoding inside the WIT-string fallback for List/Map. Returns
-/// `Err` for `Value::Unknown`; falls back to `format!("{v:?}")` for
-/// `ResourceRef`/`Interpolation`/`FunctionCall`/`Secret` for the same
-/// reason as `core_to_wit_value` — see that function's doc and #2387
-/// for the planned tightening.
+/// `Err` for the same set of variants as `core_to_wit_value` — see
+/// that function's doc for the rationale and the strip-and-restore
+/// pass that keeps these arms unreachable in legitimate flows.
 fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationError> {
     match v {
         CoreValue::String(s) => Ok(serde_json::Value::String(s.clone())),
@@ -122,7 +132,18 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
             reason: reason.clone(),
             context: SerializationContext::WasmBoundary,
         }),
-        _ => Ok(serde_json::Value::String(format!("{v:?}"))),
+        CoreValue::ResourceRef { path } => Err(SerializationError::UnresolvedResourceRef {
+            path: path.to_dot_string(),
+            context: SerializationContext::WasmBoundary,
+        }),
+        CoreValue::Interpolation(_) => Err(SerializationError::UnresolvedInterpolation {
+            context: SerializationContext::WasmBoundary,
+        }),
+        CoreValue::FunctionCall { name, .. } => Err(SerializationError::UnresolvedFunctionCall {
+            name: name.clone(),
+            context: SerializationContext::WasmBoundary,
+        }),
+        CoreValue::Secret(_) => Ok(serde_json::Value::String(format!("{v:?}"))),
     }
 }
 
@@ -579,19 +600,81 @@ mod tests {
         assert_eq!(core, back);
     }
 
-    /// Unresolved `ResourceRef` falls back to debug format (#1687).
-    /// Managed-to-managed refs reach `core_to_wit_value` at plan time
-    /// via `normalize_desired` — they get resolved later by the executor.
+    /// #2387: `Value::ResourceRef` reaching `core_to_wit_value` is a
+    /// stage-2 invariant violation now — the strip-and-restore pass in
+    /// `PlanPreprocessor::prepare` removes any attribute that
+    /// recursively contains a `ResourceRef` before this boundary. The
+    /// converter returns `Err(UnresolvedResourceRef)` so a regression
+    /// surfaces as a typed error at the call site instead of a
+    /// debug-format string silently flowing into the provider.
     #[test]
-    fn core_to_wit_value_resource_ref_produces_debug_string() {
+    fn resource_ref_returns_err_in_core_to_wit_value() {
         use carina_core::resource::AccessPath;
-        let v = CoreValue::ResourceRef {
-            path: AccessPath::new("sso", "identity_store_id"),
+        let path = AccessPath::new("sso", "identity_store_id");
+        let v = CoreValue::ResourceRef { path: path.clone() };
+        let err = core_to_wit_value(&v).unwrap_err();
+        match err {
+            SerializationError::UnresolvedResourceRef {
+                path: p,
+                context: SerializationContext::WasmBoundary,
+            } => assert_eq!(p, path.to_dot_string()),
+            other => panic!("expected UnresolvedResourceRef/WasmBoundary, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpolation_returns_err_in_core_to_wit_value() {
+        use carina_core::resource::{AccessPath, InterpolationPart};
+        let v = CoreValue::Interpolation(vec![
+            InterpolationPart::Literal("prefix-".into()),
+            InterpolationPart::Expr(CoreValue::ResourceRef {
+                path: AccessPath::new("vpc", "id"),
+            }),
+        ]);
+        let err = core_to_wit_value(&v).unwrap_err();
+        assert!(matches!(
+            err,
+            SerializationError::UnresolvedInterpolation {
+                context: SerializationContext::WasmBoundary,
+            }
+        ));
+    }
+
+    #[test]
+    fn function_call_returns_err_in_core_to_wit_value() {
+        use carina_core::resource::AccessPath;
+        let v = CoreValue::FunctionCall {
+            name: "join".into(),
+            args: vec![
+                CoreValue::String("-".into()),
+                CoreValue::ResourceRef {
+                    path: AccessPath::new("vpc", "id"),
+                },
+            ],
         };
-        let wit::Value::StrVal(s) = core_to_wit_value(&v).unwrap() else {
-            panic!("expected StrVal");
-        };
-        assert!(s.contains("ResourceRef"), "expected debug format, got: {s}");
+        let err = core_to_wit_value(&v).unwrap_err();
+        match err {
+            SerializationError::UnresolvedFunctionCall {
+                name,
+                context: SerializationContext::WasmBoundary,
+            } => assert_eq!(name, "join"),
+            other => panic!("expected UnresolvedFunctionCall/WasmBoundary, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resource_ref_returns_err_in_core_value_to_json() {
+        use carina_core::resource::AccessPath;
+        let path = AccessPath::new("sso", "identity_store_id");
+        let v = CoreValue::ResourceRef { path: path.clone() };
+        let err = core_value_to_json(&v).unwrap_err();
+        assert!(matches!(
+            err,
+            SerializationError::UnresolvedResourceRef {
+                context: SerializationContext::WasmBoundary,
+                ..
+            }
+        ));
     }
 
     // -- ResourceId roundtrip --
