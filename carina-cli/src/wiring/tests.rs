@@ -674,3 +674,66 @@ fn restore_unknown_attributes_after_normalize_injection() {
         "originals must keep their indices; injected attrs trail them"
     );
 }
+
+#[test]
+fn strip_and_restore_for_expression_unknowns_round_trip() {
+    // The strip-and-restore helpers must cover every `UnknownReason`
+    // variant — the WASM provider boundary must never see a
+    // `Value::Unknown` of any reason.
+    use carina_core::resource::{UnknownReason, Value};
+
+    let mut r = carina_core::resource::Resource::new("test.t", "n");
+    r.attributes
+        .insert("name".into(), Value::String("static".into()));
+    r.attributes
+        .insert("target_id".into(), Value::Unknown(UnknownReason::ForValue));
+    r.attributes.insert(
+        "items".into(),
+        Value::List(vec![Value::Unknown(UnknownReason::ForKey)]),
+    );
+    r.attributes
+        .insert("index".into(), Value::Unknown(UnknownReason::ForIndex));
+    let mut resources = vec![r];
+    let order_before: Vec<String> = resources[0].attributes.keys().cloned().collect();
+
+    let stripped = super::strip_unknown_attributes(&mut resources);
+    let after_strip: Vec<String> = resources[0].attributes.keys().cloned().collect();
+    assert_eq!(
+        after_strip,
+        vec!["name".to_string()],
+        "all three for-expression Unknown attributes must be stripped"
+    );
+    assert_eq!(stripped.values().next().unwrap().len(), 3);
+
+    super::restore_unknown_attributes(&mut resources, stripped);
+    let order_after: Vec<String> = resources[0].attributes.keys().cloned().collect();
+    assert_eq!(
+        order_after, order_before,
+        "for-expression Unknowns must be restored at their original indices"
+    );
+    assert!(matches!(
+        resources[0].get_attr("target_id"),
+        Some(Value::Unknown(UnknownReason::ForValue))
+    ));
+    assert!(matches!(
+        resources[0].get_attr("index"),
+        Some(Value::Unknown(UnknownReason::ForIndex))
+    ));
+}
+
+#[test]
+fn value_contains_unknown_covers_for_variants() {
+    use carina_core::resource::{UnknownReason, Value};
+    assert!(super::value_contains_unknown(&Value::Unknown(
+        UnknownReason::ForValue
+    )));
+    assert!(super::value_contains_unknown(&Value::Unknown(
+        UnknownReason::ForKey
+    )));
+    assert!(super::value_contains_unknown(&Value::Unknown(
+        UnknownReason::ForIndex
+    )));
+    assert!(super::value_contains_unknown(&Value::List(vec![
+        Value::Unknown(UnknownReason::ForValue),
+    ])));
+}

@@ -11,7 +11,6 @@ use carina_core::diff_helpers::compute_map_diff;
 #[cfg(test)]
 use carina_core::effect::CascadingUpdate;
 use carina_core::effect::Effect;
-use carina_core::parser::DEFERRED_UPSTREAM_PLACEHOLDER;
 use carina_core::plan::Plan;
 #[cfg(test)]
 use carina_core::plan_tree::shorten_attr_name;
@@ -51,11 +50,19 @@ fn format_compact_name(
 }
 
 /// Format a value in a deferred for-expression template.
-/// Placeholder strings are shown dimmed; resolved values are shown normally.
+/// Placeholder values (`Value::Unknown`) are shown dimmed; resolved
+/// values are shown normally.
 fn format_deferred_value(value: &Value) -> String {
+    /// Catch-all placeholder text for value variants whose contents
+    /// cannot be sensibly inlined into a deferred-for template
+    /// (e.g. `Interpolation`, `FunctionCall`, `Secret`). The wording
+    /// matches `render_unknown(ForValue)` so display stays uniform
+    /// across the deferred and resolved-Unknown paths.
+    const DEFERRED_FALLBACK: &str = "(known after upstream apply)";
+
     match value {
-        Value::String(s) if s == DEFERRED_UPSTREAM_PLACEHOLDER => {
-            format!("{}", s.dimmed())
+        Value::Unknown(reason) => {
+            format!("{}", carina_core::value::render_unknown(reason).dimmed())
         }
         Value::String(s) => format!("'{}'", s),
         Value::Int(i) => i.to_string(),
@@ -73,7 +80,7 @@ fn format_deferred_value(value: &Value) -> String {
                 .collect();
             format!("{{{}}}", formatted.join(", "))
         }
-        _ => format!("{}", DEFERRED_UPSTREAM_PLACEHOLDER.dimmed()),
+        _ => format!("{}", DEFERRED_FALLBACK.dimmed()),
     }
 }
 

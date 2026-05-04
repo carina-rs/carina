@@ -87,14 +87,16 @@ fn walk_custom_lookup(
     lookup: CustomTypeLookup<'_>,
     errors: &mut Vec<TypeError>,
 ) {
-    // Values that resolve at runtime are skipped — the same convention
-    // the schema-attached `validate` closure follows.
+    // Skip deferred-resolution values — same convention as
+    // `AttributeType::validate`, plus `ResourceRef` / `Interpolation`
+    // which only resolve to a concrete string at apply time.
     if matches!(
         value,
         Value::FunctionCall { .. }
             | Value::Secret(_)
             | Value::ResourceRef { .. }
             | Value::Interpolation(_)
+            | Value::Unknown(_)
     ) {
         return;
     }
@@ -487,8 +489,12 @@ impl AttributeType {
     /// value (or one of the variant-specific dynamic shapes like
     /// `ResourceRef`/`Interpolation` that the helpers handle individually).
     pub fn validate(&self, value: &Value) -> Result<(), TypeError> {
-        // FunctionCall and Secret values are resolved at runtime, skip validation
-        if matches!(value, Value::FunctionCall { .. } | Value::Secret(_)) {
+        // Deferred-resolution values carry no concrete type at plan
+        // time — skip them.
+        if matches!(
+            value,
+            Value::FunctionCall { .. } | Value::Secret(_) | Value::Unknown(_)
+        ) {
             return Ok(());
         }
 
@@ -528,9 +534,11 @@ impl AttributeType {
     }
 
     fn collect_into(&self, path: &FieldPath, value: &Value, out: &mut Vec<(FieldPath, TypeError)>) {
-        // FunctionCall and Secret resolve at runtime — same skip rule
-        // as `validate`.
-        if matches!(value, Value::FunctionCall { .. } | Value::Secret(_)) {
+        // Same skip rule as `validate` — deferred-resolution values.
+        if matches!(
+            value,
+            Value::FunctionCall { .. } | Value::Secret(_) | Value::Unknown(_)
+        ) {
             return;
         }
 

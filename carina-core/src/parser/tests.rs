@@ -5102,6 +5102,66 @@ fn user_fn_typed_param_bool_mismatch() {
 }
 
 #[test]
+fn typed_user_fn_accepts_value_unknown_in_deferred_for_body() {
+    // RFC #2371 stage 3: a deferred for-expression binds the loop var
+    // to `Value::Unknown(ForValue)` during template parsing. If a typed
+    // user function is invoked with that placeholder, `check_fn_arg_type`
+    // must skip the type check (the concrete type resolves at upstream
+    // apply). Without the skip, parsing fails with `expects type 'String'`.
+    let input = r#"
+        fn label(s: String) {
+            s
+        }
+
+        let net = upstream_state {
+            source = "../net"
+        }
+
+        for x in net.names {
+            aws.s3_bucket {
+                name = label(x)
+            }
+        }
+    "#;
+
+    let result = parse(input, &ProviderContext::default());
+    assert!(
+        result.is_ok(),
+        "deferred-for body must accept typed user fn called with Unknown loop var, got: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn typed_return_user_fn_accepts_value_unknown_in_deferred_for_body() {
+    // Same skip rule must apply to return-type checking. The user fn
+    // here has both a typed param and a typed return; both must let
+    // `Value::Unknown` pass through.
+    let input = r#"
+        fn label(s: String): String {
+            s
+        }
+
+        let net = upstream_state {
+            source = "../net"
+        }
+
+        for x in net.names {
+            aws.s3_bucket {
+                name = label(x)
+            }
+        }
+    "#;
+
+    let result = parse(input, &ProviderContext::default());
+    assert!(
+        result.is_ok(),
+        "typed-return user fn must accept Unknown propagation, got: {:?}",
+        result.err()
+    );
+}
+
+#[test]
 fn user_fn_param_type_stored_in_parsed_file() {
     let input = r#"
         fn greet(name: String, count: Int) {
@@ -6751,10 +6811,33 @@ fn expand_deferred_for_substitutes_placeholder_inside_interpolation() {
         "interpolation should contain substituted account id, got: {}",
         rendered
     );
+    // After expansion no `Value::Unknown(ForValue)` placeholder must
+    // remain in the resource tree — every for-binding occurrence is
+    // replaced by the resolved iterable element. RFC #2371 stage 3.
+    fn contains_for_unknown(v: &Value) -> bool {
+        use crate::resource::{InterpolationPart, UnknownReason};
+        match v {
+            Value::Unknown(UnknownReason::ForValue)
+            | Value::Unknown(UnknownReason::ForKey)
+            | Value::Unknown(UnknownReason::ForIndex) => true,
+            Value::List(items) => items.iter().any(contains_for_unknown),
+            Value::Map(m) => m.values().any(contains_for_unknown),
+            Value::Interpolation(parts) => parts.iter().any(|p| match p {
+                InterpolationPart::Expr(inner) => contains_for_unknown(inner),
+                InterpolationPart::Literal(_) => false,
+            }),
+            Value::FunctionCall { args, .. } => args.iter().any(contains_for_unknown),
+            Value::Secret(inner) => contains_for_unknown(inner),
+            _ => false,
+        }
+    }
+    let leaked = parsed.resources[0]
+        .attributes
+        .values()
+        .any(contains_for_unknown);
     assert!(
-        !rendered.contains(DEFERRED_UPSTREAM_PLACEHOLDER),
-        "placeholder must not leak into rendered label, got: {}",
-        rendered
+        !leaked,
+        "for-binding Value::Unknown placeholder must not leak into expanded resource"
     );
 }
 

@@ -795,6 +795,12 @@ pub fn validate_type_expr_value(
     value: &Value,
     config: &ProviderContext,
 ) -> Option<String> {
+    // `Value::Unknown` resolves at upstream apply — the concrete type
+    // is unknowable here. Same skip rule the schema validator and
+    // `check_fn_arg_type` follow.
+    if matches!(value, Value::Unknown(_)) {
+        return None;
+    }
     match (type_expr, value) {
         (TypeExpr::Simple(name), _) => validate_custom_type(name, value, config).err(),
         (TypeExpr::List(inner), Value::List(items)) => {

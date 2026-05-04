@@ -9,12 +9,11 @@
 
 use crate::parser::expressions::primary::parse_primary_eval;
 use crate::parser::{
-    DEFERRED_UPSTREAM_INDEX_PLACEHOLDER, DEFERRED_UPSTREAM_KEY_PLACEHOLDER,
-    DEFERRED_UPSTREAM_PLACEHOLDER, DeferredForExpression, ModuleCall, ParseContext, ParseError,
-    ParseWarning, Rule, evaluate_static_value, first_inner, next_pair, parse_expression,
-    parse_module_call, parse_read_resource_expr, parse_resource_expr,
+    DeferredForExpression, ModuleCall, ParseContext, ParseError, ParseWarning, Rule,
+    evaluate_static_value, first_inner, next_pair, parse_expression, parse_module_call,
+    parse_read_resource_expr, parse_resource_expr,
 };
-use crate::resource::{Resource, Value};
+use crate::resource::{Resource, UnknownReason, Value};
 
 /// Binding pattern for a for expression
 #[derive(Debug, Clone, PartialEq)]
@@ -236,7 +235,7 @@ pub(crate) fn parse_for_expr(
             // Try to parse the body once with placeholder values for the loop
             // variable(s) to extract the resource type and attribute template.
             let mut template_ctx = ctx.clone();
-            let placeholder = || Value::String(DEFERRED_UPSTREAM_PLACEHOLDER.to_string());
+            let placeholder = || Value::Unknown(UnknownReason::ForValue);
             let bind = |c: &mut ParseContext, name: &str, v: Value| {
                 if name != "_" {
                     c.set_variable(name.to_string(), v);
@@ -250,16 +249,12 @@ pub(crate) fn parse_for_expr(
                     bind(
                         &mut template_ctx,
                         idx,
-                        Value::String(DEFERRED_UPSTREAM_INDEX_PLACEHOLDER.to_string()),
+                        Value::Unknown(UnknownReason::ForIndex),
                     );
                     bind(&mut template_ctx, val, placeholder());
                 }
                 ForBinding::Map(k, v) => {
-                    bind(
-                        &mut template_ctx,
-                        k,
-                        Value::String(DEFERRED_UPSTREAM_KEY_PLACEHOLDER.to_string()),
-                    );
+                    bind(&mut template_ctx, k, Value::Unknown(UnknownReason::ForKey));
                     bind(&mut template_ctx, v, placeholder());
                 }
             }
@@ -314,7 +309,7 @@ pub(crate) fn parse_for_expr(
                     ForBinding::Map(k, v) => format!("for {}, {} in {}", k, v, s),
                 };
                 let mut template_ctx = ctx.clone();
-                let placeholder = || Value::String(DEFERRED_UPSTREAM_PLACEHOLDER.to_string());
+                let placeholder = || Value::Unknown(UnknownReason::ForValue);
                 let bind = |c: &mut ParseContext, name: &str, v: Value| {
                     if name != "_" {
                         c.set_variable(name.to_string(), v);
@@ -328,16 +323,12 @@ pub(crate) fn parse_for_expr(
                         bind(
                             &mut template_ctx,
                             idx,
-                            Value::String(DEFERRED_UPSTREAM_INDEX_PLACEHOLDER.to_string()),
+                            Value::Unknown(UnknownReason::ForIndex),
                         );
                         bind(&mut template_ctx, val, placeholder());
                     }
                     ForBinding::Map(k, v) => {
-                        bind(
-                            &mut template_ctx,
-                            k,
-                            Value::String(DEFERRED_UPSTREAM_KEY_PLACEHOLDER.to_string()),
-                        );
+                        bind(&mut template_ctx, k, Value::Unknown(UnknownReason::ForKey));
                         bind(&mut template_ctx, v, placeholder());
                     }
                 }

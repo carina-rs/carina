@@ -2149,3 +2149,31 @@ fn read_against_managed_only_type_is_rejected() {
         "expected fix hint, got: {err}"
     );
 }
+
+#[test]
+fn validate_type_expr_value_skips_value_unknown() {
+    // RFC #2371 stage 3: a `Value::Unknown` reaching this validator
+    // (e.g. from a deferred-for body where a typed module-call argument
+    // is bound to the loop var) must short-circuit rather than emit
+    // `expected <type>, got unknown`.
+    use crate::resource::{UnknownReason, Value};
+    use crate::validation::TypeExpr;
+
+    let unknown = Value::Unknown(UnknownReason::ForValue);
+    let cfg = ProviderContext::default();
+
+    assert!(super::validate_type_expr_value(&TypeExpr::String, &unknown, &cfg).is_none());
+    assert!(super::validate_type_expr_value(&TypeExpr::Int, &unknown, &cfg).is_none());
+    assert!(super::validate_type_expr_value(&TypeExpr::Bool, &unknown, &cfg).is_none());
+
+    let struct_ty = TypeExpr::Struct {
+        fields: vec![("name".to_string(), TypeExpr::String)],
+    };
+    assert!(super::validate_type_expr_value(&struct_ty, &unknown, &cfg).is_none());
+
+    let upstream = Value::Unknown(UnknownReason::UpstreamRef {
+        path: crate::resource::AccessPath::with_fields("net", "vpc", vec!["vpc_id".into()]),
+    });
+    assert!(super::validate_type_expr_value(&TypeExpr::String, &upstream, &cfg).is_none());
+    assert!(super::validate_type_expr_value(&struct_ty, &upstream, &cfg).is_none());
+}
