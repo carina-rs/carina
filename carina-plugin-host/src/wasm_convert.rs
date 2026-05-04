@@ -51,7 +51,9 @@ pub fn core_to_wit_value(v: &CoreValue) -> wit::Value {
         // would degrade it to `"Unknown(...)"` debug-format string.
         // Reject explicitly so a stage-2/3 producer bug surfaces here.
         CoreValue::Unknown(_) => {
-            unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
+            unimplemented!(
+                "Value::Unknown reached a stage-4 serialization boundary; the producer should have stripped or resolved it (RFC #2371)"
+            )
         }
         // Managed-to-managed refs (e.g. `admins.group_id`) are expected
         // here at plan time — they get resolved at apply time by the
@@ -106,7 +108,9 @@ fn core_value_to_json(v: &CoreValue) -> serde_json::Value {
         // RFC #2371: `Value::Unknown` must not be serialized to JSON
         // for provider transport. See sibling arm in `core_to_wit_value`.
         CoreValue::Unknown(_) => {
-            unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
+            unimplemented!(
+                "Value::Unknown reached a stage-4 serialization boundary; the producer should have stripped or resolved it (RFC #2371)"
+            )
         }
         _ => serde_json::Value::String(format!("{v:?}")),
     }
@@ -422,6 +426,31 @@ fn proto_struct_field_to_core(f: &proto::StructField) -> CoreStructField {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RFC #2371 contract pin: `Value::Unknown` reaching either WASM-
+    /// boundary converter is a stage-2 invariant violation
+    /// (`PlanPreprocessor::strip_unknown_attributes` must remove it
+    /// first). A future change that swaps these `unimplemented!()` arms
+    /// for a `format!("{v:?}")` fallback would silently re-introduce
+    /// the v1 corruption bug (#2375); these `#[should_panic]` tests
+    /// pin the contract.
+    #[test]
+    #[should_panic(expected = "Value::Unknown")]
+    fn unknown_panics_in_core_to_wit_value() {
+        use carina_core::resource::{AccessPath, UnknownReason};
+        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
+        let v = CoreValue::Unknown(UnknownReason::UpstreamRef { path });
+        let _ = core_to_wit_value(&v);
+    }
+
+    #[test]
+    #[should_panic(expected = "Value::Unknown")]
+    fn unknown_panics_in_core_value_to_json() {
+        use carina_core::resource::{AccessPath, UnknownReason};
+        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
+        let v = CoreValue::Unknown(UnknownReason::UpstreamRef { path });
+        let _ = core_value_to_json(&v);
+    }
 
     // -- Value roundtrips --
 

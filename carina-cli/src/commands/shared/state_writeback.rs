@@ -134,7 +134,9 @@ pub(crate) fn dsl_value_to_json(value: &carina_core::resource::Value) -> Option<
         // drop it (`-> None`), losing the plan/apply boundary contract;
         // reject explicitly so a stage-2/3 producer bug surfaces here.
         Value::Unknown(_) => {
-            unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
+            unimplemented!(
+                "Value::Unknown reached a stage-4 serialization boundary; the producer should have stripped or resolved it (RFC #2371)"
+            )
         }
         _ => None, // ResourceRef, Null, etc. — skip
     }
@@ -285,5 +287,23 @@ pub(crate) fn build_orphan_resource(sf: &carina_state::StateFile, id: &ResourceI
         dependency_bindings: rs.dependency_bindings.clone(),
         module_source: None,
         quoted_string_attrs: std::collections::HashSet::new(),
+    }
+}
+
+#[cfg(test)]
+mod stage2_unknown_panic_tests {
+    use super::*;
+    use carina_core::resource::{AccessPath, UnknownReason, Value};
+
+    /// RFC #2371 contract pin: `dsl_value_to_json` panics on
+    /// `Value::Unknown`. State files must never carry the variant
+    /// (constraint b); a future change that swaps for a silent
+    /// fallback would re-introduce the v1 corruption bug.
+    #[test]
+    #[should_panic(expected = "Value::Unknown")]
+    fn unknown_panics_in_dsl_value_to_json() {
+        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
+        let v = Value::Unknown(UnknownReason::UpstreamRef { path });
+        let _ = dsl_value_to_json(&v);
     }
 }

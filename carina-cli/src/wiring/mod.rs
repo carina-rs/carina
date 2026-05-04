@@ -421,6 +421,21 @@ impl<'a> PlanPreprocessor<'a> {
         current_states: &mut HashMap<ResourceId, State>,
         provider_configs: &[ProviderConfig],
     ) {
+        // RFC #2371 stage 2: strip `Value::Unknown`-bearing attributes
+        // before handing resources to the WASM provider boundary, then
+        // restore them after. The WASM boundary panics on `Value::Unknown`
+        // by design (RFC constraint c) — this strip-and-restore is the
+        // stage 2 obligation that keeps the constraint inviolate.
+        let stripped = strip_unknown_attributes(resources);
+        // Hard assert (not debug_assert): RFC #2371 constraint b says
+        // state files never carry `Value::Unknown`, and the
+        // strip-and-restore design depends on it. A release-mode
+        // violation would degrade silently into a WASM-boundary panic
+        // far from the source — fail fast here instead.
+        assert!(
+            !current_states_contain_unknown(current_states),
+            "Value::Unknown found in current_states — RFC #2371 constraint b violated"
+        );
         self.normalizer.normalize_desired(resources);
         self.normalizer.normalize_state(current_states);
         let schemas = self.ctx.schemas();
@@ -432,7 +447,105 @@ impl<'a> PlanPreprocessor<'a> {
         }
         resolve_enum_aliases_with_ctx(self.ctx, resources);
         resolve_enum_aliases_in_states(self.ctx, current_states);
+        restore_unknown_attributes(resources, stripped);
     }
+}
+
+/// One stripped attribute, retained so it can be re-inserted at its
+/// original position after `normalize_desired` returns.
+struct StrippedAttribute {
+    insert_index: usize,
+    key: String,
+    value: carina_core::resource::Value,
+}
+
+/// Remove every attribute whose value is (or recursively contains)
+/// `Value::Unknown` from each resource's attribute map. Returns a
+/// per-resource record of what was removed, keyed by `ResourceId`, so
+/// `restore_unknown_attributes` can put them back at their original
+/// `IndexMap` position. See RFC #2371 stage 2 / #2377.
+fn strip_unknown_attributes(
+    resources: &mut [Resource],
+) -> HashMap<ResourceId, Vec<StrippedAttribute>> {
+    let mut out: HashMap<ResourceId, Vec<StrippedAttribute>> = HashMap::new();
+    for resource in resources.iter_mut() {
+        let mut stripped: Vec<StrippedAttribute> = Vec::new();
+        // Collect keys to remove first so we don't mutate while iterating.
+        let to_remove: Vec<(usize, String)> = resource
+            .attributes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (k, v))| {
+                if value_contains_unknown(v) {
+                    Some((i, k.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // Process highest-index-first so each `shift_remove` doesn't
+        // shift the indices of later removals.
+        for (i, key) in to_remove.into_iter().rev() {
+            if let Some(value) = resource.attributes.shift_remove(&key) {
+                stripped.push(StrippedAttribute {
+                    insert_index: i,
+                    key,
+                    value,
+                });
+            }
+        }
+        if !stripped.is_empty() {
+            // Restoration order: lowest insert_index first, so each
+            // `shift_insert` lands the entry at its pre-strip position
+            // without disturbing entries with smaller indices.
+            stripped.sort_by_key(|s| s.insert_index);
+            out.insert(resource.id.clone(), stripped);
+        }
+    }
+    out
+}
+
+/// Counterpart to `strip_unknown_attributes`. Re-inserts each stripped
+/// attribute at its original index in the resource's attribute map.
+/// Attributes appended by `normalize_desired` (e.g. provider-injected
+/// defaults) end up after the original entries, which matches behavior
+/// pre-#2377 for non-Unknown attributes.
+fn restore_unknown_attributes(
+    resources: &mut [Resource],
+    mut stripped: HashMap<ResourceId, Vec<StrippedAttribute>>,
+) {
+    for resource in resources.iter_mut() {
+        if let Some(entries) = stripped.remove(&resource.id) {
+            for entry in entries {
+                let target = entry.insert_index.min(resource.attributes.len());
+                resource
+                    .attributes
+                    .shift_insert(target, entry.key, entry.value);
+            }
+        }
+    }
+}
+
+fn value_contains_unknown(value: &carina_core::resource::Value) -> bool {
+    use carina_core::resource::{InterpolationPart, Value};
+    match value {
+        Value::Unknown(_) => true,
+        Value::List(items) => items.iter().any(value_contains_unknown),
+        Value::Map(map) => map.values().any(value_contains_unknown),
+        Value::Interpolation(parts) => parts.iter().any(|p| match p {
+            InterpolationPart::Expr(v) => value_contains_unknown(v),
+            _ => false,
+        }),
+        Value::FunctionCall { args, .. } => args.iter().any(value_contains_unknown),
+        Value::Secret(inner) => value_contains_unknown(inner),
+        _ => false,
+    }
+}
+
+fn current_states_contain_unknown(states: &HashMap<ResourceId, State>) -> bool {
+    states
+        .values()
+        .any(|state| state.attributes.values().any(value_contains_unknown))
 }
 
 /// Run provider-specific normalization on desired resources.

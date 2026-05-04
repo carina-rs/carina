@@ -156,7 +156,9 @@ fn value_to_json(value: &carina_core::resource::Value) -> serde_json::Value {
         // map it to `null`; reject explicitly so a stage-2/3 producer
         // bug surfaces here instead of silently corrupting the lock.
         Value::Unknown(_) => {
-            unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
+            unimplemented!(
+                "Value::Unknown reached a stage-4 serialization boundary; the producer should have stripped or resolved it (RFC #2371)"
+            )
         }
         _ => serde_json::Value::Null,
     }
@@ -276,5 +278,18 @@ mod tests {
         assert!(diff.contains("backend type"));
         assert!(diff.contains("local"));
         assert!(diff.contains("s3"));
+    }
+
+    /// RFC #2371 contract pin: `value_to_json` panics on
+    /// `Value::Unknown`. Backend lock files must never carry the
+    /// variant (constraint b); a future change that swaps for a silent
+    /// fallback would re-introduce v1-style corruption.
+    #[test]
+    #[should_panic(expected = "Value::Unknown")]
+    fn unknown_panics_in_value_to_json() {
+        use carina_core::resource::{AccessPath, UnknownReason, Value};
+        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
+        let v = Value::Unknown(UnknownReason::UpstreamRef { path });
+        let _ = value_to_json(&v);
     }
 }

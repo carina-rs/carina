@@ -196,8 +196,16 @@ fn deterministic_value_string(value: &Value) -> String {
         Value::Secret(inner) => {
             format!("Secret({})", deterministic_value_string(inner))
         }
-        Value::Unknown(_) => {
-            unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
+        Value::Unknown(reason) => {
+            use crate::resource::UnknownReason;
+            match reason {
+                UnknownReason::UpstreamRef { path } => {
+                    format!("Unknown(UpstreamRef({}))", path.to_dot_string())
+                }
+                UnknownReason::ForKey => "Unknown(ForKey)".to_string(),
+                UnknownReason::ForIndex => "Unknown(ForIndex)".to_string(),
+                UnknownReason::ForValue => "Unknown(ForValue)".to_string(),
+            }
         }
     }
 }

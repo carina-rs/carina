@@ -22,7 +22,6 @@ pub use ast::{
     InferredFile, ModuleCall, ParsedExportParam, ParsedFile, ProviderConfig, RequireBlock,
     ResourceContext, ResourceTypePath, StateBlock, TypeExpr, UpstreamState, UseStatement,
     UserFunction, UserFunctionBody, ValidateExpr, ValidationBlock,
-    decode_unresolved_upstream_marker, encode_unresolved_upstream_marker,
 };
 pub use config::{DecryptorFn, ProviderContext, ValidatorFn};
 pub use entry::{parse, parse_and_resolve};

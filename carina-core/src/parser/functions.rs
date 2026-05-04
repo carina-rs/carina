@@ -469,12 +469,8 @@ fn substitute_fn_params(value: &Value, substitutions: &HashMap<String, Value>) -
                 .collect(),
         ),
         Value::Secret(inner) => Value::Secret(Box::new(substitute_fn_params(inner, substitutions))),
-        // RFC #2371: `Value::Unknown` is plan-display only and has no
-        // producer in stage 1. The wildcard below would silently
-        // pass it through; reject explicitly.
-        Value::Unknown(_) => {
-            unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
-        }
+        // `Value::Unknown` is not a function-param placeholder. Pass through.
+        Value::Unknown(_) => value.clone(),
         other => other.clone(),
     }
 }

@@ -175,9 +175,7 @@ fn format_value(value: &Value) -> String {
             format!("{}({})", name, arg_strs.join(", "))
         }
         Value::Secret(_) => "(secret)".to_string(),
-        Value::Unknown(_) => {
-            unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
-        }
+        Value::Unknown(reason) => crate::value::render_unknown(reason),
     }
 }
 

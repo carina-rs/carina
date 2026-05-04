@@ -10,12 +10,9 @@ use crate::utils::{convert_enum_value, is_dsl_enum_format};
 
 /// Render an `UnknownReason` to its plan-display string. See RFC #2371.
 ///
-/// `pub(crate)` for stage 1: only same-crate callers (stage 2 will route
-/// `format_value_with_key` through here). Promote to `pub` in stage 3
-/// when the carina-cli display layer migrates. `#[allow(dead_code)]` is
-/// the explicit acknowledgement that no caller exists *yet* — stage 2
-/// removes the attribute when `format_value_with_key` calls in.
-#[allow(dead_code)]
+/// `pub(crate)` because stage 2 only needs same-crate callers
+/// (`format_value_with_key`). Stage 3 promotes to `pub` when carina-cli's
+/// display layer migrates.
 pub(crate) fn render_unknown(reason: &UnknownReason) -> String {
     match reason {
         UnknownReason::UpstreamRef { path } => {
@@ -161,7 +158,9 @@ pub fn value_to_json_with_context(
             )))
         }
         Value::Unknown(_) => {
-            unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
+            unimplemented!(
+                "Value::Unknown reached a stage-4 serialization boundary; the producer should have stripped or resolved it (RFC #2371)"
+            )
         }
     }
 }
@@ -210,12 +209,6 @@ pub fn format_value_with_key(value: &Value, _key: Option<&str>) -> String {
             if s.starts_with(SECRET_PREFIX) {
                 return "(secret)".to_string();
             }
-            // Unresolved upstream_state references stamped by
-            // `resolve_refs_for_plan` — render unquoted as
-            // `(known after upstream apply: <ref>)`.
-            if let Some(rest) = crate::parser::decode_unresolved_upstream_marker(s) {
-                return format!("(known after upstream apply: {})", rest);
-            }
             // DSL enum format (namespaced identifiers) - resolve to provider value
             if is_dsl_enum_format(s) {
                 let resolved = convert_enum_value(s);
@@ -262,9 +255,7 @@ pub fn format_value_with_key(value: &Value, _key: Option<&str>) -> String {
             format!("{}({})", name, arg_strs.join(", "))
         }
         Value::Secret(_) => "(secret)".to_string(),
-        Value::Unknown(_) => {
-            unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
-        }
+        Value::Unknown(reason) => render_unknown(reason),
     }
 }
 
@@ -383,7 +374,9 @@ pub fn redact_secrets_in_value(value: &Value) -> Value {
         // `other` arm below would silently pass it through; reject
         // explicitly so a stage-2/3 producer bug surfaces here.
         Value::Unknown(_) => {
-            unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
+            unimplemented!(
+                "Value::Unknown reached a stage-4 serialization boundary; the producer should have stripped or resolved it (RFC #2371)"
+            )
         }
         other => other.clone(),
     }
@@ -837,19 +830,37 @@ mod tests {
         assert_eq!(format_value(&v), "vpc.id");
     }
 
-    /// `Value::String` carrying the upstream-unresolved marker prefix
-    /// renders unquoted as `(known after upstream apply: <ref>)`. The
-    /// marker is stamped by `resolve_refs_for_plan` and detected here by
-    /// `format_value_with_key` (#2366).
+    /// `Value::Unknown(UpstreamRef)` renders unquoted as
+    /// `(known after upstream apply: <ref>)` via `format_value_with_key`.
+    /// Stage 2 of RFC #2371 — the variant replaced the NUL-prefixed
+    /// `Value::String` sentinel from #2367.
     #[test]
-    fn test_format_value_unresolved_upstream_marker() {
-        let v = Value::String(crate::parser::encode_unresolved_upstream_marker(
-            "network.vpc.vpc_id",
-        ));
+    fn test_format_value_unresolved_upstream() {
+        use crate::resource::{AccessPath, UnknownReason};
+        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
+        let v = Value::Unknown(UnknownReason::UpstreamRef { path });
         assert_eq!(
             format_value(&v),
             "(known after upstream apply: network.vpc.vpc_id)"
         );
+    }
+
+    /// RFC #2371 contract pin: serialization boundaries panic on
+    /// `Value::Unknown`. A future change that swaps the arm for a
+    /// silent fallback would re-introduce the v1 corruption bug;
+    /// these `#[should_panic]` tests pin the contract.
+    #[test]
+    #[should_panic(expected = "Value::Unknown")]
+    fn unknown_panics_in_value_to_json() {
+        let v = Value::Unknown(UnknownReason::ForKey);
+        let _ = value_to_json(&v);
+    }
+
+    #[test]
+    #[should_panic(expected = "Value::Unknown")]
+    fn unknown_panics_in_redact_secrets_in_value() {
+        let v = Value::Unknown(UnknownReason::ForKey);
+        let _ = redact_secrets_in_value(&v);
     }
 
     #[test]
