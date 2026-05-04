@@ -21,7 +21,7 @@ use carina_core::provider::{
     ProviderRouter,
 };
 use carina_core::resolver::{resolve_refs_for_plan, resolve_refs_with_state_and_remote};
-use carina_core::resource::{Resource, ResourceId, State, Value};
+use carina_core::resource::{Resource, ResourceId, State, Value, contains_resource_ref};
 use carina_core::schema::{SchemaRegistry, resolve_block_names};
 use carina_core::utils;
 use carina_core::validation;
@@ -421,12 +421,16 @@ impl<'a> PlanPreprocessor<'a> {
         current_states: &mut HashMap<ResourceId, State>,
         provider_configs: &[ProviderConfig],
     ) {
-        // RFC #2371 stage 2: strip `Value::Unknown`-bearing attributes
-        // before handing resources to the WASM provider boundary, then
-        // restore them after. The WASM boundary panics on `Value::Unknown`
-        // by design (RFC constraint c) — this strip-and-restore is the
-        // stage 2 obligation that keeps the constraint inviolate.
-        let stripped = strip_unknown_attributes(resources);
+        // RFC #2371 stage 2 + #2387: strip every attribute the WASM
+        // provider boundary refuses to serialize — `Value::Unknown`
+        // (#2378) and `Value::ResourceRef` plus the wrappers that hide
+        // a ref (`Interpolation` / `FunctionCall` / `Secret`-of-ref,
+        // #2387) — before `normalize_desired` runs, then restore them
+        // at their original index. After this pass, `core_to_wit_value`
+        // is type-system-enforced to never see either kind.
+        let stripped = strip_attributes_matching(resources, &|v| {
+            value_contains_unknown(v) || contains_resource_ref(v)
+        });
         // Hard assert (not debug_assert): RFC #2371 constraint b says
         // state files never carry `Value::Unknown`, and the
         // strip-and-restore design depends on it. A release-mode
@@ -447,7 +451,7 @@ impl<'a> PlanPreprocessor<'a> {
         }
         resolve_enum_aliases_with_ctx(self.ctx, resources);
         resolve_enum_aliases_in_states(self.ctx, current_states);
-        restore_unknown_attributes(resources, stripped);
+        restore_stripped_attributes(resources, stripped);
     }
 }
 
@@ -459,13 +463,25 @@ struct StrippedAttribute {
     value: carina_core::resource::Value,
 }
 
-/// Remove every attribute whose value is (or recursively contains)
-/// `Value::Unknown` from each resource's attribute map. Returns a
-/// per-resource record of what was removed, keyed by `ResourceId`, so
-/// `restore_unknown_attributes` can put them back at their original
-/// `IndexMap` position. See RFC #2371 stage 2 / #2377.
-fn strip_unknown_attributes(
+/// Remove every attribute whose value matches `predicate` from each
+/// resource's attribute map. Returns a per-resource record of what was
+/// removed, keyed by `ResourceId`, so [`restore_stripped_attributes`]
+/// can put them back at their original `IndexMap` position.
+///
+/// The single caller in `PlanPreprocessor::prepare` passes a unified
+/// predicate that covers two kinds the WASM provider boundary refuses
+/// to serialize:
+///
+/// - `value_contains_unknown` — `Value::Unknown` (RFC #2371 stage 2 /
+///   #2377)
+/// - `contains_resource_ref` — `Value::ResourceRef` plus the wrappers
+///   that recursively contain one (`Interpolation` / `FunctionCall` /
+///   `Secret` / nested `List` / `Map`); without this strip the
+///   `core_to_wit_value` `_` debug-format fallback would silently
+///   stringify the ref (#2387).
+fn strip_attributes_matching(
     resources: &mut [Resource],
+    predicate: &dyn Fn(&Value) -> bool,
 ) -> HashMap<ResourceId, Vec<StrippedAttribute>> {
     let mut out: HashMap<ResourceId, Vec<StrippedAttribute>> = HashMap::new();
     for resource in resources.iter_mut() {
@@ -476,7 +492,7 @@ fn strip_unknown_attributes(
             .iter()
             .enumerate()
             .filter_map(|(i, (k, v))| {
-                if value_contains_unknown(v) {
+                if predicate(v) {
                     Some((i, k.clone()))
                 } else {
                     None
@@ -505,12 +521,12 @@ fn strip_unknown_attributes(
     out
 }
 
-/// Counterpart to `strip_unknown_attributes`. Re-inserts each stripped
-/// attribute at its original index in the resource's attribute map.
-/// Attributes appended by `normalize_desired` (e.g. provider-injected
-/// defaults) end up after the original entries, which matches behavior
-/// pre-#2377 for non-Unknown attributes.
-fn restore_unknown_attributes(
+/// Counterpart to [`strip_attributes_matching`]. Re-inserts each
+/// stripped attribute at its original index in the resource's
+/// attribute map. Attributes appended by `normalize_desired` (e.g.
+/// provider-injected defaults) end up after the original entries,
+/// which matches behavior pre-#2377 for non-stripped attributes.
+fn restore_stripped_attributes(
     resources: &mut [Resource],
     mut stripped: HashMap<ResourceId, Vec<StrippedAttribute>>,
 ) {

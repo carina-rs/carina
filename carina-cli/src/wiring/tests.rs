@@ -572,7 +572,7 @@ fn strip_and_restore_unknown_attributes_round_trip() {
     let mut resources = vec![r];
     let order_before: Vec<String> = resources[0].attributes.keys().cloned().collect();
 
-    let stripped = super::strip_unknown_attributes(&mut resources);
+    let stripped = super::strip_attributes_matching(&mut resources, &super::value_contains_unknown);
     // After strip: vpc_id and nested_unknown removed.
     let after_strip: Vec<String> = resources[0].attributes.keys().cloned().collect();
     assert_eq!(
@@ -584,7 +584,7 @@ fn strip_and_restore_unknown_attributes_round_trip() {
     let entries = stripped.values().next().unwrap();
     assert_eq!(entries.len(), 2);
 
-    super::restore_unknown_attributes(&mut resources, stripped);
+    super::restore_stripped_attributes(&mut resources, stripped);
     let order_after: Vec<String> = resources[0].attributes.keys().cloned().collect();
     assert_eq!(
         order_after, order_before,
@@ -655,12 +655,12 @@ fn restore_unknown_attributes_after_normalize_injection() {
         .insert("c".into(), Value::String("c-val".into()));
     let mut resources = vec![r];
 
-    let stripped = super::strip_unknown_attributes(&mut resources);
+    let stripped = super::strip_attributes_matching(&mut resources, &super::value_contains_unknown);
     // After strip: ["a", "c"]. Simulate normalize injecting "z".
     resources[0]
         .attributes
         .insert("z".into(), Value::String("z-val".into()));
-    super::restore_unknown_attributes(&mut resources, stripped);
+    super::restore_stripped_attributes(&mut resources, stripped);
 
     let order: Vec<String> = resources[0].attributes.keys().cloned().collect();
     assert_eq!(
@@ -696,7 +696,7 @@ fn strip_and_restore_for_expression_unknowns_round_trip() {
     let mut resources = vec![r];
     let order_before: Vec<String> = resources[0].attributes.keys().cloned().collect();
 
-    let stripped = super::strip_unknown_attributes(&mut resources);
+    let stripped = super::strip_attributes_matching(&mut resources, &super::value_contains_unknown);
     let after_strip: Vec<String> = resources[0].attributes.keys().cloned().collect();
     assert_eq!(
         after_strip,
@@ -705,7 +705,7 @@ fn strip_and_restore_for_expression_unknowns_round_trip() {
     );
     assert_eq!(stripped.values().next().unwrap().len(), 3);
 
-    super::restore_unknown_attributes(&mut resources, stripped);
+    super::restore_stripped_attributes(&mut resources, stripped);
     let order_after: Vec<String> = resources[0].attributes.keys().cloned().collect();
     assert_eq!(
         order_after, order_before,
@@ -736,4 +736,124 @@ fn value_contains_unknown_covers_for_variants() {
     assert!(super::value_contains_unknown(&Value::List(vec![
         Value::Unknown(UnknownReason::ForValue),
     ])));
+}
+
+// ----- #2387: strip-and-restore round trip for ResourceRef -----
+
+#[test]
+fn strip_and_restore_resource_ref_round_trip() {
+    // The strip-and-restore pass must remove any attribute that
+    // recursively contains a `Value::ResourceRef` so the WASM
+    // boundary's `core_to_wit_value` never sees one (#2387). This
+    // mirrors the stage-2 `Value::Unknown` round-trip test for the
+    // ResourceRef predicate.
+    use carina_core::resource::{AccessPath, InterpolationPart, Value, contains_resource_ref};
+    use indexmap::IndexMap;
+
+    let mut r = carina_core::resource::Resource::new("test.t", "n");
+    let path = AccessPath::with_fields("admins", "group_id", vec![]);
+    r.attributes
+        .insert("name".into(), Value::String("static".into()));
+    r.attributes
+        .insert("group_id".into(), Value::ResourceRef { path: path.clone() });
+    let mut nested_map: IndexMap<String, Value> = IndexMap::new();
+    nested_map.insert("ref".into(), Value::ResourceRef { path: path.clone() });
+    r.attributes.insert("policy".into(), Value::Map(nested_map));
+    r.attributes.insert(
+        "label".into(),
+        Value::Interpolation(vec![
+            InterpolationPart::Literal("prefix-".into()),
+            InterpolationPart::Expr(Value::ResourceRef { path: path.clone() }),
+        ]),
+    );
+    r.attributes.insert(
+        "joined".into(),
+        Value::FunctionCall {
+            name: "join".into(),
+            args: vec![
+                Value::String(",".into()),
+                Value::ResourceRef { path: path.clone() },
+            ],
+        },
+    );
+    r.attributes.insert(
+        "secret_ref".into(),
+        Value::Secret(Box::new(Value::ResourceRef { path: path.clone() })),
+    );
+    let mut resources = vec![r];
+    let order_before: Vec<String> = resources[0].attributes.keys().cloned().collect();
+
+    let stripped = super::strip_attributes_matching(&mut resources, &contains_resource_ref);
+    let after_strip: Vec<String> = resources[0].attributes.keys().cloned().collect();
+    assert_eq!(
+        after_strip,
+        vec!["name".to_string()],
+        "every attribute that recursively contains a ResourceRef must be stripped"
+    );
+    let entries = stripped.values().next().expect("one resource stripped");
+    assert_eq!(entries.len(), 5);
+
+    super::restore_stripped_attributes(&mut resources, stripped);
+    let order_after: Vec<String> = resources[0].attributes.keys().cloned().collect();
+    assert_eq!(
+        order_after, order_before,
+        "ResourceRef-bearing attributes must be restored at their original indices"
+    );
+    // Spot-check that the restored values are still typed (not coerced
+    // to a debug-format String — the failure mode #2387 prevents).
+    assert!(matches!(
+        resources[0].get_attr("group_id"),
+        Some(Value::ResourceRef { .. })
+    ));
+    assert!(matches!(
+        resources[0].get_attr("label"),
+        Some(Value::Interpolation(_))
+    ));
+    assert!(matches!(
+        resources[0].get_attr("joined"),
+        Some(Value::FunctionCall { .. })
+    ));
+    assert!(matches!(
+        resources[0].get_attr("secret_ref"),
+        Some(Value::Secret(_))
+    ));
+}
+
+#[test]
+fn strip_unified_predicate_covers_unknown_and_ref() {
+    // The `prepare` pass uses the unified predicate
+    // `value_contains_unknown(v) || contains_resource_ref(v)`. Verify
+    // it strips both kinds in a single pass, in original order.
+    use carina_core::resource::{AccessPath, UnknownReason, Value, contains_resource_ref};
+
+    let mut r = carina_core::resource::Resource::new("test.t", "n");
+    let path = AccessPath::with_fields("admins", "group_id", vec![]);
+    r.attributes
+        .insert("name".into(), Value::String("static".into()));
+    r.attributes.insert(
+        "vpc_id".into(),
+        Value::Unknown(UnknownReason::UpstreamRef {
+            path: AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]),
+        }),
+    );
+    r.attributes
+        .insert("group_id".into(), Value::ResourceRef { path: path.clone() });
+    let mut resources = vec![r];
+
+    let stripped = super::strip_attributes_matching(&mut resources, &|v| {
+        super::value_contains_unknown(v) || contains_resource_ref(v)
+    });
+    let after_strip: Vec<String> = resources[0].attributes.keys().cloned().collect();
+    assert_eq!(after_strip, vec!["name".to_string()]);
+    assert_eq!(stripped.values().next().unwrap().len(), 2);
+
+    super::restore_stripped_attributes(&mut resources, stripped);
+    assert!(matches!(
+        resources[0].get_attr("vpc_id"),
+        Some(Value::Unknown(_))
+    ));
+    assert!(matches!(
+        resources[0].get_attr("group_id"),
+        Some(Value::ResourceRef { .. })
+    ));
 }
