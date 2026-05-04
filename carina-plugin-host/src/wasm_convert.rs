@@ -10,6 +10,7 @@ use carina_core::schema::{
     AttributeSchema as CoreAttributeSchema, AttributeType as CoreAttributeType,
     ResourceSchema as CoreResourceSchema, StructField as CoreStructField, noop_validator,
 };
+use carina_core::value::{SerializationContext, SerializationError};
 
 use carina_provider_protocol::types as proto;
 
@@ -19,47 +20,57 @@ use crate::wasm_bindings::carina::provider::types as wit;
 
 /// Convert a core Value to a WIT Value.
 ///
-/// List and Map values are serialized to JSON strings because WIT does not
-/// support recursive types.
+/// List and Map values are serialized to JSON strings because WIT does
+/// not support recursive types.
 ///
-/// `ResourceRef`, `Interpolation`, `FunctionCall`, `Closure`, and `Secret`
-/// variants are stringified via `format!("{v:?}")` as a fallback.
-/// Managed-to-managed refs (e.g. `admins.group_id`) are *expected* to be
-/// unresolved at plan time — they get resolved at apply time by the
-/// executor. Data source refs are resolved during refresh phase 2
-/// (#1683); if one slips through, the provider receives a debug string
-/// that will fail at the remote API with a clear error.
-pub fn core_to_wit_value(v: &CoreValue) -> wit::Value {
+/// Returns `Err(SerializationError)` for `Value::Unknown` (RFC #2371
+/// stage 4) — `PlanPreprocessor::strip_unknown_attributes` must remove
+/// it before reaching this boundary.
+///
+/// `ResourceRef`, `Interpolation`, `FunctionCall`, and `Secret` variants
+/// are stringified via `format!("{v:?}")` as a fallback. Managed-to-
+/// managed refs (e.g. `admins.group_id`) are *expected* to be unresolved
+/// at plan time — they get resolved at apply time by the executor.
+/// Data source refs are resolved during refresh phase 2 (#1683); if one
+/// slips through, the provider receives a debug string that will fail
+/// at the remote API with a clear error.
+pub fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, SerializationError> {
     match v {
-        CoreValue::String(s) => wit::Value::StrVal(s.clone()),
-        CoreValue::Int(i) => wit::Value::IntVal(*i),
-        CoreValue::Float(f) => wit::Value::FloatVal(*f),
-        CoreValue::Bool(b) => wit::Value::BoolVal(*b),
+        CoreValue::String(s) => Ok(wit::Value::StrVal(s.clone())),
+        CoreValue::Int(i) => Ok(wit::Value::IntVal(*i)),
+        CoreValue::Float(f) => Ok(wit::Value::FloatVal(*f)),
+        CoreValue::Bool(b) => Ok(wit::Value::BoolVal(*b)),
         CoreValue::List(items) => {
-            let json_items: Vec<serde_json::Value> = items.iter().map(core_value_to_json).collect();
-            wit::Value::ListVal(serde_json::to_string(&json_items).unwrap())
+            let json_items: Result<Vec<serde_json::Value>, _> =
+                items.iter().map(core_value_to_json).collect();
+            let json_str =
+                serde_json::to_string(&json_items?).map_err(|e| SerializationError::SerdeJson {
+                    message: e.to_string(),
+                    context: SerializationContext::WasmBoundary,
+                })?;
+            Ok(wit::Value::ListVal(json_str))
         }
         CoreValue::Map(map) => {
-            let json_map: serde_json::Map<String, serde_json::Value> = map
+            let json_map: Result<serde_json::Map<String, serde_json::Value>, _> = map
                 .iter()
-                .map(|(k, v)| (k.clone(), core_value_to_json(v)))
+                .map(|(k, v)| core_value_to_json(v).map(|jv| (k.clone(), jv)))
                 .collect();
-            wit::Value::MapVal(serde_json::to_string(&json_map).unwrap())
+            let json_str =
+                serde_json::to_string(&json_map?).map_err(|e| SerializationError::SerdeJson {
+                    message: e.to_string(),
+                    context: SerializationContext::WasmBoundary,
+                })?;
+            Ok(wit::Value::MapVal(json_str))
         }
-        // RFC #2371: `Value::Unknown` is plan-display only and must
-        // never cross the WASM provider boundary — the wildcard
-        // would degrade it to `"Unknown(...)"` debug-format string.
-        // Reject explicitly so a stage-2/3 producer bug surfaces here.
-        CoreValue::Unknown(_) => {
-            unimplemented!(
-                "Value::Unknown reached a stage-4 serialization boundary; the producer should have stripped or resolved it (RFC #2371)"
-            )
-        }
+        CoreValue::Unknown(reason) => Err(SerializationError::UnknownNotAllowed {
+            reason: reason.clone(),
+            context: SerializationContext::WasmBoundary,
+        }),
         // Managed-to-managed refs (e.g. `admins.group_id`) are expected
         // here at plan time — they get resolved at apply time by the
         // executor. Data source refs should have been resolved during
         // refresh phase 2 (#1683).
-        _ => wit::Value::StrVal(format!("{v:?}")),
+        _ => Ok(wit::Value::StrVal(format!("{v:?}"))),
     }
 }
 
@@ -86,33 +97,34 @@ pub fn wit_to_core_value(v: &wit::Value) -> CoreValue {
     }
 }
 
-/// Helper: convert a core Value to a serde_json::Value for JSON encoding.
-fn core_value_to_json(v: &CoreValue) -> serde_json::Value {
+/// Helper: convert a core Value to a serde_json::Value for JSON
+/// encoding inside the WIT-string fallback for List/Map. Returns
+/// `Err` for `Value::Unknown` (RFC #2371 stage 4) — sibling contract
+/// to `core_to_wit_value`.
+fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationError> {
     match v {
-        CoreValue::String(s) => serde_json::Value::String(s.clone()),
-        CoreValue::Int(i) => serde_json::Value::Number((*i).into()),
-        CoreValue::Float(f) => serde_json::Number::from_f64(*f)
+        CoreValue::String(s) => Ok(serde_json::Value::String(s.clone())),
+        CoreValue::Int(i) => Ok(serde_json::Value::Number((*i).into())),
+        CoreValue::Float(f) => Ok(serde_json::Number::from_f64(*f)
             .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
-        CoreValue::Bool(b) => serde_json::Value::Bool(*b),
+            .unwrap_or(serde_json::Value::Null)),
+        CoreValue::Bool(b) => Ok(serde_json::Value::Bool(*b)),
         CoreValue::List(items) => {
-            serde_json::Value::Array(items.iter().map(core_value_to_json).collect())
+            let arr: Result<Vec<_>, _> = items.iter().map(core_value_to_json).collect();
+            Ok(serde_json::Value::Array(arr?))
         }
         CoreValue::Map(map) => {
-            let obj: serde_json::Map<String, serde_json::Value> = map
+            let obj: Result<serde_json::Map<String, serde_json::Value>, _> = map
                 .iter()
-                .map(|(k, v)| (k.clone(), core_value_to_json(v)))
+                .map(|(k, v)| core_value_to_json(v).map(|jv| (k.clone(), jv)))
                 .collect();
-            serde_json::Value::Object(obj)
+            Ok(serde_json::Value::Object(obj?))
         }
-        // RFC #2371: `Value::Unknown` must not be serialized to JSON
-        // for provider transport. See sibling arm in `core_to_wit_value`.
-        CoreValue::Unknown(_) => {
-            unimplemented!(
-                "Value::Unknown reached a stage-4 serialization boundary; the producer should have stripped or resolved it (RFC #2371)"
-            )
-        }
-        _ => serde_json::Value::String(format!("{v:?}")),
+        CoreValue::Unknown(reason) => Err(SerializationError::UnknownNotAllowed {
+            reason: reason.clone(),
+            context: SerializationContext::WasmBoundary,
+        }),
+        _ => Ok(serde_json::Value::String(format!("{v:?}"))),
     }
 }
 
@@ -144,12 +156,12 @@ fn json_to_core_value(v: &serde_json::Value) -> CoreValue {
 
 // -- Value map helpers --
 
-pub fn core_to_wit_value_map<'a, M>(map: M) -> Vec<(String, wit::Value)>
+pub fn core_to_wit_value_map<'a, M>(map: M) -> Result<Vec<(String, wit::Value)>, SerializationError>
 where
     M: IntoIterator<Item = (&'a String, &'a CoreValue)>,
 {
     map.into_iter()
-        .map(|(k, v)| (k.clone(), core_to_wit_value(v)))
+        .map(|(k, v)| core_to_wit_value(v).map(|wv| (k.clone(), wv)))
         .collect()
 }
 
@@ -176,12 +188,12 @@ pub fn wit_to_core_resource_id(id: &wit::ResourceId) -> CoreResourceId {
 
 // -- State --
 
-pub fn core_to_wit_state(state: &CoreState) -> wit::State {
-    wit::State {
+pub fn core_to_wit_state(state: &CoreState) -> Result<wit::State, SerializationError> {
+    Ok(wit::State {
         identifier: state.identifier.clone(),
-        attributes: core_to_wit_value_map(&state.attributes),
+        attributes: core_to_wit_value_map(&state.attributes)?,
         exists: state.exists,
-    }
+    })
 }
 
 pub fn wit_to_core_state(state: &wit::State, id: &CoreResourceId) -> CoreState {
@@ -198,11 +210,13 @@ pub fn wit_to_core_state(state: &wit::State, id: &CoreResourceId) -> CoreState {
 
 // -- Resource --
 
-pub fn core_to_wit_resource(resource: &CoreResource) -> wit::ResourceDef {
-    wit::ResourceDef {
+pub fn core_to_wit_resource(
+    resource: &CoreResource,
+) -> Result<wit::ResourceDef, SerializationError> {
+    Ok(wit::ResourceDef {
         id: core_to_wit_resource_id(&resource.id),
-        attributes: core_to_wit_value_map(&resource.resolved_attributes()),
-    }
+        attributes: core_to_wit_value_map(&resource.resolved_attributes())?,
+    })
 }
 
 pub fn wit_to_core_resource(resource: &wit::ResourceDef) -> CoreResource {
@@ -427,29 +441,41 @@ fn proto_struct_field_to_core(f: &proto::StructField) -> CoreStructField {
 mod tests {
     use super::*;
 
-    /// RFC #2371 contract pin: `Value::Unknown` reaching either WASM-
-    /// boundary converter is a stage-2 invariant violation
+    /// RFC #2371 stage 4 contract pin: `Value::Unknown` reaching either
+    /// WASM-boundary converter is a stage-2 invariant violation
     /// (`PlanPreprocessor::strip_unknown_attributes` must remove it
-    /// first). A future change that swaps these `unimplemented!()` arms
-    /// for a `format!("{v:?}")` fallback would silently re-introduce
-    /// the v1 corruption bug (#2375); these `#[should_panic]` tests
-    /// pin the contract.
+    /// first). The converters now return `Err(SerializationError::
+    /// UnknownNotAllowed)` so a silent `format!("{v:?}")` fallback
+    /// would re-introduce the v1 corruption bug (#2375); these tests
+    /// pin the contract by asserting the variant + context survives.
     #[test]
-    #[should_panic(expected = "Value::Unknown")]
-    fn unknown_panics_in_core_to_wit_value() {
+    fn unknown_returns_err_in_core_to_wit_value() {
         use carina_core::resource::{AccessPath, UnknownReason};
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
-        let v = CoreValue::Unknown(UnknownReason::UpstreamRef { path });
-        let _ = core_to_wit_value(&v);
+        let v = CoreValue::Unknown(UnknownReason::UpstreamRef { path: path.clone() });
+        let err = core_to_wit_value(&v).unwrap_err();
+        match err {
+            SerializationError::UnknownNotAllowed {
+                reason: UnknownReason::UpstreamRef { path: p },
+                context: SerializationContext::WasmBoundary,
+            } => assert_eq!(p, path),
+            other => panic!("expected UnknownNotAllowed/UpstreamRef/WasmBoundary, got: {other:?}"),
+        }
     }
 
     #[test]
-    #[should_panic(expected = "Value::Unknown")]
-    fn unknown_panics_in_core_value_to_json() {
+    fn unknown_returns_err_in_core_value_to_json() {
         use carina_core::resource::{AccessPath, UnknownReason};
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
-        let v = CoreValue::Unknown(UnknownReason::UpstreamRef { path });
-        let _ = core_value_to_json(&v);
+        let v = CoreValue::Unknown(UnknownReason::UpstreamRef { path: path.clone() });
+        let err = core_value_to_json(&v).unwrap_err();
+        assert!(matches!(
+            err,
+            SerializationError::UnknownNotAllowed {
+                reason: UnknownReason::UpstreamRef { .. },
+                context: SerializationContext::WasmBoundary,
+            }
+        ));
     }
 
     // -- Value roundtrips --
@@ -457,7 +483,7 @@ mod tests {
     #[test]
     fn test_scalar_bool_roundtrip() {
         let core = CoreValue::Bool(true);
-        let wit = core_to_wit_value(&core);
+        let wit = core_to_wit_value(&core).unwrap();
         let back = wit_to_core_value(&wit);
         assert_eq!(core, back);
     }
@@ -465,7 +491,7 @@ mod tests {
     #[test]
     fn test_scalar_int_roundtrip() {
         let core = CoreValue::Int(42);
-        let wit = core_to_wit_value(&core);
+        let wit = core_to_wit_value(&core).unwrap();
         let back = wit_to_core_value(&wit);
         assert_eq!(core, back);
     }
@@ -473,7 +499,7 @@ mod tests {
     #[test]
     fn test_scalar_float_roundtrip() {
         let core = CoreValue::Float(2.78);
-        let wit = core_to_wit_value(&core);
+        let wit = core_to_wit_value(&core).unwrap();
         let back = wit_to_core_value(&wit);
         assert_eq!(core, back);
     }
@@ -481,7 +507,7 @@ mod tests {
     #[test]
     fn test_scalar_string_roundtrip() {
         let core = CoreValue::String("hello".into());
-        let wit = core_to_wit_value(&core);
+        let wit = core_to_wit_value(&core).unwrap();
         let back = wit_to_core_value(&wit);
         assert_eq!(core, back);
     }
@@ -493,7 +519,7 @@ mod tests {
             CoreValue::Int(1),
             CoreValue::Bool(false),
         ]);
-        let wit = core_to_wit_value(&core);
+        let wit = core_to_wit_value(&core).unwrap();
         assert!(matches!(wit, wit::Value::ListVal(_)));
         let back = wit_to_core_value(&wit);
         assert_eq!(core, back);
@@ -509,7 +535,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let wit = core_to_wit_value(&core);
+        let wit = core_to_wit_value(&core).unwrap();
         assert!(matches!(wit, wit::Value::MapVal(_)));
         let back = wit_to_core_value(&wit);
         assert_eq!(core, back);
@@ -526,7 +552,7 @@ mod tests {
             .collect(),
         );
         let core = CoreValue::List(vec![inner_map.clone(), inner_map]);
-        let wit = core_to_wit_value(&core);
+        let wit = core_to_wit_value(&core).unwrap();
         let back = wit_to_core_value(&wit);
         assert_eq!(core, back);
     }
@@ -550,7 +576,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let wit = core_to_wit_value(&core);
+        let wit = core_to_wit_value(&core).unwrap();
         let back = wit_to_core_value(&wit);
         assert_eq!(core, back);
     }
@@ -564,7 +590,7 @@ mod tests {
         let v = CoreValue::ResourceRef {
             path: AccessPath::new("sso", "identity_store_id"),
         };
-        let wit::Value::StrVal(s) = core_to_wit_value(&v) else {
+        let wit::Value::StrVal(s) = core_to_wit_value(&v).unwrap() else {
             panic!("expected StrVal");
         };
         assert!(s.contains("ResourceRef"), "expected debug format, got: {s}");
@@ -593,7 +619,7 @@ mod tests {
         attrs.insert("region".into(), CoreValue::String("us-east-1".into()));
         let core = CoreState::existing(id.clone(), attrs);
 
-        let wit = core_to_wit_state(&core);
+        let wit = core_to_wit_state(&core).unwrap();
         let back = wit_to_core_state(&wit, &id);
 
         assert_eq!(back.id, core.id);
@@ -607,7 +633,7 @@ mod tests {
         let attrs = HashMap::from([("cidr".into(), CoreValue::String("10.0.0.0/16".into()))]);
         let core = CoreState::existing(id.clone(), attrs).with_identifier("vpc-12345");
 
-        let wit = core_to_wit_state(&core);
+        let wit = core_to_wit_state(&core).unwrap();
         assert_eq!(wit.identifier, Some("vpc-12345".into()));
         let back = wit_to_core_state(&wit, &id);
         assert_eq!(back.identifier, Some("vpc-12345".into()));
@@ -624,7 +650,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let wit = core_to_wit_value_map(&map);
+        let wit = core_to_wit_value_map(&map).unwrap();
         let back = wit_to_core_value_map(&wit);
         assert_eq!(map, back);
     }
@@ -639,7 +665,7 @@ mod tests {
             ("region".into(), CoreValue::String("us-east-1".into())),
         ]);
 
-        let wit = core_to_wit_resource(&resource);
+        let wit = core_to_wit_resource(&resource).unwrap();
         assert_eq!(wit.id.provider, "aws");
         assert_eq!(wit.id.resource_type, "s3.Bucket");
         assert_eq!(wit.id.name, "my-bucket");
@@ -913,7 +939,7 @@ mod tests {
             .collect(),
         )]);
 
-        let wit = core_to_wit_value(&policies);
+        let wit = core_to_wit_value(&policies).unwrap();
         let back = wit_to_core_value(&wit);
         assert_eq!(policies, back);
     }

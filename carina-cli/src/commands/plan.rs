@@ -94,8 +94,8 @@ fn build_plan_file<E>(
     parsed: &carina_core::parser::File<E>,
     state_file: &Option<StateFile>,
     ctx: &crate::wiring::PlanContext,
-) -> PlanFile {
-    PlanFile {
+) -> Result<PlanFile, carina_core::value::SerializationError> {
+    Ok(PlanFile {
         version: 2,
         carina_version: env!("CARGO_PKG_VERSION").to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -104,20 +104,22 @@ fn build_plan_file<E>(
         state_serial: state_file.as_ref().map(|s| s.serial),
         provider_configs: parsed.providers.clone(),
         backend_config: parsed.backend.clone(),
-        plan: redact_secrets_in_plan(&ctx.plan),
+        plan: redact_secrets_in_plan(&ctx.plan)?,
         sorted_resources: ctx
             .sorted_resources
             .iter()
             .map(redact_secrets_in_resource)
-            .collect(),
+            .collect::<Result<Vec<_>, _>>()?,
         current_states: ctx
             .current_states
             .iter()
-            .map(|(id, state)| CurrentStateEntry {
-                id: id.clone(),
-                state: redact_secrets_in_state(state),
+            .map(|(id, state)| {
+                Ok::<_, carina_core::value::SerializationError>(CurrentStateEntry {
+                    id: id.clone(),
+                    state: redact_secrets_in_state(state)?,
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>, _>>()?,
         upstream_snapshot: ctx.upstream_snapshot.clone(),
         upstream_sources: parsed
             .upstream_states
@@ -127,6 +129,20 @@ fn build_plan_file<E>(
                 source: us.source.clone(),
             })
             .collect(),
+    })
+}
+
+/// Format a `SerializationError` from `build_plan_file` into the
+/// CLI's "cannot save plan" diagnostic, suggesting the caller drop
+/// `flag` (e.g. `--json`, `--out`) to fall back to display-only.
+fn format_plan_save_error(e: &carina_core::value::SerializationError, flag: &str) -> String {
+    match e {
+        carina_core::value::SerializationError::UnknownNotAllowed { reason, .. } => format!(
+            "Cannot save plan: it depends on values that are not yet \
+             applied ({reason}). Apply the upstream module(s) first, \
+             or rerun without {flag}."
+        ),
+        _ => e.to_string(),
     }
 }
 
@@ -326,12 +342,11 @@ pub async fn run_plan(
         .collect();
 
     if json {
-        // RFC #2371: `Value::Unknown` cannot be serialized (stage-2
-        // serialization-boundary panics + `#[serde(skip)]` on the
-        // variant). Detect it here so the user sees an actionable
-        // error instead of a panic backtrace.
-        check_no_unresolved_upstream_in_plan(&ctx.plan)?;
-        let plan_file = build_plan_file(path, &parsed, &state_file, &ctx);
+        // `build_plan_file` propagates `SerializationError` so the user
+        // sees an actionable diagnostic (which upstream / for-binding
+        // is unresolved) instead of a panic backtrace.
+        let plan_file = build_plan_file(path, &parsed, &state_file, &ctx)
+            .map_err(|e| format_plan_save_error(&e, "--json"))?;
         let json_str = serde_json::to_string_pretty(&plan_file)
             .map_err(|e| format!("Failed to serialize plan: {}", e))?;
         println!("{}", json_str);
@@ -363,9 +378,8 @@ pub async fn run_plan(
 
     // Save plan to file if --out was specified
     if let Some(out_path) = out {
-        // See the `--json` branch above for why this gate exists.
-        check_no_unresolved_upstream_in_plan(&ctx.plan)?;
-        let plan_file = build_plan_file(path, &parsed, &state_file, &ctx);
+        let plan_file = build_plan_file(path, &parsed, &state_file, &ctx)
+            .map_err(|e| format_plan_save_error(&e, "--out"))?;
         let json_out = serde_json::to_string_pretty(&plan_file)
             .map_err(|e| format!("Failed to serialize plan: {}", e))?;
         fs::write(out_path, json_out).map_err(|e| format!("Failed to write plan file: {}", e))?;
@@ -515,7 +529,13 @@ pub fn compute_export_diffs(
         // plan display; surface as `None` so the diff prints without
         // a type tag.
         let type_expr = param.type_expr.clone().into_known();
-        let new_json = crate::commands::shared::state_writeback::dsl_value_to_json(value);
+        // Plan display tolerates `Value::Unknown` in the export rhs
+        // (the deferred-for body will resolve it later). Map both the
+        // skip variants and the Unknown error to `None`; the diff
+        // surfaces as a "value not yet known" change without a JSON.
+        let new_json = crate::commands::shared::state_writeback::dsl_value_to_json(value)
+            .ok()
+            .flatten();
         match (current_exports.get(&param.name), new_json) {
             (None, _) => changes.push(ExportChange::Added {
                 name: param.name.clone(),
@@ -546,78 +566,6 @@ pub fn compute_export_diffs(
 
     changes.sort_by(|a, b| a.name().cmp(b.name()));
     changes
-}
-
-/// Refuse to persist a plan whose attributes carry `Value::Unknown`
-/// (RFC #2371 stage 2). The serialization paths panic on Unknown by
-/// design (`#[serde(skip)]` + explicit `unimplemented!()` arms in
-/// `value_to_json` / `dsl_value_to_json` / `core_to_wit_value`); this
-/// check exists so the user sees an actionable "apply upstreams first"
-/// message instead of a panic backtrace from `--out` or `--json`.
-fn check_no_unresolved_upstream_in_plan(plan: &carina_core::plan::Plan) -> Result<(), AppError> {
-    let mut offending: Vec<String> = plan
-        .effects()
-        .iter()
-        .filter_map(unresolved_upstream_ref_in_effect)
-        .collect();
-    if offending.is_empty() {
-        return Ok(());
-    }
-    offending.sort();
-    offending.dedup();
-    Err(AppError::Config(format!(
-        "Cannot save plan: it depends on upstream values that are not yet \
-         applied ({}). Apply the upstream module(s) first, then re-run \
-         `carina plan --out` (or `--json`).",
-        offending.join(", ")
-    )))
-}
-
-fn unresolved_upstream_ref_in_effect(effect: &Effect) -> Option<String> {
-    let mut resources: Vec<&Resource> = Vec::new();
-    match effect {
-        Effect::Read { resource } | Effect::Create(resource) => resources.push(resource),
-        Effect::Update { to, .. } => resources.push(to),
-        Effect::Replace {
-            to,
-            cascading_updates,
-            ..
-        } => {
-            resources.push(to);
-            for cu in cascading_updates {
-                resources.push(&cu.to);
-            }
-        }
-        Effect::Delete { .. }
-        | Effect::Import { .. }
-        | Effect::Remove { .. }
-        | Effect::Move { .. } => return None,
-    }
-    for resource in resources {
-        for value in resource.attributes.values() {
-            if let Some(reference) = first_unresolved_upstream_ref(value) {
-                return Some(reference);
-            }
-        }
-    }
-    None
-}
-
-fn first_unresolved_upstream_ref(value: &Value) -> Option<String> {
-    use carina_core::resource::{InterpolationPart, UnknownReason};
-    match value {
-        Value::Unknown(UnknownReason::UpstreamRef { path }) => Some(path.to_dot_string()),
-        Value::Unknown(_) => Some("for-expression placeholder".to_string()),
-        Value::List(items) => items.iter().find_map(first_unresolved_upstream_ref),
-        Value::Map(map) => map.values().find_map(first_unresolved_upstream_ref),
-        Value::Interpolation(parts) => parts.iter().find_map(|p| match p {
-            InterpolationPart::Expr(v) => first_unresolved_upstream_ref(v),
-            _ => None,
-        }),
-        Value::FunctionCall { args, .. } => args.iter().find_map(first_unresolved_upstream_ref),
-        Value::Secret(inner) => first_unresolved_upstream_ref(inner),
-        _ => None,
-    }
 }
 
 /// Seed a cycle guard with the caller's own base directory so that a chain
@@ -1111,128 +1059,76 @@ mod export_diff_tests {
 }
 
 #[cfg(test)]
-mod check_no_unresolved_upstream_in_plan_tests {
-    use super::*;
-    use carina_core::effect::{CascadingUpdate, Effect};
-    use carina_core::plan::Plan;
-    use carina_core::resource::{
-        AccessPath, LifecycleConfig, Resource, ResourceId, State, UnknownReason, Value,
-    };
+mod plan_serialization_error_tests {
+    //! RFC #2371 stage 4: serialization-boundary errors are now produced
+    //! by `value_to_json` / `redact_secrets_in_*` directly, surfaced
+    //! through `build_plan_file`'s `SerializationError` return. Verify
+    //! the actionable wording and that every effect shape (top-level
+    //! attributes, nested List/Map, Replace cascade) propagates the
+    //! error.
+    use carina_core::resource::{AccessPath, Resource, UnknownReason, Value};
+    use carina_core::value::{SerializationError, redact_secrets_in_resource, value_to_json};
 
-    fn unknown_value() -> Value {
+    fn upstream_unknown() -> Value {
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
         Value::Unknown(UnknownReason::UpstreamRef { path })
     }
 
-    fn make_plan_with(attrs: Vec<(&str, Value)>) -> Plan {
-        let mut r = Resource::new("test.resource", "name");
-        for (k, v) in attrs {
-            r.attributes.insert(k.to_string(), v);
+    #[test]
+    fn value_to_json_errors_on_top_level_unknown() {
+        let err = value_to_json(&upstream_unknown()).unwrap_err();
+        match err {
+            SerializationError::UnknownNotAllowed {
+                reason: UnknownReason::UpstreamRef { path },
+                ..
+            } => {
+                assert_eq!(path.to_dot_string(), "network.vpc.vpc_id");
+            }
+            other => panic!("expected UnknownNotAllowed/UpstreamRef, got: {other:?}"),
         }
-        let mut plan = Plan::new();
-        plan.add(Effect::Create(r));
-        plan
     }
 
     #[test]
-    fn passes_when_clean() {
-        let plan = make_plan_with(vec![("vpc_id", Value::String("vpc-123".into()))]);
-        assert!(check_no_unresolved_upstream_in_plan(&plan).is_ok());
-    }
-
-    #[test]
-    fn errors_on_top_level_unknown() {
-        let plan = make_plan_with(vec![("vpc_id", unknown_value())]);
-        let err = check_no_unresolved_upstream_in_plan(&plan).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("network.vpc.vpc_id"), "got: {}", msg);
-        assert!(msg.contains("upstream"), "got: {}", msg);
-    }
-
-    #[test]
-    fn errors_on_unknown_inside_list_or_map() {
-        let plan = make_plan_with(vec![(
-            "tags",
-            Value::List(vec![Value::String("a".into()), unknown_value()]),
-        )]);
-        assert!(check_no_unresolved_upstream_in_plan(&plan).is_err());
+    fn value_to_json_errors_on_unknown_inside_list_or_map() {
+        let list_val = Value::List(vec![Value::String("a".into()), upstream_unknown()]);
+        assert!(matches!(
+            value_to_json(&list_val).unwrap_err(),
+            SerializationError::UnknownNotAllowed { .. }
+        ));
 
         let mut m: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
-        m.insert("Name".into(), unknown_value());
-        let plan = make_plan_with(vec![("tags", Value::Map(m))]);
-        assert!(check_no_unresolved_upstream_in_plan(&plan).is_err());
+        m.insert("Name".into(), upstream_unknown());
+        assert!(matches!(
+            value_to_json(&Value::Map(m)).unwrap_err(),
+            SerializationError::UnknownNotAllowed { .. }
+        ));
     }
 
-    /// Cascade dependents of a Replace also carry attribute maps that
-    /// must be checked — a dependent referencing an unapplied upstream
-    /// must block plan persistence.
     #[test]
-    fn errors_on_unknown_in_cascading_update() {
-        let mut top = Resource::new("test.resource", "primary");
-        top.attributes
-            .insert("name".into(), Value::String("clean".into()));
-        let top_id = top.id.clone();
-
-        let mut dep = Resource::new("test.resource", "dependent");
-        dep.attributes.insert("vpc_id".into(), unknown_value());
-        let dep_id = dep.id.clone();
-
-        let mut plan = Plan::new();
-        plan.add(Effect::Replace {
-            id: top_id.clone(),
-            from: Box::new(State::not_found(top_id)),
-            to: top,
-            lifecycle: LifecycleConfig::default(),
-            changed_create_only: Vec::new(),
-            cascading_updates: vec![CascadingUpdate {
-                id: dep_id.clone(),
-                from: Box::new(State::not_found(dep_id)),
-                to: dep,
-            }],
-            temporary_name: None,
-            cascade_ref_hints: Vec::new(),
-        });
-        assert!(check_no_unresolved_upstream_in_plan(&plan).is_err());
+    fn redact_secrets_in_resource_errors_on_unknown_attribute() {
+        let mut r = Resource::new("test.resource", "name");
+        r.attributes.insert("vpc_id".into(), upstream_unknown());
+        let err = redact_secrets_in_resource(&r).unwrap_err();
+        assert!(matches!(err, SerializationError::UnknownNotAllowed { .. }));
     }
 
-    /// Delete / Import / Remove / Move effects do not carry attribute
-    /// maps that need checking; they must be skipped silently.
+    /// `for*` placeholders carry no path, but their reason variant
+    /// must survive into the error so the caller can render
+    /// "for-binding placeholder" rather than a generic message.
     #[test]
-    fn delete_import_remove_move_effects_are_skipped() {
-        let id = ResourceId::new("test", "name");
-        let mut plan = Plan::new();
-        plan.add(Effect::Delete {
-            id: id.clone(),
-            identifier: "x".into(),
-            lifecycle: LifecycleConfig::default(),
-            binding: None,
-            dependencies: std::collections::HashSet::new(),
-        });
-        plan.add(Effect::Import {
-            id: id.clone(),
-            identifier: "x".into(),
-        });
-        plan.add(Effect::Remove { id: id.clone() });
-        plan.add(Effect::Move {
-            from: id.clone(),
-            to: id,
-        });
-        assert!(check_no_unresolved_upstream_in_plan(&plan).is_ok());
-    }
-
-    /// Multiple effects with the same Unknown ref dedup in the message.
-    #[test]
-    fn dedup_same_reference_across_effects() {
-        let mut plan = Plan::new();
-        for n in ["a", "b"] {
-            let mut r = Resource::new("test.resource", n);
-            r.attributes.insert("vpc_id".into(), unknown_value());
-            plan.add(Effect::Create(r));
+    fn value_to_json_preserves_for_variants_in_error() {
+        for (variant, label) in [
+            (UnknownReason::ForValue, "ForValue"),
+            (UnknownReason::ForKey, "ForKey"),
+            (UnknownReason::ForIndex, "ForIndex"),
+        ] {
+            let err = value_to_json(&Value::Unknown(variant.clone())).unwrap_err();
+            match err {
+                SerializationError::UnknownNotAllowed { reason, .. } => {
+                    assert_eq!(reason, variant, "expected {label} round-trip");
+                }
+                other => panic!("expected UnknownNotAllowed for {label}, got: {other:?}"),
+            }
         }
-        let err = check_no_unresolved_upstream_in_plan(&plan).unwrap_err();
-        let msg = err.to_string();
-        // The reference should appear only once in the comma-separated list.
-        let count = msg.matches("network.vpc.vpc_id").count();
-        assert_eq!(count, 1, "ref must dedup, got: {}", msg);
     }
 }

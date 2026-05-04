@@ -473,7 +473,7 @@ fn resolve_exports_resolves_cross_file_dot_notation_strings() {
         value: Some(Value::String("registry_prod.account_id".to_string())),
     }];
 
-    let exports = resolve_exports(&export_params, &state);
+    let exports = resolve_exports(&export_params, &state).unwrap();
 
     assert_eq!(
         exports.get("account_id"),

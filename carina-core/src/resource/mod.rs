@@ -343,13 +343,13 @@ pub enum Value {
     ///
     /// `#[serde(skip)]` blocks both serialization (returns `Err`) and
     /// deserialization (the variant is unreachable from any JSON input).
-    /// This is the type-system enforcement of RFC constraints b and c:
-    /// even a hand-edited state/plan file cannot resurrect a
-    /// `Value::Unknown` and route it past the explicit `unimplemented!()`
-    /// guards in `value_to_json` / `dsl_value_to_json` /
-    /// `core_to_wit_value`. Stage 4 may further tighten by replacing
-    /// the panics with `Result::Err`, but the deserialization seal
-    /// already covers the round-trip attack surface today.
+    /// Together with the `Err(SerializationError::UnknownNotAllowed)`
+    /// arm at every serialization boundary (`value_to_json`,
+    /// `dsl_value_to_json`, `core_to_wit_value`, `redact_secrets_*`,
+    /// `backend_lock::value_to_json`), this enforces RFC constraints b
+    /// and c: a `Value::Unknown` cannot survive a state-file / plan-file
+    /// round trip, and any internal producer bug surfaces as a typed
+    /// error rather than corrupted output.
     #[serde(skip)]
     Unknown(UnknownReason),
 }

@@ -77,7 +77,7 @@ pub(crate) struct FinalizeApplyInput<'a> {
 pub(crate) fn resolve_exports(
     export_params: &[carina_core::parser::InferredExportParam],
     state: &StateFile,
-) -> HashMap<String, serde_json::Value> {
+) -> Result<HashMap<String, serde_json::Value>, carina_core::value::SerializationError> {
     use carina_core::binding_index::{BindingValueSource, ResolvedBindings};
     use carina_core::resource::Value;
 
@@ -101,44 +101,63 @@ pub(crate) fn resolve_exports(
             // Resolve both ResourceRef and cross-file dot-notation strings
             // (e.g., "registry_prod.account_id" parsed from a different .crn file).
             let resolved = crate::commands::plan::resolve_export_value(value, &bindings);
-            if let Some(json) = dsl_value_to_json(&resolved) {
+            if let Some(json) = dsl_value_to_json(&resolved)? {
                 exports.insert(param.name.clone(), json);
             }
         }
     }
-    exports
+    Ok(exports)
 }
 
 /// Convert a DSL Value to a serde_json::Value for state persistence.
-pub(crate) fn dsl_value_to_json(value: &carina_core::resource::Value) -> Option<serde_json::Value> {
+///
+/// Returns:
+/// - `Ok(Some(json))` for a representable concrete value
+/// - `Ok(None)` for variants that have no JSON representation in
+///   exports (`ResourceRef`, `Interpolation`, etc.) — the caller
+///   filters these out
+/// - `Err(SerializationError)` for `Value::Unknown`, so apply-time
+///   export resolution surfaces an actionable error rather than
+///   silently dropping or panicking.
+pub(crate) fn dsl_value_to_json(
+    value: &carina_core::resource::Value,
+) -> Result<Option<serde_json::Value>, carina_core::value::SerializationError> {
     use carina_core::resource::Value;
+    use carina_core::value::{SerializationContext, SerializationError};
     match value {
-        Value::String(s) => Some(serde_json::Value::String(s.clone())),
-        Value::Bool(b) => Some(serde_json::Value::Bool(*b)),
-        Value::Int(i) => Some(serde_json::Value::Number((*i).into())),
-        Value::Float(f) => serde_json::Number::from_f64(*f).map(serde_json::Value::Number),
+        Value::String(s) => Ok(Some(serde_json::Value::String(s.clone()))),
+        Value::Bool(b) => Ok(Some(serde_json::Value::Bool(*b))),
+        Value::Int(i) => Ok(Some(serde_json::Value::Number((*i).into()))),
+        Value::Float(f) => Ok(serde_json::Number::from_f64(*f).map(serde_json::Value::Number)),
         Value::List(items) => {
-            let json_items: Vec<serde_json::Value> =
-                items.iter().filter_map(dsl_value_to_json).collect();
-            Some(serde_json::Value::Array(json_items))
+            let json_items: Result<Vec<_>, _> = items
+                .iter()
+                .map(dsl_value_to_json)
+                .filter_map(|r| match r {
+                    Ok(Some(v)) => Some(Ok(v)),
+                    Ok(None) => None,
+                    Err(e) => Some(Err(e)),
+                })
+                .collect();
+            Ok(Some(serde_json::Value::Array(json_items?)))
         }
         Value::Map(map) => {
-            let json_map: serde_json::Map<String, serde_json::Value> = map
+            let json_map: Result<serde_json::Map<String, serde_json::Value>, _> = map
                 .iter()
-                .filter_map(|(k, v)| dsl_value_to_json(v).map(|jv| (k.clone(), jv)))
+                .map(|(k, v)| dsl_value_to_json(v).map(|jv| jv.map(|j| (k.clone(), j))))
+                .filter_map(|r| match r {
+                    Ok(Some(pair)) => Some(Ok(pair)),
+                    Ok(None) => None,
+                    Err(e) => Some(Err(e)),
+                })
                 .collect();
-            Some(serde_json::Value::Object(json_map))
+            Ok(Some(serde_json::Value::Object(json_map?)))
         }
-        // RFC #2371: `Value::Unknown` is plan-display only and must
-        // never reach a state file. The wildcard below would silently
-        // drop it (`-> None`), losing the plan/apply boundary contract;
-        // reject explicitly so a stage-2/3 producer bug surfaces here.
-        Value::Unknown(_) => {
-            unimplemented!(
-                "Value::Unknown reached a stage-4 serialization boundary; the producer should have stripped or resolved it (RFC #2371)"
-            )
-        }
-        _ => None, // ResourceRef, Null, etc. — skip
+        Value::Unknown(reason) => Err(SerializationError::UnknownNotAllowed {
+            reason: reason.clone(),
+            context: SerializationContext::StateWriteback,
+        }),
+        _ => Ok(None), // ResourceRef, Null, etc. — skip
     }
 }
 
@@ -291,19 +310,37 @@ pub(crate) fn build_orphan_resource(sf: &carina_state::StateFile, id: &ResourceI
 }
 
 #[cfg(test)]
-mod stage2_unknown_panic_tests {
+mod stage4_unknown_err_tests {
     use super::*;
     use carina_core::resource::{AccessPath, UnknownReason, Value};
+    use carina_core::value::{SerializationContext, SerializationError};
 
-    /// RFC #2371 contract pin: `dsl_value_to_json` panics on
-    /// `Value::Unknown`. State files must never carry the variant
-    /// (constraint b); a future change that swaps for a silent
-    /// fallback would re-introduce the v1 corruption bug.
+    /// RFC #2371 stage 4 contract pin: `dsl_value_to_json` returns
+    /// `Err(SerializationError::UnknownNotAllowed)` for `Value::Unknown`.
+    /// State files must never carry the variant (constraint b); a
+    /// silent fallback would re-introduce v1 corruption.
     #[test]
-    #[should_panic(expected = "Value::Unknown")]
-    fn unknown_panics_in_dsl_value_to_json() {
+    fn unknown_returns_err_in_dsl_value_to_json() {
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-        let v = Value::Unknown(UnknownReason::UpstreamRef { path });
-        let _ = dsl_value_to_json(&v);
+        let v = Value::Unknown(UnknownReason::UpstreamRef { path: path.clone() });
+        let err = dsl_value_to_json(&v).unwrap_err();
+        match err {
+            SerializationError::UnknownNotAllowed {
+                reason: UnknownReason::UpstreamRef { path: p },
+                context: SerializationContext::StateWriteback,
+            } => assert_eq!(p, path),
+            other => {
+                panic!("expected UnknownNotAllowed/UpstreamRef/StateWriteback, got: {other:?}")
+            }
+        }
+    }
+
+    /// `Value::ResourceRef` keeps its existing `Ok(None)` skip semantic.
+    #[test]
+    fn resource_ref_returns_ok_none() {
+        let v = Value::ResourceRef {
+            path: AccessPath::with_fields("net", "vpc", vec!["vpc_id".into()]),
+        };
+        assert!(matches!(dsl_value_to_json(&v), Ok(None)));
     }
 }

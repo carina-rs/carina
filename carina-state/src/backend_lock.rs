@@ -42,16 +42,22 @@ pub struct BackendLock {
 
 impl BackendLock {
     /// Build a lock snapshot from the current backend configuration.
-    pub fn from_config(config: &BackendConfig) -> Self {
+    ///
+    /// Returns `Err` if any backend attribute holds a `Value::Unknown`
+    /// — backend configurations cannot reference unresolved upstream
+    /// values (RFC #2371 stage 4).
+    pub fn from_config(
+        config: &BackendConfig,
+    ) -> Result<Self, carina_core::value::SerializationError> {
         let attributes = config
             .attributes
             .iter()
-            .map(|(k, v)| (k.clone(), value_to_json(v)))
-            .collect();
-        Self {
+            .map(|(k, v)| value_to_json(v).map(|jv| (k.clone(), jv)))
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        Ok(Self {
             backend_type: config.backend_type.clone(),
             attributes,
-        }
+        })
     }
 
     /// Build a lock snapshot representing the implicit local backend that
@@ -144,23 +150,23 @@ impl BackendLock {
 
 /// Convert a `carina_core::resource::Value` into a `serde_json::Value`
 /// for persistence in the lock file. Only scalar types are expected in
-/// backend configurations, but complex types fall back to `null`.
-fn value_to_json(value: &carina_core::resource::Value) -> serde_json::Value {
+/// backend configurations; complex types fall back to `null`. A
+/// `Value::Unknown` produces `Err` because backend configurations
+/// cannot reference unresolved upstream values.
+fn value_to_json(
+    value: &carina_core::resource::Value,
+) -> Result<serde_json::Value, carina_core::value::SerializationError> {
     use carina_core::resource::Value;
+    use carina_core::value::{SerializationContext, SerializationError};
     match value {
-        Value::String(s) => serde_json::Value::String(s.clone()),
-        Value::Bool(b) => serde_json::Value::Bool(*b),
-        Value::Int(i) => serde_json::Value::Number((*i).into()),
-        // RFC #2371: `Value::Unknown` is plan-display only and must
-        // never reach a state file. The wildcard below would silently
-        // map it to `null`; reject explicitly so a stage-2/3 producer
-        // bug surfaces here instead of silently corrupting the lock.
-        Value::Unknown(_) => {
-            unimplemented!(
-                "Value::Unknown reached a stage-4 serialization boundary; the producer should have stripped or resolved it (RFC #2371)"
-            )
-        }
-        _ => serde_json::Value::Null,
+        Value::String(s) => Ok(serde_json::Value::String(s.clone())),
+        Value::Bool(b) => Ok(serde_json::Value::Bool(*b)),
+        Value::Int(i) => Ok(serde_json::Value::Number((*i).into())),
+        Value::Unknown(reason) => Err(SerializationError::UnknownNotAllowed {
+            reason: reason.clone(),
+            context: SerializationContext::BackendLock,
+        }),
+        _ => Ok(serde_json::Value::Null),
     }
 }
 
@@ -183,7 +189,7 @@ mod tests {
     #[test]
     fn from_config_captures_type_and_attributes() {
         let config = make_config("my-bucket", "us-east-1");
-        let lock = BackendLock::from_config(&config);
+        let lock = BackendLock::from_config(&config).unwrap();
         assert_eq!(lock.backend_type, "s3");
         assert_eq!(
             lock.attributes.get("bucket"),
@@ -194,7 +200,7 @@ mod tests {
     #[test]
     fn lock_roundtrip_via_disk() {
         let tmp = tempfile::tempdir().unwrap();
-        let lock = BackendLock::from_config(&make_config("b", "us-east-1"));
+        let lock = BackendLock::from_config(&make_config("b", "us-east-1")).unwrap();
         lock.save(tmp.path()).unwrap();
         let loaded = BackendLock::load(tmp.path()).unwrap().unwrap();
         assert_eq!(lock, loaded);
@@ -209,7 +215,7 @@ mod tests {
     #[test]
     fn lock_saves_to_project_root() {
         let tmp = tempfile::tempdir().unwrap();
-        let lock = BackendLock::from_config(&make_config("b", "us-east-1"));
+        let lock = BackendLock::from_config(&make_config("b", "us-east-1")).unwrap();
         lock.save(tmp.path()).unwrap();
         // Should be at root, not in .carina/
         assert!(tmp.path().join("carina-backend.lock").exists());
@@ -219,7 +225,7 @@ mod tests {
     #[test]
     fn load_migrates_from_legacy_path() {
         let tmp = tempfile::tempdir().unwrap();
-        let lock = BackendLock::from_config(&make_config("b", "us-east-1"));
+        let lock = BackendLock::from_config(&make_config("b", "us-east-1")).unwrap();
         // Write to legacy path
         let legacy_dir = tmp.path().join(".carina");
         std::fs::create_dir_all(&legacy_dir).unwrap();
@@ -233,8 +239,8 @@ mod tests {
     #[test]
     fn new_path_takes_precedence_over_legacy() {
         let tmp = tempfile::tempdir().unwrap();
-        let old_lock = BackendLock::from_config(&make_config("old-bucket", "us-east-1"));
-        let new_lock = BackendLock::from_config(&make_config("new-bucket", "us-east-1"));
+        let old_lock = BackendLock::from_config(&make_config("old-bucket", "us-east-1")).unwrap();
+        let new_lock = BackendLock::from_config(&make_config("new-bucket", "us-east-1")).unwrap();
         // Write old to legacy, new to root
         let legacy_dir = tmp.path().join(".carina");
         std::fs::create_dir_all(&legacy_dir).unwrap();
@@ -251,8 +257,8 @@ mod tests {
 
     #[test]
     fn detects_bucket_change() {
-        let a = BackendLock::from_config(&make_config("old-bucket", "us-east-1"));
-        let b = BackendLock::from_config(&make_config("new-bucket", "us-east-1"));
+        let a = BackendLock::from_config(&make_config("old-bucket", "us-east-1")).unwrap();
+        let b = BackendLock::from_config(&make_config("new-bucket", "us-east-1")).unwrap();
         assert_ne!(a, b);
         let diff = a.describe_diff(&b);
         assert!(diff.contains("bucket"));
@@ -262,8 +268,8 @@ mod tests {
 
     #[test]
     fn equal_configs_do_not_differ() {
-        let a = BackendLock::from_config(&make_config("b", "us-east-1"));
-        let b = BackendLock::from_config(&make_config("b", "us-east-1"));
+        let a = BackendLock::from_config(&make_config("b", "us-east-1")).unwrap();
+        let b = BackendLock::from_config(&make_config("b", "us-east-1")).unwrap();
         assert_eq!(a, b);
     }
 
@@ -272,7 +278,7 @@ mod tests {
         let local = BackendLock::local_default();
         assert_eq!(local.backend_type, "local");
         assert!(local.attributes.is_empty());
-        let s3 = BackendLock::from_config(&make_config("b", "us-east-1"));
+        let s3 = BackendLock::from_config(&make_config("b", "us-east-1")).unwrap();
         assert_ne!(local, s3);
         let diff = local.describe_diff(&s3);
         assert!(diff.contains("backend type"));
@@ -280,16 +286,25 @@ mod tests {
         assert!(diff.contains("s3"));
     }
 
-    /// RFC #2371 contract pin: `value_to_json` panics on
-    /// `Value::Unknown`. Backend lock files must never carry the
-    /// variant (constraint b); a future change that swaps for a silent
-    /// fallback would re-introduce v1-style corruption.
+    /// RFC #2371 stage 4 contract pin: `value_to_json` returns
+    /// `Err(SerializationError::UnknownNotAllowed)` for `Value::Unknown`.
+    /// Backend lock files must never carry the variant (constraint b);
+    /// a silent fallback would re-introduce v1-style corruption.
     #[test]
-    #[should_panic(expected = "Value::Unknown")]
-    fn unknown_panics_in_value_to_json() {
+    fn unknown_returns_err_in_value_to_json() {
         use carina_core::resource::{AccessPath, UnknownReason, Value};
+        use carina_core::value::{SerializationContext, SerializationError};
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-        let v = Value::Unknown(UnknownReason::UpstreamRef { path });
-        let _ = value_to_json(&v);
+        let v = Value::Unknown(UnknownReason::UpstreamRef { path: path.clone() });
+        let err = value_to_json(&v).unwrap_err();
+        match err {
+            SerializationError::UnknownNotAllowed {
+                reason: UnknownReason::UpstreamRef { path: p },
+                context: SerializationContext::BackendLock,
+            } => {
+                assert_eq!(p, path);
+            }
+            other => panic!("expected UnknownNotAllowed/UpstreamRef/BackendLock, got: {other:?}"),
+        }
     }
 }
