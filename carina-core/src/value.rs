@@ -68,6 +68,36 @@ pub enum SerializationError {
         value: f64,
         context: SerializationContext,
     },
+    /// A `Value::ResourceRef` reached a serialization boundary that
+    /// expected a concrete value. Resolvers must substitute the
+    /// reference before this point. Reaching this arm at apply-time
+    /// state writeback or plan-file write is a resolver bug.
+    ///
+    /// `path` is stored as a pre-formatted `String` rather than the
+    /// structured `AccessPath` (cf. `UnknownReason::UpstreamRef`)
+    /// because `SerializationError` is terminating diagnostic data
+    /// consumed only via `Display`; programmatic path inspection has
+    /// no callers today. Lift to `AccessPath` if a future caller needs
+    /// it.
+    #[error("cannot serialize at {context}: unresolved reference {path}")]
+    UnresolvedResourceRef {
+        path: String,
+        context: SerializationContext,
+    },
+    /// A `Value::Interpolation` reached a serialization boundary. The
+    /// canonicalize pass should collapse interpolations to a `String`
+    /// once all parts resolve; reaching this arm means a part stayed
+    /// unresolved through apply-time export resolution.
+    #[error("cannot serialize at {context}: unresolved interpolation")]
+    UnresolvedInterpolation { context: SerializationContext },
+    /// A `Value::FunctionCall` reached a serialization boundary. The
+    /// resolver should evaluate the function (built-in or user-defined)
+    /// before this point; reaching this arm is a resolver bug.
+    #[error("cannot serialize at {context}: unresolved function call {name}(...)")]
+    UnresolvedFunctionCall {
+        name: String,
+        context: SerializationContext,
+    },
 }
 
 impl std::fmt::Display for UnknownReason {
@@ -201,28 +231,17 @@ pub fn value_to_json_with_context(
                 .collect();
             Ok(serde_json::Value::Object(obj?))
         }
-        Value::ResourceRef { path } => Ok(serde_json::Value::String(format!(
-            "${{{}}}",
-            path.to_dot_string()
-        ))),
-        Value::Interpolation(parts) => {
-            let s = parts
-                .iter()
-                .map(|p| match p {
-                    InterpolationPart::Literal(s) => s.clone(),
-                    InterpolationPart::Expr(v) => format_value(v),
-                })
-                .collect::<String>();
-            Ok(serde_json::Value::String(s))
+        Value::ResourceRef { path } => Err(SerializationError::UnresolvedResourceRef {
+            path: path.to_dot_string(),
+            context: ctx,
+        }),
+        Value::Interpolation(_) => {
+            Err(SerializationError::UnresolvedInterpolation { context: ctx })
         }
-        Value::FunctionCall { name, args } => {
-            let arg_strs: Vec<_> = args.iter().map(format_value).collect();
-            Ok(serde_json::Value::String(format!(
-                "{}({})",
-                name,
-                arg_strs.join(", ")
-            )))
-        }
+        Value::FunctionCall { name, .. } => Err(SerializationError::UnresolvedFunctionCall {
+            name: name.clone(),
+            context: ctx,
+        }),
         Value::Secret(inner) => {
             let inner_json = value_to_json_with_context(inner, context)?;
             // `serde_json::Value -> String` only fails on a custom
@@ -790,9 +809,64 @@ mod tests {
     }
 
     #[test]
-    fn test_value_to_json_resource_ref() {
+    fn test_value_to_json_resource_ref_returns_err() {
+        // RFC #2371 #2385: `Value::ResourceRef` reaching JSON
+        // serialization is a resolver bug — surface as a structured
+        // `UnresolvedResourceRef` Err instead of the legacy
+        // `"${vpc.id}"` debug-string fallback.
         let v = Value::resource_ref("vpc", "id", vec![]);
-        assert_eq!(value_to_json(&v).unwrap(), serde_json::json!("${vpc.id}"));
+        let err = value_to_json(&v).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                SerializationError::UnresolvedResourceRef {
+                    path,
+                    context: SerializationContext::ValueToJson,
+                } if path == "vpc.id"
+            ),
+            "expected UnresolvedResourceRef/vpc.id/ValueToJson, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_value_to_json_interpolation_returns_err() {
+        // RFC #2371 #2386: `Value::Interpolation` reaching JSON
+        // serialization is a canonicalize / resolver bug — surface as
+        // `UnresolvedInterpolation` instead of producing a partial
+        // string with embedded debug formatting.
+        let v = Value::Interpolation(vec![InterpolationPart::Literal("hello".into())]);
+        let err = value_to_json(&v).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                SerializationError::UnresolvedInterpolation {
+                    context: SerializationContext::ValueToJson,
+                }
+            ),
+            "expected UnresolvedInterpolation/ValueToJson, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_value_to_json_function_call_returns_err() {
+        // RFC #2371 #2386: `Value::FunctionCall` reaching JSON
+        // serialization is a resolver bug — the function should have
+        // been evaluated by this point.
+        let v = Value::FunctionCall {
+            name: "join".into(),
+            args: vec![],
+        };
+        let err = value_to_json(&v).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                SerializationError::UnresolvedFunctionCall {
+                    name,
+                    context: SerializationContext::ValueToJson,
+                } if name == "join"
+            ),
+            "expected UnresolvedFunctionCall/join/ValueToJson, got: {err:?}"
+        );
     }
 
     #[test]
@@ -1002,15 +1076,20 @@ mod tests {
     }
 
     #[test]
-    fn test_value_to_json_resource_ref_with_field_path() {
+    fn test_value_to_json_resource_ref_with_field_path_returns_err() {
         let v = Value::resource_ref(
             "web",
             "output",
             vec!["network".to_string(), "vpc_id".to_string()],
         );
-        assert_eq!(
-            value_to_json(&v).unwrap(),
-            serde_json::json!("${web.output.network.vpc_id}")
+        let err = value_to_json(&v).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                SerializationError::UnresolvedResourceRef { path, .. }
+                    if path == "web.output.network.vpc_id"
+            ),
+            "expected UnresolvedResourceRef/web.output.network.vpc_id, got: {err:?}"
         );
     }
 

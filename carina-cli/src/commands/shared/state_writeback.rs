@@ -113,17 +113,18 @@ pub(crate) fn resolve_exports(
 ///
 /// Returns:
 /// - `Ok(Some(json))` for a representable concrete value
-/// - `Ok(None)` for variants that have no JSON representation in
-///   exports (`ResourceRef`, `Interpolation`, etc.) — the caller
-///   filters these out
-/// - `Err(SerializationError)` for `Value::Unknown`, so apply-time
-///   export resolution surfaces an actionable error rather than
-///   silently dropping or panicking.
+/// - `Ok(None)` for `Value::Secret` (state.exports must not embed
+///   plaintext secrets, so exports of secret-typed values are skipped)
+/// - `Err(SerializationError)` for variants that should not have
+///   reached this boundary — the resolver / canonicalize / for-expand
+///   pass should have eliminated them. Surfacing as Err names the
+///   specific resolver bug instead of silently losing the export.
 pub(crate) fn dsl_value_to_json(
     value: &carina_core::resource::Value,
 ) -> Result<Option<serde_json::Value>, carina_core::value::SerializationError> {
     use carina_core::resource::Value;
     use carina_core::value::{SerializationContext, SerializationError};
+    let ctx = SerializationContext::StateWriteback;
     match value {
         Value::String(s) => Ok(Some(serde_json::Value::String(s.clone()))),
         Value::Bool(b) => Ok(Some(serde_json::Value::Bool(*b))),
@@ -150,9 +151,20 @@ pub(crate) fn dsl_value_to_json(
         }
         Value::Unknown(reason) => Err(SerializationError::UnknownNotAllowed {
             reason: reason.clone(),
-            context: SerializationContext::StateWriteback,
+            context: ctx,
         }),
-        _ => Ok(None), // ResourceRef, Null, etc. — skip
+        Value::ResourceRef { path } => Err(SerializationError::UnresolvedResourceRef {
+            path: path.to_dot_string(),
+            context: ctx,
+        }),
+        Value::Interpolation(_) => {
+            Err(SerializationError::UnresolvedInterpolation { context: ctx })
+        }
+        Value::FunctionCall { name, .. } => Err(SerializationError::UnresolvedFunctionCall {
+            name: name.clone(),
+            context: ctx,
+        }),
+        Value::Secret(_) => Ok(None),
     }
 }
 
@@ -330,12 +342,71 @@ mod stage4_unknown_err_tests {
         }
     }
 
-    /// `Value::ResourceRef` keeps its existing `Ok(None)` skip semantic.
+    /// `Value::ResourceRef` reaching apply-time export resolution
+    /// is a resolver bug — surface as `UnresolvedResourceRef` instead
+    /// of silently dropping the export. (#2385)
     #[test]
-    fn resource_ref_returns_ok_none() {
+    fn resource_ref_returns_unresolved_err() {
         let v = Value::ResourceRef {
             path: AccessPath::with_fields("net", "vpc", vec!["vpc_id".into()]),
         };
+        let err = dsl_value_to_json(&v).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                SerializationError::UnresolvedResourceRef {
+                    path,
+                    context: SerializationContext::StateWriteback,
+                } if path == "net.vpc.vpc_id"
+            ),
+            "expected UnresolvedResourceRef/net.vpc.vpc_id/StateWriteback, got: {err:?}"
+        );
+    }
+
+    /// `Value::Interpolation` reaching apply-time is a resolver /
+    /// canonicalize bug — surface as `UnresolvedInterpolation`. (#2386)
+    #[test]
+    fn interpolation_returns_unresolved_err() {
+        use carina_core::resource::InterpolationPart;
+        let v = Value::Interpolation(vec![InterpolationPart::Literal("x".into())]);
+        let err = dsl_value_to_json(&v).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                SerializationError::UnresolvedInterpolation {
+                    context: SerializationContext::StateWriteback,
+                }
+            ),
+            "expected UnresolvedInterpolation/StateWriteback, got: {err:?}"
+        );
+    }
+
+    /// `Value::FunctionCall` reaching apply-time is a resolver bug —
+    /// surface as `UnresolvedFunctionCall`. (#2386)
+    #[test]
+    fn function_call_returns_unresolved_err() {
+        let v = Value::FunctionCall {
+            name: "join".into(),
+            args: vec![],
+        };
+        let err = dsl_value_to_json(&v).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                SerializationError::UnresolvedFunctionCall {
+                    name,
+                    context: SerializationContext::StateWriteback,
+                } if name == "join"
+            ),
+            "expected UnresolvedFunctionCall/join/StateWriteback, got: {err:?}"
+        );
+    }
+
+    /// `Value::Secret` continues to be skipped silently — exports must
+    /// not embed plaintext secrets in state.
+    #[test]
+    fn secret_returns_ok_none() {
+        let v = Value::Secret(Box::new(Value::String("password".into())));
         assert!(matches!(dsl_value_to_json(&v), Ok(None)));
     }
 }

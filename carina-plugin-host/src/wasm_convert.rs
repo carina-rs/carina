@@ -23,17 +23,19 @@ use crate::wasm_bindings::carina::provider::types as wit;
 /// List and Map values are serialized to JSON strings because WIT does
 /// not support recursive types.
 ///
-/// Returns `Err(SerializationError)` for `Value::Unknown` (RFC #2371
-/// stage 4) — `PlanPreprocessor::strip_unknown_attributes` must remove
-/// it before reaching this boundary.
+/// Returns `Err(SerializationError)` for `Value::Unknown` —
+/// `PlanPreprocessor::strip_unknown_attributes` must remove it before
+/// reaching this boundary.
 ///
 /// `ResourceRef`, `Interpolation`, `FunctionCall`, and `Secret` variants
-/// are stringified via `format!("{v:?}")` as a fallback. Managed-to-
-/// managed refs (e.g. `admins.group_id`) are *expected* to be unresolved
-/// at plan time — they get resolved at apply time by the executor.
-/// Data source refs are resolved during refresh phase 2 (#1683); if one
-/// slips through, the provider receives a debug string that will fail
-/// at the remote API with a clear error.
+/// fall back to `format!("{v:?}")`. The fallback is *intentional* for
+/// managed-to-managed refs (e.g. `admins.group_id`) — those genuinely
+/// arrive unresolved at plan time and get resolved by the executor at
+/// apply time. Data source refs are resolved during refresh phase 2
+/// (#1683). The asymmetry with `Value::Unknown` (which is stripped
+/// before this point) is tracked by #2387 — extending the strip-and-
+/// restore pass to `ResourceRef` will let this fallback become an
+/// `UnresolvedResourceRef` Err too.
 pub fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, SerializationError> {
     match v {
         CoreValue::String(s) => Ok(wit::Value::StrVal(s.clone())),
@@ -93,8 +95,10 @@ pub fn wit_to_core_value(v: &wit::Value) -> CoreValue {
 
 /// Helper: convert a core Value to a serde_json::Value for JSON
 /// encoding inside the WIT-string fallback for List/Map. Returns
-/// `Err` for `Value::Unknown` (RFC #2371 stage 4) — sibling contract
-/// to `core_to_wit_value`.
+/// `Err` for `Value::Unknown`; falls back to `format!("{v:?}")` for
+/// `ResourceRef`/`Interpolation`/`FunctionCall`/`Secret` for the same
+/// reason as `core_to_wit_value` — see that function's doc and #2387
+/// for the planned tightening.
 fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationError> {
     match v {
         CoreValue::String(s) => Ok(serde_json::Value::String(s.clone())),
