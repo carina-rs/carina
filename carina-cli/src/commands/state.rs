@@ -767,7 +767,7 @@ pub(crate) async fn run_state_refresh_locked(
         state.exports = crate::commands::shared::state_writeback::resolve_exports(
             &parsed.export_params,
             &state,
-        );
+        )?;
     }
 
     // Save state (with or without lock validation)
@@ -1064,7 +1064,7 @@ async fn run_state_migrate(
 
     // Update the backend lock so subsequent plan/apply runs don't report a
     // "backend changed" error.
-    let new_lock = carina_state::BackendLock::from_config(&remote_state_config);
+    let new_lock = carina_state::BackendLock::from_config(&remote_state_config)?;
     new_lock.save(base_dir).map_err(AppError::Backend)?;
     println!("  {} updated backend lock", "✓".green());
 

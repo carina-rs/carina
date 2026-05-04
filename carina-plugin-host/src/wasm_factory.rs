@@ -1104,7 +1104,8 @@ impl WasmProviderFactory {
         } else {
             create_instance(&self.engine, &self.component).await?
         };
-        let wit_attrs = wasm_convert::core_to_wit_value_map(attributes);
+        let wit_attrs =
+            wasm_convert::core_to_wit_value_map(attributes).map_err(|e| e.to_string())?;
         bindings
             .call_initialize(&mut store, &wit_attrs)
             .await
@@ -1178,7 +1179,8 @@ impl ProviderFactory for WasmProviderFactory {
     }
 
     fn validate_config(&self, attributes: &IndexMap<String, Value>) -> Result<(), String> {
-        let wit_attrs = wasm_convert::core_to_wit_value_map(attributes);
+        let wit_attrs =
+            wasm_convert::core_to_wit_value_map(attributes).map_err(|e| e.to_string())?;
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
@@ -1332,7 +1334,10 @@ impl Provider for WasmProvider {
     }
 
     fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-        let wit_resource = wasm_convert::core_to_wit_resource(resource);
+        let wit_resource = match wasm_convert::core_to_wit_resource(resource) {
+            Ok(v) => v,
+            Err(e) => return Box::pin(async move { Err(ProviderError::new(e.to_string())) }),
+        };
         let id = resource.id.clone();
         Box::pin(async move {
             let mut store = self.instance.store.lock().await;
@@ -1362,7 +1367,10 @@ impl Provider for WasmProvider {
     }
 
     fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-        let wit_resource = wasm_convert::core_to_wit_resource(resource);
+        let wit_resource = match wasm_convert::core_to_wit_resource(resource) {
+            Ok(v) => v,
+            Err(e) => return Box::pin(async move { Err(ProviderError::new(e.to_string())) }),
+        };
         let id = resource.id.clone();
         Box::pin(async move {
             let mut store = self.instance.store.lock().await;
@@ -1400,8 +1408,14 @@ impl Provider for WasmProvider {
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let wit_id = wasm_convert::core_to_wit_resource_id(id);
         let identifier = identifier.to_string();
-        let wit_from = wasm_convert::core_to_wit_state(from);
-        let wit_to = wasm_convert::core_to_wit_resource(to);
+        let wit_from = match wasm_convert::core_to_wit_state(from) {
+            Ok(v) => v,
+            Err(e) => return Box::pin(async move { Err(ProviderError::new(e.to_string())) }),
+        };
+        let wit_to = match wasm_convert::core_to_wit_resource(to) {
+            Ok(v) => v,
+            Err(e) => return Box::pin(async move { Err(ProviderError::new(e.to_string())) }),
+        };
         let id = id.clone();
         Box::pin(async move {
             let mut store = self.instance.store.lock().await;
@@ -1479,10 +1493,14 @@ unsafe impl Sync for WasmProviderNormalizer {}
 
 impl ProviderNormalizer for WasmProviderNormalizer {
     fn normalize_desired(&self, resources: &mut [Resource]) {
+        // `Value::Unknown` is stripped by
+        // `PlanPreprocessor::strip_unknown_attributes` before this
+        // point; an `Err` here would mean that pass is buggy.
         let wit_resources: Vec<_> = resources
             .iter()
             .map(wasm_convert::core_to_wit_resource)
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .expect("strip_unknown_attributes must run before normalize_desired");
 
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
@@ -1519,9 +1537,15 @@ impl ProviderNormalizer for WasmProviderNormalizer {
     }
 
     fn normalize_state(&self, current_states: &mut HashMap<ResourceId, State>) {
+        // State files only carry concrete post-apply values, never
+        // `Value::Unknown`. An `Err` here means a stage-2 bug.
         let wit_states: Vec<(String, _)> = current_states
             .iter()
-            .map(|(id, state)| (id.to_string(), wasm_convert::core_to_wit_state(state)))
+            .map(|(id, state)| {
+                wasm_convert::core_to_wit_state(state)
+                    .map(|s| (id.to_string(), s))
+                    .expect("state must not carry Value::Unknown")
+            })
             .collect();
 
         let result = tokio::task::block_in_place(|| {
@@ -1554,14 +1578,23 @@ impl ProviderNormalizer for WasmProviderNormalizer {
         current_states: &mut HashMap<ResourceId, State>,
         saved_attrs: &SavedAttrs,
     ) {
+        // Both inputs are post-apply (concrete) values.
         let wit_states: Vec<(String, _)> = current_states
             .iter()
-            .map(|(id, state)| (id.to_string(), wasm_convert::core_to_wit_state(state)))
+            .map(|(id, state)| {
+                wasm_convert::core_to_wit_state(state)
+                    .map(|s| (id.to_string(), s))
+                    .expect("state must not carry Value::Unknown")
+            })
             .collect();
 
         let wit_saved: Vec<(String, Vec<(String, _)>)> = saved_attrs
             .iter()
-            .map(|(id, attrs)| (id.to_string(), wasm_convert::core_to_wit_value_map(attrs)))
+            .map(|(id, attrs)| {
+                wasm_convert::core_to_wit_value_map(attrs)
+                    .map(|v| (id.to_string(), v))
+                    .expect("saved attrs must not carry Value::Unknown")
+            })
             .collect();
 
         let result = tokio::task::block_in_place(|| {

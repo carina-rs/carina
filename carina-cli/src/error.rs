@@ -39,6 +39,12 @@ impl From<&str> for AppError {
     }
 }
 
+impl From<carina_core::value::SerializationError> for AppError {
+    fn from(e: carina_core::value::SerializationError) -> Self {
+        AppError::Config(e.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

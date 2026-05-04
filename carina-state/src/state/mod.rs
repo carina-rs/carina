@@ -533,7 +533,8 @@ impl ResourceState {
         );
         rs.identifier = state.identifier.clone();
         for (k, v) in &state.attributes {
-            rs.attributes.insert(k.clone(), value_to_json(v)?);
+            rs.attributes
+                .insert(k.clone(), value_to_json(v).map_err(|e| e.to_string())?);
         }
         // For secret attributes, override the provider-returned plain value
         // with the Argon2id hash. The provider returns the actual value (since
@@ -548,12 +549,14 @@ impl ResourceState {
                 if let Some(provider_json) = rs.attributes.get(k).cloned() {
                     rs.attributes.insert(
                         k.clone(),
-                        merge_secrets_into_provider_json(v, &provider_json, Some(&ctx))?,
+                        merge_secrets_into_provider_json(v, &provider_json, Some(&ctx))
+                            .map_err(|e| e.to_string())?,
                     );
                 } else {
                     rs.attributes.insert(
                         k.clone(),
-                        carina_core::value::value_to_json_with_context(v, Some(&ctx))?,
+                        carina_core::value::value_to_json_with_context(v, Some(&ctx))
+                            .map_err(|e| e.to_string())?,
                     );
                 }
             }

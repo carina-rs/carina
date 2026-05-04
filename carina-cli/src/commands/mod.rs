@@ -48,7 +48,7 @@ pub fn check_backend_lock(
     let current = match backend_config {
         Some(config) => {
             let state_config = StateBackendConfig::from(config);
-            BackendLock::from_config(&state_config)
+            BackendLock::from_config(&state_config)?
         }
         None => BackendLock::local_default(),
     };
@@ -105,7 +105,7 @@ pub fn ensure_backend_lock(
     let lock = match backend_config {
         Some(config) => {
             let state_config = StateBackendConfig::from(config);
-            BackendLock::from_config(&state_config)
+            BackendLock::from_config(&state_config)?
         }
         None => BackendLock::local_default(),
     };

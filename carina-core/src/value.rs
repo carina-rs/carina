@@ -4,9 +4,91 @@ use std::collections::HashMap;
 
 use argon2::Argon2;
 use indexmap::IndexMap;
+use thiserror::Error;
 
 use crate::resource::{InterpolationPart, UnknownReason, Value};
 use crate::utils::{convert_enum_value, is_dsl_enum_format};
+
+/// Where in the pipeline a `Value` is being serialized. Used so the
+/// caller of a failing serialization (e.g. `--out plan.json`) can
+/// tell the user *which* boundary refused the value, not just that
+/// some boundary did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SerializationContext {
+    /// JSON conversion of a `Value` (the shared helper used by both
+    /// the plan-file write path and arbitrary callers).
+    ValueToJson,
+    /// Recursive secret-redaction walk over a `Value` tree.
+    SecretRedaction,
+    /// State backend write path (after apply).
+    StateWriteback,
+    /// Backend lock JSON.
+    BackendLock,
+    /// WASM provider boundary (`core_to_wit_value` and the JSON
+    /// fallback used to inspect provider input/output).
+    WasmBoundary,
+}
+
+impl std::fmt::Display for SerializationContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ValueToJson => write!(f, "JSON conversion"),
+            Self::SecretRedaction => write!(f, "secret redaction"),
+            Self::StateWriteback => write!(f, "state writeback"),
+            Self::BackendLock => write!(f, "backend lock"),
+            Self::WasmBoundary => write!(f, "WASM provider boundary"),
+        }
+    }
+}
+
+/// Error produced when a `Value` cannot be serialized for transport
+/// out of the planner (provider/state/plan-file).
+///
+/// The `UnknownNotAllowed` variant carries the structured
+/// [`UnknownReason`] (rather than a stringified rendition) so the
+/// top-level CLI handler can build an actionable diagnostic — e.g.
+/// it can mention the specific upstream path or the for-binding kind
+/// that produced the placeholder, without re-parsing a flattened
+/// message string.
+#[derive(Debug, Error)]
+pub enum SerializationError {
+    /// A `Value::Unknown` reached a serialization boundary. Producers
+    /// must strip / resolve it before this point — see
+    /// `PlanPreprocessor::strip_unknown_attributes` for the WASM
+    /// boundary stripping pass.
+    #[error("cannot serialize at {context}: value is not yet known ({reason})")]
+    UnknownNotAllowed {
+        reason: UnknownReason,
+        context: SerializationContext,
+    },
+    /// A non-finite float (`NaN`, `±∞`) reached JSON serialization.
+    /// JSON has no representation for these.
+    #[error("cannot serialize at {context}: non-finite float {value}")]
+    NonFiniteFloat {
+        value: f64,
+        context: SerializationContext,
+    },
+    /// `serde_json` reported a serialization failure on a sub-value.
+    /// Currently only reachable when hashing a `Value::Secret`.
+    #[error("cannot serialize at {context}: {message}")]
+    SerdeJson {
+        message: String,
+        context: SerializationContext,
+    },
+}
+
+impl std::fmt::Display for UnknownReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UnknownReason::UpstreamRef { path } => {
+                write!(f, "upstream value {}", path.to_dot_string())
+            }
+            UnknownReason::ForKey => write!(f, "deferred for-binding key"),
+            UnknownReason::ForIndex => write!(f, "deferred for-binding index"),
+            UnknownReason::ForValue => write!(f, "deferred for-binding value"),
+        }
+    }
+}
 
 /// Render an `UnknownReason` to its plan-display string.
 pub fn render_unknown(reason: &UnknownReason) -> String {
@@ -86,7 +168,7 @@ pub(crate) fn argon2id_hash(input: &[u8], context: Option<&SecretHashContext>) -
 ///
 /// For `Value::Secret`, uses the fallback salt. Use `value_to_json_with_context`
 /// to provide resource context for deterministic context-specific salt.
-pub fn value_to_json(value: &Value) -> Result<serde_json::Value, String> {
+pub fn value_to_json(value: &Value) -> Result<serde_json::Value, SerializationError> {
     value_to_json_with_context(value, None)
 }
 
@@ -98,13 +180,17 @@ pub fn value_to_json(value: &Value) -> Result<serde_json::Value, String> {
 pub fn value_to_json_with_context(
     value: &Value,
     context: Option<&SecretHashContext>,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, SerializationError> {
+    let ctx = SerializationContext::ValueToJson;
     match value {
         Value::String(s) => Ok(serde_json::Value::String(s.clone())),
         Value::Int(n) => Ok(serde_json::Value::Number((*n).into())),
         Value::Float(f) => {
-            let num = serde_json::Number::from_f64(*f)
-                .ok_or_else(|| format!("cannot convert non-finite float {f} to JSON"))?;
+            let num =
+                serde_json::Number::from_f64(*f).ok_or(SerializationError::NonFiniteFloat {
+                    value: *f,
+                    context: ctx,
+                })?;
             Ok(serde_json::Value::Number(num))
         }
         Value::Bool(b) => Ok(serde_json::Value::Bool(*b)),
@@ -146,18 +232,20 @@ pub fn value_to_json_with_context(
         }
         Value::Secret(inner) => {
             let inner_json = value_to_json_with_context(inner, context)?;
-            let json_str = serde_json::to_string(&inner_json)
-                .map_err(|e| format!("failed to serialize secret inner value: {e}"))?;
+            let json_str =
+                serde_json::to_string(&inner_json).map_err(|e| SerializationError::SerdeJson {
+                    message: format!("failed to serialize secret inner value: {e}"),
+                    context: ctx,
+                })?;
             let hash_hex = argon2id_hash(json_str.as_bytes(), context);
             Ok(serde_json::Value::String(format!(
                 "{SECRET_PREFIX}{hash_hex}",
             )))
         }
-        Value::Unknown(_) => {
-            unimplemented!(
-                "Value::Unknown reached a stage-4 serialization boundary; the producer should have stripped or resolved it (RFC #2371)"
-            )
-        }
+        Value::Unknown(reason) => Err(SerializationError::UnknownNotAllowed {
+            reason: reason.clone(),
+            context: ctx,
+        }),
     }
 }
 
@@ -284,7 +372,7 @@ pub fn merge_secrets_into_provider_json(
     desired: &Value,
     provider_json: &serde_json::Value,
     context: Option<&SecretHashContext>,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, SerializationError> {
     match desired {
         Value::Secret(_) => value_to_json_with_context(desired, context),
         Value::Map(desired_map) => {
@@ -349,77 +437,85 @@ pub fn merge_secrets_into_provider_json(
 /// secret plaintext is ever written. The hash uses Argon2id with the fallback
 /// salt (not context-aware). This is suitable for plan file serialization where
 /// the goal is redaction, not state comparison.
-pub fn redact_secrets_in_value(value: &Value) -> Value {
+pub fn redact_secrets_in_value(value: &Value) -> Result<Value, SerializationError> {
     match value {
         Value::Secret(inner) => {
-            let inner_json = value_to_json(inner).unwrap_or(serde_json::Value::Null);
-            let json_str = serde_json::to_string(&inner_json).unwrap_or_default();
+            let inner_json = value_to_json(inner)?;
+            let json_str =
+                serde_json::to_string(&inner_json).map_err(|e| SerializationError::SerdeJson {
+                    message: format!("failed to serialize secret inner value: {e}"),
+                    context: SerializationContext::SecretRedaction,
+                })?;
             let hash_hex = argon2id_hash(json_str.as_bytes(), None);
-            Value::String(format!("{SECRET_PREFIX}{hash_hex}"))
+            Ok(Value::String(format!("{SECRET_PREFIX}{hash_hex}")))
         }
         Value::Map(map) => {
-            let redacted: IndexMap<String, Value> = map
+            let redacted: Result<IndexMap<String, Value>, _> = map
                 .iter()
-                .map(|(k, v)| (k.clone(), redact_secrets_in_value(v)))
+                .map(|(k, v)| redact_secrets_in_value(v).map(|rv| (k.clone(), rv)))
                 .collect();
-            Value::Map(redacted)
+            Ok(Value::Map(redacted?))
         }
-        Value::List(items) => Value::List(items.iter().map(redact_secrets_in_value).collect()),
-        // RFC #2371: `Value::Unknown` is plan-display only and must
-        // never reach a serialized output (state file, plan file). The
-        // `other` arm below would silently pass it through; reject
-        // explicitly so a stage-2/3 producer bug surfaces here.
-        Value::Unknown(_) => {
-            unimplemented!(
-                "Value::Unknown reached a stage-4 serialization boundary; the producer should have stripped or resolved it (RFC #2371)"
-            )
+        Value::List(items) => {
+            let redacted: Result<Vec<_>, _> = items.iter().map(redact_secrets_in_value).collect();
+            Ok(Value::List(redacted?))
         }
-        other => other.clone(),
+        Value::Unknown(reason) => Err(SerializationError::UnknownNotAllowed {
+            reason: reason.clone(),
+            context: SerializationContext::SecretRedaction,
+        }),
+        other => Ok(other.clone()),
     }
 }
 
 /// Redact all secrets in an attributes map.
-pub fn redact_secrets_in_attributes(attrs: &HashMap<String, Value>) -> HashMap<String, Value> {
+pub fn redact_secrets_in_attributes(
+    attrs: &HashMap<String, Value>,
+) -> Result<HashMap<String, Value>, SerializationError> {
     attrs
         .iter()
-        .map(|(k, v)| (k.clone(), redact_secrets_in_value(v)))
+        .map(|(k, v)| redact_secrets_in_value(v).map(|rv| (k.clone(), rv)))
         .collect()
 }
 
 /// Redact all secrets in a `Resource`, returning a new Resource with secrets replaced by hashes.
 pub fn redact_secrets_in_resource(
     resource: &crate::resource::Resource,
-) -> crate::resource::Resource {
-    let attributes = resource
+) -> Result<crate::resource::Resource, SerializationError> {
+    let attributes: Result<_, _> = resource
         .attributes
         .iter()
-        .map(|(k, e)| (k.clone(), redact_secrets_in_value(e)))
+        .map(|(k, e)| redact_secrets_in_value(e).map(|rv| (k.clone(), rv)))
         .collect();
-    crate::resource::Resource {
-        attributes,
+    Ok(crate::resource::Resource {
+        attributes: attributes?,
         ..resource.clone()
-    }
+    })
 }
 
 /// Redact all secrets in a `State`, returning a new State with secrets replaced by hashes.
-pub fn redact_secrets_in_state(state: &crate::resource::State) -> crate::resource::State {
-    crate::resource::State {
+pub fn redact_secrets_in_state(
+    state: &crate::resource::State,
+) -> Result<crate::resource::State, SerializationError> {
+    Ok(crate::resource::State {
         id: state.id.clone(),
         identifier: state.identifier.clone(),
-        attributes: redact_secrets_in_attributes(&state.attributes),
+        attributes: redact_secrets_in_attributes(&state.attributes)?,
         exists: state.exists,
         dependency_bindings: state.dependency_bindings.clone(),
-    }
+    })
 }
 
 /// Redact all secrets in an `Effect`, returning a new Effect with secrets replaced by hashes.
-pub fn redact_secrets_in_effect(effect: &crate::effect::Effect) -> crate::effect::Effect {
+pub fn redact_secrets_in_effect(
+    effect: &crate::effect::Effect,
+) -> Result<crate::effect::Effect, SerializationError> {
     use crate::effect::Effect;
-    match effect {
+    Ok(match effect {
         Effect::Read { resource } => Effect::Read {
-            resource: redact_secrets_in_resource(resource),
+            resource: redact_secrets_in_resource(resource)?,
         },
-        Effect::Create(resource) => Effect::Create(redact_secrets_in_resource(resource)),
+        Effect::Create(resource) => Effect::Create(redact_secrets_in_resource(resource)?),
         Effect::Update {
             id,
             from,
@@ -427,8 +523,8 @@ pub fn redact_secrets_in_effect(effect: &crate::effect::Effect) -> crate::effect
             changed_attributes,
         } => Effect::Update {
             id: id.clone(),
-            from: Box::new(redact_secrets_in_state(from)),
-            to: redact_secrets_in_resource(to),
+            from: Box::new(redact_secrets_in_state(from)?),
+            to: redact_secrets_in_resource(to)?,
             changed_attributes: changed_attributes.clone(),
         },
         Effect::Replace {
@@ -442,20 +538,22 @@ pub fn redact_secrets_in_effect(effect: &crate::effect::Effect) -> crate::effect
             cascade_ref_hints,
         } => Effect::Replace {
             id: id.clone(),
-            from: Box::new(redact_secrets_in_state(from)),
-            to: redact_secrets_in_resource(to),
+            from: Box::new(redact_secrets_in_state(from)?),
+            to: redact_secrets_in_resource(to)?,
             lifecycle: lifecycle.clone(),
             changed_create_only: changed_create_only.clone(),
             temporary_name: temporary_name.clone(),
             cascade_ref_hints: cascade_ref_hints.clone(),
             cascading_updates: cascading_updates
                 .iter()
-                .map(|cu| crate::effect::CascadingUpdate {
-                    id: cu.id.clone(),
-                    from: Box::new(redact_secrets_in_state(&cu.from)),
-                    to: redact_secrets_in_resource(&cu.to),
+                .map(|cu| {
+                    Ok::<_, SerializationError>(crate::effect::CascadingUpdate {
+                        id: cu.id.clone(),
+                        from: Box::new(redact_secrets_in_state(&cu.from)?),
+                        to: redact_secrets_in_resource(&cu.to)?,
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, _>>()?,
         },
         Effect::Delete {
             id,
@@ -479,16 +577,18 @@ pub fn redact_secrets_in_effect(effect: &crate::effect::Effect) -> crate::effect
             from: from.clone(),
             to: to.clone(),
         },
-    }
+    })
 }
 
 /// Redact all secrets in a `Plan`, returning a new Plan with secrets replaced by hashes.
-pub fn redact_secrets_in_plan(plan: &crate::plan::Plan) -> crate::plan::Plan {
+pub fn redact_secrets_in_plan(
+    plan: &crate::plan::Plan,
+) -> Result<crate::plan::Plan, SerializationError> {
     let mut redacted = crate::plan::Plan::new();
     for effect in plan.effects() {
-        redacted.add(redact_secrets_in_effect(effect));
+        redacted.add(redact_secrets_in_effect(effect)?);
     }
-    redacted
+    Ok(redacted)
 }
 
 /// Check if a value is a list of maps (list-of-struct)
@@ -590,6 +690,32 @@ mod tests {
         );
     }
 
+    /// `UnknownReason::Display` flows into the user-facing error from
+    /// `format_plan_save_error` / `SerializationError::Display`. Pin
+    /// the wording so a future regression does not silently degrade
+    /// the diagnostic.
+    #[test]
+    fn unknown_reason_display_wording() {
+        use crate::resource::AccessPath;
+        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
+        assert_eq!(
+            format!("{}", UnknownReason::UpstreamRef { path }),
+            "upstream value network.vpc.vpc_id"
+        );
+        assert_eq!(
+            format!("{}", UnknownReason::ForKey),
+            "deferred for-binding key"
+        );
+        assert_eq!(
+            format!("{}", UnknownReason::ForIndex),
+            "deferred for-binding index"
+        );
+        assert_eq!(
+            format!("{}", UnknownReason::ForValue),
+            "deferred for-binding value"
+        );
+    }
+
     #[test]
     fn test_value_to_json_string() {
         let v = Value::String("hello".to_string());
@@ -613,7 +739,7 @@ mod tests {
         let v = Value::Float(f64::NAN);
         let result = value_to_json(&v);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("NaN"));
+        assert!(result.unwrap_err().to_string().contains("NaN"));
     }
 
     #[test]
@@ -621,7 +747,7 @@ mod tests {
         let v = Value::Float(f64::INFINITY);
         let result = value_to_json(&v);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("inf"));
+        assert!(result.unwrap_err().to_string().contains("inf"));
     }
 
     #[test]
@@ -629,7 +755,7 @@ mod tests {
         let v = Value::Float(f64::NEG_INFINITY);
         let result = value_to_json(&v);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("-inf"));
+        assert!(result.unwrap_err().to_string().contains("-inf"));
     }
 
     #[test]
@@ -637,7 +763,7 @@ mod tests {
         let v = Value::List(vec![Value::Int(1), Value::Float(f64::NAN)]);
         let result = value_to_json(&v);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("NaN"));
+        assert!(result.unwrap_err().to_string().contains("NaN"));
     }
 
     #[test]
@@ -647,7 +773,7 @@ mod tests {
         let v = Value::Map(map);
         let result = value_to_json(&v);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("inf"));
+        assert!(result.unwrap_err().to_string().contains("inf"));
     }
 
     #[test]
@@ -841,22 +967,42 @@ mod tests {
         );
     }
 
-    /// RFC #2371 contract pin: serialization boundaries panic on
-    /// `Value::Unknown`. A future change that swaps the arm for a
-    /// silent fallback would re-introduce the v1 corruption bug;
-    /// these `#[should_panic]` tests pin the contract.
+    /// RFC #2371 stage 4 contract pin: serialization boundaries return
+    /// `Err(SerializationError::UnknownNotAllowed { reason })` rather
+    /// than panicking. The `reason` field must round-trip the variant
+    /// passed in so the caller can render an actionable diagnostic.
+    /// A silent fallback (e.g. `Ok(Value::String("Unknown(...)"))`)
+    /// would re-introduce the v1 corruption bug (#2375).
     #[test]
-    #[should_panic(expected = "Value::Unknown")]
-    fn unknown_panics_in_value_to_json() {
+    fn unknown_returns_err_in_value_to_json() {
         let v = Value::Unknown(UnknownReason::ForKey);
-        let _ = value_to_json(&v);
+        let err = value_to_json(&v).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SerializationError::UnknownNotAllowed {
+                    reason: UnknownReason::ForKey,
+                    context: SerializationContext::ValueToJson,
+                }
+            ),
+            "expected UnknownNotAllowed/ForKey/ValueToJson, got: {err:?}"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "Value::Unknown")]
-    fn unknown_panics_in_redact_secrets_in_value() {
+    fn unknown_returns_err_in_redact_secrets_in_value() {
         let v = Value::Unknown(UnknownReason::ForKey);
-        let _ = redact_secrets_in_value(&v);
+        let err = redact_secrets_in_value(&v).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SerializationError::UnknownNotAllowed {
+                    reason: UnknownReason::ForKey,
+                    context: SerializationContext::SecretRedaction,
+                }
+            ),
+            "expected UnknownNotAllowed/ForKey/SecretRedaction, got: {err:?}"
+        );
     }
 
     #[test]
@@ -1066,7 +1212,7 @@ mod tests {
     #[test]
     fn test_redact_secrets_in_value_replaces_secret() {
         let v = Value::Secret(Box::new(Value::String("my-password".to_string())));
-        let redacted = redact_secrets_in_value(&v);
+        let redacted = redact_secrets_in_value(&v).unwrap();
         // Should be a String starting with the secret prefix, not a Secret variant
         match &redacted {
             Value::String(s) => {
@@ -1086,7 +1232,7 @@ mod tests {
     #[test]
     fn test_redact_secrets_in_value_no_plaintext_in_serialized_output() {
         let v = Value::Secret(Box::new(Value::String("super-secret-password".to_string())));
-        let redacted = redact_secrets_in_value(&v);
+        let redacted = redact_secrets_in_value(&v).unwrap();
         let json = serde_json::to_string(&redacted).unwrap();
         assert!(
             !json.contains("super-secret-password"),
@@ -1104,7 +1250,7 @@ mod tests {
             Value::Secret(Box::new(Value::String("s3cret".to_string()))),
         );
         let v = Value::Map(map);
-        let redacted = redact_secrets_in_value(&v);
+        let redacted = redact_secrets_in_value(&v).unwrap();
         let json = serde_json::to_string(&redacted).unwrap();
         assert!(
             !json.contains("s3cret"),
@@ -1124,7 +1270,7 @@ mod tests {
             Value::String("visible".to_string()),
             Value::Secret(Box::new(Value::String("hidden".to_string()))),
         ]);
-        let redacted = redact_secrets_in_value(&v);
+        let redacted = redact_secrets_in_value(&v).unwrap();
         let json = serde_json::to_string(&redacted).unwrap();
         assert!(
             !json.contains("hidden"),
@@ -1137,7 +1283,7 @@ mod tests {
     #[test]
     fn test_redact_secrets_in_value_preserves_non_secret() {
         let v = Value::String("not-a-secret".to_string());
-        let redacted = redact_secrets_in_value(&v);
+        let redacted = redact_secrets_in_value(&v).unwrap();
         assert_eq!(redacted, v);
     }
 
@@ -1149,7 +1295,7 @@ mod tests {
             "password".to_string(),
             Value::Secret(Box::new(Value::String("hunter2".to_string()))),
         );
-        let redacted = redact_secrets_in_attributes(&attrs);
+        let redacted = redact_secrets_in_attributes(&attrs).unwrap();
         let json = serde_json::to_string(&redacted).unwrap();
         assert!(
             !json.contains("hunter2"),
