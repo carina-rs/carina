@@ -204,19 +204,69 @@ Update `format_value_with_key` to render `Value::Unknown` via
 `render_unknown`. Update the two `format_value_with_key`-adjacent
 formatters that previously checked the sentinel.
 
-`unreachable!()` arms added in stage 1 for display and persistence are
+`unimplemented!()` arms added in stage 1 for display and persistence are
 replaced with real handling (display: `render_unknown`; persistence:
-`Err`).
+the existing `unimplemented!()` stays — it is promoted to `Err` in
+stage 4, not stage 2).
 
 `check_no_unresolved_upstream_in_plan` is downsized — it now exists
-only as a defense check that calls into the new persistence-layer
-`Err` path; the recursive Value walk is no longer needed because the
-type system guarantees the encoding cannot leak from a `String`.
+only as a defense check that calls into the persistence-layer
+`unimplemented!()` arms; the recursive Value walk is no longer needed
+because the type system guarantees the encoding cannot leak from a
+`String`.
 
 Existing tests in `carina-cli/src/plan_snapshot_tests.rs`
 (`plan_snapshot_upstream_state_unresolved`,
 `plan_snapshot_upstream_state_empty_exports`) should continue to pass
 unchanged — same display output, different internal representation.
+
+#### Stage 2 also includes the WASM provider boundary (lesson from #2375)
+
+The first stage-2 attempt (issue #2375, abandoned without merging)
+exposed a gap in the original RFC: the WASM provider boundary
+(`carina-plugin-host/src/wasm_convert.rs`) is hit during plan-time
+**`PlanPreprocessor::prepare`**, which calls
+`ProviderNormalizer::normalize_desired` to canonicalize attribute
+shapes. That call chain reaches `core_to_wit_value` — which, after
+stage 2's producer migration, sees `Value::Unknown` for unresolved
+upstream refs even on the plan path.
+
+The original RFC's assumption "providers never see `Value::Unknown`"
+held only for `apply` (where a strict resolver runs). It does **not**
+hold for plan-time normalization. Three options were considered:
+
+1. **Provider-side handling**: pass `Unknown` through `core_to_wit_value`
+   as a placeholder string and let the provider's normalize hook
+   round-trip it. The first attempt at #2375 took this route and it
+   broke the plan display: the provider returns the placeholder as-is
+   in the resource it sends back, so the user sees
+   `vpc_id: "Unknown(UpstreamRef { … debug-format … })"` instead of
+   `(known after upstream apply: …)`. The display layer cannot recover
+   the typed `Value::Unknown` from a string the provider has touched.
+2. **Skip Unknown-bearing resources at the normalize boundary**: omit
+   `Value::Unknown` attributes from the WIT payload, run the provider's
+   normalizer on the remaining attributes, then re-attach the `Unknown`
+   values to the result. This keeps plan-time display correct without
+   exposing the type to the provider plugin.
+3. **Defer the problem to stage 4**: leave the stage-1 `unimplemented!()`
+   arm panicking and treat all `plan` runs against unresolved upstreams
+   as broken until stage 4 lands. Unacceptable — `carina plan` against
+   unresolved upstreams must work as it did under #2367.
+
+Stage 2 takes **option (2)**: the producer migration is paired with a
+`PlanPreprocessor` change that strips `Value::Unknown` from each
+resource's attribute map before `normalize_desired`, runs the
+normalizer on the remaining concrete attributes, then re-merges the
+`Unknown` values into the normalized result. The WASM boundary's
+`Value::Unknown(_) => unimplemented!(...)` arm stays in place — it is
+the type-level guarantee that this preprocessing actually happens.
+
+This is a mechanical refactor in `carina-cli/src/wiring/mod.rs`; the
+provider plugin contract does not change. A regression test that runs
+the existing `upstream_state_unresolved` fixture through
+`PlanPreprocessor::prepare` (or through the real plan path with a
+mock provider) and asserts `Unknown` survives the round trip must be
+added in this stage.
 
 ### Stage 3 — Migrate mechanism #2 (3 siblings)
 
