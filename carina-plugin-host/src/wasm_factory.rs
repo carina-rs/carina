@@ -28,10 +28,29 @@ use carina_core::resource::{
     LifecycleConfig, Resource, ResourceId, State, Value, contains_resource_ref,
 };
 use carina_core::schema::{CompletionValue, ResourceSchema};
+use carina_core::value::SerializationError;
 
 use crate::wasm_bindings::CarinaProvider;
 use crate::wasm_bindings_http::CarinaProviderWithHttp;
 use crate::wasm_convert;
+
+/// Wrap a `SerializationError` from a sync `core_to_wit_*` call site
+/// into the matching async `BoxFuture` shape that `Provider` trait
+/// methods return. Pulls the `e.to_string()` allocation out of the
+/// async block so the future is `'static`.
+fn early_provider_err<T: 'static>(e: SerializationError) -> BoxFuture<'static, ProviderResult<T>> {
+    let msg = e.to_string();
+    Box::pin(async move { Err(ProviderError::new(msg)) })
+}
+
+/// Unwrap a `core_to_wit_*` result that **must** succeed by invariant
+/// (state/saved attrs are post-apply concrete values; normalize_desired
+/// runs after `PlanPreprocessor::strip_unknown_attributes`). Embeds the
+/// failing `SerializationError` in the panic message so a stripping-pass
+/// regression surfaces with the actual `UnknownReason` + context.
+fn expect_no_unknown<T>(r: Result<T, SerializationError>, what: &'static str) -> T {
+    r.unwrap_or_else(|e| panic!("{what} must not see Value::Unknown ({e})"))
+}
 
 // -- HTTP allow-list hooks --
 
@@ -1336,7 +1355,7 @@ impl Provider for WasmProvider {
     fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
         let wit_resource = match wasm_convert::core_to_wit_resource(resource) {
             Ok(v) => v,
-            Err(e) => return Box::pin(async move { Err(ProviderError::new(e.to_string())) }),
+            Err(e) => return early_provider_err(e),
         };
         let id = resource.id.clone();
         Box::pin(async move {
@@ -1369,7 +1388,7 @@ impl Provider for WasmProvider {
     fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
         let wit_resource = match wasm_convert::core_to_wit_resource(resource) {
             Ok(v) => v,
-            Err(e) => return Box::pin(async move { Err(ProviderError::new(e.to_string())) }),
+            Err(e) => return early_provider_err(e),
         };
         let id = resource.id.clone();
         Box::pin(async move {
@@ -1410,11 +1429,11 @@ impl Provider for WasmProvider {
         let identifier = identifier.to_string();
         let wit_from = match wasm_convert::core_to_wit_state(from) {
             Ok(v) => v,
-            Err(e) => return Box::pin(async move { Err(ProviderError::new(e.to_string())) }),
+            Err(e) => return early_provider_err(e),
         };
         let wit_to = match wasm_convert::core_to_wit_resource(to) {
             Ok(v) => v,
-            Err(e) => return Box::pin(async move { Err(ProviderError::new(e.to_string())) }),
+            Err(e) => return early_provider_err(e),
         };
         let id = id.clone();
         Box::pin(async move {
@@ -1493,14 +1512,13 @@ unsafe impl Sync for WasmProviderNormalizer {}
 
 impl ProviderNormalizer for WasmProviderNormalizer {
     fn normalize_desired(&self, resources: &mut [Resource]) {
-        // `Value::Unknown` is stripped by
-        // `PlanPreprocessor::strip_unknown_attributes` before this
-        // point; an `Err` here would mean that pass is buggy.
-        let wit_resources: Vec<_> = resources
-            .iter()
-            .map(wasm_convert::core_to_wit_resource)
-            .collect::<Result<Vec<_>, _>>()
-            .expect("strip_unknown_attributes must run before normalize_desired");
+        let wit_resources: Vec<_> = expect_no_unknown(
+            resources
+                .iter()
+                .map(wasm_convert::core_to_wit_resource)
+                .collect::<Result<Vec<_>, _>>(),
+            "normalize_desired",
+        );
 
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
@@ -1537,14 +1555,12 @@ impl ProviderNormalizer for WasmProviderNormalizer {
     }
 
     fn normalize_state(&self, current_states: &mut HashMap<ResourceId, State>) {
-        // State files only carry concrete post-apply values, never
-        // `Value::Unknown`. An `Err` here means a stage-2 bug.
         let wit_states: Vec<(String, _)> = current_states
             .iter()
             .map(|(id, state)| {
-                wasm_convert::core_to_wit_state(state)
-                    .map(|s| (id.to_string(), s))
-                    .expect("state must not carry Value::Unknown")
+                let wit =
+                    expect_no_unknown(wasm_convert::core_to_wit_state(state), "normalize_state");
+                (id.to_string(), wit)
             })
             .collect();
 
@@ -1578,22 +1594,25 @@ impl ProviderNormalizer for WasmProviderNormalizer {
         current_states: &mut HashMap<ResourceId, State>,
         saved_attrs: &SavedAttrs,
     ) {
-        // Both inputs are post-apply (concrete) values.
         let wit_states: Vec<(String, _)> = current_states
             .iter()
             .map(|(id, state)| {
-                wasm_convert::core_to_wit_state(state)
-                    .map(|s| (id.to_string(), s))
-                    .expect("state must not carry Value::Unknown")
+                let wit = expect_no_unknown(
+                    wasm_convert::core_to_wit_state(state),
+                    "hydrate_read_state (current_states)",
+                );
+                (id.to_string(), wit)
             })
             .collect();
 
         let wit_saved: Vec<(String, Vec<(String, _)>)> = saved_attrs
             .iter()
             .map(|(id, attrs)| {
-                wasm_convert::core_to_wit_value_map(attrs)
-                    .map(|v| (id.to_string(), v))
-                    .expect("saved attrs must not carry Value::Unknown")
+                let wit = expect_no_unknown(
+                    wasm_convert::core_to_wit_value_map(attrs),
+                    "hydrate_read_state (saved_attrs)",
+                );
+                (id.to_string(), wit)
             })
             .collect();
 

@@ -43,11 +43,8 @@ pub fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, SerializationError
         CoreValue::List(items) => {
             let json_items: Result<Vec<serde_json::Value>, _> =
                 items.iter().map(core_value_to_json).collect();
-            let json_str =
-                serde_json::to_string(&json_items?).map_err(|e| SerializationError::SerdeJson {
-                    message: e.to_string(),
-                    context: SerializationContext::WasmBoundary,
-                })?;
+            let json_str = serde_json::to_string(&json_items?)
+                .expect("serde_json::Value -> String is infallible");
             Ok(wit::Value::ListVal(json_str))
         }
         CoreValue::Map(map) => {
@@ -55,11 +52,8 @@ pub fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, SerializationError
                 .iter()
                 .map(|(k, v)| core_value_to_json(v).map(|jv| (k.clone(), jv)))
                 .collect();
-            let json_str =
-                serde_json::to_string(&json_map?).map_err(|e| SerializationError::SerdeJson {
-                    message: e.to_string(),
-                    context: SerializationContext::WasmBoundary,
-                })?;
+            let json_str = serde_json::to_string(&json_map?)
+                .expect("serde_json::Value -> String is infallible");
             Ok(wit::Value::MapVal(json_str))
         }
         CoreValue::Unknown(reason) => Err(SerializationError::UnknownNotAllowed {

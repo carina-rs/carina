@@ -130,28 +130,23 @@ pub(crate) fn dsl_value_to_json(
         Value::Int(i) => Ok(Some(serde_json::Value::Number((*i).into()))),
         Value::Float(f) => Ok(serde_json::Number::from_f64(*f).map(serde_json::Value::Number)),
         Value::List(items) => {
-            let json_items: Result<Vec<_>, _> = items
+            // `Result::transpose` flips `Result<Option<T>, E>` to
+            // `Option<Result<T, E>>`, so `filter_map` drops the
+            // `Ok(None)` skips and propagates `Err`.
+            let json_items: Vec<_> = items
                 .iter()
                 .map(dsl_value_to_json)
-                .filter_map(|r| match r {
-                    Ok(Some(v)) => Some(Ok(v)),
-                    Ok(None) => None,
-                    Err(e) => Some(Err(e)),
-                })
-                .collect();
-            Ok(Some(serde_json::Value::Array(json_items?)))
+                .filter_map(Result::transpose)
+                .collect::<Result<_, _>>()?;
+            Ok(Some(serde_json::Value::Array(json_items)))
         }
         Value::Map(map) => {
-            let json_map: Result<serde_json::Map<String, serde_json::Value>, _> = map
+            let json_map: serde_json::Map<String, serde_json::Value> = map
                 .iter()
                 .map(|(k, v)| dsl_value_to_json(v).map(|jv| jv.map(|j| (k.clone(), j))))
-                .filter_map(|r| match r {
-                    Ok(Some(pair)) => Some(Ok(pair)),
-                    Ok(None) => None,
-                    Err(e) => Some(Err(e)),
-                })
-                .collect();
-            Ok(Some(serde_json::Value::Object(json_map?)))
+                .filter_map(Result::transpose)
+                .collect::<Result<_, _>>()?;
+            Ok(Some(serde_json::Value::Object(json_map)))
         }
         Value::Unknown(reason) => Err(SerializationError::UnknownNotAllowed {
             reason: reason.clone(),

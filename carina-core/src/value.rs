@@ -68,13 +68,6 @@ pub enum SerializationError {
         value: f64,
         context: SerializationContext,
     },
-    /// `serde_json` reported a serialization failure on a sub-value.
-    /// Currently only reachable when hashing a `Value::Secret`.
-    #[error("cannot serialize at {context}: {message}")]
-    SerdeJson {
-        message: String,
-        context: SerializationContext,
-    },
 }
 
 impl std::fmt::Display for UnknownReason {
@@ -232,11 +225,11 @@ pub fn value_to_json_with_context(
         }
         Value::Secret(inner) => {
             let inner_json = value_to_json_with_context(inner, context)?;
-            let json_str =
-                serde_json::to_string(&inner_json).map_err(|e| SerializationError::SerdeJson {
-                    message: format!("failed to serialize secret inner value: {e}"),
-                    context: ctx,
-                })?;
+            // `serde_json::Value -> String` only fails on a custom
+            // `Serialize` impl or invalid map keys, neither of which a
+            // freshly-built `serde_json::Value` can produce.
+            let json_str = serde_json::to_string(&inner_json)
+                .expect("serde_json::Value -> String is infallible");
             let hash_hex = argon2id_hash(json_str.as_bytes(), context);
             Ok(serde_json::Value::String(format!(
                 "{SECRET_PREFIX}{hash_hex}",
@@ -441,11 +434,8 @@ pub fn redact_secrets_in_value(value: &Value) -> Result<Value, SerializationErro
     match value {
         Value::Secret(inner) => {
             let inner_json = value_to_json(inner)?;
-            let json_str =
-                serde_json::to_string(&inner_json).map_err(|e| SerializationError::SerdeJson {
-                    message: format!("failed to serialize secret inner value: {e}"),
-                    context: SerializationContext::SecretRedaction,
-                })?;
+            let json_str = serde_json::to_string(&inner_json)
+                .expect("serde_json::Value -> String is infallible");
             let hash_hex = argon2id_hash(json_str.as_bytes(), None);
             Ok(Value::String(format!("{SECRET_PREFIX}{hash_hex}")))
         }
