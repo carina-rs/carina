@@ -46,6 +46,13 @@ pub fn core_to_wit_value(v: &CoreValue) -> wit::Value {
                 .collect();
             wit::Value::MapVal(serde_json::to_string(&json_map).unwrap())
         }
+        // RFC #2371: `Value::Unknown` is plan-display only and must
+        // never cross the WASM provider boundary — the wildcard
+        // would degrade it to `"Unknown(...)"` debug-format string.
+        // Reject explicitly so a stage-2/3 producer bug surfaces here.
+        CoreValue::Unknown(_) => {
+            unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
+        }
         // Managed-to-managed refs (e.g. `admins.group_id`) are expected
         // here at plan time — they get resolved at apply time by the
         // executor. Data source refs should have been resolved during
@@ -95,6 +102,11 @@ fn core_value_to_json(v: &CoreValue) -> serde_json::Value {
                 .map(|(k, v)| (k.clone(), core_value_to_json(v)))
                 .collect();
             serde_json::Value::Object(obj)
+        }
+        // RFC #2371: `Value::Unknown` must not be serialized to JSON
+        // for provider transport. See sibling arm in `core_to_wit_value`.
+        CoreValue::Unknown(_) => {
+            unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
         }
         _ => serde_json::Value::String(format!("{v:?}")),
     }

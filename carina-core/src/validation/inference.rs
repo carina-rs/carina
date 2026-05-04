@@ -233,6 +233,9 @@ pub fn infer_type_from_value(
             schemas,
         ),
         Value::FunctionCall { name, .. } => infer_function_call(name),
+        Value::Unknown(_) => {
+            unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
+        }
     }
 }
 

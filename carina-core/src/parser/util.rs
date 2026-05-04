@@ -59,6 +59,9 @@ pub(crate) fn value_type_name(value: &Value) -> &'static str {
         Value::Interpolation(_) => "string",
         Value::FunctionCall { .. } => "function call",
         Value::Secret(_) => "secret",
+        Value::Unknown(_) => {
+            unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
+        }
     }
 }
 

@@ -129,6 +129,13 @@ pub(crate) fn dsl_value_to_json(value: &carina_core::resource::Value) -> Option<
                 .collect();
             Some(serde_json::Value::Object(json_map))
         }
+        // RFC #2371: `Value::Unknown` is plan-display only and must
+        // never reach a state file. The wildcard below would silently
+        // drop it (`-> None`), losing the plan/apply boundary contract;
+        // reject explicitly so a stage-2/3 producer bug surfaces here.
+        Value::Unknown(_) => {
+            unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
+        }
         _ => None, // ResourceRef, Null, etc. — skip
     }
 }

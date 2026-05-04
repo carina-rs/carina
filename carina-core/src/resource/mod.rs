@@ -338,6 +338,32 @@ pub enum Value {
     /// A secret value. The inner value is sent to the provider but stored as a
     /// SHA256 hash in state. Plan output displays `(secret)` instead of the value.
     Secret(Box<Value>),
+    /// A value not known at plan time. Plan-display only — must never
+    /// reach `apply`, state files, or provider plugins. See RFC #2371.
+    Unknown(UnknownReason),
+}
+
+/// Why a `Value::Unknown` is unknown. Each variant carries only the
+/// information its own consumer needs — no shared "context" field invites
+/// drift across reasons. See RFC #2371.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum UnknownReason {
+    /// Plan-time reference into an `upstream_state` binding that did not
+    /// resolve (state file missing, or the referenced export was absent).
+    /// Renders as `(known after upstream apply: <path.to_dot_string()>)`.
+    /// Holds the original `AccessPath` so display retains subscripts and
+    /// chained field access (`network.accounts[0]`, `vpc.tags["Name"]`).
+    UpstreamRef { path: AccessPath },
+    /// Map-binding key in a deferred for-expression
+    /// (`for (k, _) in iterable`). Substituted with the actual key when
+    /// the iterable is later resolved.
+    ForKey,
+    /// Indexed-binding index in a deferred for-expression
+    /// (`for (i, _) in iterable`). Substituted with the actual index.
+    ForIndex,
+    /// Loop-variable value in a deferred for-expression
+    /// (`for v in iterable`). Substituted with the actual element.
+    ForValue,
 }
 
 /// A part of a string interpolation expression
@@ -529,6 +555,9 @@ impl Value {
             }
             Value::Secret(inner) => inner.visit_refs(f),
             Value::String(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_) => {}
+            Value::Unknown(_) => {
+                unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
+            }
         }
     }
 }
@@ -639,6 +668,14 @@ impl Value {
             }
             Value::Secret(inner) => {
                 inner.hash_into(hasher);
+            }
+            // Stage 2 must replace this with deterministic hashing before
+            // any producer ships — `merge_lists_hashed` calls
+            // `canonical_hash` → `hash_into`, so a `Value::Unknown` inside
+            // a list element would panic before the planned plan/apply
+            // boundary checks land in stage 4 (RFC #2371).
+            Value::Unknown(_) => {
+                unimplemented!("Value::Unknown handling lands in RFC #2371 stage 2/3")
             }
         }
     }
