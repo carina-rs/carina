@@ -32,12 +32,13 @@ use crate::wasm_bindings::carina::provider::types as wit;
 /// which variant leaked. See RFC #2371 stage 2 (#2378) for `Unknown`
 /// and #2387 for `ResourceRef` / `Interpolation` / `FunctionCall`.
 ///
-/// `Value::Secret` still falls back to debug format here because the
-/// WASM provider needs to receive the *value* (so a creator like
-/// `aws.iam.User` can pass a generated password to the cloud API). The
-/// strip pass takes secrets-of-refs out of this path; a plain
-/// `Secret(String)` reaches the boundary intentionally. Tightening the
-/// secret path is out of scope for #2387.
+/// `Value::Secret(inner)` is encoded as the `secret-val` WIT variant
+/// (#2390): the inner is JSON-encoded the same way `list-val` / `map-val`
+/// encode their contents, and a typed signal crosses the boundary so the
+/// WASM provider can distinguish a secret from a plain string. The
+/// previous `format!("{v:?}")` debug-format fallback would send
+/// `"Secret(String(\"…\"))"` literally to the provider — a contract leak
+/// equivalent to the pre-#2387 `ResourceRef` debug-string.
 pub fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, SerializationError> {
     match v {
         CoreValue::String(s) => Ok(wit::Value::StrVal(s.clone())),
@@ -75,9 +76,12 @@ pub fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, SerializationError
             name: name.clone(),
             context: SerializationContext::WasmBoundary,
         }),
-        // `Value::Secret(inner)` is expected at the WASM boundary for
-        // plain secret values — see the function doc for scope.
-        CoreValue::Secret(_) => Ok(wit::Value::StrVal(format!("{v:?}"))),
+        CoreValue::Secret(inner) => {
+            let json = core_value_to_json(inner)?;
+            let json_str =
+                serde_json::to_string(&json).expect("serde_json::Value -> String is infallible");
+            Ok(wit::Value::SecretVal(json_str))
+        }
     }
 }
 
@@ -100,6 +104,18 @@ pub fn wit_to_core_value(v: &wit::Value) -> CoreValue {
                     .map(|(k, v)| (k.clone(), json_to_core_value(v)))
                     .collect(),
             )
+        }
+        wit::Value::SecretVal(json) => {
+            // Decode the JSON-encoded inner value the same way `ListVal` /
+            // `MapVal` decode theirs, then re-wrap in `Value::Secret` so the
+            // host's secret-tracking machinery (state hashing, plan
+            // redaction) keeps working. A malformed encoding falls back to
+            // an empty string secret rather than panicking — the WASM
+            // provider produced this, so we treat it as untrusted input.
+            let inner_json: serde_json::Value =
+                serde_json::from_str(json).unwrap_or(serde_json::Value::Null);
+            let inner = json_to_core_value(&inner_json);
+            CoreValue::Secret(Box::new(inner))
         }
     }
 }
@@ -143,7 +159,15 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
             name: name.clone(),
             context: SerializationContext::WasmBoundary,
         }),
-        CoreValue::Secret(_) => Ok(serde_json::Value::String(format!("{v:?}"))),
+        // Within this helper a `Secret` would only appear if the caller
+        // wrapped one inside a `List` / `Map` payload going to a WIT
+        // `list-val` / `map-val`. Render it as the JSON-encoded inner so
+        // the byte stream the provider receives is identical to what
+        // `core_to_wit_value`'s `secret-val` arm produces. Provider plugins
+        // that decode `list-val` / `map-val` see the inner JSON shape;
+        // `secret-val` is the channel used to mark the *attribute* itself
+        // as a secret.
+        CoreValue::Secret(inner) => core_value_to_json(inner),
     }
 }
 
@@ -675,6 +699,66 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// #2390: `Value::Secret` crosses the boundary as the `secret-val`
+    /// WIT variant carrying the JSON-encoded inner — never as a
+    /// `format!("{v:?}")` debug string.
+    #[test]
+    fn secret_string_emits_secret_val_variant() {
+        let v = CoreValue::Secret(Box::new(CoreValue::String("password".into())));
+        let wit_v = core_to_wit_value(&v).unwrap();
+        match wit_v {
+            wit::Value::SecretVal(json) => assert_eq!(json, "\"password\""),
+            other => panic!("expected SecretVal, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn secret_int_emits_secret_val_variant() {
+        // Audit (carina#2390 step 12) confirmed `secret()` accepts any
+        // scalar; pin the wire format for non-string inner values too.
+        let v = CoreValue::Secret(Box::new(CoreValue::Int(42)));
+        let wit_v = core_to_wit_value(&v).unwrap();
+        match wit_v {
+            wit::Value::SecretVal(json) => assert_eq!(json, "42"),
+            other => panic!("expected SecretVal, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn secret_round_trip_preserves_inner_value() {
+        // Round-tripping through the WIT boundary preserves the
+        // `Secret` wrapper so host-side machinery (state hashing, plan
+        // redaction) keeps recognising it after a guest call returns.
+        let original = CoreValue::Secret(Box::new(CoreValue::String("hunter2".into())));
+        let wit_v = core_to_wit_value(&original).unwrap();
+        let back = wit_to_core_value(&wit_v);
+        match back {
+            CoreValue::Secret(inner) => match *inner {
+                CoreValue::String(s) => assert_eq!(s, "hunter2"),
+                other => panic!("expected inner String, got: {other:?}"),
+            },
+            other => panic!("expected Secret, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn secret_in_list_serialises_inner_to_json() {
+        // Within `core_value_to_json` (the helper that flattens nested
+        // structures into the `list-val` / `map-val` JSON payload) a
+        // `Secret` is serialised as its inner JSON shape — providers
+        // decoding the list see the operational value. The
+        // *attribute*-level secret signal goes through `secret-val` via
+        // `core_to_wit_value`, not this path.
+        let v = CoreValue::List(vec![CoreValue::Secret(Box::new(CoreValue::String(
+            "p".into(),
+        )))]);
+        let wit_v = core_to_wit_value(&v).unwrap();
+        match wit_v {
+            wit::Value::ListVal(json) => assert_eq!(json, "[\"p\"]"),
+            other => panic!("expected ListVal, got: {other:?}"),
+        }
     }
 
     // -- ResourceId roundtrip --

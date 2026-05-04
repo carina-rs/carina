@@ -145,6 +145,19 @@ macro_rules! export_provider {
                                 .collect(),
                         )
                     }
+                    // The host marks an attribute as a secret with this
+                    // variant (carina#2390). `proto::Value` does not yet
+                    // carry a `Secret` arm, so we decode the JSON-encoded
+                    // inner value here and surface it to the provider as
+                    // an opaque value — providers MUST NOT log or persist
+                    // values that arrived in attributes the host marked
+                    // as secret. Adding `proto::Value::Secret` to preserve
+                    // the signal end-to-end is tracked separately.
+                    wit_types::Value::SecretVal(json) => {
+                        let inner: serde_json::Value =
+                            serde_json::from_str(json).unwrap_or(serde_json::Value::Null);
+                        helpers::json_to_proto_value(inner)
+                    }
                 }
             }
 
@@ -492,6 +505,19 @@ macro_rules! export_provider {
                                 .map(|(k, v)| (k, helpers::json_to_proto_value(v)))
                                 .collect(),
                         )
+                    }
+                    // The host marks an attribute as a secret with this
+                    // variant (carina#2390). `proto::Value` does not yet
+                    // carry a `Secret` arm, so we decode the JSON-encoded
+                    // inner value here and surface it to the provider as
+                    // an opaque value — providers MUST NOT log or persist
+                    // values that arrived in attributes the host marked
+                    // as secret. Adding `proto::Value::Secret` to preserve
+                    // the signal end-to-end is tracked separately.
+                    wit_types::Value::SecretVal(json) => {
+                        let inner: serde_json::Value =
+                            serde_json::from_str(json).unwrap_or(serde_json::Value::Null);
+                        helpers::json_to_proto_value(inner)
                     }
                 }
             }
