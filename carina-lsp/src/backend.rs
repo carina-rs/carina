@@ -508,15 +508,20 @@ impl LanguageServer for Backend {
                 .to_file_path()
                 .ok()
                 .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+            let current_file_name: Option<String> = uri
+                .to_file_path()
+                .ok()
+                .and_then(|p| p.file_name().and_then(|n| n.to_str().map(String::from)));
             let providers = self.providers.read().await;
             let state = base_path
                 .as_ref()
                 .map(|p| providers.state_for_path(p))
                 .unwrap_or(&providers.empty);
-            return Ok(state.hover_provider.hover_with_base_path(
+            return Ok(state.hover_provider.hover_with_context(
                 &doc,
                 position,
                 base_path.as_deref(),
+                current_file_name.as_deref(),
             ));
         }
         Ok(None)

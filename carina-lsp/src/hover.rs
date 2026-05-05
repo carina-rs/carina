@@ -9,6 +9,50 @@ use carina_core::parser::ArgumentParameter;
 use carina_core::resource::Value;
 use carina_core::schema::{CompletionValue, ResourceSchema, SchemaRegistry};
 
+/// Find the `source` path of a `let <alias> = use {...}` declaration
+/// for `alias`. Tries the buffer's own parse first, then walks sibling
+/// `.crn` files individually so a parse error in an unrelated sibling
+/// (e.g. a half-typed `providers.crn`) does not block hover (#2443).
+/// The current document's text is used in place of its on-disk copy
+/// so unsaved edits are honored.
+fn find_use_import_path(
+    doc: &Document,
+    base_path: &Path,
+    current_file_name: Option<&str>,
+    alias: &str,
+) -> Option<String> {
+    if let Some(parsed) = doc.parsed()
+        && let Some(import) = parsed.uses.iter().find(|imp| imp.alias == alias)
+    {
+        return Some(import.path.clone());
+    }
+    let mut files =
+        carina_core::config_loader::find_crn_files_in_dir(&base_path.to_path_buf()).ok()?;
+    // `find_crn_files_in_dir` does not sort; rely on a deterministic
+    // walk so the result is stable when two siblings happen to
+    // declare the same alias (rare, but the user shouldn't see
+    // different hovers across filesystems).
+    files.sort();
+    let ctx = doc.provider_context();
+    for file in files {
+        let file_name = file.file_name().and_then(|n| n.to_str());
+        let content = match (file_name, current_file_name) {
+            (Some(name), Some(current)) if name == current => doc.text(),
+            _ => match std::fs::read_to_string(&file) {
+                Ok(text) => text,
+                Err(_) => continue,
+            },
+        };
+        let Ok(parsed) = carina_core::parser::parse(&content, ctx) else {
+            continue;
+        };
+        if let Some(import) = parsed.uses.iter().find(|imp| imp.alias == alias) {
+            return Some(import.path.clone());
+        }
+    }
+    None
+}
+
 /// Format a Value for hover display
 fn format_value_for_hover(value: &Value) -> String {
     match value {
@@ -115,6 +159,20 @@ impl HoverProvider {
         position: Position,
         base_path: Option<&Path>,
     ) -> Option<Hover> {
+        self.hover_with_context(doc, position, base_path, None)
+    }
+
+    /// Like [`Self::hover_with_base_path`] but also accepts the open
+    /// document's filename. Required for hovers that rely on a directory-
+    /// merged parse (`module_call_hover`, `module_argument_hover`) to
+    /// honor the in-memory buffer instead of the on-disk copy.
+    pub fn hover_with_context(
+        &self,
+        doc: &Document,
+        position: Position,
+        base_path: Option<&Path>,
+        current_file_name: Option<&str>,
+    ) -> Option<Hover> {
         let word = doc.word_at(position)?;
 
         // Check for resource type hover
@@ -124,7 +182,7 @@ impl HoverProvider {
 
         // Check for module call name hover (e.g., hovering on "github" in "github {")
         if let Some(base) = base_path
-            && let Some(hover) = self.module_call_hover(doc, &word, base)
+            && let Some(hover) = self.module_call_hover(doc, &word, base, current_file_name)
         {
             return Some(hover);
         }
@@ -132,7 +190,8 @@ impl HoverProvider {
         // Check for module argument description hover (inside module calls)
         if self.is_in_module_call(doc, position)
             && let Some(base) = base_path
-            && let Some(hover) = self.module_argument_hover(doc, position, &word, base)
+            && let Some(hover) =
+                self.module_argument_hover(doc, position, &word, base, current_file_name)
         {
             return Some(hover);
         }
@@ -254,17 +313,20 @@ impl HoverProvider {
     /// Show hover info for a module call argument, including its description if available.
     /// Hover on a module call name (e.g., "github" in "github {").
     /// Shows the module source path and its arguments/attributes summary.
-    fn module_call_hover(&self, doc: &Document, word: &str, base_path: &Path) -> Option<Hover> {
-        let parsed = doc.parsed()?;
-
-        // Check if this word is a module alias (defined by an import)
-        let import = parsed.uses.iter().find(|imp| imp.alias == word)?;
+    fn module_call_hover(
+        &self,
+        doc: &Document,
+        word: &str,
+        base_path: &Path,
+        current_file_name: Option<&str>,
+    ) -> Option<Hover> {
+        let import_path = find_use_import_path(doc, base_path, current_file_name, word)?;
 
         // Load the module to get its definition
-        let module_path = base_path.join(&import.path);
+        let module_path = base_path.join(&import_path);
         let module_parsed = carina_core::module_resolver::load_module(&module_path)?;
 
-        let mut content = format!("## {}\n\n`{}`\n", word, import.path);
+        let mut content = format!("## {}\n\n`{}`\n", word, import_path);
 
         // Show arguments
         if !module_parsed.arguments.is_empty() {
@@ -315,17 +377,13 @@ impl HoverProvider {
         position: Position,
         word: &str,
         base_path: &Path,
+        current_file_name: Option<&str>,
     ) -> Option<Hover> {
-        let parsed = doc.parsed()?;
-
-        // Find the enclosing module call name
         let module_name = self.find_enclosing_module_call_name(doc, position)?;
-
-        // Find the import for this module
-        let import = parsed.uses.iter().find(|imp| imp.alias == module_name)?;
+        let import_path = find_use_import_path(doc, base_path, current_file_name, &module_name)?;
 
         // Load the module to get argument definitions
-        let module_path = base_path.join(&import.path);
+        let module_path = base_path.join(&import_path);
         let module_parsed = carina_core::module_resolver::load_module(&module_path)?;
 
         // Find the argument matching the word
@@ -1283,6 +1341,212 @@ awscc.ec2.vpc_gateway_attachment {
         assert!(
             hover.is_some(),
             "map() in function call position should show builtin function hover"
+        );
+    }
+
+    /// Build the multi-file fixture used by the #2443 sibling-use
+    /// tests. Returns `(tempdir, consumer_dir, doc, provider)`. Layout:
+    ///
+    ///   <tmp>/modules/github-oidc/main.crn   — arguments { github_repo, role_name }
+    ///   <tmp>/consumer/imports.crn           — let github = use { source = '../modules/github-oidc' }
+    ///   <tmp>/consumer/main.crn              — github { github_repo = 'carina-rs/infra' }
+    ///
+    /// Hover positions used by the call sites:
+    ///   line 0 col 2 → on the alias `github`
+    ///   line 1 col 4 → on the argument name `github_repo`
+    fn sibling_use_fixture() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        Document,
+        HoverProvider,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let module_dir = tmp.path().join("modules").join("github-oidc");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        std::fs::write(
+            module_dir.join("main.crn"),
+            r#"
+                arguments {
+                    github_repo: String
+                    role_name: String
+                }
+            "#,
+        )
+        .unwrap();
+        let consumer_dir = tmp.path().join("consumer");
+        std::fs::create_dir(&consumer_dir).unwrap();
+        std::fs::write(
+            consumer_dir.join("imports.crn"),
+            r#"let github = use { source = '../modules/github-oidc' }
+"#,
+        )
+        .unwrap();
+        let main_text = "github {\n  github_repo = 'carina-rs/infra'\n}\n";
+        std::fs::write(consumer_dir.join("main.crn"), main_text).unwrap();
+        let doc = Document::new(main_text.to_string(), Arc::new(ProviderContext::default()));
+        let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
+        (tmp, consumer_dir, doc, provider)
+    }
+
+    /// Issue #2443: hover on the module alias when its `let X = use {...}`
+    /// declaration lives in a sibling `.crn` returns module-doc hover.
+    #[test]
+    fn test_module_call_hover_with_sibling_use_decl() {
+        let (_tmp, consumer_dir, doc, provider) = sibling_use_fixture();
+        let hover = provider
+            .hover_with_base_path(&doc, Position::new(0, 2), Some(&consumer_dir))
+            .expect("hover on sibling-defined module alias must return Some");
+        let content = match &hover.contents {
+            HoverContents::Markup(m) => m.value.clone(),
+            _ => panic!("expected markup content"),
+        };
+        assert!(
+            content.contains("github") && content.contains("github_repo"),
+            "hover should mention alias and module arguments, got:\n{content}"
+        );
+    }
+
+    /// Issue #2443: hover on a module argument inside `X { ... }` when
+    /// the `let X = use {...}` lives in a sibling `.crn` returns the
+    /// argument hover.
+    #[test]
+    fn test_module_argument_hover_with_sibling_use_decl() {
+        let (_tmp, consumer_dir, doc, provider) = sibling_use_fixture();
+        let hover = provider
+            .hover_with_base_path(&doc, Position::new(1, 4), Some(&consumer_dir))
+            .expect("hover on sibling-defined module argument must return Some");
+        let content = match &hover.contents {
+            HoverContents::Markup(m) => m.value.clone(),
+            _ => panic!("expected markup content"),
+        };
+        assert!(
+            content.contains("github_repo"),
+            "argument hover should mention the parameter name, got:\n{content}"
+        );
+    }
+
+    /// Companion to `test_module_call_hover_same_buffer_fast_path`:
+    /// argument-hover on `github_repo` inside a `github { ... }` block
+    /// when the `let github = use {...}` lives in the same buffer
+    /// (original single-file behavior). End-to-end through
+    /// `hover_with_base_path` so the fast-path branch of
+    /// `find_use_import_path` is exercised on the argument side too.
+    #[test]
+    fn test_module_argument_hover_same_buffer_fast_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let module_dir = tmp.path().join("modules").join("github-oidc");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        std::fs::write(
+            module_dir.join("main.crn"),
+            r#"
+                arguments {
+                    github_repo: String
+                }
+            "#,
+        )
+        .unwrap();
+        let consumer_dir = tmp.path().join("consumer");
+        std::fs::create_dir(&consumer_dir).unwrap();
+        let main_text = "let github = use { source = '../modules/github-oidc' }\ngithub {\n  github_repo = 'x'\n}\n";
+        std::fs::write(consumer_dir.join("main.crn"), main_text).unwrap();
+
+        let doc = Document::new(main_text.to_string(), Arc::new(ProviderContext::default()));
+        let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
+
+        // Hover on `github_repo` at line 2, column 4 (inside the identifier).
+        let hover = provider
+            .hover_with_base_path(&doc, Position::new(2, 4), Some(&consumer_dir))
+            .expect("same-buffer fast path for argument hover must return Some");
+        let content = match &hover.contents {
+            HoverContents::Markup(m) => m.value.clone(),
+            _ => panic!("expected markup content"),
+        };
+        assert!(
+            content.contains("github_repo"),
+            "fast-path argument hover should mention the parameter name, got:\n{content}"
+        );
+    }
+
+    /// Fast-path regression guard: when `let X = use {...}` lives in
+    /// the *same* buffer the user is hovering in, the helper's first
+    /// branch (`doc.parsed()`) must satisfy the lookup without touching
+    /// the disk. This was the original single-file behavior before
+    /// #2443 — a future refactor of `find_use_import_path` must not
+    /// drop it.
+    #[test]
+    fn test_module_call_hover_same_buffer_fast_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let module_dir = tmp.path().join("modules").join("github-oidc");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        std::fs::write(
+            module_dir.join("main.crn"),
+            r#"
+                arguments {
+                    github_repo: String
+                }
+            "#,
+        )
+        .unwrap();
+        let consumer_dir = tmp.path().join("consumer");
+        std::fs::create_dir(&consumer_dir).unwrap();
+        // Both the `let` and the call live in the same buffer.
+        let main_text = "let github = use { source = '../modules/github-oidc' }\ngithub {\n  github_repo = 'x'\n}\n";
+        std::fs::write(consumer_dir.join("main.crn"), main_text).unwrap();
+
+        let doc = Document::new(main_text.to_string(), Arc::new(ProviderContext::default()));
+        let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
+
+        // Hover on `github` at line 1 (the call site, not the let).
+        let hover = provider
+            .hover_with_base_path(&doc, Position::new(1, 2), Some(&consumer_dir))
+            .expect("same-buffer fast path must return Some");
+        let content = match &hover.contents {
+            HoverContents::Markup(m) => m.value.clone(),
+            _ => panic!("expected markup content"),
+        };
+        assert!(
+            content.contains("github_repo"),
+            "fast-path hover should still list module arguments, got:\n{content}"
+        );
+    }
+
+    /// A typo'd alias has no `use` declaration anywhere in the directory
+    /// — hover must return None rather than synthesize a bogus result.
+    #[test]
+    fn test_module_call_hover_unknown_alias_returns_none() {
+        let (_tmp, consumer_dir, _doc, provider) = sibling_use_fixture();
+        // Document with a typo'd alias that has no matching `use` decl
+        // anywhere in the directory.
+        let bad_text = "githubb {\n  github_repo = 'x'\n}\n";
+        let bad_doc = Document::new(bad_text.to_string(), Arc::new(ProviderContext::default()));
+        let hover =
+            provider.hover_with_base_path(&bad_doc, Position::new(0, 2), Some(&consumer_dir));
+        assert!(
+            hover.is_none(),
+            "hover on unknown alias must return None, got: {hover:?}"
+        );
+    }
+
+    /// A parse error in an *unrelated* sibling `.crn` (e.g. half-typed
+    /// `providers.crn`) must not block hover on a valid alias declared
+    /// in another sibling. The per-file resilient walk in
+    /// `find_use_import_path` is what makes this work — guard against
+    /// regression to the all-or-nothing `parse_directory_with_overrides`
+    /// shape.
+    #[test]
+    fn test_module_call_hover_survives_unrelated_sibling_parse_error() {
+        let (_tmp, consumer_dir, doc, provider) = sibling_use_fixture();
+        // Add a deliberately broken sibling — must not affect hover on
+        // `github` whose declaration is in `imports.crn`.
+        std::fs::write(
+            consumer_dir.join("providers.crn"),
+            "provider awscc { region = ", // unterminated, parse error
+        )
+        .unwrap();
+        let hover = provider.hover_with_base_path(&doc, Position::new(0, 2), Some(&consumer_dir));
+        assert!(
+            hover.is_some(),
+            "hover should survive an unrelated sibling parse error"
         );
     }
 }

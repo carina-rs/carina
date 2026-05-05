@@ -81,6 +81,13 @@ impl Document {
         self.parsed.as_ref()
     }
 
+    /// Provider context the document was parsed with. Exposed so
+    /// directory-scoped re-parses (hover, completion, etc.) can reuse the
+    /// same configuration when they need to merge sibling `.crn` files.
+    pub fn provider_context(&self) -> &ProviderContext {
+        &self.provider_context
+    }
+
     pub fn parse_error(&self) -> Option<&ParseError> {
         self.parse_error.as_ref()
     }
