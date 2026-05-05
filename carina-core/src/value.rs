@@ -600,6 +600,119 @@ pub fn redact_secrets_in_plan(
     Ok(redacted)
 }
 
+/// Maximum line width before list-of-string and Map values expand vertically
+/// in `format_value_pretty`. Fixed (not terminal-derived) so snapshot tests are
+/// deterministic and CI/PR-comment readers see identical output.
+pub(crate) const PRETTY_LINE_LIMIT: usize = 80;
+
+/// Format a `Value` for human-readable, multi-line plan output.
+///
+/// `indent_cols` is the column at which the *value* starts (the caller has
+/// already written `<indent>key: ` and is about to append the return value).
+///
+/// The return value is either a bare inline string, or begins with `\n`
+/// followed by indented continuation lines. Either way, the caller can
+/// append it verbatim after `<indent>key: ` and the indentation will line
+/// up correctly.
+///
+/// Behavior:
+/// - Scalar variants are identical to `format_value_with_key(value, None)`.
+/// - `Value::List` of all `Value::Map` always renders vertically under `- `
+///   prefix; map keys are sorted alphabetically and values recurse.
+/// - `Value::List` of scalars renders inline `[a, b, c]` if the inline
+///   representation fits within 80 columns (`PRETTY_LINE_LIMIT`) starting at
+///   `indent_cols`; otherwise expands to a bracketed multi-line form.
+/// - `Value::Map` renders inline if it fits within 80 columns, otherwise
+///   expands vertically.
+pub fn format_value_pretty(value: &Value, indent_cols: usize) -> String {
+    match value {
+        Value::List(items) => {
+            if items.is_empty() {
+                return "[]".to_string();
+            }
+            if is_list_of_maps(value) {
+                return format_list_of_maps_vertical(items, indent_cols);
+            }
+            let inline = format_value_with_key(value, None);
+            if indent_cols + inline.len() <= PRETTY_LINE_LIMIT {
+                return inline;
+            }
+            format_list_of_scalars_vertical(items, indent_cols)
+        }
+        Value::Map(map) => {
+            if map.is_empty() {
+                return "{}".to_string();
+            }
+            let inline = format_value_with_key(value, None);
+            if indent_cols + inline.len() <= PRETTY_LINE_LIMIT {
+                return inline;
+            }
+            format_map_vertical(map, indent_cols)
+        }
+        _ => format_value_with_key(value, None),
+    }
+}
+
+fn format_list_of_maps_vertical(items: &[Value], indent_cols: usize) -> String {
+    let parent_indent = " ".repeat(indent_cols);
+    let entry_indent_cols = indent_cols + 2;
+    let entry_indent = " ".repeat(entry_indent_cols);
+    let mut out = String::new();
+    for item in items {
+        if let Value::Map(map) = item {
+            let mut keys: Vec<_> = map.keys().collect();
+            keys.sort();
+            for (i, k) in keys.iter().enumerate() {
+                let val_indent = entry_indent_cols + k.len() + 2;
+                let val_str = format_value_pretty(&map[*k], val_indent);
+                out.push('\n');
+                if i == 0 {
+                    out.push_str(&parent_indent);
+                    out.push_str("- ");
+                } else {
+                    out.push_str(&entry_indent);
+                }
+                out.push_str(k);
+                out.push_str(": ");
+                out.push_str(&val_str);
+            }
+        }
+    }
+    out
+}
+
+fn format_list_of_scalars_vertical(items: &[Value], indent_cols: usize) -> String {
+    let item_indent = " ".repeat(indent_cols + 2);
+    let close_indent = " ".repeat(indent_cols);
+    let mut out = String::from("[\n");
+    for item in items {
+        out.push_str(&item_indent);
+        out.push_str(&format_value_with_key(item, None));
+        out.push(',');
+        out.push('\n');
+    }
+    out.push_str(&close_indent);
+    out.push(']');
+    out
+}
+
+fn format_map_vertical(map: &IndexMap<String, Value>, indent_cols: usize) -> String {
+    let mut keys: Vec<_> = map.keys().collect();
+    keys.sort();
+    let key_indent = " ".repeat(indent_cols);
+    let mut out = String::new();
+    for k in keys {
+        let val_indent = indent_cols + k.len() + 2;
+        let val_str = format_value_pretty(&map[k], val_indent);
+        out.push('\n');
+        out.push_str(&key_indent);
+        out.push_str(k);
+        out.push_str(": ");
+        out.push_str(&val_str);
+    }
+    out
+}
+
 /// Check if a value is a list of maps (list-of-struct)
 pub fn is_list_of_maps(value: &Value) -> bool {
     if let Value::List(items) = value {
@@ -1378,4 +1491,262 @@ mod tests {
     // so `format_value` and `value_to_json` only see user-facing values.
     // The "closure cannot become data" guarantee is now enforced at the
     // type level by `EvalValue::into_value`.
+
+    // ----- format_value_pretty tests -----
+
+    #[test]
+    fn format_value_pretty_string_matches_format_value() {
+        let v = Value::String("hello".to_string());
+        assert_eq!(format_value_pretty(&v, 0), format_value(&v));
+    }
+
+    #[test]
+    fn format_value_pretty_int_renders_as_integer_literal() {
+        let v = Value::Int(42);
+        assert_eq!(format_value_pretty(&v, 0), "42");
+    }
+
+    #[test]
+    fn format_value_pretty_bool_renders_as_keyword() {
+        let v = Value::Bool(true);
+        assert_eq!(format_value_pretty(&v, 0), "true");
+    }
+
+    #[test]
+    fn format_value_pretty_dsl_enum_resolves_to_provider_value() {
+        let v = Value::String("aws.s3.Bucket.VersioningStatus.enabled".to_string());
+        assert_eq!(format_value_pretty(&v, 0), format_value(&v));
+    }
+
+    #[test]
+    fn format_value_pretty_secret_masked() {
+        let v = Value::Secret(Box::new(Value::String("my-password".to_string())));
+        assert_eq!(format_value_pretty(&v, 0), "(secret)");
+    }
+
+    #[test]
+    fn format_value_pretty_unknown_renders_like_format_value() {
+        let v = Value::Unknown(UnknownReason::ForKey);
+        assert_eq!(format_value_pretty(&v, 0), format_value(&v));
+    }
+
+    #[test]
+    fn format_value_pretty_list_of_maps_vertical() {
+        let mut s1 = IndexMap::new();
+        s1.insert("sid".to_string(), Value::String("First".to_string()));
+        s1.insert("effect".to_string(), Value::String("Allow".to_string()));
+        let mut s2 = IndexMap::new();
+        s2.insert("sid".to_string(), Value::String("Second".to_string()));
+        s2.insert("effect".to_string(), Value::String("Deny".to_string()));
+        let v = Value::List(vec![Value::Map(s1), Value::Map(s2)]);
+
+        // indent_cols=6 means the parent already wrote "      key: " (6 spaces of indent)
+        // so continuation lines (the `- ` and following keys) need 6 spaces of indent too.
+        let out = format_value_pretty(&v, 6);
+        let expected = "\n      - effect: \"Allow\"\n        sid: \"First\"\n      - effect: \"Deny\"\n        sid: \"Second\"";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn format_value_pretty_list_of_maps_single_entry() {
+        let mut m = IndexMap::new();
+        m.insert("k".to_string(), Value::String("v".to_string()));
+        let v = Value::List(vec![Value::Map(m)]);
+        let out = format_value_pretty(&v, 4);
+        assert_eq!(out, "\n    - k: \"v\"");
+    }
+
+    #[test]
+    fn format_value_pretty_empty_list_inline() {
+        let v = Value::List(vec![]);
+        assert_eq!(format_value_pretty(&v, 0), "[]");
+    }
+
+    #[test]
+    fn format_value_pretty_list_of_strings_under_80_inline() {
+        let v = Value::List(vec![
+            Value::String("a".to_string()),
+            Value::String("b".to_string()),
+        ]);
+        assert_eq!(format_value_pretty(&v, 0), "[\"a\", \"b\"]");
+    }
+
+    #[test]
+    fn format_value_pretty_list_of_strings_over_80_vertical() {
+        // 5 strings of ~20 chars each → inline ~110 chars
+        let items: Vec<Value> = (0..5)
+            .map(|i| Value::String(format!("iam:LongActionName{}", i)))
+            .collect();
+        let v = Value::List(items);
+        let out = format_value_pretty(&v, 4);
+        assert!(
+            out.starts_with("[\n"),
+            "expected bracket-newline start, got: {out}"
+        );
+        assert!(
+            out.contains("\n      \"iam:LongActionName0\","),
+            "missing first item line: {out}"
+        );
+        assert!(
+            out.ends_with("\n    ]"),
+            "expected closing bracket on its own indented line: {out}"
+        );
+    }
+
+    #[test]
+    fn format_value_pretty_list_of_strings_threshold_boundary_exact_80_inline() {
+        // Construct a list whose inline form is exactly 80 chars at indent_cols=0
+        // → should stay inline ("> 80 expand" rule).
+        let item = "x".repeat(76); // "[\"<76 x's>\"]" = 1 + 1 + 76 + 1 + 1 = 80
+        let v = Value::List(vec![Value::String(item)]);
+        let inline = format_value_with_key(&v, None);
+        assert_eq!(inline.len(), 80, "fixture sanity: {} chars", inline.len());
+        assert_eq!(format_value_pretty(&v, 0), inline);
+    }
+
+    #[test]
+    fn format_value_pretty_list_of_strings_threshold_boundary_81_expands() {
+        // Mirror of the exact-80 test: 81 chars must flip to vertical.
+        let item = "x".repeat(77); // inline = 1 + 1 + 77 + 1 + 1 = 81
+        let v = Value::List(vec![Value::String(item)]);
+        let inline = format_value_with_key(&v, None);
+        assert_eq!(inline.len(), 81, "fixture sanity: {} chars", inline.len());
+        let out = format_value_pretty(&v, 0);
+        assert!(
+            out.starts_with("[\n"),
+            "81 chars at indent 0 should expand, got: {out}"
+        );
+    }
+
+    #[test]
+    fn format_value_pretty_list_of_strings_indent_pushes_over_threshold() {
+        // Inline form is 75 chars; at indent_cols=10 the total would be 85 → expand.
+        let inline_target = 75;
+        let item = "x".repeat(inline_target - 4);
+        let v = Value::List(vec![Value::String(item)]);
+        let inline = format_value_with_key(&v, None);
+        assert_eq!(inline.len(), inline_target);
+        let out = format_value_pretty(&v, 10);
+        assert!(
+            out.starts_with("[\n"),
+            "indent should have pushed over threshold: {out}"
+        );
+    }
+
+    #[test]
+    fn format_value_pretty_list_of_maps_with_nested_map() {
+        let mut inner = IndexMap::new();
+        inner.insert("StringEquals".to_string(), {
+            let mut m = IndexMap::new();
+            m.insert("aws:Tag".to_string(), Value::String("prod".to_string()));
+            Value::Map(m)
+        });
+        let mut entry = IndexMap::new();
+        entry.insert("sid".to_string(), Value::String("X".to_string()));
+        entry.insert("condition".to_string(), Value::Map(inner));
+        let v = Value::List(vec![Value::Map(entry)]);
+        let out = format_value_pretty(&v, 4);
+        assert!(
+            out.contains("    - condition:"),
+            "expected nested key line, got: {out}"
+        );
+        assert!(out.contains("sid: \"X\""), "expected sid line, got: {out}");
+    }
+
+    #[test]
+    fn format_value_pretty_list_of_maps_with_long_string_list_inside() {
+        let actions: Vec<Value> = (0..6)
+            .map(|i| Value::String(format!("iam:Action{:03}", i)))
+            .collect();
+        let mut entry = IndexMap::new();
+        entry.insert("sid".to_string(), Value::String("X".to_string()));
+        entry.insert("action".to_string(), Value::List(actions));
+        let v = Value::List(vec![Value::Map(entry)]);
+        let out = format_value_pretty(&v, 4);
+        assert!(
+            out.contains("action: ["),
+            "expected expanded action list bracket: {out}"
+        );
+        assert!(
+            out.contains("\"iam:Action000\","),
+            "expected first action on its own line: {out}"
+        );
+    }
+
+    #[test]
+    fn format_value_pretty_empty_map_inline() {
+        let v = Value::Map(IndexMap::new());
+        assert_eq!(format_value_pretty(&v, 0), "{}");
+    }
+
+    #[test]
+    fn format_value_pretty_small_map_inline_fits() {
+        let mut m = IndexMap::new();
+        m.insert("a".to_string(), Value::Int(1));
+        m.insert("b".to_string(), Value::Int(2));
+        let v = Value::Map(m);
+        // {a: 1, b: 2} is short — should stay inline at indent 0.
+        assert_eq!(format_value_pretty(&v, 0), "{a: 1, b: 2}");
+    }
+
+    #[test]
+    fn format_value_pretty_top_level_map_expands_when_over_threshold() {
+        // A Map whose inline form would exceed 80 cols at indent 0 → vertical.
+        let mut m = IndexMap::new();
+        m.insert("first_key".to_string(), Value::String("a".repeat(40)));
+        m.insert("second_key".to_string(), Value::String("b".repeat(40)));
+        let v = Value::Map(m);
+        let inline = format_value_with_key(&v, None);
+        assert!(inline.len() > PRETTY_LINE_LIMIT, "fixture sanity");
+
+        let out = format_value_pretty(&v, 0);
+        assert!(
+            out.starts_with("\nfirst_key: "),
+            "expected vertical map starting with newline + first key, got: {out}"
+        );
+        assert!(
+            out.contains("\nsecond_key: "),
+            "expected second key on its own line, got: {out}"
+        );
+    }
+
+    #[test]
+    fn format_value_pretty_scalar_variants_match_format_value_with_key() {
+        // Lock the "scalar fallthrough" contract: every non-List, non-Map
+        // Value variant must produce identical output to
+        // format_value_with_key(_, None). Adding a Value variant that
+        // diverges between the two functions should fail this test.
+        use crate::resource::AccessPath;
+
+        let path = AccessPath::new("vpc", "id");
+        let cases = vec![
+            Value::String("hello".to_string()),
+            Value::Int(42),
+            Value::Float(2.5),
+            Value::Bool(false),
+            Value::Secret(Box::new(Value::String("pw".to_string()))),
+            Value::Unknown(UnknownReason::ForKey),
+            Value::Unknown(UnknownReason::UpstreamRef { path: path.clone() }),
+            Value::ResourceRef { path: path.clone() },
+            Value::Interpolation(vec![
+                InterpolationPart::Literal("prefix-".to_string()),
+                InterpolationPart::Expr(Value::ResourceRef { path }),
+            ]),
+            Value::FunctionCall {
+                name: "concat".to_string(),
+                args: vec![
+                    Value::String("a".to_string()),
+                    Value::String("b".to_string()),
+                ],
+            },
+        ];
+
+        for v in &cases {
+            assert_eq!(
+                format_value_pretty(v, 0),
+                format_value_with_key(v, None),
+                "scalar fallthrough drift for variant: {v:?}"
+            );
+        }
+    }
 }
