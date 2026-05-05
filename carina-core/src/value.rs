@@ -605,72 +605,115 @@ pub fn redact_secrets_in_plan(
 /// deterministic and CI/PR-comment readers see identical output.
 pub(crate) const PRETTY_LINE_LIMIT: usize = 80;
 
+/// Layout context for `format_value_pretty`.
+///
+/// Carries the column at which the parent attribute's *key* is rendered
+/// (`parent_indent_cols`) and the parent attribute's *key* itself. The
+/// helper uses these to decide whether the value fits inline (`<indent>key:
+/// <inline-value>` ≤ 80 cols) and at what column to indent vertical
+/// continuation lines (children render at `parent_indent_cols + 2`,
+/// YAML-conventional).
+///
+/// The struct exists so the two `usize` / `&str` fields can't be passed
+/// in the wrong order, and to leave room for future fields (e.g. a
+/// custom width budget) without breaking the call signature.
+#[derive(Debug, Clone, Copy)]
+pub struct PrettyLayout<'a> {
+    /// Column at which the parent attribute's key is rendered (i.e. how
+    /// many leading spaces precede `<key>:` on its line).
+    pub parent_indent_cols: usize,
+    /// Parent attribute's key, used to compute `<indent>key: ` width when
+    /// deciding inline-vs-vertical.
+    pub key: &'a str,
+}
+
+impl<'a> PrettyLayout<'a> {
+    /// Width of the prefix (`<indent>key: `) that the caller has already
+    /// emitted, in columns. Used as the budget consumed before any value
+    /// content can fit on the same line. Map keys can carry non-ASCII
+    /// characters (the `Value::Map` key type is `String` with no
+    /// encoding constraint), so width is measured in Unicode scalar values.
+    fn prefix_cols(&self) -> usize {
+        self.parent_indent_cols + self.key.chars().count() + 2
+    }
+
+    /// Column for child entries / keys when expanding vertically.
+    fn child_indent_cols(&self) -> usize {
+        self.parent_indent_cols + 2
+    }
+}
+
 /// Format a `Value` for human-readable, multi-line plan output.
 ///
-/// `indent_cols` is the column at which the *value* starts (the caller has
-/// already written `<indent>key: ` and is about to append the return value).
-///
 /// The return value is either a bare inline string, or begins with `\n`
-/// followed by indented continuation lines. Either way, the caller can
-/// append it verbatim after `<indent>key: ` and the indentation will line
-/// up correctly.
+/// followed by lines indented at `layout.parent_indent_cols + 2`. Either
+/// way, the caller can append it verbatim after `<indent><key>: ` and the
+/// indentation will line up correctly.
 ///
 /// Behavior:
 /// - Scalar variants are identical to `format_value_with_key(value, None)`.
 /// - `Value::List` of all `Value::Map` always renders vertically under `- `
-///   prefix; map keys are sorted alphabetically and values recurse.
-/// - `Value::List` of scalars renders inline `[a, b, c]` if the inline
-///   representation fits within 80 columns (`PRETTY_LINE_LIMIT`) starting at
-///   `indent_cols`; otherwise expands to a bracketed multi-line form.
-/// - `Value::Map` renders inline if it fits within 80 columns, otherwise
-///   expands vertically.
-pub fn format_value_pretty(value: &Value, indent_cols: usize) -> String {
+///   prefix at `parent_indent_cols + 2`; map keys are sorted alphabetically.
+/// - `Value::List` of scalars renders inline `[a, b, c]` if the entire line
+///   (`<indent>key: <inline>`) fits within `PRETTY_LINE_LIMIT`; otherwise
+///   expands to a bracketed multi-line form.
+/// - `Value::Map` renders inline if it fits, otherwise expands vertically
+///   with each key at `parent_indent_cols + 2`.
+pub fn format_value_pretty(value: &Value, layout: PrettyLayout<'_>) -> String {
     match value {
         Value::List(items) => {
             if items.is_empty() {
                 return "[]".to_string();
             }
             if is_list_of_maps(value) {
-                return format_list_of_maps_vertical(items, indent_cols);
+                return format_list_of_maps_vertical(items, layout.child_indent_cols());
             }
             let inline = format_value_with_key(value, None);
-            if indent_cols + inline.len() <= PRETTY_LINE_LIMIT {
+            if layout.prefix_cols() + inline.len() <= PRETTY_LINE_LIMIT {
                 return inline;
             }
-            format_list_of_scalars_vertical(items, indent_cols)
+            format_list_of_scalars_vertical(items, layout.child_indent_cols())
         }
         Value::Map(map) => {
             if map.is_empty() {
                 return "{}".to_string();
             }
             let inline = format_value_with_key(value, None);
-            if indent_cols + inline.len() <= PRETTY_LINE_LIMIT {
+            if layout.prefix_cols() + inline.len() <= PRETTY_LINE_LIMIT {
                 return inline;
             }
-            format_map_vertical(map, indent_cols)
+            format_map_vertical(map, layout.child_indent_cols())
         }
         _ => format_value_with_key(value, None),
     }
 }
 
-fn format_list_of_maps_vertical(items: &[Value], indent_cols: usize) -> String {
-    let parent_indent = " ".repeat(indent_cols);
-    let entry_indent_cols = indent_cols + 2;
+/// Render a list-of-maps vertically. Each entry's first key gets a `- `
+/// prefix at `entry_indent_cols`; remaining keys align under it at
+/// `entry_indent_cols + 2`.
+fn format_list_of_maps_vertical(items: &[Value], entry_indent_cols: usize) -> String {
     let entry_indent = " ".repeat(entry_indent_cols);
+    let continuation_indent = " ".repeat(entry_indent_cols + 2);
     let mut out = String::new();
     for item in items {
         if let Value::Map(map) = item {
             let mut keys: Vec<_> = map.keys().collect();
             keys.sort();
+            // Both first-key (`- key`) and continuation keys (`  key`) sit
+            // at `entry_indent_cols + 2` measured from the line start: the
+            // `- ` and the equivalent two-space pad consume the same width.
             for (i, k) in keys.iter().enumerate() {
-                let val_indent = entry_indent_cols + k.len() + 2;
-                let val_str = format_value_pretty(&map[*k], val_indent);
+                let child_layout = PrettyLayout {
+                    parent_indent_cols: entry_indent_cols + 2,
+                    key: k,
+                };
+                let val_str = format_value_pretty(&map[*k], child_layout);
                 out.push('\n');
                 if i == 0 {
-                    out.push_str(&parent_indent);
+                    out.push_str(&entry_indent);
                     out.push_str("- ");
                 } else {
-                    out.push_str(&entry_indent);
+                    out.push_str(&continuation_indent);
                 }
                 out.push_str(k);
                 out.push_str(": ");
@@ -681,9 +724,15 @@ fn format_list_of_maps_vertical(items: &[Value], indent_cols: usize) -> String {
     out
 }
 
-fn format_list_of_scalars_vertical(items: &[Value], indent_cols: usize) -> String {
-    let item_indent = " ".repeat(indent_cols + 2);
-    let close_indent = " ".repeat(indent_cols);
+/// Render a list-of-scalars vertically inside a bracketed block. Items
+/// indent at `item_indent_cols`; closing `]` aligns with the parent line
+/// (one level shallower).
+fn format_list_of_scalars_vertical(items: &[Value], item_indent_cols: usize) -> String {
+    // Invariant: `item_indent_cols` is always `child_indent_cols()` of some
+    // `PrettyLayout`, which is `parent_indent_cols + 2`, so >= 2.
+    debug_assert!(item_indent_cols >= 2);
+    let item_indent = " ".repeat(item_indent_cols);
+    let close_indent = " ".repeat(item_indent_cols - 2);
     let mut out = String::from("[\n");
     for item in items {
         out.push_str(&item_indent);
@@ -696,14 +745,19 @@ fn format_list_of_scalars_vertical(items: &[Value], indent_cols: usize) -> Strin
     out
 }
 
-fn format_map_vertical(map: &IndexMap<String, Value>, indent_cols: usize) -> String {
+/// Render a map vertically. Each key is at `key_indent_cols` and its value
+/// recurses with that key as the new parent key.
+fn format_map_vertical(map: &IndexMap<String, Value>, key_indent_cols: usize) -> String {
     let mut keys: Vec<_> = map.keys().collect();
     keys.sort();
-    let key_indent = " ".repeat(indent_cols);
+    let key_indent = " ".repeat(key_indent_cols);
     let mut out = String::new();
     for k in keys {
-        let val_indent = indent_cols + k.len() + 2;
-        let val_str = format_value_pretty(&map[k], val_indent);
+        let child_layout = PrettyLayout {
+            parent_indent_cols: key_indent_cols,
+            key: k,
+        };
+        let val_str = format_value_pretty(&map[k], child_layout);
         out.push('\n');
         out.push_str(&key_indent);
         out.push_str(k);
@@ -1494,40 +1548,48 @@ mod tests {
 
     // ----- format_value_pretty tests -----
 
+    /// Helper to construct a layout for tests.
+    fn layout(parent_indent_cols: usize, key: &str) -> PrettyLayout<'_> {
+        PrettyLayout {
+            parent_indent_cols,
+            key,
+        }
+    }
+
     #[test]
     fn format_value_pretty_string_matches_format_value() {
         let v = Value::String("hello".to_string());
-        assert_eq!(format_value_pretty(&v, 0), format_value(&v));
+        assert_eq!(format_value_pretty(&v, layout(0, "k")), format_value(&v));
     }
 
     #[test]
     fn format_value_pretty_int_renders_as_integer_literal() {
         let v = Value::Int(42);
-        assert_eq!(format_value_pretty(&v, 0), "42");
+        assert_eq!(format_value_pretty(&v, layout(0, "k")), "42");
     }
 
     #[test]
     fn format_value_pretty_bool_renders_as_keyword() {
         let v = Value::Bool(true);
-        assert_eq!(format_value_pretty(&v, 0), "true");
+        assert_eq!(format_value_pretty(&v, layout(0, "k")), "true");
     }
 
     #[test]
     fn format_value_pretty_dsl_enum_resolves_to_provider_value() {
         let v = Value::String("aws.s3.Bucket.VersioningStatus.enabled".to_string());
-        assert_eq!(format_value_pretty(&v, 0), format_value(&v));
+        assert_eq!(format_value_pretty(&v, layout(0, "k")), format_value(&v));
     }
 
     #[test]
     fn format_value_pretty_secret_masked() {
         let v = Value::Secret(Box::new(Value::String("my-password".to_string())));
-        assert_eq!(format_value_pretty(&v, 0), "(secret)");
+        assert_eq!(format_value_pretty(&v, layout(0, "k")), "(secret)");
     }
 
     #[test]
     fn format_value_pretty_unknown_renders_like_format_value() {
         let v = Value::Unknown(UnknownReason::ForKey);
-        assert_eq!(format_value_pretty(&v, 0), format_value(&v));
+        assert_eq!(format_value_pretty(&v, layout(0, "k")), format_value(&v));
     }
 
     #[test]
@@ -1540,10 +1602,11 @@ mod tests {
         s2.insert("effect".to_string(), Value::String("Deny".to_string()));
         let v = Value::List(vec![Value::Map(s1), Value::Map(s2)]);
 
-        // indent_cols=6 means the parent already wrote "      key: " (6 spaces of indent)
-        // so continuation lines (the `- ` and following keys) need 6 spaces of indent too.
-        let out = format_value_pretty(&v, 6);
-        let expected = "\n      - effect: \"Allow\"\n        sid: \"First\"\n      - effect: \"Deny\"\n        sid: \"Second\"";
+        // parent_indent_cols=6 means parent's `key:` is at column 6, so the
+        // children `- ` start at column 8 (parent_indent + 2). This is the
+        // YAML-conventional "two cols inside parent" layout.
+        let out = format_value_pretty(&v, layout(6, "statement"));
+        let expected = "\n        - effect: \"Allow\"\n          sid: \"First\"\n        - effect: \"Deny\"\n          sid: \"Second\"";
         assert_eq!(out, expected);
     }
 
@@ -1552,14 +1615,15 @@ mod tests {
         let mut m = IndexMap::new();
         m.insert("k".to_string(), Value::String("v".to_string()));
         let v = Value::List(vec![Value::Map(m)]);
-        let out = format_value_pretty(&v, 4);
-        assert_eq!(out, "\n    - k: \"v\"");
+        // parent_indent_cols=4 → `- ` at column 6.
+        let out = format_value_pretty(&v, layout(4, "items"));
+        assert_eq!(out, "\n      - k: \"v\"");
     }
 
     #[test]
     fn format_value_pretty_empty_list_inline() {
         let v = Value::List(vec![]);
-        assert_eq!(format_value_pretty(&v, 0), "[]");
+        assert_eq!(format_value_pretty(&v, layout(0, "k")), "[]");
     }
 
     #[test]
@@ -1568,7 +1632,7 @@ mod tests {
             Value::String("a".to_string()),
             Value::String("b".to_string()),
         ]);
-        assert_eq!(format_value_pretty(&v, 0), "[\"a\", \"b\"]");
+        assert_eq!(format_value_pretty(&v, layout(0, "k")), "[\"a\", \"b\"]");
     }
 
     #[test]
@@ -1578,59 +1642,59 @@ mod tests {
             .map(|i| Value::String(format!("iam:LongActionName{}", i)))
             .collect();
         let v = Value::List(items);
-        let out = format_value_pretty(&v, 4);
+        // parent_indent_cols=4, key="action" → first item starts at parent_indent+2 = col 6.
+        let out = format_value_pretty(&v, layout(4, "action"));
         assert!(
             out.starts_with("[\n"),
             "expected bracket-newline start, got: {out}"
         );
         assert!(
             out.contains("\n      \"iam:LongActionName0\","),
-            "missing first item line: {out}"
+            "missing first item line at col 6: {out}"
         );
         assert!(
             out.ends_with("\n    ]"),
-            "expected closing bracket on its own indented line: {out}"
+            "expected closing bracket at parent_indent col: {out}"
         );
     }
 
     #[test]
     fn format_value_pretty_list_of_strings_threshold_boundary_exact_80_inline() {
-        // Construct a list whose inline form is exactly 80 chars at indent_cols=0
-        // → should stay inline ("> 80 expand" rule).
-        let item = "x".repeat(76); // "[\"<76 x's>\"]" = 1 + 1 + 76 + 1 + 1 = 80
+        // Inline form fits exactly within 80 cols at parent_indent=0, key="x" (1 char):
+        // total = 0 + 1 + 2 + len(inline). For len(inline)=77, total=80 → stay inline.
+        let item = "x".repeat(73); // inline = 1 + 1 + 73 + 1 + 1 = 77
         let v = Value::List(vec![Value::String(item)]);
         let inline = format_value_with_key(&v, None);
-        assert_eq!(inline.len(), 80, "fixture sanity: {} chars", inline.len());
-        assert_eq!(format_value_pretty(&v, 0), inline);
+        assert_eq!(inline.len(), 77, "fixture sanity: {} chars", inline.len());
+        // total budget = 0 + 1 + 2 + 77 = 80, exactly at limit → inline.
+        assert_eq!(format_value_pretty(&v, layout(0, "x")), inline);
     }
 
     #[test]
     fn format_value_pretty_list_of_strings_threshold_boundary_81_expands() {
-        // Mirror of the exact-80 test: 81 chars must flip to vertical.
-        let item = "x".repeat(77); // inline = 1 + 1 + 77 + 1 + 1 = 81
+        // 1 char over threshold: 0 + 1 + 2 + 78 = 81 → expand.
+        let item = "x".repeat(74); // inline = 78
         let v = Value::List(vec![Value::String(item)]);
         let inline = format_value_with_key(&v, None);
-        assert_eq!(inline.len(), 81, "fixture sanity: {} chars", inline.len());
-        let out = format_value_pretty(&v, 0);
+        assert_eq!(inline.len(), 78, "fixture sanity: {} chars", inline.len());
+        let out = format_value_pretty(&v, layout(0, "x"));
         assert!(
             out.starts_with("[\n"),
-            "81 chars at indent 0 should expand, got: {out}"
+            "1 over threshold should expand, got: {out}"
         );
     }
 
     #[test]
     fn format_value_pretty_list_of_strings_indent_pushes_over_threshold() {
-        // Inline form is 75 chars; at indent_cols=10 the total would be 85 → expand.
+        // Inline form is 75 chars; at parent_indent=10, key="kk" (2),
+        // total = 10 + 2 + 2 + 75 = 89 → expand.
         let inline_target = 75;
         let item = "x".repeat(inline_target - 4);
         let v = Value::List(vec![Value::String(item)]);
         let inline = format_value_with_key(&v, None);
         assert_eq!(inline.len(), inline_target);
-        let out = format_value_pretty(&v, 10);
-        assert!(
-            out.starts_with("[\n"),
-            "indent should have pushed over threshold: {out}"
-        );
+        let out = format_value_pretty(&v, layout(10, "kk"));
+        assert!(out.starts_with("[\n"), "deep indent should expand: {out}");
     }
 
     #[test]
@@ -1645,10 +1709,11 @@ mod tests {
         entry.insert("sid".to_string(), Value::String("X".to_string()));
         entry.insert("condition".to_string(), Value::Map(inner));
         let v = Value::List(vec![Value::Map(entry)]);
-        let out = format_value_pretty(&v, 4);
+        // parent_indent_cols=4 → `- ` at col 6, continuation keys at col 8.
+        let out = format_value_pretty(&v, layout(4, "statement"));
         assert!(
-            out.contains("    - condition:"),
-            "expected nested key line, got: {out}"
+            out.contains("      - condition:"),
+            "expected `- condition:` at col 6, got: {out}"
         );
         assert!(out.contains("sid: \"X\""), "expected sid line, got: {out}");
     }
@@ -1662,7 +1727,7 @@ mod tests {
         entry.insert("sid".to_string(), Value::String("X".to_string()));
         entry.insert("action".to_string(), Value::List(actions));
         let v = Value::List(vec![Value::Map(entry)]);
-        let out = format_value_pretty(&v, 4);
+        let out = format_value_pretty(&v, layout(4, "statement"));
         assert!(
             out.contains("action: ["),
             "expected expanded action list bracket: {out}"
@@ -1676,7 +1741,7 @@ mod tests {
     #[test]
     fn format_value_pretty_empty_map_inline() {
         let v = Value::Map(IndexMap::new());
-        assert_eq!(format_value_pretty(&v, 0), "{}");
+        assert_eq!(format_value_pretty(&v, layout(0, "k")), "{}");
     }
 
     #[test]
@@ -1685,13 +1750,12 @@ mod tests {
         m.insert("a".to_string(), Value::Int(1));
         m.insert("b".to_string(), Value::Int(2));
         let v = Value::Map(m);
-        // {a: 1, b: 2} is short — should stay inline at indent 0.
-        assert_eq!(format_value_pretty(&v, 0), "{a: 1, b: 2}");
+        // {a: 1, b: 2} = 12 chars; total = 0 + 1 + 2 + 12 = 15 → inline.
+        assert_eq!(format_value_pretty(&v, layout(0, "k")), "{a: 1, b: 2}");
     }
 
     #[test]
     fn format_value_pretty_top_level_map_expands_when_over_threshold() {
-        // A Map whose inline form would exceed 80 cols at indent 0 → vertical.
         let mut m = IndexMap::new();
         m.insert("first_key".to_string(), Value::String("a".repeat(40)));
         m.insert("second_key".to_string(), Value::String("b".repeat(40)));
@@ -1699,23 +1763,21 @@ mod tests {
         let inline = format_value_with_key(&v, None);
         assert!(inline.len() > PRETTY_LINE_LIMIT, "fixture sanity");
 
-        let out = format_value_pretty(&v, 0);
+        // parent_indent_cols=0, key="cfg" → child keys at col 2.
+        let out = format_value_pretty(&v, layout(0, "cfg"));
         assert!(
-            out.starts_with("\nfirst_key: "),
-            "expected vertical map starting with newline + first key, got: {out}"
+            out.starts_with("\n  first_key: "),
+            "expected child keys at col 2, got: {out}"
         );
         assert!(
-            out.contains("\nsecond_key: "),
-            "expected second key on its own line, got: {out}"
+            out.contains("\n  second_key: "),
+            "expected second key at col 2: {out}"
         );
     }
 
     #[test]
     fn format_value_pretty_scalar_variants_match_format_value_with_key() {
-        // Lock the "scalar fallthrough" contract: every non-List, non-Map
-        // Value variant must produce identical output to
-        // format_value_with_key(_, None). Adding a Value variant that
-        // diverges between the two functions should fail this test.
+        // Lock the "scalar fallthrough" contract.
         use crate::resource::AccessPath;
 
         let path = AccessPath::new("vpc", "id");
@@ -1743,7 +1805,7 @@ mod tests {
 
         for v in &cases {
             assert_eq!(
-                format_value_pretty(v, 0),
+                format_value_pretty(v, layout(0, "k")),
                 format_value_with_key(v, None),
                 "scalar fallthrough drift for variant: {v:?}"
             );

@@ -105,11 +105,13 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
             lines.push(line);
         }
         DetailRow::PrettyAttribute { key, value } => {
-            // Indent is fixed at the TUI's "  " (2 cols) prefix plus the
-            // "key: " width — the TUI doesn't have the CLI's dynamic
+            // TUI uses a fixed 2-col prefix instead of the CLI's dynamic
             // tree-indent string, so the layout is approximated.
-            let pretty =
-                carina_core::value::format_value_pretty(value, 2 + key.chars().count() + 2);
+            let layout = carina_core::value::PrettyLayout {
+                parent_indent_cols: 2,
+                key,
+            };
+            let pretty = carina_core::value::format_value_pretty(value, layout);
             let mut spans = vec![Span::raw(format!("  {}: ", key))];
             spans.push(Span::raw(pretty));
             let mut line = Line::from(spans);
