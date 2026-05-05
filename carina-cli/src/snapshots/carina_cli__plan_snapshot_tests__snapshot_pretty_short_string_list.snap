@@ -1,0 +1,11 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  + awscc.iam.Role 
+      role_name: "short-list-test"
+      short_tags: ["a", "b", "c"]
+
+Plan: 1 to add, 0 to change, 0 to destroy.
