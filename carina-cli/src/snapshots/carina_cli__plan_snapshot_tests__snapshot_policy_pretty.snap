@@ -1,0 +1,20 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  + awscc.iam.RolePolicy 
+      policy_name: "test-inline"
+      role_name: "test-role"
+      statement: 
+                 - action: "s3:GetObject"
+                   effect: "Allow"
+                   resource: "arn:aws:s3:::example/*"
+                   sid: "AllowS3Read"
+                 - action: "s3:PutObject"
+                   effect: "Deny"
+                   resource: "arn:aws:s3:::example/*"
+                   sid: "DenyS3Write"
+
+Plan: 1 to add, 0 to change, 0 to destroy.
