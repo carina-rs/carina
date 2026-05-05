@@ -390,17 +390,24 @@ impl CompletionProvider {
         }
     }
 
-    /// Find the module `source` path for a given module binding from `let name = use { source = '...' }`.
+    /// Find the module `source` path for a given module binding from
+    /// `let <name> = use { source = '...' }`.
+    ///
+    /// Recognizes both the single-line shape and the multi-line shape:
+    ///
+    /// ```text
+    /// let github = use {
+    ///   source = '../../../modules/github-oidc'
+    /// }
+    /// ```
+    ///
+    /// The real `carina-rs/infra` tree always writes the multi-line form, so
+    /// scanning line-by-line and only looking at the `let` line itself misses
+    /// the `source` value entirely. We instead locate the `let <name> = use {`
+    /// header and then slurp the buffer up to the matching `}` to find
+    /// `source = '...'` anywhere inside.
     pub(super) fn find_module_import_path(&self, module_name: &str, text: &str) -> Option<String> {
-        for line in text.lines() {
-            if let Some((alias, after_eq)) = crate::let_parse::parse_let_header(line)
-                && alias == module_name
-                && let Some(path) = extract_use_source_path(after_eq)
-            {
-                return Some(path);
-            }
-        }
-        None
+        find_let_use_source(module_name, text)
     }
 
     /// Build a snippet for a module call with argument placeholders.
@@ -414,6 +421,9 @@ impl CompletionProvider {
         base_path: Option<&Path>,
     ) -> String {
         // Extract source path from "use { source = 'path' }" or with double quotes.
+        // Only the single-line shape is resolvable here — when the `use` body
+        // spans newlines, `after_eq` is just the line tail and we fall back
+        // to the no-source scaffold below.
         let import_path = extract_use_source_path(after_eq);
 
         if let Some(path) = import_path.as_deref()
@@ -441,18 +451,84 @@ impl CompletionProvider {
     }
 }
 
-/// Extract the `source` path from a `let` RHS of the shape `use { source = 'path' }`
-/// (or with double quotes). Returns `None` if `after_eq` doesn't look like a `use` block
-/// or if the `source` value can't be parsed.
-pub(super) fn extract_use_source_path(after_eq: &str) -> Option<String> {
-    let trimmed = after_eq.trim_start();
-    let rest = trimmed
-        .strip_prefix("use ")
-        .or_else(|| trimmed.strip_prefix("use{"))
-        .map(|s| s.trim_start_matches('{').trim_start())?;
+/// Find the `source` path for `let <module_name> = use { ... source = '...' ... }`
+/// anywhere in `text`, including the multi-line form where the body of the `use`
+/// block spans several lines.
+///
+/// The scan looks for a `let <module_name> = use {` opening, then walks forward
+/// tracking brace depth until the matching closing `}`. Inside that range the
+/// first `source = '<path>'` (or with double quotes) wins. Returns `None` if
+/// the binding isn't found, isn't a `use { ... }`, or has no parseable `source`.
+fn find_let_use_source(module_name: &str, text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        let Some((alias, after_eq)) = crate::let_parse::parse_let_header(line) else {
+            continue;
+        };
+        if alias != module_name {
+            continue;
+        }
+        let trimmed = after_eq.trim_start();
+        // Recognize both `use {` and `use{` openings.
+        let body_head = match trimmed
+            .strip_prefix("use ")
+            .or_else(|| trimmed.strip_prefix("use{"))
+        {
+            Some(rest) => rest.trim_start_matches('{'),
+            None => continue,
+        };
 
-    let idx = rest.find("source")?;
-    let after = rest[idx + "source".len()..].trim_start();
+        // Single-line shape: try the existing fast path first.
+        if let Some(path) = extract_source_in_block(body_head) {
+            return Some(path);
+        }
+
+        // Multi-line shape: slurp body lines until braces balance, then scan.
+        // The opening `{` was consumed when we stripped `use {`, so brace_depth
+        // starts at 1.
+        let mut body = String::from(body_head);
+        let mut brace_depth: i32 = 1 + count_braces(body_head);
+        if brace_depth <= 0 {
+            // Already balanced on the same line but no `source` found above;
+            // give up — this is a `use { ... }` without a source.
+            return None;
+        }
+        for next_line in lines.iter().skip(i + 1) {
+            body.push('\n');
+            body.push_str(next_line);
+            brace_depth += count_braces(next_line);
+            if brace_depth <= 0 {
+                break;
+            }
+        }
+        return extract_source_in_block(&body);
+    }
+    None
+}
+
+/// Net brace delta of `s`: number of `{` minus number of `}`. Used to balance
+/// the body of a `use { ... }` block when the shape spans multiple lines.
+/// String literals are not specially handled — `use` block bodies in practice
+/// are key-value pairs whose values are quoted paths, not free-form text with
+/// embedded braces, so a naive count is sufficient.
+fn count_braces(s: &str) -> i32 {
+    let mut depth: i32 = 0;
+    for b in s.bytes() {
+        match b {
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            _ => {}
+        }
+    }
+    depth
+}
+
+/// Locate `source = '<path>'` (or with double quotes) anywhere in `block_body`,
+/// where `block_body` is the text inside a `use { ... }` block (possibly across
+/// newlines). Returns the unquoted path on the first match.
+fn extract_source_in_block(block_body: &str) -> Option<String> {
+    let idx = block_body.find("source")?;
+    let after = block_body[idx + "source".len()..].trim_start();
     let after = after.strip_prefix('=')?.trim_start();
     let quote = after.chars().next()?;
     if quote != '\'' && quote != '"' {
@@ -461,6 +537,23 @@ pub(super) fn extract_use_source_path(after_eq: &str) -> Option<String> {
     let body = &after[1..];
     let end = body.find(quote)?;
     Some(body[..end].to_string())
+}
+
+/// Extract the `source` path from a `let` RHS of the shape `use { source = 'path' }`
+/// (or with double quotes). Returns `None` if `after_eq` doesn't look like a `use` block
+/// or if the `source` value can't be parsed.
+///
+/// This is the single-line fast path used by snippet generation, where we only
+/// have the line tail after `=`. For the multi-line shape used by the real
+/// infra, callers must use `find_let_use_source` instead, which reaches across
+/// newlines to find `source` on its own line.
+pub(super) fn extract_use_source_path(after_eq: &str) -> Option<String> {
+    let trimmed = after_eq.trim_start();
+    let rest = trimmed
+        .strip_prefix("use ")
+        .or_else(|| trimmed.strip_prefix("use{"))
+        .map(|s| s.trim_start_matches('{').trim_start())?;
+    extract_source_in_block(rest)
 }
 
 /// Build a navigation-anchor `CompletionItem` for `./` or `../`.
