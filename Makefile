@@ -126,6 +126,10 @@ plan-fixtures:
 	@echo ""
 	@echo "=== policy_pretty ==="
 	@$(MAKE) plan-policy-pretty
+	@echo "---"
+	@$(MAKE) plan-pretty-long-string-list
+	@echo "---"
+	@$(MAKE) plan-pretty-short-string-list
 
 plan-upstream-state:
 	$(PLAN_FIXTURE) upstream_state
@@ -143,6 +147,10 @@ plan-exports-multifile:
 	$(PLAN_FIXTURE) exports_multifile
 plan-policy-pretty:
 	$(PLAN_FIXTURE) policy_pretty
+plan-pretty-long-string-list:
+	$(PLAN_FIXTURE) pretty_long_string_list
+plan-pretty-short-string-list:
+	$(PLAN_FIXTURE) pretty_short_string_list
 .PHONY: plan-all-create plan-no-changes plan-no-changes-enum plan-mixed plan-delete plan-compact \
         plan-map-diff plan-enum-display plan-destroy-full plan-destroy-orphans plan-read-only-attrs \
         plan-default-values plan-explicit plan-default-tags \
@@ -150,6 +158,7 @@ plan-policy-pretty:
         plan-upstream-state plan-upstream-state-unresolved plan-upstream-state-empty-exports \
         plan-upstream-state-map-subscript \
         plan-deferred-for plan-exports plan-exports-multifile plan-policy-pretty \
+        plan-pretty-long-string-list plan-pretty-short-string-list \
         plan-map-diff-tui plan-all-create-tui plan-mixed-tui plan-delete-tui \
         plan-moved-with-changes-tui plan-moved-pure-tui plan-fixtures
 

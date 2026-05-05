@@ -1,0 +1,15 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  + awscc.iam.Role 
+      managed_policy_arns: [
+        "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess",
+        "arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess",
+        "arn:aws:iam::aws:policy/IAMReadOnlyAccess",
+      ]
+      role_name: "test-role"
+
+Plan: 1 to add, 0 to change, 0 to destroy.

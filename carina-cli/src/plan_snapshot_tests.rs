@@ -77,6 +77,36 @@ fn snapshot_policy_pretty() {
 }
 
 #[test]
+fn snapshot_pretty_long_string_list() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("pretty_long_string_list");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+    ));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_pretty_short_string_list() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("pretty_short_string_list");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+    ));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
 fn snapshot_no_changes() {
     let (plan, _schemas, _moved) = build_plan_from_fixture("no_changes");
     let output = strip_ansi(&format_plan(
