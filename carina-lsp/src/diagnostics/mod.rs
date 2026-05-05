@@ -708,8 +708,20 @@ impl DiagnosticEngine {
                 }
             }
 
-            // Check for unknown built-in function calls
-            diagnostics.extend(self.check_unknown_functions(doc, parsed));
+            // Check for unknown built-in function calls. Pass the merged
+            // parse so user-defined `fn X(...)` declared in a sibling
+            // `.crn` is not flagged as unknown (#2442). `base_path` is
+            // threaded so the check can fall back to a per-file walk
+            // when the directory parse failed (e.g. an unrelated error
+            // elsewhere in the directory) — without that fallback,
+            // every sibling-defined fn would redline as Unknown the
+            // moment any sibling fails to parse.
+            diagnostics.extend(self.check_unknown_functions(
+                doc,
+                parsed,
+                merged.as_ref(),
+                base_path,
+            ));
 
             // Check attributes blocks
             diagnostics.extend(self.check_attributes_blocks(doc, parsed));

@@ -1453,20 +1453,79 @@ impl DiagnosticEngine {
     }
 
     /// Check for unknown built-in function calls in parsed resource attributes.
+    ///
+    /// User-defined functions declared in any sibling `.crn` are excluded
+    /// from the unknown-function diagnostic — without this, `fn X(...)` in
+    /// `helpers.crn` is flagged as Unknown when called from `main.crn`
+    /// (#2442).
+    ///
+    /// The "known user-fns" set is built defensively:
+    ///   * `merged.user_functions` when the directory-merged parse
+    ///     succeeded (the cheap, common case); else
+    ///   * a per-file walk of `base_path`'s `.crn` siblings via
+    ///     `collect_sibling_user_fn_names`. Without this fallback any
+    ///     unrelated parse-blocking error elsewhere in the directory
+    ///     would redline every correctly-defined sibling `fn` as
+    ///     Unknown. Else
+    ///   * the buffer's own `parsed.user_functions` (single-file path,
+    ///     no `base_path`).
     pub(super) fn check_unknown_functions(
         &self,
         doc: &Document,
         parsed: &ParsedFile,
+        merged: Option<&ParsedFile>,
+        base_path: Option<&std::path::Path>,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
+        // Build a flat name set — the diagnostic only checks
+        // `contains(name)`, never inspects the function body. Avoiding
+        // `UserFunction` clones keeps the slow path cheap.
+        let user_fns: HashSet<String> = match (merged, base_path) {
+            (Some(m), _) => m.user_functions.keys().cloned().collect(),
+            (None, Some(base)) => self.collect_sibling_user_fn_names(doc, base),
+            (None, None) => parsed.user_functions.keys().cloned().collect(),
+        };
 
         for (_ctx, resource) in parsed.iter_all_resources() {
             for value in resource.attributes.values() {
-                self.collect_unknown_function_diagnostics(doc, value, &mut diagnostics);
+                self.collect_unknown_function_diagnostics(doc, value, &user_fns, &mut diagnostics);
             }
         }
 
         diagnostics
+    }
+
+    /// Walk every `.crn` file in `base_path` independently and collect
+    /// their user-function names. Used as a fallback when the full
+    /// directory parse failed (`parse_directory_with_overrides` returns
+    /// `Err` if any sibling has a parse error or the resolver bails).
+    /// A per-file failure is non-fatal — we just skip that file. The
+    /// open buffer's own user-fn names are taken from `doc` so unsaved
+    /// edits are honored.
+    fn collect_sibling_user_fn_names(
+        &self,
+        doc: &Document,
+        base_path: &std::path::Path,
+    ) -> HashSet<String> {
+        let mut out: HashSet<String> = HashSet::new();
+        // Buffer-defined fns first (unsaved edits beat on-disk).
+        if let Some(parsed) = doc.parsed() {
+            out.extend(parsed.user_functions.keys().cloned());
+        }
+        let Ok(files) = carina_core::config_loader::find_crn_files_in_dir(&base_path.to_path_buf())
+        else {
+            return out;
+        };
+        for file in files {
+            let Ok(content) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let Ok(parsed) = carina_core::parser::parse(&content, &self.provider_context) else {
+                continue;
+            };
+            out.extend(parsed.user_functions.into_keys());
+        }
+        out
     }
 
     /// Recursively walk a Value tree to find FunctionCall nodes with unknown names.
@@ -1474,11 +1533,13 @@ impl DiagnosticEngine {
         &self,
         doc: &Document,
         value: &Value,
+        user_fns: &HashSet<String>,
         diagnostics: &mut Vec<Diagnostic>,
     ) {
         match value {
             Value::FunctionCall { name, args } => {
                 if !builtins::is_known_builtin(name)
+                    && !user_fns.contains(name)
                     && let Some((line, col)) = self.find_function_call_position(doc, name)
                 {
                     diagnostics.push(carina_diagnostic(
@@ -1491,23 +1552,23 @@ impl DiagnosticEngine {
                 }
                 // Also check nested function calls in arguments
                 for arg in args {
-                    self.collect_unknown_function_diagnostics(doc, arg, diagnostics);
+                    self.collect_unknown_function_diagnostics(doc, arg, user_fns, diagnostics);
                 }
             }
             Value::List(items) => {
                 for item in items {
-                    self.collect_unknown_function_diagnostics(doc, item, diagnostics);
+                    self.collect_unknown_function_diagnostics(doc, item, user_fns, diagnostics);
                 }
             }
             Value::Map(map) => {
                 for v in map.values() {
-                    self.collect_unknown_function_diagnostics(doc, v, diagnostics);
+                    self.collect_unknown_function_diagnostics(doc, v, user_fns, diagnostics);
                 }
             }
             Value::Interpolation(parts) => {
                 for part in parts {
                     if let carina_core::resource::InterpolationPart::Expr(expr) = part {
-                        self.collect_unknown_function_diagnostics(doc, expr, diagnostics);
+                        self.collect_unknown_function_diagnostics(doc, expr, user_fns, diagnostics);
                     }
                 }
             }
