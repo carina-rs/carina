@@ -12,17 +12,19 @@ use crate::parser::expressions::string_literal::parse_string_value;
 use crate::parser::expressions::validate_expr::parse_validate_expr;
 use crate::parser::parse_expression;
 use crate::parser::types::parse_type_expr;
-use crate::resource::{LifecycleConfig, Value};
+use crate::resource::{LifecycleConfig, Resource, Value};
 use indexmap::IndexMap;
 
-/// Parse arguments block
+/// Parse arguments block. See `register_argument_binding` for the
+/// incremental scoping discipline that lets a later argument's default
+/// expression reference earlier arguments (#2393).
 pub(in crate::parser) fn parse_arguments_block(
     pair: pest::iterators::Pair<Rule>,
     config: &ProviderContext,
+    ctx: &mut ParseContext,
     warnings: &mut Vec<ParseWarning>,
 ) -> Result<Vec<ArgumentParameter>, ParseError> {
     let mut arguments = Vec::new();
-    let ctx = ParseContext::new(config);
 
     for param in pair.into_inner() {
         if param.as_rule() == Rule::arguments_param {
@@ -36,13 +38,12 @@ pub(in crate::parser) fn parse_arguments_block(
                 warnings,
             )?;
 
-            // Check if the next element is a block form or simple default
+            let mut description = None;
+            let mut default = None;
+            let mut validations = Vec::new();
+
             if let Some(next) = param_inner.next() {
                 if next.as_rule() == Rule::arguments_param_block {
-                    // Block form: parse description, default, validate blocks from attrs
-                    let mut description = None;
-                    let mut default = None;
-                    let mut validations = Vec::new();
                     for attr in next.into_inner() {
                         if attr.as_rule() == Rule::arguments_param_attr {
                             let inner_attr =
@@ -51,7 +52,7 @@ pub(in crate::parser) fn parse_arguments_block(
                                 Rule::arg_description_attr => {
                                     let string_pair =
                                         first_inner(inner_attr, "string", "arg_description_attr")?;
-                                    let value = parse_string_value(string_pair, &ctx)?;
+                                    let value = parse_string_value(string_pair, ctx)?;
                                     if let Value::String(s) = value {
                                         description = Some(s);
                                     }
@@ -59,7 +60,7 @@ pub(in crate::parser) fn parse_arguments_block(
                                 Rule::arg_default_attr => {
                                     let expr_pair =
                                         first_inner(inner_attr, "expression", "arg_default_attr")?;
-                                    default = Some(parse_expression(expr_pair, &ctx)?);
+                                    default = Some(parse_expression(expr_pair, ctx)?);
                                 }
                                 Rule::arg_validation_block => {
                                     let mut rule = None;
@@ -88,7 +89,7 @@ pub(in crate::parser) fn parse_arguments_block(
                                                         "validation_error_message_attr",
                                                     )?;
                                                     let value =
-                                                        parse_string_value(string_pair, &ctx)?;
+                                                        parse_string_value(string_pair, ctx)?;
                                                     if let Value::String(s) = value {
                                                         error_msg = Some(s);
                                                     }
@@ -108,38 +109,36 @@ pub(in crate::parser) fn parse_arguments_block(
                             }
                         }
                     }
-                    arguments.push(ArgumentParameter {
-                        name,
-                        type_expr,
-                        default,
-                        description,
-                        validations,
-                    });
                 } else {
-                    // Simple form: the next element is the default expression
-                    let default = Some(parse_expression(next, &ctx)?);
-                    arguments.push(ArgumentParameter {
-                        name,
-                        type_expr,
-                        default,
-                        description: None,
-                        validations: Vec::new(),
-                    });
+                    // Simple form: the next element is the default expression itself.
+                    default = Some(parse_expression(next, ctx)?);
                 }
-            } else {
-                // No default, no block
-                arguments.push(ArgumentParameter {
-                    name,
-                    type_expr,
-                    default: None,
-                    description: None,
-                    validations: Vec::new(),
-                });
             }
+
+            register_argument_binding(ctx, &name);
+            arguments.push(ArgumentParameter {
+                name,
+                type_expr,
+                default,
+                description,
+                validations,
+            });
         }
     }
 
     Ok(arguments)
+}
+
+/// Register an argument name as a lexical binding so subsequent expressions
+/// (later argument defaults, resource bodies, etc.) resolve it as a
+/// `ResourceRef` placeholder rather than a literal string. Without this
+/// incremental registration, `${other_arg}` inside a default would have no
+/// in-scope binding and degrade to the literal string `"other_arg"` (#2393).
+fn register_argument_binding(ctx: &mut ParseContext, name: &str) {
+    let placeholder_ref = Value::resource_ref(name.to_string(), String::new(), vec![]);
+    ctx.set_variable(name.to_string(), placeholder_ref);
+    let placeholder = Resource::new("_argument", name);
+    ctx.set_resource_binding(name.to_string(), placeholder);
 }
 
 /// Parse attributes block

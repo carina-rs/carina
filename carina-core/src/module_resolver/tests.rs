@@ -2314,6 +2314,347 @@ fn test_load_module_directory_merges_sibling_files_with_main() {
     let _ = fs::remove_dir_all(&tmp_dir);
 }
 
+/// Helper for #2393 regression tests: write a module body and a calling
+/// root body to a tempdir, parse and resolve, return the parsed root with
+/// modules expanded. Mirrors the directory-scoped fixture shape required by
+/// CLAUDE.md so single-file thinking can't sneak back in.
+fn resolve_default_arg_fixture(module_body: &str, root_body: &str) -> ParsedFile {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let module_dir = tmp.path().join("modules/m");
+    fs::create_dir_all(&module_dir).unwrap();
+    fs::write(module_dir.join("main.crn"), module_body).unwrap();
+
+    let root_dir = tmp.path().join("root");
+    fs::create_dir_all(&root_dir).unwrap();
+    fs::write(root_dir.join("main.crn"), root_body).unwrap();
+
+    let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
+    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    resolve_modules(&mut parsed, &root_dir).expect("resolve_modules should succeed");
+    parsed
+}
+
+fn role_attr<'a>(parsed: &'a ParsedFile, attr: &str) -> &'a Value {
+    parsed
+        .resources
+        .iter()
+        .find(|r| r.id.resource_type == "iam.Role")
+        .expect("Role resource should exist")
+        .get_attr(attr)
+        .unwrap_or_else(|| panic!("Role.{attr} should exist"))
+}
+
+// Regression for #2393. A module argument default that interpolates another
+// argument (`["repo:${github_repo}:*"]`) must resolve `${github_repo}` against
+// the caller-provided value, not leave it as the literal binding name.
+#[test]
+fn test_argument_default_interpolates_other_arguments() {
+    let parsed = resolve_default_arg_fixture(
+        r#"
+arguments {
+  github_repo     : String
+  subject_patterns: list(String) = ["repo:${github_repo}:*"]
+}
+
+let role = awscc.iam.Role {
+  role_name = 'r'
+  assume_role_policy_document = {
+    patterns = subject_patterns
+  }
+}
+"#,
+        r#"
+let m = use { source = '../modules/m' }
+
+m {
+  github_repo = 'carina-rs/infra'
+}
+"#,
+    );
+
+    let policy = role_attr(&parsed, "assume_role_policy_document");
+    let Value::Map(policy_map) = policy else {
+        panic!("assume_role_policy_document should be a Map, got {policy:?}");
+    };
+    let patterns = policy_map.get("patterns").expect("patterns should exist");
+    let Value::List(items) = patterns else {
+        panic!("patterns should be a List, got {patterns:?}");
+    };
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0],
+        Value::String("repo:carina-rs/infra:*".to_string()),
+        "default's ${{github_repo}} interpolation must resolve against the caller's value"
+    );
+}
+
+// #2393 — block-form default with `${other_arg}` interpolation must also
+// resolve, not just the simple `name: T = expr` form.
+#[test]
+fn test_argument_default_block_form_interpolates_other_arguments() {
+    let parsed = resolve_default_arg_fixture(
+        r#"
+arguments {
+  github_repo: String
+  subject_pattern: String {
+    description = "subject pattern"
+    default     = "repo:${github_repo}:*"
+  }
+}
+
+let role = awscc.iam.Role {
+  role_name                   = subject_pattern
+  assume_role_policy_document = {}
+}
+"#,
+        r#"
+let m = use { source = '../modules/m' }
+
+m {
+  github_repo = 'carina-rs/infra'
+}
+"#,
+    );
+
+    assert_eq!(
+        role_attr(&parsed, "role_name"),
+        &Value::String("repo:carina-rs/infra:*".to_string()),
+        "block-form default's `${{github_repo}}` must resolve against the caller's value"
+    );
+}
+
+// #2393 — bare-identifier default (`b: String = a`, no `${}` wrapping) is a
+// `Value::ResourceRef { binding: "a" }` after parse and must resolve to the
+// caller-supplied value of `a`.
+#[test]
+fn test_argument_default_bare_identifier_resolves() {
+    let parsed = resolve_default_arg_fixture(
+        r#"
+arguments {
+  primary  : String
+  secondary: String = primary
+}
+
+let role = awscc.iam.Role {
+  role_name                   = secondary
+  assume_role_policy_document = {}
+}
+"#,
+        r#"
+let m = use { source = '../modules/m' }
+
+m {
+  primary = 'p'
+}
+"#,
+    );
+
+    assert_eq!(
+        role_attr(&parsed, "role_name"),
+        &Value::String("p".to_string()),
+        "bare-identifier default `secondary = primary` must resolve to caller's `primary`"
+    );
+}
+
+// #2393 — transitive default chain `a → b → c`. Each default is resolved
+// against arguments already in scope, so by the time `c = "${b}!"` is
+// resolved, `b` has been canonicalized to a flat string `"X-X"`. Pinning
+// this is important because removing the `canonicalize_in_place` call in
+// the expander would produce a nested `Interpolation` in `c` that no
+// downstream consumer flattens.
+#[test]
+fn test_argument_default_transitive_chain_resolves() {
+    let parsed = resolve_default_arg_fixture(
+        r#"
+arguments {
+  a: String = 'X'
+  b: String = "${a}-${a}"
+  c: String = "${b}!"
+}
+
+let role = awscc.iam.Role {
+  role_name                   = c
+  assume_role_policy_document = {}
+}
+"#,
+        r#"
+let m = use { source = '../modules/m' }
+
+m {}
+"#,
+    );
+
+    assert_eq!(
+        role_attr(&parsed, "role_name"),
+        &Value::String("X-X!".to_string()),
+        "transitive default chain `a → b → c` must collapse to a flat string"
+    );
+}
+
+// #2393 — interpolation nested inside a Map value within a list default
+// must be resolved by `substitute_arguments`'s recursion through
+// List/Map/Interpolation arms.
+#[test]
+fn test_argument_default_nested_collection_interpolates() {
+    let parsed = resolve_default_arg_fixture(
+        r#"
+arguments {
+  region : String
+  tags   : map(String) = {
+    managed_by = 'carina'
+    region     = "${region}-tag"
+  }
+}
+
+let role = awscc.iam.Role {
+  role_name                   = 'r'
+  assume_role_policy_document = {
+    tags = tags
+  }
+}
+"#,
+        r#"
+let m = use { source = '../modules/m' }
+
+m {
+  region = 'ap-northeast-1'
+}
+"#,
+    );
+
+    let policy = role_attr(&parsed, "assume_role_policy_document");
+    let Value::Map(policy_map) = policy else {
+        panic!("policy should be Map, got {policy:?}");
+    };
+    let tags = policy_map.get("tags").expect("tags should exist");
+    let Value::Map(tag_map) = tags else {
+        panic!("tags should be Map, got {tags:?}");
+    };
+    assert_eq!(
+        tag_map.get("region"),
+        Some(&Value::String("ap-northeast-1-tag".to_string())),
+        "interpolation inside a nested map default must resolve recursively"
+    );
+}
+
+// #2393 — module with arguments but no defaults at all must work; the new
+// substitute+canonicalize pass is a no-op on caller-supplied scalars.
+#[test]
+fn test_argument_no_defaults_caller_scalars_pass_through() {
+    let parsed = resolve_default_arg_fixture(
+        r#"
+arguments {
+  x: String
+  y: Int
+}
+
+let role = awscc.iam.Role {
+  role_name                   = x
+  assume_role_policy_document = {
+    y_value = y
+  }
+}
+"#,
+        r#"
+let m = use { source = '../modules/m' }
+
+m {
+  x = 'hello'
+  y = 42
+}
+"#,
+    );
+
+    assert_eq!(
+        role_attr(&parsed, "role_name"),
+        &Value::String("hello".to_string()),
+    );
+    let policy = role_attr(&parsed, "assume_role_policy_document");
+    let Value::Map(policy_map) = policy else {
+        panic!("policy should be Map, got {policy:?}");
+    };
+    assert_eq!(policy_map.get("y_value"), Some(&Value::Int(42)));
+}
+
+// #2393 — argument defaults are resolved in declaration order; a default
+// that refers to a later-declared argument has no in-scope binding when its
+// expression is parsed and degrades to the literal identifier name. This
+// test pins the current behavior so any future change (e.g. moving to a
+// two-pass resolution that allows forward refs) is explicit.
+#[test]
+fn test_argument_default_forward_ref_degrades_to_literal() {
+    let parsed = resolve_default_arg_fixture(
+        r#"
+arguments {
+  prefix: String = later
+  later : String = 'L'
+}
+
+let role = awscc.iam.Role {
+  role_name                   = prefix
+  assume_role_policy_document = {}
+}
+"#,
+        r#"
+let m = use { source = '../modules/m' }
+
+m {}
+"#,
+    );
+
+    assert_eq!(
+        role_attr(&parsed, "role_name"),
+        &Value::String("later".to_string()),
+        "forward-ref default falls back to the literal identifier name; \
+         resolution is order-sensitive (see #2393)"
+    );
+}
+
+// #2393 — caller-supplied ResourceRefs (cross-module data flow) must NOT be
+// substituted by the new default-resolution pass: their binding names are
+// not argument names, so they should pass through untouched until the outer
+// resolver rewrites them.
+#[test]
+fn test_argument_caller_resource_ref_passes_through() {
+    let parsed = resolve_default_arg_fixture(
+        r#"
+arguments {
+  source_arn: String
+}
+
+let role = awscc.iam.Role {
+  role_name                   = source_arn
+  assume_role_policy_document = {}
+}
+"#,
+        r#"
+let upstream = awscc.ec2.Vpc {
+  cidr_block = '10.0.0.0/16'
+}
+
+let m = use { source = '../modules/m' }
+
+m {
+  source_arn = upstream.arn
+}
+"#,
+    );
+
+    // Find the module's expanded `role` (the upstream Vpc has type Vpc, not Role).
+    let role_name = role_attr(&parsed, "role_name");
+    match role_name {
+        Value::ResourceRef { path } => {
+            assert_eq!(
+                path.binding(),
+                "upstream",
+                "caller's `upstream.arn` must remain a ResourceRef with binding=upstream"
+            );
+            assert_eq!(path.attribute(), "arn");
+        }
+        other => panic!("role_name should be a ResourceRef, got {other:?}"),
+    }
+}
+
 #[test]
 fn test_load_module_directory_merge_order_is_deterministic() {
     // Merged vectors must be ordered by file path so that downstream

@@ -51,7 +51,17 @@ impl ModuleResolver<'_> {
             }
         }
 
-        // Build argument value map
+        // Build argument value map.
+        //
+        // Defaults may interpolate other arguments (#2393), e.g.
+        // `subject_patterns: list(String) = ["repo:${github_repo}:*"]`.
+        // The parser registers each argument as a placeholder ResourceRef
+        // binding while parsing the block, so the default lands here as a
+        // tree containing `Value::ResourceRef { binding: "<other_arg>" }`
+        // nodes. Resolve those against arguments processed so far, in
+        // declaration order, before storing — that way every downstream
+        // consumer (type check, validate, require, attribute substitution)
+        // sees a fully-resolved value.
         let mut argument_values: HashMap<String, Value> = HashMap::new();
         for arg in &module.arguments {
             let value = call
@@ -60,7 +70,13 @@ impl ModuleResolver<'_> {
                 .cloned()
                 .or_else(|| arg.default.clone())
                 .unwrap();
-            argument_values.insert(arg.name.clone(), value);
+            let mut resolved = substitute_arguments(&value, &argument_values);
+            // Substitution may turn an `Interpolation` whose parts now hold
+            // only literal scalars into a flat `String`; canonicalize so
+            // downstream consumers (type check, validate, plan rendering)
+            // see the collapsed form rather than a single-Expr Interpolation.
+            resolved.canonicalize_in_place();
+            argument_values.insert(arg.name.clone(), resolved);
         }
 
         // Type-check argument values against declared types
