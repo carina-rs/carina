@@ -25,13 +25,6 @@ aws.s3.BucketVersioning {
 
 ## Argument Reference
 
-### `acl`
-
-- **Type:** [Enum (ACL)](#acl-acl)
-- **Required:** No
-
-The canned ACL to apply to the bucket. This functionality is not supported for directory buckets.
-
 ### `bucket`
 
 - **Type:** String
@@ -46,53 +39,6 @@ The name of the bucket to create. General purpose buckets - For information abou
 
 Specifies the namespace where you want to create your general purpose bucket. When you create a general purpose bucket, you can choose to create a bucket in the shared global namespace or you can choose to create a bucket in your account regional namespace. Your account regional namespace is a subdivision of the global namespace that only your account can create buckets in. For more information on bucket namespaces, see Namespaces for general purpose buckets. General purpose buckets in your account regional namespace must follow a specific naming convention. These buckets consist of a bucket name prefix that you create, and a suffix that contains your 12-digit Amazon Web Services Account ID, the Amazon Web Services Region code, and ends with -an. Bucket names must follow the format bucket-name-prefix-accountId-region-an (for example, amzn-s3-demo-bucket-111122223333-us-west-2-an). For information about bucket naming restrictions, see Account regional namespace naming rules in the Amazon S3 User Guide. This functionality is not supported for directory buckets.
 
-### `grant_full_control`
-
-- **Type:** S3Grantee
-- **Required:** No
-
-Allows grantee the read, write, read ACP, and write ACP permissions on the bucket. This functionality is not supported for directory buckets.
-
-### `grant_read`
-
-- **Type:** S3Grantee
-- **Required:** No
-
-Allows grantee to list the objects in the bucket. This functionality is not supported for directory buckets.
-
-### `grant_read_acp`
-
-- **Type:** S3Grantee
-- **Required:** No
-
-Allows grantee to read the bucket ACL. This functionality is not supported for directory buckets.
-
-### `grant_write`
-
-- **Type:** S3Grantee
-- **Required:** No
-
-Allows grantee to create new objects in the bucket. For the bucket and object owners of existing objects, also allows deletions and overwrites of those objects. This functionality is not supported for directory buckets.
-
-### `grant_write_acp`
-
-- **Type:** S3Grantee
-- **Required:** No
-
-Allows grantee to write the ACL for the applicable bucket. This functionality is not supported for directory buckets.
-
-### `object_lock_enabled_for_bucket`
-
-- **Type:** Bool
-- **Required:** No
-
-Specifies whether you want S3 Object Lock to be enabled for the new bucket. This functionality is not supported for directory buckets.
-
-### `object_ownership`
-
-- **Type:** [Enum (ObjectOwnership)](#object_ownership-objectownership)
-- **Required:** No
-
 ### `tags`
 
 - **Type:** Map
@@ -102,17 +48,6 @@ The tags for the resource.
 
 ## Enum Values
 
-### acl (ACL)
-
-| Value | DSL Identifier |
-|-------|----------------|
-| `authenticated-read` | `aws.s3.Bucket.ACL.authenticated_read` |
-| `private` | `aws.s3.Bucket.ACL.private` |
-| `public-read` | `aws.s3.Bucket.ACL.public_read` |
-| `public-read-write` | `aws.s3.Bucket.ACL.public_read_write` |
-
-Shorthand formats: `authenticated_read` or `ACL.authenticated_read`
-
 ### bucket_namespace (BucketNamespace)
 
 | Value | DSL Identifier |
@@ -121,14 +56,4 @@ Shorthand formats: `authenticated_read` or `ACL.authenticated_read`
 | `global` | `aws.s3.Bucket.BucketNamespace.global` |
 
 Shorthand formats: `account_regional` or `BucketNamespace.account_regional`
-
-### object_ownership (ObjectOwnership)
-
-| Value | DSL Identifier |
-|-------|----------------|
-| `BucketOwnerEnforced` | `aws.s3.Bucket.ObjectOwnership.BucketOwnerEnforced` |
-| `BucketOwnerPreferred` | `aws.s3.Bucket.ObjectOwnership.BucketOwnerPreferred` |
-| `ObjectWriter` | `aws.s3.Bucket.ObjectOwnership.ObjectWriter` |
-
-Shorthand formats: `BucketOwnerEnforced` or `ObjectOwnership.BucketOwnerEnforced`
 
