@@ -184,22 +184,31 @@ impl CompletionProvider {
         ];
 
         // Generate module binding completions from `use` statements
-        // e.g., "let github = use { source = '...' }" → suggest "github" with call scaffold
-        for line in lines.iter() {
-            if let Some((binding, after_eq)) = crate::let_parse::parse_let_header(line)
-                && binding != "_"
-                && (after_eq.starts_with("use ") || after_eq.starts_with("use{"))
-            {
-                let snippet = self.build_module_call_snippet(binding, after_eq, base_path);
-                completions.push(CompletionItem {
-                    label: binding.to_string(),
-                    kind: Some(CompletionItemKind::MODULE),
-                    insert_text: Some(snippet),
-                    insert_text_format: Some(InsertTextFormat::SNIPPET),
-                    detail: Some("Module call".to_string()),
-                    ..Default::default()
-                });
+        // e.g., "let github = use { source = '...' }" → suggest "github" with call scaffold.
+        // Resolve `DslSource` once so the directory's sibling `.crn`
+        // files are read a single time per completion request — both the
+        // let-binding scan here and any `find_module_import_path`
+        // fallback inside `build_module_call_snippet` share the same
+        // merged text (#2446).
+        let mut storage = String::new();
+        let src = DslSource::resolve_directory(text, base_path, &mut storage);
+        let merged = src.merged_text();
+        for (binding, after_eq) in Self::extract_let_bindings(src) {
+            if binding == "_" {
+                continue;
             }
+            if !(after_eq.starts_with("use ") || after_eq.starts_with("use{")) {
+                continue;
+            }
+            let snippet = self.build_module_call_snippet(&binding, &after_eq, merged, base_path);
+            completions.push(CompletionItem {
+                label: binding.clone(),
+                kind: Some(CompletionItemKind::MODULE),
+                insert_text: Some(snippet),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                detail: Some("Module call".to_string()),
+                ..Default::default()
+            });
         }
 
         // Generate resource type completions from schemas
@@ -334,8 +343,9 @@ impl CompletionProvider {
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
 
-        // Find the import statement for this module
-        let import_path = self.find_module_import_path(module_name, text);
+        // Find the import statement for this module — across the buffer
+        // and every sibling `.crn` in the same directory (#2446).
+        let import_path = self.find_module_import_path(module_name, text, base_path);
 
         if let Some(import_path) = import_path
             && let Some(base) = base_path
@@ -404,27 +414,51 @@ impl CompletionProvider {
     /// The real `carina-rs/infra` tree always writes the multi-line form, so
     /// scanning line-by-line and only looking at the `let` line itself misses
     /// the `source` value entirely. We instead locate the `let <name> = use {`
-    /// header and then slurp the buffer up to the matching `}` to find
+    /// header and then slurp the source text up to the matching `}` to find
     /// `source = '...'` anywhere inside.
-    pub(super) fn find_module_import_path(&self, module_name: &str, text: &str) -> Option<String> {
-        find_let_use_source(module_name, text)
+    ///
+    /// Tries the buffer first; on miss, falls back to a directory-merged
+    /// scan so a `let X = use {...}` declared in a sibling `.crn`
+    /// (e.g. `imports.crn`) is found from a consumer in `main.crn` (#2446).
+    pub(super) fn find_module_import_path(
+        &self,
+        module_name: &str,
+        text: &str,
+        base_path: Option<&Path>,
+    ) -> Option<String> {
+        // Fast path: when the `let X = use {...}` lives in the open
+        // buffer itself, skip the disk walk over sibling `.crn` files.
+        // Only the cross-file case (#2446) needs the merged scan.
+        if let Some(path) = find_let_use_source(module_name, text) {
+            return Some(path);
+        }
+        let mut storage = String::new();
+        let src = DslSource::resolve_directory(text, base_path, &mut storage);
+        find_let_use_source(module_name, src.merged_text())
     }
 
     /// Build a snippet for a module call with argument placeholders.
     ///
     /// If the module can be loaded, generates a snippet with all arguments
     /// as tab stops. Falls back to a simple `name { ${1} }` if loading fails.
+    ///
+    /// `merged` is the buffer + sibling `.crn` text already resolved
+    /// once by the caller (`DslSource::resolve_directory`); reusing it
+    /// here avoids a second disk read per `let X = use {...}` binding
+    /// in the snippet loop.
     fn build_module_call_snippet(
         &self,
         binding: &str,
         after_eq: &str,
+        merged: &str,
         base_path: Option<&Path>,
     ) -> String {
-        // Extract source path from "use { source = 'path' }" or with double quotes.
-        // Only the single-line shape is resolvable here — when the `use` body
-        // spans newlines, `after_eq` is just the line tail and we fall back
-        // to the no-source scaffold below.
-        let import_path = extract_use_source_path(after_eq);
+        // Try the same-line shape first (`use { source = '...' }` on the
+        // `let` line). Falls back to scanning the merged text so the
+        // multi-line shape and the sibling-`.crn` shape (#2446) also
+        // resolve.
+        let import_path =
+            extract_use_source_path(after_eq).or_else(|| find_let_use_source(binding, merged));
 
         if let Some(path) = import_path.as_deref()
             && let Some(base) = base_path

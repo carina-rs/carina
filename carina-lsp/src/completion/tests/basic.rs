@@ -1764,3 +1764,138 @@ fn use_source_path_completion_works_multiline_with_trailing_brace() {
         labels
     );
 }
+
+/// Build the multi-file fixture used by the #2446 sibling-use
+/// completion tests. Layout:
+///
+///   <tmp>/modules/github-oidc/main.crn   — `arguments { <args> }`
+///   <tmp>/consumer/imports.crn           — `let github = use { source = '../modules/github-oidc' }`
+///   <tmp>/consumer/main.crn              — `<main_text>`
+///
+/// Returns `(tempdir, consumer_dir_path)`.
+fn sibling_use_module_fixture(
+    args_block: &str,
+    main_text: &str,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    let module_dir = base.join("modules").join("github-oidc");
+    std::fs::create_dir_all(&module_dir).unwrap();
+    std::fs::write(
+        module_dir.join("main.crn"),
+        format!("arguments {{\n{args_block}\n}}\n"),
+    )
+    .unwrap();
+    let consumer = base.join("consumer");
+    std::fs::create_dir(&consumer).unwrap();
+    std::fs::write(
+        consumer.join("imports.crn"),
+        "let github = use {\n  source = '../modules/github-oidc'\n}\n",
+    )
+    .unwrap();
+    std::fs::write(consumer.join("main.crn"), main_text).unwrap();
+    (tmp, consumer)
+}
+
+/// Issue #2446: when `let X = use { source = '...' }` lives in a sibling
+/// `.crn` file, completion inside `X { ... }` in `main.crn` must offer
+/// the module's `arguments {}` parameters. Same class as PR #2120 / PR
+/// #2118: per-file blind spot in an LSP feature that should be
+/// directory-scoped.
+#[test]
+fn module_parameter_completion_with_sibling_use_decl() {
+    let main_text = "github {\n  \n}\n";
+    let (_tmp, consumer) =
+        sibling_use_module_fixture("  github_repo: String\n  role_name  : String", main_text);
+
+    let provider = test_provider();
+    let doc = create_document(main_text);
+    // Cursor on the empty body line at column 2.
+    let completions = provider.complete(
+        &doc,
+        Position {
+            line: 1,
+            character: 2,
+        },
+        Some(consumer.as_path()),
+    );
+
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"github_repo"),
+        "expected `github_repo` parameter completion when `let X = use {{...}}` lives in a sibling `.crn`, got: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"role_name"),
+        "expected `role_name` parameter completion, got: {labels:?}"
+    );
+}
+
+/// Discard binding (`let _ = use {...}`) must not surface a `_ { ... }`
+/// snippet completion. Pre-existing guard at `top_level.rs` skips
+/// `binding == "_"`; this test pins that guard against regression now
+/// that the snippet loop walks merged-directory text (#2446).
+#[test]
+fn top_level_module_call_completion_skips_discard_binding() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    let module_dir = base.join("modules").join("noop");
+    std::fs::create_dir_all(&module_dir).unwrap();
+    std::fs::write(module_dir.join("main.crn"), "arguments {\n  x: String\n}\n").unwrap();
+    let consumer = base.join("consumer");
+    std::fs::create_dir(&consumer).unwrap();
+    std::fs::write(
+        consumer.join("imports.crn"),
+        "let _ = use {\n  source = '../modules/noop'\n}\n",
+    )
+    .unwrap();
+    let main_text = "";
+    std::fs::write(consumer.join("main.crn"), main_text).unwrap();
+
+    let provider = test_provider();
+    let doc = create_document(main_text);
+    let completions = provider.complete(
+        &doc,
+        Position {
+            line: 0,
+            character: 0,
+        },
+        Some(consumer.as_path()),
+    );
+
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        !labels.contains(&"_"),
+        "discard binding `_` must not surface a module-call completion, got: {labels:?}"
+    );
+}
+
+/// Issue #2446 (top-level form): the `module call` snippet completion
+/// must also surface bindings whose `let X = use {...}` lives in a
+/// sibling `.crn`. Without this, typing at the top of `main.crn` does
+/// not offer the `X { ... }` scaffold.
+#[test]
+fn top_level_module_call_completion_with_sibling_use_decl() {
+    // Empty buffer (top-level position). The user is about to type a
+    // module-call binding name; completion must include `github` from
+    // the sibling `imports.crn`.
+    let main_text = "";
+    let (_tmp, consumer) = sibling_use_module_fixture("  github_repo: String", main_text);
+
+    let provider = test_provider();
+    let doc = create_document(main_text);
+    let completions = provider.complete(
+        &doc,
+        Position {
+            line: 0,
+            character: 0,
+        },
+        Some(consumer.as_path()),
+    );
+
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"github"),
+        "expected `github` module-call completion from sibling `let X = use {{...}}`, got: {labels:?}"
+    );
+}
