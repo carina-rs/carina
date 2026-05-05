@@ -189,11 +189,17 @@ impl SemanticTokensProvider {
         // Scan for /* to find inline block comments. While scanning, skip over
         // single- and double-quoted string literals so a `/*` inside an ARN
         // like 'arn:aws:s3:::bucket/*' does not open a block comment (#2436).
+        // Also stop at `#` / `//` line-comment markers — pest treats line
+        // and block comments as disjoint productions, so a `/*` inside a
+        // line comment must not open one (#2448).
         let mut i = 0;
         while i < chars.len() {
             if chars[i] == '\'' || chars[i] == '"' {
                 i = skip_string_literal(&chars, i);
                 continue;
+            }
+            if chars[i] == '#' || (i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '/') {
+                break;
             }
             if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
                 *block_comment_depth = 1;
@@ -1207,6 +1213,45 @@ mod tests {
         assert!(
             comment_tokens.is_empty(),
             "/* inside a double-quoted string must not start a block comment. Got: {:?}",
+            tokens
+        );
+    }
+
+    /// Regression test for #2448: `/*` inside a `#` line comment must not
+    /// open a block comment. A path like `management/*` in a `#` comment
+    /// previously caused every following line to be emitted as `COMMENT`
+    /// until a `*/` was seen, even though pest treats line comments as a
+    /// production disjoint from block comments.
+    #[test]
+    fn test_block_comment_not_triggered_inside_hash_line_comment() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let content =
+            "# Cross-account read for the management/* state objects\nname = \"after\"\nvalue = 42";
+        let tokens = provider.tokenize(content);
+        // Only line 0 (the `#` comment itself) should produce a COMMENT
+        // token. The buggy scanner emits one COMMENT token per subsequent
+        // line because it stays in "inside block comment" state.
+        let comment_tokens: Vec<_> = tokens.iter().filter(|t| t.token_type == 7).collect();
+        assert_eq!(
+            comment_tokens.len(),
+            1,
+            "/* inside a `#` line comment must not leak block-comment state to following lines. Got: {:?}",
+            tokens
+        );
+    }
+
+    /// Sibling of the above for `//` line comments, which the pest grammar
+    /// treats identically to `#` line comments.
+    #[test]
+    fn test_block_comment_not_triggered_inside_slash_line_comment() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let content = "// Cross-account read for the management/* state objects\nname = \"after\"\nvalue = 42";
+        let tokens = provider.tokenize(content);
+        let comment_tokens: Vec<_> = tokens.iter().filter(|t| t.token_type == 7).collect();
+        assert_eq!(
+            comment_tokens.len(),
+            1,
+            "/* inside a `//` line comment must not leak block-comment state to following lines. Got: {:?}",
             tokens
         );
     }
