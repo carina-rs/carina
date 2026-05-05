@@ -16,9 +16,15 @@ use crate::schema::SchemaRegistry;
 #[derive(Debug)]
 pub struct ProviderError {
     pub message: String,
-    pub resource_id: Option<ResourceId>,
+    pub resource_id: Option<Box<ResourceId>>,
     pub cause: Option<Box<dyn std::error::Error + Send + Sync>>,
     pub is_timeout: bool,
+    /// Optional provider name (e.g. `"aws"`, `"awscc"`) attached when
+    /// the error is raised at provider boundary points where the name
+    /// is known but no specific resource is in scope (e.g. provider
+    /// init / `create_provider`). Display ignores this field; CLI
+    /// renderers can read it to label structured output.
+    pub provider_name: Option<String>,
 }
 
 impl std::fmt::Display for ProviderError {
@@ -50,11 +56,12 @@ impl ProviderError {
             resource_id: None,
             cause: None,
             is_timeout: false,
+            provider_name: None,
         }
     }
 
     pub fn for_resource(mut self, id: ResourceId) -> Self {
-        self.resource_id = Some(id);
+        self.resource_id = Some(Box::new(id));
         self
     }
 
@@ -65,6 +72,15 @@ impl ProviderError {
 
     pub fn timeout(mut self) -> Self {
         self.is_timeout = true;
+        self
+    }
+
+    /// Attach a provider name (e.g. `"aws"`, `"awscc"`) for boundary
+    /// errors that don't carry a specific resource id (e.g.
+    /// `create_provider` / provider init failures). Used by the CLI
+    /// renderer to label structured account-guard output.
+    pub fn for_provider(mut self, provider_name: impl Into<String>) -> Self {
+        self.provider_name = Some(provider_name.into());
         self
     }
 }
@@ -434,10 +450,15 @@ pub trait ProviderFactory: Send + Sync {
     fn extract_region(&self, attributes: &IndexMap<String, Value>) -> String;
 
     /// Create a provider instance from configuration attributes.
+    ///
+    /// Returns `Err(ProviderError)` when the provider rejects the
+    /// supplied configuration (e.g., an `allowed_account_ids` mismatch
+    /// detected during `init`). Callers MUST surface the inner message
+    /// verbatim — it is the user-facing error text.
     fn create_provider(
         &self,
         attributes: &IndexMap<String, Value>,
-    ) -> BoxFuture<'_, Box<dyn Provider>>;
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>>;
 
     /// Create a normalizer instance from configuration attributes.
     ///
@@ -993,6 +1014,77 @@ mod tests {
                 .unwrap_err()
                 .message
                 .contains("Unknown provider: nonexistent")
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_factory_create_provider_propagates_error() {
+        // Issue #2407: providers can fail to initialize on user input
+        // (e.g. allowed_account_ids mismatch). The trait method must
+        // return ProviderResult so the host can surface the error
+        // verbatim instead of panicking with .expect(...).
+        use crate::schema::ResourceSchema;
+
+        struct FailingFactory;
+
+        impl ProviderFactory for FailingFactory {
+            fn name(&self) -> &str {
+                "failing"
+            }
+            fn display_name(&self) -> &str {
+                "Failing provider"
+            }
+            fn provider_config_attribute_types(
+                &self,
+            ) -> HashMap<String, crate::schema::AttributeType> {
+                HashMap::new()
+            }
+            fn validate_config(&self, _attrs: &IndexMap<String, Value>) -> Result<(), String> {
+                Ok(())
+            }
+            fn extract_region(&self, _attrs: &IndexMap<String, Value>) -> String {
+                "us-east-1".to_string()
+            }
+            fn create_provider(
+                &self,
+                _attrs: &IndexMap<String, Value>,
+            ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+                Box::pin(async {
+                    Err(ProviderError::new(
+                        "AWS account ID '019115212452' is not in the provider's \
+                         allowed_account_ids [\"151116838382\"]. Refusing to operate \
+                         against this account. Check the AWS credentials in your environment.",
+                    ))
+                })
+            }
+            fn schemas(&self) -> Vec<ResourceSchema> {
+                Vec::new()
+            }
+        }
+
+        let factory = FailingFactory;
+        let result = factory.create_provider(&IndexMap::new()).await;
+        let err = match result {
+            Ok(_) => panic!("create_provider must surface the init error"),
+            Err(e) => e,
+        };
+        // Inner message must be preserved verbatim; no implementation-detail wrapper.
+        let msg = err.message;
+        assert!(
+            msg.contains("019115212452"),
+            "actual account missing: {msg}"
+        );
+        assert!(
+            msg.contains("allowed_account_ids"),
+            "kind label missing: {msg}"
+        );
+        assert!(
+            !msg.contains("WASM provider instance"),
+            "must not leak WASM hosting detail: {msg}"
+        );
+        assert!(
+            !msg.contains("panicked"),
+            "must not surface panic framing: {msg}"
         );
     }
 

@@ -541,7 +541,7 @@ async fn run_state_bucket_delete(
         .find(|p| p.name == backend_provider_name)
         .map(|p| p.attributes.clone())
         .unwrap_or_default();
-    let bucket_provider = factory.create_provider(&provider_config_attrs).await;
+    let bucket_provider = factory.create_provider(&provider_config_attrs).await?;
 
     // First, try to empty the bucket (delete all objects and versions)
     println!();
@@ -665,7 +665,7 @@ pub(crate) async fn run_state_refresh_locked(
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
 
     // Select provider
-    let provider = get_provider_with_ctx(&ctx, parsed, base_dir).await;
+    let provider = get_provider_with_ctx(&ctx, parsed, base_dir).await?;
 
     println!();
     println!("{}", "Refreshing state...".cyan().bold());

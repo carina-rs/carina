@@ -1265,17 +1265,22 @@ impl ProviderFactory for WasmProviderFactory {
     fn create_provider(
         &self,
         attributes: &IndexMap<String, Value>,
-    ) -> BoxFuture<'_, Box<dyn Provider>> {
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
         let attrs = attributes.clone();
         Box::pin(async move {
+            // Surface the inner error string verbatim — it carries the
+            // user-actionable message (e.g. allowed_account_ids
+            // mismatch) produced by the provider's init step. Adding a
+            // wrapper prefix here would leak the WASM hosting detail
+            // into the user-facing error (see #2407).
             let instance = self
                 .get_or_create_shared_instance(&attrs)
                 .await
-                .expect("Failed to create WASM provider instance");
-            Box::new(WasmProvider {
+                .map_err(ProviderError::new)?;
+            Ok(Box::new(WasmProvider {
                 instance,
                 name: self.name.clone(),
-            }) as Box<dyn Provider>
+            }) as Box<dyn Provider>)
         })
     }
 

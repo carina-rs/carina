@@ -768,13 +768,13 @@ pub async fn get_provider_with_ctx<E>(
     ctx: &WiringContext,
     parsed: &carina_core::parser::File<E>,
     base_dir: &Path,
-) -> ProviderRouter {
+) -> Result<ProviderRouter, AppError> {
     let mut router = ProviderRouter::new();
 
     for provider_config in &parsed.providers {
         // If the provider has a source, load it as a WASM plugin
         if let Some(ref source) = provider_config.source {
-            try_add_source_provider(&mut router, source, provider_config, base_dir).await;
+            try_add_source_provider(&mut router, source, provider_config, base_dir).await?;
             continue;
         }
 
@@ -785,7 +785,10 @@ pub async fn get_provider_with_ctx<E>(
                 "{}",
                 format!("Using {} (region: {})", factory.display_name(), region).cyan()
             );
-            let provider = factory.create_provider(&provider_config.attributes).await;
+            let provider = factory
+                .create_provider(&provider_config.attributes)
+                .await
+                .map_err(|e| e.for_provider(provider_config.name.clone()))?;
             router.add_provider(provider_config.name.clone(), provider);
             router.add_normalizer(factory.create_normalizer(&provider_config.attributes).await);
         } else if !provider_config.name.is_empty() {
@@ -807,7 +810,7 @@ pub async fn get_provider_with_ctx<E>(
         router.add_provider(String::new(), Box::new(MockProvider::new()));
     }
 
-    router
+    Ok(router)
 }
 
 async fn try_add_source_provider(
@@ -815,7 +818,7 @@ async fn try_add_source_provider(
     source: &str,
     config: &ProviderConfig,
     base_dir: &Path,
-) {
+) -> Result<(), AppError> {
     match load_source_provider(source, config, base_dir).await {
         Ok((factory, provider, name)) => {
             let region = factory.extract_region(&config.attributes);
@@ -825,56 +828,84 @@ async fn try_add_source_provider(
             );
             router.add_provider(name, provider);
             router.add_normalizer(factory.create_normalizer(&config.attributes).await);
+            Ok(())
         }
-        Err(e) => {
+        Err(LoadSourceError::Provider(e)) => {
+            // Provider init failure (e.g. allowed_account_ids mismatch).
+            // Propagate verbatim so the CLI boundary can render it
+            // structurally without leaking implementation-detail
+            // wrappers like "Failed to load provider '...': ...".
+            // Attach provider name so the renderer can label the
+            // structured block with the right provider.
+            Err(AppError::Provider(e.for_provider(config.name.clone())))
+        }
+        Err(LoadSourceError::Other(msg)) => {
             eprintln!(
                 "{}",
-                format!("Failed to load provider '{}': {}", config.name, e).red()
+                format!("Failed to load provider '{}': {}", config.name, msg).red()
             );
+            Ok(())
         }
     }
+}
+
+/// Failure mode for `load_source_provider`. Distinguishing between a
+/// provider init rejection and other plumbing failures lets the caller
+/// surface the former as a structured error without the
+/// "Failed to load provider '...': ..." wrapper that obscures the
+/// real message (#2407).
+enum LoadSourceError {
+    /// The provider's `init` step rejected the configuration (e.g.,
+    /// `allowed_account_ids` mismatch). Message is user-facing.
+    Provider(ProviderError),
+    /// Plumbing failure: binary not found, unsupported source scheme,
+    /// invalid config, etc. Logged and skipped.
+    Other(String),
 }
 
 async fn load_source_provider(
     source: &str,
     config: &ProviderConfig,
     base_dir: &Path,
-) -> Result<(Box<dyn ProviderFactory>, Box<dyn Provider>, String), String> {
+) -> Result<(Box<dyn ProviderFactory>, Box<dyn Provider>, String), LoadSourceError> {
     let binary_path = if source.starts_with("file://") || source.starts_with("github.com/") {
         carina_provider_resolver::find_installed_provider(base_dir, config)
-            .map_err(|e| format!("Provider '{}' {}", config.name, e))?
+            .map_err(|e| LoadSourceError::Other(format!("Provider '{}' {}", config.name, e)))?
     } else {
-        return Err(format!(
+        return Err(LoadSourceError::Other(format!(
             "Unsupported source format: {source}. Use file:// for local binaries or github.com/owner/repo for remote."
-        ));
+        )));
     };
 
     if !carina_provider_resolver::is_wasm_provider(&binary_path) {
-        return Err(format!(
+        return Err(LoadSourceError::Other(format!(
             "Provider '{}': native binaries are no longer supported. Use a .wasm component instead.",
             config.name
-        ));
+        )));
     }
 
     let factory: Box<dyn ProviderFactory> = Box::new(
         carina_plugin_host::WasmProviderFactory::new(binary_path.clone())
             .await
-            .map_err(|e| format!("Failed to load WASM provider: {e}"))?,
+            .map_err(|e| LoadSourceError::Other(format!("Failed to load WASM provider: {e}")))?,
     );
     let name = factory.name().to_string();
 
     factory
         .validate_config(&config.attributes)
-        .map_err(|e| format!("Config validation failed: {e}"))?;
+        .map_err(|e| LoadSourceError::Other(format!("Config validation failed: {e}")))?;
 
-    let provider = factory.create_provider(&config.attributes).await;
+    let provider = factory
+        .create_provider(&config.attributes)
+        .await
+        .map_err(LoadSourceError::Provider)?;
     Ok((factory, provider, name))
 }
 
 pub async fn create_providers_from_configs(
     configs: &[ProviderConfig],
     base_dir: &Path,
-) -> ProviderRouter {
+) -> Result<ProviderRouter, AppError> {
     let (factories, _) = build_factories_from_providers(configs, base_dir);
     let ctx = WiringContext::new(factories);
     let mut router = ProviderRouter::new();
@@ -882,7 +913,7 @@ pub async fn create_providers_from_configs(
     for config in configs {
         // If the provider has a source, load it as a WASM plugin
         if let Some(ref source) = config.source {
-            try_add_source_provider(&mut router, source, config, base_dir).await;
+            try_add_source_provider(&mut router, source, config, base_dir).await?;
             continue;
         }
 
@@ -892,7 +923,10 @@ pub async fn create_providers_from_configs(
                 "{}",
                 format!("Using {} (region: {})", factory.display_name(), region).cyan()
             );
-            let provider = factory.create_provider(&config.attributes).await;
+            let provider = factory
+                .create_provider(&config.attributes)
+                .await
+                .map_err(|e| e.for_provider(config.name.clone()))?;
             router.add_provider(config.name.clone(), provider);
             router.add_normalizer(factory.create_normalizer(&config.attributes).await);
         }
@@ -903,7 +937,7 @@ pub async fn create_providers_from_configs(
         router.add_provider(String::new(), Box::new(MockProvider::new()));
     }
 
-    router
+    Ok(router)
 }
 
 /// Create a plan from parsed configuration (without upstream state bindings).
@@ -934,7 +968,7 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
         sort_resources_by_dependencies(&parsed.resources).map_err(AppError::Validation)?;
 
     // Select appropriate Provider based on configuration
-    let provider = get_provider_with_ctx(&ctx, parsed, base_dir).await;
+    let provider = get_provider_with_ctx(&ctx, parsed, base_dir).await?;
 
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
 

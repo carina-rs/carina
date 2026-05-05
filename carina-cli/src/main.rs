@@ -335,8 +335,7 @@ async fn main() {
                 }
             }
             Err(e) => {
-                eprint!("{}", format_error_lines(&e.to_string()));
-                std::process::exit(1);
+                handle_app_error(e);
             }
         }
         return;
@@ -452,17 +451,51 @@ async fn main() {
     };
 
     if let Err(e) = result {
-        match e {
-            error::AppError::Interrupted => {
-                // Exit code 130 = 128 + 2 (SIGINT), the Unix convention
-                std::process::exit(130);
-            }
-            _ => {
-                eprint!("{}", format_error_lines(&e.to_string()));
-                std::process::exit(1);
+        handle_app_error(e);
+    }
+}
+
+/// Outcome of rendering an `AppError`: the text to write to stderr
+/// and the exit code to terminate with.
+struct AppErrorRendering {
+    stderr: String,
+    exit_code: i32,
+}
+
+/// Pure rendering of `AppError`. Split out from `handle_app_error` so
+/// the formatting can be tested without invoking `process::exit`.
+fn render_app_error(e: &error::AppError) -> AppErrorRendering {
+    match e {
+        error::AppError::Interrupted => AppErrorRendering {
+            stderr: String::new(),
+            // Exit code 130 = 128 + 2 (SIGINT), the Unix convention
+            exit_code: 130,
+        },
+        error::AppError::Provider(pe) => {
+            let body = error::format_account_guard_error(&pe.message, pe.provider_name.as_deref())
+                .unwrap_or_else(|| e.to_string());
+            AppErrorRendering {
+                stderr: format_error_lines(&body),
+                exit_code: 1,
             }
         }
+        _ => AppErrorRendering {
+            stderr: format_error_lines(&e.to_string()),
+            exit_code: 1,
+        },
     }
+}
+
+/// Render a top-level `AppError` and exit. Provider init failures get
+/// the structured account-guard rendering when the message shape
+/// matches; everything else falls through to the generic `Error: ...`
+/// formatter (#2407).
+fn handle_app_error(e: error::AppError) -> ! {
+    let rendering = render_app_error(&e);
+    if !rendering.stderr.is_empty() {
+        eprint!("{}", rendering.stderr);
+    }
+    std::process::exit(rendering.exit_code);
 }
 
 fn format_error_lines(msg: &str) -> String {
@@ -491,5 +524,122 @@ mod error_format_tests {
         colored::control::set_override(false);
         let result = format_error_lines("first error\nsecond error");
         assert_eq!(result, "Error: first error\nError: second error\n");
+    }
+
+    // -- #2407 acceptance: AppError -> stderr rendering --
+
+    #[test]
+    fn provider_account_guard_renders_structured_block() {
+        colored::control::set_override(false);
+        let pe = carina_core::provider::ProviderError::new(
+            "Provider initialization failed: AWS account ID '019115212452' \
+             is not in the provider's allowed_account_ids [\"151116838382\"]. \
+             Refusing to operate against this account. \
+             Check the AWS credentials in your environment.",
+        );
+        let app_err: error::AppError = pe.into();
+        let r = render_app_error(&app_err);
+        assert_eq!(r.exit_code, 1);
+        assert!(
+            r.stderr.contains("AWS account mismatch"),
+            "header missing: {}",
+            r.stderr
+        );
+        assert!(
+            r.stderr
+                .contains("Expected:    151116838382 (allowed_account_ids)"),
+            "expected line missing: {}",
+            r.stderr
+        );
+        assert!(
+            r.stderr.contains("Actual:      019115212452"),
+            "actual line missing: {}",
+            r.stderr
+        );
+        // Acceptance criteria from #2407.
+        assert!(
+            !r.stderr.contains("panicked"),
+            "must not surface panic framing: {}",
+            r.stderr
+        );
+        assert!(
+            !r.stderr.contains("RUST_BACKTRACE"),
+            "must not surface backtrace hint: {}",
+            r.stderr
+        );
+        assert!(
+            !r.stderr.contains("WASM provider instance"),
+            "must not leak WASM hosting detail: {}",
+            r.stderr
+        );
+        assert!(
+            !r.stderr.contains("wasm_factory.rs"),
+            "must not surface source-file path: {}",
+            r.stderr
+        );
+    }
+
+    #[test]
+    fn provider_non_account_guard_falls_back_to_plain_error() {
+        // Generic provider init failures (invalid region, missing
+        // credentials chain, etc.) must still be surfaced — just not
+        // through the structured account-guard renderer.
+        colored::control::set_override(false);
+        let pe = carina_core::provider::ProviderError::new(
+            "Provider initialization failed: failed to load AWS credentials \
+             from the environment",
+        );
+        let app_err: error::AppError = pe.into();
+        let r = render_app_error(&app_err);
+        assert_eq!(r.exit_code, 1);
+        assert!(
+            r.stderr.starts_with("Error: "),
+            "missing Error: prefix, got: {}",
+            r.stderr
+        );
+        assert!(
+            r.stderr.contains("failed to load AWS credentials"),
+            "inner message missing: {}",
+            r.stderr
+        );
+        // Must NOT have promoted itself to the structured shape.
+        assert!(
+            !r.stderr.contains("AWS account mismatch"),
+            "non-account-guard must not be coerced into structured shape: {}",
+            r.stderr
+        );
+        // Acceptance: still no panic / backtrace / WASM leak.
+        assert!(!r.stderr.contains("panicked"));
+        assert!(!r.stderr.contains("RUST_BACKTRACE"));
+        assert!(!r.stderr.contains("WASM provider instance"));
+    }
+
+    #[test]
+    fn provider_account_guard_uses_attached_provider_name() {
+        // When the wiring layer has attached a provider name via
+        // ProviderError::for_provider, the structured renderer uses
+        // it instead of the "aws" default. Catches awscc-vs-aws
+        // mislabeling.
+        colored::control::set_override(false);
+        let pe = carina_core::provider::ProviderError::new(
+            "Provider initialization failed: AWS account ID '019115212452' \
+             is not in the provider's allowed_account_ids [\"151116838382\"]. \
+             Refusing to operate against this account.",
+        )
+        .for_provider("awscc");
+        let app_err: error::AppError = pe.into();
+        let r = render_app_error(&app_err);
+        assert!(
+            r.stderr.contains("Provider:    awscc"),
+            "provider label not picked up from ProviderError: {}",
+            r.stderr
+        );
+    }
+
+    #[test]
+    fn interrupted_error_renders_quietly_with_sigint_exit_code() {
+        let r = render_app_error(&error::AppError::Interrupted);
+        assert_eq!(r.exit_code, 130);
+        assert!(r.stderr.is_empty(), "interrupted stderr: {}", r.stderr);
     }
 }

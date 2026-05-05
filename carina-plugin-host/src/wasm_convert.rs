@@ -287,10 +287,15 @@ pub fn json_to_provider_error(json: &str) -> carina_core::provider::ProviderErro
         carina_core::provider::ProviderError {
             message: proto_err.message,
             resource_id: proto_err.resource_id.map(|pid| {
-                CoreResourceId::with_provider(&pid.provider, &pid.resource_type, &pid.name)
+                Box::new(CoreResourceId::with_provider(
+                    &pid.provider,
+                    &pid.resource_type,
+                    &pid.name,
+                ))
             }),
             cause: None,
             is_timeout: proto_err.is_timeout,
+            provider_name: None,
         }
     } else {
         carina_core::provider::ProviderError {
@@ -298,6 +303,7 @@ pub fn json_to_provider_error(json: &str) -> carina_core::provider::ProviderErro
             resource_id: None,
             cause: None,
             is_timeout: false,
+            provider_name: None,
         }
     }
 }
