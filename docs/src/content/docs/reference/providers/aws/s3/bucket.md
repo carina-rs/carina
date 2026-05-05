@@ -9,14 +9,17 @@ CloudFormation Type: `AWS::S3::Bucket`
 ## Example
 
 ```crn
-aws.s3.Bucket {
+let bucket = aws.s3.Bucket {
   bucket = 'carina-example-s3-bucket'
-
-  versioning_status = aws.s3.Bucket.VersioningStatus.Enabled
 
   tags = {
     Environment = 'example'
   }
+}
+
+aws.s3.BucketVersioning {
+  bucket = bucket.bucket
+  status = aws.s3.BucketVersioning.VersioningStatus.Enabled
 }
 ```
 
@@ -90,13 +93,6 @@ Specifies whether you want S3 Object Lock to be enabled for the new bucket. This
 - **Type:** [Enum (ObjectOwnership)](#object_ownership-objectownership)
 - **Required:** No
 
-### `versioning_status`
-
-- **Type:** [Enum (VersioningStatus)](#versioning_status-versioningstatus)
-- **Required:** No
-
-The versioning state of the bucket.
-
 ### `tags`
 
 - **Type:** Map
@@ -135,13 +131,4 @@ Shorthand formats: `account_regional` or `BucketNamespace.account_regional`
 | `ObjectWriter` | `aws.s3.Bucket.ObjectOwnership.ObjectWriter` |
 
 Shorthand formats: `BucketOwnerEnforced` or `ObjectOwnership.BucketOwnerEnforced`
-
-### versioning_status (VersioningStatus)
-
-| Value | DSL Identifier |
-|-------|----------------|
-| `Enabled` | `aws.s3.Bucket.VersioningStatus.Enabled` |
-| `Suspended` | `aws.s3.Bucket.VersioningStatus.Suspended` |
-
-Shorthand formats: `Enabled` or `VersioningStatus.Enabled`
 
