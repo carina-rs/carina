@@ -4,7 +4,7 @@ use carina_core::detail_rows::DetailRow;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use crate::app::{App, EffectKind, FocusedPanel};
+use crate::app::{App, FocusedPanel};
 
 use super::diff::{render_list_of_maps_diff, render_map_diff_entries};
 use super::style::effect_style;
@@ -56,7 +56,7 @@ pub(super) fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         let is_detail_focused = app.focused_panel == FocusedPanel::Detail;
         for (row_idx, row) in node.detail_rows.iter().enumerate() {
             let is_selected = is_detail_focused && row_idx == app.detail_selected;
-            render_detail_row_to_lines(&mut lines, row, node.kind, is_selected);
+            render_detail_row_to_lines(&mut lines, row, is_selected);
         }
     }
 
@@ -73,12 +73,7 @@ pub(super) fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Render a single `DetailRow` into TUI `Line`s.
-fn render_detail_row_to_lines(
-    lines: &mut Vec<Line>,
-    row: &DetailRow,
-    kind: EffectKind,
-    is_selected: bool,
-) {
+fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selected: bool) {
     let dim_style = Style::default().fg(Color::DarkGray);
 
     match row {
@@ -109,6 +104,20 @@ fn render_detail_row_to_lines(
             }
             lines.push(line);
         }
+        DetailRow::PrettyAttribute { key, value } => {
+            // Indent is fixed at the TUI's "  " (2 cols) prefix plus the
+            // "key: " width — the TUI doesn't have the CLI's dynamic
+            // tree-indent string, so the layout is approximated.
+            let pretty =
+                carina_core::value::format_value_pretty(value, 2 + key.chars().count() + 2);
+            let mut spans = vec![Span::raw(format!("  {}: ", key))];
+            spans.push(Span::raw(pretty));
+            let mut line = Line::from(spans);
+            if is_selected {
+                line = line.style(Style::default().bg(Color::DarkGray));
+            }
+            lines.push(line);
+        }
         DetailRow::MapExpanded { key, entries } => {
             let mut header_line = Line::from(vec![Span::raw(format!("  {}:", key))]);
             if is_selected {
@@ -126,31 +135,6 @@ fn render_detail_row_to_lines(
                 }
                 lines.push(Line::from(spans));
             }
-        }
-        DetailRow::ListOfMaps { key, items } => {
-            let value_style = if kind == EffectKind::Create {
-                Style::default().fg(Color::Green)
-            } else {
-                Style::default()
-            };
-            let mut first_line = Line::from(vec![
-                Span::raw(format!("  {}: ", key)),
-                Span::styled("[", value_style),
-            ]);
-            if is_selected {
-                first_line = first_line.style(Style::default().bg(Color::DarkGray));
-            }
-            lines.push(first_line);
-            for item in items {
-                lines.push(Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled(format!("{{{}}}", item.fields), value_style),
-                ]));
-            }
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled("]", value_style),
-            ]));
         }
         DetailRow::Changed { key, old, new } => {
             let mut spans = vec![
