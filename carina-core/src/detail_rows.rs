@@ -43,11 +43,11 @@ pub enum DetailRow {
         key: String,
         entries: Vec<MapExpandedEntry>,
     },
-    /// A list-of-maps attribute (for Create effects)
-    ListOfMaps {
-        key: String,
-        items: Vec<ListOfMapsItem>,
-    },
+    /// An attribute whose value is rendered with `format_value_pretty` at
+    /// render time. Used for list-of-map attributes on Create — carries the
+    /// raw `Value` rather than a pre-stringified form so the renderer can
+    /// supply the actual indent column when calling `format_value_pretty`.
+    PrettyAttribute { key: String, value: Value },
     /// An attribute that changed (for Update effects)
     Changed {
         key: String,
@@ -112,13 +112,6 @@ pub enum DetailRow {
         count: usize,
         updates: Vec<CascadingUpdateIR>,
     },
-}
-
-/// A single item in a list-of-maps (for Create effects)
-#[derive(Debug, Clone, PartialEq)]
-pub struct ListOfMapsItem {
-    /// Pre-formatted fields string: "key1: val1, key2: val2"
-    pub fields: String,
 }
 
 /// A single entry in an expanded map (e.g., tags with default_tags annotation)
@@ -300,7 +293,10 @@ fn build_create_rows(
             continue;
         }
         if is_list_of_maps(value) {
-            rows.push(build_list_of_maps_row(key, value));
+            rows.push(DetailRow::PrettyAttribute {
+                key: key.to_string(),
+                value: value.clone(),
+            });
         } else if let Value::Map(map) = value {
             rows.push(build_expanded_map_row(key, map));
         } else {
@@ -383,40 +379,6 @@ fn build_expanded_tags_row(
     DetailRow::MapExpanded {
         key: "tags".to_string(),
         entries,
-    }
-}
-
-fn build_list_of_maps_row(key: &str, value: &Value) -> DetailRow {
-    let items = match value {
-        Value::List(items) => items,
-        _ => {
-            return DetailRow::Attribute {
-                key: key.to_string(),
-                value: format_value(value),
-                ref_binding: None,
-                annotation: None,
-            };
-        }
-    };
-
-    let mut list_items = Vec::new();
-    for item in items {
-        if let Value::Map(map) = item {
-            let mut map_keys: Vec<_> = map.keys().collect();
-            map_keys.sort();
-            let fields: Vec<String> = map_keys
-                .iter()
-                .map(|k| format!("{}: {}", k, format_value(&map[*k])))
-                .collect();
-            list_items.push(ListOfMapsItem {
-                fields: fields.join(", "),
-            });
-        }
-    }
-
-    DetailRow::ListOfMaps {
-        key: key.to_string(),
-        items: list_items,
     }
 }
 
@@ -1201,5 +1163,44 @@ mod tests {
             &Value::String("plain".to_string()),
             "vpc"
         ));
+    }
+
+    #[test]
+    fn create_row_list_of_maps_emits_pretty_attribute() {
+        let mut entry = indexmap::IndexMap::new();
+        entry.insert("sid".to_string(), Value::String("S1".to_string()));
+        entry.insert("effect".to_string(), Value::String("Allow".to_string()));
+        let resource = Resource::new("iam.RolePolicy", "test")
+            .with_attribute("statement", Value::List(vec![Value::Map(entry)]));
+        let effect = Effect::Create(resource);
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None);
+
+        let pretty_value = rows.iter().find_map(|row| match row {
+            DetailRow::PrettyAttribute { key, value } if key == "statement" => Some(value),
+            _ => None,
+        });
+        assert!(
+            pretty_value.is_some(),
+            "expected PrettyAttribute row for statement, got: {rows:?}"
+        );
+        assert!(
+            matches!(pretty_value.unwrap(), Value::List(_)),
+            "PrettyAttribute should carry the raw Value::List"
+        );
+    }
+
+    #[test]
+    fn create_row_scalar_attribute_unchanged() {
+        let resource = Resource::new("iam.Role", "test")
+            .with_attribute("role_name", Value::String("foo".to_string()));
+        let effect = Effect::Create(resource);
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None);
+        assert!(
+            rows.iter().any(|row| matches!(
+                row,
+                DetailRow::Attribute { key, .. } if key == "role_name"
+            )),
+            "scalar attribute should still emit DetailRow::Attribute, got: {rows:?}"
+        );
     }
 }

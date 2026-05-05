@@ -19,6 +19,7 @@ use carina_core::plan_tree::{
 };
 use carina_core::resource::{ResourceId, Value};
 use carina_core::schema::SchemaRegistry;
+use carina_core::value::format_value_pretty;
 #[cfg(test)]
 use carina_core::value::{format_value, format_value_with_key, is_list_of_maps, map_similarity};
 
@@ -987,6 +988,19 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
                 writeln!(out, "{}{}: {}", attr_prefix, key, cv).unwrap();
             }
         }
+        DetailRow::PrettyAttribute { key, value } => {
+            // The value starts at the column after `<attr_prefix><key>: `.
+            // attr_prefix may contain the tree glyph `│` (U+2502, 1 column
+            // wide but 3 bytes in UTF-8), so use `chars().count()` for column
+            // count, not `.len()`.
+            let indent_cols = attr_prefix.chars().count() + key.chars().count() + 2;
+            let pretty = format_value_pretty(value, indent_cols);
+            let cv = match effect {
+                Effect::Delete { .. } => pretty.red().strikethrough().to_string(),
+                _ => colored_value(&pretty, false),
+            };
+            writeln!(out, "{}{}: {}", attr_prefix, key, cv).unwrap();
+        }
         DetailRow::MapExpanded { key, entries } => {
             writeln!(out, "{}{}:", attr_prefix, key).unwrap();
             for entry in entries {
@@ -1007,19 +1021,6 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
                 } else {
                     writeln!(out, "{}  {}: {}", attr_prefix, entry.key, cv).unwrap();
                 }
-            }
-        }
-        DetailRow::ListOfMaps { key, items } => {
-            writeln!(out, "{}{}:", attr_prefix, key).unwrap();
-            for item in items {
-                writeln!(
-                    out,
-                    "{}  {} {{{}}}",
-                    attr_prefix,
-                    "+".green().bold(),
-                    item.fields
-                )
-                .unwrap();
             }
         }
         DetailRow::Changed { key, old, new } => {
