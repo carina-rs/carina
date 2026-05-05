@@ -218,7 +218,27 @@ pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<V
                             Some(nested) => {
                                 resolved = resolve_ref_value(nested, bindings)?;
                             }
-                            None => return Ok(value.clone()),
+                            None => {
+                                // When the map is concrete (the upstream's
+                                // value was loaded) and the requested key
+                                // is not in its keyset, the user typo'd
+                                // the key. Surface a clear error listing
+                                // the known keys instead of silently
+                                // degrading to "(known after upstream
+                                // apply: …)". Issue #2435.
+                                let known_list = if map.is_empty() {
+                                    "<no keys>".to_string()
+                                } else {
+                                    map.keys()
+                                        .map(|k| format!("{k:?}"))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                };
+                                return Err(format!(
+                                    "{}: key not found; available keys: {}",
+                                    path, known_list
+                                ));
+                            }
                         },
                         _ => return Ok(value.clone()),
                     }
@@ -806,6 +826,268 @@ mod tests {
         assert_eq!(
             resources[0].get_attr("vpc_id"),
             Some(&Value::String("vpc-123".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_resolve_upstream_state_map_subscript_substitutes_value() {
+        // Issue #2435: `${orgs.accounts['registry_dev']}` against an
+        // upstream that exports `accounts: map(AwsAccountId)` must
+        // resolve to the concrete account id, not the literal substring
+        // or an unresolved ref.
+        let mut resources = vec![make_resource(
+            "policy",
+            None,
+            vec![(
+                "principal_arn",
+                // orgs.accounts["registry_dev"]
+                Value::ResourceRef {
+                    path: crate::resource::AccessPath::with_fields_and_subscripts(
+                        "orgs",
+                        "accounts",
+                        Vec::new(),
+                        vec![crate::resource::Subscript::Str {
+                            key: "registry_dev".to_string(),
+                        }],
+                    ),
+                },
+            )],
+        )];
+
+        let mut accounts_map: IndexMap<String, Value> = IndexMap::new();
+        accounts_map.insert(
+            "registry_prod".to_string(),
+            Value::String("111111111111".to_string()),
+        );
+        accounts_map.insert(
+            "registry_dev".to_string(),
+            Value::String("222222222222".to_string()),
+        );
+        let mut orgs_attrs = HashMap::new();
+        orgs_attrs.insert("accounts".to_string(), Value::Map(accounts_map));
+        let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        remote_bindings.insert("orgs".to_string(), orgs_attrs);
+
+        resolve_refs_with_state_and_remote(&mut resources, &HashMap::new(), &remote_bindings)
+            .unwrap();
+
+        assert_eq!(
+            resources[0].get_attr("principal_arn"),
+            Some(&Value::String("222222222222".to_string())),
+        );
+    }
+
+    #[test]
+    fn test_resolve_upstream_state_map_subscript_missing_key_errors() {
+        // Issue #2435 acceptance: when the upstream map IS loaded
+        // (concrete `Value::Map`) but the requested string key is not
+        // among its entries, the resolver must surface a clear error
+        // naming the binding, attribute, and key — otherwise a typo
+        // silently degrades to "(known after upstream apply: …)".
+        let mut resources = vec![make_resource(
+            "policy",
+            None,
+            vec![(
+                "principal_arn",
+                Value::ResourceRef {
+                    path: crate::resource::AccessPath::with_fields_and_subscripts(
+                        "orgs",
+                        "accounts",
+                        Vec::new(),
+                        vec![crate::resource::Subscript::Str {
+                            key: "registry_qa".to_string(),
+                        }],
+                    ),
+                },
+            )],
+        )];
+
+        let mut accounts_map: IndexMap<String, Value> = IndexMap::new();
+        accounts_map.insert(
+            "registry_prod".to_string(),
+            Value::String("111111111111".to_string()),
+        );
+        accounts_map.insert(
+            "registry_dev".to_string(),
+            Value::String("222222222222".to_string()),
+        );
+        let mut orgs_attrs = HashMap::new();
+        orgs_attrs.insert("accounts".to_string(), Value::Map(accounts_map));
+        let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        remote_bindings.insert("orgs".to_string(), orgs_attrs);
+
+        let err =
+            resolve_refs_with_state_and_remote(&mut resources, &HashMap::new(), &remote_bindings)
+                .expect_err("missing key in concrete upstream map must error");
+        assert!(
+            err.contains("orgs.accounts") && err.contains("registry_qa"),
+            "error must name the upstream path and the missing key, got: {err}"
+        );
+        // Should also list available keys so the user can fix the typo.
+        assert!(
+            err.contains("registry_prod") && err.contains("registry_dev"),
+            "error should list known keys, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_upstream_state_map_subscript_empty_map_errors() {
+        // Empty `Value::Map` exists but has no keys — the error must
+        // still fire and the available-keys list must say so explicitly
+        // ("<no keys>") rather than render an empty string.
+        let mut orgs_attrs = HashMap::new();
+        orgs_attrs.insert("accounts".to_string(), Value::Map(IndexMap::new()));
+        let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        remote_bindings.insert("orgs".to_string(), orgs_attrs);
+
+        let mut resources = vec![make_resource(
+            "policy",
+            None,
+            vec![(
+                "principal_arn",
+                Value::ResourceRef {
+                    path: crate::resource::AccessPath::with_fields_and_subscripts(
+                        "orgs",
+                        "accounts",
+                        Vec::new(),
+                        vec![crate::resource::Subscript::Str {
+                            key: "registry_dev".to_string(),
+                        }],
+                    ),
+                },
+            )],
+        )];
+        let err =
+            resolve_refs_with_state_and_remote(&mut resources, &HashMap::new(), &remote_bindings)
+                .expect_err("empty map subscript must error");
+        assert!(
+            err.contains("<no keys>"),
+            "empty-map error must say '<no keys>', got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_upstream_state_map_subscript_unloaded_keeps_ref() {
+        // The new missing-key error must NOT fire when the upstream
+        // binding itself isn't loaded yet (e.g. plan-time before the
+        // upstream apply has run). The resolver should keep the ref so
+        // `resolve_refs_for_plan` can stamp it as
+        // `Unknown(UpstreamRef)`. Guards against a future refactor that
+        // hoists the subscript walk above the binding-presence check.
+        let mut resources = vec![make_resource(
+            "policy",
+            None,
+            vec![(
+                "principal_arn",
+                Value::ResourceRef {
+                    path: crate::resource::AccessPath::with_fields_and_subscripts(
+                        "orgs",
+                        "accounts",
+                        Vec::new(),
+                        vec![crate::resource::Subscript::Str {
+                            key: "anything".to_string(),
+                        }],
+                    ),
+                },
+            )],
+        )];
+
+        let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        resolve_refs_with_state_and_remote(&mut resources, &HashMap::new(), &remote_bindings)
+            .expect("unloaded upstream subscript must not error");
+        assert!(
+            matches!(
+                resources[0].get_attr("principal_arn"),
+                Some(Value::ResourceRef { .. })
+            ),
+            "ref must stay as ResourceRef when upstream is not loaded"
+        );
+    }
+
+    #[test]
+    fn test_resolve_upstream_state_chained_subscripts() {
+        // `orgs.regions['us'][0]` against a `map(list(String))` should
+        // walk the map, then index into the list, returning the leaf.
+        let inner_list = Value::List(vec![
+            Value::String("aza".to_string()),
+            Value::String("azb".to_string()),
+        ]);
+        let mut regions_map: IndexMap<String, Value> = IndexMap::new();
+        regions_map.insert("us".to_string(), inner_list);
+        let mut orgs_attrs = HashMap::new();
+        orgs_attrs.insert("regions".to_string(), Value::Map(regions_map));
+        let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        remote_bindings.insert("orgs".to_string(), orgs_attrs);
+
+        let mut resources = vec![make_resource(
+            "policy",
+            None,
+            vec![(
+                "az",
+                Value::ResourceRef {
+                    path: crate::resource::AccessPath::with_fields_and_subscripts(
+                        "orgs",
+                        "regions",
+                        Vec::new(),
+                        vec![
+                            crate::resource::Subscript::Str {
+                                key: "us".to_string(),
+                            },
+                            crate::resource::Subscript::Int { index: 0 },
+                        ],
+                    ),
+                },
+            )],
+        )];
+        resolve_refs_with_state_and_remote(&mut resources, &HashMap::new(), &remote_bindings)
+            .unwrap();
+        assert_eq!(
+            resources[0].get_attr("az"),
+            Some(&Value::String("aza".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_resolve_upstream_state_chained_subscript_missing_key_errors() {
+        // `orgs.regions['eu'][0]` where map has only 'us' — the missing
+        // string key surfaces the same key-not-found error as the
+        // single-subscript case.
+        let mut regions_map: IndexMap<String, Value> = IndexMap::new();
+        regions_map.insert(
+            "us".to_string(),
+            Value::List(vec![Value::String("aza".to_string())]),
+        );
+        let mut orgs_attrs = HashMap::new();
+        orgs_attrs.insert("regions".to_string(), Value::Map(regions_map));
+        let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        remote_bindings.insert("orgs".to_string(), orgs_attrs);
+
+        let mut resources = vec![make_resource(
+            "policy",
+            None,
+            vec![(
+                "az",
+                Value::ResourceRef {
+                    path: crate::resource::AccessPath::with_fields_and_subscripts(
+                        "orgs",
+                        "regions",
+                        Vec::new(),
+                        vec![
+                            crate::resource::Subscript::Str {
+                                key: "eu".to_string(),
+                            },
+                            crate::resource::Subscript::Int { index: 0 },
+                        ],
+                    ),
+                },
+            )],
+        )];
+        let err =
+            resolve_refs_with_state_and_remote(&mut resources, &HashMap::new(), &remote_bindings)
+                .expect_err("chained subscript with missing key must error");
+        assert!(
+            err.contains("eu") && err.contains("us"),
+            "error must mention the missing key and known keys, got: {err}"
         );
     }
 

@@ -1,0 +1,13 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: stripped
+---
+Execution Plan:
+
+  + awscc.s3.Bucket 
+      bucket_name: "shared-222222222222-bucket"
+      tags:
+        DevAccount: "222222222222"
+        ProdAccount: "111111111111"
+
+Plan: 1 to add, 0 to change, 0 to destroy.

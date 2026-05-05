@@ -1,0 +1,18 @@
+# Test upstream_state map subscript across sibling .crn files (#2435).
+#
+# `let X = upstream_state {...}` lives in `state.crn`; the consuming
+# `${X.field['key']}` lives in this `main.crn`. The fix in #2435 makes
+# this directory shape parse and resolve.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.s3.Bucket {
+  bucket_name = "shared-${orgs.accounts['registry_dev']}-bucket"
+
+  tags = {
+    DevAccount  = orgs.accounts['registry_dev']
+    ProdAccount = orgs.accounts['registry_prod']
+  }
+}

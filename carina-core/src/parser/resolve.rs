@@ -332,11 +332,16 @@ fn resolve_value_with_config(
                     Ok(value.clone())
                 }
             },
-            None => Err(ParseError::UndefinedVariable(format!(
-                "{}.{}",
-                path.binding(),
-                path.attribute()
-            ))),
+            // Binding not found in *this* file's binding_map. The same
+            // resolver runs both per-file (config_loader.rs L93) and on
+            // the merged `ParsedFile` (L178); a per-file miss may be a
+            // legitimate cross-file ref (`upstream_state` declared in a
+            // sibling `.crn`, resource binding from another file).
+            // Keep the ref as-is and let the post-merge
+            // `check_identifier_scope` walk surface any genuine
+            // undefined identifiers — that walk has full directory
+            // context plus did-you-mean suggestions.
+            None => Ok(value.clone()),
         },
         Value::List(items) => {
             let resolved: Result<Vec<Value>, ParseError> = items
