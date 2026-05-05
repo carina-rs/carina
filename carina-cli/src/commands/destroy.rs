@@ -174,7 +174,7 @@ async fn run_destroy_locked(
     }
 
     // Select appropriate Provider based on configuration
-    let provider = get_provider_with_ctx(&ctx, parsed, base_dir).await;
+    let provider = get_provider_with_ctx(&ctx, parsed, base_dir).await?;
 
     // Build current states -- either from provider (refresh=true) or from state file
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();

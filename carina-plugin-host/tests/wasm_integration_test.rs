@@ -66,7 +66,10 @@ async fn test_wasm_mock_provider_factory() {
 async fn test_wasm_mock_provider_create_and_read() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
-    let provider = factory.create_provider(&indexmap::IndexMap::new()).await;
+    let provider = factory
+        .create_provider(&indexmap::IndexMap::new())
+        .await
+        .expect("provider should init");
 
     assert_eq!(provider.name(), "mock");
 
@@ -123,7 +126,10 @@ async fn test_wasm_mock_provider_create_and_read() {
 async fn test_wasm_mock_provider_update_and_delete() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
-    let provider = factory.create_provider(&indexmap::IndexMap::new()).await;
+    let provider = factory
+        .create_provider(&indexmap::IndexMap::new())
+        .await
+        .expect("provider should init");
 
     let id = ResourceId::with_provider("mock", "test.resource", "updatable");
 
@@ -226,7 +232,10 @@ async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
     // that flag shows up, the WASM bridge forwarded the call correctly.
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
-    let provider = factory.create_provider(&indexmap::IndexMap::new()).await;
+    let provider = factory
+        .create_provider(&indexmap::IndexMap::new())
+        .await
+        .expect("provider should init");
 
     let mut resource = Resource::with_provider("mock", "test.data_source", "example");
     resource.attributes = indexmap::IndexMap::from([

@@ -146,7 +146,10 @@ async fn test_precompiled_factory_creates_provider() {
         .expect("from_precompiled should succeed");
 
     // Verify the factory can actually create a working provider
-    let provider = factory.create_provider(&indexmap::IndexMap::new()).await;
+    let provider = factory
+        .create_provider(&indexmap::IndexMap::new())
+        .await
+        .expect("provider should init");
     assert_eq!(provider.name(), "mock");
 }
 

@@ -1288,14 +1288,7 @@ impl Provider for RecordingMockProvider {
         _id: &ResourceId,
         _identifier: Option<&str>,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        Box::pin(async {
-            Err(ProviderError {
-                message: "not implemented".to_string(),
-                resource_id: None,
-                cause: None,
-                is_timeout: false,
-            })
-        })
+        Box::pin(async { Err(ProviderError::new("not implemented")) })
     }
 
     fn read_data_source(&self, _resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
@@ -1317,14 +1310,7 @@ impl Provider for RecordingMockProvider {
         _from: &State,
         _to: &Resource,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        Box::pin(async {
-            Err(ProviderError {
-                message: "not implemented".to_string(),
-                resource_id: None,
-                cause: None,
-                is_timeout: false,
-            })
-        })
+        Box::pin(async { Err(ProviderError::new("not implemented")) })
     }
 
     fn delete(
@@ -1333,14 +1319,7 @@ impl Provider for RecordingMockProvider {
         _identifier: &str,
         _lifecycle: &LifecycleConfig,
     ) -> BoxFuture<'_, ProviderResult<()>> {
-        Box::pin(async {
-            Err(ProviderError {
-                message: "not implemented".to_string(),
-                resource_id: None,
-                cause: None,
-                is_timeout: false,
-            })
-        })
+        Box::pin(async { Err(ProviderError::new("not implemented")) })
     }
 }
 

@@ -539,7 +539,7 @@ pub async fn run_apply(
                     .find(|p| p.name == backend_provider_name)
                     .map(|p| p.attributes.clone())
                     .unwrap_or_default();
-                let bucket_provider = factory.create_provider(&provider_config_attrs).await;
+                let bucket_provider = factory.create_provider(&provider_config_attrs).await?;
 
                 match bucket_provider.create(bucket_resource).await {
                     Ok(_) => {
@@ -742,7 +742,7 @@ async fn run_apply_locked(
     apply_name_overrides(&mut parsed.resources, &state_file);
 
     // Select appropriate Provider based on configuration
-    let provider = get_provider_with_ctx(ctx, parsed, base_dir).await;
+    let provider = get_provider_with_ctx(ctx, parsed, base_dir).await?;
 
     // Upstream state bindings are loaded up front so refs that target
     // `upstream_state` blocks can be resolved during refresh (#1683).
@@ -1293,7 +1293,7 @@ async fn run_apply_from_plan_locked(
         .collect();
 
     // Create provider early for drift detection
-    let provider = create_providers_from_configs(&plan_file.provider_configs, base_dir).await;
+    let provider = create_providers_from_configs(&plan_file.provider_configs, base_dir).await?;
 
     // Drift detection: re-read actual infrastructure state and compare against planned states
     println!("{}", "Checking for infrastructure drift...".cyan());

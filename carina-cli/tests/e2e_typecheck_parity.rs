@@ -183,8 +183,8 @@ impl ProviderFactory for TestProviderFactory {
     fn create_provider(
         &self,
         _attributes: &IndexMap<String, Value>,
-    ) -> BoxFuture<'_, Box<dyn Provider>> {
-        Box::pin(async { Box::new(NoopProvider) as Box<dyn Provider> })
+    ) -> BoxFuture<'_, carina_core::provider::ProviderResult<Box<dyn Provider>>> {
+        Box::pin(async { Ok(Box::new(NoopProvider) as Box<dyn Provider>) })
     }
 
     fn create_normalizer(
@@ -818,8 +818,8 @@ impl ProviderFactory for WasmStyleProviderFactory {
     fn create_provider(
         &self,
         _attributes: &IndexMap<String, Value>,
-    ) -> BoxFuture<'_, Box<dyn Provider>> {
-        Box::pin(async { Box::new(NoopProvider) as Box<dyn Provider> })
+    ) -> BoxFuture<'_, carina_core::provider::ProviderResult<Box<dyn Provider>>> {
+        Box::pin(async { Ok(Box::new(NoopProvider) as Box<dyn Provider>) })
     }
     fn create_normalizer(
         &self,
