@@ -284,6 +284,22 @@ impl SemanticTokensProvider {
             return tokens;
         }
 
+        // Detect an inline `#` / `//` line comment outside string literals.
+        // If found, split the line so the code-side tokenizers see only the
+        // prefix and we emit one COMMENT token for the trailing comment.
+        // Mirrors the pest grammar's disjoint `line_comment` /
+        // `block_comment` productions. The rest of this function operates
+        // on the truncated `line` shadow — any future code that needs the
+        // full original line must read it before this point.
+        let (line, comment_token) = match find_inline_comment_split(line) {
+            Some(split) => (
+                &line[..split.byte_pos],
+                Some((split.char_pos, split.total_char_len - split.char_pos, 7u32)),
+            ),
+            None => (line, None),
+        };
+        let trimmed = line.trim_start();
+
         // DSL keywords (let, fn, provider, for, if, etc.) are intentionally NOT
         // emitted as semantic tokens: the TextMate grammar paints them via
         // dedicated scopes (`storage.type.carina`, `keyword.control.carina`,
@@ -480,6 +496,13 @@ impl SemanticTokensProvider {
         // (`constant.language.boolean.carina`) to avoid a blanket KEYWORD
         // semantic token overriding it.
 
+        // Inline comment tail: added after code-side tokenization so it
+        // does not interfere with property/operator/string scanners that
+        // walk the (now-truncated) `line`.
+        if let Some(comment) = comment_token {
+            tokens.push(comment);
+        }
+
         // Sort by position and deduplicate
         tokens.sort_by_key(|(start, _, _)| *start);
         tokens.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
@@ -639,6 +662,58 @@ impl SemanticTokensProvider {
             search_start = absolute_byte_pos + pattern.len();
         }
     }
+}
+
+/// Result of scanning a line for an inline `#` / `//` line-comment marker.
+struct InlineCommentSplit {
+    /// Byte offset of the marker in the original `line`.
+    byte_pos: usize,
+    /// Char offset of the marker (LSP positions use char counts).
+    char_pos: u32,
+    /// Total char length of the line, returned alongside the position so
+    /// callers can compute the comment-token length without re-walking.
+    total_char_len: u32,
+}
+
+/// Locate an inline `#` or `//` line-comment marker in `line`, skipping
+/// over single- and double-quoted string literals. Returns the marker's
+/// byte and char offsets plus the line's total char length, all from a
+/// single pass over the input. Returns `None` if the line has no
+/// line-comment marker outside a string.
+///
+/// Mirrors the pest grammar's `line_comment = ("//" | "#") ~ …` production
+/// (carina-core/src/parser/carina.pest). The block-comment scanner has its
+/// own line-comment short-circuit at the top of
+/// `tokenize_line_with_block_comments` (#2448); this helper covers the
+/// `tokenize_line` (no-block-comment) path.
+fn find_inline_comment_split(line: &str) -> Option<InlineCommentSplit> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut char_idx: usize = 0;
+    let mut byte_idx: usize = 0;
+    let mut marker: Option<(usize, u32)> = None;
+    while char_idx < chars.len() {
+        let c = chars[char_idx];
+        if marker.is_none() {
+            if c == '\'' || c == '"' {
+                let next_char = skip_string_literal(&chars, char_idx);
+                while char_idx < next_char {
+                    byte_idx += chars[char_idx].len_utf8();
+                    char_idx += 1;
+                }
+                continue;
+            }
+            if c == '#' || (c == '/' && char_idx + 1 < chars.len() && chars[char_idx + 1] == '/') {
+                marker = Some((byte_idx, char_idx as u32));
+            }
+        }
+        byte_idx += c.len_utf8();
+        char_idx += 1;
+    }
+    marker.map(|(byte_pos, char_pos)| InlineCommentSplit {
+        byte_pos,
+        char_pos,
+        total_char_len: char_idx as u32,
+    })
 }
 
 /// Skip past a single- or double-quoted string literal starting at `start`
@@ -1252,6 +1327,114 @@ mod tests {
             comment_tokens.len(),
             1,
             "/* inside a `//` line comment must not leak block-comment state to following lines. Got: {:?}",
+            tokens
+        );
+    }
+
+    /// Regression test for #2454: an inline `#` line comment (e.g.
+    /// `name = "x" # foo`) must produce a `COMMENT` semantic token covering
+    /// the trailing comment. Pre-fix, `tokenize_line` only emitted a
+    /// COMMENT when the *whole* trimmed line started with `#` or `//`, so
+    /// inline comments were silently uncolored at the semantic-token
+    /// layer.
+    #[test]
+    fn test_inline_hash_comment_emits_comment_token() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize("name = \"x\" # foo");
+        let comment_tokens: Vec<_> = tokens.iter().filter(|t| t.token_type == 7).collect();
+        assert_eq!(
+            comment_tokens.len(),
+            1,
+            "inline `#` comment must produce one COMMENT token. Got: {:?}",
+            tokens
+        );
+    }
+
+    /// Sibling of the above for inline `//` comments.
+    #[test]
+    fn test_inline_slash_comment_emits_comment_token() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize("name = \"x\" // foo");
+        let comment_tokens: Vec<_> = tokens.iter().filter(|t| t.token_type == 7).collect();
+        assert_eq!(
+            comment_tokens.len(),
+            1,
+            "inline `//` comment must produce one COMMENT token. Got: {:?}",
+            tokens
+        );
+    }
+
+    /// `#` inside a string literal must NOT be classified as a comment.
+    /// (Symmetric to #2436's protection for `/*`.)
+    #[test]
+    fn test_hash_inside_string_is_not_a_comment() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize("name = \"no # here\"");
+        let comment_tokens: Vec<_> = tokens.iter().filter(|t| t.token_type == 7).collect();
+        assert!(
+            comment_tokens.is_empty(),
+            "`#` inside a string literal must not produce a COMMENT token. Got: {:?}",
+            tokens
+        );
+    }
+
+    /// `//` inside a string literal must NOT be classified as a comment.
+    #[test]
+    fn test_slashes_inside_string_are_not_a_comment() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize("name = \"https://example.com\"");
+        let comment_tokens: Vec<_> = tokens.iter().filter(|t| t.token_type == 7).collect();
+        assert!(
+            comment_tokens.is_empty(),
+            "`//` inside a string literal must not produce a COMMENT token. Got: {:?}",
+            tokens
+        );
+    }
+
+    /// The inline COMMENT token must cover the marker and the rest of the
+    /// line exactly — verifies no off-by-one in `total_char_len - char_pos`.
+    /// `name = "x" # foo` has the `#` at char 11 (0-indexed) and the line
+    /// is 16 chars long, so the COMMENT token is (start=11, length=5).
+    #[test]
+    fn test_inline_comment_token_position_and_length() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize("name = \"x\" # foo");
+        // Tokens are LSP-encoded with delta_line / delta_start. For a
+        // single-line input the COMMENT is the last token; its
+        // delta_start equals (absolute_start - prev_token_start).
+        let comment = tokens
+            .iter()
+            .find(|t| t.token_type == 7)
+            .expect("expected one COMMENT token");
+        // Compare against character length of the trailing comment slice.
+        assert_eq!(
+            comment.length, 5,
+            "COMMENT token must cover `# foo` (5 chars). Got: {:?}",
+            tokens
+        );
+    }
+
+    /// An inline `#` comment on one line must not bleed into the next
+    /// line's tokenization. `tokenize_line` is per-line, but assert it
+    /// explicitly to mirror the line-independence invariants from #2436
+    /// and #2448.
+    #[test]
+    fn test_inline_comment_does_not_leak_to_next_line() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize("x = 1 # foo\ny = 2");
+        // Line 0 has its own COMMENT (the `# foo` tail). Line 1 must not
+        // produce any COMMENT token.
+        let line1_comment_tokens: Vec<_> = tokens
+            .iter()
+            .scan(0u32, |line, t| {
+                *line += t.delta_line;
+                Some((*line, t))
+            })
+            .filter(|(line, t)| *line == 1 && t.token_type == 7)
+            .collect();
+        assert!(
+            line1_comment_tokens.is_empty(),
+            "line 2 must not be classified as COMMENT. Got: {:?}",
             tokens
         );
     }
