@@ -292,7 +292,12 @@ fn build_create_rows(
             rows.push(build_expanded_tags_row(map, &default_tag_keys));
             continue;
         }
-        if is_list_of_maps(value) {
+        // `Value::List` (any element type) goes through PrettyAttribute so
+        // `format_value_pretty` can apply its 80-col threshold and YAML-style
+        // vertical layout. `Value::Map` keeps the existing MapExpanded path
+        // because that variant carries per-entry annotation slots that
+        // PrettyAttribute does not represent (used by tags/default_tags).
+        if let Value::List(_) = value {
             rows.push(DetailRow::PrettyAttribute {
                 key: key.to_string(),
                 value: value.clone(),
@@ -1201,6 +1206,54 @@ mod tests {
                 DetailRow::Attribute { key, .. } if key == "role_name"
             )),
             "scalar attribute should still emit DetailRow::Attribute, got: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn create_row_list_of_strings_emits_pretty_attribute() {
+        // list-of-string must route through PrettyAttribute so
+        // format_value_pretty's 80-col threshold can apply.
+        let resource = Resource::new("iam.Role", "test").with_attribute(
+            "managed_policy_arns",
+            Value::List(vec![
+                Value::String("arn:aws:iam::aws:policy/Policy1".to_string()),
+                Value::String("arn:aws:iam::aws:policy/Policy2".to_string()),
+            ]),
+        );
+        let effect = Effect::Create(resource);
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None);
+
+        let pretty = rows.iter().find_map(|row| match row {
+            DetailRow::PrettyAttribute { key, value } if key == "managed_policy_arns" => {
+                Some(value)
+            }
+            _ => None,
+        });
+        assert!(
+            pretty.is_some(),
+            "expected PrettyAttribute row for list-of-string attribute, got: {rows:?}"
+        );
+        assert!(
+            matches!(pretty.unwrap(), Value::List(_)),
+            "PrettyAttribute should carry the raw Value::List"
+        );
+    }
+
+    #[test]
+    fn create_row_empty_list_emits_pretty_attribute() {
+        // Pins down `tags = []` behavior — a regression that re-introduces
+        // an `!items.is_empty()` guard would silently bypass the routing
+        // for empty lists, breaking the formatting-path uniformity.
+        let resource =
+            Resource::new("iam.Role", "test").with_attribute("tags", Value::List(vec![]));
+        let effect = Effect::Create(resource);
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None);
+        assert!(
+            rows.iter().any(|row| matches!(
+                row,
+                DetailRow::PrettyAttribute { key, .. } if key == "tags"
+            )),
+            "empty list should also emit PrettyAttribute, got: {rows:?}"
         );
     }
 }
