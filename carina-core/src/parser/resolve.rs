@@ -126,6 +126,12 @@ pub fn resolve_resource_refs(parsed: &mut ParsedFile) -> Result<(), ParseError> 
 }
 
 /// Resolve resource references with the given parser configuration.
+///
+/// `parsed.user_functions` is consulted when resolving `Value::FunctionCall`
+/// values — a name that isn't a builtin but is a user-defined function in
+/// the merged directory parse triggers user-fn evaluation here, even when
+/// the per-file parse couldn't evaluate it because the `fn` declaration
+/// lived in a sibling `.crn` (#2444).
 pub fn resolve_resource_refs_with_config(
     parsed: &mut ParsedFile,
     config: &ProviderContext,
@@ -170,17 +176,44 @@ pub fn resolve_resource_refs_with_config(
         binding_map.entry(us.binding.clone()).or_default();
     }
 
+    // Build a `ParseContext` once, populated with the merged
+    // directory's user functions so a `Value::FunctionCall` whose name
+    // is a sibling-defined user-fn (visible only in the merged parse —
+    // #2444) is evaluated here rather than rejected as "Unknown
+    // built-in function". The HashMap is small (typically a handful of
+    // user-defined functions). Restructuring the surrounding
+    // `&mut parsed` borrow to avoid the clone is hairy on the error
+    // path (would need to restore on every `?` exit), so we accept a
+    // single map clone per call.
+    let mut fn_ctx = super::ParseContext::new(config);
+    fn_ctx.user_functions = parsed.user_functions.clone();
+
     // Resolve references in each resource. Keep `IndexMap` to preserve
     // the user's source order through resolution (#2222).
     for resource in &mut parsed.resources {
         let mut resolved_attrs: IndexMap<String, Value> = IndexMap::new();
 
         for (key, expr) in &resource.attributes {
-            let resolved = resolve_value_with_config(expr, &binding_map, config)?;
+            let resolved = resolve_value_with_config(expr, &binding_map, &fn_ctx)?;
             resolved_attrs.insert(key.clone(), resolved);
         }
 
         resource.attributes = resolved_attrs;
+    }
+
+    // Resolve top-level `let v = ...` bindings that contain
+    // `Value::FunctionCall` placeholders deferred by the per-file
+    // parse — typically `fn X(...)` lives in a sibling `.crn` (#2444).
+    // The variant below only mutates `FunctionCall` arms, leaving
+    // other shapes (`Value::String("${vpc}")` placeholder,
+    // `Value::ResourceRef`, etc.) untouched so earlier passes
+    // (`upstream_exports`, `BindingNameSet`) keep seeing the raw
+    // unresolved forms they expect.
+    let var_keys: Vec<String> = parsed.variables.keys().cloned().collect();
+    for key in var_keys {
+        let expr = parsed.variables[&key].clone();
+        let resolved = resolve_function_calls_only(&expr, &binding_map, &fn_ctx)?;
+        parsed.variables[&key] = resolved;
     }
 
     // Resolve cross-file forward references in export_params.
@@ -318,14 +351,14 @@ fn accumulate_deferred_iterable_errors(
 fn resolve_value_with_config(
     value: &Value,
     binding_map: &HashMap<String, HashMap<String, Value>>,
-    config: &ProviderContext,
+    fn_ctx: &super::ParseContext<'_>,
 ) -> Result<Value, ParseError> {
     match value {
         Value::ResourceRef { path } => match binding_map.get(path.binding()) {
             Some(attributes) => match attributes.get(path.attribute()) {
                 Some(attr_value) => {
                     // Recursively resolve in case the attribute itself is a reference
-                    resolve_value_with_config(attr_value, binding_map, config)
+                    resolve_value_with_config(attr_value, binding_map, fn_ctx)
                 }
                 None => {
                     // Attribute not found, keep as reference (might be resolved at runtime)
@@ -346,7 +379,7 @@ fn resolve_value_with_config(
         Value::List(items) => {
             let resolved: Result<Vec<Value>, ParseError> = items
                 .iter()
-                .map(|item| resolve_value_with_config(item, binding_map, config))
+                .map(|item| resolve_value_with_config(item, binding_map, fn_ctx))
                 .collect();
             Ok(Value::List(resolved?))
         }
@@ -355,7 +388,7 @@ fn resolve_value_with_config(
             for (k, v) in map {
                 resolved.insert(
                     k.clone(),
-                    resolve_value_with_config(v, binding_map, config)?,
+                    resolve_value_with_config(v, binding_map, fn_ctx)?,
                 );
             }
             Ok(Value::Map(resolved))
@@ -366,7 +399,7 @@ fn resolve_value_with_config(
                 .iter()
                 .map(|p| match p {
                     InterpolationPart::Expr(v) => Ok(InterpolationPart::Expr(
-                        resolve_value_with_config(v, binding_map, config)?,
+                        resolve_value_with_config(v, binding_map, fn_ctx)?,
                     )),
                     other => Ok(other.clone()),
                 })
@@ -376,7 +409,7 @@ fn resolve_value_with_config(
         Value::FunctionCall { name, args } => {
             let resolved_args: Result<Vec<Value>, ParseError> = args
                 .iter()
-                .map(|a| resolve_value_with_config(a, binding_map, config))
+                .map(|a| resolve_value_with_config(a, binding_map, fn_ctx))
                 .collect();
             let resolved_args = resolved_args?;
 
@@ -387,7 +420,7 @@ fn resolve_value_with_config(
                 .cloned()
                 .map(EvalValue::from_value)
                 .collect();
-            match crate::builtins::evaluate_builtin_with_config(name, &eval_args, config) {
+            match crate::builtins::evaluate_builtin_with_config(name, &eval_args, fn_ctx.config) {
                 Ok(result) => result
                     .into_value()
                     .map_err(|leak| ParseError::InvalidExpression {
@@ -399,6 +432,19 @@ fn resolve_value_with_config(
                         ),
                     }),
                 Err(e) => {
+                    // Builtin lookup failed. The name may be a user-fn
+                    // that became visible only after directory merge
+                    // (#2444): evaluate against the merged `fn_ctx`
+                    // built once at the top of the resolver pass.
+                    // Truly-undefined names with all-static args still
+                    // error.
+                    if let Some(user_fn) = fn_ctx.user_functions.get(name) {
+                        return super::functions::evaluate_user_function(
+                            user_fn,
+                            &resolved_args,
+                            fn_ctx,
+                        );
+                    }
                     if all_args_resolved {
                         // All args are resolved but builtin failed — propagate the error
                         Err(ParseError::InvalidExpression {
@@ -414,6 +460,54 @@ fn resolve_value_with_config(
                     }
                 }
             }
+        }
+        _ => Ok(value.clone()),
+    }
+}
+
+/// Walk a value tree and finalize any `Value::FunctionCall` placeholder
+/// that the per-file parse deferred (typically because the user-fn
+/// lives in a sibling `.crn` — #2444). Recurses through `List` / `Map`
+/// / `Interpolation` containers so deferred calls inside them surface
+/// too. Non-FunctionCall arms (`String`, `ResourceRef`,
+/// `Interpolation` literals, etc.) pass through unchanged so earlier
+/// passes that read raw forms keep working.
+fn resolve_function_calls_only(
+    value: &Value,
+    binding_map: &HashMap<String, HashMap<String, Value>>,
+    fn_ctx: &super::ParseContext<'_>,
+) -> Result<Value, ParseError> {
+    use crate::resource::InterpolationPart;
+    match value {
+        Value::FunctionCall { .. } => resolve_value_with_config(value, binding_map, fn_ctx),
+        Value::List(items) => {
+            let resolved: Result<Vec<Value>, ParseError> = items
+                .iter()
+                .map(|v| resolve_function_calls_only(v, binding_map, fn_ctx))
+                .collect();
+            Ok(Value::List(resolved?))
+        }
+        Value::Map(map) => {
+            let mut resolved: IndexMap<String, Value> = IndexMap::new();
+            for (k, v) in map {
+                resolved.insert(
+                    k.clone(),
+                    resolve_function_calls_only(v, binding_map, fn_ctx)?,
+                );
+            }
+            Ok(Value::Map(resolved))
+        }
+        Value::Interpolation(parts) => {
+            let resolved: Result<Vec<InterpolationPart>, ParseError> = parts
+                .iter()
+                .map(|p| match p {
+                    InterpolationPart::Expr(v) => Ok(InterpolationPart::Expr(
+                        resolve_function_calls_only(v, binding_map, fn_ctx)?,
+                    )),
+                    other => Ok(other.clone()),
+                })
+                .collect();
+            Ok(Value::Interpolation(resolved?).canonicalize())
         }
         _ => Ok(value.clone()),
     }
