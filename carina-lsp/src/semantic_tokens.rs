@@ -186,14 +186,23 @@ impl SemanticTokensProvider {
         }
 
         // Not inside a block comment. Check if this line starts one.
-        // Scan for /* to find inline block comments.
+        // Scan for /* to find inline block comments. While scanning, skip over
+        // single- and double-quoted string literals so a `/*` inside an ARN
+        // like 'arn:aws:s3:::bucket/*' does not open a block comment (#2436).
         let mut i = 0;
         while i < chars.len() {
+            if chars[i] == '\'' || chars[i] == '"' {
+                i = skip_string_literal(&chars, i);
+                continue;
+            }
             if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
                 *block_comment_depth = 1;
                 let comment_start = i as u32;
                 i += 2;
-                // Scan for end of block comment on same line
+                // Scan for end of block comment on same line. A nested /*
+                // increments depth; a */ decrements. String literals inside
+                // a block comment are inert in the pest grammar, so we do
+                // not skip them here.
                 while i < chars.len() {
                     if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
                         *block_comment_depth += 1;
@@ -624,6 +633,29 @@ impl SemanticTokensProvider {
             search_start = absolute_byte_pos + pattern.len();
         }
     }
+}
+
+/// Skip past a single- or double-quoted string literal starting at `start`
+/// (which must point at the opening quote). Returns the index of the
+/// character after the closing quote, or `chars.len()` if the line ends
+/// before the string closes. Honors `\\` escapes inside double-quoted
+/// strings; single-quoted strings have no escape mechanism in Carina's
+/// pest grammar, so the first matching `'` closes them.
+fn skip_string_literal(chars: &[char], start: usize) -> usize {
+    let quote = chars[start];
+    let mut i = start + 1;
+    while i < chars.len() {
+        let c = chars[i];
+        if quote == '"' && c == '\\' && i + 1 < chars.len() {
+            i += 2;
+            continue;
+        }
+        if c == quote {
+            return i + 1;
+        }
+        i += 1;
+    }
+    chars.len()
 }
 
 #[cfg(test)]
@@ -1144,6 +1176,37 @@ mod tests {
         assert!(
             !comment_tokens.is_empty(),
             "Should highlight nested block comment as COMMENT. Got: {:?}",
+            tokens
+        );
+    }
+
+    /// Regression test for #2436: `/*` inside a single-quoted string must not
+    /// open a block comment. ARNs like `'arn:aws:s3:::bucket/*'` previously
+    /// caused every line below to be emitted as `COMMENT`, killing semantic
+    /// highlighting in VS Code from that point onward.
+    #[test]
+    fn test_block_comment_not_triggered_inside_single_quoted_string() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let content = "resource = 'arn:aws:s3:::bucket/*'\nname = \"after\"";
+        let tokens = provider.tokenize(content);
+        // No COMMENT tokens should be emitted; the `/*` is inside the string.
+        let comment_tokens: Vec<_> = tokens.iter().filter(|t| t.token_type == 7).collect();
+        assert!(
+            comment_tokens.is_empty(),
+            "/* inside a single-quoted string must not start a block comment. Got: {:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn test_block_comment_not_triggered_inside_double_quoted_string() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let content = "resource = \"arn:aws:s3:::bucket/*\"\nname = \"after\"";
+        let tokens = provider.tokenize(content);
+        let comment_tokens: Vec<_> = tokens.iter().filter(|t| t.token_type == 7).collect();
+        assert!(
+            comment_tokens.is_empty(),
+            "/* inside a double-quoted string must not start a block comment. Got: {:?}",
             tokens
         );
     }
