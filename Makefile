@@ -173,3 +173,18 @@ install-lsp:
 	@echo "Installed $(INSTALL_DIR)/carina-lsp"
 
 .PHONY: install install-cli install-lsp
+
+# ---------------------------------------------------------------------------
+# VS Code extension packaging
+# ---------------------------------------------------------------------------
+#
+# `make vscode-package` builds a `.vsix` for the VS Code extension. Install
+# the result with: `code --install-extension editors/vscode/carina-X.Y.Z.vsix`.
+# Do NOT install by copying the source directory into ~/.vscode/extensions/ —
+# that path skips `npm install` and produces the silent activation failure
+# described in #2420.
+
+vscode-package:
+	cd editors/vscode && npm run package
+
+.PHONY: vscode-package
