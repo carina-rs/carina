@@ -1,0 +1,22 @@
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.iam.RolePolicy {
+  policy_name = 'test-inline'
+  role_name   = 'test-role'
+  statement = [
+    {
+      sid      = 'AllowS3Read'
+      effect   = 'Allow'
+      action   = 's3:GetObject'
+      resource = 'arn:aws:s3:::example/*'
+    },
+    {
+      sid      = 'DenyS3Write'
+      effect   = 'Deny'
+      action   = 's3:PutObject'
+      resource = 'arn:aws:s3:::example/*'
+    },
+  ]
+}

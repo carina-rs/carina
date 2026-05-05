@@ -123,6 +123,9 @@ plan-fixtures:
 	@$(MAKE) plan-upstream-state-map-subscript
 	@echo "---"
 	@$(MAKE) plan-deferred-for
+	@echo ""
+	@echo "=== policy_pretty ==="
+	@$(MAKE) plan-policy-pretty
 
 plan-upstream-state:
 	$(PLAN_FIXTURE) upstream_state
@@ -138,13 +141,15 @@ plan-exports:
 	$(PLAN_FIXTURE) exports
 plan-exports-multifile:
 	$(PLAN_FIXTURE) exports_multifile
+plan-policy-pretty:
+	$(PLAN_FIXTURE) policy_pretty
 .PHONY: plan-all-create plan-no-changes plan-no-changes-enum plan-mixed plan-delete plan-compact \
         plan-map-diff plan-enum-display plan-destroy-full plan-destroy-orphans plan-read-only-attrs \
         plan-default-values plan-explicit plan-default-tags \
         plan-state-blocks plan-secret-values plan-moved-with-changes plan-moved-prev-keys plan-moved-pure \
         plan-upstream-state plan-upstream-state-unresolved plan-upstream-state-empty-exports \
         plan-upstream-state-map-subscript \
-        plan-deferred-for plan-exports plan-exports-multifile \
+        plan-deferred-for plan-exports plan-exports-multifile plan-policy-pretty \
         plan-map-diff-tui plan-all-create-tui plan-mixed-tui plan-delete-tui \
         plan-moved-with-changes-tui plan-moved-pure-tui plan-fixtures
 

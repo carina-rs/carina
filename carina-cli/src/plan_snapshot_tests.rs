@@ -62,6 +62,21 @@ fn snapshot_all_create() {
 }
 
 #[test]
+fn snapshot_policy_pretty() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("policy_pretty");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+    ));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
 fn snapshot_no_changes() {
     let (plan, _schemas, _moved) = build_plan_from_fixture("no_changes");
     let output = strip_ansi(&format_plan(
