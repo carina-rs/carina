@@ -1,0 +1,10 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  ~ awscc.ec2.Vpc new_vpc (moved from: old_vpc)
+        └─ + awscc.ec2.Subnet (cidr_block: 10.0.1.0/24)
+
+Plan: 1 to add, 1 to change, 0 to destroy, 1 to move.

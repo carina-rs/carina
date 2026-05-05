@@ -468,7 +468,7 @@ impl<'a> TreeRenderContext<'a> {
                 let moved_note = self
                     .moved_origins
                     .get(id)
-                    .map(|from| format!(" (moved from: {}.{})", from.display_type(), from.name));
+                    .map(|from| format!(" (moved from: {})", from.name_str()));
                 if self.detail == DetailLevel::None {
                     let name_part = format_compact_name(to, id.name_str(), parent_binding);
                     writeln!(
@@ -507,7 +507,7 @@ impl<'a> TreeRenderContext<'a> {
                 let moved_note = self
                     .moved_origins
                     .get(id)
-                    .map(|from| format!(" (moved from: {}.{})", from.display_type(), from.name));
+                    .map(|from| format!(" (moved from: {})", from.name_str()));
                 if self.detail == DetailLevel::None {
                     let name_part = format_compact_name(to, id.name_str(), parent_binding);
                     writeln!(
@@ -620,7 +620,7 @@ impl<'a> TreeRenderContext<'a> {
                     colored_symbol,
                     to.display_type().cyan().bold(),
                     to.name_str().yellow().bold(),
-                    format!("(moved from: {})", from).dimmed()
+                    format!("(moved from: {})", from.name_str()).dimmed()
                 )
                 .unwrap();
             }
