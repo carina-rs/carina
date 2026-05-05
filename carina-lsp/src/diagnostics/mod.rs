@@ -142,19 +142,29 @@ impl DiagnosticEngine {
         }
 
         // `known_bindings` for the text-scan undefined-reference check.
-        // When no merged parse is available (no base_path, or directory
-        // parse fails) the fallback is the current buffer's `let` headers
-        // only — cross-file bindings become undetectable and we'd rather
-        // miss typos than manufacture false positives against
-        // `upstream_state` / `import` bindings the old text scan used to
-        // mishandle (#2131 / #2132).
+        // When the merged parse succeeds, `BindingNameSet::from_parsed`
+        // yields every binding declared anywhere in the directory. When
+        // it fails (`merged = None` because a parse error somewhere in
+        // the directory blocked the merge), fall back to a per-file
+        // resilient walk: parse each sibling `.crn` independently,
+        // swallow per-file errors, run `BindingNameSet::from_parsed` on
+        // each successful parse. Without this, sibling-defined
+        // bindings (including `arguments`, `import`, `fn`, ...) redline
+        // as Unknown the moment any sibling fails to parse (#2445).
+        // When no `base_path` is available at all, the buffer-only scan
+        // remains the last resort.
         let declared_providers = self.extract_declared_provider_names(&text);
-        let known_bindings: HashSet<String> = match merged.as_ref() {
-            Some(merged) => carina_core::binding_index::BindingNameSet::from_parsed(merged)
+        let known_bindings: HashSet<String> = match (merged.as_ref(), base_path) {
+            (Some(merged), _) => carina_core::binding_index::BindingNameSet::from_parsed(merged)
                 .iter_names()
                 .map(String::from)
                 .collect(),
-            None => self.extract_resource_bindings(crate::completion::DslSource::BufferOnly(&text)),
+            (None, Some(base)) => {
+                self.collect_sibling_binding_names(&text, current_file_name, base)
+            }
+            (None, None) => {
+                self.extract_resource_bindings(crate::completion::DslSource::BufferOnly(&text))
+            }
         };
         diagnostics.extend(self.check_undefined_references(
             &text,
