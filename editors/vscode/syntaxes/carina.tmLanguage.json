@@ -86,6 +86,17 @@
               "match": "\\\\."
             }
           ]
+        },
+        {
+          "name": "string.quoted.single.carina",
+          "begin": "'",
+          "end": "'",
+          "patterns": [
+            {
+              "name": "constant.character.escape.carina",
+              "match": "\\\\."
+            }
+          ]
         }
       ]
     },
