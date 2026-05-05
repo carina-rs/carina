@@ -123,6 +123,41 @@ fn tmlanguage_has_pascal_case_type_pattern() {
     );
 }
 
+fn assert_grammar_has_single_quoted_string_pattern(path: &str) {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let content = fs::read_to_string(manifest_dir.join(path)).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+    let patterns = json
+        .pointer("/repository/strings/patterns")
+        .and_then(|v| v.as_array())
+        .unwrap_or_else(|| panic!("expected repository.strings.patterns array in {path}"));
+
+    let has_single_quoted = patterns.iter().any(|p| {
+        p.get("begin").and_then(|v| v.as_str()) == Some("'")
+            && p.get("end").and_then(|v| v.as_str()) == Some("'")
+    });
+    assert!(
+        has_single_quoted,
+        "{path} strings repository must include a single-quoted string \
+         pattern (begin: \"'\", end: \"'\"). Carina's pest grammar accepts \
+         single-quoted strings (e.g. 'arn:aws:...'); without this pattern, \
+         policy_document blocks render with no string highlighting and \
+         PascalCase tokens inside ARNs (Allow, PutObject) leak into the \
+         entity.name.type scope."
+    );
+}
+
+#[test]
+fn vscode_grammar_has_single_quoted_string_pattern() {
+    assert_grammar_has_single_quoted_string_pattern(VSCODE_GRAMMAR);
+}
+
+#[test]
+fn tmbundle_grammar_has_single_quoted_string_pattern() {
+    assert_grammar_has_single_quoted_string_pattern(TMBUNDLE_GRAMMAR);
+}
+
 #[test]
 fn vscode_and_tmbundle_grammars_are_byte_identical() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
