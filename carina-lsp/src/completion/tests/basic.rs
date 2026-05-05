@@ -184,6 +184,158 @@ web_tier {
 }
 
 #[test]
+fn module_parameter_completion_for_let_binding_module_call() {
+    // Regression test for #2423: inside `let <name> = <module> { <CURSOR> }`,
+    // completion must surface the module's parameters (from `exports.crn` /
+    // `arguments { ... }`). Previously the context walker excluded *all*
+    // lines starting with `let `, so the named-binding form of a module
+    // call was misclassified and the LSP returned an empty array. VS Code
+    // then fell back to word-based suggestions.
+    use std::fs;
+    use tempfile::tempdir;
+
+    let provider = test_provider();
+
+    // Multi-file directory fixture per CLAUDE.md "Directory-scoped, never
+    // single-file" rule. Module lives in a sibling directory.
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let base_path = temp_dir.path();
+
+    let module_dir = base_path.join("modules").join("github-oidc");
+    fs::create_dir_all(&module_dir).expect("Failed to create module dir");
+
+    let module_arguments = r#"
+arguments {
+role_name: String
+policy_name: String
+repository: String
+}
+"#;
+    fs::write(module_dir.join("exports.crn"), module_arguments)
+        .expect("Failed to write module exports");
+
+    // Main file uses the let-binding form: `let bootstrap = github { ... }`.
+    let main_content = r#"let github = use { source = "./modules/github-oidc" }
+
+let bootstrap = github {
+  gi
+}
+"#;
+    let doc = create_document(main_content);
+
+    // Cursor at end of `  gi` on line 3.
+    let position = Position {
+        line: 3,
+        character: 4,
+    };
+
+    let completions = provider.complete(&doc, position, Some(base_path));
+
+    assert!(
+        !completions.is_empty(),
+        "Should have module parameter completions for `let X = module {{ ... }}` form, \
+         got empty (regression of #2423)"
+    );
+
+    let role_name = completions.iter().find(|c| c.label == "role_name");
+    assert!(
+        role_name.is_some(),
+        "Should have role_name parameter completion. Got: {:?}",
+        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+
+    let policy_name = completions.iter().find(|c| c.label == "policy_name");
+    assert!(
+        policy_name.is_some(),
+        "Should have policy_name parameter completion"
+    );
+}
+
+#[test]
+fn module_parameter_completion_for_multiline_use_block() {
+    // Regression test for the second bug uncovered by #2423: the real
+    // `carina-rs/infra` tree writes `let <name> = use { ... }` across
+    // multiple lines, with the `source = '...'` on its own line:
+    //
+    //   let github = use {
+    //     source = '../../../modules/github-oidc'
+    //   }
+    //
+    // `find_module_import_path` previously scanned line-by-line and only
+    // recognized the single-line form, so it returned `None` here and the
+    // user saw zero completions. The fix must scan across the body of the
+    // `use` block. This fixture mirrors the production module's
+    // `arguments { ... }` shape, including default values and dotted/list
+    // types.
+    use std::fs;
+    use tempfile::tempdir;
+
+    let provider = test_provider();
+
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let base_path = temp_dir.path();
+
+    let module_dir = base_path.join("modules").join("github-oidc");
+    fs::create_dir_all(&module_dir).expect("Failed to create module dir");
+
+    // Match the real-infra module shape (multi-arg, default value, list type).
+    let module_main = r#"arguments {
+  github_repo        : String
+  role_name          : String
+  managed_policy_arns: list(IamPolicyArn) = []
+  subject_patterns   : list(String)       = ["repo:${github_repo}:*"]
+}
+"#;
+    fs::write(module_dir.join("main.crn"), module_main).expect("Failed to write module main.crn");
+
+    // Main file uses the multi-line `use { ... }` form, exactly as the
+    // real infra writes it.
+    let main_content = r#"let github = use {
+  source = './modules/github-oidc'
+}
+
+let bootstrap = github {
+  gi
+}
+"#;
+    let doc = create_document(main_content);
+
+    // Cursor at end of `  gi` on line 5 (0-indexed).
+    let position = Position {
+        line: 5,
+        character: 4,
+    };
+
+    let completions = provider.complete(&doc, position, Some(base_path));
+
+    assert!(
+        !completions.is_empty(),
+        "Should have module parameter completions for multi-line `use {{ ... }}` block; \
+         got empty (the real-infra reproduction of #2423). \
+         Hint: `find_module_import_path` is line-by-line and won't find `source` on its own line."
+    );
+
+    let github_repo = completions.iter().find(|c| c.label == "github_repo");
+    assert!(
+        github_repo.is_some(),
+        "Should have github_repo parameter completion. Got: {:?}",
+        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+
+    let role_name = completions.iter().find(|c| c.label == "role_name");
+    assert!(
+        role_name.is_some(),
+        "Should have role_name parameter completion"
+    );
+
+    let subject_patterns = completions.iter().find(|c| c.label == "subject_patterns");
+    assert!(
+        subject_patterns.is_some(),
+        "Should have subject_patterns parameter completion (default value with list type)"
+    );
+}
+
+#[test]
 #[ignore = "requires provider schemas"]
 fn instance_tenancy_completion_for_aws_vpc() {
     let provider = test_provider();

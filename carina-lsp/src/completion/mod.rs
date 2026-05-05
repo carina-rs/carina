@@ -291,6 +291,24 @@ impl CompletionProvider {
                     module_name = Some(name.to_string());
                     resource_type.clear();
                 }
+            } else if brace_depth == 0
+                && trimmed.ends_with('{')
+                && let Some(name) = extract_let_module_call_name(trimmed)
+            {
+                // Named-binding module call: `let <binding> = <module-name> {`.
+                // The RHS is a bare identifier (not `use`, `upstream_state`, or
+                // a resource path), so this is a call into an imported module.
+                // Without this branch the line falls through both
+                // `extract_resource_type` (no schema match) and the anonymous
+                // module-call branch above (which excludes `let `), leaving
+                // `module_name` unset and the cursor classified as
+                // `InsideResourceBlock { resource_type: "" }` — which surfaces
+                // no candidates and lets VS Code fall back to word-based
+                // suggestions. See #2423.
+                module_name = Some(name);
+                resource_type.clear();
+                current_binding =
+                    crate::let_parse::parse_let_header(trimmed).map(|(n, _)| n.to_string());
             }
 
             // At brace_depth >= 1, detect nested block in two forms:
@@ -805,6 +823,42 @@ fn is_let_upstream_state_line(trimmed: &str) -> bool {
     // longer identifier like `upstream_states`.
     let next = rest.trim_start();
     next.starts_with('{') || next.is_empty()
+}
+
+/// If `trimmed` is a `let <binding> = <module-name> {` header (named-binding
+/// module call), return `<module-name>`. Otherwise return `None`.
+///
+/// Distinguished from the other `let` shapes:
+///   - `let x = use { ... }`         → handled by `is_let_use_line`
+///   - `let x = upstream_state { ... }` → handled by `is_let_upstream_state_line`
+///   - `let x = aws.ec2.Vpc { ... }` → handled by `extract_resource_type`
+///
+/// The RHS must be a bare ASCII identifier followed by `{` (with optional
+/// whitespace). Anything else — provider-prefixed paths, `read`, dotted
+/// expressions, function calls — is rejected so callers can rely on this
+/// only matching the module-call shape.
+fn extract_let_module_call_name(trimmed: &str) -> Option<String> {
+    let (_, rhs) = crate::let_parse::parse_let_header(trimmed)?;
+    let rhs = rhs.trim_end_matches('{').trim_end();
+    if rhs.is_empty() {
+        return None;
+    }
+    if !rhs.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    // Reject reserved RHS keywords that have their own shapes.
+    if rhs == "use" || rhs == "upstream_state" || rhs == "read" {
+        return None;
+    }
+    // First char must be an identifier-start (not a digit).
+    if !rhs
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+    {
+        return None;
+    }
+    Some(rhs.to_string())
 }
 
 fn is_let_use_line(trimmed: &str) -> bool {
