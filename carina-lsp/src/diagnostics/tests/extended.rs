@@ -3258,3 +3258,190 @@ fn check_unknown_functions_still_warns_when_truly_undefined() {
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+/// Build the multi-file fixture used by the #2445 sibling-binding tests.
+/// Layout:
+///   `<tmp>/network.crn`  — `let bar = awscc.ec2.Vpc { ... }`
+///   `<tmp>/providers.crn` — fake `provider awscc { ... }`
+///   `<tmp>/main.crn`     — `<main_text>`
+///
+/// Returns `(tempdir, base_path)`.
+fn sibling_resource_binding_fixture(main_text: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().to_path_buf();
+    std::fs::write(
+        base.join("network.crn"),
+        "let bar = awscc.ec2.Vpc {\n    cidr_block = \"10.0.0.0/16\"\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        base.join("providers.crn"),
+        "provider awscc {\n  source = 'x/y'\n  version = '0.1'\n  region = 'ap-northeast-1'\n}\n",
+    )
+    .unwrap();
+    std::fs::write(base.join("main.crn"), main_text).unwrap();
+    (tmp, base)
+}
+
+/// Issue #2445: when `let bar = X { ... }` lives in a sibling `.crn`
+/// (e.g. `network.crn`) and `attributes { foo = bar.cidr_block }` lives
+/// in `main.crn`, the LSP must NOT emit `Undefined resource 'bar'` —
+/// even when the directory-merged parse fails for unrelated reasons.
+///
+/// In the happy path (merged parse succeeds), the existing
+/// `BindingNameSet::from_parsed(merged)` already covers sibling
+/// bindings. The bug surfaces when `merged = None`: the buffer-only
+/// `extract_resource_bindings` fallback misses sibling-defined `bar`
+/// and the text-scan `check_undefined_references` redlines it as
+/// Unknown.
+///
+/// CLAUDE.md "Directory-scoped, never single-file": same shape as
+/// #2435 / #2442 / #2443 / #2446.
+#[test]
+fn check_attributes_blocks_skips_sibling_resource_binding() {
+    let main_text = "attributes {\n    foo = bar.cidr_block\n}\n";
+    let (_tmp, base) = sibling_resource_binding_fixture(main_text);
+
+    let engine = test_engine();
+    let doc = create_document(main_text);
+    let diagnostics = engine.analyze_with_filename(&doc, Some("main.crn"), Some(&base));
+
+    let undefined_resource = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Undefined resource") && d.message.contains("'bar'"));
+    assert!(
+        undefined_resource.is_none(),
+        "sibling-defined `let bar = ...` must not produce 'Undefined resource' diagnostic. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+/// The actual user-visible bug from #2445: when the directory parse
+/// fails for an unrelated reason (broken sibling), `merged = None`
+/// and the buffer-only fallback for `known_bindings` misses sibling-
+/// defined `bar`, redlining it as Unknown. Per-file resilient walk
+/// must keep sibling let-bindings visible.
+#[test]
+fn check_attributes_blocks_skips_sibling_resource_binding_even_when_merge_fails() {
+    let main_text = "attributes {\n    foo = bar.cidr_block\n}\n";
+    let (_tmp, base) = sibling_resource_binding_fixture(main_text);
+    // Deliberately broken sibling — half-typed `provider` block. This
+    // makes `parse_directory_with_overrides` return Err, so `merged`
+    // is None and the LSP must fall back to a per-file walk over
+    // siblings to keep `bar` visible.
+    std::fs::write(base.join("broken.crn"), "provider gcp { region = ").unwrap();
+
+    let engine = test_engine();
+    let doc = create_document(main_text);
+    let diagnostics = engine.analyze_with_filename(&doc, Some("main.crn"), Some(&base));
+
+    let undefined_resource = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Undefined resource") && d.message.contains("'bar'"));
+    assert!(
+        undefined_resource.is_none(),
+        "sibling-defined `bar` must not redline as Unknown when an *unrelated* sibling fails to parse. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+/// Coverage parity: when the merge fails, the fallback path must
+/// recognize non-`let`-shaped sibling bindings — `arguments`,
+/// `fn`, `import`, etc. — same as the merge-success
+/// `BindingNameSet::from_parsed` set. A regression that narrowed the
+/// fallback to `let X = ...` headers would phantom-redline arguments
+/// referenced from a sibling. Pins the round-2 coverage-parity gap.
+#[test]
+fn check_attributes_blocks_skips_sibling_argument_even_when_merge_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().to_path_buf();
+    // `vpc_id` is declared via an `arguments` block in a sibling — no
+    // `let` header. Only the per-file parse + `BindingNameSet`
+    // recognizes it as a binding.
+    std::fs::write(
+        base.join("inputs.crn"),
+        "arguments {\n    vpc_id: String\n}\n",
+    )
+    .unwrap();
+    // Force the directory parse to fail so the LSP must hit the
+    // (None, Some(base)) fallback arm.
+    std::fs::write(base.join("broken.crn"), "provider gcp { region = ").unwrap();
+    let main_text = "attributes {\n    foo = vpc_id\n}\n";
+    std::fs::write(base.join("main.crn"), main_text).unwrap();
+
+    let engine = test_engine();
+    let doc = create_document(main_text);
+    let diagnostics = engine.analyze_with_filename(&doc, Some("main.crn"), Some(&base));
+
+    let phantom_arg = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Undefined resource") && d.message.contains("vpc_id"));
+    assert!(
+        phantom_arg.is_none(),
+        "sibling-defined `arguments {{ vpc_id }}` must not redline as Unknown when an unrelated sibling fails to parse. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+/// Companion to the merge-fails case: even on the directory-aware
+/// fallback path, a *truly* unknown identifier must still produce the
+/// diagnostic. Pins the regression class where a future refactor
+/// returning an empty `known_bindings` set on the `(None, Some)` arm
+/// would silently let typos through.
+#[test]
+fn check_attributes_blocks_warns_when_truly_undefined_even_when_merge_fails() {
+    let main_text = "attributes {\n    foo = bar.cidr_block\n    bad = nope.cidr_block\n}\n";
+    let (_tmp, base) = sibling_resource_binding_fixture(main_text);
+    std::fs::write(base.join("broken.crn"), "provider gcp { region = ").unwrap();
+
+    let engine = test_engine();
+    let doc = create_document(main_text);
+    let diagnostics = engine.analyze_with_filename(&doc, Some("main.crn"), Some(&base));
+
+    let phantom_bar = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Undefined resource") && d.message.contains("'bar'"));
+    assert!(
+        phantom_bar.is_none(),
+        "sibling-defined `bar` must not redline. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    let undefined_nope = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Undefined resource") && d.message.contains("nope"));
+    assert!(
+        undefined_nope.is_some(),
+        "truly undefined `nope` must still produce 'Undefined resource' even on the merge-fails fallback. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+/// Companion: a *truly* unknown binding name in `attributes` must
+/// still produce the diagnostic.
+#[test]
+fn check_attributes_blocks_still_warns_when_truly_undefined() {
+    // `bar` is sibling-defined; `nope` is not declared anywhere.
+    let main_text = "attributes {\n    bad = nope.cidr_block\n}\n";
+    let (_tmp, base) = sibling_resource_binding_fixture(main_text);
+
+    let engine = test_engine();
+    let doc = create_document(main_text);
+    let diagnostics = engine.analyze_with_filename(&doc, Some("main.crn"), Some(&base));
+
+    let undefined_resource = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Undefined resource") && d.message.contains("nope"));
+    assert!(
+        undefined_resource.is_some(),
+        "genuinely undefined `nope.*` must still produce 'Undefined resource'. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    let phantom_bar = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Undefined resource") && d.message.contains("'bar'"));
+    assert!(
+        phantom_bar.is_none(),
+        "sibling-defined `bar` must NOT be reported even when another binding is truly unknown. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}

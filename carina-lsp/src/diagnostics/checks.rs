@@ -410,6 +410,51 @@ impl DiagnosticEngine {
         .ok()
     }
 
+    /// Collect every binding name declared anywhere in `base_path` by
+    /// parsing each sibling `.crn` independently. Used as a fallback
+    /// when the full directory parse fails (`parse_merged_with_buffer`
+    /// returns `None`). A per-file failure is non-fatal — that file's
+    /// declarations are skipped. The current document's text replaces
+    /// its on-disk copy so unsaved edits are honored.
+    ///
+    /// Mirrors the merge-success path's
+    /// `BindingNameSet::from_parsed`, so the same eight binding kinds
+    /// (resources, module-calls, upstream-states, arguments, uses,
+    /// user-functions, structural, variables) stay covered when the
+    /// merge fails. Without this, an unrelated parse error in one
+    /// sibling redlines every cross-file binding as Unknown (#2445).
+    pub(super) fn collect_sibling_binding_names(
+        &self,
+        buffer_text: &str,
+        current_file_name: Option<&str>,
+        base_path: &std::path::Path,
+    ) -> HashSet<String> {
+        let mut out: HashSet<String> = HashSet::new();
+        let Ok(files) = carina_core::config_loader::find_crn_files_in_dir(&base_path.to_path_buf())
+        else {
+            return out;
+        };
+        for file in files {
+            let file_name = file.file_name().and_then(|n| n.to_str());
+            let content = match (file_name, current_file_name) {
+                (Some(name), Some(current)) if name == current => buffer_text.to_string(),
+                _ => match std::fs::read_to_string(&file) {
+                    Ok(text) => text,
+                    Err(_) => continue,
+                },
+            };
+            let Ok(parsed) = carina_core::parser::parse(&content, &self.provider_context) else {
+                continue;
+            };
+            out.extend(
+                carina_core::binding_index::BindingNameSet::from_parsed(&parsed)
+                    .iter_names()
+                    .map(String::from),
+            );
+        }
+        out
+    }
+
     /// Reject references like `orgs.account` whose field isn't declared by
     /// the upstream's `exports { }` block.
     ///
