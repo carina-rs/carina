@@ -460,10 +460,20 @@ pub fn compute_anonymous_identifiers(
             format!("{:08x}", hasher.finish() & 0xFFFFFFFF)
         };
 
-        // Build identifier: resource_type_hash (e.g., ec2_vpc_a3f2b1c8). The
-        // resource_type segments carry PascalCase for the final type name
+        // Build identifier: provider_resource_type_hash (e.g., awscc_ec2_vpc_a3f2b1c8).
+        // The resource_type segments carry PascalCase for the final type name
         // (e.g., "ec2.Vpc"); identifier names are snake_case values per the
         // naming-conventions rule, so lower each segment before joining.
+        // The provider segment makes anonymous identifiers self-describe their
+        // provider so plan output and state files distinguish e.g.
+        // `aws.iam.RolePolicy` from `awscc.iam.RolePolicy` at a glance.
+        let provider_snake = resource
+            .id
+            .provider
+            .split('.')
+            .map(crate::parser::pascal_to_snake)
+            .collect::<Vec<_>>()
+            .join("_");
         let type_snake = resource
             .id
             .resource_type
@@ -471,7 +481,7 @@ pub fn compute_anonymous_identifiers(
             .map(crate::parser::pascal_to_snake)
             .collect::<Vec<_>>()
             .join("_");
-        let identifier = format!("{}_{}", type_snake, hash_str);
+        let identifier = format!("{}_{}_{}", provider_snake, type_snake, hash_str);
 
         computed.push((idx, identifier));
     }
@@ -520,11 +530,19 @@ pub struct AnonymousIdStateInfo {
 ///
 /// `find_state_by_type` takes (provider, resource_type) and returns all state
 /// entries for that resource type with their create-only attribute values.
+///
+/// Returns a list of `(old_state_name, new_resource_name)` pairs that the
+/// caller should apply to state-keyed maps. These are emitted when a SimHash
+/// match identifies a state entry under an older identifier format (e.g.
+/// `iam_role_policy_<hash>` from before the provider prefix was added) — the
+/// resource keeps its freshly-computed new-format name and the wiring layer
+/// re-keys the state entry instead of destroy+recreate.
 pub fn reconcile_anonymous_identifiers(
     resources: &mut [Resource],
     registry: &SchemaRegistry,
     find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
-) {
+) -> Vec<(String, String)> {
+    let mut renames: Vec<(String, String)> = Vec::new();
     for resource in resources.iter_mut() {
         if resource.id.name.is_pending() {
             continue;
@@ -583,12 +601,12 @@ pub fn reconcile_anonymous_identifiers(
                 }
             }
 
-            if let Some((name, _)) = best_match {
-                resource.id = ResourceId::with_provider(
-                    &resource.id.provider,
-                    &resource.id.resource_type,
-                    name,
-                );
+            if let Some((state_name, _)) = best_match {
+                // The state entry may use an older identifier format (e.g.
+                // pre-provider-prefix). Keep our freshly-computed new-format
+                // name on the resource and record a rename so the wiring
+                // layer can re-key the state entry.
+                renames.push((state_name.to_string(), resource.id.name_str().to_string()));
             }
             continue;
         }
@@ -632,6 +650,7 @@ pub fn reconcile_anonymous_identifiers(
             );
         }
     }
+    renames
 }
 
 /// Detect let-bound (named) resources that were previously anonymous.

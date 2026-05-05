@@ -657,7 +657,7 @@ pub(crate) async fn run_state_refresh_locked(
     }
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
-    if let Some(sf) = state_file.as_ref() {
+    if let Some(sf) = state_file.as_mut() {
         reconcile_anonymous_identifiers_with_ctx(&ctx, &mut parsed.resources, sf);
     }
     apply_name_overrides(&mut parsed.resources, &state_file);

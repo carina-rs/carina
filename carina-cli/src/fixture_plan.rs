@@ -58,7 +58,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     let base_dir = get_base_dir(&fixture_pathbuf);
     validate_and_resolve(&mut parsed, base_dir, true).unwrap();
 
-    let state_file: Option<StateFile> = if state_path.exists() {
+    let mut state_file: Option<StateFile> = if state_path.exists() {
         let json = std::fs::read_to_string(&state_path).unwrap();
         Some(serde_json::from_str(&json).unwrap())
     } else {
@@ -77,6 +77,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
                     .collect()
             },
         );
+    }
+    if let Some(sf) = state_file.as_mut() {
         reconcile_anonymous_identifiers_with_ctx(&wiring, &mut parsed.resources, sf);
     }
 

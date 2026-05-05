@@ -803,3 +803,22 @@ fn snapshot_deferred_for() {
     ));
     insta::assert_snapshot!(output);
 }
+
+#[test]
+fn snapshot_provider_prefix() {
+    // Regression guard for #2426 / #2431: anonymous resource identifiers
+    // gain a `<provider>_` prefix so plan output and state files
+    // self-describe their provider. The header line for the lone Vpc
+    // resource must read `+ awscc.ec2.Vpc awscc_ec2_vpc_<8hex>`.
+    let (plan, schemas, _moved) = build_plan_from_fixture("provider_prefix");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+    ));
+    insta::assert_snapshot!(output);
+}

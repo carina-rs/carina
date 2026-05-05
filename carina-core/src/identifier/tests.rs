@@ -394,7 +394,7 @@ fn test_anonymous_resource_no_create_only_properties() {
 
     // Should have computed an identifier
     assert!(!resources[0].id.name_str().is_empty());
-    assert!(resources[0].id.name_str().starts_with("ec2_eip_"));
+    assert!(resources[0].id.name_str().starts_with("awscc_ec2_eip_"));
 }
 
 #[test]
@@ -641,12 +641,18 @@ fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
         name: old_id.clone(),
         create_only_values: HashMap::new(),
     }];
-    reconcile_anonymous_identifiers(&mut resources2, &schemas, &|_provider, _rt| {
+    let renames = reconcile_anonymous_identifiers(&mut resources2, &schemas, &|_provider, _rt| {
         state_entries.clone()
     });
 
-    // After reconciliation, should have the old identifier (Hamming distance match)
-    assert_eq!(resources2[0].id.name_str(), old_id);
+    // After reconciliation: the resource keeps its freshly-computed
+    // (new) identifier and a rename pair is emitted so the wiring
+    // layer can re-key the state entry. Previous behavior (overwriting
+    // resource.id with the state's old name) was changed when the
+    // provider prefix was introduced — the rename path is now the
+    // only mechanism for legacy state name reuse.
+    assert_eq!(resources2[0].id.name_str(), new_id);
+    assert_eq!(renames, vec![(old_id.clone(), new_id.clone())]);
 }
 
 #[test]
@@ -704,7 +710,7 @@ fn test_reconcile_anonymous_id_create_only_exists_but_none_set() {
 
     // Should have computed an identifier (not errored)
     assert!(!resources[0].id.name_str().is_empty());
-    assert!(resources[0].id.name_str().starts_with("ec2_eip_"));
+    assert!(resources[0].id.name_str().starts_with("awscc_ec2_eip_"));
 
     // Reconciliation should use Hamming distance (create-only values empty)
     let current_id = resources[0].id.name_str().to_string();
@@ -915,25 +921,37 @@ fn test_reconcile_no_create_only_picks_closest_among_multiple_state_entries() {
         },
     ];
 
-    reconcile_anonymous_identifiers(&mut resources_current, &schemas, &|_provider, _rt| {
-        state_entries.clone()
-    });
+    let current_id_before = resources_current[0].id.name_str().to_string();
+    let renames =
+        reconcile_anonymous_identifiers(&mut resources_current, &schemas, &|_provider, _rt| {
+            state_entries.clone()
+        });
 
-    // Should match orig (closer: 1 attr changed) rather than distant (2 attrs changed)
-    // Note: This depends on SimHash producing closer hashes for more similar inputs.
-    // If the Hamming distance for both is below the threshold, the closest is picked.
-    let current_hash = extract_hash_from_identifier(resources_current[0].id.name_str()).unwrap();
+    // Resource keeps its freshly-computed identifier; the rename pair (if any)
+    // points from the closest state entry to the new identifier so the wiring
+    // layer can re-key the legacy state row.
+    assert_eq!(
+        resources_current[0].id.name_str(),
+        current_id_before,
+        "Resource should retain its freshly-computed identifier",
+    );
+
+    let current_hash = extract_hash_from_identifier(&current_id_before).unwrap();
     let orig_hash = extract_hash_from_identifier(&orig_id).unwrap();
     let distant_hash = extract_hash_from_identifier(&distant_id).unwrap();
     let dist_to_orig = (current_hash ^ orig_hash).count_ones();
     let dist_to_distant = (current_hash ^ distant_hash).count_ones();
 
-    if dist_to_orig < SIMHASH_HAMMING_THRESHOLD {
-        // If orig is within threshold, it should have been picked (as closest)
-        assert_eq!(resources_current[0].id.name_str(), orig_id);
+    if dist_to_orig < SIMHASH_HAMMING_THRESHOLD && dist_to_orig <= dist_to_distant {
+        // Orig is within threshold and at least as close as distant: rename pair
+        // should reference orig as the source name.
+        assert_eq!(
+            renames,
+            vec![(orig_id.clone(), current_id_before.clone())],
+            "Closest state entry (orig) should drive the rename pair",
+        );
     }
     if dist_to_orig < dist_to_distant {
-        // Orig should be closer than distant
         assert!(
             dist_to_orig < dist_to_distant,
             "1-attr change (dist={}) should be closer than 2-attr change (dist={})",
@@ -1085,8 +1103,8 @@ fn test_compute_anonymous_id_simhash_vs_create_only_hash_independent() {
     compute_anonymous_identifiers(&mut resources, &providers, &schemas, &identity_fn).unwrap();
 
     // Both should have identifiers computed
-    assert!(resources[0].id.name_str().starts_with("ec2_vpc_"));
-    assert!(resources[1].id.name_str().starts_with("ec2_eip_"));
+    assert!(resources[0].id.name_str().starts_with("awscc_ec2_vpc_"));
+    assert!(resources[1].id.name_str().starts_with("awscc_ec2_eip_"));
 
     // VPC uses standard hash (8 hex chars), EIP uses SimHash (16 hex chars)
     let vpc_hash_part = resources[0].id.name_str().rsplit('_').next().unwrap();
@@ -1420,15 +1438,23 @@ fn test_reconcile_eip_tag_update_with_unset_create_only_props() {
         name: step1_id.clone(),
         create_only_values: HashMap::new(), // No create-only values in state either
     }];
-    reconcile_anonymous_identifiers(&mut resources2, &schemas, &|_provider, _rt| {
+    let renames = reconcile_anonymous_identifiers(&mut resources2, &schemas, &|_provider, _rt| {
         state_entries.clone()
     });
 
-    // After reconciliation, step2 should have step1's identifier (in-place update)
+    // After reconciliation, step2 keeps its freshly-computed identifier
+    // and emits a rename pair so the wiring layer re-keys the state
+    // entry from step1's name to step2's name. This produces an
+    // in-place update on the same state row instead of delete+create.
     assert_eq!(
         resources2[0].id.name_str(),
-        step1_id,
-        "Tag-only change on EIP with unset create-only props should reconcile to same identifier"
+        step2_id,
+        "Resource should retain its freshly-computed identifier"
+    );
+    assert_eq!(
+        renames,
+        vec![(step1_id.clone(), step2_id.clone())],
+        "Reconcile should emit rename pair for re-keying the state entry"
     );
 }
 
@@ -1701,7 +1727,7 @@ fn test_detect_rename_no_create_only_matches_by_simhash() {
     compute_anonymous_identifiers(&mut anon_vec, &providers, &schemas, &identity_fn).unwrap();
     let anonymous_name = anon_vec[0].id.name_str().to_string();
     assert!(
-        anonymous_name.starts_with("sso_instance_"),
+        anonymous_name.starts_with("awscc_sso_instance_"),
         "expected hash-derived name, got {anonymous_name}"
     );
 
@@ -1921,5 +1947,122 @@ fn test_detect_rename_no_create_only_skips_when_two_orphans_tie_on_distance() {
         renames.is_empty(),
         "two orphans tie on distance, should skip to avoid rebinding wrong entry: {:?}",
         renames
+    );
+}
+
+#[test]
+fn anonymous_identifier_includes_provider_prefix() {
+    let schema = ResourceSchema::new("iam.RolePolicy")
+        .attribute(AttributeSchema::new("policy_name", AttributeType::String));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
+    let providers = vec![ProviderConfig {
+        name: "awscc".to_string(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+        source: None,
+        version: None,
+        revision: None,
+    }];
+    let identity_fn = |_: &str| -> Vec<String> { vec![] };
+
+    let mut r = Resource::with_provider("awscc", "iam.RolePolicy", "");
+    r.set_attr("policy_name".to_string(), Value::String("foo".to_string()));
+    let mut resources = vec![r];
+    compute_anonymous_identifiers(&mut resources, &providers, &schemas, &identity_fn).unwrap();
+
+    let name = resources[0].id.name_str();
+    assert!(
+        name.starts_with("awscc_"),
+        "identifier should begin with the provider prefix, got: {name}"
+    );
+    assert!(
+        name.contains("iam_role_policy_"),
+        "identifier should still contain the snake-case type, got: {name}"
+    );
+}
+
+#[test]
+fn anonymous_identifier_provider_prefix_for_aws_provider() {
+    let schema = ResourceSchema::new("s3.Bucket")
+        .attribute(AttributeSchema::new("bucket_name", AttributeType::String));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("aws", schema);
+    let providers = vec![ProviderConfig {
+        name: "aws".to_string(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+        source: None,
+        version: None,
+        revision: None,
+    }];
+    let identity_fn = |_: &str| -> Vec<String> { vec![] };
+
+    let mut r = Resource::with_provider("aws", "s3.Bucket", "");
+    r.set_attr(
+        "bucket_name".to_string(),
+        Value::String("example".to_string()),
+    );
+    let mut resources = vec![r];
+    compute_anonymous_identifiers(&mut resources, &providers, &schemas, &identity_fn).unwrap();
+    assert!(
+        resources[0].id.name_str().starts_with("aws_s3_bucket_"),
+        "identifier should begin with `aws_s3_bucket_`, got: {}",
+        resources[0].id.name_str()
+    );
+}
+
+#[test]
+fn reconcile_simhash_match_keeps_new_format_identifier_and_emits_rename() {
+    // Schema with NO create-only attrs forces the SimHash-distance branch.
+    let schema = ResourceSchema::new("iam.RolePolicy")
+        .attribute(AttributeSchema::new("policy_name", AttributeType::String));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
+    let providers = vec![ProviderConfig {
+        name: "awscc".to_string(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+        source: None,
+        version: None,
+        revision: None,
+    }];
+    let identity_fn = |_: &str| -> Vec<String> { vec![] };
+
+    // Build a resource and let compute_anonymous_identifiers assign its
+    // freshly-computed new-format name.
+    let mut r = Resource::with_provider("awscc", "iam.RolePolicy", "");
+    r.set_attr(
+        "policy_name".to_string(),
+        Value::String("inline".to_string()),
+    );
+    let mut resources = vec![r];
+    compute_anonymous_identifiers(&mut resources, &providers, &schemas, &identity_fn).unwrap();
+    let new_name = resources[0].id.name_str().to_string();
+    assert!(new_name.starts_with("awscc_iam_role_policy_"));
+
+    // Strip the provider prefix to simulate a state entry written under the
+    // older identifier format.
+    let old_name = new_name
+        .strip_prefix("awscc_")
+        .expect("new format starts with awscc_ prefix")
+        .to_string();
+    let state_entries = vec![AnonymousIdStateInfo {
+        name: old_name.clone(),
+        create_only_values: HashMap::new(),
+    }];
+
+    let renames =
+        reconcile_anonymous_identifiers(&mut resources, &schemas, &|_p, _rt| state_entries.clone());
+
+    assert_eq!(
+        resources[0].id.name_str(),
+        new_name,
+        "resource id should retain the new-format identifier",
+    );
+    assert_eq!(
+        renames,
+        vec![(old_name, new_name)],
+        "should emit a rename pair from the old state name to the new identifier",
     );
 }
