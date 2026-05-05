@@ -69,22 +69,22 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
                                 providers.push(provider);
                             }
                             Rule::arguments_block => {
-                                let parsed_arguments =
-                                    parse_arguments_block(stmt, config, &mut ctx.warnings)?;
-                                for arg in &parsed_arguments {
-                                    // Register argument names as lexical bindings so that
-                                    // `vpc.vpc_id` resolves as ResourceRef and `cidr_block`
-                                    // resolves as a variable reference during parsing.
-                                    // No `arguments.` prefix needed.
-                                    let placeholder_ref = Value::resource_ref(
-                                        arg.name.clone(),
-                                        String::new(),
-                                        vec![],
+                                // `parse_arguments_block` registers each argument as a
+                                // lexical binding inside `ctx` as it is parsed, so a
+                                // later argument's default expression can reference
+                                // earlier arguments (#2393).
+                                let parsed_arguments = {
+                                    let warnings = std::mem::take(&mut ctx.warnings);
+                                    let mut warnings = warnings;
+                                    let result = parse_arguments_block(
+                                        stmt,
+                                        config,
+                                        &mut ctx,
+                                        &mut warnings,
                                     );
-                                    ctx.set_variable(arg.name.clone(), placeholder_ref);
-                                    let placeholder = Resource::new("_argument", &arg.name);
-                                    ctx.set_resource_binding(arg.name.clone(), placeholder);
-                                }
+                                    ctx.warnings = warnings;
+                                    result?
+                                };
                                 arguments.extend(parsed_arguments);
                             }
                             Rule::attributes_block => {
