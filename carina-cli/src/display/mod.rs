@@ -878,6 +878,15 @@ fn color_atom_dimmed(rendered: &str) -> String {
 /// - Lists (`[...]`) → each element colored individually
 /// - Maps (`{...}`) → each value colored individually
 fn colored_value(rendered: &str, ref_binding: bool) -> String {
+    // Multi-line input from `format_value_pretty`'s vertical layout
+    // (`format_list_of_scalars_vertical` / `format_map_vertical`). The inline
+    // `starts_with('[') && ends_with(']')` branch below would `split_top_level`
+    // the body and re-`join(", ")` it, collapsing the layout back to inline.
+    // Color atoms in place and preserve newlines + leading indentation +
+    // structural punctuation (`[`, `]`, `{`, `}`, `,`) verbatim instead.
+    if rendered.contains('\n') {
+        return color_lines(rendered, ref_binding);
+    }
     // List: color each element individually
     if rendered.starts_with('[') && rendered.ends_with(']') {
         let inner = &rendered[1..rendered.len() - 1];
@@ -913,6 +922,47 @@ fn colored_value(rendered: &str, ref_binding: bool) -> String {
         return format!("{{{}}}", colored_entries.join(", "));
     }
     color_atom(rendered, ref_binding)
+}
+
+/// Color a multi-line `format_value_pretty` payload while preserving its
+/// vertical layout. For each line, separate leading whitespace and a trailing
+/// `,`, then color the middle. Atoms that look like list items (`"x"`, `42`)
+/// or `key: value` map entries get atom-coloring; structural lines like `[`,
+/// `]`, `{`, `}` fall through `color_atom` unchanged.
+fn color_lines(rendered: &str, ref_binding: bool) -> String {
+    let mut out = String::with_capacity(rendered.len());
+    for (i, line) in rendered.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let indent_end = line
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(line.len());
+        let (indent, body) = line.split_at(indent_end);
+        out.push_str(indent);
+        if body.is_empty() {
+            continue;
+        }
+        let (core, trailing_comma) = if let Some(stripped) = body.strip_suffix(',') {
+            (stripped, ",")
+        } else {
+            (body, "")
+        };
+        // Split `key: value` to color only the value half. Safe because keys
+        // emitted by `format_map_vertical` are bare attribute names (never
+        // quoted strings that could contain `": "`).
+        if let Some(colon_pos) = core.find(": ") {
+            let key = &core[..colon_pos];
+            let val = &core[colon_pos + 2..];
+            out.push_str(key);
+            out.push_str(": ");
+            out.push_str(&color_atom(val, ref_binding));
+        } else {
+            out.push_str(&color_atom(core, ref_binding));
+        }
+        out.push_str(trailing_comma);
+    }
+    out
 }
 
 /// Apply type-based coloring to a value, with dimmed modifier for default values.
