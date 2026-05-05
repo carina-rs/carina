@@ -7899,3 +7899,237 @@ fn parse_subscript_on_upstream_state_inside_string_interpolation_sibling_file() 
         other => panic!("expected Value::Interpolation, got {other:?}"),
     }
 }
+
+// ================================================================
+// #2444: eager user-fn eval errors on sibling-file fn with static args
+// ================================================================
+
+/// Build the multi-file fixture used by the #2444 sibling-fn tests.
+/// Layout: `helpers.crn` defines `fn timestamp() { "2026-05-05" }`;
+/// `main.crn` carries a `provider test` block plus a resource whose
+/// `created_at` attribute is the `call_text` argument.
+fn sibling_user_fn_fixture(call_text: &str) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("helpers.crn"),
+        r#"
+            fn timestamp() {
+                "2026-05-05"
+            }
+        "#,
+    )
+    .unwrap();
+    let main = format!(
+        r#"
+            provider test {{
+                source = "x/y"
+                version = "0.1"
+                region = "ap-northeast-1"
+            }}
+
+            test.r.res {{
+                name = "x"
+                created_at = {call_text}
+            }}
+        "#
+    );
+    std::fs::write(tmp.path().join("main.crn"), main).unwrap();
+    tmp
+}
+
+#[test]
+fn parse_directory_resolves_sibling_user_fn_with_static_args() {
+    use crate::config_loader::parse_directory;
+    let tmp = sibling_user_fn_fixture("timestamp()");
+
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
+        .expect("sibling-file user-fn with static args must parse");
+    let res = parsed
+        .resources
+        .iter()
+        .find(|r| r.attributes.contains_key("created_at"))
+        .expect("resource present");
+    let v = res.attributes.get("created_at").unwrap();
+    match v {
+        Value::String(s) if s == "2026-05-05" => {}
+        Value::FunctionCall { name, .. } if name == "timestamp" => {}
+        other => panic!(
+            "expected timestamp() to resolve to a String or be kept as FunctionCall, got {other:?}"
+        ),
+    }
+}
+
+#[test]
+fn parse_directory_truly_undefined_fn_with_static_args_still_errors() {
+    use crate::config_loader::parse_directory;
+    let tmp = sibling_user_fn_fixture("no_such_fn()");
+
+    let result = parse_directory(tmp.path(), &ProviderContext::default());
+    assert!(
+        result.is_err(),
+        "directory parse must error when calling a fn that exists nowhere in the directory"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("no_such_fn"),
+        "error should name the unknown function `no_such_fn`, got: {err}"
+    );
+}
+
+/// Issue #2444's exact reproduction: top-level `let v = X()` where
+/// `fn X(...)` lives in a sibling.
+#[test]
+fn parse_directory_resolves_sibling_user_fn_in_top_level_let() {
+    use crate::config_loader::parse_directory;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("helpers.crn"),
+        r#"
+            fn timestamp() {
+                "2026-05-05"
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("main.crn"),
+        r#"
+            let v = timestamp()
+        "#,
+    )
+    .unwrap();
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
+        .expect("top-level `let` calling a sibling user-fn must parse");
+    let v = parsed
+        .variables
+        .get("v")
+        .expect("variable `v` should be present");
+    assert!(
+        matches!(v, Value::String(s) if s == "2026-05-05"),
+        "expected `v` to resolve to the user-fn body, got: {v:?}"
+    );
+}
+
+#[test]
+fn parse_directory_truly_undefined_fn_in_top_level_let_still_errors() {
+    use crate::config_loader::parse_directory;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("helpers.crn"),
+        r#"
+            fn timestamp() {
+                "2026-05-05"
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("main.crn"),
+        r#"
+            let v = no_such_fn()
+        "#,
+    )
+    .unwrap();
+    let result = parse_directory(tmp.path(), &ProviderContext::default());
+    assert!(
+        result.is_err(),
+        "top-level `let v = no_such_fn()` must error when no `fn no_such_fn` exists in the directory"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("no_such_fn"),
+        "error should name the unknown function `no_such_fn`, got: {err}"
+    );
+}
+
+/// Container shapes (List/Map/Interpolation) at the top-level `let`
+/// position must also resolve sibling user-fn placeholders. Round 3
+/// found the narrowed walk skipped containers entirely — adding
+/// `resolve_function_calls_only` recurses through them.
+#[test]
+fn parse_directory_resolves_sibling_user_fn_in_let_list() {
+    use crate::config_loader::parse_directory;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("helpers.crn"), "fn ts() { \"2026\" }\n").unwrap();
+    std::fs::write(tmp.path().join("main.crn"), "let xs = [ts(), \"static\"]\n").unwrap();
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
+        .expect("List containing sibling user-fn must parse");
+    let v = parsed.variables.get("xs").expect("xs present");
+    match v {
+        Value::List(items) => {
+            assert_eq!(items.len(), 2);
+            assert!(
+                matches!(&items[0], Value::String(s) if s == "2026"),
+                "first item should resolve to user-fn body, got: {:?}",
+                items[0]
+            );
+        }
+        other => panic!("expected Value::List, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_directory_resolves_sibling_user_fn_in_let_map() {
+    use crate::config_loader::parse_directory;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("helpers.crn"), "fn ts() { \"2026\" }\n").unwrap();
+    std::fs::write(
+        tmp.path().join("main.crn"),
+        "let m = { created_at = ts() }\n",
+    )
+    .unwrap();
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
+        .expect("Map containing sibling user-fn must parse");
+    let v = parsed.variables.get("m").expect("m present");
+    match v {
+        Value::Map(map) => {
+            let entry = map.get("created_at").expect("created_at key");
+            assert!(
+                matches!(entry, Value::String(s) if s == "2026"),
+                "map value should resolve to user-fn body, got: {entry:?}"
+            );
+        }
+        other => panic!("expected Value::Map, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_directory_resolves_sibling_user_fn_in_let_interpolation() {
+    use crate::config_loader::parse_directory;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("helpers.crn"), "fn ts() { \"2026\" }\n").unwrap();
+    std::fs::write(
+        tmp.path().join("main.crn"),
+        "let s = \"prefix-${ts()}-suffix\"\n",
+    )
+    .unwrap();
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
+        .expect("Interpolation containing sibling user-fn must parse");
+    let v = parsed.variables.get("s").expect("s present");
+    assert!(
+        matches!(v, Value::String(s) if s == "prefix-2026-suffix"),
+        "interpolation should canonicalize to the joined string, got: {v:?}"
+    );
+}
+
+#[test]
+fn parse_directory_truly_undefined_fn_in_let_list_still_errors() {
+    use crate::config_loader::parse_directory;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("helpers.crn"), "fn ts() { \"2026\" }\n").unwrap();
+    std::fs::write(
+        tmp.path().join("main.crn"),
+        "let xs = [no_such_fn(), \"static\"]\n",
+    )
+    .unwrap();
+    let result = parse_directory(tmp.path(), &ProviderContext::default());
+    assert!(
+        result.is_err(),
+        "List containing a truly-undefined fn must error"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("no_such_fn"),
+        "error should name the unknown fn, got: {err}"
+    );
+}

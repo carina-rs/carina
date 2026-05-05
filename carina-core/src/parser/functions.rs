@@ -5,7 +5,6 @@
 use super::ast::{FnParam, TypeExpr, UserFunction, UserFunctionBody};
 use super::context::{ParseContext, next_pair};
 use super::error::{ParseError, ParseWarning};
-use super::static_eval::is_static_value;
 use super::types::parse_type_expr;
 use super::util::{pascal_to_snake, value_type_name};
 use super::{ProviderContext, Rule, parse_expression};
@@ -551,22 +550,20 @@ fn try_evaluate_fn_value(value: Value, ctx: &ParseContext) -> Result<Value, Pars
                         ),
                     }),
                 Err(_builtin_err) => {
-                    // Try user-defined function
+                    // Try user-defined function declared in *this* file.
                     if let Some(user_fn) = ctx.user_functions.get(name) {
                         evaluate_user_function(user_fn, &evaluated_args, ctx)
                     } else {
-                        // Keep as FunctionCall (may contain unresolved refs)
-                        if evaluated_args.iter().all(is_static_value) {
-                            Err(ParseError::InvalidExpression {
-                                line: 0,
-                                message: format!("Unknown function: {name}"),
-                            })
-                        } else {
-                            Ok(Value::FunctionCall {
-                                name: name.clone(),
-                                args: evaluated_args,
-                            })
-                        }
+                        // Defer the call — the user-fn may live in a
+                        // sibling `.crn` and only become visible after
+                        // `merge_parsed_file` (#2444). Truly-undefined
+                        // names are caught at the post-merge resolver
+                        // pass (`resolve_value_with_config`), which has
+                        // the full directory's `user_functions`.
+                        Ok(Value::FunctionCall {
+                            name: name.clone(),
+                            args: evaluated_args,
+                        })
                     }
                 }
             }
