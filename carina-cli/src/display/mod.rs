@@ -989,12 +989,14 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
             }
         }
         DetailRow::PrettyAttribute { key, value } => {
-            // The value starts at the column after `<attr_prefix><key>: `.
             // attr_prefix may contain the tree glyph `│` (U+2502, 1 column
             // wide but 3 bytes in UTF-8), so use `chars().count()` for column
             // count, not `.len()`.
-            let indent_cols = attr_prefix.chars().count() + key.chars().count() + 2;
-            let pretty = format_value_pretty(value, indent_cols);
+            let layout = carina_core::value::PrettyLayout {
+                parent_indent_cols: attr_prefix.chars().count(),
+                key,
+            };
+            let pretty = format_value_pretty(value, layout);
             let cv = match effect {
                 Effect::Delete { .. } => pretty.red().strikethrough().to_string(),
                 _ => colored_value(&pretty, false),
