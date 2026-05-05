@@ -1321,3 +1321,58 @@ fn colored_value_empty_list() {
 fn colored_value_empty_map() {
     assert_eq!(colored_value("{}", false), "{}");
 }
+
+/// Strip ANSI SGR (color) escape sequences for assertion purposes.
+/// Matches the helper used by `plan_snapshot_tests.rs` and
+/// `module_info_snapshot_tests.rs` (both call sites use this same regex).
+fn strip_ansi(s: &str) -> String {
+    let re = regex_lite::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
+    re.replace_all(s, "").to_string()
+}
+
+#[test]
+fn colored_value_preserves_vertical_list_layout() {
+    // `format_value_pretty` emits a multi-line bracketed form for lists that
+    // exceed the 80-col threshold. `colored_value` must NOT collapse the
+    // layout back to inline — it should color atoms in place and keep
+    // newlines / leading indentation intact.
+    let input = "[\n  \"a\",\n  \"b\",\n  \"c\",\n]";
+    let result = colored_value(input, false);
+    let stripped = strip_ansi(&result);
+    assert_eq!(
+        stripped, input,
+        "vertical layout (newlines, indent, trailing comma, closing bracket) must be preserved verbatim",
+    );
+    let green_a = "\"a\"".green().to_string();
+    assert!(
+        result.contains(&green_a),
+        "string atoms inside the vertical list should still be colored: {result:?}",
+    );
+}
+
+#[test]
+fn colored_value_preserves_vertical_list_closing_bracket_alone() {
+    // The closing `]` sits on its own line, indented to the parent. This is
+    // the most layout-fragile token — earlier impls collapsed it into the
+    // previous line as `,]`. Pin its standalone-line preservation explicitly.
+    let input = "[\n  \"x\",\n]";
+    let result = colored_value(input, false);
+    let stripped = strip_ansi(&result);
+    assert_eq!(stripped, input);
+    assert!(
+        stripped.ends_with("\n]"),
+        "closing bracket must remain on its own line, got: {stripped:?}",
+    );
+}
+
+#[test]
+fn colored_value_preserves_vertical_map_layout() {
+    // Same constraint for `format_map_vertical` output.
+    let input = "\n  k1: \"v1\"\n  k2: 42";
+    let result = colored_value(input, false);
+    let stripped = strip_ansi(&result);
+    assert_eq!(
+        stripped, input,
+        "vertical map layout must be preserved verbatim, got: {result:?}",
+    );
+}
