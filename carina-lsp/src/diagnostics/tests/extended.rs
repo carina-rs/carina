@@ -3175,3 +3175,86 @@ fn exports_type_check_resolves_resource_binding_from_sibling_file() {
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+/// Build the multi-file fixture used by the #2442 sibling-fn tests.
+/// Layout:
+///   `<tmp>/helpers.crn`   — `fn double(x: Int) { x }`
+///   `<tmp>/providers.crn` — fake `provider test { ... }`
+///   `<tmp>/main.crn`      — `<main_text>`
+///
+/// Returns `(tempdir, base_path)`.
+fn sibling_user_fn_fixture(main_text: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().to_path_buf();
+    std::fs::write(base.join("helpers.crn"), "fn double(x: Int) {\n    x\n}\n").unwrap();
+    std::fs::write(
+        base.join("providers.crn"),
+        "provider test {\n  source = 'x/y'\n  version = '0.1'\n  region = 'ap-northeast-1'\n}\n",
+    )
+    .unwrap();
+    std::fs::write(base.join("main.crn"), main_text).unwrap();
+    (tmp, base)
+}
+
+/// Issue #2442: when `fn X(...) { ... }` lives in a sibling `.crn`
+/// (e.g. `helpers.crn`) and a consumer in `main.crn` calls `X(...)`,
+/// `check_unknown_functions` must NOT emit `Unknown function 'X'`.
+/// The check previously consulted only `builtins::is_known_builtin`;
+/// the fix threads the merged-directory `user_functions` through.
+/// CLAUDE.md "Directory-scoped, never single-file": same shape as
+/// #2435 / PR #2120 / PR #2118.
+#[test]
+fn check_unknown_functions_skips_sibling_user_fn() {
+    let main_text = "test.r.res {\n    name = \"x\"\n    val = double(2)\n}\n";
+    let (_tmp, base) = sibling_user_fn_fixture(main_text);
+
+    let engine = test_engine();
+    let doc = create_document(main_text);
+    let diagnostics = engine.analyze_with_filename(&doc, Some("main.crn"), Some(&base));
+
+    let unknown_fn = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Unknown function 'double'"));
+    assert!(
+        unknown_fn.is_none(),
+        "sibling-file `fn double(...)` must not produce 'Unknown function' diagnostic. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+/// Companion: a *truly* unknown function name in the consumer must
+/// still produce the diagnostic. Wrap inside another (deferred) call
+/// so the per-file parser keeps the FunctionCall placeholder rather
+/// than rejecting it outright at parse time.
+///
+/// Also pins the round-2 regression class: even when the directory
+/// parse fails (because of the truly-undefined call), sibling-defined
+/// `fn double(...)` must NOT be redlined. Without the per-file
+/// fallback walk, the `merged = None` path would fall back to the
+/// buffer's empty `parsed.user_functions` and report `double` too.
+#[test]
+fn check_unknown_functions_still_warns_when_truly_undefined() {
+    let main_text = "test.r.res {\n    name = \"x\"\n    val = triple(double(2))\n}\n";
+    let (_tmp, base) = sibling_user_fn_fixture(main_text);
+
+    let engine = test_engine();
+    let doc = create_document(main_text);
+    let diagnostics = engine.analyze_with_filename(&doc, Some("main.crn"), Some(&base));
+
+    let unknown_fn = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Unknown function 'triple'"));
+    assert!(
+        unknown_fn.is_some(),
+        "genuinely undefined `triple(...)` must still produce 'Unknown function'. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    let phantom_double = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Unknown function 'double'"));
+    assert!(
+        phantom_double.is_none(),
+        "sibling-defined `fn double(...)` must NOT be reported even when the directory parse fails. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
