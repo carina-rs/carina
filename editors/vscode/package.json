@@ -50,7 +50,8 @@
   },
   "scripts": {
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "watch": "tsc -watch -p ./",
+    "package": "npm install && npm run compile && npx --yes @vscode/vsce package"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
