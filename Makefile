@@ -120,6 +120,8 @@ plan-fixtures:
 	@echo "---"
 	@$(MAKE) plan-upstream-state-empty-exports
 	@echo "---"
+	@$(MAKE) plan-upstream-state-map-subscript
+	@echo "---"
 	@$(MAKE) plan-deferred-for
 
 plan-upstream-state:
@@ -128,6 +130,8 @@ plan-upstream-state-unresolved:
 	$(PLAN_FIXTURE) upstream_state_unresolved
 plan-upstream-state-empty-exports:
 	$(PLAN_FIXTURE) upstream_state_empty_exports
+plan-upstream-state-map-subscript:
+	$(PLAN_FIXTURE) upstream_state_map_subscript
 plan-deferred-for:
 	$(PLAN_FIXTURE) deferred_for
 plan-exports:
@@ -139,6 +143,7 @@ plan-exports-multifile:
         plan-default-values plan-explicit plan-default-tags \
         plan-state-blocks plan-secret-values plan-moved-with-changes plan-moved-prev-keys plan-moved-pure \
         plan-upstream-state plan-upstream-state-unresolved plan-upstream-state-empty-exports \
+        plan-upstream-state-map-subscript \
         plan-deferred-for plan-exports plan-exports-multifile \
         plan-map-diff-tui plan-all-create-tui plan-mixed-tui plan-delete-tui \
         plan-moved-with-changes-tui plan-moved-pure-tui plan-fixtures

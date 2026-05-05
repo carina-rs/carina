@@ -59,26 +59,29 @@ fn parse_namespaced_id_value(
         full_str
     );
 
-    if ctx.is_resource_binding(parts[0]) {
-        let attribute = parts[1].to_string();
-        let field_path = parts[2..].iter().map(|s| s.to_string()).collect();
+    let as_resource_ref = |subscripts: Vec<Subscript>| {
         let path = AccessPath::with_fields_and_subscripts(
             parts[0].to_string(),
-            attribute,
-            field_path,
+            parts[1].to_string(),
+            parts[2..].iter().map(|s| s.to_string()).collect(),
             subscripts,
         );
-        return Ok(EvalValue::from_value(Value::ResourceRef { path }));
+        EvalValue::from_value(Value::ResourceRef { path })
+    };
+
+    if ctx.is_resource_binding(parts[0]) {
+        return Ok(as_resource_ref(subscripts));
     }
 
+    // Subscripts (`a.b['k']`, `a.b[0]`) unambiguously mean binding
+    // access — no enum shorthand uses `[...]`. So when the head is not
+    // yet known as a resource binding in this file, emit a structured
+    // `ResourceRef` anyway and let cross-file resolution / scope checks
+    // either confirm the binding (e.g. an `upstream_state` declared in
+    // a sibling `.crn`) or surface an undefined-identifier diagnostic
+    // post-merge. Issue #2435.
     if !subscripts.is_empty() {
-        return Err(ParseError::InvalidExpression {
-            line: 0,
-            message: format!(
-                "cannot subscript `{}` — it is not a known resource binding",
-                full_str
-            ),
-        });
+        return Ok(as_resource_ref(subscripts));
     }
 
     if parts.len() == 2

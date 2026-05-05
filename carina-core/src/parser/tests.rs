@@ -7769,3 +7769,133 @@ fn inferred_file_holds_inferred_export_param() {
     };
     assert_eq!(f.export_params[0].type_expr, TypeExpr::String);
 }
+
+// ================================================================
+// #2435: upstream_state map subscript across sibling files
+//
+// In the real reproduction the `let X = upstream_state {...}` lives in
+// one .crn file and the consuming `${X.field['key']}` lives in a sibling
+// .crn — typical multi-file directory shape (CLAUDE.md "Directory-scoped,
+// never single-file"). The single-file path was already covered by
+// #2318's tests; the cross-file path was rejected at parse time with
+// "cannot subscript ... not a known resource binding" because the
+// per-file ParseContext did not yet know about the upstream binding.
+// ================================================================
+
+#[test]
+fn parse_subscript_on_upstream_state_in_sibling_file() {
+    use crate::config_loader::parse_directory;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("state.crn"),
+        r#"
+            let orgs = upstream_state { source = "../organizations" }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("main.crn"),
+        r#"
+            provider test {
+                source = "x/y"
+                version = "0.1"
+                region = "ap-northeast-1"
+            }
+
+            test.r.res {
+                name = "x"
+                account_id = orgs.accounts["registry_dev"]
+            }
+        "#,
+    )
+    .unwrap();
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
+        .expect("cross-file upstream subscript must parse");
+    let res = parsed
+        .resources
+        .iter()
+        .find(|r| r.attributes.contains_key("account_id"))
+        .expect("resource present");
+    let v = res.attributes.get("account_id").unwrap();
+    match v {
+        Value::ResourceRef { path } => {
+            assert_eq!(path.binding(), "orgs");
+            assert_eq!(path.attribute(), "accounts");
+            assert!(path.field_path().is_empty());
+            assert_eq!(
+                path.subscripts(),
+                [crate::resource::Subscript::Str {
+                    key: "registry_dev".to_string()
+                }]
+            );
+        }
+        other => panic!("expected ResourceRef with map subscript, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_subscript_on_upstream_state_inside_string_interpolation_sibling_file() {
+    // `"prefix${orgs.accounts['registry_dev']}suffix"` inside an
+    // interpolation must lower the same as the bare attribute case.
+    // Issue #2435 try-2 (subscript) needs to work both as a direct
+    // attribute value and embedded in `${...}` so policy-document
+    // strings like `"arn:aws:iam::${orgs.accounts['x']}:root"` resolve.
+    use crate::config_loader::parse_directory;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("state.crn"),
+        r#"
+            let orgs = upstream_state { source = "../organizations" }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("main.crn"),
+        r#"
+            provider test {
+                source = "x/y"
+                version = "0.1"
+                region = "ap-northeast-1"
+            }
+
+            test.r.res {
+                name = "x"
+                arn = "arn:aws:iam::${orgs.accounts['registry_dev']}:root"
+            }
+        "#,
+    )
+    .unwrap();
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
+        .expect("cross-file upstream subscript inside ${...} must parse");
+    let res = parsed
+        .resources
+        .iter()
+        .find(|r| r.attributes.contains_key("arn"))
+        .expect("resource present");
+    let v = res.attributes.get("arn").unwrap();
+    match v {
+        Value::Interpolation(parts) => {
+            // The middle Expr part should be the upstream ResourceRef
+            // with a string subscript.
+            let mut found_ref = false;
+            for p in parts {
+                if let InterpolationPart::Expr(Value::ResourceRef { path }) = p {
+                    assert_eq!(path.binding(), "orgs");
+                    assert_eq!(path.attribute(), "accounts");
+                    assert_eq!(
+                        path.subscripts(),
+                        [crate::resource::Subscript::Str {
+                            key: "registry_dev".to_string()
+                        }]
+                    );
+                    found_ref = true;
+                }
+            }
+            assert!(
+                found_ref,
+                "expected a ResourceRef expression part in the interpolation, got {parts:?}"
+            );
+        }
+        other => panic!("expected Value::Interpolation, got {other:?}"),
+    }
+}

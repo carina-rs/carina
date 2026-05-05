@@ -1,0 +1,8 @@
+backend local { path = "carina.state.json" }
+
+exports {
+  accounts: map(String) = {
+    registry_prod = "111111111111"
+    registry_dev  = "222222222222"
+  }
+}

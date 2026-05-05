@@ -579,6 +579,49 @@ fn plan_snapshot_upstream_state_empty_exports() {
     insta::assert_snapshot!(stripped);
 }
 
+/// Issue #2435: `let X = upstream_state {...}` lives in `state.crn`,
+/// the consuming `${X.field['key']}` and bare `X.field['key']` live in
+/// `main.crn`. The plan must resolve both forms to the concrete value
+/// from the upstream's exports map.
+#[test]
+fn plan_snapshot_upstream_state_map_subscript() {
+    let (plan, schemas, moved_origins) = build_plan_from_fixture("upstream_state_map_subscript");
+    let output = format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &moved_origins,
+        &[],
+        &[],
+    );
+    let stripped = strip_ansi(&output);
+    // Both subscript forms — bare attribute value and inside `${...}`
+    // interpolation — must end up substituted with the actual account ids.
+    assert!(
+        stripped.contains("222222222222"),
+        "expected dev account id substituted, got:\n{stripped}"
+    );
+    assert!(
+        stripped.contains("111111111111"),
+        "expected prod account id substituted, got:\n{stripped}"
+    );
+    assert!(
+        stripped.contains("shared-222222222222-bucket"),
+        "expected `${{orgs.accounts['registry_dev']}}` interpolation substituted, got:\n{stripped}"
+    );
+    // Pin the bare-attribute form distinctly from the interpolation
+    // form: a regression that re-rendered the bare-attribute case as
+    // the literal `orgs.accounts['registry_dev']` (the original #2435
+    // bug) would still satisfy the broad "contains the id" checks
+    // above because the interpolation case would still substitute.
+    assert!(
+        stripped.contains("DevAccount: \"222222222222\""),
+        "expected bare `orgs.accounts['registry_dev']` attribute substituted, got:\n{stripped}"
+    );
+    insta::assert_snapshot!(stripped);
+}
+
 #[test]
 fn plan_snapshot_exports() {
     use crate::commands::plan::ExportChange;

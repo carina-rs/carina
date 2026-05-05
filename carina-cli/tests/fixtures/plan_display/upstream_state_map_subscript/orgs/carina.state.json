@@ -1,0 +1,13 @@
+{
+  "version": 5,
+  "serial": 1,
+  "lineage": "remote-orgs-lineage",
+  "carina_version": "0.1.0",
+  "resources": [],
+  "exports": {
+    "accounts": {
+      "registry_prod": "111111111111",
+      "registry_dev": "222222222222"
+    }
+  }
+}
