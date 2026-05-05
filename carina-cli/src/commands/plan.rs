@@ -276,6 +276,8 @@ pub async fn run_plan(
                     .collect()
             },
         );
+    }
+    if let Some(sf) = state_file.as_mut() {
         reconcile_anonymous_identifiers_with_ctx(&wiring, &mut parsed.resources, sf);
     }
     apply_name_overrides(&mut parsed.resources, &state_file);

@@ -724,7 +724,7 @@ async fn run_apply_locked(
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
     // Read current state from backend
-    let state_file = backend.read_state().await.map_err(AppError::Backend)?;
+    let mut state_file = backend.read_state().await.map_err(AppError::Backend)?;
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
     if let Some(sf) = state_file.as_ref() {
@@ -737,6 +737,8 @@ async fn run_apply_locked(
                     .collect()
             },
         );
+    }
+    if let Some(sf) = state_file.as_mut() {
         reconcile_anonymous_identifiers_with_ctx(ctx, &mut parsed.resources, sf);
     }
     apply_name_overrides(&mut parsed.resources, &state_file);

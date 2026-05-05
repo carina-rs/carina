@@ -1,0 +1,10 @@
+# Provider prefix snapshot fixture (#2426 / #2431).
+#
+# State carries an orphaned anonymous resource whose name uses the
+# `<provider>_<type>_<hash>` form introduced by the provider prefix
+# change. The plan-display snapshot then captures the prefix as
+# rendered in the orphan-delete row, locking in the format.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}

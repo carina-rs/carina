@@ -341,9 +341,9 @@ pub fn apply_anonymous_to_named_renames(
 pub fn reconcile_anonymous_identifiers_with_ctx(
     ctx: &WiringContext,
     resources: &mut [Resource],
-    state_file: &StateFile,
+    state_file: &mut StateFile,
 ) {
-    identifier::reconcile_anonymous_identifiers(
+    let renames = identifier::reconcile_anonymous_identifiers(
         resources,
         ctx.schemas(),
         &|provider, resource_type| {
@@ -378,6 +378,31 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
                 .collect()
         },
     );
+
+    apply_provider_prefix_renames(&renames, state_file);
+}
+
+/// Re-key state entries when `reconcile_anonymous_identifiers` produced rename
+/// pairs (anonymous → anonymous due to identifier-format upgrade).
+///
+/// For each `(old_name, new_name)` pair, find the matching `ResourceState`
+/// in `state_file.resources` and overwrite its `name` field. Downstream maps
+/// (`build_saved_attrs`, `build_desired_keys`, `build_lifecycles`) then key
+/// off the new name, so the differ sees the resource under its updated
+/// identifier instead of an orphan-delete + create pair.
+pub fn apply_provider_prefix_renames(renames: &[(String, String)], state_file: &mut StateFile) {
+    if renames.is_empty() {
+        return;
+    }
+    let by_old: HashMap<&str, &str> = renames
+        .iter()
+        .map(|(old, new)| (old.as_str(), new.as_str()))
+        .collect();
+    for sr in &mut state_file.resources {
+        if let Some(new_name) = by_old.get(sr.name.as_str()) {
+            sr.name = new_name.to_string();
+        }
+    }
 }
 
 pub fn compute_anonymous_identifiers_with_ctx(
