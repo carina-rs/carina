@@ -3492,3 +3492,136 @@ fn check_attributes_blocks_still_warns_when_truly_undefined() {
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+// =====================================================================
+// Empty `${}` interpolation: parser must accept it, LSP surfaces a
+// per-location diagnostic, sibling `let` bindings stay visible (#2480).
+// =====================================================================
+
+#[test]
+fn empty_interpolation_emits_diagnostic_at_span() {
+    let engine = test_engine();
+    let buffer = "let bucket = aws.s3.Bucket {\n    name = \"arn:${}:root\"\n}\n";
+    let doc = create_document(buffer);
+    let diagnostics = engine.analyze(&doc, None);
+
+    let empty = diagnostics
+        .iter()
+        .find(|d| d.message.to_lowercase().contains("empty interpolation"))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected an EmptyInterpolation diagnostic; got: {:?}",
+                diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+            )
+        });
+
+    // The `${}` span sits inside `name = "arn:${}:root"` on line 1.
+    // The diagnostic must point at that interpolation, not the whole
+    // string and not the resource block.
+    assert_eq!(
+        empty.range.start.line, 1,
+        "expected line 1, got: {:?}",
+        empty
+    );
+    let line1 = buffer.lines().nth(1).unwrap();
+    let dollar_col = line1.find("${").unwrap() as u32;
+    let close_col = (line1.find("${}").unwrap() + "${}".len()) as u32;
+    assert_eq!(
+        empty.range.start.character, dollar_col,
+        "diagnostic start should be at `${{`; got: {:?}",
+        empty.range
+    );
+    assert_eq!(
+        empty.range.end.character, close_col,
+        "diagnostic end should be just after `}}`; got: {:?}",
+        empty.range
+    );
+}
+
+#[test]
+fn empty_interpolation_does_not_cascade_undefined_for_sibling_bindings() {
+    // Cross-file repro from #2480: an empty `${}` in main.crn must not
+    // cause sibling-declared `bucket` (in backend.crn) to be flagged
+    // as undefined.
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().to_path_buf();
+    std::fs::write(
+        base.join("backend.crn"),
+        "let bucket = aws.s3.Bucket {\n    name = 'state-bucket'\n}\n",
+    )
+    .unwrap();
+    let main = "aws.s3.BucketPolicy {\n    bucket = bucket.bucket_name\n    policy = \"arn:${}:root\"\n}\n";
+    std::fs::write(base.join("main.crn"), main).unwrap();
+
+    let engine = test_engine();
+    let doc = create_document(main);
+    let diagnostics = engine.analyze_with_filename(&doc, Some("main.crn"), Some(&base));
+
+    let bucket_undefined = diagnostics
+        .iter()
+        .any(|d| d.message.contains("Undefined") && d.message.contains("bucket"));
+    assert!(
+        !bucket_undefined,
+        "sibling `let bucket = ...` must stay visible despite empty `${{}}`; got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn empty_interpolation_does_not_misfire_on_nested_object_literal() {
+    // `${ {a = 1}.a }` is a non-empty expression that *contains* `{}`
+    // within. The brace-balanced scanner must stop at the matching `}`,
+    // not the first one, so this must NOT produce an EmptyInterpolation
+    // diagnostic.
+    let engine = test_engine();
+    let buffer = "let x = aws.s3.Bucket {\n    name = \"prefix-${ {a = 1}.a }\"\n}\n";
+    let doc = create_document(buffer);
+    let diagnostics = engine.analyze(&doc, None);
+
+    let empty = diagnostics
+        .iter()
+        .find(|d| d.message.to_lowercase().contains("empty interpolation"));
+    assert!(
+        empty.is_none(),
+        "nested object literal inside `${{}}` is not empty; got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn empty_interpolation_does_not_misfire_on_escape_inside_braces() {
+    // `${\\}` contains an escaped backslash inside the braces. The body
+    // is non-whitespace (a `\\` pair), so the scanner must NOT flag it
+    // as empty.
+    let engine = test_engine();
+    let buffer = "let x = aws.s3.Bucket {\n    name = \"prefix-${\\\\}\"\n}\n";
+    let doc = create_document(buffer);
+    let diagnostics = engine.analyze(&doc, None);
+
+    let empty = diagnostics
+        .iter()
+        .find(|d| d.message.to_lowercase().contains("empty interpolation"));
+    assert!(
+        empty.is_none(),
+        "escape pair inside `${{}}` is not empty; got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn empty_interpolation_diagnostic_is_warning_not_error() {
+    let engine = test_engine();
+    let buffer = "let x = aws.s3.Bucket {\n    name = \"prefix-${}\"\n}\n";
+    let doc = create_document(buffer);
+    let diagnostics = engine.analyze(&doc, None);
+
+    let empty = diagnostics
+        .iter()
+        .find(|d| d.message.to_lowercase().contains("empty interpolation"))
+        .expect("expected an EmptyInterpolation diagnostic");
+    assert_eq!(
+        empty.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING),
+        "empty interpolation is a mid-edit hint, not a hard error"
+    );
+}

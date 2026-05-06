@@ -375,6 +375,11 @@ pub enum UnknownReason {
     /// Loop-variable value in a deferred for-expression
     /// (`for v in iterable`). Substituted with the actual element.
     ForValue,
+    /// Mid-edit empty `${}` interpolation. Carries no payload — the
+    /// presence of the marker is enough for the LSP to surface a
+    /// diagnostic at the `${}` span and for downstream resolvers to
+    /// stay tolerant. See #2480.
+    EmptyInterpolation,
 }
 
 /// A part of a string interpolation expression
@@ -730,9 +735,13 @@ impl Value {
                     // the `ResourceRef` arm above) — no per-call String
                     // allocation.
                     UnknownReason::UpstreamRef { path } => path.hash(hasher),
-                    // `For{Key,Index,Value}` carry no payload; the
-                    // discriminant alone already distinguishes them.
-                    UnknownReason::ForKey | UnknownReason::ForIndex | UnknownReason::ForValue => {}
+                    // `For{Key,Index,Value}` and `EmptyInterpolation`
+                    // carry no payload; the discriminant alone already
+                    // distinguishes them.
+                    UnknownReason::ForKey
+                    | UnknownReason::ForIndex
+                    | UnknownReason::ForValue
+                    | UnknownReason::EmptyInterpolation => {}
                 }
             }
         }

@@ -291,7 +291,16 @@ number = @{ "-"? ~ ASCII_DIGIT+ }
 string = ${ single_quoted_string | double_quoted_string }
 double_quoted_string = ${ "\"" ~ string_part* ~ "\"" }
 string_part = ${ interpolation | string_literal }
-interpolation = ${ "${" ~ expression ~ "}" }
+// `expression` is optional so a mid-edit empty `${}` doesn't abort
+// the AST. `inline_ws*` (space/tab only) lets `${ }` parse too —
+// `WHITESPACE` is auto-disabled inside compound-atomic (`${ ... }`)
+// rules, so without an explicit allowance the inner whitespace is
+// rejected. Newlines are deliberately excluded so the parser stays
+// in sync with the single-line LSP `check_empty_interpolations`
+// scanner — no silent gap where `${\n}` parses but no diagnostic
+// fires. See #2480.
+interpolation = ${ "${" ~ inline_ws* ~ expression? ~ inline_ws* ~ "}" }
+inline_ws = _{ " " | "\t" }
 string_literal = @{ string_char+ }
 string_char = {
     !("\"" | "\\" | "${") ~ ANY
