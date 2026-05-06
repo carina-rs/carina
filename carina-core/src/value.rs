@@ -957,6 +957,46 @@ pub fn canonicalize_resources_with_schemas(
     }
 }
 
+/// Walk every entry in a `current_states` map and canonicalize attribute
+/// values whose declared schema type is `Union[String, list(String)]`
+/// into `Value::StringList`.
+///
+/// State files written before #2510 / #2511 (or by an apply path that
+/// somehow produced the legacy shape) come back through serde as the
+/// natural `Value::String` / `Value::List` form. Run this immediately
+/// after `current_states` is built — typically right after
+/// `StateFile::build_state_for_resource` populates the map — so the
+/// differ never sees a non-canonical state value compared against a
+/// canonical desired value. See #2481, #2513.
+pub fn canonicalize_states_with_schemas(
+    states: &mut std::collections::HashMap<crate::resource::ResourceId, crate::resource::State>,
+    registry: &crate::schema::SchemaRegistry,
+) {
+    for state in states.values_mut() {
+        let kind = if state.id.resource_type.is_empty() {
+            None
+        } else {
+            registry.get(
+                &state.id.provider,
+                &state.id.resource_type,
+                crate::schema::SchemaKind::Managed,
+            )
+        };
+        let Some(schema) = kind else {
+            continue;
+        };
+        let mut new_attrs = std::collections::HashMap::with_capacity(state.attributes.len());
+        for (key, value) in std::mem::take(&mut state.attributes) {
+            let canon = match schema.attributes.get(&key) {
+                Some(attr_schema) => canonicalize_with_type(value, &attr_schema.attr_type),
+                None => value,
+            };
+            new_attrs.insert(key, canon);
+        }
+        state.attributes = new_attrs;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2289,5 +2329,98 @@ mod tests {
         canonicalize_resources_with_schemas(&mut a, &registry);
         canonicalize_resources_with_schemas(&mut b, &registry);
         assert_eq!(a[0].attributes, b[0].attributes);
+    }
+
+    // ---- canonicalize_states_with_schemas tests (#2481, #2513) ----
+
+    fn make_state(attrs: Vec<(&str, Value)>) -> crate::resource::State {
+        use crate::resource::{ResourceId, ResourceName, State};
+        use std::collections::{BTreeSet, HashMap};
+        let mut attributes = HashMap::new();
+        for (k, v) in attrs {
+            attributes.insert(k.to_string(), v);
+        }
+        State {
+            id: ResourceId {
+                provider: "aws".to_string(),
+                resource_type: "iam.policy".to_string(),
+                name: ResourceName::Bound("p1".to_string()),
+            },
+            identifier: Some("arn:aws:iam::123:policy/p1".to_string()),
+            attributes,
+            exists: true,
+            dependency_bindings: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn canonicalize_states_with_schemas_scalar_to_string_list() {
+        let registry = build_test_registry();
+        let mut states = std::collections::HashMap::new();
+        let s = make_state(vec![("subject", Value::String("repo:foo:*".to_string()))]);
+        states.insert(s.id.clone(), s);
+        canonicalize_states_with_schemas(&mut states, &registry);
+        let state = states.values().next().unwrap();
+        assert_eq!(
+            state.attributes.get("subject"),
+            Some(&Value::StringList(vec!["repo:foo:*".to_string()]))
+        );
+    }
+
+    #[test]
+    fn canonicalize_states_with_schemas_legacy_list_to_string_list() {
+        let registry = build_test_registry();
+        let mut states = std::collections::HashMap::new();
+        let s = make_state(vec![(
+            "subject",
+            Value::List(vec![Value::String("repo:foo:*".to_string())]),
+        )]);
+        states.insert(s.id.clone(), s);
+        canonicalize_states_with_schemas(&mut states, &registry);
+        let state = states.values().next().unwrap();
+        assert_eq!(
+            state.attributes.get("subject"),
+            Some(&Value::StringList(vec!["repo:foo:*".to_string()]))
+        );
+    }
+
+    #[test]
+    fn canonicalize_states_with_schemas_skips_unknown_resource() {
+        let registry = crate::schema::SchemaRegistry::new();
+        let mut states = std::collections::HashMap::new();
+        let s = make_state(vec![("subject", Value::String("x".to_string()))]);
+        states.insert(s.id.clone(), s);
+        canonicalize_states_with_schemas(&mut states, &registry);
+        let state = states.values().next().unwrap();
+        assert_eq!(
+            state.attributes.get("subject"),
+            Some(&Value::String("x".to_string()))
+        );
+    }
+
+    #[test]
+    fn canonicalize_states_diff_empty_after_both_sides_canonical() {
+        // The acceptance criterion from #2513: a desired side written
+        // as `["x"]` and a state side stored as `"x"` collapse to the
+        // same `Value::StringList(vec!["x"])` after both pass through
+        // canonicalization.
+        let registry = build_test_registry();
+
+        let mut resources = vec![make_resource(vec![(
+            "subject",
+            Value::List(vec![Value::String("repo:foo:*".to_string())]),
+        )])];
+        canonicalize_resources_with_schemas(&mut resources, &registry);
+
+        let mut states = std::collections::HashMap::new();
+        let s = make_state(vec![("subject", Value::String("repo:foo:*".to_string()))]);
+        states.insert(s.id.clone(), s);
+        canonicalize_states_with_schemas(&mut states, &registry);
+
+        let state = states.values().next().unwrap();
+        assert_eq!(
+            resources[0].attributes.get("subject"),
+            state.attributes.get("subject"),
+        );
     }
 }
