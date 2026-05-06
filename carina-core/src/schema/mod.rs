@@ -1191,7 +1191,7 @@ fn union_member_score(member: &AttributeType, value: &Value) -> u32 {
 /// [`AttributeType::validate_collect`] (path-tagged) so the two paths
 /// agree on which keys are accepted (#2214 — the LSP previously did
 /// this alias resolution itself, which let the two validators drift).
-fn build_accepted_field_map(fields: &[StructField]) -> HashMap<&str, &StructField> {
+pub(crate) fn build_accepted_field_map(fields: &[StructField]) -> HashMap<&str, &StructField> {
     let mut accepted: HashMap<&str, &StructField> = HashMap::new();
     for f in fields {
         accepted.insert(f.name.as_str(), f);
