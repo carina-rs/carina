@@ -307,64 +307,185 @@ pub fn format_value(value: &Value) -> String {
 
 /// Format a `Value` for display, with an optional key for context
 pub fn format_value_with_key(value: &Value, _key: Option<&str>) -> String {
+    let mut sink = StringSink::default();
+    // `StringSink::write_str` never returns Err (it has no overflow
+    // budget), so the `Result` here is structurally `Ok(())`. Treat the
+    // unwrap as proof of that — never an actual fallible path.
+    format_value_into(value, &mut sink).expect("StringSink writes are infallible");
+    sink.buf
+}
+
+/// Marker returned by [`FormatSink::write_str`] when a budget-bounded
+/// sink (e.g. [`WidthCounter`]) has exceeded its limit. [`StringSink`]
+/// never returns this.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Overflow;
+
+/// Output sink for [`format_value_into`]. The trait lets the same
+/// formatting code path drive either a [`StringSink`] (for the public
+/// `String`-returning APIs like `format_value_with_key`) or a
+/// [`WidthCounter`] (for the byte-length-only fast path used by
+/// [`format_value_pretty`]'s inline-vs-vertical decision). #2434.
+///
+/// Historically the byte-length path was its own arm-by-arm
+/// `inline_width` mirror of `format_value_with_key`, kept consistent by
+/// a parity test. That shape silently rotted when a `Value` variant was
+/// added on one side but not the other; the trait fuses both into a
+/// single source of truth so a new variant only needs one update.
+pub(crate) trait FormatSink {
+    /// Append `s` to the sink. `Err(Overflow)` short-circuits the
+    /// whole render — used by the budget-bounded sink to bail out as
+    /// soon as the running width exceeds the limit, without visiting
+    /// the rest of the value tree.
+    fn write_str(&mut self, s: &str) -> Result<(), Overflow>;
+}
+
+#[derive(Default)]
+pub(crate) struct StringSink {
+    pub(crate) buf: String,
+}
+
+impl FormatSink for StringSink {
+    fn write_str(&mut self, s: &str) -> Result<(), Overflow> {
+        self.buf.push_str(s);
+        Ok(())
+    }
+}
+
+/// Counts byte length of writes, returning `Err(Overflow)` once the
+/// running total exceeds `budget`. Pairs with [`format_value_into`] to
+/// answer "would this value's inline form fit in N bytes?" without
+/// allocating the rendered string.
+pub(crate) struct WidthCounter {
+    running: usize,
+    budget: usize,
+}
+
+impl WidthCounter {
+    pub(crate) fn new(budget: usize) -> Self {
+        Self { running: 0, budget }
+    }
+    pub(crate) fn width(&self) -> usize {
+        self.running
+    }
+}
+
+impl FormatSink for WidthCounter {
+    fn write_str(&mut self, s: &str) -> Result<(), Overflow> {
+        let next = self.running.checked_add(s.len()).ok_or(Overflow)?;
+        if next > self.budget {
+            return Err(Overflow);
+        }
+        self.running = next;
+        Ok(())
+    }
+}
+
+/// Render `value` into `sink` using the same code path that produces
+/// the public `format_value_with_key` output. The single source of
+/// truth for plan-display value formatting; sinks downstream of this
+/// function decide whether to materialise a `String` or just count
+/// bytes (#2434).
+pub(crate) fn format_value_into<S: FormatSink>(
+    value: &Value,
+    sink: &mut S,
+) -> Result<(), Overflow> {
     match value {
         Value::String(s) => {
             // Secret hash strings should display as "(secret)" to avoid
-            // leaking internal hash representation in plan output
+            // leaking internal hash representation in plan output.
             if s.starts_with(SECRET_PREFIX) {
-                return "(secret)".to_string();
+                return sink.write_str("(secret)");
             }
-            // DSL enum format (namespaced identifiers) - resolve to provider value
+            // DSL enum format (namespaced identifiers): resolve to
+            // provider value before quoting.
             if is_dsl_enum_format(s) {
                 let resolved = convert_enum_value(s);
-                return format!("\"{}\"", resolved);
+                sink.write_str("\"")?;
+                sink.write_str(resolved)?;
+                return sink.write_str("\"");
             }
-            format!("\"{}\"", s)
+            sink.write_str("\"")?;
+            sink.write_str(s)?;
+            sink.write_str("\"")
         }
-        Value::Int(n) => n.to_string(),
+        Value::Int(n) => sink.write_str(&n.to_string()),
         Value::Float(f) => {
             let s = f.to_string();
-            if s.contains('.') {
-                s
-            } else {
-                format!("{}.0", s)
+            sink.write_str(&s)?;
+            if !s.contains('.') {
+                sink.write_str(".0")?;
             }
+            Ok(())
         }
-        Value::Bool(b) => b.to_string(),
+        Value::Bool(b) => sink.write_str(if *b { "true" } else { "false" }),
         Value::List(items) => {
-            let strs: Vec<_> = items.iter().map(format_value).collect();
-            format!("[{}]", strs.join(", "))
+            sink.write_str("[")?;
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    sink.write_str(", ")?;
+                }
+                format_value_into(item, sink)?;
+            }
+            sink.write_str("]")
         }
         Value::StringList(items) => {
-            let strs: Vec<_> = items.iter().map(|s| format!("\"{}\"", s)).collect();
-            format!("[{}]", strs.join(", "))
+            // Canonicalised string-or-list-of-strings shape (#2510).
+            // Renders with the same `[ "a", "b" ]` form as `Value::List`
+            // of `Value::String` so plan output stays uniform.
+            sink.write_str("[")?;
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    sink.write_str(", ")?;
+                }
+                sink.write_str("\"")?;
+                sink.write_str(item)?;
+                sink.write_str("\"")?;
+            }
+            sink.write_str("]")
         }
         Value::Map(map) => {
             let mut keys: Vec<_> = map.keys().collect();
             keys.sort();
-            let strs: Vec<_> = keys
-                .iter()
-                .map(|k| format!("{}: {}", k, format_value(&map[*k])))
-                .collect();
-            format!("{{{}}}", strs.join(", "))
+            sink.write_str("{")?;
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    sink.write_str(", ")?;
+                }
+                sink.write_str(k)?;
+                sink.write_str(": ")?;
+                format_value_into(&map[*k], sink)?;
+            }
+            sink.write_str("}")
         }
-        Value::ResourceRef { path } => path.to_dot_string(),
+        Value::ResourceRef { path } => sink.write_str(&path.to_dot_string()),
         Value::Interpolation(parts) => {
-            let inner: String = parts
-                .iter()
-                .map(|p| match p {
-                    InterpolationPart::Literal(s) => s.clone(),
-                    InterpolationPart::Expr(v) => format!("${{{}}}", format_value(v)),
-                })
-                .collect();
-            format!("\"{}\"", inner)
+            sink.write_str("\"")?;
+            for part in parts {
+                match part {
+                    InterpolationPart::Literal(s) => sink.write_str(s)?,
+                    InterpolationPart::Expr(v) => {
+                        sink.write_str("${")?;
+                        format_value_into(v, sink)?;
+                        sink.write_str("}")?;
+                    }
+                }
+            }
+            sink.write_str("\"")
         }
         Value::FunctionCall { name, args } => {
-            let arg_strs: Vec<_> = args.iter().map(format_value).collect();
-            format!("{}({})", name, arg_strs.join(", "))
+            sink.write_str(name)?;
+            sink.write_str("(")?;
+            for (i, arg) in args.iter().enumerate() {
+                if i > 0 {
+                    sink.write_str(", ")?;
+                }
+                format_value_into(arg, sink)?;
+            }
+            sink.write_str(")")
         }
-        Value::Secret(_) => "(secret)".to_string(),
-        Value::Unknown(reason) => render_unknown(reason),
+        Value::Secret(_) => sink.write_str("(secret)"),
+        Value::Unknown(reason) => sink.write_str(&render_unknown(reason)),
     }
 }
 
@@ -681,9 +802,15 @@ pub fn format_value_pretty(value: &Value, layout: PrettyLayout<'_>) -> String {
             if is_list_of_maps(value) {
                 return format_list_of_maps_vertical(items, layout.child_indent_cols());
             }
-            let inline = format_value_with_key(value, None);
-            if layout.prefix_cols() + inline.len() <= PRETTY_LINE_LIMIT {
-                return inline;
+            // #2434: measure first, build only when we know it fits.
+            // Pre-fix this called `format_value_with_key` unconditionally
+            // and discarded the result on overflow — quadratic on deep
+            // nested values because `format_*_vertical` recurses back
+            // into `format_value_pretty`, which built-and-discarded again
+            // at every level.
+            let budget = PRETTY_LINE_LIMIT.saturating_sub(layout.prefix_cols());
+            if inline_width(value, budget).is_some() {
+                return format_value_with_key(value, None);
             }
             format_list_of_scalars_vertical(items, layout.child_indent_cols())
         }
@@ -691,14 +818,34 @@ pub fn format_value_pretty(value: &Value, layout: PrettyLayout<'_>) -> String {
             if map.is_empty() {
                 return "{}".to_string();
             }
-            let inline = format_value_with_key(value, None);
-            if layout.prefix_cols() + inline.len() <= PRETTY_LINE_LIMIT {
-                return inline;
+            let budget = PRETTY_LINE_LIMIT.saturating_sub(layout.prefix_cols());
+            if inline_width(value, budget).is_some() {
+                return format_value_with_key(value, None);
             }
             format_map_vertical(map, layout.child_indent_cols())
         }
         _ => format_value_with_key(value, None),
     }
+}
+
+/// Compute the byte length of `format_value_with_key(value, None)` without
+/// allocating the rendered string, short-circuiting to `None` as soon as
+/// the running total exceeds `budget` (#2434).
+///
+/// Implemented as a thin wrapper around [`format_value_into`] with a
+/// [`WidthCounter`] sink, so the byte count is byte-for-byte identical
+/// to what `format_value_with_key` would emit by construction —
+/// adding a new `Value` variant only needs one site update (the
+/// `format_value_into` arm), not a measure/build pair that could rot
+/// out of sync.
+///
+/// `format_value_pretty` is the only intended caller; `pub(crate)`
+/// lets the value tests pin the boundary behaviour.
+pub(crate) fn inline_width(value: &Value, budget: usize) -> Option<usize> {
+    let mut counter = WidthCounter::new(budget);
+    format_value_into(value, &mut counter)
+        .ok()
+        .map(|()| counter.width())
 }
 
 /// Render a list-of-maps vertically. Each entry's first key gets a `- `
@@ -2202,6 +2349,94 @@ mod tests {
         );
     }
 
+    // ----- inline_width tests (#2434) -----
+
+    /// Parity oracle: every variant `inline_width` claims to know the
+    /// width of must report the same byte length as `format_value_with_key`
+    /// would emit. Anything else is a drift bug — the optimization
+    /// silently changes the inline-vs-vertical decision boundary.
+    fn assert_inline_width_matches_build(v: &Value) {
+        // `format_value_pretty`'s overflow check uses byte length
+        // (`inline.len()`), so `inline_width` must report bytes too.
+        let built = format_value_with_key(v, None);
+        let measured = inline_width(v, usize::MAX);
+        assert_eq!(
+            measured,
+            Some(built.len()),
+            "inline_width vs format_value_with_key drift for {v:?}: built={built:?}",
+        );
+    }
+
+    #[test]
+    fn inline_width_parity_for_scalars() {
+        for v in [
+            Value::String("hello".to_string()),
+            Value::String("(empty)".to_string()),
+            Value::Int(42),
+            Value::Int(-7),
+            Value::Float(1.5),
+            Value::Float(2.0),
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Secret(Box::new(Value::String("hidden".to_string()))),
+        ] {
+            assert_inline_width_matches_build(&v);
+        }
+    }
+
+    #[test]
+    fn inline_width_parity_for_lists_and_maps() {
+        let list = Value::List(vec![
+            Value::String("a".to_string()),
+            Value::Int(1),
+            Value::Bool(true),
+        ]);
+        assert_inline_width_matches_build(&list);
+
+        let mut map = IndexMap::new();
+        map.insert("k1".to_string(), Value::String("v1".to_string()));
+        map.insert("k2".to_string(), Value::Int(99));
+        assert_inline_width_matches_build(&Value::Map(map));
+
+        // Nested list/map.
+        let mut inner = IndexMap::new();
+        inner.insert("x".to_string(), Value::Int(1));
+        let nested = Value::List(vec![Value::Map(inner), Value::String("end".to_string())]);
+        assert_inline_width_matches_build(&nested);
+
+        // Empty collections.
+        assert_inline_width_matches_build(&Value::List(vec![]));
+        assert_inline_width_matches_build(&Value::Map(IndexMap::new()));
+    }
+
+    #[test]
+    fn inline_width_parity_for_dsl_enum_string() {
+        // DSL enum identifiers (e.g. `aws.s3.VersioningStatus.Enabled`)
+        // resolve to their provider value before being quoted in
+        // `format_value_with_key`. inline_width must follow the same
+        // resolution to match the rendered byte length.
+        let v = Value::String("aws.Region.ap_northeast_1".to_string());
+        assert_inline_width_matches_build(&v);
+    }
+
+    #[test]
+    fn inline_width_short_circuits_above_budget() {
+        // Pin the optimization's *purpose*: a deeply-nested value that
+        // obviously won't fit must return None *without* recursing into
+        // every leaf. The cheapest observable proxy: a budget of 1 on a
+        // value whose first byte already exceeds it returns None even
+        // though the value itself is structurally complex.
+        let mut deep = Value::Int(1);
+        for _ in 0..10 {
+            deep = Value::List(vec![deep]);
+        }
+        assert_eq!(
+            inline_width(&deep, 1),
+            None,
+            "deeply-nested value must short-circuit on a tight budget"
+        );
+    }
+
     #[test]
     fn canonicalize_format_value_string_list() {
         let v = Value::StringList(vec!["a".to_string(), "b".to_string()]);
@@ -2453,5 +2688,55 @@ mod tests {
         let v = Value::StringList(vec!["a".to_string(), "b".to_string()]);
         let formatted = format_value(&v);
         assert_eq!(formatted, "[\"a\", \"b\"]");
+    }
+
+    #[test]
+    fn inline_width_returns_none_when_just_over_budget() {
+        // List of three short strings: `["aa", "bb", "cc"]` = 18 bytes.
+        // Budget 17 must return None; budget 18 must return Some(18).
+        let v = Value::List(vec![
+            Value::String("aa".to_string()),
+            Value::String("bb".to_string()),
+            Value::String("cc".to_string()),
+        ]);
+        assert_eq!(
+            format_value_with_key(&v, None).len(),
+            18,
+            "fixture sanity: rendered width should be 18 bytes"
+        );
+        assert_eq!(inline_width(&v, 17), None);
+        assert_eq!(inline_width(&v, 18), Some(18));
+        assert_eq!(inline_width(&v, 100), Some(18));
+    }
+
+    #[test]
+    fn format_value_pretty_decision_unchanged_after_inline_width() {
+        // End-to-end: the inline-vs-vertical decision in
+        // `format_value_pretty` must be byte-identical to the pre-fix
+        // build-then-measure shape. Construct values that straddle
+        // PRETTY_LINE_LIMIT (80) at the prefix boundary and confirm both
+        // sides of the boundary still pick the same form.
+        // Just under the limit (inline expected).
+        let small_list = Value::List(vec![
+            Value::String("aaaaaaaaaaaa".to_string()),
+            Value::String("bbbbbbbbbbbb".to_string()),
+        ]);
+        let small = format_value_pretty(&small_list, layout(0, "k"));
+        assert!(
+            !small.contains('\n'),
+            "small list must render inline, got: {small:?}"
+        );
+
+        // Over the limit (vertical expected).
+        let big_list = Value::List(vec![
+            Value::String("a".repeat(40)),
+            Value::String("b".repeat(40)),
+            Value::String("c".repeat(40)),
+        ]);
+        let big = format_value_pretty(&big_list, layout(0, "k"));
+        assert!(
+            big.contains('\n'),
+            "oversize list must render vertically, got: {big:?}"
+        );
     }
 }
