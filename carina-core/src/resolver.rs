@@ -183,43 +183,50 @@ pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<V
                     Some(crate::binding_index::BindingValueSource::Upstream)
                 );
                 for field in field_path {
-                    match resolved {
+                    // Peel `Secret` wrappers so dot-form key access
+                    // (`creds.db_pwd` against a `Secret(Map)` upstream)
+                    // descends into the inner map and re-wraps the
+                    // leaf — symmetric with the subscript walk below
+                    // (#2439). Pre-fix the wildcard arm dropped any
+                    // `Secret(Map)` ref silently.
+                    let (peeled, secret_depth) = peel_secrets(resolved);
+                    let next = match peeled {
                         Value::Map(ref map) => match map.get(field) {
-                            Some(nested) => {
-                                resolved = resolve_ref_value(nested, bindings)?;
-                            }
+                            Some(nested) => resolve_ref_value(nested, bindings)?,
                             None if is_upstream => {
                                 return Err(missing_map_key_error(path, map));
                             }
                             None => return Ok(value.clone()),
                         },
                         _ => return Ok(value.clone()),
-                    }
+                    };
+                    resolved = rewrap_secrets(next, secret_depth);
                 }
 
                 use crate::resource::Subscript;
                 for sub in path.subscripts() {
-                    match (resolved, sub) {
+                    // Peel `Secret` wrappers so the subscript addresses
+                    // the inner container, then re-wrap so the secret
+                    // tag survives end-to-end. #2439.
+                    let (peeled, secret_depth) = peel_secrets(resolved);
+                    let next = match (peeled, sub) {
                         (Value::List(items), Subscript::Int { index }) => {
                             let idx = usize::try_from(*index).ok().filter(|i| *i < items.len());
                             match idx {
-                                Some(i) => {
-                                    resolved = resolve_ref_value(&items[i], bindings)?;
-                                }
+                                Some(i) => resolve_ref_value(&items[i], bindings)?,
                                 None => return Ok(value.clone()),
                             }
                         }
                         (Value::Map(map), Subscript::Str { key }) => match map.get(key) {
-                            Some(nested) => {
-                                resolved = resolve_ref_value(nested, bindings)?;
-                            }
+                            Some(nested) => resolve_ref_value(nested, bindings)?,
                             None if is_upstream => {
                                 return Err(missing_map_key_error(path, &map));
                             }
                             None => return Ok(value.clone()),
                         },
                         _ => return Ok(value.clone()),
-                    }
+                    };
+                    resolved = rewrap_secrets(next, secret_depth);
                 }
 
                 return Ok(resolved);
@@ -305,6 +312,26 @@ pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<V
         Value::Unknown(_) => Ok(value.clone()),
         _ => Ok(value.clone()),
     }
+}
+
+/// Strip leading `Value::Secret` wrappers, returning the inner value
+/// and the number of layers peeled. Pair with [`rewrap_secrets`] to
+/// preserve the secret tag end-to-end through `field_path` /
+/// `subscripts` projection (#2439). Plan-display redaction depends on
+/// the tag.
+fn peel_secrets(mut value: Value) -> (Value, usize) {
+    let mut depth = 0;
+    while let Value::Secret(inner) = value {
+        value = *inner;
+        depth += 1;
+    }
+    (value, depth)
+}
+
+/// Re-wrap `value` in `depth` layers of `Value::Secret`. Inverse of
+/// [`peel_secrets`].
+fn rewrap_secrets(value: Value, depth: usize) -> Value {
+    (0..depth).fold(value, |acc, _| Value::Secret(Box::new(acc)))
 }
 
 /// Format the "key not found; available keys: ..." error for a missing
@@ -397,6 +424,256 @@ mod tests {
         let ref_value = Value::ResourceRef { path };
         let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
         assert_eq!(resolved, Value::String("1".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_subscript_descends_into_secret_wrapped_map() {
+        // #2439: subscript on `Secret(Map)` must descend and re-wrap
+        // so plan-display redaction survives end-to-end.
+        let map: indexmap::IndexMap<String, Value> = vec![
+            ("db_pwd".to_string(), Value::String("hunter2".to_string())),
+            ("api_key".to_string(), Value::String("xyz".to_string())),
+        ]
+        .into_iter()
+        .collect();
+        let bindings = bindings_from(vec![(
+            "creds_binding",
+            vec![("creds", Value::Secret(Box::new(Value::Map(map))))],
+        )]);
+        let path = crate::resource::AccessPath::with_fields_and_subscripts(
+            "creds_binding",
+            "creds",
+            Vec::new(),
+            vec![crate::resource::Subscript::Str {
+                key: "db_pwd".to_string(),
+            }],
+        );
+        let ref_value = Value::ResourceRef { path };
+        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        assert_eq!(
+            resolved,
+            Value::Secret(Box::new(Value::String("hunter2".to_string()))),
+            "subscript on Secret(Map) must project the entry and re-wrap as Secret(String)"
+        );
+    }
+
+    #[test]
+    fn test_resolve_subscript_descends_into_secret_wrapped_list() {
+        // Symmetric with the map test: `Value::Secret(Box::new(
+        // Value::List(...)))` + integer subscript projects the element
+        // and re-wraps the leaf as `Value::Secret`.
+        let bindings = bindings_from(vec![(
+            "secret_holder",
+            vec![(
+                "tokens",
+                Value::Secret(Box::new(Value::List(vec![
+                    Value::String("alpha".to_string()),
+                    Value::String("beta".to_string()),
+                ]))),
+            )],
+        )]);
+        let path = crate::resource::AccessPath::with_fields_and_subscripts(
+            "secret_holder",
+            "tokens",
+            Vec::new(),
+            vec![crate::resource::Subscript::Int { index: 1 }],
+        );
+        let ref_value = Value::ResourceRef { path };
+        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        assert_eq!(
+            resolved,
+            Value::Secret(Box::new(Value::String("beta".to_string()))),
+        );
+    }
+
+    #[test]
+    fn test_resolve_field_path_descends_into_secret_wrapped_map() {
+        // #2439 sibling: dot-form field access on `Secret(Map)` walks
+        // the same blind spot as the subscript path. Pin the symmetric
+        // fix so a regression that drops the field_path peel doesn't
+        // silently keep the ref.
+        let map: indexmap::IndexMap<String, Value> =
+            vec![("db_pwd".to_string(), Value::String("hunter2".to_string()))]
+                .into_iter()
+                .collect();
+        let bindings = bindings_from(vec![(
+            "creds_binding",
+            vec![("creds", Value::Secret(Box::new(Value::Map(map))))],
+        )]);
+        let path = crate::resource::AccessPath::with_fields(
+            "creds_binding",
+            "creds",
+            vec!["db_pwd".to_string()],
+        );
+        let ref_value = Value::ResourceRef { path };
+        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        assert_eq!(
+            resolved,
+            Value::Secret(Box::new(Value::String("hunter2".to_string()))),
+        );
+    }
+
+    #[test]
+    fn test_resolve_subscript_descends_into_doubly_secret_wrapped_map() {
+        // Defensive: stacked `Secret(Secret(Map))` (parser-rejected in
+        // practice, but `peel_secrets` literally exists to handle it).
+        // Re-wrap depth must match peel depth — pin the contract.
+        let map: indexmap::IndexMap<String, Value> =
+            vec![("k".to_string(), Value::String("v".to_string()))]
+                .into_iter()
+                .collect();
+        let bindings = bindings_from(vec![(
+            "b",
+            vec![(
+                "creds",
+                Value::Secret(Box::new(Value::Secret(Box::new(Value::Map(map))))),
+            )],
+        )]);
+        let path = crate::resource::AccessPath::with_fields_and_subscripts(
+            "b",
+            "creds",
+            Vec::new(),
+            vec![crate::resource::Subscript::Str {
+                key: "k".to_string(),
+            }],
+        );
+        let ref_value = Value::ResourceRef { path };
+        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        assert_eq!(
+            resolved,
+            Value::Secret(Box::new(Value::Secret(Box::new(Value::String(
+                "v".to_string()
+            ))))),
+        );
+    }
+
+    #[test]
+    fn test_resolve_subscript_secret_wrapped_list_out_of_range_keeps_ref() {
+        // Parity with `test_resolve_subscript_out_of_range_keeps_ref`
+        // for the `Secret(List)` shape: out-of-range index keeps the
+        // original ref unchanged (the planner surfaces it as
+        // unresolved). Pin so a future refactor of the rewrap path
+        // can't accidentally wrap the kept ref in `Secret`.
+        let bindings = bindings_from(vec![(
+            "h",
+            vec![(
+                "tokens",
+                Value::Secret(Box::new(Value::List(vec![Value::String(
+                    "only".to_string(),
+                )]))),
+            )],
+        )]);
+        let path = crate::resource::AccessPath::with_fields_and_subscripts(
+            "h",
+            "tokens",
+            Vec::new(),
+            vec![crate::resource::Subscript::Int { index: 5 }],
+        );
+        let ref_value = Value::ResourceRef { path };
+        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        assert_eq!(resolved, ref_value);
+    }
+
+    #[test]
+    fn test_resolve_subscript_secret_wrapped_map_missing_key_local_keeps_ref() {
+        // Local binding (DSL-side `let`) with a `Secret(Map)` value:
+        // a missing key keeps the ref unchanged because the value may
+        // not be resolved yet. Mirrors the non-secret local-missing
+        // path, just with the Secret peel.
+        let map: indexmap::IndexMap<String, Value> =
+            vec![("known".to_string(), Value::String("v".to_string()))]
+                .into_iter()
+                .collect();
+        let bindings = bindings_from(vec![(
+            "h",
+            vec![("creds", Value::Secret(Box::new(Value::Map(map))))],
+        )]);
+        let path = crate::resource::AccessPath::with_fields_and_subscripts(
+            "h",
+            "creds",
+            Vec::new(),
+            vec![crate::resource::Subscript::Str {
+                key: "missing".to_string(),
+            }],
+        );
+        let ref_value = Value::ResourceRef { path };
+        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        assert_eq!(resolved, ref_value);
+    }
+
+    #[test]
+    fn test_resolve_subscript_secret_wrapped_map_missing_key_upstream_errors() {
+        // Upstream binding with a `Secret(Map)` value: a missing key
+        // surfaces `missing_map_key_error` (concrete state, so a
+        // missing key is a real typo). Pin the error path through the
+        // peel so a refactor can't accidentally swallow it.
+        use crate::binding_index::{BindingValueSource, ResolvedBindings};
+        let map: indexmap::IndexMap<String, Value> =
+            vec![("known".to_string(), Value::String("v".to_string()))]
+                .into_iter()
+                .collect();
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "creds".to_string(),
+            Value::Secret(Box::new(Value::Map(map))),
+        );
+        let mut bindings = ResolvedBindings::default();
+        bindings.set("h", attrs, BindingValueSource::Upstream);
+        let path = crate::resource::AccessPath::with_fields_and_subscripts(
+            "h",
+            "creds",
+            Vec::new(),
+            vec![crate::resource::Subscript::Str {
+                key: "missing".to_string(),
+            }],
+        );
+        let ref_value = Value::ResourceRef { path };
+        let result = resolve_ref_value(&ref_value, &bindings);
+        let err = result.expect_err("missing key in concrete upstream Secret(Map) must error");
+        assert!(
+            err.contains("key not found"),
+            "expected missing-key error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_subscript_secret_wrapped_unresolved_inner_ref_keeps_outer() {
+        // Defensive: after the initial `resolve_ref_value(attr_value)`
+        // call, the `resolved` value can be a `Secret(ResourceRef)` if
+        // the inner ref points to an as-yet-unresolved binding. The
+        // peel/rewrap loops then expose the inner ResourceRef and the
+        // wildcard arm should keep the *outer* ref unchanged — never
+        // silently strip the Secret tag and surface the bare inner
+        // ref. Pin the contract.
+        let mut h_attrs: HashMap<String, Value> = HashMap::new();
+        h_attrs.insert(
+            "creds".to_string(),
+            Value::Secret(Box::new(Value::resource_ref(
+                "missing".to_string(),
+                "x".to_string(),
+                vec![],
+            ))),
+        );
+        let mut bindings = crate::binding_index::ResolvedBindings::default();
+        bindings.set(
+            "h",
+            h_attrs,
+            crate::binding_index::BindingValueSource::Local,
+        );
+        let path = crate::resource::AccessPath::with_fields_and_subscripts(
+            "h",
+            "creds",
+            Vec::new(),
+            vec![crate::resource::Subscript::Str {
+                key: "k".to_string(),
+            }],
+        );
+        let ref_value = Value::ResourceRef { path };
+        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        assert_eq!(
+            resolved, ref_value,
+            "Secret(ResourceRef) projection must keep the outer ref unchanged"
+        );
     }
 
     #[test]
