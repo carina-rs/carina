@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use colored::Colorize;
 
@@ -459,7 +459,7 @@ pub async fn detect_drift(
 }
 
 pub async fn run_apply(
-    path: &PathBuf,
+    path: &Path,
     auto_approve: bool,
     lock: bool,
     reconfigure: bool,
@@ -574,7 +574,7 @@ pub async fn run_apply(
                         .ok_or("Backend does not specify a provider name")?;
 
                     // Append resource definition to backend file
-                    let target_file = backend_file.clone().unwrap_or_else(|| path.clone());
+                    let target_file = backend_file.clone().unwrap_or_else(|| path.to_path_buf());
 
                     let resource_code = backend
                         .resource_definition(&bucket_name)

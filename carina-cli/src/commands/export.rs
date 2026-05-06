@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::Path;
 
 use colored::Colorize;
 
@@ -21,7 +21,7 @@ pub enum OutputFormat {
 
 /// Run the `carina export` command.
 pub async fn run_export(
-    path: &PathBuf,
+    path: &Path,
     name: Option<String>,
     format: OutputFormat,
     provider_context: &ProviderContext,

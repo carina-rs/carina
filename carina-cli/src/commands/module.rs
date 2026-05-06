@@ -37,7 +37,7 @@ pub fn run_module_command(
 
 fn run_module_list(path: &Path, provider_context: &ProviderContext) -> Result<(), AppError> {
     let config = config_loader::load_configuration_with_config(
-        &path.to_path_buf(),
+        path,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;

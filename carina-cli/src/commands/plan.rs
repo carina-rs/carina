@@ -148,8 +148,8 @@ fn format_plan_save_error(e: &carina_core::value::SerializationError, flag: &str
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_plan(
-    path: &PathBuf,
-    out: Option<&PathBuf>,
+    path: &Path,
+    out: Option<&Path>,
     detail: DetailLevel,
     tui: bool,
     refresh: bool,
@@ -679,7 +679,7 @@ async fn build_upstream_backend(
     policy: UpstreamMissingStatePolicy,
 ) -> Result<Box<dyn StateBackend>, AppError> {
     let loaded = load_configuration_with_config(
-        &source_abs.to_path_buf(),
+        source_abs,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )

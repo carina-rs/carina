@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -40,7 +40,7 @@ use crate::wiring::{
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_destroy(
-    path: &PathBuf,
+    path: &Path,
     auto_approve: bool,
     lock: bool,
     refresh: bool,

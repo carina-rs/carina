@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use colored::Colorize;
 use serde::Serialize;
@@ -49,7 +49,7 @@ struct ValidateWarning {
 ///
 /// Not used outside test code.
 pub fn validate_with_factories(
-    path: &PathBuf,
+    path: &Path,
     factories: Vec<Box<dyn carina_core::provider::ProviderFactory>>,
 ) -> Vec<String> {
     let provider_context = ProviderContext::default();
@@ -106,7 +106,7 @@ fn format_inference_errors(
 }
 
 pub fn run_validate(
-    path: &PathBuf,
+    path: &Path,
     json: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {

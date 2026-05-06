@@ -44,7 +44,7 @@ pub struct LoadedConfig {
 }
 
 /// Load configuration from a directory containing .crn files
-pub fn load_configuration(path: &PathBuf) -> Result<LoadedConfig, String> {
+pub fn load_configuration(path: &Path) -> Result<LoadedConfig, String> {
     load_configuration_with_config(path, &ProviderContext::default(), &SchemaRegistry::new())
 }
 
@@ -52,7 +52,7 @@ pub fn load_configuration(path: &PathBuf) -> Result<LoadedConfig, String> {
 ///
 /// File paths are rejected — pass a directory instead.
 pub fn load_configuration_with_config(
-    path: &PathBuf,
+    path: &Path,
     config: &ProviderContext,
     schemas: &SchemaRegistry,
 ) -> Result<LoadedConfig, String> {
@@ -226,8 +226,7 @@ pub fn parse_directory_with_overrides(
     config: &ProviderContext,
     overrides: &HashMap<String, String>,
 ) -> Result<ParsedFile, String> {
-    let dir_buf = dir.to_path_buf();
-    let files = find_crn_files_in_dir(&dir_buf)?;
+    let files = find_crn_files_in_dir(dir)?;
     let mut paths: Vec<(std::path::PathBuf, String)> = files
         .into_iter()
         .filter_map(|p| {
@@ -239,7 +238,7 @@ pub fn parse_directory_with_overrides(
     // buffer the user hasn't saved). Keep the list de-duplicated by name.
     for name in overrides.keys() {
         if !paths.iter().any(|(_, n)| n == name) {
-            paths.push((dir_buf.join(name), name.clone()));
+            paths.push((dir.join(name), name.clone()));
         }
     }
     if paths.is_empty() {
@@ -324,13 +323,13 @@ pub fn get_base_dir(path: &Path) -> &Path {
 }
 
 /// Find all .crn files recursively in a directory, skipping hidden dirs, target, and node_modules
-pub fn find_crn_files_recursive(dir: &PathBuf) -> Result<Vec<PathBuf>, String> {
+pub fn find_crn_files_recursive(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut files = Vec::new();
     collect_crn_files_recursive(dir, &mut files)?;
     Ok(files)
 }
 
-fn collect_crn_files_recursive(dir: &PathBuf, files: &mut Vec<PathBuf>) -> Result<(), String> {
+fn collect_crn_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
     let entries = fs::read_dir(dir)
         .map_err(|e| format!("Failed to read directory {}: {}", dir.display(), e))?;
 
@@ -352,8 +351,14 @@ fn collect_crn_files_recursive(dir: &PathBuf, files: &mut Vec<PathBuf>) -> Resul
     Ok(())
 }
 
-/// Find .crn files in a single directory (non-recursive)
-pub fn find_crn_files_in_dir(dir: &PathBuf) -> Result<Vec<PathBuf>, String> {
+/// Find .crn files in a single directory (non-recursive).
+///
+/// The returned paths are sorted by `PathBuf` ordering, which for a
+/// single-directory listing degenerates to filename order. Callers that
+/// walk siblings independently (rather than going through
+/// `parse_directory`'s merge path) get deterministic order across
+/// filesystems (#2449).
+pub fn find_crn_files_in_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let entries = fs::read_dir(dir)
         .map_err(|e| format!("Failed to read directory {}: {}", dir.display(), e))?;
 
@@ -365,6 +370,7 @@ pub fn find_crn_files_in_dir(dir: &PathBuf) -> Result<Vec<PathBuf>, String> {
             files.push(path);
         }
     }
+    files.sort();
     Ok(files)
 }
 
@@ -403,13 +409,41 @@ mod tests {
         fs::write(dir.join("a.crn"), "").unwrap();
         fs::write(dir.join("b.crn"), "").unwrap();
 
-        let mut result = find_crn_files_in_dir(&dir).unwrap();
-        result.sort();
+        let result = find_crn_files_in_dir(&dir).unwrap();
         assert_eq!(result.len(), 2);
         assert!(result[0].ends_with("a.crn"));
         assert!(result[1].ends_with("b.crn"));
         cleanup(&dir);
     }
+
+    #[test]
+    fn find_crn_files_in_dir_returns_paths_sorted_by_name() {
+        // #2449: callers that walk siblings independently (rather than
+        // through `parse_directory`'s merge path) used to inherit the
+        // filesystem-dependent order. Pin lexicographic order so first-
+        // match-wins lookups are deterministic across ext4 / APFS / tmpfs.
+        // Insert the files in reverse name order to defeat the common
+        // "creation order == listing order" fallback on tmpfs.
+        let dir = create_temp_dir("in_dir_sorted");
+        for name in ["z.crn", "m.crn", "a.crn", "providers.crn", "main.crn"] {
+            fs::write(dir.join(name), "").unwrap();
+        }
+        let result = find_crn_files_in_dir(&dir).unwrap();
+        let names: Vec<String> = result
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a.crn", "m.crn", "main.crn", "providers.crn", "z.crn"]
+        );
+        cleanup(&dir);
+    }
+
+    // #2465: pin the signature as `&Path`-accepting at compile time, so a
+    // future revert to `&PathBuf` fails to build instead of silently
+    // re-introducing the `.to_path_buf()` ceremony at every LSP callsite.
+    const _: fn(&Path) -> Result<Vec<PathBuf>, String> = find_crn_files_in_dir;
 
     #[test]
     fn find_crn_files_in_dir_ignores_non_crn_files() {
