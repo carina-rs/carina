@@ -104,6 +104,13 @@ impl CompletionProvider {
                 .upstream_state_dot_completions(&binding, &partial, &source, position, base_path);
         }
 
+        // Without this branch the surrounding string-literal context
+        // suppresses completion entirely — the value-position path
+        // declines once `after_eq` starts with a double quote.
+        if let Some(partial) = detect_interpolation_bare_partial(&text, position) {
+            return self.in_scope_binding_completions(&text, position, &partial, base_path);
+        }
+
         let context = self.get_completion_context(&text, position);
 
         match context {
@@ -153,7 +160,7 @@ impl CompletionProvider {
                 self.upstream_state_source_completions(&partial_path, position, base_path)
             }
             CompletionContext::ForIterable { partial } => {
-                self.for_iterable_completions(&text, position, &partial, base_path)
+                self.in_scope_binding_completions(&text, position, &partial, base_path)
             }
             CompletionContext::None => vec![],
         }
@@ -967,6 +974,63 @@ struct UpstreamDepth2Match {
     source: String,
 }
 
+/// Returns `None` past a dot inside the interpolation (the
+/// depth-1/depth-2 dot detectors cover those), when no unescaped `${`
+/// opens to the left, or when the cursor isn't inside a double-quoted
+/// string on this line. Single-quoted strings are literal-only.
+fn detect_interpolation_bare_partial(text: &str, position: Position) -> Option<String> {
+    let line_idx = position.line as usize;
+    let current_line = text.lines().nth(line_idx)?;
+    // Cheap bail for the 99% common case: no `$` on this line, no
+    // interpolation possible. Avoids the prefix allocation below.
+    if !current_line.as_bytes().contains(&b'$') {
+        return None;
+    }
+
+    let col = position.character as usize;
+    let prefix: String = current_line.chars().take(col).collect();
+
+    let mut tail_start = prefix.len();
+    for (idx, ch) in prefix.char_indices().rev() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            tail_start = idx;
+        } else {
+            break;
+        }
+    }
+    let partial = &prefix[tail_start..];
+    let before_partial = &prefix[..tail_start];
+
+    let before_brace = before_partial.strip_suffix('{')?.strip_suffix('$')?;
+    if before_brace.ends_with('\\') {
+        return None;
+    }
+
+    if !is_inside_double_quoted_string(before_brace) {
+        return None;
+    }
+
+    Some(partial.to_string())
+}
+
+/// Returns true when an unmatched (odd-count) double quote opens a
+/// string literal somewhere in `prefix`. Backslash-escaped quotes
+/// (`\"`) don't open or close the literal and are skipped.
+fn is_inside_double_quoted_string(prefix: &str) -> bool {
+    let mut open = false;
+    let mut chars = prefix.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            chars.next();
+            continue;
+        }
+        if c == '"' {
+            open = !open;
+        }
+    }
+    open
+}
+
 /// Walk back from the end of `prefix` collecting the trailing run of
 /// `<id>(.<id>)*<.partial>` (where `partial` may be empty after a
 /// trailing `.`). Returns exactly `n` segments — earliest first — or
@@ -1152,8 +1216,87 @@ fn parse_source_partial_from(s: &str) -> Option<String> {
 #[cfg(test)]
 mod helper_tests {
     use super::{
-        extract_source_partial_anywhere, extract_upstream_source_partial, is_let_use_line,
+        detect_interpolation_bare_partial, extract_source_partial_anywhere,
+        extract_upstream_source_partial, is_inside_double_quoted_string, is_let_use_line,
     };
+    use tower_lsp::lsp_types::Position;
+
+    fn pos_at_end(text: &str) -> Position {
+        let last = text.lines().last().unwrap_or("");
+        Position {
+            line: text.lines().count().saturating_sub(1) as u32,
+            character: last.chars().count() as u32,
+        }
+    }
+
+    #[test]
+    fn double_quote_parity_inside_outside() {
+        assert!(!is_inside_double_quoted_string(""));
+        assert!(is_inside_double_quoted_string("foo = \""));
+        assert!(!is_inside_double_quoted_string("foo = \"bar\""));
+        // Escaped quote is a literal — neither opens nor closes.
+        assert!(is_inside_double_quoted_string("foo = \"a\\\""));
+    }
+
+    #[test]
+    fn interpolation_bare_partial_after_open_brace() {
+        let text = "policy = \"arn:${";
+        assert_eq!(
+            detect_interpolation_bare_partial(text, pos_at_end(text)).as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn interpolation_bare_partial_with_typed_chars() {
+        let text = "policy = \"arn:${o";
+        assert_eq!(
+            detect_interpolation_bare_partial(text, pos_at_end(text)).as_deref(),
+            Some("o")
+        );
+    }
+
+    #[test]
+    fn interpolation_bare_partial_rejected_after_dot() {
+        // After a dot, depth-1/depth-2 detectors take over — the bare
+        // detector must decline.
+        let text = "policy = \"arn:${orgs.";
+        assert_eq!(
+            detect_interpolation_bare_partial(text, pos_at_end(text)),
+            None
+        );
+    }
+
+    #[test]
+    fn interpolation_bare_partial_rejected_outside_string() {
+        // `${` outside a double-quoted string isn't an interpolation.
+        let text = "policy = ${";
+        assert_eq!(
+            detect_interpolation_bare_partial(text, pos_at_end(text)),
+            None
+        );
+    }
+
+    #[test]
+    fn interpolation_bare_partial_rejected_in_single_quoted_string() {
+        // Single-quoted strings are literal-only — `${` is not an
+        // interpolation there.
+        let text = "policy = '${";
+        assert_eq!(
+            detect_interpolation_bare_partial(text, pos_at_end(text)),
+            None
+        );
+    }
+
+    #[test]
+    fn interpolation_bare_partial_rejected_when_dollar_is_escaped() {
+        // `\${` is a literal `${`, not an interpolation opener.
+        let text = "policy = \"arn:\\${";
+        assert_eq!(
+            detect_interpolation_bare_partial(text, pos_at_end(text)),
+            None
+        );
+    }
 
     #[test]
     fn single_quote_unclosed_returns_partial() {

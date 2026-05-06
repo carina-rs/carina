@@ -359,6 +359,13 @@ impl LanguageServer for Backend {
                         // requiring a manual Ctrl-Space. Harmless outside import paths:
                         // other contexts return nothing for a bare `/`.
                         "/".to_string(),
+                        // `{` opens an interpolation expression (`${`) inside a
+                        // double-quoted string. Without it the editor never asks the
+                        // server for completion at the empty interpolation position,
+                        // so in-scope binding names (`orgs`, `bucket`, …) wouldn't
+                        // surface until the user typed an identifier char or hit
+                        // Ctrl-Space manually.
+                        "{".to_string(),
                     ]),
                     ..Default::default()
                 }),
