@@ -1,0 +1,21 @@
+# Test upstream_state map dot-notation across sibling .crn files (#2447).
+#
+# Symmetric with `upstream_state_map_subscript`: `let X = upstream_state {...}`
+# lives in `state.crn`; the consuming `${X.field.key}` lives in this
+# `main.crn`. The fix in #2447 makes the dot-notation form lower to a
+# `Value::ResourceRef` so the resolver substitutes the upstream's
+# concrete map value instead of leaving the literal `orgs.accounts.k`
+# substring in the rendered plan.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.s3.Bucket {
+  bucket_name = "shared-${orgs.accounts.registry_dev}-bucket"
+
+  tags = {
+    DevAccount  = orgs.accounts.registry_dev
+    ProdAccount = orgs.accounts.registry_prod
+  }
+}

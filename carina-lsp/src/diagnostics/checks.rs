@@ -1068,22 +1068,53 @@ impl DiagnosticEngine {
         ))
     }
 
-    /// Validate an attributes value against its declared type.
-    ///
-    /// Skips ResourceRef values (type is resolved at runtime), then delegates all
-    /// validation to `carina_core::validation::validate_type_expr_value`.
+    /// Validate an attributes value against its declared type, with
+    /// cross-file ref awareness so a `ResourceRef` whose head lives in
+    /// a sibling `.crn` is resolved against the schema instead of being
+    /// silently skipped.
     fn validate_attributes_type(
         &self,
         type_expr: &TypeExpr,
         value: &Value,
         sibling_bindings: &HashMap<String, String>,
     ) -> Option<String> {
-        // ResourceRef is always allowed (type is resolved at runtime)
-        if matches!(value, Value::ResourceRef { .. }) {
+        self.validate_type_with_ref_awareness(type_expr, value, sibling_bindings)
+    }
+
+    /// Look up `binding.attr` against `sibling_bindings` + the schema
+    /// registry, then compare the resolved schema type against
+    /// `type_expr`. Returns the formatted diagnostic on mismatch, or
+    /// `None` if the binding/attr cannot be resolved (deferred to the CLI).
+    fn check_cross_file_ref_type(
+        &self,
+        type_expr: &TypeExpr,
+        binding: &str,
+        attr: &str,
+        sibling_bindings: &HashMap<String, String>,
+    ) -> Option<String> {
+        let resource_type = sibling_bindings.get(binding)?;
+        let (provider, rt) = resource_type
+            .split_once('.')
+            .unwrap_or(("", resource_type.as_str()));
+        let schema = self
+            .schemas
+            .get(provider, rt, carina_core::schema::SchemaKind::Managed)
+            .or_else(|| {
+                self.schemas
+                    .get(provider, rt, carina_core::schema::SchemaKind::DataSource)
+            })?;
+        let attr_schema = schema.attributes.get(attr)?;
+        let ref_type = &attr_schema.attr_type;
+        if carina_core::validation::is_type_expr_compatible_with_schema(type_expr, ref_type) {
             return None;
         }
-
-        self.validate_type_with_ref_awareness(type_expr, value, sibling_bindings)
+        Some(format!(
+            "type mismatch: expected {}, got {} (from {}.{})",
+            type_expr,
+            ref_type.type_name(),
+            binding,
+            attr
+        ))
     }
 
     /// Type-check a value against a TypeExpr, resolving cross-file references
@@ -1095,48 +1126,34 @@ impl DiagnosticEngine {
         sibling_bindings: &HashMap<String, String>,
     ) -> Option<String> {
         match (type_expr, value) {
-            // Cross-file ref: look up schema type via sibling bindings
+            // Cross-file ref: look up schema type via sibling bindings.
+            // Two shapes reach this arm. The string form covers values
+            // not produced by the .crn parser — synthetic test inputs
+            // and any caller that hands us a raw `"binding.attr"` —
+            // since the parser itself now lowers dotted IDs to
+            // `Value::ResourceRef` (#2447). The ResourceRef arm below
+            // is the parser-produced path; both must agree.
             (_, Value::String(s)) if is_dot_notation_ref(s) => {
                 let parts: Vec<&str> = s.split('.').collect();
-                let binding = parts[0];
-                let attr = parts[1];
-
-                // Look up resource type from sibling bindings
-                if let Some(resource_type) = sibling_bindings.get(binding) {
-                    // Look up attribute schema type
-                    let (provider, rt) = resource_type
-                        .split_once('.')
-                        .unwrap_or(("", resource_type.as_str()));
-                    if let Some(schema) = self
-                        .schemas
-                        .get(provider, rt, carina_core::schema::SchemaKind::Managed)
-                        .or_else(|| {
-                            self.schemas.get(
-                                provider,
-                                rt,
-                                carina_core::schema::SchemaKind::DataSource,
-                            )
-                        })
-                        && let Some(attr_schema) = schema.attributes.get(attr)
-                    {
-                        let ref_type = &attr_schema.attr_type;
-                        if !carina_core::validation::is_type_expr_compatible_with_schema(
-                            type_expr, ref_type,
-                        ) {
-                            return Some(format!(
-                                "type mismatch: expected {}, got {} (from {}.{})",
-                                type_expr,
-                                ref_type.type_name(),
-                                binding,
-                                attr
-                            ));
-                        }
-                        return None;
-                    }
-                }
-                // Can't resolve: skip (will be validated by CLI)
-                None
+                self.check_cross_file_ref_type(type_expr, parts[0], parts[1], sibling_bindings)
             }
+            // Bare `binding.attribute` ref: check the head's schema type.
+            // Refs with subscripts or a field_path narrow inside the
+            // head's type and would need a positional walker to compare
+            // against the receiver precisely (#2475); skip the
+            // comparison rather than false-flag against the head's
+            // outer type.
+            (_, Value::ResourceRef { path })
+                if path.field_path().is_empty() && path.subscripts().is_empty() =>
+            {
+                self.check_cross_file_ref_type(
+                    type_expr,
+                    path.binding(),
+                    path.attribute(),
+                    sibling_bindings,
+                )
+            }
+            (_, Value::ResourceRef { .. }) => None,
             // List: recurse into elements
             (TypeExpr::List(inner), Value::List(items)) => {
                 for (i, item) in items.iter().enumerate() {
@@ -1175,8 +1192,6 @@ impl DiagnosticEngine {
                 }
                 None
             }
-            // ResourceRef: skip (resolved at runtime)
-            (_, Value::ResourceRef { .. }) => None,
             // Everything else: normal validation
             _ => carina_core::validation::validate_type_expr_value(
                 type_expr,

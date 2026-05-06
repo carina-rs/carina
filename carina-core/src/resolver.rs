@@ -173,35 +173,30 @@ pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<V
                 // Resolve the initial attribute value
                 let mut resolved = resolve_ref_value(attr_value, bindings)?;
 
-                // Traverse chained field path through nested maps
+                // For upstream bindings the loaded `Value::Map` is
+                // concrete, so a missing field/key is a user typo and
+                // gets a "key not found" error. For local bindings the
+                // value may simply not be known yet (referenced
+                // resource not created) and we keep the ref unchanged.
+                let is_upstream = matches!(
+                    bindings.source(binding_name),
+                    Some(crate::binding_index::BindingValueSource::Upstream)
+                );
                 for field in field_path {
                     match resolved {
-                        Value::Map(ref map) => {
-                            if let Some(nested) = map.get(field) {
+                        Value::Map(ref map) => match map.get(field) {
+                            Some(nested) => {
                                 resolved = resolve_ref_value(nested, bindings)?;
-                            } else {
-                                // Field not found in nested map, keep original ref
-                                return Ok(value.clone());
                             }
-                        }
-                        _ => {
-                            // Cannot traverse non-map value, keep original ref
-                            return Ok(value.clone());
-                        }
+                            None if is_upstream => {
+                                return Err(missing_map_key_error(path, map));
+                            }
+                            None => return Ok(value.clone()),
+                        },
+                        _ => return Ok(value.clone()),
                     }
                 }
 
-                // Descend into the resolved value by each post-field
-                // subscript (`orgs.accounts[0]`, `orgs.matrix[0][1]`).
-                // The validate-time shape check
-                // (`check_upstream_state_subscript_shapes`) already
-                // rejects kind mismatches against typed exports, so by
-                // the time we get here the subscripts should fit the
-                // shape — but the resolver still has to handle the
-                // happy path and bail out cleanly when an out-of-range
-                // index or missing key is encountered (e.g. resources
-                // produced by `for` whose count differs from the
-                // upstream's declared length).
                 use crate::resource::Subscript;
                 for sub in path.subscripts() {
                     match (resolved, sub) {
@@ -218,27 +213,10 @@ pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<V
                             Some(nested) => {
                                 resolved = resolve_ref_value(nested, bindings)?;
                             }
-                            None => {
-                                // When the map is concrete (the upstream's
-                                // value was loaded) and the requested key
-                                // is not in its keyset, the user typo'd
-                                // the key. Surface a clear error listing
-                                // the known keys instead of silently
-                                // degrading to "(known after upstream
-                                // apply: …)". Issue #2435.
-                                let known_list = if map.is_empty() {
-                                    "<no keys>".to_string()
-                                } else {
-                                    map.keys()
-                                        .map(|k| format!("{k:?}"))
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                };
-                                return Err(format!(
-                                    "{}: key not found; available keys: {}",
-                                    path, known_list
-                                ));
+                            None if is_upstream => {
+                                return Err(missing_map_key_error(path, &map));
                             }
+                            None => return Ok(value.clone()),
                         },
                         _ => return Ok(value.clone()),
                     }
@@ -327,6 +305,24 @@ pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<V
         Value::Unknown(_) => Ok(value.clone()),
         _ => Ok(value.clone()),
     }
+}
+
+/// Format the "key not found; available keys: ..." error for a missing
+/// map entry. Shared by the `field_path` (dot-notation, #2447) and
+/// `subscripts` (#2435) walks so the message format cannot drift.
+fn missing_map_key_error(
+    path: &crate::resource::AccessPath,
+    map: &indexmap::IndexMap<String, Value>,
+) -> String {
+    let known_list = if map.is_empty() {
+        "<no keys>".to_string()
+    } else {
+        map.keys()
+            .map(|k| format!("{k:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!("{path}: key not found; available keys: {known_list}")
 }
 
 #[cfg(test)]

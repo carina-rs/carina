@@ -71,3 +71,9 @@ fn plan_fixture_upstream_state_map_subscript() {
     let output = run_plan_fixture(&["upstream_state_map_subscript"]);
     assert_success(&output, "upstream_state_map_subscript");
 }
+
+#[test]
+fn plan_fixture_upstream_state_map_dot_notation() {
+    let output = run_plan_fixture(&["upstream_state_map_dot_notation"]);
+    assert_success(&output, "upstream_state_map_dot_notation");
+}
