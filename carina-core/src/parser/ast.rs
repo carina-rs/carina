@@ -148,6 +148,22 @@ impl TypeExpr {
             other => Some(other),
         }
     }
+
+    /// True when this `TypeExpr` represents a string-shaped value at
+    /// runtime: bare `String`, a `Simple` named identity (typically a
+    /// string-base custom like `AwsAccountId`), or a `SchemaType`
+    /// (provider-defined string-typed identifier like
+    /// `awscc.ec2.VpcId`). Callers use this to accept these in any
+    /// string-compatible receiver position; the symmetric strictness
+    /// in the opposite direction (`String → Custom{Specific}`) is
+    /// enforced by `attr_type_demands_specific_custom` in the
+    /// validation crate.
+    pub fn is_string_shaped(&self) -> bool {
+        matches!(
+            self,
+            TypeExpr::String | TypeExpr::Simple(_) | TypeExpr::SchemaType { .. }
+        )
+    }
 }
 
 impl std::fmt::Display for TypeExpr {

@@ -522,66 +522,158 @@ fn check_ref_against_type(
     location: &str,
     errors: &mut Vec<UpstreamTypeError>,
 ) {
-    value.visit_refs(&mut |path| {
-        let binding = path.binding();
-        let field = path.attribute();
-        let Some(keys) = exports.get(binding) else {
-            return;
-        };
-        let Some(Some(export_type)) = keys.get(field) else {
-            // Either the field isn't in the export set (already reported
-            // by `check_upstream_state_field_references`) or it has no
-            // declared type — nothing to type-check against.
-            return;
-        };
+    walk_value_against_type(value, expected, exports, location, errors);
+}
 
-        // Narrow the export type through the access path's `field_path`
-        // and `subscripts`. `${orgs.accounts['k']}` over an export of
-        // `map(AwsAccountId)` resolves to `AwsAccountId`, not the whole
-        // map; the position-compatibility check must use the narrowed
-        // type so a bucket-policy interpolation isn't false-flagged
-        // against the outer `Struct(IamPolicyDocument)` (#2447).
-        let Some(narrowed) = narrow_type_expr(export_type, path.field_path(), path.subscripts())
-        else {
-            // Kind mismatch (subscripting an Int, dotting into a
-            // String, etc.) is the dedicated shape checkers' job —
-            // `check_upstream_state_attribute_access_shapes` for the
-            // field_path leg, `check_upstream_state_subscript_shapes`
-            // for the subscript leg. Skip here so we don't
-            // double-report.
-            return;
-        };
-
-        // Once narrowing through `field_path`/`subscripts` has reduced
-        // the export to a scalar leaf, we can't usefully compare it to
-        // the *outer* attribute type from here: the ref may sit deep
-        // inside a string interpolation, a struct field, or a list
-        // element, and only a positional walker can pick out the right
-        // inner expected type. Accepting the scalar matches reality
-        // (a resolved scalar can occupy nearly any leaf position) and
-        // stops the top-level check from false-flagging the
-        // bucket-policy shape from #2447.
-        //
-        // Only applies when the path actually narrowed: a top-level
-        // ref with neither `field_path` nor `subscripts` still gets the
-        // direct compare against the outer attribute type, preserving
-        // the existing kind-mismatch diagnostics
-        // (`type_check_flags_string_consumer_with_int_export` etc.).
-        let narrowed_below_root = !path.field_path().is_empty() || !path.subscripts().is_empty();
-        if narrowed_below_root && is_scalar_type_expr(&narrowed) {
-            return;
+/// Positional walker: descend `value` and `expected` in lockstep,
+/// threading the inner expected type to each leaf `Value::ResourceRef`
+/// so the comparison fires against the *position's* schema type rather
+/// than the outer attribute's. Without this, a ref deep inside a
+/// struct field or interpolation gets compared to the outer attr type
+/// and either false-flags or silently passes (the
+/// `is_scalar_type_expr` short-circuit before #2475).
+///
+/// Assumes the receiver `AttributeType` exposes its container shape
+/// directly: a `Map`/`List`/`Struct` receiver is matched as such.
+/// `Custom { base: <Container> }` is not unwrapped here — provider
+/// schemas keep `Custom` over scalar bases only, so the catch-all
+/// best-effort walk is sufficient. If a future schema introduces a
+/// `Custom { base: Map(_) }` shape, add an explicit `Custom` arm that
+/// recurses on `base`.
+fn walk_value_against_type(
+    value: &Value,
+    expected: &AttributeType,
+    exports: &UpstreamExports,
+    location: &str,
+    errors: &mut Vec<UpstreamTypeError>,
+) {
+    match value {
+        Value::ResourceRef { path } => {
+            check_resource_ref_at_position(path, expected, exports, location, errors);
         }
-
-        if crate::validation::is_type_expr_compatible_with_schema(&narrowed, expected) {
-            return;
+        Value::List(items) => {
+            // Descend `list(T)` element-wise. For non-list receivers
+            // the existing top-level shape check (run elsewhere)
+            // already flags the kind mismatch, so we just walk each
+            // element against the same expected type — the leaf-ref
+            // comparison will fire if the element doesn't fit.
+            let inner = match expected {
+                AttributeType::List { inner, .. } => inner.as_ref(),
+                _ => expected,
+            };
+            for item in items {
+                walk_value_against_type(item, inner, exports, location, errors);
+            }
         }
-        errors.push(UpstreamTypeError {
-            location: location.to_string(),
-            binding: binding.to_string(),
-            field: field.to_string(),
-            export_type: narrowed,
-            expected_type: expected.clone(),
-        });
+        Value::Map(entries) => match expected {
+            AttributeType::Map { value: inner, .. } => {
+                for v in entries.values() {
+                    walk_value_against_type(v, inner, exports, location, errors);
+                }
+            }
+            AttributeType::Struct { fields, .. } => {
+                // Resolve via `build_accepted_field_map` so `block_name`
+                // aliases (`field { ... }` block syntax) reach the
+                // same field as the canonical name. Without this a
+                // ref written under the alias key would silently skip
+                // the type check.
+                let accepted = crate::schema::build_accepted_field_map(fields);
+                for (key, v) in entries {
+                    if let Some(field) = accepted.get(key.as_str()) {
+                        walk_value_against_type(v, &field.field_type, exports, location, errors);
+                    }
+                    // Unknown struct fields are flagged by the schema
+                    // validator; don't double-report here.
+                }
+            }
+            _ => {
+                // Receiver isn't a `Map`/`Struct` — Union receivers in
+                // particular land here. We don't try each Union member
+                // (would require committing to a best-fit member, which
+                // is the schema validator's job at the top level);
+                // walking each value against the whole Union still lets
+                // leaf-ref checks dispatch via
+                // `is_type_expr_compatible_with_schema`'s Union arm.
+                for v in entries.values() {
+                    walk_value_against_type(v, expected, exports, location, errors);
+                }
+            }
+        },
+        Value::Interpolation(parts) => {
+            // The result of an interpolation is always a string, so
+            // every embedded `Expr` part sits in a String position
+            // regardless of where the interpolation itself appears.
+            for part in parts {
+                if let crate::resource::InterpolationPart::Expr(v) = part {
+                    walk_value_against_type(v, &AttributeType::String, exports, location, errors);
+                }
+            }
+        }
+        Value::Secret(inner) => {
+            walk_value_against_type(inner, expected, exports, location, errors);
+        }
+        Value::FunctionCall { args, .. } => {
+            // Function arguments occupy function-internal positions
+            // whose declared types live on the function definition
+            // (out of reach here). Walk with `expected` as a
+            // best-effort so leaf refs get *some* check; precision
+            // would require typed function signatures.
+            for arg in args {
+                walk_value_against_type(arg, expected, exports, location, errors);
+            }
+        }
+        Value::String(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Unknown(_) => {
+        }
+    }
+}
+
+/// Compare a single `ResourceRef` against the receiver type at its
+/// position. Narrows the export type through the access path's
+/// `field_path` / `subscripts` first (a positional walker by itself is
+/// not enough — `accounts['k']` still has to step through `map(T) → T`
+/// before comparing).
+fn check_resource_ref_at_position(
+    path: &crate::resource::AccessPath,
+    expected: &AttributeType,
+    exports: &UpstreamExports,
+    location: &str,
+    errors: &mut Vec<UpstreamTypeError>,
+) {
+    let binding = path.binding();
+    let field = path.attribute();
+    let Some(keys) = exports.get(binding) else {
+        return;
+    };
+    let Some(Some(export_type)) = keys.get(field) else {
+        return;
+    };
+    let Some(narrowed) = narrow_type_expr(export_type, path.field_path(), path.subscripts()) else {
+        // Kind mismatch through the access path — already reported by
+        // `check_upstream_state_attribute_access_shapes` /
+        // `check_upstream_state_subscript_shapes`. Skip to avoid
+        // double-reporting.
+        return;
+    };
+    if crate::validation::is_type_expr_compatible_with_schema(&narrowed, expected) {
+        return;
+    }
+    // Narrowed-string-shape vs string-receiver: a `Simple("aws_account_id")`
+    // (or any other string-compatible scalar identity) can sit in any
+    // string-compatible position. The strict compat check rejects this
+    // direction (it walks the receiver's `Custom` chain looking for the
+    // exact identity; `String` carries no chain), but the runtime
+    // value is a string, so the position is satisfiable. The reverse
+    // direction (`String → Custom{Specific}`) stays strict via
+    // `attr_type_demands_specific_custom`. #2475.
+    if narrowed.is_string_shaped() && crate::validation::is_string_compatible_type(expected) {
+        return;
+    }
+    errors.push(UpstreamTypeError {
+        location: location.to_string(),
+        binding: binding.to_string(),
+        field: field.to_string(),
+        export_type: narrowed,
+        expected_type: expected.clone(),
     });
 }
 
@@ -608,24 +700,6 @@ fn narrow_type_expr(
         };
     }
     Some(current)
-}
-
-/// True when `t` is a non-container leaf — a scalar value that can
-/// reasonably sit anywhere a string-shaped attribute position accepts.
-/// Used by `check_ref_against_type` to short-circuit the (necessarily
-/// outer-type-only) compatibility check once narrowing has bottomed out
-/// on a scalar; a positional walker would be the right tool to recover
-/// the precision lost here. See #2475 for the follow-up.
-fn is_scalar_type_expr(t: &TypeExpr) -> bool {
-    matches!(
-        t,
-        TypeExpr::String
-            | TypeExpr::Bool
-            | TypeExpr::Int
-            | TypeExpr::Float
-            | TypeExpr::Simple(_)
-            | TypeExpr::SchemaType { .. }
-    )
 }
 
 /// A `for` expression iterates an `upstream_state` field whose declared
@@ -1990,6 +2064,200 @@ mod tests {
         assert!(
             errs.is_empty(),
             "list subscript narrows list(T) to T before compare, got: {errs:?}"
+        );
+    }
+
+    // ================================================================
+    // #2475: positional walker — narrowed scalar is compared against the
+    // *position* type, not the outer attribute type.
+    // ================================================================
+
+    #[test]
+    fn type_check_walker_resolves_struct_block_name_alias() {
+        // The walker's `Struct` arm resolves field keys via
+        // `build_accepted_field_map`, which honours `block_name`
+        // aliases. Without that resolution a ref written under the
+        // alias would silently skip the type check (the alias key
+        // wouldn't match any `field.name`). Pin the path: a field
+        // declared as `name="statements", block_name="statement"`
+        // accessed via the alias must still get its leaf ref checked
+        // — here the leaf is a narrowed `Int` against a `String`
+        // declaration, so the walker must flag the mismatch.
+        use crate::schema::{AttributeType, StructField};
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    policy = {
+                        statement = orgs.counts['k']
+                    }
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[("counts", TypeExpr::Map(Box::new(TypeExpr::Int)))],
+        )]);
+        let policy_struct = AttributeType::Struct {
+            name: "PolicyDoc".to_string(),
+            fields: vec![
+                StructField::new("statements", AttributeType::String)
+                    .required()
+                    .with_block_name("statement"),
+            ],
+        };
+        let schemas = schema_with_attr("policy", policy_struct);
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        assert_eq!(
+            errs.len(),
+            1,
+            "ref under block_name alias `statement` must be type-checked, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn type_check_narrowed_int_in_int_field_passes_without_string_shape_leniency() {
+        // Counterpart to the mismatched-leaf test below: narrowed Int
+        // against an Int-typed struct field must pass via the strict
+        // compatibility check, not via the string-shape leniency arm
+        // (which only fires for `is_string_compatible_type` receivers).
+        // Pin the path so a regression that wrongly broadened leniency
+        // would still surface.
+        use crate::schema::{AttributeType, StructField};
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    config = {
+                        port = orgs.ports['k']
+                    }
+                }
+            "#,
+            "test",
+        );
+        let exports =
+            mk_typed_exports(&[("orgs", &[("ports", TypeExpr::Map(Box::new(TypeExpr::Int)))])]);
+        let cfg_struct = AttributeType::Struct {
+            name: "Cfg".to_string(),
+            fields: vec![StructField::new("port", AttributeType::Int).required()],
+        };
+        let schemas = schema_with_attr("config", cfg_struct);
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        assert!(
+            errs.is_empty(),
+            "narrowed Int in Int-typed struct field must pass strict compat, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn type_check_narrowed_scalar_in_struct_field_with_mismatched_leaf_flags() {
+        // Acceptance criterion 1 from #2475: a narrowed `Int` (from a
+        // subscript on `map(Int)`) sitting in a struct field whose
+        // declared type is `String` must be flagged. Pre-#2475 the
+        // `is_scalar_type_expr` short-circuit silently accepted this.
+        use crate::schema::{AttributeType, StructField};
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    policy = {
+                        statement = orgs.counts['k']
+                    }
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[("counts", TypeExpr::Map(Box::new(TypeExpr::Int)))],
+        )]);
+        let policy_struct = AttributeType::Struct {
+            name: "PolicyDoc".to_string(),
+            fields: vec![StructField::new("statement", AttributeType::String).required()],
+        };
+        let schemas = schema_with_attr("policy", policy_struct);
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        assert_eq!(
+            errs.len(),
+            1,
+            "narrowed Int in String-typed struct field must flag, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn type_check_narrowed_scalar_in_struct_field_with_matching_leaf_passes() {
+        // Acceptance criterion 2 from #2475: the same shape but the
+        // struct field's declared type matches the narrowed scalar —
+        // the bucket-policy repro from #2447 — must continue to pass.
+        // (Pre-fix this passed via the `is_scalar_type_expr`
+        // short-circuit; post-fix it must pass via the positional
+        // walker comparing AwsAccountId against the field's String.)
+        use crate::schema::{AttributeType, StructField};
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    policy = {
+                        statement = "arn:aws:iam::${orgs.accounts['registry_dev']}:root"
+                    }
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[(
+                "accounts",
+                TypeExpr::Map(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+            )],
+        )]);
+        let policy_struct = AttributeType::Struct {
+            name: "IamPolicyDocument".to_string(),
+            fields: vec![StructField::new("statement", AttributeType::String).required()],
+        };
+        let schemas = schema_with_attr("policy", policy_struct);
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        assert!(
+            errs.is_empty(),
+            "narrowed AwsAccountId in String-shaped position must pass, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn type_check_narrowed_map_inside_interpolation_flags() {
+        // Acceptance criterion 3 from #2475: a `map(_)` ref embedded
+        // inside a string interpolation cannot satisfy the String
+        // position the interpolation forces. The outer attribute is
+        // `tags: Map(String, String)`, so the *outer* compare
+        // `map(...)` vs `map(String)` would happily succeed (inner
+        // String ⊑ String). Only a positional walker, descending into
+        // the map value's interpolation, can spot that the
+        // interpolation position is String and the embedded ref is a
+        // `map(...)`. Pre-#2475 this regression slipped through.
+        use crate::schema::AttributeType;
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    tags = { Foo = "all accounts: ${orgs.accounts}" }
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[(
+                "accounts",
+                TypeExpr::Map(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+            )],
+        )]);
+        let schemas = schema_with_attr("tags", AttributeType::map(AttributeType::String));
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        assert_eq!(
+            errs.len(),
+            1,
+            "map embedded in tag-value interpolation must flag, got: {errs:?}"
         );
     }
 
