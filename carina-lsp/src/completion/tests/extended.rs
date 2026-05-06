@@ -3234,3 +3234,104 @@ fn unannotated_upstream_export_with_function_call_rhs_is_not_offered() {
         labels
     );
 }
+
+// =====================================================================
+// String-interpolation completion: `${...}` inside double-quoted strings
+// should behave like a bare expression position — surface in-scope
+// `let` bindings, then chain into upstream-state member access. (#2472)
+// =====================================================================
+
+/// Set up a directory with a sibling `backend.crn` declaring a
+/// `let orgs = upstream_state` binding plus a `main.crn` whose contents
+/// are supplied by the test. The upstream `organizations/` exports a
+/// `map(String)` keyed `accounts` so the dot-into-export path can be
+/// exercised too.
+fn set_up_interpolation_project(downstream_main: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let upstream = tmp.path().join("organizations");
+    std::fs::create_dir(&upstream).unwrap();
+    std::fs::write(
+        upstream.join("exports.crn"),
+        "exports {\n  accounts: map(String) = \"x\"\n}\n",
+    )
+    .unwrap();
+    let base = tmp.path().join("downstream");
+    std::fs::create_dir(&base).unwrap();
+    std::fs::write(
+        base.join("backend.crn"),
+        "let orgs = upstream_state { source = '../organizations' }\n",
+    )
+    .unwrap();
+    std::fs::write(base.join("main.crn"), downstream_main).unwrap();
+    (tmp, base)
+}
+
+#[test]
+fn interpolation_completion_empty_offers_in_scope_binding() {
+    // `"...${<cursor>"` — bare `${` with nothing typed yet should still
+    // surface `orgs` (the cross-file `let` binding from backend.crn).
+    let provider = test_provider();
+    let main = "aws.s3.BucketPolicy {\n  policy = \"arn:aws:iam::${\"\n}\n";
+    let (_tmp, base) = set_up_interpolation_project(main);
+    let main_src = std::fs::read_to_string(base.join("main.crn")).unwrap();
+    let doc = create_document(&main_src);
+    // Cursor right after `${` on line 1.
+    let position = Position {
+        line: 1,
+        character: "  policy = \"arn:aws:iam::${".chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&base));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"orgs"),
+        "expected `orgs` in completions inside `${{`, got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn interpolation_completion_partial_offers_matching_binding() {
+    // `"...${o<cursor>"` — should still surface `orgs` (the editor
+    // filters by partial; we just need the candidate present).
+    let provider = test_provider();
+    let main = "aws.s3.BucketPolicy {\n  policy = \"arn:aws:iam::${o\"\n}\n";
+    let (_tmp, base) = set_up_interpolation_project(main);
+    let main_src = std::fs::read_to_string(base.join("main.crn")).unwrap();
+    let doc = create_document(&main_src);
+    let position = Position {
+        line: 1,
+        character: "  policy = \"arn:aws:iam::${o".chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&base));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"orgs"),
+        "expected `orgs` in completions for `${{o`, got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn interpolation_completion_dot_after_binding_offers_exports() {
+    // `"...${orgs.<cursor>"` — dot after the upstream_state binding
+    // should surface its exports (`accounts`).
+    let provider = test_provider();
+    let main = "aws.s3.BucketPolicy {\n  policy = \"arn:aws:iam::${orgs.\"\n}\n";
+    let (_tmp, base) = set_up_interpolation_project(main);
+    let main_src = std::fs::read_to_string(base.join("main.crn")).unwrap();
+    let doc = create_document(&main_src);
+    let position = Position {
+        line: 1,
+        character: "  policy = \"arn:aws:iam::${orgs.".chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&base));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"accounts"),
+        "expected `accounts` from upstream exports inside `${{orgs.`, got: {:?}",
+        labels
+    );
+}

@@ -595,15 +595,18 @@ impl CompletionProvider {
         ]
     }
 
-    /// Completions for `for <pat> in <HERE>` — every binding that
-    /// `check_deferred_for_iterables` treats as in-scope: `let`,
+    /// Surface every binding that `check_deferred_for_iterables` treats
+    /// as in-scope at a bare-identifier expression position: `let`,
     /// `upstream_state`, module calls, imports, and argument parameters.
+    /// Used by the `for ... in <HERE>` iterable detector and by the
+    /// `"${<HERE>"` interpolation detector — both want the same
+    /// candidates.
     ///
-    /// Bindings commonly live in sibling `.crn` files (a typical pattern
-    /// is `let orgs = upstream_state { ... }` in `backend.crn` iterated
-    /// from `main.crn`), so we read every `.crn` in `base_path`, not just
-    /// the current buffer.
-    pub(super) fn for_iterable_completions(
+    /// Bindings commonly live in sibling `.crn` files (e.g.
+    /// `let orgs = upstream_state { ... }` in `backend.crn` referenced
+    /// from `main.crn`), so we read every `.crn` in `base_path`, not
+    /// just the current buffer.
+    pub(super) fn in_scope_binding_completions(
         &self,
         text: &str,
         position: Position,
