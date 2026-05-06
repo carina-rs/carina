@@ -222,6 +222,74 @@ pub fn validate_attribute_param_ref_types_with_ctx(
     ))
 }
 
+/// Reject any resolved value that still carries
+/// `Value::Unknown(UnknownReason::EmptyInterpolation)`. The parser
+/// accepts mid-edit `${}` to keep the AST intact (#2480) and the LSP
+/// surfaces it as a per-location warning, but `carina validate` /
+/// `plan` / `apply` must refuse to proceed — letting the marker flow
+/// to a provider would render the literal text `${}` (or worse, an
+/// empty substitution) into a real API call. See #2487.
+pub fn validate_no_empty_interpolations<E>(parsed: &carina_core::parser::File<E>) -> Vec<AppError>
+where
+    E: carina_core::parser::ExportParamLike,
+{
+    let mut errors = Vec::new();
+    for resource in &parsed.resources {
+        for (attr_name, value) in &resource.attributes {
+            if value_contains_empty_interpolation(value) {
+                errors.push(AppError::Validation(format!(
+                    "{}: attribute `{}`: empty interpolation `${{}}` — fill in the expression or remove it",
+                    resource.id, attr_name
+                )));
+            }
+        }
+    }
+    for export in &parsed.export_params {
+        if let Some(value) = export.value()
+            && value_contains_empty_interpolation(value)
+        {
+            errors.push(AppError::Validation(format!(
+                "exports `{}`: empty interpolation `${{}}` — fill in the expression or remove it",
+                export.name()
+            )));
+        }
+    }
+    for param in &parsed.attribute_params {
+        if let Some(value) = &param.value
+            && value_contains_empty_interpolation(value)
+        {
+            errors.push(AppError::Validation(format!(
+                "attributes `{}` default: empty interpolation `${{}}` — fill in the expression or remove it",
+                param.name
+            )));
+        }
+    }
+    errors
+}
+
+/// Recursively walk a `Value` tree looking for any
+/// `Value::Unknown(UnknownReason::EmptyInterpolation)`. Returns `true`
+/// when one is found at any depth — inside lists, maps, secrets,
+/// function-call arguments, or as the `Expr` segment of an
+/// `Interpolation`. Mirrors the variant coverage of the sibling
+/// `value_contains_unknown` to keep them in lockstep when new `Value`
+/// variants land.
+fn value_contains_empty_interpolation(value: &Value) -> bool {
+    use carina_core::resource::{InterpolationPart, UnknownReason};
+    match value {
+        Value::Unknown(UnknownReason::EmptyInterpolation) => true,
+        Value::Interpolation(parts) => parts.iter().any(|p| match p {
+            InterpolationPart::Expr(v) => value_contains_empty_interpolation(v),
+            InterpolationPart::Literal(_) => false,
+        }),
+        Value::List(items) => items.iter().any(value_contains_empty_interpolation),
+        Value::Map(entries) => entries.values().any(value_contains_empty_interpolation),
+        Value::Secret(inner) => value_contains_empty_interpolation(inner),
+        Value::FunctionCall { args, .. } => args.iter().any(value_contains_empty_interpolation),
+        _ => false,
+    }
+}
+
 /// Resolve block name aliases and attribute prefixes in one step.
 pub fn resolve_names_with_ctx(ctx: &WiringContext, resources: &mut [Resource]) -> Vec<AppError> {
     let mut errors = lift_validation_result(resolve_block_names(resources, ctx.schemas()));

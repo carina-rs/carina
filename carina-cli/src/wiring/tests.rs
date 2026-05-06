@@ -857,3 +857,215 @@ fn strip_unified_predicate_covers_unknown_and_ref() {
         Some(Value::ResourceRef { .. })
     ));
 }
+
+// =====================================================================
+// Empty `${}` interpolation rejection (#2487)
+//
+// The parser accepts `${}` mid-edit (#2480) and the LSP surfaces it as
+// a per-location warning. CLI validate / plan / apply must reject it
+// explicitly so a buffer with literal `${}` can't reach a provider and
+// surface only at the AWS edge.
+// =====================================================================
+
+fn parsed_with_attr(attr_name: &str, attr_value: Value) -> ParsedFile {
+    let mut r = Resource::new("foo.bar", "x");
+    r.attributes.insert(attr_name.to_string(), attr_value);
+    ParsedFile {
+        resources: vec![r],
+        ..ParsedFile::default()
+    }
+}
+
+#[test]
+fn validate_rejects_top_level_empty_interpolation() {
+    use carina_core::resource::{InterpolationPart, UnknownReason, Value};
+
+    let value = Value::Interpolation(vec![
+        InterpolationPart::Literal("arn:aws:iam::".to_string()),
+        InterpolationPart::Expr(Value::Unknown(UnknownReason::EmptyInterpolation)),
+        InterpolationPart::Literal(":root".to_string()),
+    ]);
+    let parsed = parsed_with_attr("aws", value);
+
+    let errors = validate_no_empty_interpolations(&parsed);
+    assert_eq!(errors.len(), 1, "expected one error, got: {:?}", errors);
+    let msg = match &errors[0] {
+        AppError::Validation(s) => s,
+        other => panic!("expected AppError::Validation, got {:?}", other),
+    };
+    assert!(
+        msg.contains("empty interpolation"),
+        "message must mention 'empty interpolation'; got: {}",
+        msg
+    );
+    assert!(
+        msg.contains("foo.bar.x"),
+        "message must include the resource id (provider.type.name); got: {}",
+        msg
+    );
+    assert!(
+        msg.contains("aws"),
+        "message must name the offending attribute; got: {}",
+        msg
+    );
+}
+
+#[test]
+fn validate_rejects_empty_interpolation_inside_secret() {
+    use carina_core::resource::{InterpolationPart, UnknownReason, Value};
+
+    let inner = Value::Interpolation(vec![InterpolationPart::Expr(Value::Unknown(
+        UnknownReason::EmptyInterpolation,
+    ))]);
+    let parsed = parsed_with_attr("password", Value::Secret(Box::new(inner)));
+
+    let errors = validate_no_empty_interpolations(&parsed);
+    assert_eq!(
+        errors.len(),
+        1,
+        "empty `${{}}` wrapped in `secret(...)` must error; got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn validate_rejects_empty_interpolation_inside_function_call() {
+    use carina_core::resource::{InterpolationPart, UnknownReason, Value};
+
+    let bad = Value::Interpolation(vec![InterpolationPart::Expr(Value::Unknown(
+        UnknownReason::EmptyInterpolation,
+    ))]);
+    let fn_call = Value::FunctionCall {
+        name: "join".to_string(),
+        args: vec![Value::String("-".to_string()), bad],
+    };
+    let parsed = parsed_with_attr("name", fn_call);
+
+    let errors = validate_no_empty_interpolations(&parsed);
+    assert_eq!(
+        errors.len(),
+        1,
+        "empty `${{}}` inside a function-call arg must error; got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn validate_rejects_empty_interpolation_nested_in_map() {
+    use carina_core::resource::{InterpolationPart, UnknownReason, Value};
+    use indexmap::IndexMap;
+
+    let inner = Value::Interpolation(vec![
+        InterpolationPart::Literal("prefix-".to_string()),
+        InterpolationPart::Expr(Value::Unknown(UnknownReason::EmptyInterpolation)),
+    ]);
+    let mut map = IndexMap::new();
+    map.insert("key".to_string(), inner);
+    let parsed = parsed_with_attr("tags", Value::Map(map));
+
+    let errors = validate_no_empty_interpolations(&parsed);
+    assert_eq!(
+        errors.len(),
+        1,
+        "nested-in-map empty `${{}}` must error; got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn validate_rejects_empty_interpolation_nested_in_list() {
+    use carina_core::resource::{InterpolationPart, UnknownReason, Value};
+
+    let inner = Value::Interpolation(vec![InterpolationPart::Expr(Value::Unknown(
+        UnknownReason::EmptyInterpolation,
+    ))]);
+    let parsed = parsed_with_attr("items", Value::List(vec![inner]));
+
+    let errors = validate_no_empty_interpolations(&parsed);
+    assert_eq!(
+        errors.len(),
+        1,
+        "nested-in-list empty `${{}}` must error; got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn validate_rejects_empty_interpolation_in_export_value() {
+    use carina_core::parser::ParsedExportParam;
+    use carina_core::resource::{InterpolationPart, UnknownReason, Value};
+
+    let bad = Value::Interpolation(vec![InterpolationPart::Expr(Value::Unknown(
+        UnknownReason::EmptyInterpolation,
+    ))]);
+    let parsed = ParsedFile {
+        export_params: vec![ParsedExportParam {
+            name: "url".to_string(),
+            type_expr: None,
+            value: Some(bad),
+        }],
+        ..ParsedFile::default()
+    };
+
+    let errors = validate_no_empty_interpolations(&parsed);
+    assert_eq!(
+        errors.len(),
+        1,
+        "empty `${{}}` in `exports {{ ... }}` value must error; got: {:?}",
+        errors
+    );
+    let msg = match &errors[0] {
+        AppError::Validation(s) => s,
+        _ => panic!("not a Validation error"),
+    };
+    assert!(
+        msg.contains("exports") && msg.contains("url"),
+        "message must name the offending export; got: {}",
+        msg
+    );
+}
+
+#[test]
+fn validate_rejects_empty_interpolation_in_attribute_param_default() {
+    use carina_core::parser::AttributeParameter;
+    use carina_core::resource::{InterpolationPart, UnknownReason, Value};
+
+    let bad = Value::Interpolation(vec![InterpolationPart::Expr(Value::Unknown(
+        UnknownReason::EmptyInterpolation,
+    ))]);
+    let parsed = ParsedFile {
+        attribute_params: vec![AttributeParameter {
+            name: "region".to_string(),
+            type_expr: None,
+            value: Some(bad),
+        }],
+        ..ParsedFile::default()
+    };
+
+    let errors = validate_no_empty_interpolations(&parsed);
+    assert_eq!(
+        errors.len(),
+        1,
+        "empty `${{}}` in `attributes {{ ... }}` default must error; got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn validate_passes_when_no_empty_interpolation() {
+    use carina_core::resource::{InterpolationPart, Value};
+
+    // Non-empty interpolation: must not error.
+    let value = Value::Interpolation(vec![
+        InterpolationPart::Literal("prefix-".to_string()),
+        InterpolationPart::Expr(Value::String("real-value".to_string())),
+    ]);
+    let parsed = parsed_with_attr("aws", value);
+
+    let errors = validate_no_empty_interpolations(&parsed);
+    assert!(
+        errors.is_empty(),
+        "non-empty interpolation must pass; got: {:?}",
+        errors
+    );
+}
