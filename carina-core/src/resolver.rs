@@ -193,6 +193,9 @@ pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<V
                     let next = match peeled {
                         Value::Map(ref map) => match map.get(field) {
                             Some(nested) => resolve_ref_value(nested, bindings)?,
+                            None if is_upstream && secret_depth > 0 => {
+                                return Err(missing_map_key_error_redacted(path, map.len()));
+                            }
                             None if is_upstream => {
                                 return Err(missing_map_key_error(path, map));
                             }
@@ -219,6 +222,9 @@ pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<V
                         }
                         (Value::Map(map), Subscript::Str { key }) => match map.get(key) {
                             Some(nested) => resolve_ref_value(nested, bindings)?,
+                            None if is_upstream && secret_depth > 0 => {
+                                return Err(missing_map_key_error_redacted(path, map.len()));
+                            }
                             None if is_upstream => {
                                 return Err(missing_map_key_error(path, &map));
                             }
@@ -350,6 +356,16 @@ fn missing_map_key_error(
             .join(", ")
     };
     format!("{path}: key not found; available keys: {known_list}")
+}
+
+/// Redacted variant of [`missing_map_key_error`] for `Secret`-wrapped
+/// upstream maps (#2501). The signature deliberately takes only the
+/// entry count, not the map itself, so the formatter cannot accidentally
+/// include the keys: a `Secret(Map)`'s key names (`db_pwd`, `api_key`,
+/// …) leak the shape of the credential set even when the values are
+/// already redacted by the plan-display path.
+fn missing_map_key_error_redacted(path: &crate::resource::AccessPath, key_count: usize) -> String {
+    format!("{path}: key not found; available keys: <redacted, {key_count} entries>")
 }
 
 #[cfg(test)]
@@ -607,11 +623,27 @@ mod tests {
         // surfaces `missing_map_key_error` (concrete state, so a
         // missing key is a real typo). Pin the error path through the
         // peel so a refactor can't accidentally swallow it.
+        //
+        // #2501: the available-keys list must be redacted (entry count
+        // only, no key names) because the keys of a Secret(Map) leak
+        // shape — e.g. "this binding exports a `db_pwd`, an `api_key`".
         use crate::binding_index::{BindingValueSource, ResolvedBindings};
-        let map: indexmap::IndexMap<String, Value> =
-            vec![("known".to_string(), Value::String("v".to_string()))]
-                .into_iter()
-                .collect();
+        let map: indexmap::IndexMap<String, Value> = vec![
+            (
+                "db_pwd".to_string(),
+                Value::Secret(Box::new(Value::String("v".to_string()))),
+            ),
+            (
+                "api_key".to_string(),
+                Value::Secret(Box::new(Value::String("v".to_string()))),
+            ),
+            (
+                "slack_token".to_string(),
+                Value::Secret(Box::new(Value::String("v".to_string()))),
+            ),
+        ]
+        .into_iter()
+        .collect();
         let mut attrs = HashMap::new();
         attrs.insert(
             "creds".to_string(),
@@ -633,6 +665,96 @@ mod tests {
         assert!(
             err.contains("key not found"),
             "expected missing-key error, got: {err}"
+        );
+        assert!(
+            err.contains("<redacted, 3 entries>"),
+            "Secret(Map) keys must be redacted, got: {err}"
+        );
+        for k in ["db_pwd", "api_key", "slack_token"] {
+            assert!(
+                !err.contains(k),
+                "Secret(Map) key {k:?} leaked into error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_field_path_secret_wrapped_map_missing_key_upstream_redacted() {
+        // #2501 sibling: dot-form field access (`creds.missing`) on a
+        // `Secret(Map)` upstream binding must also redact the available
+        // keys. The field_path walk and the subscript walk share the
+        // same `missing_map_key_error_redacted` helper, so both must
+        // emit the redacted message.
+        use crate::binding_index::{BindingValueSource, ResolvedBindings};
+        let map: indexmap::IndexMap<String, Value> = vec![
+            (
+                "db_pwd".to_string(),
+                Value::Secret(Box::new(Value::String("v".to_string()))),
+            ),
+            (
+                "api_key".to_string(),
+                Value::Secret(Box::new(Value::String("v".to_string()))),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "creds".to_string(),
+            Value::Secret(Box::new(Value::Map(map))),
+        );
+        let mut bindings = ResolvedBindings::default();
+        bindings.set("h", attrs, BindingValueSource::Upstream);
+        let path = crate::resource::AccessPath::with_fields_and_subscripts(
+            "h",
+            "creds",
+            vec!["missing".to_string()],
+            Vec::new(),
+        );
+        let ref_value = Value::ResourceRef { path };
+        let err = resolve_ref_value(&ref_value, &bindings)
+            .expect_err("missing dot-form field in concrete upstream Secret(Map) must error");
+        assert!(
+            err.contains("<redacted, 2 entries>"),
+            "Secret(Map) field_path keys must be redacted, got: {err}"
+        );
+        for k in ["db_pwd", "api_key"] {
+            assert!(
+                !err.contains(k),
+                "Secret(Map) key {k:?} leaked into field_path error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_subscript_secret_wrapped_empty_map_missing_key_upstream_redacted() {
+        // Edge case: an empty `Secret(Map)` still emits the redacted
+        // form (entry count = 0). Pins that the redacted helper does
+        // not fall back to the literal "<no keys>" branch, which would
+        // also be safe for an empty map but inconsistent with the
+        // populated-Secret message format.
+        use crate::binding_index::{BindingValueSource, ResolvedBindings};
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "creds".to_string(),
+            Value::Secret(Box::new(Value::Map(indexmap::IndexMap::new()))),
+        );
+        let mut bindings = ResolvedBindings::default();
+        bindings.set("h", attrs, BindingValueSource::Upstream);
+        let path = crate::resource::AccessPath::with_fields_and_subscripts(
+            "h",
+            "creds",
+            Vec::new(),
+            vec![crate::resource::Subscript::Str {
+                key: "missing".to_string(),
+            }],
+        );
+        let ref_value = Value::ResourceRef { path };
+        let err = resolve_ref_value(&ref_value, &bindings)
+            .expect_err("missing key in empty upstream Secret(Map) must error");
+        assert!(
+            err.contains("<redacted, 0 entries>"),
+            "empty Secret(Map) must still use redacted form, got: {err}"
         );
     }
 
