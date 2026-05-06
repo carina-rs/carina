@@ -791,8 +791,15 @@ impl<'a> PrettyLayout<'a> {
 /// - `Value::List` of scalars renders inline `[a, b, c]` if the entire line
 ///   (`<indent>key: <inline>`) fits within `PRETTY_LINE_LIMIT`; otherwise
 ///   expands to a bracketed multi-line form.
+/// - `Value::StringList` (the canonicalized `Union[String, list(String)]`
+///   form, #2511) follows the same inline-vs-vertical rule as
+///   `Value::List` of `Value::String` (#2528).
 /// - `Value::Map` renders inline if it fits, otherwise expands vertically
 ///   with each key at `parent_indent_cols + 2`.
+///
+/// When adding a new layout-bearing `Value` variant, add a new arm here
+/// — the wildcard fallthrough collapses to the inline form and skips
+/// the line-budget check, which is wrong for any container variant.
 pub fn format_value_pretty(value: &Value, layout: PrettyLayout<'_>) -> String {
     match value {
         Value::List(items) => {
@@ -813,6 +820,27 @@ pub fn format_value_pretty(value: &Value, layout: PrettyLayout<'_>) -> String {
                 return format_value_with_key(value, None);
             }
             format_list_of_scalars_vertical(items, layout.child_indent_cols())
+        }
+        Value::StringList(items) => {
+            // #2528: `Value::StringList` is the canonicalized form the
+            // `Union[String, list(String)]` shape collapses to (#2511).
+            // It behaves like `Value::List` of `Value::String` for
+            // layout purposes — apply the same inline-vs-vertical
+            // decision so a long list under a dynamic-key Map (e.g. an
+            // IAM `condition.string_like.<context-key>: [a, b]`) breaks
+            // across lines instead of dumping inline. Lift items to
+            // `Value::String` for the vertical fallback so the per-item
+            // rendering (SECRET_PREFIX redaction, DSL-enum resolution)
+            // stays byte-identical to `format_value_with_key`'s arm.
+            if items.is_empty() {
+                return "[]".to_string();
+            }
+            let budget = PRETTY_LINE_LIMIT.saturating_sub(layout.prefix_cols());
+            if inline_width(value, budget).is_some() {
+                return format_value_with_key(value, None);
+            }
+            let lifted: Vec<Value> = items.iter().cloned().map(Value::String).collect();
+            format_list_of_scalars_vertical(&lifted, layout.child_indent_cols())
         }
         Value::Map(map) => {
             if map.is_empty() {
@@ -2086,6 +2114,119 @@ mod tests {
         assert!(
             out.contains("\"iam:Action000\","),
             "expected first action on its own line: {out}"
+        );
+    }
+
+    #[test]
+    fn format_value_pretty_string_list_under_dynamic_key_breaks_vertically() {
+        // #2528 hypothesis: when the deepest value is `Value::StringList`
+        // (the canonical form #2511 folds `Union[String, list(String)]`
+        // into) rather than `Value::List`, `format_value_pretty` treats
+        // it as a scalar fallthrough and renders inline. This pins the
+        // expected vertical break.
+        let mut string_like = IndexMap::new();
+        string_like.insert(
+            "token.actions.githubusercontent.com:sub".to_string(),
+            Value::StringList(vec![
+                "repo:carina-rs/infra:ref:refs/heads/main".to_string(),
+                "repo:carina-rs/infra:pull_request".to_string(),
+            ]),
+        );
+        let v = Value::Map(string_like);
+        // Mirror the layout under `condition.string_like:` (parent at
+        // col 12 from the MapExpanded entry indentation). Inside a Map
+        // the value text starts after `<key>: ` so the bracketed form
+        // appears as `<key>: [\n   "...",\n   "..."\n  ]` — one element
+        // per line with a trailing comma. The inline form is the
+        // single-line `<key>: ["...", "..."]` with no `\n` mid-list.
+        let out = format_value_pretty(&v, layout(12, "string_like"));
+        assert!(
+            out.contains(":sub: [\n"),
+            "expected dynamic-key StringList to start its bracketed form, got:\n{out}"
+        );
+        assert!(
+            out.contains("refs/heads/main\",\n"),
+            "expected first element on its own line with trailing comma, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn format_value_pretty_top_level_string_list_breaks_vertically_when_oversize() {
+        // The same fix applies when a top-level attribute value is
+        // already canonicalized to `Value::StringList`. Pre-fix the
+        // wildcard arm collapsed it to `["a", "b", ...]` even when the
+        // line exceeded `PRETTY_LINE_LIMIT`.
+        let v = Value::StringList(vec!["a".repeat(40), "b".repeat(40)]);
+        let out = format_value_pretty(&v, layout(0, "k"));
+        assert!(
+            out.starts_with("[\n"),
+            "expected oversize StringList to expand vertically, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn format_value_pretty_string_list_vertical_redacts_secret_prefix_strings() {
+        // Pin parity with `Value::List<Value::String>`: a string with
+        // the SECRET_PREFIX must render as `(secret)` even when reached
+        // through the StringList vertical path. Pre-fix attempt
+        // (a dedicated `format_list_of_strings_vertical` that quoted the
+        // raw &str) would have leaked the hash; the current shape lifts
+        // items to `Value::String` and reuses
+        // `format_list_of_scalars_vertical`, so the SECRET_PREFIX arm
+        // in `format_value_with_key` runs unchanged.
+        let v = Value::StringList(vec![
+            format!("{}deadbeef", SECRET_PREFIX),
+            "x".repeat(80), // force vertical
+        ]);
+        let out = format_value_pretty(&v, layout(0, "k"));
+        assert!(
+            out.contains("(secret),"),
+            "expected SECRET_PREFIX item to render as `(secret),` in the vertical form, got:\n{out}"
+        );
+        assert!(
+            !out.contains("deadbeef"),
+            "expected hash bytes to not leak into the vertical form, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn format_value_pretty_nested_map_with_dynamic_key_list_value_breaks_vertically() {
+        // #2528: an IAM trust-policy `condition.<operator>.<context-key>:
+        // [list]` shape — a multi-element list-of-strings nested inside
+        // a Map inside a Map inside a list-of-maps inside a Map field.
+        // After #2524 the outer list-of-maps and its `action` siblings
+        // break vertically, but the deepest list (under a dynamic Map
+        // key) used to stay on one line because the prefix-width budget
+        // check looked only at the immediate parent key, not at the
+        // *sum* of all nested key prefixes once expansion bubbles down.
+        //
+        // Pin the expected break: the multi-element list under the
+        // dynamic key must render with its bracketed multi-line form,
+        // not collapse to `key: ["a", "b"]`.
+        let mut string_like = IndexMap::new();
+        string_like.insert(
+            "token.actions.githubusercontent.com:sub".to_string(),
+            Value::List(vec![
+                Value::String("repo:carina-rs/infra:ref:refs/heads/main".to_string()),
+                Value::String("repo:carina-rs/infra:pull_request".to_string()),
+            ]),
+        );
+        let mut condition = IndexMap::new();
+        condition.insert("string_like".to_string(), Value::Map(string_like));
+        let mut entry = IndexMap::new();
+        entry.insert("sid".to_string(), Value::String("AssumeRole".to_string()));
+        entry.insert("condition".to_string(), Value::Map(condition));
+        let v = Value::List(vec![Value::Map(entry)]);
+        let out = format_value_pretty(&v, layout(4, "statement"));
+        // The dynamic-key list value must break across lines (bracketed
+        // form), not collapse to `<dynamic-key>: ["a", "b"]`.
+        assert!(
+            out.contains(":sub: ["),
+            "expected dynamic-key list to start its bracket form, got:\n{out}"
+        );
+        assert!(
+            out.contains("\"repo:carina-rs/infra:ref:refs/heads/main\","),
+            "expected first list element on its own line with trailing comma, got:\n{out}"
         );
     }
 

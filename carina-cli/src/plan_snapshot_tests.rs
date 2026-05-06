@@ -113,6 +113,27 @@ fn snapshot_policy_pretty_nested() {
 }
 
 #[test]
+fn snapshot_policy_pretty_dynamic_key_list() {
+    // #2528 acceptance: an IAM trust-policy `condition.<op>.<context-key>:
+    // [list]` shape — a multi-element list-of-strings nested under a
+    // dynamic-key Map — must break across lines all the way down, the
+    // same way `statement[].action` does. Pre-fix the deepest list
+    // collapsed to one line because the inline-vs-vertical decision did
+    // not bubble down to nested Map values.
+    let (plan, schemas, _moved) = build_plan_from_fixture("policy_pretty_dynamic_key_list");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+    ));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
 fn snapshot_pretty_long_string_list() {
     let (plan, schemas, _moved) = build_plan_from_fixture("pretty_long_string_list");
     let output = strip_ansi(&format_plan(

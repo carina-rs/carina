@@ -1,0 +1,38 @@
+# IAM trust-policy `condition` shape that mirrors the real
+# `registry/dev/bootstrap` plan (#2528): a multi-element list-of-strings
+# nested under a *dynamic-key* Map (the GitHub OIDC subject context key).
+# This fixture pins the multi-line form across the full nesting depth
+# for the `Value::List` path. The `Value::StringList` path (the
+# canonicalized form `Union[String, list(String)]` collapses to in
+# #2511) is not reachable through this fixture because `awscc.ec2.Vpc`
+# has no schema attribute typed as that union; the unit tests at
+# `format_value_pretty_string_list_*` cover that path directly.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.ec2.Vpc {
+  cidr_block = '10.0.0.0/16'
+  config = {
+    version = '2012-10-17'
+    statement = [
+      {
+        sid    = 'AssumeRole'
+        effect = 'Allow'
+        action = ['sts:AssumeRoleWithWebIdentity']
+        condition = {
+          string_equals = {
+            'token.actions.githubusercontent.com:aud' = ['sts.amazonaws.com']
+          }
+          string_like = {
+            'token.actions.githubusercontent.com:sub' = [
+              'repo:carina-rs/infra:ref:refs/heads/main',
+              'repo:carina-rs/infra:pull_request',
+            ]
+          }
+        }
+      },
+    ]
+  }
+}
