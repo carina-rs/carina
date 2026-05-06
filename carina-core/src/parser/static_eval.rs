@@ -12,7 +12,11 @@ use crate::resource::Value;
 /// Check whether a Value is fully static (no runtime dependencies).
 pub(crate) fn is_static_value(value: &Value) -> bool {
     match value {
-        Value::String(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_) => true,
+        Value::String(_)
+        | Value::Int(_)
+        | Value::Float(_)
+        | Value::Bool(_)
+        | Value::StringList(_) => true,
         Value::List(items) => items.iter().all(is_static_value),
         Value::Map(map) => map.values().all(is_static_value),
         Value::FunctionCall { args, .. } => args.iter().all(is_static_value),

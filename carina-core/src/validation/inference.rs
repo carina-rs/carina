@@ -297,6 +297,7 @@ fn infer_type_from_value_with_visiting(
         Value::Interpolation(_) => Ok(TypeExpr::String),
         Value::Secret(_) => Ok(TypeExpr::String),
         Value::List(items) => infer_collection(items, bindings, schemas, visiting, TypeExpr::List),
+        Value::StringList(_) => Ok(TypeExpr::List(Box::new(TypeExpr::String))),
         Value::Map(entries) => {
             infer_collection(entries.values(), bindings, schemas, visiting, TypeExpr::Map)
         }

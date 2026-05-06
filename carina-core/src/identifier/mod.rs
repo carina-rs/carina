@@ -164,6 +164,10 @@ fn deterministic_value_string(value: &Value) -> String {
             let parts: Vec<String> = items.iter().map(deterministic_value_string).collect();
             format!("List([{}])", parts.join(", "))
         }
+        Value::StringList(items) => {
+            let parts: Vec<String> = items.iter().map(|s| format!("{:?}", s)).collect();
+            format!("StringList([{}])", parts.join(", "))
+        }
         Value::Map(map) => {
             let mut entries: Vec<(&String, &Value)> = map.iter().collect();
             entries.sort_by_key(|(k, _)| *k);

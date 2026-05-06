@@ -314,6 +314,20 @@ pub enum Value {
     Float(f64),
     Bool(bool),
     List(Vec<Value>),
+    /// Canonical form for fields whose schema type is
+    /// `Union(vec![String, list(String)])` — the IAM-style
+    /// `string_or_list_of_strings` shape. AWS normalizes single-element
+    /// list condition values back to scalars, so a desired `["x"]` and
+    /// the actual `"x"` would otherwise diff forever. Carrying the
+    /// canonical shape in the type system makes the divergence
+    /// impossible at the differ boundary. See #2481, #2510.
+    ///
+    /// Producers must always go through
+    /// [`crate::value::canonicalize_with_type`] — never construct
+    /// `StringList` directly from user input or wire data without the
+    /// type, because the canonicalization decision depends on the
+    /// declared `AttributeType`.
+    StringList(Vec<String>),
     Map(IndexMap<String, Value>),
     /// Reference to another resource's attribute via an access path.
     ///
@@ -408,6 +422,7 @@ impl PartialEq for Value {
             (Value::Float(a), Value::Float(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
+            (Value::StringList(a), Value::StringList(b)) => a == b,
             (Value::Map(a), Value::Map(b)) => a == b,
             (Value::ResourceRef { path: a }, Value::ResourceRef { path: b }) => a == b,
             (Value::Interpolation(a), Value::Interpolation(b)) => a == b,
@@ -600,7 +615,11 @@ impl Value {
                 }
             }
             Value::Secret(inner) => inner.visit_refs(f),
-            Value::String(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_) => {}
+            Value::String(_)
+            | Value::Int(_)
+            | Value::Float(_)
+            | Value::Bool(_)
+            | Value::StringList(_) => {}
             // `Value::Unknown` is what a previously-unresolved
             // `ResourceRef` was *replaced with* by `stamp_unresolved_upstream`.
             // It carries an `AccessPath` for display, but it is no longer
@@ -677,6 +696,21 @@ impl Value {
                 let mut sum_hash: u64 = 0;
                 for item in items {
                     sum_hash = sum_hash.wrapping_add(item.canonical_hash());
+                }
+                sum_hash.hash(hasher);
+            }
+            Value::StringList(items) => {
+                // Hash with the same order-independent shape as
+                // `Value::List` so that a `List([String("x")])` and a
+                // `StringList(vec!["x"])` cannot collide on hash equality
+                // (the outer discriminant separates them) but each
+                // individually preserves the merge-list invariant.
+                items.len().hash(hasher);
+                let mut sum_hash: u64 = 0;
+                for s in items {
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    s.hash(&mut h);
+                    sum_hash = sum_hash.wrapping_add(h.finish());
                 }
                 sum_hash.hash(hasher);
             }
