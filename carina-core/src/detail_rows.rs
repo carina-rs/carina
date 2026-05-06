@@ -114,11 +114,18 @@ pub enum DetailRow {
     },
 }
 
-/// A single entry in an expanded map (e.g., tags with default_tags annotation)
+/// A single entry in an expanded map (e.g., tags with default_tags annotation).
+///
+/// `value` is kept as a raw `Value` so renderers can apply
+/// `format_value_pretty` with the actual indent column. Pre-stringifying
+/// at build time would force nested complex values (list-of-maps,
+/// long string lists) onto a single line because a `String` carries no
+/// indentation context. Renderers should pass the column at which the
+/// entry's `key` is rendered as `PrettyLayout::parent_indent_cols`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MapExpandedEntry {
     pub key: String,
-    pub value: String,
+    pub value: Value,
     /// Optional annotation (e.g., "# default_tags") shown after the value
     pub annotation: Option<String>,
 }
@@ -348,7 +355,7 @@ fn build_expanded_map_row(key: &str, map: &IndexMap<String, Value>) -> DetailRow
         .into_iter()
         .map(|k| MapExpandedEntry {
             key: k.clone(),
-            value: format_value_with_key(&map[k], Some(k)),
+            value: map[k].clone(),
             annotation: None,
         })
         .collect();
@@ -376,7 +383,7 @@ fn build_expanded_tags_row(
             };
             MapExpandedEntry {
                 key: key.clone(),
-                value: format_value_with_key(value, Some(key)),
+                value: value.clone(),
                 annotation,
             }
         })
@@ -1064,13 +1071,64 @@ mod tests {
                 assert_eq!(key, "tags");
                 assert_eq!(entries.len(), 2);
                 assert_eq!(entries[0].key, "Environment");
-                assert_eq!(entries[0].value, "\"prod\"");
+                assert_eq!(entries[0].value, Value::String("prod".to_string()));
                 assert!(entries[0].annotation.is_none());
                 assert_eq!(entries[1].key, "Name");
-                assert_eq!(entries[1].value, "\"test\"");
+                assert_eq!(entries[1].value, Value::String("test".to_string()));
                 assert!(entries[1].annotation.is_none());
             }
             other => panic!("expected MapExpanded, got {:?}", other),
+        }
+    }
+
+    /// Regression: a Map attribute whose entry value is itself a list-of-maps
+    /// must carry the raw `Value` so the renderer can pretty-print it. If
+    /// the build phase pre-stringifies entry values, the inline form
+    /// `[{...}, {...}]` is locked in and the renderer cannot expand it
+    /// onto multiple lines (issue #2409).
+    #[test]
+    fn test_create_map_expanded_carries_raw_value_for_nested_list_of_maps() {
+        let mut statement1 = IndexMap::new();
+        statement1.insert("sid".to_string(), Value::String("AllowRead".to_string()));
+        statement1.insert("effect".to_string(), Value::String("Allow".to_string()));
+        let mut statement2 = IndexMap::new();
+        statement2.insert("sid".to_string(), Value::String("DenyWrite".to_string()));
+        statement2.insert("effect".to_string(), Value::String("Deny".to_string()));
+        let mut policy = IndexMap::new();
+        policy.insert(
+            "version".to_string(),
+            Value::String("2012-10-17".to_string()),
+        );
+        policy.insert(
+            "statement".to_string(),
+            Value::List(vec![Value::Map(statement1), Value::Map(statement2.clone())]),
+        );
+        let resource = Resource::new("iam.RolePolicy", "test")
+            .with_attribute("policy_document", Value::Map(policy));
+        let effect = Effect::Create(resource);
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None);
+        let entries = rows
+            .iter()
+            .find_map(|r| match r {
+                DetailRow::MapExpanded { key, entries } if key == "policy_document" => {
+                    Some(entries)
+                }
+                _ => None,
+            })
+            .expect("expected MapExpanded row for policy_document");
+        let stmt_entry = entries
+            .iter()
+            .find(|e| e.key == "statement")
+            .expect("expected `statement` entry");
+        match &stmt_entry.value {
+            Value::List(items) => {
+                assert_eq!(items.len(), 2, "list-of-maps preserved as raw Value");
+                assert!(
+                    matches!(items[0], Value::Map(_)),
+                    "inner element kept as Value::Map, not stringified"
+                );
+            }
+            other => panic!("expected Value::List, got {:?}", other),
         }
     }
 
@@ -1100,7 +1158,7 @@ mod tests {
                 assert_eq!(key, "tags");
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].key, "Name");
-                assert_eq!(entries[0].value, "\"test\"");
+                assert_eq!(entries[0].value, Value::String("test".to_string()));
             }
             other => panic!("expected MapExpanded, got {:?}", other),
         }

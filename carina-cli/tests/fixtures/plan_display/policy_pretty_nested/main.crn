@@ -1,0 +1,33 @@
+# Policy document wrapped in a Map attribute. Verifies that nested
+# list-of-maps and long string-lists inside a top-level Map break onto
+# multiple indented lines instead of dumping inline (issue #2409).
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.ec2.Vpc {
+  cidr_block = '10.0.0.0/16'
+  config = {
+    version = '2012-10-17'
+    statement = [
+      {
+        sid    = 'ManageDeployRoles'
+        effect = 'Allow'
+        action = [
+          'iam:CreateRole',
+          'iam:DeleteRole',
+          'iam:GetRole',
+          'iam:UpdateRole',
+        ]
+        resource = 'arn:aws:iam::*:role/carina-*-deploy'
+      },
+      {
+        sid      = 'ReadOIDCProvider'
+        effect   = 'Allow'
+        action   = 'iam:GetOpenIDConnectProvider'
+        resource = 'arn:aws:iam::*:oidc-provider/token.actions.githubusercontent.com'
+      },
+    ]
+  }
+}

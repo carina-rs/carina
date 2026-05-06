@@ -129,6 +129,8 @@ plan-fixtures:
 	@echo "=== policy_pretty ==="
 	@$(MAKE) plan-policy-pretty
 	@echo "---"
+	@$(MAKE) plan-policy-pretty-nested
+	@echo "---"
 	@$(MAKE) plan-pretty-long-string-list
 	@echo "---"
 	@$(MAKE) plan-pretty-short-string-list
@@ -154,6 +156,8 @@ plan-exports-multifile:
 	$(PLAN_FIXTURE) exports_multifile
 plan-policy-pretty:
 	$(PLAN_FIXTURE) policy_pretty
+plan-policy-pretty-nested:
+	$(PLAN_FIXTURE) policy_pretty_nested
 plan-pretty-long-string-list:
 	$(PLAN_FIXTURE) pretty_long_string_list
 plan-pretty-short-string-list:
@@ -167,7 +171,7 @@ plan-provider-prefix:
         plan-upstream-state plan-upstream-state-unresolved plan-upstream-state-empty-exports \
         plan-upstream-state-map-subscript plan-upstream-state-map-dot-notation \
         plan-deferred-for plan-exports plan-exports-multifile plan-policy-pretty \
-        plan-pretty-long-string-list plan-pretty-short-string-list plan-provider-prefix \
+        plan-policy-pretty-nested plan-pretty-long-string-list plan-pretty-short-string-list plan-provider-prefix \
         plan-map-diff-tui plan-all-create-tui plan-mixed-tui plan-delete-tui \
         plan-moved-with-changes-tui plan-moved-pure-tui plan-fixtures
 

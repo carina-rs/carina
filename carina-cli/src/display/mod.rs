@@ -1055,10 +1055,16 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
         }
         DetailRow::MapExpanded { key, entries } => {
             writeln!(out, "{}{}:", attr_prefix, key).unwrap();
+            let entry_indent_cols = attr_prefix.chars().count() + 2;
             for entry in entries {
+                let layout = carina_core::value::PrettyLayout {
+                    parent_indent_cols: entry_indent_cols,
+                    key: &entry.key,
+                };
+                let pretty = carina_core::value::format_value_pretty(&entry.value, layout);
                 let cv = match effect {
-                    Effect::Delete { .. } => entry.value.red().strikethrough().to_string(),
-                    _ => colored_value(&entry.value, false),
+                    Effect::Delete { .. } => pretty.red().strikethrough().to_string(),
+                    _ => colored_value(&pretty, false),
                 };
                 if let Some(ann) = &entry.annotation {
                     writeln!(
