@@ -130,6 +130,10 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     resolve_refs_for_plan(&mut resources, &current_states, &remote_bindings)
         .expect("Failed to resolve refs with state");
 
+    // Type-level canonicalization for `Union[String, list(String)]`
+    // fields. See #2481, #2511.
+    carina_core::value::canonicalize_resources_with_schemas(&mut resources, wiring.schemas());
+
     normalize_desired_with_ctx(&wiring, &mut resources);
     normalize_state_with_ctx(&wiring, &mut current_states);
 

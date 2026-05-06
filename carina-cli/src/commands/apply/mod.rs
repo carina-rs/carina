@@ -904,8 +904,12 @@ async fn run_apply_locked(
 
     // Phase 2: resolve data source inputs against the consolidated state
     // and refresh them via `read_data_source` (#1683, #1685).
-    let resolved_data_sources =
-        resolve_data_source_refs_for_refresh(&sorted_resources, &current_states, &remote_bindings)?;
+    let resolved_data_sources = resolve_data_source_refs_for_refresh(
+        &sorted_resources,
+        &current_states,
+        &remote_bindings,
+        ctx.schemas(),
+    )?;
     let phase2_results: Vec<Result<(ResourceId, State), AppError>> =
         stream::iter(resolved_data_sources.iter())
             .map(|resource| {
@@ -940,6 +944,10 @@ async fn run_apply_locked(
     // Resolve references and enum identifiers, then create initial plan for display
     let mut resources_for_plan = sorted_resources.clone();
     resolve_refs_with_state_and_remote(&mut resources_for_plan, &current_states, &remote_bindings)?;
+
+    // Type-level canonicalization for `Union[String, list(String)]`
+    // fields (IAM-style `string_or_list_of_strings`). See #2481, #2511.
+    carina_core::value::canonicalize_resources_with_schemas(&mut resources_for_plan, ctx.schemas());
 
     // Run the normalization pipeline (same as plan path in wiring.rs).
     let preprocessor = crate::wiring::PlanPreprocessor::new(&provider, ctx);

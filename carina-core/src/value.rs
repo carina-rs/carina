@@ -928,6 +928,35 @@ fn canonicalize_to_string_list(value: Value) -> Value {
     }
 }
 
+/// Walk every resource's attributes, canonicalizing values whose
+/// declared schema type is `Union[String, list(String)]` into
+/// `Value::StringList`. Resources whose schema is not in the registry
+/// (provider not loaded, unknown resource type) are skipped — schema
+/// validation surfaces the mismatch elsewhere.
+///
+/// Call this once after `resolver::resolve_refs_*` and before the
+/// differ runs, so every `Resource` flowing into the plan / state /
+/// provider boundary carries the canonical shape. See #2481, #2511.
+pub fn canonicalize_resources_with_schemas(
+    resources: &mut [crate::resource::Resource],
+    registry: &crate::schema::SchemaRegistry,
+) {
+    for resource in resources.iter_mut() {
+        let Some(schema) = registry.get_for(resource) else {
+            continue;
+        };
+        let mut new_attrs: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
+        for (key, value) in std::mem::take(&mut resource.attributes) {
+            let canon = match schema.attributes.get(&key) {
+                Some(attr_schema) => canonicalize_with_type(value, &attr_schema.attr_type),
+                None => value,
+            };
+            new_attrs.insert(key, canon);
+        }
+        resource.attributes = new_attrs;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2147,5 +2176,118 @@ mod tests {
         let a = Value::List(vec![Value::String("x".to_string())]);
         let b = Value::StringList(vec!["x".to_string()]);
         assert_ne!(a, b);
+    }
+
+    // ---- canonicalize_resources_with_schemas tests (#2481, #2511) ----
+
+    fn build_test_registry() -> crate::schema::SchemaRegistry {
+        use crate::schema::{AttributeSchema, ResourceSchema, SchemaRegistry};
+        let mut reg = SchemaRegistry::new();
+        let schema = ResourceSchema::new("iam.policy")
+            .attribute(AttributeSchema::new("subject", string_or_list_of_strings()));
+        reg.insert("aws", schema);
+        reg
+    }
+
+    fn make_resource(attrs: Vec<(&str, Value)>) -> crate::resource::Resource {
+        use crate::resource::{Resource, ResourceId, ResourceKind, ResourceName};
+        use std::collections::{BTreeSet, HashMap, HashSet};
+        let mut attributes = IndexMap::new();
+        for (k, v) in attrs {
+            attributes.insert(k.to_string(), v);
+        }
+        Resource {
+            id: ResourceId {
+                provider: "aws".to_string(),
+                resource_type: "iam.policy".to_string(),
+                name: ResourceName::Bound("p1".to_string()),
+            },
+            attributes,
+            kind: ResourceKind::Managed,
+            lifecycle: Default::default(),
+            prefixes: HashMap::new(),
+            binding: Some("p1".to_string()),
+            dependency_bindings: BTreeSet::new(),
+            module_source: None,
+            quoted_string_attrs: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn canonicalize_resources_with_schemas_scalar_to_string_list() {
+        let registry = build_test_registry();
+        let mut resources = vec![make_resource(vec![(
+            "subject",
+            Value::String("repo:foo:*".to_string()),
+        )])];
+        canonicalize_resources_with_schemas(&mut resources, &registry);
+        assert_eq!(
+            resources[0].attributes.get("subject"),
+            Some(&Value::StringList(vec!["repo:foo:*".to_string()]))
+        );
+    }
+
+    #[test]
+    fn canonicalize_resources_with_schemas_single_list_to_string_list() {
+        let registry = build_test_registry();
+        let mut resources = vec![make_resource(vec![(
+            "subject",
+            Value::List(vec![Value::String("repo:foo:*".to_string())]),
+        )])];
+        canonicalize_resources_with_schemas(&mut resources, &registry);
+        assert_eq!(
+            resources[0].attributes.get("subject"),
+            Some(&Value::StringList(vec!["repo:foo:*".to_string()]))
+        );
+    }
+
+    #[test]
+    fn canonicalize_resources_with_schemas_skips_unknown_resource() {
+        // No schema registered for the resource type — pass through.
+        let registry = crate::schema::SchemaRegistry::new();
+        let mut resources = vec![make_resource(vec![(
+            "subject",
+            Value::String("x".to_string()),
+        )])];
+        canonicalize_resources_with_schemas(&mut resources, &registry);
+        assert_eq!(
+            resources[0].attributes.get("subject"),
+            Some(&Value::String("x".to_string()))
+        );
+    }
+
+    #[test]
+    fn canonicalize_resources_with_schemas_passes_through_unrelated_attr() {
+        // Schema has only `subject`, but the resource has an extra
+        // unknown attribute — leave it alone.
+        let registry = build_test_registry();
+        let mut resources = vec![make_resource(vec![
+            ("subject", Value::String("x".to_string())),
+            ("name", Value::String("p1".to_string())),
+        ])];
+        canonicalize_resources_with_schemas(&mut resources, &registry);
+        assert_eq!(
+            resources[0].attributes.get("name"),
+            Some(&Value::String("p1".to_string()))
+        );
+    }
+
+    #[test]
+    fn canonicalize_resources_with_schemas_scalar_and_list_yield_same_value() {
+        // The acceptance criterion from #2511: scalar literal and
+        // single-element list literal produce byte-equal canonical
+        // values once canonicalization runs.
+        let registry = build_test_registry();
+        let mut a = vec![make_resource(vec![(
+            "subject",
+            Value::String("repo:foo:*".to_string()),
+        )])];
+        let mut b = vec![make_resource(vec![(
+            "subject",
+            Value::List(vec![Value::String("repo:foo:*".to_string())]),
+        )])];
+        canonicalize_resources_with_schemas(&mut a, &registry);
+        canonicalize_resources_with_schemas(&mut b, &registry);
+        assert_eq!(a[0].attributes, b[0].attributes);
     }
 }

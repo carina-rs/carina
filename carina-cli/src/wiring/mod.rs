@@ -1223,6 +1223,7 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
             &sorted_resources,
             &current_states,
             remote_bindings,
+            ctx.schemas(),
         )?;
         let phase2_results: Vec<Result<(ResourceId, State), AppError>> =
             stream::iter(resolved_data_sources.iter())
@@ -1307,6 +1308,13 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
     // unresolved upstream references.
     let mut resources = sorted_resources.clone();
     resolve_refs_for_plan(&mut resources, &current_states, remote_bindings)?;
+
+    // Type-level canonicalization for `Union[String, list(String)]`
+    // fields (IAM-style `string_or_list_of_strings`). Done after refs
+    // resolve so concrete `String` / `List` shapes can be folded to the
+    // canonical `Value::StringList` form before differ / display see
+    // them. See #2481, #2511.
+    carina_core::value::canonicalize_resources_with_schemas(&mut resources, ctx.schemas());
 
     // Run the normalization pipeline: normalize_desired → normalize_state →
     // merge_default_tags → resolve_enum_aliases (order matters).
@@ -1652,10 +1660,12 @@ pub(crate) fn resolve_data_source_refs_for_refresh(
     sorted_resources: &[Resource],
     current_states: &HashMap<ResourceId, State>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    schemas: &carina_core::schema::SchemaRegistry,
 ) -> Result<Vec<Resource>, AppError> {
     let mut resolved = sorted_resources.to_vec();
     resolve_refs_with_state_and_remote(&mut resolved, current_states, remote_bindings)
         .map_err(AppError::Validation)?;
+    carina_core::value::canonicalize_resources_with_schemas(&mut resolved, schemas);
     Ok(resolved
         .into_iter()
         .filter(|r| !r.is_virtual() && r.is_data_source())
