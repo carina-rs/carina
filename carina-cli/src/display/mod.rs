@@ -74,6 +74,10 @@ fn format_deferred_value(value: &Value) -> String {
             let formatted: Vec<String> = items.iter().map(format_deferred_value).collect();
             format!("[{}]", formatted.join(", "))
         }
+        Value::StringList(items) => {
+            let formatted: Vec<String> = items.iter().map(|s| format!("'{}'", s)).collect();
+            format!("[{}]", formatted.join(", "))
+        }
         Value::Map(map) => {
             let formatted: Vec<String> = map
                 .iter()
@@ -95,6 +99,10 @@ fn format_export_value(value: &Value) -> String {
         Value::ResourceRef { path } => path.to_dot_string().to_string(),
         Value::List(items) => {
             let formatted: Vec<String> = items.iter().map(format_export_value).collect();
+            format!("[{}]", formatted.join(", "))
+        }
+        Value::StringList(items) => {
+            let formatted: Vec<String> = items.iter().map(|s| format!("'{}'", s)).collect();
             format!("[{}]", formatted.join(", "))
         }
         Value::Map(map) => {
