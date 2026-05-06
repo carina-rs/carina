@@ -122,6 +122,8 @@ plan-fixtures:
 	@echo "---"
 	@$(MAKE) plan-upstream-state-map-subscript
 	@echo "---"
+	@$(MAKE) plan-upstream-state-map-dot-notation
+	@echo "---"
 	@$(MAKE) plan-deferred-for
 	@echo ""
 	@echo "=== policy_pretty ==="
@@ -142,6 +144,8 @@ plan-upstream-state-empty-exports:
 	$(PLAN_FIXTURE) upstream_state_empty_exports
 plan-upstream-state-map-subscript:
 	$(PLAN_FIXTURE) upstream_state_map_subscript
+plan-upstream-state-map-dot-notation:
+	$(PLAN_FIXTURE) upstream_state_map_dot_notation
 plan-deferred-for:
 	$(PLAN_FIXTURE) deferred_for
 plan-exports:
@@ -161,7 +165,7 @@ plan-provider-prefix:
         plan-default-values plan-explicit plan-default-tags \
         plan-state-blocks plan-secret-values plan-moved-with-changes plan-moved-prev-keys plan-moved-pure \
         plan-upstream-state plan-upstream-state-unresolved plan-upstream-state-empty-exports \
-        plan-upstream-state-map-subscript \
+        plan-upstream-state-map-subscript plan-upstream-state-map-dot-notation \
         plan-deferred-for plan-exports plan-exports-multifile plan-policy-pretty \
         plan-pretty-long-string-list plan-pretty-short-string-list plan-provider-prefix \
         plan-map-diff-tui plan-all-create-tui plan-mixed-tui plan-delete-tui \

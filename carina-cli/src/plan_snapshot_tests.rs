@@ -690,6 +690,53 @@ fn plan_snapshot_upstream_state_map_subscript() {
     insta::assert_snapshot!(stripped);
 }
 
+/// Issue #2447: companion to the subscript fixture, but for the
+/// dot-notation form `${X.field.key}` / bare `X.field.key`. Pre-fix the
+/// dot form passed validate but rendered the literal substring
+/// `orgs.accounts.registry_dev` into the output (the parser fell back
+/// to `Value::String` because the head wasn't a known binding in the
+/// current file). Symmetric with the #2435 subscript fix; both forms
+/// must now resolve to the upstream's concrete map value.
+#[test]
+fn plan_snapshot_upstream_state_map_dot_notation() {
+    let (plan, schemas, moved_origins) = build_plan_from_fixture("upstream_state_map_dot_notation");
+    let output = format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &moved_origins,
+        &[],
+        &[],
+    );
+    let stripped = strip_ansi(&output);
+    // Both dot-notation forms — bare attribute value and inside `${...}`
+    // interpolation — must end up substituted with the actual account ids.
+    assert!(
+        stripped.contains("222222222222"),
+        "expected dev account id substituted, got:\n{stripped}"
+    );
+    assert!(
+        stripped.contains("111111111111"),
+        "expected prod account id substituted, got:\n{stripped}"
+    );
+    assert!(
+        stripped.contains("shared-222222222222-bucket"),
+        "expected `${{orgs.accounts.registry_dev}}` interpolation substituted, got:\n{stripped}"
+    );
+    // Pin that the bare-attribute form does not regress to the literal
+    // `orgs.accounts.registry_dev` substring (the original #2447 bug).
+    assert!(
+        stripped.contains("DevAccount: \"222222222222\""),
+        "expected bare `orgs.accounts.registry_dev` attribute substituted, got:\n{stripped}"
+    );
+    assert!(
+        !stripped.contains("orgs.accounts.registry_dev"),
+        "literal `orgs.accounts.registry_dev` substring leaked into output:\n{stripped}"
+    );
+    insta::assert_snapshot!(stripped);
+}
+
 #[test]
 fn plan_snapshot_exports() {
     use crate::commands::plan::ExportChange;

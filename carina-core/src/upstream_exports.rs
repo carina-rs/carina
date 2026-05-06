@@ -534,17 +534,98 @@ fn check_ref_against_type(
             // declared type — nothing to type-check against.
             return;
         };
-        if crate::validation::is_type_expr_compatible_with_schema(export_type, expected) {
+
+        // Narrow the export type through the access path's `field_path`
+        // and `subscripts`. `${orgs.accounts['k']}` over an export of
+        // `map(AwsAccountId)` resolves to `AwsAccountId`, not the whole
+        // map; the position-compatibility check must use the narrowed
+        // type so a bucket-policy interpolation isn't false-flagged
+        // against the outer `Struct(IamPolicyDocument)` (#2447).
+        let Some(narrowed) = narrow_type_expr(export_type, path.field_path(), path.subscripts())
+        else {
+            // Kind mismatch (subscripting an Int, dotting into a
+            // String, etc.) is the dedicated shape checkers' job —
+            // `check_upstream_state_attribute_access_shapes` for the
+            // field_path leg, `check_upstream_state_subscript_shapes`
+            // for the subscript leg. Skip here so we don't
+            // double-report.
+            return;
+        };
+
+        // Once narrowing through `field_path`/`subscripts` has reduced
+        // the export to a scalar leaf, we can't usefully compare it to
+        // the *outer* attribute type from here: the ref may sit deep
+        // inside a string interpolation, a struct field, or a list
+        // element, and only a positional walker can pick out the right
+        // inner expected type. Accepting the scalar matches reality
+        // (a resolved scalar can occupy nearly any leaf position) and
+        // stops the top-level check from false-flagging the
+        // bucket-policy shape from #2447.
+        //
+        // Only applies when the path actually narrowed: a top-level
+        // ref with neither `field_path` nor `subscripts` still gets the
+        // direct compare against the outer attribute type, preserving
+        // the existing kind-mismatch diagnostics
+        // (`type_check_flags_string_consumer_with_int_export` etc.).
+        let narrowed_below_root = !path.field_path().is_empty() || !path.subscripts().is_empty();
+        if narrowed_below_root && is_scalar_type_expr(&narrowed) {
+            return;
+        }
+
+        if crate::validation::is_type_expr_compatible_with_schema(&narrowed, expected) {
             return;
         }
         errors.push(UpstreamTypeError {
             location: location.to_string(),
             binding: binding.to_string(),
             field: field.to_string(),
-            export_type: export_type.clone(),
+            export_type: narrowed,
             expected_type: expected.clone(),
         });
     });
+}
+
+/// Narrow `start` through a chain of `field_path` segments and
+/// trailing `subscripts`. Returns `None` when a step doesn't fit the
+/// container kind; those mismatches are already reported by the
+/// dedicated shape checkers and a duplicate here would be noise.
+///
+/// The field-path leg delegates to `walk_type_expr_path` to keep the
+/// dot-form descent rules (map-key + struct-field) in one place.
+fn narrow_type_expr(
+    start: &TypeExpr,
+    field_path: &[String],
+    subscripts: &[crate::resource::Subscript],
+) -> Option<TypeExpr> {
+    let after_fields = walk_type_expr_path(start, field_path).ok()?;
+    let mut current = after_fields.clone();
+    use crate::resource::Subscript;
+    for sub in subscripts {
+        current = match (current, sub) {
+            (TypeExpr::List(inner), Subscript::Int { .. }) => *inner,
+            (TypeExpr::Map(inner), Subscript::Str { .. }) => *inner,
+            _ => return None,
+        };
+    }
+    Some(current)
+}
+
+/// True when `t` is a non-container leaf — a scalar value that can
+/// reasonably sit anywhere a string-shaped attribute position accepts.
+/// Used by `check_ref_against_type` to short-circuit the (necessarily
+/// outer-type-only) compatibility check once narrowing has bottomed out
+/// on a scalar; a positional walker would be the right tool to recover
+/// the precision lost here. See #2475 for the follow-up.
+fn is_scalar_type_expr(t: &TypeExpr) -> bool {
+    matches!(
+        t,
+        TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Simple(_)
+            | TypeExpr::SchemaType { .. }
+    )
 }
 
 /// A `for` expression iterates an `upstream_state` field whose declared
@@ -907,6 +988,11 @@ fn walk_type_expr_path<'a, 'b>(
                 }
                 None => return Err((current, segment.as_str())),
             },
+            // Dot form on a map is map-key access (`accounts.k → T`),
+            // symmetric with the subscript form `accounts['k']`. #2447.
+            TypeExpr::Map(inner) => {
+                current = inner.as_ref();
+            }
             _ => return Err((current, segment.as_str())),
         }
     }
@@ -1760,6 +1846,154 @@ mod tests {
     }
 
     // ================================================================
+    // #2447: subscript narrows the export type before the top-level
+    // type-compatibility check
+    // ================================================================
+
+    #[test]
+    fn type_check_map_subscript_narrows_to_value_type() {
+        // `orgs.accounts['k']` against export `map(AwsAccountId)` narrows to
+        // the value type before being compared to the receiver. Without the
+        // narrowing the comparison fires `map(AwsAccountId)` against the
+        // receiver and (when the receiver is anything but a compatible map)
+        // false-flags the position. Issue #2447.
+        use crate::schema::{AttributeType, noop_validator};
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.accounts['k']
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[(
+                "accounts",
+                TypeExpr::Map(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+            )],
+        )]);
+        // Receiver is `String`. Without narrowing, `map(AwsAccountId)`
+        // compares against `String` and fails. With narrowing,
+        // `AwsAccountId` (Custom over String) is accepted.
+        let aws_account_id = AttributeType::Custom {
+            semantic_name: Some("AwsAccountId".to_string()),
+            base: Box::new(AttributeType::String),
+            pattern: None,
+            length: None,
+            validate: noop_validator(),
+            namespace: None,
+            to_dsl: None,
+        };
+        let schemas = schema_with_attr("name", aws_account_id);
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        assert!(
+            errs.is_empty(),
+            "subscript narrows map(T) to T before compare, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn type_check_subscript_inside_struct_position_does_not_false_flag() {
+        // The bucket-policy repro from #2447: a deeply-nested ref inside a
+        // struct attribute (`policy: Struct(IamPolicyDocument)`) where
+        // narrowing through a subscript produces a scalar that *could*
+        // legitimately occupy a leaf string position inside the struct.
+        // The top-level check must not reject the narrowed scalar against
+        // the outer struct type — positional walking is the precise tool
+        // for that, and the existing top-level check is too coarse.
+        use crate::schema::{AttributeType, StructField};
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    policy = {
+                        statement = "arn:aws:iam::${orgs.accounts['registry_dev']}:root"
+                    }
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[(
+                "accounts",
+                TypeExpr::Map(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+            )],
+        )]);
+        let policy_struct = AttributeType::Struct {
+            name: "IamPolicyDocument".to_string(),
+            fields: vec![StructField::new("statement", AttributeType::String).required()],
+        };
+        let schemas = schema_with_attr("policy", policy_struct);
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        assert!(
+            errs.is_empty(),
+            "subscript-narrowed scalar must not be rejected against outer \
+             struct attr, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn type_check_dot_form_chains_through_map_into_struct_field() {
+        // `orgs.accounts.k.account_id` where `accounts: map(struct{
+        // account_id: aws_account_id })`. The dot walk descends
+        // map(T).k → T (struct), then struct.account_id → aws_account_id.
+        // Both legs of `walk_type_expr_path` exercised by one path.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.accounts.alpha.account_id
+                }
+            "#,
+            "test",
+        );
+        let account_struct = TypeExpr::Struct {
+            fields: vec![(
+                "account_id".to_string(),
+                TypeExpr::Simple("aws_account_id".to_string()),
+            )],
+        };
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[("accounts", TypeExpr::Map(Box::new(account_struct)))],
+        )]);
+        let schemas = schema_with_attr("name", crate::schema::AttributeType::String);
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        assert!(
+            errs.is_empty(),
+            "dot-walk through map into struct field must resolve to leaf type, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn type_check_list_subscript_narrows_to_element_type() {
+        // Same shape as the map case for `list(T)[idx]`: subscript narrows
+        // to T before the top-level check.
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = orgs.regions[0]
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[("regions", TypeExpr::List(Box::new(TypeExpr::String)))],
+        )]);
+        let schemas = schema_with_attr("name", crate::schema::AttributeType::String);
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        assert!(
+            errs.is_empty(),
+            "list subscript narrows list(T) to T before compare, got: {errs:?}"
+        );
+    }
+
+    // ================================================================
     // #1894: for-iterable shape compatibility
     // (`check_upstream_state_for_iterable_shapes`)
     // ================================================================
@@ -2285,15 +2519,12 @@ mod tests {
     }
 
     #[test]
-    fn attribute_access_against_map_export_flags_mismatch() {
-        // `orgs.accounts.alpha` against `accounts: map(_)` — same class
-        // of error. The carina parser does not currently accept
-        // subscript-after-field-access (see `parser/expressions/primary.rs`
-        // — `index access after field access is not supported`), so
-        // `accounts["alpha"]` and `accounts.alpha` are *both* errors
-        // today, just at different layers (parser vs. this check).
-        // Bare `.alpha` parses as struct-field access, which is what
-        // this check rejects against a map export.
+    fn attribute_access_against_map_export_resolves_as_key_access() {
+        // `orgs.accounts.alpha` against `accounts: map(_)` is valid
+        // map-key access, equivalent to `orgs.accounts['alpha']`. The
+        // shape walk descends `map(T).k → T` for the dot form, the
+        // same way it does for the subscript form. Issue #2447 — both
+        // notations must resolve a single map entry.
         let parsed = parse_project_with_provider(
             r#"
                 let orgs = upstream_state { source = "../organizations" }
@@ -2311,13 +2542,10 @@ mod tests {
             )],
         )]);
         let errs = check_upstream_state_attribute_access_shapes(&parsed, &exports);
-        assert_eq!(
-            errs.len(),
-            1,
-            "field access on map must fail, got: {errs:?}"
+        assert!(
+            errs.is_empty(),
+            "dot-notation against map must be accepted as key access, got: {errs:?}"
         );
-        let msg = errs[0].diagnostic_message();
-        assert!(msg.contains("map"), "message must mention map shape: {msg}");
     }
 
     #[test]

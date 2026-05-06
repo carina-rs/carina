@@ -2110,6 +2110,53 @@ fn exports_map_type_warning_for_cross_file_ref() {
 }
 
 #[test]
+fn exports_subscripted_cross_file_ref_does_not_false_flag() {
+    // Counterpart to the bare-attribute test above: when an exports
+    // value is a `ResourceRef` with a `field_path` or `subscripts`
+    // (e.g. `accounts['k']` against a sibling-file binding), the LSP
+    // must not compare the receiver type against the head's full
+    // attribute type — the subscript narrows the position and a
+    // positional walker (#2475) is the precise tool. Today the LSP
+    // skips the comparison rather than false-flag, matching the
+    // behaviour of the core `check_ref_against_type` after #2447.
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let schema = ResourceSchema::new("organizations.account").attribute(AttributeSchema::new(
+        "accounts",
+        AttributeType::map(AttributeType::String),
+    ));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
+    let engine = custom_engine(schemas);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("downstream");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(
+        base.join("main.crn"),
+        "let orgs = awscc.organizations.account { name = 'orgs' }\n",
+    )
+    .unwrap();
+    // Receiver expects String. Pre-#2447 (or with naive ResourceRef
+    // handling), the LSP would compare `map(String)` vs `String` and
+    // emit a spurious mismatch; with subscript-awareness it must stay
+    // silent.
+    let exports = "exports {\n  dev: String = orgs.accounts['registry_dev']\n}\n";
+    std::fs::write(base.join("exports.crn"), exports).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "exports.crn", exports);
+
+    let type_warning = diagnostics
+        .iter()
+        .find(|d| d.message.contains("type mismatch") || d.message.contains("expected"));
+    assert!(
+        type_warning.is_none(),
+        "Subscripted ref must not be compared against head's outer type. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn no_undefined_resource_for_sibling_binding_in_exports() {
     let engine = DiagnosticEngine::new(
         Arc::new(SchemaRegistry::new()),

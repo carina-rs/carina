@@ -338,9 +338,16 @@ fn parse_and_resolve_resource_reference() {
 }
 
 #[test]
-fn parse_undefined_two_part_identifier_becomes_string() {
-    // When a 2-part identifier references an unknown binding,
-    // it becomes a String (e.g., "nonexistent.name") for later schema validation
+fn parse_undefined_two_part_identifier_becomes_resource_ref() {
+    // A 2-part dotted identifier whose head is not a known binding in
+    // this file lowers to `Value::ResourceRef`, not a literal string.
+    // Two reasons:
+    //   - the head may legitimately live in a sibling `.crn` (the
+    //     directory-scoped, multi-file shape), and
+    //   - the post-merge `check_identifier_scope` walk produces a
+    //     proper "Undefined identifier" diagnostic with did-you-mean
+    //     suggestions when the binding really is undeclared.
+    // Issues #2435 (subscript form) and #2447 (dot-notation form).
     let input = r#"
         let policy = aws.s3_bucket_policy {
             name = "my-policy"
@@ -348,13 +355,30 @@ fn parse_undefined_two_part_identifier_becomes_string() {
         }
     "#;
 
-    // Parsing succeeds - unknown identifiers become String
     let result = parse_and_resolve(input);
     assert!(result.is_ok());
     let parsed = result.unwrap();
-    assert_eq!(
-        parsed.resources[0].get_attr("bucket"),
-        Some(&Value::String("nonexistent.name".to_string()))
+    match parsed.resources[0].get_attr("bucket") {
+        Some(Value::ResourceRef { path }) => {
+            assert_eq!(path.binding(), "nonexistent");
+            assert_eq!(path.attribute(), "name");
+            assert!(path.field_path().is_empty());
+            assert!(path.subscripts().is_empty());
+        }
+        other => panic!("expected ResourceRef, got {other:?}"),
+    }
+
+    // Pin that the post-merge scope walk surfaces a clear undefined
+    // diagnostic for the lowered ref — without this, the silent
+    // ResourceRef shape would land in the resolver as an unresolvable
+    // dangling reference instead of the user-friendly error the
+    // previous "literal string" fallback produced indirectly.
+    let scope_errors = crate::parser::check_identifier_scope(&parsed);
+    assert!(
+        scope_errors
+            .iter()
+            .any(|e| e.to_string().contains("nonexistent")),
+        "expected check_identifier_scope to flag `nonexistent`, got: {scope_errors:?}"
     );
 }
 
@@ -7888,6 +7912,122 @@ fn parse_subscript_on_upstream_state_inside_string_interpolation_sibling_file() 
                             key: "registry_dev".to_string()
                         }]
                     );
+                    found_ref = true;
+                }
+            }
+            assert!(
+                found_ref,
+                "expected a ResourceRef expression part in the interpolation, got {parts:?}"
+            );
+        }
+        other => panic!("expected Value::Interpolation, got {other:?}"),
+    }
+}
+
+// ================================================================
+// #2447: dot-notation upstream_state field access across sibling files
+//
+// Symmetric with the #2435 subscript fixes above: `${orgs.accounts.k}` must
+// also lower to `Value::ResourceRef` when the `let orgs = upstream_state{...}`
+// declaration lives in a sibling .crn. Without this, the dotted form falls
+// through to a `Value::String("orgs.accounts.k")` literal and the literal
+// flows through the resolver into the rendered plan.
+// ================================================================
+
+#[test]
+fn parse_dot_notation_on_upstream_state_in_sibling_file() {
+    use crate::config_loader::parse_directory;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("state.crn"),
+        r#"
+            let orgs = upstream_state { source = "../organizations" }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("main.crn"),
+        r#"
+            provider test {
+                source = "x/y"
+                version = "0.1"
+                region = "ap-northeast-1"
+            }
+
+            test.r.res {
+                name = "x"
+                account_id = orgs.accounts.registry_dev
+            }
+        "#,
+    )
+    .unwrap();
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
+        .expect("cross-file upstream dot-notation must parse");
+    let res = parsed
+        .resources
+        .iter()
+        .find(|r| r.attributes.contains_key("account_id"))
+        .expect("resource present");
+    let v = res.attributes.get("account_id").unwrap();
+    match v {
+        Value::ResourceRef { path } => {
+            assert_eq!(path.binding(), "orgs");
+            assert_eq!(path.attribute(), "accounts");
+            assert_eq!(path.field_path(), ["registry_dev".to_string()]);
+            assert!(path.subscripts().is_empty());
+        }
+        other => panic!("expected ResourceRef with field_path, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_dot_notation_on_upstream_state_inside_string_interpolation_sibling_file() {
+    // `"prefix${orgs.accounts.registry_dev}suffix"` must lower the field
+    // access into a `Value::ResourceRef` so the resolver can substitute
+    // the actual map value at plan time. Without this fix the embedded
+    // ${...} renders the literal substring `orgs.accounts.registry_dev`
+    // into the output.
+    use crate::config_loader::parse_directory;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("state.crn"),
+        r#"
+            let orgs = upstream_state { source = "../organizations" }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("main.crn"),
+        r#"
+            provider test {
+                source = "x/y"
+                version = "0.1"
+                region = "ap-northeast-1"
+            }
+
+            test.r.res {
+                name = "x"
+                arn = "arn:aws:iam::${orgs.accounts.registry_dev}:root"
+            }
+        "#,
+    )
+    .unwrap();
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
+        .expect("cross-file upstream dot-notation inside ${...} must parse");
+    let res = parsed
+        .resources
+        .iter()
+        .find(|r| r.attributes.contains_key("arn"))
+        .expect("resource present");
+    let v = res.attributes.get("arn").unwrap();
+    match v {
+        Value::Interpolation(parts) => {
+            let mut found_ref = false;
+            for p in parts {
+                if let InterpolationPart::Expr(Value::ResourceRef { path }) = p {
+                    assert_eq!(path.binding(), "orgs");
+                    assert_eq!(path.attribute(), "accounts");
+                    assert_eq!(path.field_path(), ["registry_dev".to_string()]);
                     found_ref = true;
                 }
             }

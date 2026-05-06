@@ -97,6 +97,14 @@ fn parse_namespaced_id_value(
         });
     }
 
+    // Dotted IDs that aren't an enum shorthand are binding refs; the
+    // head may live in a sibling `.crn`, so emit a structured
+    // `ResourceRef` and let `check_identifier_scope` flag genuine typos
+    // post-merge. Symmetric with the subscript fallback above. #2447.
+    if crate::utils::NamespacedId::parse(full_str).is_none() {
+        return Ok(as_resource_ref(Vec::new()));
+    }
+
     Ok(EvalValue::from_value(Value::String(full_str.to_string())))
 }
 
