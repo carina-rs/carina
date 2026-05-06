@@ -1,7 +1,7 @@
 //! Formatter methods for resources, `let` bindings, and state-mutation
 //! blocks (`import`, `removed`, `moved`).
 
-use super::super::cst::{CstChild, CstNode};
+use super::super::cst::{CstChild, CstNode, NodeKind};
 use super::super::format::Formatter;
 
 impl Formatter {
@@ -100,7 +100,14 @@ impl Formatter {
                 }
                 CstChild::Node(n) => {
                     if found_equals {
-                        self.format_node(n);
+                        // ModuleCall as let-binding RHS: emit inline so we
+                        // get `let X = name { ... }` instead of an indented
+                        // module_call statement on the next line.
+                        if n.kind == NodeKind::ModuleCall {
+                            self.format_module_call_inline(n);
+                        } else {
+                            self.format_node(n);
+                        }
                     }
                 }
                 CstChild::Trivia(_) => {}

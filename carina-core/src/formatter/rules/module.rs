@@ -11,7 +11,15 @@ impl Formatter {
 
     pub(in crate::formatter) fn format_module_call(&mut self, node: &CstNode) {
         self.write_indent();
+        self.format_module_call_inline(node);
+        self.write_newline();
+    }
 
+    /// Emit `name { ... }` without the surrounding indent / trailing newline.
+    /// Used when a module call appears as an expression (e.g. the RHS of
+    /// `let X = module_call { ... }`), where the caller has already
+    /// positioned the cursor and is responsible for line breaks.
+    pub(in crate::formatter) fn format_module_call_inline(&mut self, node: &CstNode) {
         // Find and write module name
         for child in &node.children {
             if let CstChild::Token(token) = child
@@ -22,16 +30,7 @@ impl Formatter {
             }
         }
 
-        self.write(" {");
-        self.write_newline();
-        self.current_indent += 1;
-
-        self.format_block_attributes(node);
-
-        self.current_indent -= 1;
-        self.write_indent();
-        self.write("}");
-        self.write_newline();
+        self.format_block_body_tail(node);
     }
 
     /// Format a state block (import, removed, moved)

@@ -79,3 +79,43 @@ fn fmt_idempotent_on_identity_center_fixture() {
         }
     }
 }
+
+// `github-oidc/` mirrors `carina-rs/infra/aws/management/github-oidc/` from
+// issue #2504: `let X = module_call { ... }` is accepted by validate/plan
+// but rejected by the formatter parser, so any infra layout that names a
+// module instantiation (to expose its outputs via `exports.crn`) blocks
+// CI fmt enforcement.
+#[test]
+fn fmt_accepts_github_oidc_fixture() {
+    let dir = fixture_dir("github-oidc");
+    let result = format_all_crn_files(&dir);
+    assert!(
+        result.is_ok(),
+        "`carina fmt` must parse every .crn file in {}. Failures:\n{}",
+        dir.display(),
+        result.unwrap_err()
+    );
+}
+
+#[test]
+fn fmt_idempotent_on_github_oidc_fixture() {
+    let dir = fixture_dir("github-oidc");
+    let config = FormatConfig::default();
+    let entries = fs::read_dir(&dir).expect("read_dir");
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "crn") {
+            let source = fs::read_to_string(&path).expect("read file");
+            let first = format(&source, &config)
+                .unwrap_or_else(|e| panic!("{}: format failed: {}", path.display(), e));
+            let second = format(&first, &config)
+                .unwrap_or_else(|e| panic!("{}: second format failed: {}", path.display(), e));
+            assert_eq!(
+                first,
+                second,
+                "format must be idempotent on {}",
+                path.display()
+            );
+        }
+    }
+}

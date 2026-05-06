@@ -302,4 +302,26 @@ mod tests {
             result.unwrap_err()
         );
     }
+
+    #[test]
+    fn issue_2504_let_binding_with_module_call_rhs() {
+        // `let X = module_call { ... }` is accepted by the main parser
+        // but rejected by the formatter parser. See carina-rs/carina#2504.
+        let input = r#"let github = use {
+  source = '../../../modules/github-oidc'
+}
+
+let github_actions_carina = github {
+  github_repo         = 'carina-rs/infra'
+  role_name           = 'github-actions-carina'
+  managed_policy_arns = ['arn:aws:iam::aws:policy/AdministratorAccess']
+}
+"#;
+        let result = parse(input);
+        assert!(
+            result.is_ok(),
+            "let binding with module call RHS should parse, got: {}",
+            result.unwrap_err()
+        );
+    }
 }
