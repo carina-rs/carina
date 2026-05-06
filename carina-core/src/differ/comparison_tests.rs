@@ -850,3 +850,74 @@ fn secret_in_map_with_refresh_no_false_diff() {
         changed,
     );
 }
+
+// ---- Union[String, list(String)] canonical-form invariant (#2481, #2512) ----
+
+/// Helper: build the `Union[String, list(String)]` shape used by
+/// IAM-style `string_or_list_of_strings` schema fields.
+fn string_or_list_of_strings_type() -> AttributeType {
+    AttributeType::Union(vec![
+        AttributeType::String,
+        AttributeType::list(AttributeType::String),
+    ])
+}
+
+#[test]
+fn union_string_or_list_canonical_string_list_equal_to_self() {
+    // Two `Value::StringList` values with identical contents must be
+    // equal under the differ for the `Union[String, list(String)]`
+    // type. Sanity check that the canonical form is comparable at all.
+    let union = string_or_list_of_strings_type();
+    let a = Value::StringList(vec!["repo:foo:*".to_string()]);
+    let b = Value::StringList(vec!["repo:foo:*".to_string()]);
+    assert!(type_aware_equal(&a, &b, Some(&union), None));
+}
+
+#[test]
+fn union_string_or_list_canonical_string_list_diff_on_different_content() {
+    let union = string_or_list_of_strings_type();
+    let a = Value::StringList(vec!["repo:foo:*".to_string()]);
+    let b = Value::StringList(vec!["repo:bar:*".to_string()]);
+    assert!(!type_aware_equal(&a, &b, Some(&union), None));
+}
+
+#[test]
+fn union_string_or_list_non_canonical_mixed_shapes_fail_to_equal() {
+    // Invariant guard (#2512): a non-canonical pair must NOT be
+    // treated as equal by the differ. If the canonicalization upstream
+    // (#2511 / #2513) ever regresses, this test catches the resulting
+    // phantom diff at its source instead of letting the comparator
+    // paper over it. Adding a special-case equality here would defeat
+    // the type-level canonicalization design.
+    let union = string_or_list_of_strings_type();
+    let scalar = Value::String("repo:foo:*".to_string());
+    let canonical = Value::StringList(vec!["repo:foo:*".to_string()]);
+    assert!(!type_aware_equal(&scalar, &canonical, Some(&union), None));
+
+    let legacy_list = Value::List(vec![Value::String("repo:foo:*".to_string())]);
+    assert!(!type_aware_equal(
+        &legacy_list,
+        &canonical,
+        Some(&union),
+        None
+    ));
+}
+
+#[test]
+fn union_string_or_list_through_custom_wrapper() {
+    // `Custom` wrappers around the union must remain transparent —
+    // the comparator delegates `Custom { base, .. }` to its `base`.
+    let inner = string_or_list_of_strings_type();
+    let custom = AttributeType::Custom {
+        semantic_name: Some("PolicyConditionValue".to_string()),
+        base: Box::new(inner),
+        pattern: None,
+        length: None,
+        validate: std::sync::Arc::new(|_| Ok(())),
+        namespace: None,
+        to_dsl: None,
+    };
+    let a = Value::StringList(vec!["x".to_string()]);
+    let b = Value::StringList(vec!["x".to_string()]);
+    assert!(type_aware_equal(&a, &b, Some(&custom), None));
+}

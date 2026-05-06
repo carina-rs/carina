@@ -23,6 +23,27 @@ use crate::value::{SECRET_PREFIX, SecretHashContext, argon2id_hash, value_to_jso
 ///
 /// When `secret_ctx` is provided, it is used for context-specific salt when
 /// comparing `Value::Secret` against state hash strings.
+///
+/// # Invariant: `Union[String, list(String)]` is canonicalized upstream
+///
+/// For attributes typed as `Union[String, list(String)]` (the IAM-style
+/// `string_or_list_of_strings` shape — see #2481), **both** `a` and
+/// `b` reach this function as the canonical `Value::StringList` form,
+/// never as a mix of `Value::String` and `Value::List([String])`. The
+/// canonicalization happens upstream in
+/// `value::canonicalize_resources_with_schemas` (#2511) for the
+/// desired side and `value::canonicalize_states_with_schemas` (#2513)
+/// for the actual side, both run before the differ.
+///
+/// **Do not add a special-case equality here that treats `"x"` and
+/// `["x"]` as equal for this Union type.** Doing so would mask the
+/// canonicalization invariant: if a non-canonical value reaches the
+/// differ, that is an upstream bug and should fail the comparison so
+/// the diff surfaces it. Special-case equality at the comparator
+/// hides the divergence and leaves state files recording the
+/// non-canonical shape, so plan diffs would keep firing on the next
+/// run — exactly the phantom-diff regression that #2481 set out to
+/// eliminate.
 pub(super) fn type_aware_equal(
     a: &Value,
     b: &Value,
