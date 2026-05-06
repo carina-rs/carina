@@ -1315,6 +1315,12 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
     // canonical `Value::StringList` form before differ / display see
     // them. See #2481, #2511.
     carina_core::value::canonicalize_resources_with_schemas(&mut resources, ctx.schemas());
+    // Same canonicalization for the actual-side state values (#2481, #2513).
+    // Existing state files written before this change come back from
+    // serde with the legacy `String` / `List` shape; converging both
+    // sides on `StringList` lets the differ produce no diff against a
+    // canonical desired side.
+    carina_core::value::canonicalize_states_with_schemas(&mut current_states, ctx.schemas());
 
     // Run the normalization pipeline: normalize_desired → normalize_state →
     // merge_default_tags → resolve_enum_aliases (order matters).

@@ -948,6 +948,8 @@ async fn run_apply_locked(
     // Type-level canonicalization for `Union[String, list(String)]`
     // fields (IAM-style `string_or_list_of_strings`). See #2481, #2511.
     carina_core::value::canonicalize_resources_with_schemas(&mut resources_for_plan, ctx.schemas());
+    // Same for actual-state side (#2481, #2513).
+    carina_core::value::canonicalize_states_with_schemas(&mut current_states, ctx.schemas());
 
     // Run the normalization pipeline (same as plan path in wiring.rs).
     let preprocessor = crate::wiring::PlanPreprocessor::new(&provider, ctx);
