@@ -126,6 +126,12 @@ impl DiagnosticEngine {
             diagnostics.push(parse_error_to_diagnostic(error));
         }
 
+        // Empty `${}` interpolation hint. Runs even when other parses
+        // succeeded — and especially before the buffer-only checks
+        // below — so users get an actionable warning right at the
+        // placeholder rather than only learning at apply time.
+        diagnostics.extend(self.check_empty_interpolations(doc));
+
         // Build the directory-scoped merged parse once up-front — it is
         // the authoritative source of truth for every check that needs
         // cross-file context: undefined-identifier (#2132), upstream-

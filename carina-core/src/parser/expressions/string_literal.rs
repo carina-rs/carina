@@ -4,7 +4,7 @@
 //! (interpolated) string forms, plus the related unescape routines.
 
 use crate::parser::{ParseContext, ParseError, Rule, first_inner, parse_expression};
-use crate::resource::{InterpolationPart, Value};
+use crate::resource::{InterpolationPart, UnknownReason, Value};
 
 pub(crate) fn parse_string_literal(
     pair: pest::iterators::Pair<Rule>,
@@ -65,9 +65,15 @@ pub(crate) fn parse_string_value(
                 }
                 Rule::interpolation => {
                     has_interpolation = true;
-                    let expr_pair =
-                        first_inner(inner, "interpolation expression", "interpolation")?;
-                    let value = parse_expression(expr_pair, ctx)?;
+                    // Grammar makes the inner expression optional so
+                    // mid-edit `${}` doesn't poison the AST. An empty
+                    // interpolation lands as `Value::Unknown(EmptyInterpolation)`
+                    // — the LSP surfaces it as a diagnostic; downstream
+                    // resolvers carry it as an unresolved value. See #2480.
+                    let value = match inner.into_inner().next() {
+                        Some(expr_pair) => parse_expression(expr_pair, ctx)?,
+                        None => Value::Unknown(UnknownReason::EmptyInterpolation),
+                    };
                     parts.push(InterpolationPart::Expr(value));
                 }
                 _ => {}

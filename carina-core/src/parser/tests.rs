@@ -2684,6 +2684,104 @@ fn parse_string_escaped_interpolation() {
 }
 
 #[test]
+fn parse_empty_interpolation_accepted_as_unknown() {
+    // `${}` mid-edit must NOT abort parsing — instead it is stamped as
+    // `Value::Unknown(EmptyInterpolation)` so other diagnostics in the
+    // file (sibling let bindings, type mismatches, etc.) keep running.
+    // See #2480 — pre-fix, this input rejected the entire AST with
+    // `expected primary` and made every let binding appear undefined.
+    let input = r#"
+        let bucket = aws.s3.Bucket {
+            name = "arn:${}:root"
+        }
+    "#;
+
+    let result =
+        parse(input, &ProviderContext::default()).expect("empty `${}` must parse, not abort");
+    let bucket = &result.resources[0];
+    let attr = bucket.get_attr("name").expect("name attr");
+    let parts = match attr {
+        Value::Interpolation(parts) => parts,
+        other => panic!("expected Value::Interpolation, got {:?}", other),
+    };
+    let has_empty = parts.iter().any(|p| {
+        matches!(
+            p,
+            crate::resource::InterpolationPart::Expr(Value::Unknown(
+                crate::resource::UnknownReason::EmptyInterpolation
+            ))
+        )
+    });
+    assert!(
+        has_empty,
+        "expected an InterpolationPart::Expr(Value::Unknown(EmptyInterpolation)) in the parsed parts; got {:?}",
+        parts
+    );
+}
+
+#[test]
+fn parse_whitespace_only_interpolation_accepted_as_unknown() {
+    // `${ }` (only whitespace inside) must also be accepted, not just
+    // the zero-char `${}` shape. The grammar's `inline_ws*` covers
+    // space and tab; both stamp the same `EmptyInterpolation` marker.
+    let input = "
+        let bucket = aws.s3.Bucket {
+            name = \"arn:${ \t  \t}:root\"
+        }
+    ";
+
+    let result = parse(input, &ProviderContext::default())
+        .expect("`${  }` (whitespace-only) must parse, not abort");
+    let bucket = &result.resources[0];
+    let attr = bucket.get_attr("name").expect("name attr");
+    let parts = match attr {
+        Value::Interpolation(parts) => parts,
+        other => panic!("expected Value::Interpolation, got {:?}", other),
+    };
+    let has_empty = parts.iter().any(|p| {
+        matches!(
+            p,
+            crate::resource::InterpolationPart::Expr(Value::Unknown(
+                crate::resource::UnknownReason::EmptyInterpolation
+            ))
+        )
+    });
+    assert!(
+        has_empty,
+        "whitespace-only `${{}}` must stamp EmptyInterpolation; got {:?}",
+        parts
+    );
+}
+
+#[test]
+fn parse_empty_interpolation_does_not_break_sibling_bindings() {
+    // The whole file's other let bindings stay accessible — concretely,
+    // a binding declared after the empty `${}` line still appears in
+    // the resulting resource set. Pre-fix the parse error short-
+    // circuited everything past the offending line.
+    let input = r#"
+        let bucket = aws.s3.Bucket {
+            name = "arn:${}:root"
+        }
+        let vpc = aws.ec2.Vpc {
+            cidr_block = "10.0.0.0/16"
+        }
+    "#;
+
+    let result = parse(input, &ProviderContext::default()).expect("must parse");
+    let resource_names: Vec<&str> = result
+        .resources
+        .iter()
+        .map(|r| r.binding.as_deref().unwrap_or(""))
+        .collect();
+    assert!(
+        resource_names.contains(&"bucket") && resource_names.contains(&"vpc"),
+        "both let-bound resources must survive an empty `${{}}`; got: {:?}",
+        resource_names
+    );
+}
+
+#[test]
 fn parse_string_interpolation_with_bool() {
     let input = r#"
         let vpc = aws.ec2.Vpc {
