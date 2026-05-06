@@ -18,7 +18,7 @@ use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
 use carina_core::resolver::resolve_refs_with_state_and_remote;
 use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::value::format_value;
-use carina_state::{LockInfo, ResourceState, StateBackend, StateFile, resolve_backend};
+use carina_state::{LockInfo, StateBackend, StateFile, resolve_backend};
 
 use carina_core::parser::ProviderContext;
 
@@ -598,22 +598,14 @@ pub async fn run_apply(
                         target_file.display()
                     );
 
-                    // Create a protected ResourceState for the auto-created bucket
                     let backend_resource_type = backend
                         .resource_type()
                         .ok_or("Backend does not specify a resource type")?;
-                    let bucket_state = ResourceState::new(
+                    let initial_state = StateFile::with_managed_state_bucket(
+                        backend_provider_name,
                         backend_resource_type,
                         &bucket_name,
-                        backend_provider_name,
-                    )
-                    .with_identifier(&bucket_name)
-                    .with_attribute("bucket".to_string(), serde_json::json!(bucket_name))
-                    .with_protected(true);
-
-                    // Initialize state with the protected bucket
-                    let mut initial_state = StateFile::new();
-                    initial_state.upsert_resource(bucket_state);
+                    );
                     backend
                         .write_state(&initial_state)
                         .await
