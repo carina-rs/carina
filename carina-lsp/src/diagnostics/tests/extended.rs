@@ -2157,6 +2157,58 @@ fn exports_subscripted_cross_file_ref_does_not_false_flag() {
 }
 
 #[test]
+fn exports_referencing_module_call_attribute_does_not_require_annotation() {
+    // #2493: an `exports` value of the form `<module_call>.<attr>` (e.g.
+    // `role_arn = github_actions_carina.role_arn` where
+    // `let github_actions_carina = github { ... }` invokes a module)
+    // must not surface a `type annotation required: unknown binding`
+    // warning. The LSP doesn't run module expansion, so the inferer
+    // sees the binding as `ModuleCall` (known-but-non-inferable, like
+    // upstream_state) and the export gets `TypeExpr::Unknown` without
+    // a hard error.
+    let engine = DiagnosticEngine::new(
+        Arc::new(SchemaRegistry::new()),
+        vec!["awscc".to_string()],
+        Arc::new(vec![]),
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let module_dir = tmp.path().join("github_module");
+    std::fs::create_dir_all(&module_dir).unwrap();
+    std::fs::write(
+        module_dir.join("main.crn"),
+        "arguments {\n  name: String\n}\nattributes {\n  role_arn: String = name\n}\n",
+    )
+    .unwrap();
+    let base = tmp.path().join("downstream");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(
+        base.join("main.crn"),
+        "let github = use { source = '../github_module' }\nlet github_actions_carina = github { name = 'demo' }\n",
+    )
+    .unwrap();
+    let exports = "exports {\n  role_arn = github_actions_carina.role_arn\n}\n";
+    std::fs::write(base.join("exports.crn"), exports).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "exports.crn", exports);
+    let annotation_warning = diagnostics
+        .iter()
+        .find(|d| d.message.contains("type annotation required"));
+    assert!(
+        annotation_warning.is_none(),
+        "module-call attribute export must not raise `type annotation required`. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    let undefined = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Undefined") || d.message.contains("unknown binding"));
+    assert!(
+        undefined.is_none(),
+        "module-call binding must not be flagged as unknown. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn no_undefined_resource_for_sibling_binding_in_exports() {
     let engine = DiagnosticEngine::new(
         Arc::new(SchemaRegistry::new()),

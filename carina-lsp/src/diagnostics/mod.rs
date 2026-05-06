@@ -752,7 +752,13 @@ impl DiagnosticEngine {
                 .as_ref()
                 .map(exports_sibling_bindings_from)
                 .unwrap_or_default();
-            diagnostics.extend(self.check_exports_blocks(doc, parsed, None, &sibling_bindings));
+            diagnostics.extend(self.check_exports_blocks(
+                doc,
+                parsed,
+                merged.as_ref(),
+                None,
+                &sibling_bindings,
+            ));
 
             // Unused `let` detection. When a merged parse is available,
             // run the core check against it (so references from sibling
