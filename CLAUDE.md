@@ -242,6 +242,80 @@ machine-specific paths. Each new worktree needs the file copied or
 recreated. The `target/` directory inside the worktree should also be
 gitignored (it already is at the workspace level).
 
+### Multi-Worktree Parallel Verify
+
+When 2+ `git wt` worktrees are running `cargo nextest run` (or any
+cargo build) at the same time, each worktree's verify cycle gets
+noticeably slower. The contention has three sources, in rough order
+of severity:
+
+1. **sccache file-storage lock contention.** The default sccache
+   backend serializes concurrent writers, so cross-worktree reuse
+   stalls instead of accelerating.
+2. **Duplicate dependency compilation.** Per-worktree `target/`
+   removes cargo's "Blocking waiting for file lock" stalls but does
+   not dedupe compile work. On a cache miss each worktree recompiles
+   the same dependency graph independently.
+3. **rustc / linker CPU + memory-bandwidth contention.** Each worktree
+   spawns its own rustc and linker processes that compete for cores.
+   Linking is especially memory-bandwidth heavy.
+
+Mitigations, in the order to try them:
+
+**1. Scope tests to touched crates.** This is the single biggest win
+and applies even with one worktree. Use the
+`scripts/touched-crates.sh` helper documented above instead of
+defaulting to `--workspace`. A crate-local change reruns one crate's
+tests; a `--workspace` run reruns every crate in the repo. Also
+prefer `cargo check -p <crate>` for mid-iteration sanity and reserve
+`cargo nextest run` for pre-PR.
+
+**2. Use `cargo nextest run -j N` to cap test parallelism per
+worktree when multiple worktrees are active.** Pick `N` so the total
+across worktrees stays at or below the physical core count — e.g.
+on a 16-core machine with 2 active worktrees, run each with `-j 8`.
+Note this caps the *test execution* phase only, not the compile
+phase: rustc/linker contention (source 3 above) is unaffected.
+Repository default is left unchanged (no `.config/nextest.toml`)
+because a fixed cap penalizes the common single-worktree case;
+prefer the ad-hoc `-j` flag.
+
+**3. Switch sccache to a Redis backend (opt-in).** Assumes sccache
+is already wired in via the previous "Build Cache Setup" section.
+Switching the backend removes the sccache file-storage lock
+contention (source 1 above) and improves hit rate across worktrees,
+which also reduces the duplicate compilation in source 2. This is
+opt-in, not the repository default, because Redis is a long-running
+service and the benefit only materializes when 2+ worktrees
+regularly compile concurrently.
+
+```bash
+# Install and start Redis
+brew install redis
+brew services start redis
+
+# Add to your shell rc (zsh, bash, etc.)
+export SCCACHE_REDIS_ENDPOINT=redis://127.0.0.1:6379
+
+# Restart sccache so the new backend takes effect
+sccache --stop-server
+sccache --start-server
+
+# Watch hit rate (run again after a few builds to see ratio rise)
+sccache --show-stats | grep -E "^Cache (hits|misses|hits rate)"
+```
+
+Cap Redis memory by setting `maxmemory` and
+`maxmemory-policy allkeys-lru` in your Redis config
+(`/opt/homebrew/etc/redis.conf` on Apple Silicon brew,
+`/usr/local/etc/redis.conf` on Intel macOS brew).
+`SCCACHE_CACHE_SIZE` only applies to the local file backend;
+with Redis, the bound is set on the Redis side.
+
+When the benefit fades (e.g. you stop using parallel worktrees) you
+can revert by unsetting `SCCACHE_REDIS_ENDPOINT` — sccache falls
+back to its default file storage automatically.
+
 ## Architecture
 
 Carina is a functional infrastructure management tool that treats side effects as values (Effects) rather than immediately executing them.
