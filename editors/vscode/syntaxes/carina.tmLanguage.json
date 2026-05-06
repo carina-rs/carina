@@ -77,6 +77,59 @@
     "strings": {
       "patterns": [
         {
+          "name": "string.unquoted.heredoc.literal.carina",
+          "comment": "Quoted heredoc form (`<<'EOT'` / `<<-'EOT'`): body is literal — `${...}` is NOT expanded by the parser, so no interpolation pattern is embedded.",
+          "begin": "<<-?'([A-Za-z_][A-Za-z0-9_]*)'",
+          "end": "^\\s*\\1\\s*$",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.string.begin.carina" },
+            "1": { "name": "entity.name.tag.heredoc.carina" }
+          },
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.string.end.carina" }
+          }
+        },
+        {
+          "name": "string.unquoted.heredoc.carina",
+          "comment": "Unquoted heredoc form (`<<EOT` / `<<-EOT`): body hosts `${...}` interpolation, mirroring the double-quoted-string treatment.",
+          "begin": "<<-?([A-Za-z_][A-Za-z0-9_]*)",
+          "end": "^\\s*\\1\\s*$",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.string.begin.carina" },
+            "1": { "name": "entity.name.tag.heredoc.carina" }
+          },
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.string.end.carina" }
+          },
+          "patterns": [
+            {
+              "name": "constant.character.escape.carina",
+              "match": "\\\\."
+            },
+            {
+              "name": "meta.embedded.expression.carina",
+              "begin": "\\$\\{",
+              "end": "\\}",
+              "beginCaptures": {
+                "0": { "name": "punctuation.section.embedded.begin.carina" }
+              },
+              "endCaptures": {
+                "0": { "name": "punctuation.section.embedded.end.carina" }
+              },
+              "patterns": [
+                {
+                  "name": "variable.other.carina",
+                  "match": "[A-Za-z_][A-Za-z0-9_]*"
+                },
+                {
+                  "name": "punctuation.accessor.carina",
+                  "match": "\\."
+                }
+              ]
+            }
+          ]
+        },
+        {
           "name": "string.quoted.double.carina",
           "begin": "\"",
           "end": "\"",
