@@ -2012,13 +2012,107 @@ fn upstream_state_depth2_dot_completion_text_edit_replaces_partial() {
 }
 
 #[test]
-fn upstream_state_depth2_dot_completion_skips_map_typed_export() {
-    // `accounts: map(string)` — depth-2 completion has no named keys to
-    // suggest (the map's runtime keys aren't part of the type). Falling
-    // through to no-op is the documented behavior, deferred per #2041.
+fn upstream_state_depth2_dot_completion_lists_map_literal_keys() {
+    // `accounts: map(String) = { registry_prod = ..., registry_dev = ... }` —
+    // depth-2 completion now mines the upstream's literal map for the
+    // statically-declared keys (#2490). Pre-fix this returned nothing
+    // because the map's runtime values weren't carried in the type
+    // information. Post-fix the LSP re-parses the upstream's
+    // `exports.crn` and offers each key.
     let provider = test_provider();
     let (_tmp, base) = set_up_upstream_project(
-        "exports {\n  accounts: map(String) = \"x\"\n}\n",
+        "exports {\n  accounts: map(String) = {\n    registry_prod = \"111111111111\"\n    registry_dev  = \"222222222222\"\n  }\n}\n",
+        "let orgs = upstream_state { source = '../organizations' }\nlet x = orgs.accounts.\n",
+    );
+    let main_src = std::fs::read_to_string(base.join("main.crn")).unwrap();
+    let doc = create_document(&main_src);
+    let position = Position {
+        line: 1,
+        character: "let x = orgs.accounts.".chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&base));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"registry_prod") && labels.contains(&"registry_dev"),
+        "expected `registry_prod` and `registry_dev` from upstream map literal; got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn upstream_state_depth2_dot_completion_lists_map_literal_keys_inside_interpolation() {
+    // Same as the bare `orgs.accounts.<cursor>` case, but with the
+    // cursor inside a `${...}` interpolation. Must also surface the
+    // upstream map literal's keys. This is the original UX pain point
+    // from issue #2490 (`"arn:aws:iam::${orgs.accounts.}:root"`).
+    let provider = test_provider();
+    let (_tmp, base) = set_up_upstream_project(
+        "exports {\n  accounts: map(String) = {\n    registry_prod = \"111111111111\"\n    registry_dev  = \"222222222222\"\n  }\n}\n",
+        "let orgs = upstream_state { source = '../organizations' }\nlet x = \"arn:${orgs.accounts.}:root\"\n",
+    );
+    let main_src = std::fs::read_to_string(base.join("main.crn")).unwrap();
+    let doc = create_document(&main_src);
+    let line1 = main_src.lines().nth(1).unwrap();
+    // Cursor at the `}` (just after the trailing `.`), so the prefix
+    // ends with `${orgs.accounts.`.
+    let cursor_col = line1.find("${orgs.accounts.").unwrap() + "${orgs.accounts.".chars().count();
+    let position = Position {
+        line: 1,
+        character: cursor_col as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&base));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"registry_prod") && labels.contains(&"registry_dev"),
+        "expected upstream map keys inside `${{...}}`; got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn upstream_state_depth2_dot_completion_filters_non_identifier_map_keys() {
+    // Map literals accept string keys (`"prod-1" = ...`) but
+    // `<binding>.<key>` dot access only resolves identifier-shaped
+    // keys. Surfacing `prod-1` would be misleading — the user accepts
+    // the candidate and the resulting expression is invalid. Filter
+    // to identifier-shaped keys only.
+    let provider = test_provider();
+    let (_tmp, base) = set_up_upstream_project(
+        "exports {\n  accounts: map(String) = {\n    \"prod-1\" = \"111111111111\"\n    registry_dev = \"222222222222\"\n  }\n}\n",
+        "let orgs = upstream_state { source = '../organizations' }\nlet x = orgs.accounts.\n",
+    );
+    let main_src = std::fs::read_to_string(base.join("main.crn")).unwrap();
+    let doc = create_document(&main_src);
+    let position = Position {
+        line: 1,
+        character: "let x = orgs.accounts.".chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&base));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"registry_dev"),
+        "identifier-shaped key must be present; got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.contains(&"prod-1"),
+        "non-identifier key must be filtered out (dot access can't reference it); got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn upstream_state_depth2_dot_completion_unparseable_upstream_yields_nothing() {
+    // The upstream's `exports.crn` has a syntax error — the LSP must
+    // not crash and must return an empty completion set. The silent-
+    // fallback contract is documented in `extract_map_literal_keys`.
+    let provider = test_provider();
+    let (_tmp, base) = set_up_upstream_project(
+        // Trailing `=` makes the rhs missing → parse error.
+        "exports {\n  accounts: map(String) =\n}\n",
         "let orgs = upstream_state { source = '../organizations' }\nlet x = orgs.accounts.\n",
     );
     let main_src = std::fs::read_to_string(base.join("main.crn")).unwrap();
@@ -2031,7 +2125,31 @@ fn upstream_state_depth2_dot_completion_skips_map_typed_export() {
     let completions = provider.complete(&doc, position, Some(&base));
     assert!(
         completions.is_empty(),
-        "depth-2 completion on a map(_) export must yield nothing, got: {:?}",
+        "an unparseable upstream must yield no completions, not panic; got: {:?}",
+        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn upstream_state_depth2_dot_completion_empty_map_yields_nothing() {
+    // `accounts: map(String) = { }` — empty map literal. No keys to
+    // suggest. Must not panic, must return empty completion set.
+    let provider = test_provider();
+    let (_tmp, base) = set_up_upstream_project(
+        "exports {\n  accounts: map(String) = {}\n}\n",
+        "let orgs = upstream_state { source = '../organizations' }\nlet x = orgs.accounts.\n",
+    );
+    let main_src = std::fs::read_to_string(base.join("main.crn")).unwrap();
+    let doc = create_document(&main_src);
+    let position = Position {
+        line: 1,
+        character: "let x = orgs.accounts.".chars().count() as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&base));
+    assert!(
+        completions.is_empty(),
+        "depth-2 on empty map literal must yield nothing; got: {:?}",
         completions.iter().map(|c| &c.label).collect::<Vec<_>>()
     );
 }

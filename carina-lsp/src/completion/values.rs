@@ -718,12 +718,13 @@ impl CompletionProvider {
     /// Completions for `<binding>.<key>.<partial>` — depth-2 descent
     /// into an `upstream_state` export's declared `TypeExpr`.
     ///
-    /// When the export's type is `TypeExpr::Struct`, every field name
-    /// is offered with the field type rendered into `detail`. Other
-    /// type variants (`Map`, `List`, scalars, `Simple`, `Ref`,
-    /// `SchemaType`) have no named child positions at this depth and
-    /// produce an empty list. Map-key recursion via the runtime
-    /// `Value` is intentionally deferred per #2041.
+    /// `TypeExpr::Struct` offers every field name with the field type
+    /// rendered into `detail`. `TypeExpr::Map` mines the upstream's
+    /// literal map for its statically-declared keys (#2490) — only
+    /// identifier-shaped keys, since `<binding>.<key>` dot access
+    /// can't reach quoted string keys. List / scalar / `Simple` /
+    /// `Ref` / `SchemaType` have no named child positions at this
+    /// depth and produce an empty list.
     pub(super) fn upstream_state_depth2_dot_completions(
         &self,
         binding: &str,
@@ -741,13 +742,6 @@ impl CompletionProvider {
             // Untyped or unknown key: we have no fields to descend into.
             return Vec::new();
         };
-        let carina_core::parser::TypeExpr::Struct { fields } = type_expr else {
-            // Map / List / scalars: depth-2 names are runtime values, not
-            // part of the type. Suggest nothing rather than something
-            // potentially invalid (#2041).
-            return Vec::new();
-        };
-
         let partial_chars = partial.chars().count() as u32;
         let range = Range {
             start: Position {
@@ -757,21 +751,62 @@ impl CompletionProvider {
             end: position,
         };
 
-        let mut items: Vec<CompletionItem> = fields
-            .iter()
-            .map(|(name, field_type)| CompletionItem {
-                label: name.clone(),
-                kind: Some(CompletionItemKind::FIELD),
-                detail: Some(format!("{}: {}", name, field_type)),
-                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
-                    range,
-                    new_text: name.clone(),
-                })),
-                ..Default::default()
-            })
-            .collect();
-        items.sort_by(|a, b| a.label.cmp(&b.label));
-        items
+        match type_expr {
+            carina_core::parser::TypeExpr::Struct { fields } => {
+                let mut items: Vec<CompletionItem> = fields
+                    .iter()
+                    .map(|(name, field_type)| CompletionItem {
+                        label: name.clone(),
+                        kind: Some(CompletionItemKind::FIELD),
+                        detail: Some(format!("{}: {}", name, field_type)),
+                        text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                            range,
+                            new_text: name.clone(),
+                        })),
+                        ..Default::default()
+                    })
+                    .collect();
+                items.sort_by(|a, b| a.label.cmp(&b.label));
+                items
+            }
+            carina_core::parser::TypeExpr::Map(value_type) => {
+                // Mine the upstream's literal map for its statically-
+                // declared keys. Empty map → empty completion set.
+                // Failure to re-parse the upstream falls back silently
+                // so a transient mid-edit state in the upstream
+                // doesn't take cross-file completion offline. See
+                // #2490.
+                let Some(keys_in_literal) =
+                    resolve_upstream_map_literal_keys(source, key, base_path)
+                else {
+                    return Vec::new();
+                };
+                let value_type = value_type.to_string();
+                let mut items: Vec<CompletionItem> = keys_in_literal
+                    .into_iter()
+                    .map(|name| CompletionItem {
+                        label: name.clone(),
+                        // VARIABLE rather than FIELD — these are runtime
+                        // map entries, not type-declared struct fields.
+                        kind: Some(CompletionItemKind::VARIABLE),
+                        detail: Some(format!("{}: {}", name, value_type)),
+                        text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                            range,
+                            new_text: name,
+                        })),
+                        ..Default::default()
+                    })
+                    .collect();
+                items.sort_by(|a, b| a.label.cmp(&b.label));
+                items
+            }
+            _ => {
+                // List / scalars: depth-2 names are runtime values, not
+                // part of the type. Suggest nothing rather than something
+                // potentially invalid (#2041).
+                Vec::new()
+            }
+        }
     }
 
     pub(super) fn upstream_state_block_completions(&self) -> Vec<CompletionItem> {
@@ -1256,6 +1291,47 @@ impl CompletionProvider {
                 .collect(),
         }
     }
+}
+
+/// Re-parse the upstream directory and return the literal keys of the
+/// map-typed export named `key`. Used by depth-2 completion to surface
+/// the statically-declared keys of `upstream.<map_export>.<HERE>` —
+/// only the map case calls this, since struct fields come from the
+/// `TypeExpr` and list/scalar exports have no named keys at all.
+///
+/// Returns `None` when `base_path` is missing, the upstream directory
+/// can't be parsed, the named export has no literal value or isn't a
+/// `Value::Map`, or the binding isn't found. The completion handler
+/// treats that the same as "no candidates" — an upstream mid-edit
+/// shouldn't take downstream completion offline. See #2490.
+fn resolve_upstream_map_literal_keys(
+    source: &str,
+    key: &str,
+    base_path: Option<&Path>,
+) -> Option<Vec<String>> {
+    let base = base_path?;
+    let source_abs = base.join(source);
+    if !source_abs.is_dir() {
+        return None;
+    }
+    let parsed =
+        carina_core::config_loader::parse_directory(&source_abs, &Default::default()).ok()?;
+    let export = parsed.export_params.into_iter().find(|e| e.name == key)?;
+    let value = export.value?;
+    let carina_core::resource::Value::Map(entries) = value else {
+        return None;
+    };
+    // Filter to identifier-shaped keys only. Map literals accept string
+    // keys in the grammar (`"prod-1" = ...`), but `<binding>.<key>` dot
+    // access on the consumer side only works for identifier keys —
+    // surfacing a `prod-1` candidate would insert into a position where
+    // it can't be referenced.
+    Some(
+        entries
+            .into_keys()
+            .filter(|k| carina_core::utils::is_identifier_safe(k))
+            .collect(),
+    )
 }
 
 /// Resolve the export name → `TypeExpr` map for an `upstream_state`
