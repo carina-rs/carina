@@ -669,3 +669,223 @@ input.pagefind-ui__search-input:focus {
     rgba(51, 65, 85, 0.6) 100%
   );
 }
+
+/* ============================================================
+   Round 14c — Terminal frame parity with Hero (FINAL)
+   Supersedes Round 14 and Round 14b.
+
+   - Border, panel fill, header bar match Hero (#334155 / #1e293b / #162032)
+   - Border-radius 0.5rem on frame, header, and pre
+   - Resets EC's stray three-side border on .header
+   - Forces a default "terminal" label by overriding EC's own ::after
+   ============================================================ */
+
+/* Frame container ----------------------------------------------------- */
+.expressive-code .frame.is-terminal {
+  overflow: hidden;
+  border: 1px solid #334155 !important;
+  border-radius: 0.5rem !important;
+  box-shadow: none !important;
+
+  /* EC custom-property knobs (kept for any descendants that read them) */
+  --ec-frm-edBg: #1e293b;
+  --ec-frm-edTabBarBg: #162032;
+  --ec-frm-edTabBarBrdCol: #334155;
+  --ec-frm-frameBoxShdCssVal: none;
+  --ec-frm-trmBg: #1e293b;
+  --ec-frm-trmTtbBg: #162032;
+  --ec-frm-trmTtbBrdBtmCol: #334155;
+  --ec-frm-trmTtbFg: var(--sl-color-gray-3);
+}
+
+/* Body <pre> --------------------------------------------------------- */
+.expressive-code .frame.is-terminal pre {
+  background: #1e293b !important;
+  border: 0 !important;
+  border-radius: 0 0 0.5rem 0.5rem !important;
+}
+
+/* Header bar --------------------------------------------------------- */
+.expressive-code .frame.is-terminal .header {
+  background: #162032 !important;
+  /* Reset all four sides first, then add our single bottom rule */
+  border: 0 !important;
+  border-bottom: 1px solid #334155 !important;
+  border-radius: 0.5rem 0.5rem 0 0 !important;
+  /* EC sets justify-content:center for the (usually missing) title;
+     align our label to the start instead. */
+  justify-content: flex-start !important;
+}
+
+/* Default "terminal" label -------------------------------------------
+   EC ships its own `.header::after` with content:""; position:absolute;
+   inset:0; border-bottom:… — we have to override every one of those.
+   The `figure.frame.is-terminal` selector adds element specificity
+   so we beat EC's `.frame.is-terminal` rule on equal-class specificity.
+   --------------------------------------------------------------------- */
+figure.frame.is-terminal .header::after {
+  content: "terminal" !important;
+  position: static !important;
+  inset: auto !important;
+  border: 0 !important;
+  pointer-events: auto !important;
+  color: var(--sl-color-gray-3);
+  font-family: var(--__sl-font-mono);
+  font-size: var(--sl-text-xs);
+  font-weight: 400;
+  letter-spacing: 0;
+  margin-left: 0.5rem;
+  padding-left: 3.5rem; /* clear the traffic-light dots area */
+}
+
+/* If a frame DOES have an explicit title (non-empty .title span),
+   suppress our default label so we don't double up. */
+figure.frame.is-terminal:has(.title:not(:empty)) .header::after {
+  content: "" !important;
+  padding-left: 0 !important;
+  margin-left: 0 !important;
+}
+
+/* ============================================================
+   Round 14d — Dot colour + label spacing
+   ============================================================ */
+
+/* Make the dots fully opaque and tri-coloured.
+   EC's ::before is a single SVG mask, so we replace it with three
+   radial-gradients (same approach as Hero.astro). */
+.expressive-code .frame.is-terminal .header::before {
+  /* Kill EC's mask + opacity */
+  -webkit-mask-image: none !important;
+          mask-image: none !important;
+  opacity: 1 !important;
+  background-color: transparent !important;
+
+  /* Re-paint as three coloured dots */
+  width: 2.1rem !important;
+  height: 0.56rem !important;
+  background-image:
+    radial-gradient(circle at 0.28rem 50%, #f43f5e 0.28rem, transparent 0.3rem),
+    radial-gradient(circle at 1.05rem 50%, #f59e0b 0.28rem, transparent 0.3rem),
+    radial-gradient(circle at 1.82rem 50%, #10b981 0.28rem, transparent 0.3rem) !important;
+  background-repeat: no-repeat !important;
+}
+
+/* Tighten the gap between dots and the "terminal" label.
+   Header has padding-inline-start ≈ 0.75rem; dots are 2.1rem wide;
+   we want ~0.25rem of slack after the green dot.
+   => padding-left: 2.1rem + 0.25rem = 2.35rem (NOT additive with header padding). */
+figure.frame.is-terminal .header::after {
+  padding-left: 2.35rem !important;
+  margin-left: 0 !important;
+}
+
+/* Also kill any flex gap EC may apply to .header so the label
+   doesn't pick up extra spacing. */
+.expressive-code .frame.is-terminal .header {
+  gap: 0 !important;
+}
+
+/* ============================================================
+   Round 15 — Non-terminal code-frame parity with Hero
+   Targets every .frame that is NOT .is-terminal:
+     - .frame.has-title  (author set title="…")
+     - plain .frame       (no title — we synthesise one)
+   ============================================================ */
+
+/* Frame container ----------------------------------------------------- */
+.expressive-code .frame:not(.is-terminal) {
+  overflow: hidden;
+  border: 1px solid #334155 !important;
+  border-radius: 0.5rem !important;
+  box-shadow: none !important;
+  background: #1e293b !important;
+}
+
+/* Body <pre> --------------------------------------------------------- */
+.expressive-code .frame:not(.is-terminal) pre {
+  background: #1e293b !important;
+  border: 0 !important;
+  border-radius: 0 0 0.5rem 0.5rem !important;
+}
+
+/* When there's NO header (plain frame, no title), round all four
+   corners on the <pre> itself */
+.expressive-code .frame:not(.is-terminal):not(.has-title) pre {
+  border-radius: 0.5rem !important;
+}
+
+/* Titled header bar --------------------------------------------------- */
+.expressive-code .frame.has-title:not(.is-terminal) .header {
+  background: #162032 !important;
+  border: 0 !important;
+  border-bottom: 1px solid #334155 !important;
+  border-radius: 0.5rem 0.5rem 0 0 !important;
+  justify-content: flex-start !important;
+  padding: 0.4rem 0.75rem !important;
+}
+
+/* The <span class="title"> renders as the gold tab label */
+.expressive-code .frame.has-title:not(.is-terminal) .title {
+  background: transparent !important;
+  border: 0 !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  color: #fbbf24 !important;
+  font-family: var(--__sl-font-mono) !important;
+  font-size: var(--sl-text-xs) !important;
+  font-weight: 600 !important;
+  letter-spacing: 0 !important;
+}
+
+/* EC paints a ::after under .title for the tab-tail effect.
+   We don't want that — it conflicts with the flat header look. */
+.expressive-code .frame.has-title:not(.is-terminal) .title::after {
+  display: none !important;
+}
+
+/* Optional: synthesise a header for plain (no-title) code frames -----
+   If you'd rather every code block have a header, uncomment this block.
+   It uses the inner <pre>'s data-language attribute via :has().
+
+   Caveat: this adds a header on EVERY untitled code block, including
+   tiny inline-ish ones, which may feel heavy. Recommended only if the
+   site convention is "every code block looks like a file tab".
+*/
+/*
+.expressive-code .frame:not(.is-terminal):not(.has-title) {
+  position: relative;
+}
+.expressive-code .frame:not(.is-terminal):not(.has-title)::before {
+  content: attr(data-language);
+  display: block;
+  background: #162032;
+  border-bottom: 1px solid #334155;
+  border-radius: 0.5rem 0.5rem 0 0;
+  padding: 0.4rem 0.75rem;
+  color: #fbbf24;
+  font-family: var(--__sl-font-mono);
+  font-size: var(--sl-text-xs);
+  font-weight: 600;
+  text-transform: lowercase;
+}
+.expressive-code .frame:not(.is-terminal):not(.has-title) pre {
+  border-radius: 0 0 0.5rem 0.5rem !important;
+}
+*/
+
+/* NOTE: data-language sits on the inner <pre>, not the <figure>.
+   The :has(pre[data-language]) variant below works in modern browsers: */
+/*
+.expressive-code .frame:not(.is-terminal):not(.has-title):has(pre[data-language])::before {
+  content: attr(data-language);
+}
+*/
+
+/* ============================================================
+   Round 15b — Hide empty header on title-less, non-terminal frames.
+   Pairs with Round 15: <pre> already has full 0.5rem radius in that
+   case, so dropping the header leaves a clean rounded panel.
+   ============================================================ */
+.expressive-code .frame:not(.is-terminal):not(.has-title) .header {
+  display: none !important;
+}
