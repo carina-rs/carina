@@ -7,6 +7,7 @@ use indexmap::IndexMap;
 use thiserror::Error;
 
 use crate::resource::{InterpolationPart, UnknownReason, Value};
+use crate::schema::AttributeType;
 use crate::utils::{convert_enum_value, is_dsl_enum_format};
 
 /// Where in the pipeline a `Value` is being serialized. Used so the
@@ -226,6 +227,12 @@ pub fn value_to_json_with_context(
                 .collect();
             Ok(serde_json::Value::Array(arr?))
         }
+        Value::StringList(items) => Ok(serde_json::Value::Array(
+            items
+                .iter()
+                .map(|s| serde_json::Value::String(s.clone()))
+                .collect(),
+        )),
         Value::Map(map) => {
             let obj: Result<serde_json::Map<_, _>, _> = map
                 .iter()
@@ -326,6 +333,10 @@ pub fn format_value_with_key(value: &Value, _key: Option<&str>) -> String {
         Value::Bool(b) => b.to_string(),
         Value::List(items) => {
             let strs: Vec<_> = items.iter().map(format_value).collect();
+            format!("[{}]", strs.join(", "))
+        }
+        Value::StringList(items) => {
+            let strs: Vec<_> = items.iter().map(|s| format!("\"{}\"", s)).collect();
             format!("[{}]", strs.join(", "))
         }
         Value::Map(map) => {
@@ -792,6 +803,128 @@ pub fn map_similarity(a: &Value, b: &Value) -> usize {
             })
             .count(),
         _ => 0,
+    }
+}
+
+/// Returns true when `attr_type` is exactly the IAM-style
+/// `string_or_list_of_strings` shape — `Union(vec![String, list(String)])`
+/// in either order — peeling through `Custom` wrappers.
+fn is_string_or_list_of_strings(attr_type: &AttributeType) -> bool {
+    let unwrapped = peel_custom(attr_type);
+    let AttributeType::Union(members) = unwrapped else {
+        return false;
+    };
+    if members.len() != 2 {
+        return false;
+    }
+    let mut has_string = false;
+    let mut has_list_of_string = false;
+    for m in members {
+        match peel_custom(m) {
+            AttributeType::String => has_string = true,
+            AttributeType::List { inner, .. }
+                if matches!(peel_custom(inner.as_ref()), AttributeType::String) =>
+            {
+                has_list_of_string = true;
+            }
+            _ => return false,
+        }
+    }
+    has_string && has_list_of_string
+}
+
+fn peel_custom(t: &AttributeType) -> &AttributeType {
+    let mut cur = t;
+    while let AttributeType::Custom { base, .. } = cur {
+        cur = base.as_ref();
+    }
+    cur
+}
+
+/// Convert `value` to the canonical `Value::StringList` form when
+/// `attr_type` is the `string_or_list_of_strings` shape, recursing into
+/// containers (List, Map, Struct) so nested fields are also
+/// canonicalized.
+///
+/// Conversion rules for `string_or_list_of_strings`:
+/// - `Value::String(s)` → `Value::StringList(vec![s])`
+/// - `Value::List([Value::String(_), ...])` (every element a String) →
+///   `Value::StringList(vec![..])`
+/// - `Value::StringList(_)` is returned unchanged
+/// - any other shape (e.g. a list with non-string elements, a Map, a
+///   ResourceRef, an unresolved Interpolation/FunctionCall) is returned
+///   unchanged. Such shapes either fail validation downstream (wrong
+///   type for the schema) or carry an unresolved expression that must
+///   be canonicalized after resolution by a later pass.
+///
+/// For non-`string_or_list_of_strings` types, the function still
+/// recurses into containers so that struct/list/map fields whose
+/// declared type *is* the union are canonicalized in place. Returns
+/// `value` unchanged when no nested canonicalization applies.
+///
+/// See #2481, #2510.
+pub fn canonicalize_with_type(value: Value, attr_type: &AttributeType) -> Value {
+    let unwrapped = peel_custom(attr_type);
+    if is_string_or_list_of_strings(unwrapped) {
+        return canonicalize_to_string_list(value);
+    }
+    match (value, unwrapped) {
+        (Value::List(items), AttributeType::List { inner, .. }) => {
+            let canonicalized = items
+                .into_iter()
+                .map(|v| canonicalize_with_type(v, inner.as_ref()))
+                .collect();
+            Value::List(canonicalized)
+        }
+        (Value::Map(map), AttributeType::Map { value: vt, .. }) => {
+            let canonicalized = map
+                .into_iter()
+                .map(|(k, v)| (k, canonicalize_with_type(v, vt.as_ref())))
+                .collect();
+            Value::Map(canonicalized)
+        }
+        (Value::Map(map), AttributeType::Struct { fields, .. }) => {
+            let canonicalized = map
+                .into_iter()
+                .map(|(k, v)| {
+                    let field_type = fields
+                        .iter()
+                        .find(|f| f.name == k || f.provider_name.as_deref() == Some(k.as_str()))
+                        .map(|f| &f.field_type);
+                    let canon = match field_type {
+                        Some(ft) => canonicalize_with_type(v, ft),
+                        None => v,
+                    };
+                    (k, canon)
+                })
+                .collect();
+            Value::Map(canonicalized)
+        }
+        (Value::Secret(inner), _) => {
+            Value::Secret(Box::new(canonicalize_with_type(*inner, attr_type)))
+        }
+        (v, _) => v,
+    }
+}
+
+/// Body of [`canonicalize_with_type`] for the
+/// `string_or_list_of_strings` case.
+fn canonicalize_to_string_list(value: Value) -> Value {
+    match value {
+        Value::StringList(items) => Value::StringList(items),
+        Value::String(s) => Value::StringList(vec![s]),
+        Value::List(items) => {
+            let mut strings = Vec::with_capacity(items.len());
+            for item in &items {
+                match item {
+                    Value::String(s) => strings.push(s.clone()),
+                    _ => return Value::List(items),
+                }
+            }
+            Value::StringList(strings)
+        }
+        Value::Secret(inner) => Value::Secret(Box::new(canonicalize_to_string_list(*inner))),
+        other => other,
     }
 }
 
@@ -1812,5 +1945,207 @@ mod tests {
                 "scalar fallthrough drift for variant: {v:?}"
             );
         }
+    }
+
+    // ---- canonicalize_with_type tests (#2481, #2510) ----
+
+    fn string_or_list_of_strings() -> AttributeType {
+        AttributeType::Union(vec![
+            AttributeType::String,
+            AttributeType::list(AttributeType::String),
+        ])
+    }
+
+    #[test]
+    fn canonicalize_scalar_to_string_list() {
+        let t = string_or_list_of_strings();
+        let v = Value::String("repo:foo:*".to_string());
+        let canon = canonicalize_with_type(v, &t);
+        assert_eq!(canon, Value::StringList(vec!["repo:foo:*".to_string()]));
+    }
+
+    #[test]
+    fn canonicalize_single_element_list_to_string_list() {
+        let t = string_or_list_of_strings();
+        let v = Value::List(vec![Value::String("repo:foo:*".to_string())]);
+        let canon = canonicalize_with_type(v, &t);
+        assert_eq!(canon, Value::StringList(vec!["repo:foo:*".to_string()]));
+    }
+
+    #[test]
+    fn canonicalize_multi_element_list_to_string_list() {
+        let t = string_or_list_of_strings();
+        let v = Value::List(vec![
+            Value::String("a".to_string()),
+            Value::String("b".to_string()),
+            Value::String("c".to_string()),
+        ]);
+        let canon = canonicalize_with_type(v, &t);
+        assert_eq!(
+            canon,
+            Value::StringList(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+        );
+    }
+
+    #[test]
+    fn canonicalize_idempotent_on_string_list() {
+        let t = string_or_list_of_strings();
+        let v = Value::StringList(vec!["a".to_string()]);
+        let canon = canonicalize_with_type(v.clone(), &t);
+        assert_eq!(canon, v);
+    }
+
+    #[test]
+    fn canonicalize_passes_through_non_applicable_type() {
+        let v = Value::String("foo".to_string());
+        let canon = canonicalize_with_type(v.clone(), &AttributeType::String);
+        assert_eq!(canon, v);
+    }
+
+    #[test]
+    fn canonicalize_passes_through_non_string_list() {
+        let t = string_or_list_of_strings();
+        // List with non-String elements stays as List — not the canonical
+        // form. Schema validation will flag it elsewhere.
+        let v = Value::List(vec![Value::Int(1)]);
+        let canon = canonicalize_with_type(v.clone(), &t);
+        assert_eq!(canon, v);
+    }
+
+    #[test]
+    fn canonicalize_recurses_into_struct_fields() {
+        let t = AttributeType::Struct {
+            name: "Statement".to_string(),
+            fields: vec![crate::schema::StructField::new(
+                "action",
+                string_or_list_of_strings(),
+            )],
+        };
+        let mut map = IndexMap::new();
+        map.insert(
+            "action".to_string(),
+            Value::String("s3:GetObject".to_string()),
+        );
+        let v = Value::Map(map);
+        let canon = canonicalize_with_type(v, &t);
+        match canon {
+            Value::Map(m) => {
+                assert_eq!(
+                    m.get("action"),
+                    Some(&Value::StringList(vec!["s3:GetObject".to_string()]))
+                );
+            }
+            _ => panic!("expected Map"),
+        }
+    }
+
+    #[test]
+    fn canonicalize_recurses_into_struct_via_provider_name() {
+        let t = AttributeType::Struct {
+            name: "Statement".to_string(),
+            fields: vec![
+                crate::schema::StructField::new("action", string_or_list_of_strings())
+                    .with_provider_name("Action"),
+            ],
+        };
+        let mut map = IndexMap::new();
+        map.insert(
+            "Action".to_string(),
+            Value::String("s3:GetObject".to_string()),
+        );
+        let v = Value::Map(map);
+        let canon = canonicalize_with_type(v, &t);
+        match canon {
+            Value::Map(m) => {
+                assert_eq!(
+                    m.get("Action"),
+                    Some(&Value::StringList(vec!["s3:GetObject".to_string()]))
+                );
+            }
+            _ => panic!("expected Map"),
+        }
+    }
+
+    #[test]
+    fn canonicalize_recurses_into_map_value_type() {
+        let t = AttributeType::Map {
+            key: Box::new(AttributeType::String),
+            value: Box::new(string_or_list_of_strings()),
+        };
+        let mut map = IndexMap::new();
+        map.insert(
+            "token.actions.githubusercontent.com:sub".to_string(),
+            Value::String("repo:foo:*".to_string()),
+        );
+        let v = Value::Map(map);
+        let canon = canonicalize_with_type(v, &t);
+        match canon {
+            Value::Map(m) => {
+                assert_eq!(
+                    m.get("token.actions.githubusercontent.com:sub"),
+                    Some(&Value::StringList(vec!["repo:foo:*".to_string()]))
+                );
+            }
+            _ => panic!("expected Map"),
+        }
+    }
+
+    #[test]
+    fn canonicalize_through_custom_wrapper() {
+        // Custom wrappers must be transparent for type matching.
+        let t = AttributeType::Custom {
+            semantic_name: Some("PolicyConditionValue".to_string()),
+            base: Box::new(string_or_list_of_strings()),
+            pattern: None,
+            length: None,
+            validate: std::sync::Arc::new(|_| Ok(())),
+            namespace: None,
+            to_dsl: None,
+        };
+        let v = Value::String("x".to_string());
+        let canon = canonicalize_with_type(v, &t);
+        assert_eq!(canon, Value::StringList(vec!["x".to_string()]));
+    }
+
+    #[test]
+    fn canonicalize_secret_recurses_inner() {
+        let t = string_or_list_of_strings();
+        let v = Value::Secret(Box::new(Value::String("s".to_string())));
+        let canon = canonicalize_with_type(v, &t);
+        match canon {
+            Value::Secret(inner) => {
+                assert_eq!(*inner, Value::StringList(vec!["s".to_string()]));
+            }
+            _ => panic!("expected Secret"),
+        }
+    }
+
+    #[test]
+    fn canonicalize_value_to_json_string_list_serializes_as_array() {
+        let v = Value::StringList(vec!["a".to_string(), "b".to_string()]);
+        let json = value_to_json(&v).expect("StringList serializes cleanly");
+        assert_eq!(
+            json,
+            serde_json::Value::Array(vec![
+                serde_json::Value::String("a".to_string()),
+                serde_json::Value::String("b".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn canonicalize_format_value_string_list() {
+        let v = Value::StringList(vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(format_value(&v), "[\"a\", \"b\"]");
+    }
+
+    #[test]
+    fn canonicalize_partial_eq_distinguishes_list_and_string_list() {
+        // `Value::List([String("x")])` and `Value::StringList(vec!["x"])`
+        // are *not* equal under PartialEq — the type system carries the
+        // canonical-form invariant. Producers must canonicalize first.
+        let a = Value::List(vec![Value::String("x".to_string())]);
+        let b = Value::StringList(vec!["x".to_string()]);
+        assert_ne!(a, b);
     }
 }

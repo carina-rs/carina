@@ -267,6 +267,7 @@ pub fn infer_type_from_value(
         Value::Interpolation(_) => Ok(TypeExpr::String),
         Value::Secret(_) => Ok(TypeExpr::String),
         Value::List(items) => infer_collection(items, bindings, schemas, TypeExpr::List),
+        Value::StringList(_) => Ok(TypeExpr::List(Box::new(TypeExpr::String))),
         Value::Map(entries) => infer_collection(entries.values(), bindings, schemas, TypeExpr::Map),
         Value::ResourceRef { path } => infer_resource_ref(
             path.binding(),

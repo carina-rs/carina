@@ -652,8 +652,12 @@ fn walk_value_against_type(
                 walk_value_against_type(arg, expected, exports, location, errors);
             }
         }
-        Value::String(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Unknown(_) => {
-        }
+        Value::String(_)
+        | Value::Int(_)
+        | Value::Float(_)
+        | Value::Bool(_)
+        | Value::StringList(_)
+        | Value::Unknown(_) => {}
     }
 }
 

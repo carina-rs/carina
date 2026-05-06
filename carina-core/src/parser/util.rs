@@ -54,6 +54,7 @@ pub(crate) fn value_type_name(value: &Value) -> &'static str {
         Value::Float(_) => "float",
         Value::Bool(_) => "bool",
         Value::List(_) => "list",
+        Value::StringList(_) => "list",
         Value::Map(_) => "map",
         Value::ResourceRef { .. } => "resource reference",
         Value::Interpolation(_) => "string",

@@ -52,6 +52,19 @@ pub fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, SerializationError
                 .expect("serde_json::Value -> String is infallible");
             Ok(wit::Value::ListVal(json_str))
         }
+        CoreValue::StringList(items) => {
+            // Cross the WASM boundary as a plain JSON array of strings —
+            // the provider sees the same shape as `Value::List([String])`,
+            // matching AWS's wire-format expectation for the
+            // `string_or_list_of_strings` IAM shape.
+            let json_arr: Vec<serde_json::Value> = items
+                .iter()
+                .map(|s| serde_json::Value::String(s.clone()))
+                .collect();
+            let json_str = serde_json::to_string(&json_arr)
+                .expect("serde_json::Value -> String is infallible");
+            Ok(wit::Value::ListVal(json_str))
+        }
         CoreValue::Map(map) => {
             let json_map: Result<serde_json::Map<String, serde_json::Value>, _> = map
                 .iter()
@@ -137,6 +150,12 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
             let arr: Result<Vec<_>, _> = items.iter().map(core_value_to_json).collect();
             Ok(serde_json::Value::Array(arr?))
         }
+        CoreValue::StringList(items) => Ok(serde_json::Value::Array(
+            items
+                .iter()
+                .map(|s| serde_json::Value::String(s.clone()))
+                .collect(),
+        )),
         CoreValue::Map(map) => {
             let obj: Result<serde_json::Map<String, serde_json::Value>, _> = map
                 .iter()

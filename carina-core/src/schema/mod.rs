@@ -1634,6 +1634,7 @@ impl Value {
             Value::Float(_) => "Float".to_string(),
             Value::Bool(_) => "Bool".to_string(),
             Value::List(_) => "List".to_string(),
+            Value::StringList(_) => "StringList".to_string(),
             Value::Map(_) => "Map".to_string(),
             Value::ResourceRef { path } => {
                 format!("ResourceRef({})", path.to_dot_string())

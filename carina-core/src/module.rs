@@ -145,6 +145,16 @@ fn format_value(value: &Value) -> String {
                 format!("[{} items]", items.len())
             }
         }
+        Value::StringList(items) => {
+            if items.is_empty() {
+                "[]".to_string()
+            } else if items.len() <= 3 {
+                let strs: Vec<_> = items.iter().map(|s| format!("\"{}\"", s)).collect();
+                format!("[{}]", strs.join(", "))
+            } else {
+                format!("[{} items]", items.len())
+            }
+        }
         Value::Map(map) => {
             if map.is_empty() {
                 "{}".to_string()

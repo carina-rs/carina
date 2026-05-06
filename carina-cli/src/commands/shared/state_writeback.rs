@@ -167,6 +167,12 @@ pub(crate) fn dsl_value_to_json(
                 .collect::<Result<_, _>>()?;
             Ok(Some(serde_json::Value::Array(json_items)))
         }
+        Value::StringList(items) => Ok(Some(serde_json::Value::Array(
+            items
+                .iter()
+                .map(|s| serde_json::Value::String(s.clone()))
+                .collect(),
+        ))),
         Value::Map(map) => {
             let json_map: serde_json::Map<String, serde_json::Value> = map
                 .iter()
