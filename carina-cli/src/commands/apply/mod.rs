@@ -608,10 +608,6 @@ pub async fn run_apply(
                         backend_provider_name,
                     )
                     .with_attribute("bucket".to_string(), serde_json::json!(bucket_name))
-                    .with_attribute(
-                        "versioning_status".to_string(),
-                        serde_json::json!("Enabled"),
-                    )
                     .with_protected(true);
 
                     // Initialize state with the protected bucket

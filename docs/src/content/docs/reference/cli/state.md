@@ -43,7 +43,6 @@ Output groups attributes under each resource:
 ```
 # aws.s3.Bucket (my_bucket)
   bucket = "my-bucket-name"
-  versioning_status = aws.s3.Bucket.VersioningStatus.Enabled
 ```
 
 #### Flags

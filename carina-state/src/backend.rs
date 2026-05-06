@@ -146,7 +146,6 @@ pub trait StateBackend: Send + Sync {
     /// Create the backend storage (bucket) with appropriate settings
     ///
     /// This creates the bucket with:
-    /// - Versioning enabled (for state history)
     /// - Server-side encryption (AES256)
     /// - Public access blocked
     async fn create_bucket(&self) -> BackendResult<()>;

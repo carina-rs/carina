@@ -52,7 +52,7 @@ backend s3 {
 
 When the bucket is auto-created, Carina:
 
-1. Creates the S3 bucket with versioning enabled and public access blocked
+1. Creates the S3 bucket with public access blocked
 2. Appends an `aws.s3.Bucket` resource definition to your `.crn` file
 3. Registers the bucket as a **protected resource** in state, preventing it from being accidentally modified or destroyed
 
