@@ -1,0 +1,42 @@
+# Carina State Bucket
+#
+# Fixture for issue #2515: comments inside repeating block elements
+# (statement {} inside policy {}) must survive `carina fmt`. Earlier
+# the printer attached the leading-comment trivia to the previous
+# sibling and dropped it on emit.
+
+let bucket = awscc.s3.Bucket {
+  bucket_name = 'carina-rs-state'
+
+  tags = {
+    Project   = 'carina-rs'
+    ManagedBy = 'carina'
+  }
+}
+
+aws.s3.BucketPolicy {
+  bucket = bucket.bucket_name
+
+  policy = {
+    version = '2012-10-17'
+
+    statement {
+      sid    = 'AllowRegistryDevUpstreamRead'
+      effect = 'Allow'
+    }
+
+    statement {
+      sid    = 'AllowRegistryDevUpstreamList'
+      effect = 'Allow'
+    }
+
+    # Carina's S3 backend opens any bucket without a configured region by
+    # calling GetBucketLocation as part of its initialization. Granting it
+    # cross-account is the only way upstream_state can reach this bucket
+    # from outside the management account.
+    statement {
+      sid    = 'AllowRegistryDevUpstreamGetBucketLocation'
+      effect = 'Allow'
+    }
+  }
+}

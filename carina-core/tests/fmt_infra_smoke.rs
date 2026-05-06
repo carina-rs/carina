@@ -119,3 +119,84 @@ fn fmt_idempotent_on_github_oidc_fixture() {
         }
     }
 }
+
+// `carina-state/` is the issue #2515 fixture: comments and blank lines
+// between repeated `statement {}` siblings inside a `policy {}` map must
+// survive `carina fmt`. Earlier the printer attached the leading-comment
+// trivia to the previous sibling's closing brace and silently dropped it.
+//
+// The fixture mirrors the real `carina-rs/infra/aws/management/carina-state/`
+// directory shape (main.crn + providers.crn + backend.crn) per the
+// "Directory-scoped, never single-file" rule in CLAUDE.md.
+#[test]
+fn fmt_accepts_carina_state_fixture() {
+    let dir = fixture_dir("carina-state");
+    let result = format_all_crn_files(&dir);
+    assert!(
+        result.is_ok(),
+        "`carina fmt` must parse every .crn file in {}. Failures:\n{}",
+        dir.display(),
+        result.unwrap_err()
+    );
+}
+
+#[test]
+fn fmt_idempotent_on_carina_state_fixture() {
+    let dir = fixture_dir("carina-state");
+    let config = FormatConfig::default();
+    let entries = fs::read_dir(&dir).expect("read_dir");
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "crn") {
+            let source = fs::read_to_string(&path).expect("read file");
+            let first = format(&source, &config)
+                .unwrap_or_else(|e| panic!("{}: format failed: {}", path.display(), e));
+            let second = format(&first, &config)
+                .unwrap_or_else(|e| panic!("{}: second format failed: {}", path.display(), e));
+            assert_eq!(
+                first,
+                second,
+                "format must be idempotent on {}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn fmt_preserves_comments_in_carina_state_fixture() {
+    let dir = fixture_dir("carina-state");
+    let config = FormatConfig::default();
+    let path = dir.join("main.crn");
+    let source = fs::read_to_string(&path).expect("read main.crn");
+    let formatted = format(&source, &config).expect("format must succeed");
+
+    // The fixture itself must already be canonical so that future drift
+    // is caught here rather than masked by an idempotent-but-different
+    // round trip.
+    assert_eq!(
+        source, formatted,
+        "fixture has drifted from canonical fmt — re-format and update the fixture"
+    );
+
+    // The four-line `# Carina's S3 backend ...` comment block sits
+    // between the second and third `statement {}` siblings. Every line
+    // must round-trip through `carina fmt`.
+    for needle in [
+        "# Carina's S3 backend opens any bucket without a configured region by",
+        "# calling GetBucketLocation as part of its initialization. Granting it",
+        "# cross-account is the only way upstream_state can reach this bucket",
+        "# from outside the management account.",
+    ] {
+        assert!(
+            formatted.contains(needle),
+            "issue #2515 regression: comment dropped from formatted output:\n  missing: {needle}\n--- formatted ---\n{formatted}"
+        );
+    }
+
+    let second = format(&formatted, &config).expect("second format must succeed");
+    assert_eq!(
+        formatted, second,
+        "fmt must be idempotent on the carina-state fixture"
+    );
+}

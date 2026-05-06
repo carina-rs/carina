@@ -1,0 +1,11 @@
+provider awscc {
+  source   = 'github.com/carina-rs/carina-provider-awscc'
+  revision = 'main'
+  region   = awscc.Region.ap_northeast_1
+}
+
+provider aws {
+  source   = 'github.com/carina-rs/carina-provider-aws'
+  revision = 'main'
+  region   = aws.Region.ap_northeast_1
+}

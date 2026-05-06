@@ -1,0 +1,4 @@
+backend s3 {
+  bucket = 'carina-rs-state'
+  key    = 'management/carina-state/carina.state.json'
+}
