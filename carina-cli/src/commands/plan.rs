@@ -248,7 +248,7 @@ pub async fn run_plan(
             .ok_or("Backend does not specify a resource type")?;
         println!("{}", "Bootstrap Plan:".cyan().bold());
         println!(
-            "  {} {} (state bucket with versioning enabled)",
+            "  {} {} (state bucket)",
             "+".green(),
             format!(
                 "{}.{}.{}",
