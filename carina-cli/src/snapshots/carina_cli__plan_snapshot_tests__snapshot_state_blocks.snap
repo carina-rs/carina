@@ -4,7 +4,7 @@ expression: output
 ---
 Execution Plan:
 
-  -> awscc.ec2.SecurityGroup renamed-sg (moved from: awscc.ec2.SecurityGroup.old-sg)
+  -> awscc.ec2.SecurityGroup renamed-sg (moved from: old-sg)
   x awscc.ec2.Subnet legacy-subnet (remove from state)
   <- awscc.ec2.Vpc imported-vpc (import: vpc-0abc123def456)
       id: vpc-0abc123def456

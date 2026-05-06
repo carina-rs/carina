@@ -446,6 +446,29 @@ fn snapshot_moved_pure() {
     insta::assert_snapshot!(output);
 }
 
+/// Compact (`DetailLevel::None`) rendering of a moved Update effect.
+///
+/// Locks in the `(moved from: <name>)` annotation form on the
+/// compact path of `display::TreeRenderer::render_node` (#2470). The
+/// detailed branch is already covered by `snapshot_moved_with_changes`;
+/// this fixture-reusing test guards the compact branch separately so a
+/// regression to the redundant `<provider>.<type>.<name>` form would
+/// surface here instead of going unnoticed.
+#[test]
+fn snapshot_moved_with_changes_compact() {
+    let (plan, schemas, moved_origins) = build_plan_from_fixture("moved_with_changes");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::None,
+        &HashMap::new(),
+        Some(&schemas),
+        &moved_origins,
+        &[],
+        &[],
+    ));
+    insta::assert_snapshot!(output);
+}
+
 /// Collect unused `let` bindings across every fixture subdirectory of
 /// `fixtures_root`. A fixture is any immediate subdirectory containing at
 /// least one `.crn` file (the file need not be named `main.crn` — sibling
