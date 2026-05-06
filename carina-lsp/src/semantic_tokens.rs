@@ -17,6 +17,7 @@ pub const TOKEN_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::OPERATOR, // 6: =
     SemanticTokenType::COMMENT,  // 7: comments
     SemanticTokenType::FUNCTION, // 8: function names
+    SemanticTokenType::MACRO,    // 9: ${...} interpolation spans inside double-quoted strings
 ];
 
 /// Create the semantic tokens legend for capability registration
@@ -430,13 +431,17 @@ impl SemanticTokensProvider {
             )); // OPERATOR
         }
 
-        // String literals (double-quoted and single-quoted)
+        // String literals (double-quoted and single-quoted). Double-quoted
+        // strings additionally have their `${...}` interpolation spans
+        // split out as MACRO tokens so editor themes can render them
+        // distinctly from the surrounding string body.
         {
+            let line_chars: Vec<char> = line.chars().collect();
             let mut in_string = false;
             let mut string_start_char = 0u32;
             let mut string_quote_char = '"';
             let mut escaped = false;
-            for (char_idx, (_byte_idx, c)) in line.char_indices().enumerate() {
+            for (char_idx, c) in line_chars.iter().copied().enumerate() {
                 let char_idx = char_idx as u32;
                 if in_string {
                     if escaped {
@@ -444,8 +449,13 @@ impl SemanticTokensProvider {
                     } else if c == '\\' {
                         escaped = true;
                     } else if c == string_quote_char {
-                        tokens.push((string_start_char, char_idx - string_start_char + 1, 4));
-                        // STRING
+                        push_string_with_interpolations(
+                            &line_chars,
+                            string_start_char,
+                            char_idx + 1,
+                            string_quote_char,
+                            &mut tokens,
+                        );
                         in_string = false;
                     }
                 } else if c == '"' || c == '\'' {
@@ -737,6 +747,76 @@ fn skip_string_literal(chars: &[char], start: usize) -> usize {
         i += 1;
     }
     chars.len()
+}
+
+/// Brace-balancing inside the interpolation lets nested object/struct
+/// literals like `${ {a = 1}.a }` close at the matching `}` rather than
+/// the first one; nested string literals are skipped via
+/// `skip_string_literal` so a `}` inside them doesn't terminate the
+/// interpolation early.
+fn push_string_with_interpolations(
+    line_chars: &[char],
+    start: u32,
+    end: u32,
+    quote: char,
+    tokens: &mut Vec<(u32, u32, u32)>,
+) {
+    // Single-quoted strings are literal-only (no interpolation in the
+    // grammar), and double-quoted strings without `$` cannot host one
+    // either — bail to a single STRING token in either case.
+    if quote != '"' || !line_chars[start as usize..end as usize].contains(&'$') {
+        tokens.push((start, end - start, 4));
+        return;
+    }
+
+    let mut i = start as usize;
+    let end = end as usize;
+    let mut segment_start = i;
+    while i + 1 < end {
+        let c = line_chars[i];
+        if c == '\\' {
+            i += 2;
+            continue;
+        }
+        if c == '$' && line_chars[i + 1] == '{' {
+            if i > segment_start {
+                tokens.push((segment_start as u32, (i - segment_start) as u32, 4));
+            }
+            let interp_start = i;
+            let mut depth = 1usize;
+            let mut j = i + 2;
+            while j < end && depth > 0 {
+                match line_chars[j] {
+                    '\\' => {
+                        j += 2;
+                        continue;
+                    }
+                    '"' | '\'' => {
+                        j = skip_string_literal(line_chars, j);
+                        continue;
+                    }
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            j += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            tokens.push((interp_start as u32, (j - interp_start) as u32, 9));
+            i = j;
+            segment_start = i;
+            continue;
+        }
+        i += 1;
+    }
+    if end > segment_start {
+        tokens.push((segment_start as u32, (end - segment_start) as u32, 4));
+    }
 }
 
 #[cfg(test)]
@@ -1591,5 +1671,233 @@ mod tests {
                 "Expected token_type {expected} in output. Got kinds: {kinds:?}"
             );
         }
+    }
+
+    /// Resolve LSP-encoded `(delta_line, delta_start, length, kind)` tokens
+    /// to absolute `(line, start, length, kind)` quadruples. `delta_start`
+    /// is line-relative when `delta_line == 0`, otherwise absolute.
+    #[cfg(test)]
+    fn absolute_tokens(
+        tokens: &[tower_lsp::lsp_types::SemanticToken],
+    ) -> Vec<(u32, u32, u32, u32)> {
+        let mut line = 0u32;
+        let mut start = 0u32;
+        let mut out = Vec::with_capacity(tokens.len());
+        for t in tokens {
+            if t.delta_line == 0 {
+                start += t.delta_start;
+            } else {
+                line += t.delta_line;
+                start = t.delta_start;
+            }
+            out.push((line, start, t.length, t.token_type));
+        }
+        out
+    }
+
+    #[test]
+    fn interpolation_split_emits_macro_token_inside_double_quoted_string() {
+        let provider = SemanticTokensProvider::new(&[]);
+        // `aws = "arn:${orgs}:root"`
+        let tokens = provider.tokenize("aws = \"arn:${orgs}:root\"");
+        let abs = absolute_tokens(&tokens);
+
+        // Collect tokens on line 0 that fall inside the string literal
+        // span (cols 6..24 inclusive of opening/closing quotes).
+        let in_string: Vec<_> = abs
+            .iter()
+            .copied()
+            .filter(|(line, start, _, _)| *line == 0 && *start >= 6 && *start <= 23)
+            .collect();
+        // Expected: STRING `"arn:` (cols 6..11), MACRO `${orgs}` (cols 11..18),
+        // STRING `:root"` (cols 18..24).
+        let kinds: Vec<u32> = in_string.iter().map(|(_, _, _, k)| *k).collect();
+        assert!(
+            kinds.contains(&9),
+            "expected a MACRO (9) token for ${{orgs}}, got: {:?}",
+            in_string
+        );
+        let macro_token = in_string
+            .iter()
+            .find(|(_, _, _, k)| *k == 9)
+            .expect("MACRO token");
+        assert_eq!(
+            (macro_token.1, macro_token.2),
+            (11, 7),
+            "MACRO span must cover `${{orgs}}` (start=11, length=7); got: {:?}",
+            macro_token
+        );
+    }
+
+    #[test]
+    fn interpolation_split_with_dotted_expression() {
+        // `aws = "${a.b.c}"` — MACRO covers the whole `${a.b.c}` span,
+        // not just `${...}`.
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize("aws = \"${a.b.c}\"");
+        let abs = absolute_tokens(&tokens);
+        let macro_tokens: Vec<_> = abs.iter().filter(|(_, _, _, k)| *k == 9).collect();
+        assert_eq!(
+            macro_tokens.len(),
+            1,
+            "expected one MACRO token, got: {:?}",
+            abs
+        );
+        // `${a.b.c}` is 8 chars (`$`, `{`, `a`, `.`, `b`, `.`, `c`, `}`).
+        assert_eq!(macro_tokens[0].2, 8, "MACRO length, got: {:?}", abs);
+    }
+
+    #[test]
+    fn interpolation_split_handles_multiple_spans_on_one_line() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize("aws = \"${a}-${b}\"");
+        let abs = absolute_tokens(&tokens);
+        let macro_count = abs.iter().filter(|(_, _, _, k)| *k == 9).count();
+        assert_eq!(
+            macro_count, 2,
+            "expected two MACRO tokens for two interpolations, got: {:?}",
+            abs
+        );
+    }
+
+    #[test]
+    fn interpolation_split_skipped_for_escaped_dollar_brace() {
+        // `\${foo}` is a literal `${foo}` — no MACRO emitted.
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize("aws = \"\\${foo}\"");
+        let abs = absolute_tokens(&tokens);
+        assert!(
+            abs.iter().all(|(_, _, _, k)| *k != 9),
+            "escaped `\\${{` must not produce a MACRO token; got: {:?}",
+            abs
+        );
+    }
+
+    #[test]
+    fn interpolation_split_with_escaped_backslash_then_real_interpolation() {
+        // `"\\${x}"` — `\\` is an escape pair for a literal `\`; the
+        // following `${x}` is a real interpolation. Must emit MACRO.
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize("aws = \"\\\\${x}\"");
+        let abs = absolute_tokens(&tokens);
+        let macro_count = abs.iter().filter(|(_, _, _, k)| *k == 9).count();
+        assert_eq!(
+            macro_count, 1,
+            "real interpolation after `\\\\` must still emit MACRO; got: {:?}",
+            abs
+        );
+    }
+
+    #[test]
+    fn interpolation_split_with_nested_object_literal() {
+        // `${ {a = 1}.a }` — the brace-counter must descend into the
+        // nested `{...}` map literal and close at the matching `}`,
+        // not the first one.
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize("aws = \"${ {a = 1}.a }\"");
+        let abs = absolute_tokens(&tokens);
+        let macro_tokens: Vec<_> = abs.iter().filter(|(_, _, _, k)| *k == 9).collect();
+        assert_eq!(
+            macro_tokens.len(),
+            1,
+            "nested object literal inside `${{}}` must produce exactly one MACRO; got: {:?}",
+            abs
+        );
+        // `${ {a = 1}.a }` is 14 chars long.
+        assert_eq!(
+            macro_tokens[0].2, 14,
+            "MACRO span must cover the full balanced brace expression; got: {:?}",
+            abs
+        );
+    }
+
+    #[test]
+    fn interpolation_split_with_multibyte_chars() {
+        // Multi-byte chars (Japanese) before and inside the interpolation.
+        // Char-count semantics must not be confused by UTF-8 byte width.
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize("aws = \"日本${名前}本日\"");
+        let abs = absolute_tokens(&tokens);
+        let macro_tokens: Vec<_> = abs.iter().filter(|(_, _, _, k)| *k == 9).collect();
+        assert_eq!(
+            macro_tokens.len(),
+            1,
+            "multi-byte chars must not affect MACRO detection; got: {:?}",
+            abs
+        );
+        // `${名前}` is 5 chars (`$`, `{`, `名`, `前`, `}`).
+        assert_eq!(
+            macro_tokens[0].2, 5,
+            "MACRO length is char-count, not byte-count; got: {:?}",
+            abs
+        );
+    }
+
+    #[test]
+    fn interpolation_split_matches_issue_repro_arn_path() {
+        // Verbatim repro from issue #2473: a 3-segment dotted interpolation
+        // wrapped in literal text on both sides.
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize("aws = \"arn:aws:iam::${orgs.accounts.registry_dev}:root\"");
+        let abs = absolute_tokens(&tokens);
+        let macro_tokens: Vec<_> = abs.iter().filter(|(_, _, _, k)| *k == 9).collect();
+        assert_eq!(
+            macro_tokens.len(),
+            1,
+            "issue repro must emit exactly one MACRO token; got: {:?}",
+            abs
+        );
+    }
+
+    #[test]
+    fn interpolation_empty_string_emits_single_string_token() {
+        // `""` — opening + closing quote with no body. Must emit one
+        // STRING token (length 2) and no MACRO.
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize("aws = \"\"");
+        let abs = absolute_tokens(&tokens);
+        let string_tokens: Vec<_> = abs.iter().filter(|(_, _, _, k)| *k == 4).collect();
+        assert_eq!(
+            string_tokens.len(),
+            1,
+            "empty string `\"\"` must emit exactly one STRING token; got: {:?}",
+            abs
+        );
+        assert_eq!(string_tokens[0].2, 2, "STRING length covers both quotes");
+        assert!(
+            abs.iter().all(|(_, _, _, k)| *k != 9),
+            "empty string must not produce a MACRO token; got: {:?}",
+            abs
+        );
+    }
+
+    #[test]
+    fn interpolation_unclosed_brace_does_not_panic() {
+        // Mid-edit state: `${` opens but the user hasn't typed `}` yet.
+        // The MACRO token covers from `${` to the closing `"`; the only
+        // requirement is no panic and no missing-tail STRING.
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize("aws = \"${unclosed\"");
+        let abs = absolute_tokens(&tokens);
+        let macro_count = abs.iter().filter(|(_, _, _, k)| *k == 9).count();
+        assert_eq!(
+            macro_count, 1,
+            "expected one MACRO token for unclosed `${{`, got: {:?}",
+            abs
+        );
+    }
+
+    #[test]
+    fn interpolation_not_split_in_single_quoted_string() {
+        // Single-quoted strings are literal-only — `${foo}` is not an
+        // interpolation, so the whole literal remains STRING.
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize("aws = '${foo}'");
+        let abs = absolute_tokens(&tokens);
+        assert!(
+            abs.iter().all(|(_, _, _, k)| *k != 9),
+            "single-quoted strings must not produce MACRO tokens; got: {:?}",
+            abs
+        );
     }
 }
