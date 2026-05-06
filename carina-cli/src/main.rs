@@ -319,7 +319,7 @@ async fn main() {
     {
         match run_plan(
             &path,
-            out.as_ref(),
+            out.as_deref(),
             detail,
             tui,
             refresh,

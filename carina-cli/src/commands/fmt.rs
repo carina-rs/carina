@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use colored::Colorize;
 use similar::{ChangeTag, TextDiff};
@@ -11,12 +11,7 @@ use carina_core::schema::collect_all_block_names;
 use crate::error::AppError;
 use crate::wiring::WiringContext;
 
-pub fn run_fmt(
-    path: &PathBuf,
-    check: bool,
-    show_diff: bool,
-    recursive: bool,
-) -> Result<(), AppError> {
+pub fn run_fmt(path: &Path, check: bool, show_diff: bool, recursive: bool) -> Result<(), AppError> {
     let config = FormatConfig::default();
 
     // Load schemas to get block_name mappings for list-to-block conversion

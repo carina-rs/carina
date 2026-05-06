@@ -430,8 +430,7 @@ impl DiagnosticEngine {
         base_path: &std::path::Path,
     ) -> HashSet<String> {
         let mut out: HashSet<String> = HashSet::new();
-        let Ok(files) = carina_core::config_loader::find_crn_files_in_dir(&base_path.to_path_buf())
-        else {
+        let Ok(files) = carina_core::config_loader::find_crn_files_in_dir(base_path) else {
             return out;
         };
         for file in files {
@@ -1586,8 +1585,7 @@ impl DiagnosticEngine {
         if let Some(parsed) = doc.parsed() {
             out.extend(parsed.user_functions.keys().cloned());
         }
-        let Ok(files) = carina_core::config_loader::find_crn_files_in_dir(&base_path.to_path_buf())
-        else {
+        let Ok(files) = carina_core::config_loader::find_crn_files_in_dir(base_path) else {
             return out;
         };
         for file in files {

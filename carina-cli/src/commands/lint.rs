@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use colored::Colorize;
 
@@ -25,7 +25,7 @@ struct LintWarning {
     message: String,
 }
 
-pub fn run_lint(path: &PathBuf, provider_context: &ProviderContext) -> Result<(), AppError> {
+pub fn run_lint(path: &Path, provider_context: &ProviderContext) -> Result<(), AppError> {
     let mut parsed = load_configuration_with_config(
         path,
         provider_context,

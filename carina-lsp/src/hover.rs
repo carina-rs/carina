@@ -26,13 +26,7 @@ fn find_use_import_path(
     {
         return Some(import.path.clone());
     }
-    let mut files =
-        carina_core::config_loader::find_crn_files_in_dir(&base_path.to_path_buf()).ok()?;
-    // `find_crn_files_in_dir` does not sort; rely on a deterministic
-    // walk so the result is stable when two siblings happen to
-    // declare the same alias (rare, but the user shouldn't see
-    // different hovers across filesystems).
-    files.sort();
+    let files = carina_core::config_loader::find_crn_files_in_dir(base_path).ok()?;
     let ctx = doc.provider_context();
     for file in files {
         let file_name = file.file_name().and_then(|n| n.to_str());

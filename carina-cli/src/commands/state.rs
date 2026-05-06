@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
 use colored::Colorize;
@@ -204,7 +204,7 @@ pub async fn run_state_command(
 /// Run force-unlock command
 pub async fn run_force_unlock(
     lock_id: &str,
-    path: &PathBuf,
+    path: &Path,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
     let parsed = load_configuration_with_config(
@@ -240,7 +240,7 @@ pub async fn run_force_unlock(
 
 /// Load the state file from the backend (or local file), without acquiring a lock.
 async fn load_state_file(
-    path: &PathBuf,
+    path: &Path,
     provider_context: &ProviderContext,
 ) -> Result<StateFile, AppError> {
     let loaded = load_configuration_with_config(
@@ -284,10 +284,7 @@ fn format_state_list(state: &StateFile) -> Vec<String> {
 }
 
 /// Run state list command
-async fn run_state_list(
-    path: &PathBuf,
-    provider_context: &ProviderContext,
-) -> Result<(), AppError> {
+async fn run_state_list(path: &Path, provider_context: &ProviderContext) -> Result<(), AppError> {
     let state = load_state_file(path, provider_context).await?;
 
     if state.resources.is_empty() {
@@ -344,7 +341,7 @@ fn format_state_lookup(
 /// Run state lookup command
 async fn run_state_lookup(
     query: &str,
-    path: &PathBuf,
+    path: &Path,
     json_output: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
@@ -410,7 +407,7 @@ fn format_state_show(state: &StateFile) -> String {
 
 /// Run state show command
 async fn run_state_show(
-    path: &PathBuf,
+    path: &Path,
     tui: bool,
     json: bool,
     provider_context: &ProviderContext,
@@ -457,7 +454,7 @@ fn format_raw_value(value: &serde_json::Value) -> String {
 async fn run_state_bucket_delete(
     bucket_name: &str,
     force: bool,
-    path: &PathBuf,
+    path: &Path,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
     let parsed = load_configuration_with_config(
@@ -573,7 +570,7 @@ async fn run_state_bucket_delete(
 
 /// Run state refresh command
 pub async fn run_state_refresh(
-    path: &PathBuf,
+    path: &Path,
     lock: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
@@ -925,7 +922,7 @@ fn diff_display_update_resource(
 /// 5. Prompts to delete the local file (unless `--auto-approve`)
 /// 6. Updates `carina-backend.lock` with the new remote config
 async fn run_state_migrate(
-    path: &PathBuf,
+    path: &Path,
     auto_approve: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
