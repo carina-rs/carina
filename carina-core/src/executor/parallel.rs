@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use futures::stream::{FuturesUnordered, StreamExt};
 
-use crate::deps::{find_failed_dependency, get_resource_dependencies};
+use crate::deps::find_failed_dependency;
 use crate::effect::Effect;
 use crate::provider::Provider;
 use crate::resource::{Resource, ResourceId, State};
@@ -15,6 +15,7 @@ use super::basic::{
     ExecutionState, count_actionable_effects, execute_basic_effect, process_basic_result,
     refresh_pending_states,
 };
+use super::phased::DepResolver;
 use super::replace::{ReplaceContext, SingleEffectResult, execute_replace_parallel};
 use super::{ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, ProgressInfo};
 
@@ -42,23 +43,15 @@ pub(super) fn build_dependency_map(
         }
     }
 
+    let resolver = DepResolver::new(&binding_to_idx, unresolved_resources, None);
+
     let mut deps_of: HashMap<usize, HashSet<usize>> = HashMap::new();
     for (idx, effect) in effects.iter().enumerate() {
         let mut dep_indices = HashSet::new();
         if let Some(resource) = effect.resource() {
-            let dep_bindings = get_resource_dependencies(resource);
-            for dep_binding in &dep_bindings {
-                if let Some(&dep_idx) = binding_to_idx.get(dep_binding) {
-                    dep_indices.insert(dep_idx);
-                }
-            }
+            resolver.collect_from_resource(resource, &mut dep_indices);
             if let Some(unresolved) = unresolved_resources.get(effect.resource_id()) {
-                let unresolved_deps = get_resource_dependencies(unresolved);
-                for dep_binding in &unresolved_deps {
-                    if let Some(&dep_idx) = binding_to_idx.get(dep_binding) {
-                        dep_indices.insert(dep_idx);
-                    }
-                }
+                resolver.collect_from_resource(unresolved, &mut dep_indices);
             }
         }
         deps_of.insert(idx, dep_indices);
@@ -430,5 +423,55 @@ pub(super) async fn execute_effects_sequential(
         permanent_name_overrides,
         current_states: input.current_states.clone(),
         failed_refreshes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resource::{ResourceKind, Value};
+
+    /// Mirror of #2543's phased-executor test for the unphased dependency map:
+    /// virtual module-attribute proxies must be transparently followed to the
+    /// underlying resources their attributes reference.
+    #[test]
+    fn build_dependency_map_follows_virtual_module_binding() {
+        let mut role = Resource::with_provider("awscc", "iam.Role", "bootstrap.role");
+        role.binding = Some("bootstrap.role".to_string());
+
+        let mut virt = Resource::with_provider("_virtual", "_virtual", "bootstrap");
+        virt.binding = Some("bootstrap".to_string());
+        virt.kind = ResourceKind::Virtual {
+            module_name: "github-oidc".to_string(),
+            instance: "bootstrap".to_string(),
+        };
+        virt.set_attr(
+            "role_name",
+            Value::resource_ref("bootstrap.role", "role_name", vec![]),
+        );
+
+        let mut role_policy = Resource::with_provider("awscc", "iam.RolePolicy", "rp");
+        role_policy.set_attr(
+            "role_name",
+            Value::resource_ref("bootstrap", "role_name", vec![]),
+        );
+
+        let effects = vec![
+            Effect::Create(role.clone()),
+            Effect::Create(role_policy.clone()),
+        ];
+
+        let mut unresolved: HashMap<ResourceId, Resource> = HashMap::new();
+        unresolved.insert(role.id.clone(), role.clone());
+        unresolved.insert(virt.id.clone(), virt);
+        unresolved.insert(role_policy.id.clone(), role_policy);
+
+        let deps_of = build_dependency_map(&effects, &unresolved);
+
+        assert!(
+            deps_of[&1].contains(&0),
+            "RolePolicy (idx 1) must depend on Role (idx 0) via the bootstrap virtual binding; got: {:?}",
+            deps_of[&1],
+        );
     }
 }
