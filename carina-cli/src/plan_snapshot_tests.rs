@@ -77,6 +77,21 @@ fn snapshot_policy_pretty() {
 }
 
 #[test]
+fn snapshot_policy_pretty_nested() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("policy_pretty_nested");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+    ));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
 fn snapshot_pretty_long_string_list() {
     let (plan, schemas, _moved) = build_plan_from_fixture("pretty_long_string_list");
     let output = strip_ansi(&format_plan(

@@ -127,8 +127,13 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
             }
             lines.push(header_line);
             for entry in entries {
+                let layout = carina_core::value::PrettyLayout {
+                    parent_indent_cols: 4,
+                    key: &entry.key,
+                };
+                let pretty = carina_core::value::format_value_pretty(&entry.value, layout);
                 let mut spans = vec![Span::raw(format!("    {}: ", entry.key))];
-                spans.extend(value_spans(&entry.value, false));
+                spans.extend(value_spans(&pretty, false));
                 if let Some(ann) = &entry.annotation {
                     spans.push(Span::styled(
                         format!("  {}", ann),

@@ -1,0 +1,26 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  + awscc.ec2.Vpc 
+      cidr_block: "10.0.0.0/16"
+      config:
+        statement: 
+          - action: [
+              "iam:CreateRole",
+              "iam:DeleteRole",
+              "iam:GetRole",
+              "iam:UpdateRole",
+            ]
+            effect: "Allow"
+            resource: "arn:aws:iam::*:role/carina-*-deploy"
+            sid: "ManageDeployRoles"
+          - action: "iam:GetOpenIDConnectProvider"
+            effect: "Allow"
+            resource: "arn:aws:iam::*:oidc-provider/token.actions.githubusercontent.com"
+            sid: "ReadOIDCProvider"
+        version: "2012-10-17"
+
+Plan: 1 to add, 0 to change, 0 to destroy.
