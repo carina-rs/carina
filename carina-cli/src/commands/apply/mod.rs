@@ -607,6 +607,7 @@ pub async fn run_apply(
                         &bucket_name,
                         backend_provider_name,
                     )
+                    .with_identifier(&bucket_name)
                     .with_attribute("bucket".to_string(), serde_json::json!(bucket_name))
                     .with_protected(true);
 
