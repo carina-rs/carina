@@ -22,13 +22,27 @@ use crate::parser::{ProviderContext, ResourceContext, TypeExpr, UpstreamState};
 use crate::resource::{Subscript, Value};
 use crate::schema::{AttributeType, SchemaRegistry, suggest_similar_name};
 
+/// One export's declared type and literal value, as carried through
+/// [`UpstreamExports`]. `type_expr` is `None` when the upstream's
+/// `exports` block omits the annotation and inference can't recover
+/// it. `value` is currently always `Some` (the parser requires
+/// `name = expr`) but is kept `Option` for forward compatibility with
+/// future grammar widenings.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpstreamExportEntry {
+    pub type_expr: Option<TypeExpr>,
+    pub value: Option<Value>,
+}
+
+/// Exports for a single `upstream_state` binding: export name → entry.
+pub type UpstreamExportEntries = HashMap<String, UpstreamExportEntry>;
+
 /// Exports declared by each `upstream_state` binding: binding name →
-/// (export name → declared type, or `None` if the export has no annotation).
-///
-/// Phase 1 (#1990) only needed the key set; Phase 2 (#1992) adds the type
-/// side so downstream consumers whose expected type is known can be checked
-/// for shape compatibility.
-pub type UpstreamExports = HashMap<String, HashMap<String, Option<TypeExpr>>>;
+/// per-export entry map. Carrying the literal `Value` alongside the
+/// `TypeExpr` lets downstream consumers (LSP map-literal-key
+/// completion, future doc tools) read the body without re-parsing
+/// the upstream directory.
+pub type UpstreamExports = HashMap<String, UpstreamExportEntries>;
 
 /// A diagnostic about a `binding.field` reference whose downstream usage
 /// doesn't fit the upstream's exports.
@@ -197,7 +211,7 @@ pub fn resolve_upstream_exports_with_schemas(
                 // are silently dropped here: the upstream's own
                 // validate run reports them, and re-emitting from this
                 // resolver would double-report.
-                let keys: HashMap<String, Option<TypeExpr>> = match schemas {
+                let entries: UpstreamExportEntries = match schemas {
                     Some(s) => {
                         let (inferred, _errors) =
                             crate::validation::inference::apply_inference(parsed, s);
@@ -207,7 +221,15 @@ pub fn resolve_upstream_exports_with_schemas(
                             // Preserve the legacy "no static type"
                             // surface for sentinels — Unknown carries
                             // nothing worth forwarding to the consumer.
-                            .map(|e| (e.name, e.type_expr.into_known()))
+                            .map(|e| {
+                                (
+                                    e.name,
+                                    UpstreamExportEntry {
+                                        type_expr: e.type_expr.into_known(),
+                                        value: e.value,
+                                    },
+                                )
+                            })
                             .collect()
                     }
                     // `schemas` is None (legacy entry point) — forward
@@ -217,10 +239,18 @@ pub fn resolve_upstream_exports_with_schemas(
                     None => parsed
                         .export_params
                         .into_iter()
-                        .map(|e| (e.name, e.type_expr))
+                        .map(|e| {
+                            (
+                                e.name,
+                                UpstreamExportEntry {
+                                    type_expr: e.type_expr,
+                                    value: e.value,
+                                },
+                            )
+                        })
                         .collect(),
                 };
-                out.insert(us.binding.clone(), keys);
+                out.insert(us.binding.clone(), entries);
             }
             Err(reason) => {
                 errors.push(UpstreamResolveError {
@@ -644,7 +674,11 @@ fn check_resource_ref_at_position(
     let Some(keys) = exports.get(binding) else {
         return;
     };
-    let Some(Some(export_type)) = keys.get(field) else {
+    let Some(UpstreamExportEntry {
+        type_expr: Some(export_type),
+        ..
+    }) = keys.get(field)
+    else {
         return;
     };
     let Some(narrowed) = narrow_type_expr(export_type, path.field_path(), path.subscripts()) else {
@@ -804,7 +838,11 @@ pub fn check_upstream_state_for_iterable_shapes<E>(
         let Some(fields) = exports.get(deferred.iterable_binding.as_str()) else {
             continue;
         };
-        let Some(Some(export_type)) = fields.get(&deferred.iterable_attr) else {
+        let Some(UpstreamExportEntry {
+            type_expr: Some(export_type),
+            ..
+        }) = fields.get(&deferred.iterable_attr)
+        else {
             continue;
         };
         let binding_kind = ForIterableBindingKind::from_for_binding(&deferred.binding);
@@ -1000,7 +1038,11 @@ fn visit_attribute_access(
         let Some(fields) = exports.get(binding) else {
             return;
         };
-        let Some(Some(export_type)) = fields.get(attribute) else {
+        let Some(UpstreamExportEntry {
+            type_expr: Some(export_type),
+            ..
+        }) = fields.get(attribute)
+        else {
             return;
         };
         if let Err((mismatched_at, bad_segment)) = walk_type_expr_path(export_type, field_path) {
@@ -1153,7 +1195,11 @@ fn visit_subscript_access(
         let Some(fields) = exports.get(binding) else {
             return;
         };
-        let Some(Some(export_type)) = fields.get(attribute) else {
+        let Some(UpstreamExportEntry {
+            type_expr: Some(export_type),
+            ..
+        }) = fields.get(attribute)
+        else {
             return;
         };
         // If the field path itself doesn't resolve, the
@@ -1224,7 +1270,17 @@ mod tests {
             .map(|(binding, keys)| {
                 (
                     binding.to_string(),
-                    keys.iter().map(|s| (s.to_string(), None)).collect(),
+                    keys.iter()
+                        .map(|s| {
+                            (
+                                s.to_string(),
+                                UpstreamExportEntry {
+                                    type_expr: None,
+                                    value: None,
+                                },
+                            )
+                        })
+                        .collect(),
                 )
             })
             .collect()
@@ -1393,11 +1449,58 @@ mod tests {
             resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], &ctx());
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
         let keys = got.get("orgs").expect("resolved");
-        let accounts_ty = keys.get("accounts").expect("accounts export").as_ref();
-        let ty = accounts_ty.expect("type annotation present");
+        let entry = keys.get("accounts").expect("accounts export");
+        let ty = entry.type_expr.as_ref().expect("type annotation present");
         assert!(
             matches!(ty, TypeExpr::Struct { fields } if fields.len() == 2),
             "expected struct with 2 fields, got {ty:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_carries_map_literal_value_alongside_type() {
+        // #2492: each resolved export entry must carry both its declared
+        // `TypeExpr` and the literal `Value` from the upstream's
+        // `exports { }` block. Without the value, downstream consumers
+        // (LSP map-literal-key completion, future doc-extracting tools)
+        // have to re-parse the upstream directory a second time per call.
+        use crate::resource::Value;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream_dir = tmp.path().join("organizations");
+        fs::create_dir(&upstream_dir).unwrap();
+        write_crn(
+            &upstream_dir,
+            "exports.crn",
+            r#"exports {
+                accounts: map(String) = {
+                    registry_prod = "111111111111"
+                    registry_dev  = "222222222222"
+                }
+            }"#,
+        );
+        let base = tmp.path().join("downstream");
+        fs::create_dir(&base).unwrap();
+
+        let (got, errs) =
+            resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], &ctx());
+        assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
+        let entries = got.get("orgs").expect("resolved");
+        let entry = entries.get("accounts").expect("accounts export");
+        assert!(
+            entry.type_expr.is_some(),
+            "type annotation must still be present"
+        );
+        let value = entry.value.as_ref().expect("export value must be carried");
+        let Value::Map(entries) = value else {
+            panic!("expected Value::Map for map literal export, got {value:?}");
+        };
+        let mut keys: Vec<&String> = entries.keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["registry_dev", "registry_prod"],
+            "map literal keys must be reachable from UpstreamExports without re-parsing"
         );
     }
 
@@ -1651,7 +1754,15 @@ mod tests {
                     binding.to_string(),
                     fields
                         .iter()
-                        .map(|(name, ty)| (name.to_string(), Some(ty.clone())))
+                        .map(|(name, ty)| {
+                            (
+                                name.to_string(),
+                                UpstreamExportEntry {
+                                    type_expr: Some(ty.clone()),
+                                    value: None,
+                                },
+                            )
+                        })
                         .collect(),
                 )
             })
@@ -1740,7 +1851,13 @@ mod tests {
         );
         let mut exports: UpstreamExports = HashMap::new();
         let mut fields = HashMap::new();
-        fields.insert("count".to_string(), None);
+        fields.insert(
+            "count".to_string(),
+            UpstreamExportEntry {
+                type_expr: None,
+                value: None,
+            },
+        );
         exports.insert("orgs".to_string(), fields);
         let schemas = schema_with_attr("name", crate::schema::AttributeType::String);
         let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
@@ -2374,7 +2491,13 @@ mod tests {
         );
         let mut exports = UpstreamExports::new();
         let mut fields = HashMap::new();
-        fields.insert("accounts".to_string(), None);
+        fields.insert(
+            "accounts".to_string(),
+            UpstreamExportEntry {
+                type_expr: None,
+                value: None,
+            },
+        );
         exports.insert("orgs".to_string(), fields);
         let errs = check_upstream_state_for_iterable_shapes(&parsed, &exports);
         assert!(errs.is_empty(), "no annotation → silent, got: {errs:?}");
@@ -2799,7 +2922,13 @@ mod tests {
         );
         let mut exports = UpstreamExports::new();
         let mut fields = HashMap::new();
-        fields.insert("account".to_string(), None);
+        fields.insert(
+            "account".to_string(),
+            UpstreamExportEntry {
+                type_expr: None,
+                value: None,
+            },
+        );
         exports.insert("orgs".to_string(), fields);
         let errs = check_upstream_state_attribute_access_shapes(&parsed, &exports);
         assert!(errs.is_empty(), "no annotation → silent, got: {errs:?}");
@@ -3239,7 +3368,13 @@ mod tests {
         );
         let mut exports = UpstreamExports::new();
         let mut fields = HashMap::new();
-        fields.insert("accounts".to_string(), None);
+        fields.insert(
+            "accounts".to_string(),
+            UpstreamExportEntry {
+                type_expr: None,
+                value: None,
+            },
+        );
         exports.insert("orgs".to_string(), fields);
         let errs = check_upstream_state_subscript_shapes(&parsed, &exports);
         assert!(errs.is_empty(), "no annotation → silent, got: {errs:?}");
@@ -3476,7 +3611,7 @@ mod tests {
         let region_type = exports
             .get("ups")
             .and_then(|m| m.get("region"))
-            .and_then(|t| t.as_ref())
+            .and_then(|e| e.type_expr.as_ref())
             .expect("region should be inferred");
         assert_eq!(region_type, &TypeExpr::String);
     }
