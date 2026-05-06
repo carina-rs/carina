@@ -11,7 +11,7 @@ use carina_core::utils::convert_region_value;
 
 use crate::backend::{BackendConfig, BackendError, BackendResult, StateBackend};
 use crate::lock::LockInfo;
-use crate::state::{self, ResourceState, StateFile};
+use crate::state::{self, StateFile};
 
 const REGION_UNRESOLVED_MESSAGE: &str = "S3 backend has no region: set `region` in the backend block, or configure AWS_REGION / a profile region";
 
@@ -364,7 +364,11 @@ impl StateBackend for S3Backend {
 
         if self.read_state().await?.is_none() {
             let state = if bucket_was_just_created {
-                state_bucket_seed(&self.bucket)
+                StateFile::with_managed_state_bucket(
+                    BACKEND_PROVIDER_NAME,
+                    BACKEND_RESOURCE_TYPE,
+                    &self.bucket,
+                )
             } else {
                 StateFile::new()
             };
@@ -438,24 +442,6 @@ impl StateBackend for S3Backend {
 
         Ok(())
     }
-}
-
-/// Build the initial `StateFile` for a freshly-created state bucket,
-/// recording the bucket itself as a protected `aws.s3.Bucket` resource.
-/// Without this seed, plan would diff an empty state against the
-/// auto-injected desired bucket and apply would re-issue `CreateBucket`.
-///
-/// `identifier` must be set — `StateFile::build_state_for_resource` treats
-/// a `None` identifier as "resource does not exist", which would defeat
-/// the seed and reproduce the original bug.
-fn state_bucket_seed(bucket_name: &str) -> StateFile {
-    let bucket = ResourceState::new(BACKEND_RESOURCE_TYPE, bucket_name, BACKEND_PROVIDER_NAME)
-        .with_identifier(bucket_name)
-        .with_attribute("bucket", serde_json::json!(bucket_name))
-        .with_protected(true);
-    let mut state = StateFile::new();
-    state.upsert_resource(bucket);
-    state
 }
 
 /// Render the auto-generated `aws.s3.Bucket` block that `carina apply`
@@ -619,37 +605,6 @@ mod tests {
         assert!(
             !definition.contains("versioning_status"),
             "auto-definition must not reference the removed versioning_status attribute, got: {definition}"
-        );
-    }
-
-    #[test]
-    fn test_state_bucket_seed_records_bucket_as_protected_resource() {
-        // After `carina init` auto-creates the bucket, plan must already see
-        // it in state — otherwise apply re-issues CreateBucket and hits
-        // BucketAlreadyOwnedByYou.
-        let seed = state_bucket_seed("my-state-bucket");
-        assert_eq!(
-            seed.resources.len(),
-            1,
-            "seed should contain exactly one resource"
-        );
-        let bucket = &seed.resources[0];
-        assert_eq!(bucket.resource_type, "s3.Bucket");
-        assert_eq!(bucket.name, "my-state-bucket");
-        assert_eq!(bucket.provider, "aws");
-        assert!(bucket.protected, "state bucket must be protected");
-        assert_eq!(
-            bucket.attributes.get("bucket"),
-            Some(&serde_json::json!("my-state-bucket")),
-            "seed must carry the bucket attribute"
-        );
-        // identifier is load-bearing: build_state_for_resource treats
-        // identifier=None as "resource does not exist", which would defeat
-        // the seed and reproduce #2533.
-        assert_eq!(
-            bucket.identifier.as_deref(),
-            Some("my-state-bucket"),
-            "seed must populate identifier so the differ recognises the bucket as existing"
         );
     }
 

@@ -66,6 +66,33 @@ fn test_resource_state_protected() {
 }
 
 #[test]
+fn test_resource_state_managed_state_bucket_shape() {
+    // The seed produced for backend-owned state buckets must carry
+    // identifier, the bucket attribute, and the protected flag.
+    // Missing identifier reproduces #2533 (BucketAlreadyOwnedByYou).
+    let resource = ResourceState::managed_state_bucket("aws", "s3.Bucket", "my-state-bucket");
+    assert_eq!(resource.provider, "aws");
+    assert_eq!(resource.resource_type, "s3.Bucket");
+    assert_eq!(resource.name, "my-state-bucket");
+    assert_eq!(resource.identifier.as_deref(), Some("my-state-bucket"));
+    assert!(resource.protected);
+    assert_eq!(
+        resource.attributes.get("bucket"),
+        Some(&serde_json::json!("my-state-bucket"))
+    );
+}
+
+#[test]
+fn test_state_file_with_managed_state_bucket_contains_one_resource() {
+    let state = StateFile::with_managed_state_bucket("aws", "s3.Bucket", "my-state-bucket");
+    assert_eq!(state.resources.len(), 1);
+    let bucket = &state.resources[0];
+    assert_eq!(bucket.name, "my-state-bucket");
+    assert_eq!(bucket.identifier.as_deref(), Some("my-state-bucket"));
+    assert!(bucket.protected);
+}
+
+#[test]
 fn test_state_file_serialization() {
     let mut state = StateFile::new();
     let resource = ResourceState::new("s3.Bucket", "my-bucket", "aws")

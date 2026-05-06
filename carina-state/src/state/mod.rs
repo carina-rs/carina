@@ -49,6 +49,41 @@ impl StateFile {
         }
     }
 
+    /// Create a fresh state file pre-seeded with a backend-owned state
+    /// bucket recorded as a protected, managed resource. This is the seed
+    /// the state backend writes after auto-creating its own storage —
+    /// see [`ResourceState::managed_state_bucket`] for the shape.
+    ///
+    /// Single-resource by design: today only the S3 backend bootstraps a
+    /// single storage resource. A backend that needs to seed multiple
+    /// resources (e.g. a DynamoDB lock table alongside an S3 bucket)
+    /// will need a different API.
+    ///
+    /// ```
+    /// use carina_state::StateFile;
+    ///
+    /// let state = StateFile::with_managed_state_bucket(
+    ///     "aws",
+    ///     "s3.Bucket",
+    ///     "my-state-bucket",
+    /// );
+    /// assert_eq!(state.resources.len(), 1);
+    /// assert_eq!(state.resources[0].name, "my-state-bucket");
+    /// ```
+    pub fn with_managed_state_bucket(
+        provider: impl Into<String>,
+        resource_type: impl Into<String>,
+        bucket_name: impl Into<String>,
+    ) -> Self {
+        let mut state = Self::new();
+        state.upsert_resource(ResourceState::managed_state_bucket(
+            provider,
+            resource_type,
+            bucket_name,
+        ));
+        state
+    }
+
     /// Create a new state file with a specific lineage (for initialization)
     pub fn with_lineage(lineage: String) -> Self {
         Self {
@@ -487,6 +522,26 @@ impl ResourceState {
     pub fn with_protected(mut self, protected: bool) -> Self {
         self.protected = protected;
         self
+    }
+
+    /// Build the seed `ResourceState` for a backend-owned state bucket.
+    ///
+    /// This is the canonical shape the state backend records when it
+    /// auto-creates its own storage (e.g. the S3 state bucket): protected,
+    /// with `identifier` populated so the differ recognises the resource as
+    /// existing — without `identifier`, `StateFile::build_state_for_resource`
+    /// returns "not found" and the next apply re-issues `CreateBucket`,
+    /// reproducing #2533 (`BucketAlreadyOwnedByYou`).
+    pub fn managed_state_bucket(
+        provider: impl Into<String>,
+        resource_type: impl Into<String>,
+        bucket_name: impl Into<String>,
+    ) -> Self {
+        let bucket_name = bucket_name.into();
+        Self::new(resource_type, &bucket_name, provider)
+            .with_identifier(&bucket_name)
+            .with_attribute("bucket", serde_json::json!(bucket_name))
+            .with_protected(true)
     }
 
     /// Merge write-only attribute values from the desired resource into this state.
