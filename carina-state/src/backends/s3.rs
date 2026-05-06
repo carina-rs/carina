@@ -16,6 +16,8 @@ use crate::backend::{BackendConfig, BackendError, BackendResult, StateBackend};
 use crate::lock::LockInfo;
 use crate::state::{self, StateFile};
 
+const REGION_UNRESOLVED_MESSAGE: &str = "S3 backend has no region: set `region` in the backend block, or configure AWS_REGION / a profile region";
+
 /// S3-based state backend
 pub struct S3Backend {
     /// S3 client
@@ -32,17 +34,16 @@ pub struct S3Backend {
     auto_create: bool,
 }
 
-/// Fallback region used when `region` is not explicitly configured and
-/// the bucket does not yet exist (auto_create case).
-const DEFAULT_BOOTSTRAP_REGION: &str = "us-east-1";
-
 impl S3Backend {
     /// Create a new S3Backend from configuration.
     ///
     /// The `region` attribute is optional. When omitted, the region is
-    /// auto-discovered by calling `GetBucketLocation` on the bucket. If the
-    /// bucket does not exist, the backend falls back to `us-east-1` so that
-    /// `auto_create` can create the bucket in that region.
+    /// resolved through the AWS SDK's standard chain (env vars, shared config
+    /// profile, etc.). If neither the backend block nor the SDK chain yields
+    /// a region, configuration fails — the backend never silently picks a
+    /// default endpoint. The S3 SDK transparently follows cross-region
+    /// redirects, so any region from the chain reaches buckets in other
+    /// regions.
     pub async fn from_config(config: &BackendConfig) -> BackendResult<Self> {
         let bucket = config
             .get_string("bucket")
@@ -57,25 +58,9 @@ impl S3Backend {
         let encrypt = config.get_bool_or("encrypt", true);
         let auto_create = config.get_bool_or("auto_create", true);
 
-        let (region, client) = match config.get_string("region") {
-            Some(v) => {
-                let region = convert_region_value(v);
-                let client = build_s3_client(&region).await;
-                (region, client)
-            }
-            None => {
-                // Discover via GetBucketLocation, reusing the bootstrap client
-                // when the bucket turns out to live in DEFAULT_BOOTSTRAP_REGION.
-                let bootstrap_client = build_s3_client(DEFAULT_BOOTSTRAP_REGION).await;
-                let discovered = discover_bucket_region(&bootstrap_client, &bucket).await?;
-                let client = if discovered == DEFAULT_BOOTSTRAP_REGION {
-                    bootstrap_client
-                } else {
-                    build_s3_client(&discovered).await
-                };
-                (discovered, client)
-            }
-        };
+        let sdk_region = sdk_chain_region().await;
+        let region = resolve_region(config.get_string("region"), sdk_region.as_deref())?;
+        let client = build_s3_client(&region).await;
 
         Ok(Self {
             client,
@@ -477,54 +462,32 @@ async fn build_s3_client(region: &str) -> Client {
     Client::new(&aws_config)
 }
 
-/// Auto-discover the AWS region of an existing S3 bucket via `GetBucketLocation`.
-///
-/// The AWS SDK handles cross-region redirects automatically, so the client used
-/// here can be configured for any region. If the bucket does not exist
-/// (NoSuchBucket), returns `DEFAULT_BOOTSTRAP_REGION` so that `auto_create` can
-/// create the bucket in that region. Other errors are propagated.
-async fn discover_bucket_region(client: &Client, bucket: &str) -> BackendResult<String> {
-    match client.get_bucket_location().bucket(bucket).send().await {
-        Ok(output) => {
-            // Empty constraint → us-east-1 (legacy behavior per AWS docs).
-            let region = output
-                .location_constraint()
-                .map(|c| c.as_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or(DEFAULT_BOOTSTRAP_REGION);
-            Ok(normalize_location_constraint(region).to_string())
-        }
-        Err(err) => {
-            if is_no_such_bucket(&err) {
-                Ok(DEFAULT_BOOTSTRAP_REGION.to_string())
-            } else {
-                Err(BackendError::Aws(format!(
-                    "Failed to discover bucket region for '{bucket}': {err}"
-                )))
-            }
-        }
-    }
+/// Resolve the region the SDK's standard chain (env vars, shared config
+/// profile, IMDS, etc.) provides, if any. Returns `None` when the chain
+/// has nothing configured.
+async fn sdk_chain_region() -> Option<String> {
+    aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .load()
+        .await
+        .region()
+        .map(|r| r.as_ref().to_string())
+        .filter(|s| !s.is_empty())
 }
 
-/// Normalize legacy `LocationConstraint` values to modern AWS region codes.
+/// Resolve the region the S3 backend should use.
 ///
-/// Some historical values don't match the modern region code — notably `"EU"`
-/// which maps to `eu-west-1`.
-fn normalize_location_constraint(constraint: &str) -> &str {
-    match constraint {
-        "EU" => "eu-west-1",
-        other => other,
+/// Priority: explicit `region` from the backend block (after DSL → AWS
+/// region-code normalization) > region from the AWS SDK chain. If neither
+/// yields a region, return a configuration error rather than silently
+/// picking a default endpoint.
+fn resolve_region(explicit: Option<&str>, sdk_chain: Option<&str>) -> BackendResult<String> {
+    if let Some(value) = explicit {
+        return Ok(convert_region_value(value));
     }
-}
-
-/// Check whether an SDK error indicates a missing bucket (NoSuchBucket).
-fn is_no_such_bucket<E, R>(err: &aws_sdk_s3::error::SdkError<E, R>) -> bool
-where
-    E: ProvideErrorMetadata,
-{
-    err.as_service_error()
-        .and_then(|e| e.code())
-        .is_some_and(|c| c == "NoSuchBucket")
+    if let Some(value) = sdk_chain {
+        return Ok(value.to_string());
+    }
+    Err(BackendError::configuration(REGION_UNRESOLVED_MESSAGE))
 }
 
 fn is_conditional_write_conflict_code(code: Option<&str>) -> bool {
@@ -578,17 +541,39 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_location_constraint_legacy_eu() {
-        assert_eq!(normalize_location_constraint("EU"), "eu-west-1");
+    fn test_resolve_region_prefers_explicit_over_sdk_chain() {
+        let resolved = resolve_region(Some("ap-northeast-1"), Some("us-east-1")).unwrap();
+        assert_eq!(resolved, "ap-northeast-1");
     }
 
     #[test]
-    fn test_normalize_location_constraint_passthrough() {
-        assert_eq!(
-            normalize_location_constraint("ap-northeast-1"),
-            "ap-northeast-1"
-        );
-        assert_eq!(normalize_location_constraint("us-west-2"), "us-west-2");
+    fn test_resolve_region_normalizes_dsl_region_value() {
+        let resolved = resolve_region(Some("aws.Region.ap_northeast_1"), None).unwrap();
+        assert_eq!(resolved, "ap-northeast-1");
+    }
+
+    #[test]
+    fn test_resolve_region_falls_back_to_sdk_chain() {
+        let resolved = resolve_region(None, Some("ap-northeast-1")).unwrap();
+        assert_eq!(resolved, "ap-northeast-1");
+    }
+
+    #[test]
+    fn test_resolve_region_errors_when_unresolved() {
+        let err = resolve_region(None, None).unwrap_err();
+        match err {
+            BackendError::Configuration(msg) => {
+                assert!(
+                    msg.contains("region"),
+                    "expected message to mention region, got: {msg}"
+                );
+                assert!(
+                    msg.contains("AWS_REGION") || msg.contains("profile"),
+                    "expected message to mention SDK chain hints, got: {msg}"
+                );
+            }
+            other => panic!("expected Configuration error, got: {other:?}"),
+        }
     }
 
     #[test]
