@@ -473,12 +473,182 @@ fn resolve_exports_resolves_cross_file_dot_notation_strings() {
         value: Some(Value::String("registry_prod.account_id".to_string())),
     }];
 
-    let exports = resolve_exports(&export_params, &state).unwrap();
+    // Mirror production callers: the resource is in sorted_resources
+    // with a binding; provider-returned attributes flow in via
+    // `current_states` derived from `state.resources`.
+    let mut registry_prod =
+        Resource::with_provider("awscc", "organizations.account", "registry-prod");
+    registry_prod.binding = Some("registry_prod".to_string());
+    let sorted_resources = vec![registry_prod];
+
+    let exports = resolve_exports(&export_params, &sorted_resources, &state).unwrap();
 
     assert_eq!(
         exports.get("account_id"),
         Some(&serde_json::Value::String("459524413166".to_string())),
         "resolve_exports should resolve dot-notation strings to actual values. Got: {:?}",
+        exports
+    );
+}
+
+#[test]
+fn resolve_exports_resolves_module_call_attribute_via_virtual_resource() {
+    // #2479: writeback used to build bindings from `state.resources`
+    // only. A virtual resource (synthesised by module-call expansion to
+    // expose `attributes { role_arn = role.arn }`) carries no provider
+    // identity and never lands in `state.resources`, so an export
+    // referencing `<module_call>.<attr>` failed with
+    // `unresolved reference <call>.<attr>`.
+    use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
+    use carina_core::resource::{AccessPath, ResourceKind, Value};
+    use carina_state::StateFile;
+
+    let state = {
+        let json = serde_json::json!({
+            "version": 5,
+            "serial": 1,
+            "lineage": "test",
+            "carina_version": "0.4.0",
+            "resources": [
+                {
+                    "resource_type": "iam.Role",
+                    "name": "github_actions_carina.role",
+                    "identifier": "github-actions-carina",
+                    "provider": "awscc",
+                    "binding": "github_actions_carina.role",
+                    "attributes": {
+                        "arn": "arn:aws:iam::123456789012:role/github-actions-carina"
+                    }
+                }
+            ]
+        });
+        serde_json::from_value::<StateFile>(json).unwrap()
+    };
+
+    let mut role_resource =
+        Resource::with_provider("awscc", "iam.Role", "github_actions_carina.role");
+    role_resource.binding = Some("github_actions_carina.role".to_string());
+
+    // Virtual resource as `expand_module_call` produces it: binding is
+    // the module-call alias, and each attribute is a ResourceRef into
+    // an expanded sub-resource.
+    let mut virtual_resource = Resource::new("_virtual", "github_actions_carina");
+    virtual_resource.binding = Some("github_actions_carina".to_string());
+    virtual_resource.kind = ResourceKind::Virtual {
+        module_name: "github_module".to_string(),
+        instance: "github_actions_carina".to_string(),
+    };
+    virtual_resource.attributes.insert(
+        "role_arn".to_string(),
+        Value::ResourceRef {
+            path: AccessPath::new("github_actions_carina.role", "arn"),
+        },
+    );
+    let sorted_resources = vec![role_resource, virtual_resource];
+
+    let export_params = vec![ExportParameter {
+        name: "role_arn".to_string(),
+        type_expr: TypeExpr::Unknown,
+        value: Some(Value::ResourceRef {
+            path: AccessPath::new("github_actions_carina", "role_arn"),
+        }),
+    }];
+
+    let exports = resolve_exports(&export_params, &sorted_resources, &state).unwrap();
+
+    assert_eq!(
+        exports.get("role_arn"),
+        Some(&serde_json::Value::String(
+            "arn:aws:iam::123456789012:role/github-actions-carina".to_string()
+        )),
+        "module-call attribute export must resolve via virtual binding + provider state, got: {:?}",
+        exports
+    );
+}
+
+#[test]
+fn resolve_exports_resolves_chained_module_call_attribute_via_two_virtuals() {
+    // #2479 follow-up: a module-call binding whose attribute itself
+    // points at *another* module-call binding's attribute (e.g.
+    // `${outer_module.public_role_arn}` where the outer module's
+    // `attributes { public_role_arn = inner_module.role_arn }` exposes
+    // an inner module-call binding's attribute). Two `Virtual` hops
+    // through `ResourceRef` recursion before bottoming out at the real
+    // role's `arn` from state. Pins the resolver's transitive walk so a
+    // regression that broke after a single hop would surface.
+    use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
+    use carina_core::resource::{AccessPath, ResourceKind, Value};
+    use carina_state::StateFile;
+
+    let state = {
+        let json = serde_json::json!({
+            "version": 5,
+            "serial": 1,
+            "lineage": "test",
+            "carina_version": "0.4.0",
+            "resources": [
+                {
+                    "resource_type": "iam.Role",
+                    "name": "outer.inner.role",
+                    "identifier": "github-actions-carina",
+                    "provider": "awscc",
+                    "binding": "outer.inner.role",
+                    "attributes": {
+                        "arn": "arn:aws:iam::123456789012:role/chained"
+                    }
+                }
+            ]
+        });
+        serde_json::from_value::<StateFile>(json).unwrap()
+    };
+
+    let mut role_resource = Resource::with_provider("awscc", "iam.Role", "outer.inner.role");
+    role_resource.binding = Some("outer.inner.role".to_string());
+
+    let mut inner_virtual = Resource::new("_virtual", "outer.inner");
+    inner_virtual.binding = Some("outer.inner".to_string());
+    inner_virtual.kind = ResourceKind::Virtual {
+        module_name: "inner_module".to_string(),
+        instance: "outer.inner".to_string(),
+    };
+    inner_virtual.attributes.insert(
+        "role_arn".to_string(),
+        Value::ResourceRef {
+            path: AccessPath::new("outer.inner.role", "arn"),
+        },
+    );
+
+    let mut outer_virtual = Resource::new("_virtual", "outer");
+    outer_virtual.binding = Some("outer".to_string());
+    outer_virtual.kind = ResourceKind::Virtual {
+        module_name: "outer_module".to_string(),
+        instance: "outer".to_string(),
+    };
+    outer_virtual.attributes.insert(
+        "public_role_arn".to_string(),
+        Value::ResourceRef {
+            path: AccessPath::new("outer.inner", "role_arn"),
+        },
+    );
+
+    let sorted_resources = vec![role_resource, inner_virtual, outer_virtual];
+
+    let export_params = vec![ExportParameter {
+        name: "role_arn".to_string(),
+        type_expr: TypeExpr::Unknown,
+        value: Some(Value::ResourceRef {
+            path: AccessPath::new("outer", "public_role_arn"),
+        }),
+    }];
+
+    let exports = resolve_exports(&export_params, &sorted_resources, &state).unwrap();
+
+    assert_eq!(
+        exports.get("role_arn"),
+        Some(&serde_json::Value::String(
+            "arn:aws:iam::123456789012:role/chained".to_string()
+        )),
+        "two-hop module-call chain must resolve through both virtuals, got: {:?}",
         exports
     );
 }

@@ -2697,9 +2697,14 @@ async fn persist_exports_only_clears_state_exports_when_params_empty() {
         .exports
         .insert("old".to_string(), serde_json::json!("stale"));
 
-    let result =
-        crate::commands::apply::persist_exports_only(&backend, Some(&lock), Some(state_in), &[])
-            .await;
+    let result = crate::commands::apply::persist_exports_only(
+        &backend,
+        Some(&lock),
+        Some(state_in),
+        &[],
+        &[],
+    )
+    .await;
 
     assert!(result.is_ok(), "persist_exports_only failed: {:?}", result);
 
@@ -2733,6 +2738,7 @@ async fn persist_exports_only_writes_state_with_new_exports() {
         &backend,
         Some(&lock),
         Some(StateFile::new()),
+        &[],
         &export_params,
     )
     .await;

@@ -74,16 +74,34 @@ pub(crate) struct FinalizeApplyInput<'a> {
 }
 
 /// Resolve export expressions using bindings built from applied state.
+///
+/// `sorted_resources` carries the in-memory resource graph including any
+/// `ResourceKind::Virtual` resources synthesised by module-call expansion
+/// (`expand_module_call`). Virtual resources are not persisted to
+/// `state.resources` because they have no provider-side identity, so a
+/// writeback that consults `state.resources` alone misses module-call
+/// bindings — a downstream `exports { x = my_module_call.attr }` then
+/// fails with `unresolved reference my_module_call.attr` even though
+/// `carina plan` rendered the value cleanly. Issue #2479.
 pub(crate) fn resolve_exports(
     export_params: &[carina_core::parser::InferredExportParam],
+    sorted_resources: &[Resource],
     state: &StateFile,
 ) -> Result<HashMap<String, serde_json::Value>, carina_core::value::SerializationError> {
-    use carina_core::binding_index::{BindingValueSource, ResolvedBindings};
+    use carina_core::binding_index::ResolvedBindings;
     use carina_core::resource::Value;
 
-    let mut bindings = ResolvedBindings::default();
-    for rs in &state.resources {
-        if let Some(ref binding) = rs.binding {
+    // `from_resources_with_state` merges DSL-side attributes
+    // (`sorted_resources`, including `ResourceKind::Virtual` synthesised
+    // by module-call expansion) with provider-returned post-apply
+    // attributes (`current_states`, derived from `state.resources`).
+    // Same merge order the planner uses, so plan and writeback resolve
+    // identically.
+    let current_states = state
+        .resources
+        .iter()
+        .map(|rs| {
+            let id = ResourceId::with_provider(&rs.provider, &rs.resource_type, &rs.name);
             let attrs: HashMap<String, Value> = rs
                 .attributes
                 .iter()
@@ -91,9 +109,17 @@ pub(crate) fn resolve_exports(
                     carina_core::value::json_to_dsl_value(v).map(|val| (k.clone(), val))
                 })
                 .collect();
-            bindings.set(binding, attrs, BindingValueSource::Local);
-        }
-    }
+            (
+                id.clone(),
+                carina_core::resource::State::existing(id, attrs),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let bindings = ResolvedBindings::from_resources_with_state(
+        sorted_resources,
+        &current_states,
+        &HashMap::new(),
+    );
 
     let mut exports = HashMap::new();
     for param in export_params {
