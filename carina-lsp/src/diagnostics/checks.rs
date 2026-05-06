@@ -1289,10 +1289,17 @@ impl DiagnosticEngine {
     ///
     /// `all_resources` provides cross-file resources for schema-level ref type
     /// checking. If None, falls back to the current file's resources.
+    ///
+    /// `merged` is the directory-merged parse used to feed inference so
+    /// module-call / `upstream_state` bindings declared in sibling
+    /// `.crn` files are visible — without it the export inference would
+    /// raise spurious `unknown binding` for an `exports.crn` that
+    /// references a `let` bound elsewhere in the directory (#2493).
     pub(super) fn check_exports_blocks(
         &self,
         doc: &Document,
         parsed: &ParsedFile,
+        merged: Option<&ParsedFile>,
         all_resources: Option<&[Resource]>,
         sibling_bindings: &HashMap<String, String>,
     ) -> Vec<Diagnostic> {
@@ -1331,15 +1338,22 @@ impl DiagnosticEngine {
         }
 
         // Schema-level ref type checking for ResourceRef values in exports.
-        // `infer_export_params` borrows `parsed` (avoiding the per-keystroke
+        // `infer_export_params` borrows the parse (avoiding the per-keystroke
         // deep clone the full `apply_inference` would force) so the LSP
         // can derive the post-inference shape without rebuilding the
-        // whole `InferredFile`.
+        // whole `InferredFile`. Use the merged parse when available so
+        // sibling-file `let` bindings (module calls, upstream_states)
+        // are visible to inference (#2493).
         let resources = all_resources.unwrap_or(&parsed.resources);
+        let inference_input = merged.unwrap_or(parsed);
         let (inferred_export_params, inference_errors) =
-            carina_core::validation::inference::infer_export_params(parsed, &self.schemas);
+            carina_core::validation::inference::infer_export_params(inference_input, &self.schemas);
         // Surface inference failures as "type annotation required"
-        // diagnostics, anchored at the export name.
+        // diagnostics, anchored at the export name. Errors for
+        // exports declared in sibling `.crn` files (visible only via
+        // `merged`) won't anchor in this buffer and are skipped here —
+        // the buffer that owns the export will surface them on its
+        // own pass.
         for (name, err) in &inference_errors {
             if let Some((line, col)) = self.find_exports_param_position(doc, name) {
                 diagnostics.push(carina_diagnostic(

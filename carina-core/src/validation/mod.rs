@@ -895,6 +895,64 @@ fn validate_struct_fields(
     None
 }
 
+/// Walk `field_path` against `start`. Return `Ok(tail_type)` on a
+/// clean walk and `Err((mismatched_type, bad_segment))` for the first
+/// segment that can't be resolved. Lists, maps, and scalars never host
+/// `.field` access — the parent type they reach is the right anchor
+/// for the diagnostic builder's "use iteration / subscript / nothing"
+/// suggestion.
+///
+/// Walks by reference so deep struct paths don't pay an O(depth) clone
+/// chain — the caller clones once at the return site if it needs an
+/// owned copy.
+///
+/// `Map` segments unwrap to the value type so dot-form key access
+/// (`accounts.k → T`) is symmetric with the subscript form
+/// (`accounts['k']`). #2447.
+pub(crate) fn walk_type_expr_path<'a, 'b>(
+    start: &'a TypeExpr,
+    field_path: &'b [String],
+) -> Result<&'a TypeExpr, (&'a TypeExpr, &'b str)> {
+    let mut current = start;
+    for segment in field_path {
+        match current {
+            TypeExpr::Struct { fields } => match fields.iter().find(|(name, _)| name == segment) {
+                Some((_, ty)) => current = ty,
+                None => return Err((current, segment.as_str())),
+            },
+            TypeExpr::Map(inner) => current = inner.as_ref(),
+            _ => return Err((current, segment.as_str())),
+        }
+    }
+    Ok(current)
+}
+
+/// Narrow `start` through a chain of `field_path` segments and trailing
+/// `subscripts`. Returns `None` when a step doesn't fit the container
+/// kind; those mismatches are reported by the dedicated shape checkers
+/// and a duplicate here would be noise.
+///
+/// The field-path leg delegates to [`walk_type_expr_path`] to keep the
+/// dot-form descent rules in one place. Used by both upstream-export
+/// type-checking and module-call attribute-export inference.
+pub(crate) fn narrow_type_expr(
+    start: &TypeExpr,
+    field_path: &[String],
+    subscripts: &[crate::resource::Subscript],
+) -> Option<TypeExpr> {
+    let after_fields = walk_type_expr_path(start, field_path).ok()?;
+    let mut current = after_fields.clone();
+    use crate::resource::Subscript;
+    for sub in subscripts {
+        current = match (current, sub) {
+            (TypeExpr::List(inner), Subscript::Int { .. }) => *inner,
+            (TypeExpr::Map(inner), Subscript::Str { .. }) => *inner,
+            _ => return None,
+        };
+    }
+    Some(current)
+}
+
 pub mod inference;
 
 #[cfg(test)]

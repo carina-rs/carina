@@ -95,6 +95,12 @@ impl std::fmt::Display for InferenceError {
 /// which the inferer doesn't recursively resolve here). Distinguishing the
 /// two lets the inferer turn a true typo (`mian.vpc_id`) into a hard error
 /// while still passing through `upstream_state`-derived references.
+///
+/// `Virtual` carries the attribute map of a module-call's
+/// `ResourceKind::Virtual` resource so an `exports` reference of the form
+/// `<module_call>.<attr>` can transitively infer through the bound
+/// expression on the module's `attributes { ... }` block, instead of
+/// failing with `unknown binding` (#2493).
 #[derive(Debug, Clone)]
 pub enum InferenceBinding {
     Resource {
@@ -102,6 +108,17 @@ pub enum InferenceBinding {
         resource_type: String,
     },
     UpstreamState,
+    Virtual {
+        attributes: indexmap::IndexMap<String, Value>,
+    },
+    /// Module-call binding registered before module expansion.
+    /// Inference treats it like `UpstreamState` (known-but-non-
+    /// inferable) so a downstream `${<call>.<attr>}` doesn't fire a
+    /// false `unknown binding` at load time. Post-expansion the
+    /// matching `Virtual` resource lands in `parsed.resources` and
+    /// `bindings_from_parts` overwrites this entry with a `Virtual`
+    /// that can actually project to a `TypeExpr`. #2493.
+    ModuleCall,
 }
 
 pub type InferenceBindings = HashMap<String, InferenceBinding>;
@@ -110,7 +127,23 @@ pub type InferenceBindings = HashMap<String, InferenceBinding>;
 /// over [`bindings_from_parts`] for the common case of having a parsed
 /// file in hand.
 pub fn bindings_from_parsed(parsed: &crate::parser::ParsedFile) -> InferenceBindings {
-    bindings_from_parts(&parsed.resources, &parsed.upstream_states)
+    let mut out = bindings_from_parts(&parsed.resources, &parsed.upstream_states);
+    // Pre-expansion (load_configuration), `parsed.resources` does not
+    // yet hold the `Virtual` resources that `expand_module_call`
+    // synthesises for each module-call binding. Register the binding
+    // names here as `ModuleCall` so a downstream
+    // `${<call>.<attr>}` reference is treated as known-but-non-
+    // inferable (mirroring `upstream_state`) instead of falsely
+    // flagged as `unknown binding`. Post-expansion the `Virtual` arm
+    // takes over and resolves the type properly. #2493.
+    for call in &parsed.module_calls {
+        if let Some(name) = &call.binding_name
+            && !out.contains_key(name)
+        {
+            out.insert(name.clone(), InferenceBinding::ModuleCall);
+        }
+    }
+    out
 }
 
 /// Build an [`InferenceBindings`] map from already-extracted resource
@@ -142,15 +175,26 @@ pub fn bindings_from_parts(
         out.insert(us.binding.clone(), InferenceBinding::UpstreamState);
     }
     for resource in resources {
-        if let Some(name) = &resource.binding {
-            out.insert(
-                name.clone(),
-                InferenceBinding::Resource {
-                    provider: resource.id.provider.clone(),
-                    resource_type: resource.id.resource_type.clone(),
-                },
-            );
-        }
+        let Some(name) = &resource.binding else {
+            continue;
+        };
+        // `Virtual` resources synthesised by module-call expansion
+        // (`expand_module_call`) carry no provider identity — their
+        // attributes are projections from the module's
+        // `attributes { ... }` block. Tag them so `infer_resource_ref`
+        // recurses into the bound expression instead of trying a schema
+        // lookup that would always fail. #2493.
+        let entry = if resource.is_virtual() {
+            InferenceBinding::Virtual {
+                attributes: resource.attributes.clone(),
+            }
+        } else {
+            InferenceBinding::Resource {
+                provider: resource.id.provider.clone(),
+                resource_type: resource.id.resource_type.clone(),
+            }
+        };
+        out.insert(name.clone(), entry);
     }
     out
 }
@@ -293,9 +337,29 @@ fn infer_resource_ref(
             provider,
             resource_type,
         }) => (provider.as_str(), resource_type.as_str()),
-        Some(InferenceBinding::UpstreamState) => {
+        Some(InferenceBinding::UpstreamState) | Some(InferenceBinding::ModuleCall) => {
             return Err(InferenceError::NonInferableBinding {
                 binding: binding.to_string(),
+            });
+        }
+        Some(InferenceBinding::Virtual { attributes }) => {
+            // The module-call's virtual resource holds the module's
+            // `attributes { ... }` projections directly. Recurse on the
+            // bound expression so the type flows transitively through
+            // the inner resource's schema. #2493.
+            let inner =
+                attributes
+                    .get(attribute)
+                    .ok_or_else(|| InferenceError::UnknownAttribute {
+                        binding: binding.to_string(),
+                        attribute: attribute.to_string(),
+                    })?;
+            let inner_type = infer_type_from_value(inner, bindings, schemas)?;
+            return super::narrow_type_expr(&inner_type, field_path, subscripts).ok_or_else(|| {
+                InferenceError::UnknownAttribute {
+                    binding: binding.to_string(),
+                    attribute: attribute.to_string(),
+                }
             });
         }
         None => {
@@ -526,7 +590,7 @@ pub fn infer_export_params(
     Vec<crate::parser::InferredExportParam>,
     Vec<(String, InferenceError)>,
 ) {
-    let bindings = bindings_from_parts(&parsed.resources, &parsed.upstream_states);
+    let bindings = bindings_from_parsed(parsed);
     let mut errors = Vec::new();
     let inferred_exports: Vec<crate::parser::InferredExportParam> = parsed
         .export_params
@@ -1140,6 +1204,109 @@ mod tests {
             inferred.export_params[0].type_expr,
             TypeExpr::Simple("vpc_id".to_string())
         );
+    }
+
+    #[test]
+    fn apply_inference_resolves_module_call_attribute_via_virtual_binding() {
+        // #2493: an `exports` value referencing `<module_call>.<attr>`
+        // (e.g. `role_arn = github_actions_carina.role_arn` where
+        // `let github_actions_carina = github_module {...}`) must
+        // resolve to the same `TypeExpr` as if the user had annotated
+        // the export explicitly. The module's `attributes { role_arn =
+        // role.arn }` block lets the type be inferred transitively
+        // through the module-call's virtual resource (post-expansion)
+        // and the inner role's schema attribute.
+        //
+        // Pre-#2493 the inference walked `parsed.resources` only, missed
+        // the `Virtual` binding (which post-expansion exposes the
+        // module's attribute set), and surfaced a misleading
+        // "unknown binding" diagnostic.
+        use crate::resource::ResourceKind;
+        let mut parsed = crate::parser::ParsedFile::default();
+        // Concrete role resource with prefixed binding (post-expansion shape).
+        let role = crate::resource::Resource::with_provider(
+            "awscc",
+            "ec2.Vpc",
+            "github_actions_carina.role",
+        )
+        .with_binding("github_actions_carina.role");
+        parsed.resources.push(role); // allow: direct — fixture test inspection
+        // Virtual resource that exposes the module's attributes.
+        // `vpc_id` here stands in for the module-exposed attribute that
+        // points at the inner role's schema attribute.
+        let mut virt = crate::resource::Resource::new("_virtual", "github_actions_carina");
+        virt.binding = Some("github_actions_carina".to_string());
+        virt.kind = ResourceKind::Virtual {
+            module_name: "github_module".to_string(),
+            instance: "github_actions_carina".to_string(),
+        };
+        virt.attributes.insert(
+            "role_id".to_string(),
+            Value::resource_ref(
+                "github_actions_carina.role".to_string(),
+                "vpc_id".to_string(),
+                vec![],
+            ),
+        );
+        parsed.resources.push(virt); // allow: direct — fixture test inspection
+        parsed.export_params.push(crate::parser::ParsedExportParam {
+            name: "role_id".to_string(),
+            type_expr: None,
+            value: Some(Value::resource_ref(
+                "github_actions_carina".to_string(),
+                "role_id".to_string(),
+                vec![],
+            )),
+        });
+
+        let (inferred, errors) = apply_inference(parsed, &schemas_with_vpc());
+        assert!(
+            errors.is_empty(),
+            "module-call attribute export must infer cleanly, got: {errs:?}",
+            errs = errors
+        );
+        assert_eq!(inferred.export_params.len(), 1);
+        assert_eq!(
+            inferred.export_params[0].type_expr,
+            TypeExpr::Simple("vpc_id".to_string()),
+            "expected the inner attribute's type to flow through the virtual binding"
+        );
+    }
+
+    #[test]
+    fn apply_inference_treats_pre_expansion_module_call_binding_as_non_inferable() {
+        // #2493 load-time path: at `load_configuration` the parser has
+        // produced `parsed.module_calls` but module expansion hasn't
+        // run yet, so the virtual resource isn't in `parsed.resources`
+        // and the bindings map can't see the module-call's projection.
+        // The inferer must treat the binding as known-but-non-inferable
+        // (mirroring `upstream_state`) so the export gets `Unknown`
+        // without a noisy `unknown binding` error. Post-expansion the
+        // CLI re-runs inference and the type is filled in via the
+        // `Virtual` arm exercised by the sibling test above.
+        let mut parsed = crate::parser::ParsedFile::default();
+        parsed.module_calls.push(crate::parser::ModuleCall {
+            module_name: "github_module".to_string(),
+            binding_name: Some("github_actions_carina".to_string()),
+            arguments: std::collections::HashMap::new(),
+        });
+        parsed.export_params.push(crate::parser::ParsedExportParam {
+            name: "role_arn".to_string(),
+            type_expr: None,
+            value: Some(Value::resource_ref(
+                "github_actions_carina".to_string(),
+                "role_arn".to_string(),
+                vec![],
+            )),
+        });
+
+        let (inferred, errors) = apply_inference(parsed, &SchemaRegistry::new());
+        assert!(
+            errors.is_empty(),
+            "module-call binding without a virtual resource yet must not error, got: {:?}",
+            errors
+        );
+        assert_eq!(inferred.export_params[0].type_expr, TypeExpr::Unknown);
     }
 
     #[test]
