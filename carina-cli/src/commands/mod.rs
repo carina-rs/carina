@@ -26,7 +26,7 @@ use crate::error::AppError;
 use crate::wiring::{
     WiringContext, build_factories_from_providers, compute_anonymous_identifiers_with_ctx,
     resolve_names_with_ctx, validate_attribute_param_ref_types_with_ctx,
-    validate_module_attribute_param_types, validate_module_calls,
+    validate_module_attribute_param_types, validate_module_calls, validate_no_empty_interpolations,
     validate_provider_region_with_ctx, validate_resource_ref_types_with_ctx,
     validate_resources_with_ctx,
 };
@@ -290,6 +290,12 @@ pub fn validate_and_resolve_errors_with_factories(
     }
 
     if !skip_resource_validation {
+        // Mid-edit `${}` is parser-accepted (#2480) so the AST stays
+        // intact for LSP diagnostics, but it must not reach a provider —
+        // surface it as a hard error before the schema-level checks
+        // below try to type-check around the marker. See #2487.
+        errors.extend(validate_no_empty_interpolations(parsed));
+
         errors.extend(validate_resources_with_ctx(&ctx, parsed, &enriched_context));
         let mut argument_names: HashSet<String> =
             parsed.arguments.iter().map(|a| a.name.clone()).collect();
