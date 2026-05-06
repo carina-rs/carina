@@ -411,6 +411,46 @@ mod tests {
         assert!(result.contains("let bucket = aws.s3.Bucket {"));
     }
 
+    // Regression: `if cond { ... }` must keep the condition `cond` on
+    // the same line as `if`, even when a module-call-shaped node sits in
+    // an expression position. An earlier draft of the #2504 fix added
+    // `module_call` to `primary`, which made `cond { body }` parse as a
+    // module call inside the if condition — mangling the formatted
+    // output. The shipped fix scopes module-call to the let-binding RHS.
+    #[test]
+    fn issue_2504_if_cond_with_block_body_unaffected() {
+        let input =
+            "let g = if cond {\n  github { repo = 'a' }\n} else {\n  github { repo = 'b' }\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert!(
+            result.contains("if cond {"),
+            "if condition must stay on the `if` line. Got:\n{}",
+            result
+        );
+        let second = format(&result, &config).unwrap();
+        assert_eq!(result, second, "format must be idempotent");
+    }
+
+    #[test]
+    fn issue_2504_let_binding_with_module_call_rhs_renders_inline() {
+        // `let X = module_call { ... }` must format with the module name
+        // on the same line as the `=`, not on its own indented line.
+        let input =
+            "let github = use {\n  source = './m'\n}\n\nlet g = github {\n  repo = 'r'\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+
+        assert!(
+            result.contains("let g = github {"),
+            "Module-call RHS should render inline with `let X = name {{`. Got:\n{}",
+            result
+        );
+        // Idempotence
+        let second = format(&result, &config).unwrap();
+        assert_eq!(result, second, "format must be idempotent");
+    }
+
     #[test]
     fn test_needs_format() {
         let config = FormatConfig::default();

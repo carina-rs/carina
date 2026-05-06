@@ -195,8 +195,14 @@ fn_local_let = { kw_let ~ trivia+ ~ identifier ~ trivia* ~ equals ~ trivia* ~ ex
 // Variable/resource definition: let name = value
 // discard_pattern allows `let _ = expr` to suppress unused binding warnings
 discard_pattern = @{ "_" }
+// `module_call` is admitted explicitly as a let-binding RHS (issue #2504)
+// for the same reason `use_expr` is — it is not a regular expression in
+// `primary` (see comment on `primary`), but it is a valid RHS surface.
+// `module_call` must be tried before `expression` so the more specific
+// `name { ... }` shape commits before `expression` reaches `variable_ref`
+// and leaves `{ ... }` unconsumed.
 let_binding = {
-    kw_let ~ trivia+ ~ (discard_pattern | identifier) ~ trivia* ~ equals ~ trivia* ~ (use_expr | expression)
+    kw_let ~ trivia+ ~ (discard_pattern | identifier) ~ trivia* ~ equals ~ trivia* ~ (use_expr | module_call | expression)
 }
 
 // Block content: local let bindings, attributes, trivia, nested blocks, or nested elements
@@ -255,6 +261,15 @@ upstream_state_expr = {
 // Primary value
 // `use_expr` is intentionally NOT here — mirrors carina.pest. It is only
 // valid as the RHS of a let binding (see `let_binding`). Issue #2233.
+//
+// `module_call` is also intentionally NOT here. The formatter's
+// `module_call` body accepts `block_content*` (which includes
+// `nested_block`), making it greedy enough to swallow `if cond { x }`
+// or `for x in xs { y { z = 1 } }` whenever the iterable/condition
+// expression hits primary. Restricting module-call to its specific
+// surface — top-level `statement`, `for_body_content`,
+// `if_body_content`, and the let-binding RHS — keeps the grammar
+// unambiguous.
 primary = {
     read_resource_expr
   | upstream_state_expr

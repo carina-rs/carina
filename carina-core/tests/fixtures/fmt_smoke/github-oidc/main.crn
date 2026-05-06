@@ -1,0 +1,14 @@
+# GitHub Actions OIDC for management account
+#
+# Allows GitHub Actions in carina-rs/infra to assume a role
+# with AdministratorAccess for plan/apply.
+
+let github = use {
+  source = '../../../modules/github-oidc'
+}
+
+let github_actions_carina = github {
+  github_repo         = 'carina-rs/infra'
+  role_name           = 'github-actions-carina'
+  managed_policy_arns = ['arn:aws:iam::aws:policy/AdministratorAccess']
+}
