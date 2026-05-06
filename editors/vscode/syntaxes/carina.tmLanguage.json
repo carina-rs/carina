@@ -84,6 +84,27 @@
             {
               "name": "constant.character.escape.carina",
               "match": "\\\\."
+            },
+            {
+              "name": "meta.embedded.expression.carina",
+              "begin": "\\$\\{",
+              "end": "\\}",
+              "beginCaptures": {
+                "0": { "name": "punctuation.section.embedded.begin.carina" }
+              },
+              "endCaptures": {
+                "0": { "name": "punctuation.section.embedded.end.carina" }
+              },
+              "patterns": [
+                {
+                  "name": "variable.other.carina",
+                  "match": "[A-Za-z_][A-Za-z0-9_]*"
+                },
+                {
+                  "name": "punctuation.accessor.carina",
+                  "match": "\\."
+                }
+              ]
             }
           ]
         },
