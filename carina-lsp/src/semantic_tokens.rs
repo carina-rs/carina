@@ -380,18 +380,22 @@ impl SemanticTokensProvider {
             }
         }
 
+        // Pattern walkers consume LineSegments so they cannot reach
+        // string-literal text — `StringBody` carries no walker-visible text.
+        let segments = segment_line(line);
+
         // Resource type: aws.service.resource pattern
-        self.find_resource_types(line, &mut tokens);
+        Self::find_resource_types(&segments, &mut tokens);
 
         // Bare PascalCase type annotations: after a `:` (type position in
         // arguments/attributes/exports/fn params), tag the following
         // identifier as TYPE if it starts with an ASCII uppercase letter.
         // Dotted forms (aws.ec2.Vpc, awscc.ec2.VpcId) are handled elsewhere.
-        self.find_pascal_type_annotations(line, &mut tokens);
+        Self::find_pascal_type_annotations(&segments, &mut tokens);
 
         // Region patterns from registered providers (e.g., aws.Region.us_east_1)
         for region in &self.region_patterns {
-            self.find_and_add_pattern(line, region, 1, &mut tokens);
+            Self::find_and_add_pattern(&segments, region, 1, &mut tokens);
         }
 
         // Property names (before =)
@@ -510,63 +514,65 @@ impl SemanticTokensProvider {
     /// Tag bare PascalCase identifiers in type-annotation position
     /// (`ident: PascalCase` or `: PascalCase`) as `TYPE`. Dotted forms
     /// like `aws.ec2.Vpc` are handled by `find_resource_types`.
-    fn find_pascal_type_annotations(&self, line: &str, tokens: &mut Vec<(u32, u32, u32)>) {
-        let bytes = line.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] != b':' {
-                i += 1;
-                continue;
-            }
-            // Skip `::` (not expected in DSL, but be defensive)
-            if i + 1 < bytes.len() && bytes[i + 1] == b':' {
-                i += 2;
-                continue;
-            }
-            // Find the first non-whitespace character after `:`
-            let mut j = i + 1;
-            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
-                j += 1;
-            }
-            if j >= bytes.len() {
-                break;
-            }
-            // Must start with ASCII uppercase to be PascalCase
-            if !bytes[j].is_ascii_uppercase() {
+    fn find_pascal_type_annotations(segments: &[LineSegment], tokens: &mut Vec<(u32, u32, u32)>) {
+        for (seg_start, text) in segments.iter().filter_map(LineSegment::walker_text) {
+            let bytes = text.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] != b':' {
+                    i += 1;
+                    continue;
+                }
+                // Skip `::` (not expected in DSL, but be defensive)
+                if i + 1 < bytes.len() && bytes[i + 1] == b':' {
+                    i += 2;
+                    continue;
+                }
+                let mut j = i + 1;
+                while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                    j += 1;
+                }
+                if j >= bytes.len() {
+                    break;
+                }
+                if !bytes[j].is_ascii_uppercase() {
+                    i = j;
+                    continue;
+                }
+                let ident_start = j;
+                while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                    j += 1;
+                }
+                // Reject dotted forms — those are handled by find_resource_types.
+                if j < bytes.len() && bytes[j] == b'.' {
+                    i = j;
+                    continue;
+                }
+                let length = (j - ident_start) as u32;
+                let start_char =
+                    seg_start + position::byte_offset_to_char_offset(text, ident_start);
+                tokens.push((start_char, length, 1)); // TYPE
                 i = j;
-                continue;
             }
-            // Scan the identifier [A-Za-z0-9_]+
-            let ident_start = j;
-            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
-                j += 1;
-            }
-            // Reject dotted forms — those are handled by find_resource_types.
-            if j < bytes.len() && bytes[j] == b'.' {
-                i = j;
-                continue;
-            }
-            let length = (j - ident_start) as u32;
-            let start_char = position::byte_offset_to_char_offset(line, ident_start);
-            tokens.push((start_char, length, 1)); // TYPE
-            i = j;
         }
     }
 
-    /// Find resource type patterns like aws.s3.Bucket, aws.ec2.Vpc
-    fn find_resource_types(&self, line: &str, tokens: &mut Vec<(u32, u32, u32)>) {
-        let chars: Vec<char> = line.chars().collect();
-        let mut i = 0;
+    /// Find resource type patterns like aws.s3.Bucket, aws.ec2.Vpc.
+    fn find_resource_types(segments: &[LineSegment], tokens: &mut Vec<(u32, u32, u32)>) {
+        for (seg_start, text) in segments.iter().filter_map(LineSegment::walker_text) {
+            let chars: Vec<char> = text.chars().collect();
+            let mut i = 0;
 
-        while i < chars.len() {
-            // Look for potential start of resource type (letter at word boundary)
-            if chars[i].is_ascii_lowercase() {
-                let before_ok = i == 0 || (!chars[i - 1].is_alphanumeric() && chars[i - 1] != '_');
+            while i < chars.len() {
+                // Walker-eligible segments are bordered by string bodies
+                // or `${` / `}` markers, none of which are word chars,
+                // so the segment's left and right edges count as word
+                // boundaries.
+                if chars[i].is_ascii_lowercase() {
+                    let before_ok =
+                        i == 0 || (!chars[i - 1].is_alphanumeric() && chars[i - 1] != '_');
 
-                if before_ok {
-                    // Try to match provider.service.resource pattern
-                    if let Some((end, pattern)) = self.match_resource_type(&chars, i) {
-                        // Verify it's followed by whitespace or {
+                    if before_ok && let Some((end, pattern)) = match_resource_type(&chars, i) {
                         let after_ok = end >= chars.len()
                             || chars[end] == ' '
                             || chars[end] == '{'
@@ -574,91 +580,92 @@ impl SemanticTokensProvider {
                             || chars[end] == '\n';
 
                         if after_ok {
-                            tokens.push((i as u32, pattern.len() as u32, 1)); // TYPE
+                            tokens.push((seg_start + i as u32, pattern.len() as u32, 1));
                             i = end;
                             continue;
                         }
                     }
                 }
+                i += 1;
             }
-            i += 1;
         }
-    }
-
-    /// Match a resource type pattern starting at position i
-    /// Returns (end_position, matched_string) if found
-    fn match_resource_type(&self, chars: &[char], start: usize) -> Option<(usize, String)> {
-        let mut parts = Vec::new();
-        let mut current_part = String::new();
-        let mut i = start;
-
-        while i < chars.len() {
-            let c = chars[i];
-            if c.is_ascii_alphanumeric() || c == '_' {
-                current_part.push(c);
-            } else if c == '.' && !current_part.is_empty() {
-                parts.push(current_part.clone());
-                current_part.clear();
-            } else {
-                break;
-            }
-            i += 1;
-        }
-
-        if !current_part.is_empty() {
-            parts.push(current_part);
-        }
-
-        // Must have at least 3 parts: provider.service.resource (e.g., aws.ec2.Vpc, awscc.ec2.Vpc)
-        if parts.len() >= 2 && parts.len() <= 3 {
-            // Exclude enum patterns like aws.Region, aws.Protocol (2nd part starts with uppercase)
-            if parts.len() == 2 && parts[1].starts_with(|c: char| c.is_uppercase()) {
-                return None;
-            }
-            let pattern = parts.join(".");
-            return Some((i, pattern));
-        }
-
-        None
     }
 
     fn find_and_add_pattern(
-        &self,
-        line: &str,
+        segments: &[LineSegment],
         pattern: &str,
         token_type: u32,
         tokens: &mut Vec<(u32, u32, u32)>,
     ) {
-        let mut search_start = 0;
-        while let Some(pos) = line[search_start..].find(pattern) {
-            let absolute_byte_pos = search_start + pos;
-            // Check word boundaries using byte-level access.
-            // Patterns and boundary characters are ASCII, so byte access is safe.
-            let before_byte = if absolute_byte_pos > 0 {
-                Some(line.as_bytes()[absolute_byte_pos - 1])
-            } else {
-                None
-            };
-            let after_byte_pos = absolute_byte_pos + pattern.len();
-            let after_byte = if after_byte_pos < line.len() {
-                Some(line.as_bytes()[after_byte_pos])
-            } else {
-                None
-            };
+        for (seg_start, text) in segments.iter().filter_map(LineSegment::walker_text) {
+            let mut search_start = 0;
+            while let Some(pos) = text[search_start..].find(pattern) {
+                let absolute_byte_pos = search_start + pos;
+                // Patterns and boundary characters are ASCII, so byte access is safe.
+                let before_byte = if absolute_byte_pos > 0 {
+                    Some(text.as_bytes()[absolute_byte_pos - 1])
+                } else {
+                    None
+                };
+                let after_byte_pos = absolute_byte_pos + pattern.len();
+                let after_byte = if after_byte_pos < text.len() {
+                    Some(text.as_bytes()[after_byte_pos])
+                } else {
+                    None
+                };
 
-            let before_ok =
-                before_byte.is_none_or(|b| !b.is_ascii_alphanumeric() && b != b'_' && b != b'.');
-            let after_ok =
-                after_byte.is_none_or(|b| !b.is_ascii_alphanumeric() && b != b'_' && b != b'.');
+                let before_ok = before_byte
+                    .is_none_or(|b| !b.is_ascii_alphanumeric() && b != b'_' && b != b'.');
+                let after_ok =
+                    after_byte.is_none_or(|b| !b.is_ascii_alphanumeric() && b != b'_' && b != b'.');
 
-            if before_ok && after_ok {
-                let char_pos = position::byte_offset_to_char_offset(line, absolute_byte_pos);
-                // Pattern is ASCII, so byte length == char length
-                tokens.push((char_pos, pattern.len() as u32, token_type));
+                if before_ok && after_ok {
+                    let char_pos =
+                        seg_start + position::byte_offset_to_char_offset(text, absolute_byte_pos);
+                    // Pattern is ASCII, so byte length == char length
+                    tokens.push((char_pos, pattern.len() as u32, token_type));
+                }
+                search_start = absolute_byte_pos + pattern.len();
             }
-            search_start = absolute_byte_pos + pattern.len();
         }
     }
+}
+
+/// Match a resource type pattern starting at position i
+/// Returns (end_position, matched_string) if found
+fn match_resource_type(chars: &[char], start: usize) -> Option<(usize, String)> {
+    let mut parts = Vec::new();
+    let mut current_part = String::new();
+    let mut i = start;
+
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_ascii_alphanumeric() || c == '_' {
+            current_part.push(c);
+        } else if c == '.' && !current_part.is_empty() {
+            parts.push(current_part.clone());
+            current_part.clear();
+        } else {
+            break;
+        }
+        i += 1;
+    }
+
+    if !current_part.is_empty() {
+        parts.push(current_part);
+    }
+
+    // Must have at least 3 parts: provider.service.resource (e.g., aws.ec2.Vpc, awscc.ec2.Vpc)
+    if parts.len() >= 2 && parts.len() <= 3 {
+        // Exclude enum patterns like aws.Region, aws.Protocol (2nd part starts with uppercase)
+        if parts.len() == 2 && parts[1].starts_with(|c: char| c.is_uppercase()) {
+            return None;
+        }
+        let pattern = parts.join(".");
+        return Some((i, pattern));
+    }
+
+    None
 }
 
 /// Result of scanning a line for an inline `#` / `//` line-comment marker.
@@ -711,6 +718,217 @@ fn find_inline_comment_split(line: &str) -> Option<InlineCommentSplit> {
         char_pos,
         total_char_len: char_idx as u32,
     })
+}
+
+/// A contiguous slice of a single source line, classified by whether
+/// pattern walkers (TYPE / region / namespaced enum) are allowed to
+/// fire inside it.
+///
+/// `Code` and `InterpolationExpr` carry their text so walkers can
+/// scan it. `StringBody` is a marker variant with no payload — its
+/// text is structurally inaccessible to walkers, so the boundary
+/// is enforced by the type system rather than by runtime discipline.
+#[derive(Debug, Clone)]
+enum LineSegment {
+    /// Outside any string literal — DSL expression position.
+    Code { start: u32, text: String },
+    /// Inside a `${...}` interpolation expression in a double-quoted
+    /// string or unquoted heredoc body. Also a DSL expression position.
+    InterpolationExpr { start: u32, text: String },
+    /// Literal text inside a single- or double-quoted string body, or
+    /// the body of a quoted heredoc. Text is intentionally absent —
+    /// walkers must not see it.
+    StringBody,
+}
+
+impl LineSegment {
+    /// Returns `(start, &text)` for walker-eligible variants. `StringBody`
+    /// returns `None`, so a walker that iterates only the `Some` results
+    /// is structurally unable to scan inside string literals.
+    fn walker_text(&self) -> Option<(u32, &str)> {
+        match self {
+            LineSegment::Code { start, text } | LineSegment::InterpolationExpr { start, text } => {
+                Some((*start, text.as_str()))
+            }
+            LineSegment::StringBody => None,
+        }
+    }
+}
+
+/// Span of a single string literal inside a line, in char offsets.
+#[derive(Debug, Clone, Copy)]
+struct StringSpan {
+    /// Char offset of the opening quote.
+    open: u32,
+    /// Char offset just past the closing quote (or line end if unclosed).
+    close: u32,
+    /// Quote character — `'` or `"`.
+    quote: char,
+}
+
+/// Find every string-literal span on a line. The scanner skips escape
+/// pairs (`\\` followed by any char) inside double-quoted strings;
+/// single-quoted strings have no escape mechanism in Carina's pest
+/// grammar, so the first matching `'` closes them.
+fn find_string_spans(line_chars: &[char]) -> Vec<StringSpan> {
+    let mut spans = Vec::new();
+    let mut i: usize = 0;
+    while i < line_chars.len() {
+        let c = line_chars[i];
+        if c == '"' || c == '\'' {
+            let open = i as u32;
+            let close = skip_string_literal(line_chars, i) as u32;
+            spans.push(StringSpan {
+                open,
+                close,
+                quote: c,
+            });
+            i = close as usize;
+            continue;
+        }
+        i += 1;
+    }
+    spans
+}
+
+/// Split a line into [`LineSegment`]s for walker dispatch.
+///
+/// Outside string literals: `Code`. Inside double-quoted strings or
+/// unquoted heredoc bodies, `${...}` spans become `InterpolationExpr`
+/// while the surrounding literal text (and quote chars) become
+/// `StringBody`. Single-quoted strings are entirely `StringBody`
+/// because Carina's grammar does not interpolate them.
+fn segment_line(line: &str) -> Vec<LineSegment> {
+    let line_chars: Vec<char> = line.chars().collect();
+    let total = line_chars.len() as u32;
+    let spans = find_string_spans(&line_chars);
+
+    let mut out: Vec<LineSegment> = Vec::new();
+    let mut cursor: u32 = 0;
+    for span in spans {
+        if span.open > cursor {
+            push_code(&mut out, &line_chars, cursor, span.open);
+        }
+        if span.quote == '\'' {
+            push_string_body(&mut out, span.open, span.close);
+        } else {
+            split_double_quoted_body(&mut out, &line_chars, span.open, span.close);
+        }
+        cursor = span.close;
+    }
+    if cursor < total {
+        push_code(&mut out, &line_chars, cursor, total);
+    }
+    out
+}
+
+/// Split a double-quoted string range `[open, close)` into segments,
+/// alternating `StringBody` (literal text + quote chars) with
+/// `InterpolationExpr` (`${...}` body — the chars between `${` and `}`).
+fn split_double_quoted_body(
+    out: &mut Vec<LineSegment>,
+    line_chars: &[char],
+    open: u32,
+    close: u32,
+) {
+    let close_us = close as usize;
+    let mut segment_start = open as usize;
+    let mut i = segment_start;
+    while i + 1 < close_us {
+        let c = line_chars[i];
+        if c == '\\' {
+            i += 2;
+            continue;
+        }
+        if c == '$' && line_chars[i + 1] == '{' {
+            if i > segment_start {
+                push_string_body(out, segment_start as u32, i as u32);
+            }
+            let interp_end = scan_interpolation_end(line_chars, i, close_us);
+            // `${...}` expanded into `${`, expression body, `}` — the
+            // braces stay with StringBody so walkers cannot reach them,
+            // and the body becomes InterpolationExpr so walkers can.
+            // If `}` is missing (unclosed interpolation: line ended inside
+            // `${...`), the body extends to interp_end with no trailing
+            // brace; otherwise interp_end points just past `}`.
+            let body_start = i + 2;
+            let closed = interp_end > body_start && line_chars[interp_end - 1] == '}';
+            let body_end = if closed { interp_end - 1 } else { interp_end };
+            push_string_body(out, i as u32, body_start as u32);
+            if body_end > body_start {
+                push_interpolation(out, line_chars, body_start as u32, body_end as u32);
+            }
+            if closed {
+                push_string_body(out, body_end as u32, interp_end as u32);
+            }
+            i = interp_end;
+            segment_start = i;
+            continue;
+        }
+        i += 1;
+    }
+    if close_us > segment_start {
+        push_string_body(out, segment_start as u32, close);
+    }
+}
+
+/// Scan from a `${` opener at `dollar_idx` to the matching `}`, honoring
+/// `\\` escapes, nested `{}` (depth counter), and string literals inside
+/// the body (skipped via [`skip_string_literal`] so a `}` inside them
+/// does not close early). Returns the index just past the closing `}`,
+/// or `close` if the body runs to the end of the surrounding range.
+///
+/// Shared by [`split_double_quoted_body`] (for walker dispatch) and
+/// [`push_interpolation_aware_string`] (for STRING/MACRO token emit)
+/// so the two stay in sync.
+fn scan_interpolation_end(line_chars: &[char], dollar_idx: usize, close: usize) -> usize {
+    let mut depth = 1usize;
+    let mut j = dollar_idx + 2;
+    while j < close && depth > 0 {
+        match line_chars[j] {
+            '\\' => {
+                j += 2;
+                continue;
+            }
+            '"' | '\'' => {
+                j = skip_string_literal(line_chars, j);
+                continue;
+            }
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    j += 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    j
+}
+
+fn push_code(out: &mut Vec<LineSegment>, line_chars: &[char], start: u32, end: u32) {
+    if end <= start {
+        return;
+    }
+    let text: String = line_chars[start as usize..end as usize].iter().collect();
+    out.push(LineSegment::Code { start, text });
+}
+
+fn push_interpolation(out: &mut Vec<LineSegment>, line_chars: &[char], start: u32, end: u32) {
+    if end <= start {
+        return;
+    }
+    let text: String = line_chars[start as usize..end as usize].iter().collect();
+    out.push(LineSegment::InterpolationExpr { start, text });
+}
+
+fn push_string_body(out: &mut Vec<LineSegment>, start: u32, end: u32) {
+    if end > start {
+        out.push(LineSegment::StringBody);
+    }
 }
 
 /// Skip past a single- or double-quoted string literal starting at `start`
@@ -804,33 +1022,9 @@ fn push_interpolation_aware_string(
             if i > segment_start {
                 tokens.push((segment_start as u32, (i - segment_start) as u32, 4));
             }
-            let interp_start = i;
-            let mut depth = 1usize;
-            let mut j = i + 2;
-            while j < end && depth > 0 {
-                match line_chars[j] {
-                    '\\' => {
-                        j += 2;
-                        continue;
-                    }
-                    '"' | '\'' => {
-                        j = skip_string_literal(line_chars, j);
-                        continue;
-                    }
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            j += 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-                j += 1;
-            }
-            tokens.push((interp_start as u32, (j - interp_start) as u32, 9));
-            i = j;
+            let interp_end = scan_interpolation_end(line_chars, i, end);
+            tokens.push((i as u32, (interp_end - i) as u32, 9));
+            i = interp_end;
             segment_start = i;
             continue;
         }
@@ -867,9 +1061,9 @@ mod tests {
 
     #[test]
     fn test_find_resource_types_directly() {
-        let provider = SemanticTokensProvider::new(&[]);
         let mut tokens = Vec::new();
-        provider.find_resource_types("aws.s3.Bucket {", &mut tokens);
+        let segments = segment_line("aws.s3.Bucket {");
+        SemanticTokensProvider::find_resource_types(&segments, &mut tokens);
 
         assert_eq!(tokens.len(), 1, "Should find one resource type");
         assert_eq!(
@@ -1040,10 +1234,10 @@ mod tests {
 
     #[test]
     fn test_find_and_add_pattern_with_non_ascii() {
-        let provider = SemanticTokensProvider::new(&[]);
         // Pattern search after multi-byte characters
         let mut tokens = Vec::new();
-        provider.find_and_add_pattern("    value = true // 日本語", "true", 0, &mut tokens);
+        let segments = segment_line("    value = true // 日本語");
+        SemanticTokensProvider::find_and_add_pattern(&segments, "true", 0, &mut tokens);
         assert!(
             !tokens.is_empty(),
             "Should find 'true' pattern. Got: {:?}",
@@ -2055,6 +2249,211 @@ mod tests {
             last.3, 4,
             "closing marker must remain STRING; got kind {} on line 2",
             last.3
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Pattern walkers must not fire inside string literal bodies.
+    // -------------------------------------------------------------------
+
+    /// Helper: assert no TYPE (1) token's range overlaps the byte slice
+    /// `needle` inside `line`. Each TYPE token range must lie entirely
+    /// outside any of `needle`'s occurrences.
+    #[cfg(test)]
+    fn assert_no_type_token_overlaps_substring(line: &str, needle: &str) {
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize_line(line, 0);
+        let chars: Vec<char> = line.chars().collect();
+        // Find char-range of `needle` inside `line`. Assumes ASCII needle.
+        let byte_pos = line
+            .find(needle)
+            .unwrap_or_else(|| panic!("needle {needle:?} not found in {line:?}"));
+        let needle_char_start = position::byte_offset_to_char_offset(line, byte_pos);
+        let needle_char_end = needle_char_start + needle.chars().count() as u32;
+        for (start, len, kind) in &tokens {
+            if *kind != 1 {
+                continue;
+            }
+            let end = *start + *len;
+            // Overlap check: token range [start, end) intersects needle range.
+            let overlaps = *start < needle_char_end && end > needle_char_start;
+            assert!(
+                !overlaps,
+                "TYPE token at {start}..{end} overlaps needle {needle:?} \
+                 at {needle_char_start}..{needle_char_end} in line {line:?}; \
+                 all tokens: {tokens:?}, line chars len {}",
+                chars.len()
+            );
+        }
+    }
+
+    #[test]
+    fn type_walker_does_not_fire_inside_double_quoted_string_body() {
+        // `description = "see aws.ec2.Vpc for details"` — the substring
+        // `aws.ec2.Vpc` is part of the string body and must NOT be
+        // highlighted as TYPE.
+        assert_no_type_token_overlaps_substring(
+            "description = \"see aws.ec2.Vpc for details\"",
+            "aws.ec2.Vpc",
+        );
+    }
+
+    #[test]
+    fn type_walker_does_not_fire_inside_single_quoted_string_body() {
+        // Single-quoted strings have no interpolation in Carina's grammar,
+        // so the walker must not run inside their body at all.
+        assert_no_type_token_overlaps_substring(
+            "description = 'see aws.s3.Bucket here'",
+            "aws.s3.Bucket",
+        );
+    }
+
+    #[test]
+    fn pascal_type_walker_does_not_fire_inside_string_body() {
+        // `: PascalCase` inside a string body must not be tagged as TYPE.
+        assert_no_type_token_overlaps_substring("msg = \"field: Vpc is required\"", "Vpc");
+    }
+
+    #[test]
+    fn region_walker_does_not_fire_inside_string_body() {
+        use carina_core::schema::CompletionValue;
+        let regions = vec![CompletionValue::new(
+            "aws.Region.us_east_1",
+            "US East (N. Virginia)",
+        )];
+        let provider = SemanticTokensProvider::new(&regions);
+        let line = "note = \"deployed to aws.Region.us_east_1 yesterday\"";
+        let tokens = provider.tokenize_line(line, 0);
+        let needle = "aws.Region.us_east_1";
+        let byte_pos = line.find(needle).expect("needle not in line");
+        let needle_start = position::byte_offset_to_char_offset(line, byte_pos);
+        let needle_end = needle_start + needle.chars().count() as u32;
+        for (start, len, kind) in &tokens {
+            if *kind != 1 {
+                continue;
+            }
+            let end = *start + *len;
+            assert!(
+                !(*start < needle_end && end > needle_start),
+                "region TYPE token at {start}..{end} overlaps string body \
+                 region needle {needle_start}..{needle_end}; tokens: {tokens:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn type_walker_fires_inside_interpolation_expression() {
+        // Inside `${...}` the walker MUST run because that is an
+        // expression position, not a string body.
+        let provider = SemanticTokensProvider::new(&[]);
+        // `msg = "see ${aws.ec2.Vpc} here"` — the `aws.ec2.Vpc` inside
+        // ${...} should be tagged as TYPE.
+        let line = "msg = \"see ${aws.ec2.Vpc} here\"";
+        let tokens = provider.tokenize_line(line, 0);
+        let byte_pos = line.find("aws.ec2.Vpc").expect("needle not in line");
+        let needle_start = position::byte_offset_to_char_offset(line, byte_pos);
+        let has_type_at_needle = tokens
+            .iter()
+            .any(|(start, _, kind)| *kind == 1 && *start == needle_start);
+        assert!(
+            has_type_at_needle,
+            "TYPE token must fire inside `${{...}}` expression position; \
+             tokens: {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn region_walker_fires_inside_interpolation_expression() {
+        use carina_core::schema::CompletionValue;
+        let regions = vec![CompletionValue::new(
+            "aws.Region.us_east_1",
+            "US East (N. Virginia)",
+        )];
+        let provider = SemanticTokensProvider::new(&regions);
+        let line = "msg = \"region=${aws.Region.us_east_1}\"";
+        let tokens = provider.tokenize_line(line, 0);
+        let byte_pos = line
+            .find("aws.Region.us_east_1")
+            .expect("needle not in line");
+        let needle_start = position::byte_offset_to_char_offset(line, byte_pos);
+        let has_type_at_needle = tokens
+            .iter()
+            .any(|(start, _, kind)| *kind == 1 && *start == needle_start);
+        assert!(
+            has_type_at_needle,
+            "region TYPE token must fire inside `${{...}}` expression \
+             position; tokens: {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn type_walker_fires_outside_strings() {
+        // Sanity check: the existing behavior — TYPE on bare resource type
+        // — still works after the refactor.
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize_line("aws.ec2.Vpc {", 0);
+        let has_type_at_zero = tokens
+            .iter()
+            .any(|(start, len, kind)| *start == 0 && *len == 11 && *kind == 1);
+        assert!(
+            has_type_at_zero,
+            "TYPE token must still fire on bare resource type; tokens: {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn type_walker_skips_string_but_fires_after_it() {
+        // `tag = "aws.ec2.Vpc" :: aws.ec2.Vpc` — the second occurrence is
+        // bare code and should be tagged TYPE; the first is inside a
+        // string body and must not.
+        // Note: this is contrived; real DSL doesn't have `::` outside
+        // strings. We use a comma to produce a code-position second
+        // occurrence.
+        let provider = SemanticTokensProvider::new(&[]);
+        let line = "x = \"see aws.ec2.Vpc\", aws.ec2.Vpc";
+        let tokens = provider.tokenize_line(line, 0);
+        // First occurrence is inside the string; its char range overlaps
+        // with the string body. Second occurrence is bare code.
+        let first_byte = line.find("aws.ec2.Vpc").unwrap();
+        let second_byte = line.rfind("aws.ec2.Vpc").unwrap();
+        assert_ne!(first_byte, second_byte);
+        let first_char = position::byte_offset_to_char_offset(line, first_byte);
+        let second_char = position::byte_offset_to_char_offset(line, second_byte);
+        let type_starts: Vec<u32> = tokens
+            .iter()
+            .filter(|(_, _, k)| *k == 1)
+            .map(|(s, _, _)| *s)
+            .collect();
+        assert!(
+            !type_starts.contains(&first_char),
+            "TYPE must not fire inside string body at char {first_char}; \
+             starts: {type_starts:?}"
+        );
+        assert!(
+            type_starts.contains(&second_char),
+            "TYPE must fire on bare code at char {second_char}; \
+             starts: {type_starts:?}"
+        );
+    }
+
+    #[test]
+    fn type_walker_fires_inside_unclosed_interpolation() {
+        // `x = "foo ${aws.ec2.Vpc` — line ends inside `${...`. The
+        // expression body still contains a resource type and must be
+        // tagged as TYPE; the trailing chars of the unclosed
+        // interpolation must not be silently swallowed into StringBody.
+        let provider = SemanticTokensProvider::new(&[]);
+        let line = "x = \"foo ${aws.ec2.Vpc";
+        let tokens = provider.tokenize_line(line, 0);
+        let byte_pos = line.find("aws.ec2.Vpc").expect("needle not in line");
+        let needle_start = position::byte_offset_to_char_offset(line, byte_pos);
+        let has_type_at_needle = tokens
+            .iter()
+            .any(|(start, len, kind)| *kind == 1 && *start == needle_start && *len == 11);
+        assert!(
+            has_type_at_needle,
+            "TYPE must fire on full identifier inside unclosed `${{`; \
+             tokens: {tokens:?}"
         );
     }
 }
