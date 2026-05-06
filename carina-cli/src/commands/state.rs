@@ -766,6 +766,7 @@ pub(crate) async fn run_state_refresh_locked(
     if !parsed.export_params.is_empty() {
         state.exports = crate::commands::shared::state_writeback::resolve_exports(
             &parsed.export_params,
+            &sorted_resources,
             &state,
         )?;
     }

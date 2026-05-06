@@ -283,7 +283,7 @@ pub(crate) async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), 
 
     // Resolve exports and persist to state
     if !input.export_params.is_empty() {
-        let exports = resolve_exports(input.export_params, &state)?;
+        let exports = resolve_exports(input.export_params, input.sorted_resources, &state)?;
         state.exports = exports;
     }
 
@@ -336,10 +336,11 @@ pub(crate) async fn persist_exports_only(
     backend: &dyn StateBackend,
     lock: Option<&LockInfo>,
     state_file: Option<StateFile>,
+    sorted_resources: &[Resource],
     export_params: &[carina_core::parser::InferredExportParam],
 ) -> Result<(), AppError> {
     let mut state = state_file.unwrap_or_default();
-    let exports = resolve_exports(export_params, &state)?;
+    let exports = resolve_exports(export_params, sorted_resources, &state)?;
     state.exports = exports;
     if let Some(lk) = lock {
         save_state_locked(backend, lk, &mut state).await?;
@@ -1034,7 +1035,14 @@ async fn run_apply_locked(
             )
             .cyan()
         );
-        persist_exports_only(backend, lock, state_file, &parsed.export_params).await?;
+        persist_exports_only(
+            backend,
+            lock,
+            state_file,
+            &sorted_resources,
+            &parsed.export_params,
+        )
+        .await?;
         return Ok(());
     }
 
