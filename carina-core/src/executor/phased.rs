@@ -129,6 +129,13 @@ pub(super) fn topological_sort_replaces(
 ///
 /// Only considers dependencies between effects in the given subset. Dependencies
 /// on effects outside the subset are ignored (assumed already completed).
+///
+/// `Virtual` resources (the synthetic bindings module calls expose for their
+/// `attributes { }` block) have no Effect and would be invisible to a direct
+/// `binding -> effect index` lookup. To preserve the dependency edge from a
+/// caller through a module's attribute to the underlying resource, virtual
+/// bindings are expanded transitively into the resource bindings their own
+/// attributes reference (#2543).
 pub(super) fn build_phase_dependency_map(
     effects: &[Effect],
     phase_indices: &[usize],
@@ -143,33 +150,98 @@ pub(super) fn build_phase_dependency_map(
         }
     }
 
+    let resolver = DepResolver::new(&binding_to_idx, unresolved_resources, Some(&phase_set));
+
     let mut deps_of: HashMap<usize, HashSet<usize>> = HashMap::new();
     for &idx in phase_indices {
         let mut dep_indices = HashSet::new();
         let effect = &effects[idx];
         if let Some(resource) = effect.resource() {
-            let dep_bindings = get_resource_dependencies(resource);
-            for dep_binding in &dep_bindings {
-                if let Some(&dep_idx) = binding_to_idx.get(dep_binding)
-                    && phase_set.contains(&dep_idx)
-                {
-                    dep_indices.insert(dep_idx);
-                }
-            }
+            resolver.collect_from_resource(resource, &mut dep_indices);
             if let Some(unresolved) = unresolved_resources.get(effect.resource_id()) {
-                let unresolved_deps = get_resource_dependencies(unresolved);
-                for dep_binding in &unresolved_deps {
-                    if let Some(&dep_idx) = binding_to_idx.get(dep_binding)
-                        && phase_set.contains(&dep_idx)
-                    {
-                        dep_indices.insert(dep_idx);
-                    }
-                }
+                resolver.collect_from_resource(unresolved, &mut dep_indices);
             }
         }
         deps_of.insert(idx, dep_indices);
     }
     deps_of
+}
+
+/// Resolve binding-name dependencies to the effect indices they reach,
+/// expanding any [`ResourceKind::Virtual`] proxy bindings transparently
+/// through their own attribute references (#2543).
+pub(super) struct DepResolver<'a> {
+    binding_to_idx: &'a HashMap<String, usize>,
+    binding_to_resource: HashMap<&'a str, &'a Resource>,
+    /// `Some` filters output indices to those in the phase; `None` retains
+    /// every reachable index.
+    phase_set: Option<&'a HashSet<usize>>,
+}
+
+impl<'a> DepResolver<'a> {
+    pub(super) fn new(
+        binding_to_idx: &'a HashMap<String, usize>,
+        unresolved_resources: &'a HashMap<ResourceId, Resource>,
+        phase_set: Option<&'a HashSet<usize>>,
+    ) -> Self {
+        let binding_to_resource = unresolved_resources
+            .values()
+            .filter_map(|r| r.binding.as_deref().map(|b| (b, r)))
+            .collect();
+        Self {
+            binding_to_idx,
+            binding_to_resource,
+            phase_set,
+        }
+    }
+
+    /// Walk a resource's dependencies (via `get_resource_dependencies`) and
+    /// merge the reached effect indices into `out`.
+    pub(super) fn collect_from_resource(&self, resource: &Resource, out: &mut HashSet<usize>) {
+        let dep_bindings = get_resource_dependencies(resource);
+        let mut visited: HashSet<&str> = HashSet::new();
+        for binding in &dep_bindings {
+            self.expand(binding.as_str(), out, &mut visited);
+        }
+    }
+
+    fn expand(&self, binding: &'a str, out: &mut HashSet<usize>, visited: &mut HashSet<&'a str>) {
+        if !visited.insert(binding) {
+            return;
+        }
+        if let Some(&idx) = self.binding_to_idx.get(binding) {
+            if self.phase_set.is_none_or(|s| s.contains(&idx)) {
+                out.insert(idx);
+            }
+            return;
+        }
+        // No Effect for this binding. If it's a Virtual resource (a module's
+        // attributes-block proxy), follow the references in its own attributes
+        // to the underlying resources the module exposes.
+        let Some(res) = self.binding_to_resource.get(binding) else {
+            return;
+        };
+        if !matches!(res.kind, crate::resource::ResourceKind::Virtual { .. }) {
+            return;
+        }
+        // `get_resource_dependencies` returns owned `String`s, but the
+        // visit set borrows from this resolver's keys to avoid per-binding
+        // allocation. Re-borrow each inner binding from the
+        // `binding_to_resource` / `binding_to_idx` keys so the borrow lifetime
+        // matches `'a`.
+        for inner in get_resource_dependencies(res) {
+            let key: &'a str =
+                if let Some((k, _)) = self.binding_to_resource.get_key_value(inner.as_str()) {
+                    k
+                } else if let Some((k, _)) = self.binding_to_idx.get_key_value(inner.as_str()) {
+                    k.as_str()
+                } else {
+                    // Unknown binding: not in the resource graph, skip.
+                    continue;
+                };
+            self.expand(key, out, visited);
+        }
+    }
 }
 
 /// Result of a phased effect operation within a single phase.
@@ -679,28 +751,19 @@ pub(super) async fn execute_effects_phased(
                 binding_to_idx.insert(binding, idx);
             }
         }
+        let resolver = DepResolver::new(
+            &binding_to_idx,
+            input.unresolved_resources,
+            Some(&phase_set),
+        );
         let mut deps_of: HashMap<usize, HashSet<usize>> = HashMap::new();
         for &idx in &delete_indices {
             let effect = &effects[idx];
             let mut dep_indices = HashSet::new();
             if let Some(resource) = effect.resource() {
-                let dep_bindings = get_resource_dependencies(resource);
-                for dep_binding in &dep_bindings {
-                    if let Some(&dep_idx) = binding_to_idx.get(dep_binding)
-                        && phase_set.contains(&dep_idx)
-                    {
-                        dep_indices.insert(dep_idx);
-                    }
-                }
+                resolver.collect_from_resource(resource, &mut dep_indices);
                 if let Some(unresolved) = input.unresolved_resources.get(effect.resource_id()) {
-                    let unresolved_deps = get_resource_dependencies(unresolved);
-                    for dep_binding in &unresolved_deps {
-                        if let Some(&dep_idx) = binding_to_idx.get(dep_binding)
-                            && phase_set.contains(&dep_idx)
-                        {
-                            dep_indices.insert(dep_idx);
-                        }
-                    }
+                    resolver.collect_from_resource(unresolved, &mut dep_indices);
                 }
             }
             deps_of.insert(idx, dep_indices);
@@ -1154,5 +1217,115 @@ pub(super) async fn execute_effects_phased(
         permanent_name_overrides,
         current_states: input.current_states.clone(),
         failed_refreshes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resource::{ResourceId, ResourceKind, Value};
+
+    /// Reproduces #2543: when a resource depends on `<module-instance>.<attr>`
+    /// (where the module-instance binding is a `Virtual` resource exposing the
+    /// module's `attributes { }`), the executor's phase dependency map drops
+    /// the dep silently — virtual resources have no Effect entry to look up.
+    /// The fix must follow the virtual binding through to the underlying
+    /// resource(s) it references.
+    #[test]
+    fn build_phase_dependency_map_follows_virtual_module_binding() {
+        let mut role = Resource::with_provider("awscc", "iam.Role", "bootstrap.role");
+        role.binding = Some("bootstrap.role".to_string());
+
+        let mut virt = Resource::with_provider("_virtual", "_virtual", "bootstrap");
+        virt.binding = Some("bootstrap".to_string());
+        virt.kind = ResourceKind::Virtual {
+            module_name: "github-oidc".to_string(),
+            instance: "bootstrap".to_string(),
+        };
+        // The virtual exposes `role_name = role.role_name`, which after intra-module
+        // rewriting becomes `bootstrap.role.role_name`.
+        virt.set_attr(
+            "role_name",
+            Value::resource_ref("bootstrap.role", "role_name", vec![]),
+        );
+
+        let mut role_policy = Resource::with_provider("awscc", "iam.RolePolicy", "rp");
+        role_policy.set_attr(
+            "role_name",
+            Value::resource_ref("bootstrap", "role_name", vec![]),
+        );
+
+        let effects = vec![
+            Effect::Create(role.clone()),
+            Effect::Create(role_policy.clone()),
+        ];
+        let phase_indices: Vec<usize> = vec![0, 1];
+
+        let mut unresolved: HashMap<ResourceId, Resource> = HashMap::new();
+        unresolved.insert(role.id.clone(), role.clone());
+        unresolved.insert(virt.id.clone(), virt.clone());
+        unresolved.insert(role_policy.id.clone(), role_policy.clone());
+
+        let deps_of = build_phase_dependency_map(&effects, &phase_indices, &unresolved);
+
+        assert!(
+            deps_of[&1].contains(&0),
+            "RolePolicy (idx 1) must depend on Role (idx 0) via the bootstrap virtual binding; got: {:?}",
+            deps_of[&1],
+        );
+    }
+
+    /// Module nesting: the outer caller references a virtual binding whose own
+    /// attribute references another virtual binding. The dep walk must drill
+    /// through both layers to the underlying resource.
+    #[test]
+    fn build_phase_dependency_map_follows_nested_virtual_module_bindings() {
+        let mut role = Resource::with_provider("awscc", "iam.Role", "outer.inner.role");
+        role.binding = Some("outer.inner.role".to_string());
+
+        let mut inner_virt = Resource::with_provider("_virtual", "_virtual", "outer.inner");
+        inner_virt.binding = Some("outer.inner".to_string());
+        inner_virt.kind = ResourceKind::Virtual {
+            module_name: "inner-mod".to_string(),
+            instance: "outer.inner".to_string(),
+        };
+        inner_virt.set_attr(
+            "role_name",
+            Value::resource_ref("outer.inner.role", "role_name", vec![]),
+        );
+
+        let mut outer_virt = Resource::with_provider("_virtual", "_virtual", "outer");
+        outer_virt.binding = Some("outer".to_string());
+        outer_virt.kind = ResourceKind::Virtual {
+            module_name: "outer-mod".to_string(),
+            instance: "outer".to_string(),
+        };
+        outer_virt.set_attr(
+            "role_name",
+            Value::resource_ref("outer.inner", "role_name", vec![]),
+        );
+
+        let mut caller = Resource::with_provider("awscc", "iam.RolePolicy", "rp");
+        caller.set_attr(
+            "role_name",
+            Value::resource_ref("outer", "role_name", vec![]),
+        );
+
+        let effects = vec![Effect::Create(role.clone()), Effect::Create(caller.clone())];
+        let phase_indices: Vec<usize> = vec![0, 1];
+
+        let mut unresolved: HashMap<ResourceId, Resource> = HashMap::new();
+        unresolved.insert(role.id.clone(), role);
+        unresolved.insert(inner_virt.id.clone(), inner_virt);
+        unresolved.insert(outer_virt.id.clone(), outer_virt);
+        unresolved.insert(caller.id.clone(), caller);
+
+        let deps_of = build_phase_dependency_map(&effects, &phase_indices, &unresolved);
+
+        assert!(
+            deps_of[&1].contains(&0),
+            "caller must depend on Role through two virtual layers (outer → outer.inner → outer.inner.role); got: {:?}",
+            deps_of[&1],
+        );
     }
 }
