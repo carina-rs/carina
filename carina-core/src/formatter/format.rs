@@ -1509,4 +1509,222 @@ require   port >= 1 && port <= 65535  , "port must be valid"
             first, second
         );
     }
+
+    /// #2515: A `# ...` comment that immediately precedes a repeated block
+    /// element (e.g. a second-or-later `statement {}` inside a `policy {}`)
+    /// must be preserved by `carina fmt`. Earlier the printer attached the
+    /// leading-comment trivia to the *previous* sibling's closing brace and
+    /// dropped it on emit, silently deleting the comment.
+    #[test]
+    fn test_format_preserves_comment_before_repeated_block_sibling() {
+        let input = r#"aws.s3.BucketPolicy {
+  bucket = bucket.bucket_name
+
+  policy = {
+    statement {
+      sid = 'First'
+    }
+
+    statement {
+      sid = 'Second'
+    }
+
+    # Multi-line comment
+    # explaining why this third statement exists
+    statement {
+      sid = 'Third'
+    }
+  }
+}
+"#;
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert!(
+            result.contains("# Multi-line comment"),
+            "leading comment line 1 dropped before repeated `statement` block, got:\n{result}"
+        );
+        assert!(
+            result.contains("# explaining why this third statement exists"),
+            "leading comment line 2 dropped before repeated `statement` block, got:\n{result}"
+        );
+
+        let second = format(&result, &config).unwrap();
+        assert_eq!(
+            result, second,
+            "fmt with comments before a repeated block sibling must be idempotent"
+        );
+    }
+
+    /// #2515 sibling case: comment before a `MapEntry` (key = value) inside
+    /// a parent map is also preserved, not just before nested blocks.
+    #[test]
+    fn test_format_preserves_comment_before_map_entry_sibling() {
+        let input = r#"aws.s3.BucketPolicy {
+  bucket = bucket.bucket_name
+
+  policy = {
+    version = '2012-10-17'
+
+    # leading comment for the second map entry
+    id      = 'PolicyId'
+  }
+}
+"#;
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert!(
+            result.contains("# leading comment for the second map entry"),
+            "leading comment dropped before MapEntry sibling, got:\n{result}"
+        );
+        let second = format(&result, &config).unwrap();
+        assert_eq!(result, second, "must be idempotent");
+    }
+
+    /// #2515 sibling case: a map that contains *only* a comment (no
+    /// MapEntry/NestedBlock children) must round-trip without losing the
+    /// comment. Earlier the empty-items short-circuit emitted `{}` and
+    /// silently dropped the comment.
+    #[test]
+    fn test_format_preserves_comment_only_map() {
+        let input = r#"aws.s3.BucketPolicy {
+  policy = {
+    # placeholder — fill in once the upstream account ID is finalized
+  }
+}
+"#;
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        // Assert the indented multi-line shape, not just substring presence,
+        // so that emitting `{ # comment }` on one line would also fail.
+        assert!(
+            result.contains(
+                "policy = {\n    # placeholder — fill in once the upstream account ID is finalized\n  }"
+            ),
+            "comment-only map dropped its comment or collapsed onto one line, got:\n{result}"
+        );
+        let second = format(&result, &config).unwrap();
+        assert_eq!(result, second, "must be idempotent");
+    }
+
+    /// #2515: a blank line between the last sibling and a trailing
+    /// comment must round-trip — losing it silently flattens visual
+    /// grouping.
+    #[test]
+    fn test_format_preserves_blank_line_before_trailing_comment() {
+        let input = r#"aws.s3.BucketPolicy {
+  policy = {
+    statement {
+      sid = 'Only'
+    }
+
+    # this comment is visually separated from the statement above
+  }
+}
+"#;
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert!(
+            result.contains("}\n\n    # this comment is visually separated"),
+            "blank line between last item and trailing comment lost, got:\n{result}"
+        );
+        let second = format(&result, &config).unwrap();
+        assert_eq!(result, second, "must be idempotent");
+    }
+
+    /// #2515: a comment after the last sibling but before the closing `}`
+    /// (a trailing-block comment, e.g. an explanatory note about the
+    /// section as a whole) must round-trip.
+    #[test]
+    fn test_format_preserves_trailing_comment_before_close() {
+        let input = r#"aws.s3.BucketPolicy {
+  policy = {
+    statement {
+      sid = 'Only'
+    }
+    # TODO: add a second statement covering ListBucket once the
+    # downstream consumers are confirmed.
+  }
+}
+"#;
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert!(
+            result.contains("# TODO: add a second statement covering ListBucket once the"),
+            "trailing comment before `}}` dropped, got:\n{result}"
+        );
+        assert!(
+            result.contains("# downstream consumers are confirmed."),
+            "second line of trailing comment dropped, got:\n{result}"
+        );
+        let second = format(&result, &config).unwrap();
+        assert_eq!(result, second, "must be idempotent");
+    }
+
+    /// #2515 audit: comment before a nested-block sibling at the
+    /// top level of a resource block (not inside a map). This path
+    /// goes through `format_block_attributes`, not `format_map`,
+    /// so it would catch a sibling regression in that handler.
+    #[test]
+    fn test_format_preserves_comment_before_resource_nested_block_sibling() {
+        let input = r#"awscc.ec2.SecurityGroup {
+  vpc_id = 'vpc-123'
+
+  security_group_ingress {
+    ip_protocol = 'tcp'
+    from_port   = 80
+    to_port     = 80
+  }
+
+  # SSH from the bastion-host VPC only — the wider 0.0.0.0/0 rule was
+  # removed in #1234 after the audit findings.
+  security_group_ingress {
+    ip_protocol = 'tcp'
+    from_port   = 22
+    to_port     = 22
+  }
+}
+"#;
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert!(
+            result.contains("# SSH from the bastion-host VPC only"),
+            "comment before nested-block sibling at resource level dropped, got:\n{result}"
+        );
+        assert!(
+            result.contains("# removed in #1234 after the audit findings."),
+            "second line of comment block dropped, got:\n{result}"
+        );
+        let second = format(&result, &config).unwrap();
+        assert_eq!(result, second, "must be idempotent");
+    }
+
+    /// #2515: blank line between map siblings must also survive (otherwise
+    /// the visual grouping in the source is silently flattened).
+    #[test]
+    fn test_format_preserves_blank_line_between_map_siblings() {
+        let input = r#"aws.s3.BucketPolicy {
+  bucket = bucket.bucket_name
+
+  policy = {
+    statement {
+      sid = 'First'
+    }
+
+    statement {
+      sid = 'Second'
+    }
+  }
+}
+"#;
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        // Two consecutive `statement` blocks separated by a blank line in
+        // the source must remain separated after fmt.
+        assert!(
+            result.contains("}\n\n    statement {"),
+            "blank line between sibling `statement` blocks dropped, got:\n{result}"
+        );
+        let second = format(&result, &config).unwrap();
+        assert_eq!(result, second, "must be idempotent");
+    }
 }
