@@ -1,0 +1,14 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  + awscc.iam.Role bootstrap.role
+      role_name: "carina-bootstrap"
+        │
+        └─ + awscc.iam.RolePolicy 
+              policy_name: "inline"
+              role_name: "carina-bootstrap"
+
+Plan: 2 to add, 0 to change, 0 to destroy.

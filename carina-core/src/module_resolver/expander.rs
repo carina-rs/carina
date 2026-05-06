@@ -6,7 +6,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use indexmap::IndexMap;
 
 use crate::parser::ModuleCall;
-use crate::resource::{LifecycleConfig, Resource, ResourceId, ResourceKind, Value};
+use crate::resource::{LifecycleConfig, Resource, ResourceId, ResourceKind, ResourceName, Value};
 
 use super::error::ModuleError;
 use super::resolver::ModuleResolver;
@@ -151,13 +151,19 @@ impl ModuleResolver<'_> {
         for resource in &module.resources {
             let mut new_resource = resource.clone();
 
-            // Prefix the resource name with instance path (dot-separated)
-            let new_name = format!("{}.{}", instance_prefix, new_resource.id.name_str());
-            new_resource.id = ResourceId::with_provider(
-                &new_resource.id.provider,
-                &new_resource.id.resource_type,
-                new_name.clone(),
-            );
+            // Only Bound names take the prefix here. Pending names stay
+            // Pending so `compute_anonymous_identifiers` can later attach
+            // both the hash and the instance prefix in one shot — see
+            // `identifier::compute_anonymous_identifiers` for the full
+            // story (#2516).
+            if let ResourceName::Bound(name) = &new_resource.id.name {
+                let new_name = format!("{}.{}", instance_prefix, name);
+                new_resource.id = ResourceId::with_provider(
+                    &new_resource.id.provider,
+                    &new_resource.id.resource_type,
+                    new_name,
+                );
+            }
 
             // Rewrite binding with instance path (dot-separated)
             if let Some(ref binding) = new_resource.binding {

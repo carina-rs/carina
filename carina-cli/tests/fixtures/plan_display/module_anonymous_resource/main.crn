@@ -1,0 +1,12 @@
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let github = use {
+  source = './oidc-module'
+}
+
+let bootstrap = github {
+  github_repo = 'carina-rs/infra'
+  role_name   = 'carina-bootstrap'
+}

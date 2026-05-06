@@ -61,6 +61,27 @@ fn snapshot_all_create() {
     insta::assert_snapshot!(output);
 }
 
+/// Locks in the no-trailing-dot regression from #2516. The hash-with-
+/// instance-prefix path is covered by the unit tests in
+/// `carina-core/src/identifier/tests.rs`; fixture mode skips the hash
+/// step (no schemas), so the rendered name is empty rather than
+/// `bootstrap.<hash>` — the value of this snapshot is asserting that
+/// the anonymous resource is *not* rendered as `bootstrap.`.
+#[test]
+fn snapshot_module_anonymous_resource() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("module_anonymous_resource");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+    ));
+    insta::assert_snapshot!(output);
+}
+
 #[test]
 fn snapshot_policy_pretty() {
     let (plan, schemas, _moved) = build_plan_from_fixture("policy_pretty");

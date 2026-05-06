@@ -106,6 +106,89 @@ fn test_substitute_arguments_nested() {
     }
 }
 
+/// Module containing one anonymous resource (`id.name` is `Pending`,
+/// no `let` binding). Used to verify that expansion preserves
+/// `Pending` rather than collapsing it to `Bound("<instance>.")` —
+/// a `Bound` value with a trailing dot would slip past
+/// `compute_anonymous_identifiers`'s `is_pending` filter and never
+/// receive its hash-derived suffix (#2516).
+fn create_test_module_with_anonymous_resource() -> ParsedFile {
+    ParsedFile {
+        providers: vec![],
+        resources: vec![Resource {
+            id: ResourceId::with_provider("awscc", "iam.RolePolicy", ""),
+            attributes: {
+                let mut attrs = IndexMap::new();
+                attrs.insert(
+                    "policy_name".to_string(),
+                    Value::String("inline".to_string()),
+                );
+                attrs
+            },
+            kind: ResourceKind::Managed,
+            lifecycle: LifecycleConfig::default(),
+            prefixes: HashMap::new(),
+            binding: None,
+            dependency_bindings: BTreeSet::new(),
+            module_source: None,
+            quoted_string_attrs: std::collections::HashSet::new(),
+        }],
+        variables: IndexMap::new(),
+        uses: vec![],
+        module_calls: vec![],
+        arguments: vec![],
+        attribute_params: vec![],
+        export_params: vec![],
+        backend: None,
+        state_blocks: vec![],
+        user_functions: HashMap::new(),
+        upstream_states: vec![],
+        requires: vec![],
+        structural_bindings: HashSet::new(),
+        warnings: vec![],
+        deferred_for_expressions: vec![],
+    }
+}
+
+#[test]
+fn test_expand_anonymous_resource_in_named_module_keeps_name_pending() {
+    use crate::resource::ResourceName;
+
+    let resolver = {
+        let mut r = ModuleResolver::new(".");
+        r.imported_modules.insert(
+            "policy_module".to_string(),
+            create_test_module_with_anonymous_resource(),
+        );
+        r
+    };
+    let call = ModuleCall {
+        module_name: "policy_module".to_string(),
+        binding_name: Some("bootstrap".to_string()),
+        arguments: HashMap::new(),
+    };
+
+    let expanded = resolver.expand_module_call(&call, "bootstrap").unwrap();
+    assert_eq!(expanded.len(), 1);
+    let policy = &expanded[0];
+    assert!(
+        matches!(policy.id.name, ResourceName::Pending),
+        "anonymous resource inside a module instance must remain Pending after expansion \
+         (compute_anonymous_identifiers filters on Pending and would skip a Bound value); \
+         got {:?}",
+        policy.id.name,
+    );
+    assert_eq!(
+        policy.module_source,
+        Some(crate::resource::ModuleSource::Module {
+            name: "policy_module".to_string(),
+            instance: "bootstrap".to_string(),
+        }),
+        "module_source must be set so compute_anonymous_identifiers can prepend \
+         the instance prefix when the Pending name is bound"
+    );
+}
+
 #[test]
 fn test_expand_module_call() {
     let resolver = {
