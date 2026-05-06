@@ -63,6 +63,15 @@ pub enum InferenceError {
     /// Could not look up the binding's resource schema (provider
     /// not loaded, etc.).
     SchemaUnavailable { binding: String },
+    /// Inference re-entered a `Virtual` binding it was already
+    /// resolving — a cycle in the module-call attribute graph. Today
+    /// the parser and module resolver reject module-of-module cycles,
+    /// so this is reachable only via hand-constructed bindings or a
+    /// future refactor that breaks that invariant; the variant is the
+    /// inferer's defense in depth (#2497). `cycle` records the
+    /// binding-name path in the order they were entered, so the
+    /// diagnostic can name which bindings closed the loop.
+    CyclicVirtualBinding { cycle: Vec<String> },
 }
 
 impl std::fmt::Display for InferenceError {
@@ -83,6 +92,9 @@ impl std::fmt::Display for InferenceError {
             }
             InferenceError::SchemaUnavailable { binding } => {
                 write!(f, "no schema available for binding `{}`", binding)
+            }
+            InferenceError::CyclicVirtualBinding { cycle } => {
+                write!(f, "cyclic virtual binding chain: {}", cycle.join(" -> "))
             }
         }
     }
@@ -259,6 +271,24 @@ pub fn infer_type_from_value(
     bindings: &InferenceBindings,
     schemas: &SchemaRegistry,
 ) -> Result<TypeExpr, InferenceError> {
+    let mut visiting = indexmap::IndexSet::new();
+    infer_type_from_value_with_visiting(value, bindings, schemas, &mut visiting)
+}
+
+/// Internal core of [`infer_type_from_value`] threading the
+/// currently-being-resolved `Virtual` binding chain through the
+/// recursive calls. Cycle detection lives on the `Virtual` arm of
+/// [`infer_resource_ref_with_visiting`] (#2497); every other arm just
+/// forwards the set unchanged. The set is scope-popped when each
+/// `Virtual` recursion returns, so unrelated sibling traversals (two
+/// list elements that each resolve through different `Virtual`
+/// bindings) do not see each other.
+fn infer_type_from_value_with_visiting(
+    value: &Value,
+    bindings: &InferenceBindings,
+    schemas: &SchemaRegistry,
+    visiting: &mut indexmap::IndexSet<String>,
+) -> Result<TypeExpr, InferenceError> {
     match value {
         Value::String(_) => Ok(TypeExpr::String),
         Value::Int(_) => Ok(TypeExpr::Int),
@@ -266,15 +296,18 @@ pub fn infer_type_from_value(
         Value::Bool(_) => Ok(TypeExpr::Bool),
         Value::Interpolation(_) => Ok(TypeExpr::String),
         Value::Secret(_) => Ok(TypeExpr::String),
-        Value::List(items) => infer_collection(items, bindings, schemas, TypeExpr::List),
-        Value::Map(entries) => infer_collection(entries.values(), bindings, schemas, TypeExpr::Map),
-        Value::ResourceRef { path } => infer_resource_ref(
+        Value::List(items) => infer_collection(items, bindings, schemas, visiting, TypeExpr::List),
+        Value::Map(entries) => {
+            infer_collection(entries.values(), bindings, schemas, visiting, TypeExpr::Map)
+        }
+        Value::ResourceRef { path } => infer_resource_ref_with_visiting(
             path.binding(),
             path.attribute(),
             path.field_path(),
             path.subscripts(),
             bindings,
             schemas,
+            visiting,
         ),
         Value::FunctionCall { name, .. } => infer_function_call(name),
         Value::Unknown(_) => Err(InferenceError::UnknownType {
@@ -287,6 +320,7 @@ fn infer_collection<'a, I, F>(
     items: I,
     bindings: &InferenceBindings,
     schemas: &SchemaRegistry,
+    visiting: &mut indexmap::IndexSet<String>,
     wrap: F,
 ) -> Result<TypeExpr, InferenceError>
 where
@@ -303,7 +337,7 @@ where
     // can add an explicit annotation to the export.
     let mut iter = items.into_iter();
     let first = match iter.next() {
-        Some(v) => infer_type_from_value(v, bindings, schemas)?,
+        Some(v) => infer_type_from_value_with_visiting(v, bindings, schemas, visiting)?,
         None => {
             return Err(InferenceError::UnknownType {
                 reason: "empty collection — element type cannot be inferred".to_string(),
@@ -311,7 +345,7 @@ where
         }
     };
     for next in iter {
-        let next_type = infer_type_from_value(next, bindings, schemas)?;
+        let next_type = infer_type_from_value_with_visiting(next, bindings, schemas, visiting)?;
         if next_type != first {
             return Err(InferenceError::HeterogeneousCollection {
                 reason: format!(
@@ -324,13 +358,14 @@ where
     Ok(wrap(Box::new(first)))
 }
 
-fn infer_resource_ref(
+fn infer_resource_ref_with_visiting(
     binding: &str,
     attribute: &str,
     field_path: &[String],
     subscripts: &[crate::resource::Subscript],
     bindings: &InferenceBindings,
     schemas: &SchemaRegistry,
+    visiting: &mut indexmap::IndexSet<String>,
 ) -> Result<TypeExpr, InferenceError> {
     let target = match bindings.get(binding) {
         Some(InferenceBinding::Resource {
@@ -347,6 +382,7 @@ fn infer_resource_ref(
             // `attributes { ... }` projections directly. Recurse on the
             // bound expression so the type flows transitively through
             // the inner resource's schema. #2493.
+            //
             let inner =
                 attributes
                     .get(attribute)
@@ -354,7 +390,26 @@ fn infer_resource_ref(
                         binding: binding.to_string(),
                         attribute: attribute.to_string(),
                     })?;
-            let inner_type = infer_type_from_value(inner, bindings, schemas)?;
+            // #2497: register the binding in `visiting` before the
+            // recursive descend; on a cycle (`a -> b -> a`) the second
+            // entry's `insert` returns `false` and we surface the
+            // chain as a `CyclicVirtualBinding` diagnostic instead of
+            // looping until stack exhaustion. Pop the binding back off
+            // once the recursion returns so unrelated sibling subtrees
+            // (e.g. two list elements that each resolve through
+            // different `Virtual` bindings) do not see each other.
+            // Use `shift_remove` (not `swap_remove`) so the cycle
+            // diagnostic preserves entry order if the next traversal
+            // re-enters after this pop.
+            if !visiting.insert(binding.to_string()) {
+                let mut cycle: Vec<String> = visiting.iter().cloned().collect();
+                cycle.push(binding.to_string());
+                return Err(InferenceError::CyclicVirtualBinding { cycle });
+            }
+            let inner_type_result =
+                infer_type_from_value_with_visiting(inner, bindings, schemas, visiting);
+            visiting.shift_remove(binding);
+            let inner_type = inner_type_result?;
             return super::narrow_type_expr(&inner_type, field_path, subscripts).ok_or_else(|| {
                 InferenceError::UnknownAttribute {
                     binding: binding.to_string(),
@@ -1324,5 +1379,123 @@ mod tests {
         let (inferred, errors) = apply_inference(parsed, &SchemaRegistry::new());
         assert!(errors.is_empty());
         assert_eq!(inferred.export_params[0].type_expr, TypeExpr::Unknown);
+    }
+
+    /// Convenience for the `Virtual`-binding cycle tests below.
+    fn virtual_binding(attrs: &[(&str, Value)]) -> InferenceBinding {
+        let mut map = indexmap::IndexMap::new();
+        for (k, v) in attrs {
+            map.insert((*k).to_string(), v.clone());
+        }
+        InferenceBinding::Virtual { attributes: map }
+    }
+
+    #[test]
+    fn virtual_binding_two_node_cycle_reports_cycle_path() {
+        // #2497: a synthetic 2-binding `Virtual` cycle (`a.x -> b.y ->
+        // a.x`) must be detected as a cycle and surface the chain in
+        // the diagnostic, not loop until stack exhaustion. Parser and
+        // module resolver reject module-of-module cycles in practice,
+        // so this shape is reachable today only via hand-constructed
+        // bindings (or a future refactor that breaks the no-cycle
+        // invariant); the inferer's defense in depth is what this test
+        // pins.
+        let mut bindings = InferenceBindings::new();
+        bindings.insert(
+            "a".to_string(),
+            virtual_binding(&[(
+                "x",
+                Value::resource_ref("b".to_string(), "y".to_string(), vec![]),
+            )]),
+        );
+        bindings.insert(
+            "b".to_string(),
+            virtual_binding(&[(
+                "y",
+                Value::resource_ref("a".to_string(), "x".to_string(), vec![]),
+            )]),
+        );
+
+        let entry = Value::resource_ref("a".to_string(), "x".to_string(), vec![]);
+        let r = infer_type_from_value(&entry, &bindings, &SchemaRegistry::new());
+        match r {
+            Err(InferenceError::CyclicVirtualBinding { cycle }) => {
+                assert_eq!(
+                    cycle,
+                    vec!["a".to_string(), "b".to_string(), "a".to_string()],
+                    "cycle must record entry order with the closing binding repeated"
+                );
+                assert_eq!(
+                    cycle.first(),
+                    cycle.last(),
+                    "first and last entries must match for the cycle to be visually obvious"
+                );
+            }
+            other => panic!(
+                "expected CyclicVirtualBinding error for 2-binding Virtual cycle, got: {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn virtual_binding_self_cycle_reports_cycle_path() {
+        // #2497 edge case: a 1-binding self-referential `Virtual`
+        // (`a.x -> a.x`) must also surface as a cycle, not loop. The
+        // visited-set must register the binding at entry, before the
+        // recursive descend.
+        let mut bindings = InferenceBindings::new();
+        bindings.insert(
+            "a".to_string(),
+            virtual_binding(&[(
+                "x",
+                Value::resource_ref("a".to_string(), "x".to_string(), vec![]),
+            )]),
+        );
+
+        let entry = Value::resource_ref("a".to_string(), "x".to_string(), vec![]);
+        let r = infer_type_from_value(&entry, &bindings, &SchemaRegistry::new());
+        match r {
+            Err(InferenceError::CyclicVirtualBinding { cycle }) => {
+                assert_eq!(
+                    cycle,
+                    vec!["a".to_string(), "a".to_string()],
+                    "self-cycle must record the binding twice (entry + closure)"
+                );
+            }
+            other => panic!("expected CyclicVirtualBinding error for self-cycle, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn virtual_binding_two_unrelated_visits_do_not_false_positive() {
+        // Defensive: visiting `a` and then (after returning) visiting
+        // `b` from a sibling collection element must NOT trip the cycle
+        // guard. Pins that the visited-set is scope-popped between
+        // sibling subtrees rather than accumulating across unrelated
+        // traversals — a naive `&mut HashSet` that only ever grows
+        // would surface a false-positive cycle here.
+        let mut bindings = InferenceBindings::new();
+        bindings.insert(
+            "a".to_string(),
+            virtual_binding(&[("x", Value::String("hi".to_string()))]),
+        );
+        bindings.insert(
+            "b".to_string(),
+            virtual_binding(&[("y", Value::String("there".to_string()))]),
+        );
+
+        // List of two refs to *different* Virtual bindings. After the
+        // first ref returns, the visited-set must no longer contain `a`
+        // when the second ref descends into `b`.
+        let entries = Value::List(vec![
+            Value::resource_ref("a".to_string(), "x".to_string(), vec![]),
+            Value::resource_ref("b".to_string(), "y".to_string(), vec![]),
+        ]);
+        let r = infer_type_from_value(&entries, &bindings, &SchemaRegistry::new());
+        assert_eq!(
+            r,
+            Ok(TypeExpr::List(Box::new(TypeExpr::String))),
+            "sibling Virtual visits must not trigger a false cycle"
+        );
     }
 }
