@@ -67,14 +67,28 @@ fn test_resource_state_protected() {
 
 #[test]
 fn test_resource_state_managed_state_bucket_shape() {
-    // The seed produced for backend-owned state buckets must carry
-    // identifier, the bucket attribute, and the protected flag.
-    // Missing identifier reproduces #2533 (BucketAlreadyOwnedByYou).
-    let resource = ResourceState::managed_state_bucket("aws", "s3.Bucket", "my-state-bucket");
+    // The seed must use the desired resource's resolved anonymous identifier
+    // as `name` (so the differ matches the seed against the desired resource)
+    // AND set the AWS bucket name as `identifier`. Conflating the two
+    // reproduces #2533: phantom Delete on the seed's name plus phantom
+    // Create on the desired's name.
+    let resource = ResourceState::managed_state_bucket(
+        "aws",
+        "s3.Bucket",
+        "aws_s3_bucket_a3f2b1c8",
+        "my-state-bucket",
+    );
     assert_eq!(resource.provider, "aws");
     assert_eq!(resource.resource_type, "s3.Bucket");
-    assert_eq!(resource.name, "my-state-bucket");
-    assert_eq!(resource.identifier.as_deref(), Some("my-state-bucket"));
+    assert_eq!(
+        resource.name, "aws_s3_bucket_a3f2b1c8",
+        "name must match the desired resource's anonymous identifier"
+    );
+    assert_eq!(
+        resource.identifier.as_deref(),
+        Some("my-state-bucket"),
+        "identifier must be the AWS bucket name so the provider can Read/Update it"
+    );
     assert!(resource.protected);
     assert_eq!(
         resource.attributes.get("bucket"),
@@ -84,10 +98,15 @@ fn test_resource_state_managed_state_bucket_shape() {
 
 #[test]
 fn test_state_file_with_managed_state_bucket_contains_one_resource() {
-    let state = StateFile::with_managed_state_bucket("aws", "s3.Bucket", "my-state-bucket");
+    let state = StateFile::with_managed_state_bucket(
+        "aws",
+        "s3.Bucket",
+        "aws_s3_bucket_a3f2b1c8",
+        "my-state-bucket",
+    );
     assert_eq!(state.resources.len(), 1);
     let bucket = &state.resources[0];
-    assert_eq!(bucket.name, "my-state-bucket");
+    assert_eq!(bucket.name, "aws_s3_bucket_a3f2b1c8");
     assert_eq!(bucket.identifier.as_deref(), Some("my-state-bucket"));
     assert!(bucket.protected);
 }

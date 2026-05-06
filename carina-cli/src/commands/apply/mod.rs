@@ -12,7 +12,6 @@ use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
 use carina_core::effect::Effect;
 use carina_core::executor::{ExecutionInput, ExecutionResult};
-use carina_core::module_resolver;
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
 use carina_core::resolver::resolve_refs_with_state_and_remote;
@@ -45,7 +44,7 @@ use crate::wiring::{
     WiringContext, build_factories_from_providers, create_providers_from_configs,
     get_provider_with_ctx, read_data_source_with_retry, read_with_retry,
     reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
-    resolve_data_source_refs_for_refresh, resolve_names_with_ctx,
+    resolve_data_source_refs_for_refresh,
 };
 
 /// Re-export ExecutionResult as the public API for apply results.
@@ -598,12 +597,46 @@ pub async fn run_apply(
                         target_file.display()
                     );
 
+                    // Re-parse and re-resolve the updated configuration so the
+                    // bucket resource is fully addressed (in particular: its
+                    // anonymous identifier is computed) before we seed state.
+                    // Without this, the seed can't use the resolved name and
+                    // the differ produces phantom Create + Delete entries on
+                    // the next plan (#2533). `skip_resource_validation = true`
+                    // reuses the heavier preflight pipeline only for its
+                    // resolve+anon-id steps; the schema validation already
+                    // ran on the pre-injection configuration.
+                    parsed = load_configuration_with_config(
+                        path,
+                        provider_context,
+                        &carina_core::schema::SchemaRegistry::new(),
+                    )?
+                    .parsed;
+                    validate_and_resolve_with_config(&mut parsed, base_dir, true)?;
+
                     let backend_resource_type = backend
                         .resource_type()
                         .ok_or("Backend does not specify a resource type")?;
+                    let bucket_resource_name = parsed
+                        .find_resource_by_attr(backend_resource_type, "bucket", &bucket_name)
+                        .map(|r| r.id.name_str().to_string())
+                        .ok_or_else(|| {
+                            format!(
+                                "Auto-injected state bucket resource '{}' not found after re-parse",
+                                bucket_name
+                            )
+                        })?;
+                    if bucket_resource_name.is_empty() {
+                        return Err(AppError::Config(format!(
+                            "Auto-injected state bucket resource '{}' has no resolved name; \
+                             anonymous identifier computation may have silently skipped it",
+                            bucket_name
+                        )));
+                    }
                     let initial_state = StateFile::with_managed_state_bucket(
                         backend_provider_name,
                         backend_resource_type,
+                        bucket_resource_name,
                         &bucket_name,
                     );
                     backend
@@ -614,25 +647,6 @@ pub async fn run_apply(
                         "  {} Registered state bucket as protected resource",
                         "✓".green()
                     );
-
-                    // Re-parse the updated configuration to include the new resource
-                    parsed = load_configuration_with_config(
-                        path,
-                        provider_context,
-                        &carina_core::schema::SchemaRegistry::new(),
-                    )?
-                    .parsed;
-                    if let Err(e) = module_resolver::resolve_modules_with_config(
-                        &mut parsed,
-                        get_base_dir(path),
-                        provider_context,
-                    ) {
-                        return Err(AppError::Config(format!("Module resolution error: {}", e)));
-                    }
-                    let name_errors = resolve_names_with_ctx(&ctx, &mut parsed.resources);
-                    if !name_errors.is_empty() {
-                        return Err(super::collapse_errors(name_errors));
-                    }
                 } else {
                     return Err(AppError::Config(format!(
                         "Backend bucket '{}' not found and auto_create is disabled",
