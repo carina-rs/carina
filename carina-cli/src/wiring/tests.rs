@@ -458,9 +458,14 @@ fn resolve_data_source_refs_replaces_resource_ref_with_concrete_value() {
     );
     current_states.insert(sso.id.clone(), sso_state);
 
-    let resolved =
-        resolve_data_source_refs_for_refresh(&[sso, mizzy], &current_states, &HashMap::new())
-            .expect("resolution should succeed");
+    let empty_registry = carina_core::schema::SchemaRegistry::new();
+    let resolved = resolve_data_source_refs_for_refresh(
+        &[sso, mizzy],
+        &current_states,
+        &HashMap::new(),
+        &empty_registry,
+    )
+    .expect("resolution should succeed");
 
     assert_eq!(resolved.len(), 1, "only the data source should be returned");
     let resolved_mizzy = &resolved[0];
