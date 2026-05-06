@@ -137,6 +137,9 @@ plan-fixtures:
 	@echo ""
 	@echo "=== provider_prefix ==="
 	@$(MAKE) plan-provider-prefix
+	@echo ""
+	@echo "=== module_anonymous_resource ==="
+	@$(MAKE) plan-module-anonymous-resource
 
 plan-upstream-state:
 	$(PLAN_FIXTURE) upstream_state
@@ -164,6 +167,8 @@ plan-pretty-short-string-list:
 	$(PLAN_FIXTURE) pretty_short_string_list
 plan-provider-prefix:
 	$(PLAN_FIXTURE) provider_prefix
+plan-module-anonymous-resource:
+	$(PLAN_FIXTURE) module_anonymous_resource
 .PHONY: plan-all-create plan-no-changes plan-no-changes-enum plan-mixed plan-delete plan-compact \
         plan-map-diff plan-enum-display plan-destroy-full plan-destroy-orphans plan-read-only-attrs \
         plan-default-values plan-explicit plan-default-tags \
@@ -172,6 +177,7 @@ plan-provider-prefix:
         plan-upstream-state-map-subscript plan-upstream-state-map-dot-notation \
         plan-deferred-for plan-exports plan-exports-multifile plan-policy-pretty \
         plan-policy-pretty-nested plan-pretty-long-string-list plan-pretty-short-string-list plan-provider-prefix \
+        plan-module-anonymous-resource \
         plan-map-diff-tui plan-all-create-tui plan-mixed-tui plan-delete-tui \
         plan-moved-with-changes-tui plan-moved-pure-tui plan-fixtures
 

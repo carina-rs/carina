@@ -1,0 +1,13 @@
+arguments {
+  github_repo: String
+  role_name:   String
+}
+
+let role = awscc.iam.Role {
+  role_name = role_name
+}
+
+awscc.iam.RolePolicy {
+  policy_name = 'inline'
+  role_name   = role.role_name
+}

@@ -360,6 +360,60 @@ fn test_reconcile_anonymous_id_single_create_only_no_reconcile() {
     assert_eq!(resources[0].id.name_str(), original_id);
 }
 
+/// Anonymous resources declared inside a module instantiation must
+/// surface the owning instance in their final identifier so the plan
+/// address shows the module they belong to (#2516). Without the prefix
+/// `iam_role_policy_<hash>` is indistinguishable from a top-level
+/// anonymous resource.
+#[test]
+fn test_anonymous_resource_inside_module_keeps_instance_prefix() {
+    use crate::resource::ModuleSource;
+
+    let schema = ResourceSchema::new("iam.RolePolicy")
+        .attribute(AttributeSchema::new("policy_name", AttributeType::String));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
+    let providers = vec![ProviderConfig {
+        name: "awscc".to_string(),
+        attributes: vec![(
+            "region".to_string(),
+            Value::String("ap-northeast-1".to_string()),
+        )]
+        .into_iter()
+        .collect(),
+        default_tags: IndexMap::new(),
+        source: None,
+        version: None,
+        revision: None,
+    }];
+    let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
+
+    let mut r = Resource::with_provider("awscc", "iam.RolePolicy", "");
+    r.set_attr(
+        "policy_name".to_string(),
+        Value::String("inline".to_string()),
+    );
+    r.module_source = Some(ModuleSource::Module {
+        name: "github_oidc".to_string(),
+        instance: "bootstrap".to_string(),
+    });
+
+    let mut resources = vec![r];
+    compute_anonymous_identifiers(&mut resources, &providers, &schemas, &identity_fn).unwrap();
+
+    let name = resources[0].id.name_str();
+    assert!(
+        name.starts_with("bootstrap."),
+        "expected `bootstrap.<hash>` prefix, got {:?}",
+        name,
+    );
+    assert!(
+        name.contains("awscc_iam_role_policy_"),
+        "expected hash-based identifier suffix, got {:?}",
+        name,
+    );
+}
+
 #[test]
 fn test_anonymous_resource_no_create_only_properties() {
     // Resources with no create-only properties should still work as anonymous resources

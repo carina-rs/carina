@@ -486,7 +486,19 @@ pub fn compute_anonymous_identifiers(
             .map(crate::parser::pascal_to_snake)
             .collect::<Vec<_>>()
             .join("_");
-        let identifier = format!("{}_{}_{}", provider_snake, type_snake, hash_str);
+        let bare_identifier = format!("{}_{}_{}", provider_snake, type_snake, hash_str);
+        // If this anonymous resource lives inside a module instantiation,
+        // surface the owning instance in the identifier (`<instance>.<bare>`).
+        // The expander leaves anonymous resources `Pending` so this pass
+        // still sees them; without the prefix, a `Pending` module-internal
+        // resource would land at the same address as a top-level
+        // `Pending` resource with matching create-only attrs (#2516).
+        let identifier = match &resource.module_source {
+            Some(crate::resource::ModuleSource::Module { instance, .. }) => {
+                format!("{}.{}", instance, bare_identifier)
+            }
+            _ => bare_identifier,
+        };
 
         computed.push((idx, identifier));
     }
