@@ -135,7 +135,7 @@ impl CompletionProvider {
         let upstream_sources = super::collect_upstream_state_bindings(src);
         let mut exports_cache: std::collections::HashMap<
             String,
-            std::collections::HashMap<String, Option<carina_core::parser::TypeExpr>>,
+            carina_core::upstream_exports::UpstreamExportEntries,
         > = std::collections::HashMap::new();
 
         // Type-based reference completions: walk every binding in scope and
@@ -213,8 +213,8 @@ impl CompletionProvider {
                     &self.schemas,
                     &mut exports_cache,
                 );
-                for (export_name, export_type) in exports {
-                    let Some(export_type) = export_type else {
+                for (export_name, entry) in exports {
+                    let Some(export_type) = &entry.type_expr else {
                         continue;
                     };
                     if !carina_core::validation::is_type_expr_compatible_with_schema(
@@ -697,10 +697,10 @@ impl CompletionProvider {
         // phrasing (still useful; tells the user which binding it came from).
         let mut items: Vec<CompletionItem> = keys
             .iter()
-            .map(|(key, type_expr)| CompletionItem {
+            .map(|(key, entry)| CompletionItem {
                 label: key.clone(),
                 kind: Some(CompletionItemKind::FIELD),
-                detail: Some(match type_expr {
+                detail: Some(match &entry.type_expr {
                     Some(t) => format!("export from upstream_state `{}`: {}", binding, t),
                     None => format!("export from upstream_state `{}`", binding),
                 }),
@@ -738,7 +738,10 @@ impl CompletionProvider {
         else {
             return Vec::new();
         };
-        let Some(Some(type_expr)) = keys.get(key) else {
+        let Some(entry) = keys.get(key) else {
+            return Vec::new();
+        };
+        let Some(type_expr) = &entry.type_expr else {
             // Untyped or unknown key: we have no fields to descend into.
             return Vec::new();
         };
@@ -770,20 +773,24 @@ impl CompletionProvider {
                 items
             }
             carina_core::parser::TypeExpr::Map(value_type) => {
-                // Mine the upstream's literal map for its statically-
-                // declared keys. Empty map → empty completion set.
-                // Failure to re-parse the upstream falls back silently
-                // so a transient mid-edit state in the upstream
-                // doesn't take cross-file completion offline. See
-                // #2490.
-                let Some(keys_in_literal) =
-                    resolve_upstream_map_literal_keys(source, key, base_path)
-                else {
+                // Read the upstream's literal map keys from the value
+                // already carried alongside the TypeExpr. Empty map →
+                // empty completion set. A non-Map value (annotation-only
+                // `accounts: map(String)` with no body, or a transient
+                // mid-edit upstream where the body hasn't parsed yet)
+                // also yields no candidates — silently, so cross-file
+                // completion stays online while the user types (#2490).
+                let Some(carina_core::resource::Value::Map(entries)) = &entry.value else {
                     return Vec::new();
                 };
                 let value_type = value_type.to_string();
-                let mut items: Vec<CompletionItem> = keys_in_literal
-                    .into_iter()
+                let mut items: Vec<CompletionItem> = entries
+                    .keys()
+                    // Filter to identifier-shaped keys only. Map literals
+                    // accept string keys in the grammar (`"prod-1" = ...`),
+                    // but `<binding>.<key>` dot access on the consumer
+                    // side only works for identifier keys.
+                    .filter(|k| carina_core::utils::is_identifier_safe(k))
                     .map(|name| CompletionItem {
                         label: name.clone(),
                         // VARIABLE rather than FIELD — these are runtime
@@ -792,7 +799,7 @@ impl CompletionProvider {
                         detail: Some(format!("{}: {}", name, value_type)),
                         text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                             range,
-                            new_text: name,
+                            new_text: name.clone(),
                         })),
                         ..Default::default()
                     })
@@ -1293,52 +1300,14 @@ impl CompletionProvider {
     }
 }
 
-/// Re-parse the upstream directory and return the literal keys of the
-/// map-typed export named `key`. Used by depth-2 completion to surface
-/// the statically-declared keys of `upstream.<map_export>.<HERE>` —
-/// only the map case calls this, since struct fields come from the
-/// `TypeExpr` and list/scalar exports have no named keys at all.
-///
-/// Returns `None` when `base_path` is missing, the upstream directory
-/// can't be parsed, the named export has no literal value or isn't a
-/// `Value::Map`, or the binding isn't found. The completion handler
-/// treats that the same as "no candidates" — an upstream mid-edit
-/// shouldn't take downstream completion offline. See #2490.
-fn resolve_upstream_map_literal_keys(
-    source: &str,
-    key: &str,
-    base_path: Option<&Path>,
-) -> Option<Vec<String>> {
-    let base = base_path?;
-    let source_abs = base.join(source);
-    if !source_abs.is_dir() {
-        return None;
-    }
-    let parsed =
-        carina_core::config_loader::parse_directory(&source_abs, &Default::default()).ok()?;
-    let export = parsed.export_params.into_iter().find(|e| e.name == key)?;
-    let value = export.value?;
-    let carina_core::resource::Value::Map(entries) = value else {
-        return None;
-    };
-    // Filter to identifier-shaped keys only. Map literals accept string
-    // keys in the grammar (`"prod-1" = ...`), but `<binding>.<key>` dot
-    // access on the consumer side only works for identifier keys —
-    // surfacing a `prod-1` candidate would insert into a position where
-    // it can't be referenced.
-    Some(
-        entries
-            .into_keys()
-            .filter(|k| carina_core::utils::is_identifier_safe(k))
-            .collect(),
-    )
-}
-
-/// Resolve the export name → `TypeExpr` map for an `upstream_state`
+/// Resolve the export name → entry map for an `upstream_state`
 /// binding. Returns `None` when `base_path` is missing or the upstream
 /// directory has no export entry for `binding`. Both depth-1 and
-/// depth-2 dot completion build on this — they only differ in how
-/// they consume the resulting map.
+/// depth-2 dot completion build on this — they only differ in how they
+/// consume the resulting map. Map-literal-key completion (depth-2 over
+/// a `: map(T) = { ... }` export) reads the keys directly from the
+/// entry's `Value`, so there is no second `parse_directory` round-trip
+/// per keystroke.
 ///
 /// Use [`resolve_upstream_exports_cached`] instead when calling from
 /// `value_completions_for_attr`, which has multiple consumers and pays
@@ -1348,7 +1317,7 @@ fn resolve_upstream_export_keys(
     source: &str,
     base_path: Option<&Path>,
     schemas: &carina_core::schema::SchemaRegistry,
-) -> Option<std::collections::HashMap<String, Option<carina_core::parser::TypeExpr>>> {
+) -> Option<carina_core::upstream_exports::UpstreamExportEntries> {
     let base = base_path?;
     let upstream = carina_core::parser::UpstreamState {
         binding: binding.to_string(),
@@ -1384,9 +1353,9 @@ fn resolve_upstream_exports_cached<'a>(
     schemas: &carina_core::schema::SchemaRegistry,
     cache: &'a mut std::collections::HashMap<
         String,
-        std::collections::HashMap<String, Option<carina_core::parser::TypeExpr>>,
+        carina_core::upstream_exports::UpstreamExportEntries,
     >,
-) -> &'a std::collections::HashMap<String, Option<carina_core::parser::TypeExpr>> {
+) -> &'a carina_core::upstream_exports::UpstreamExportEntries {
     cache.entry(binding.to_string()).or_insert_with(|| {
         resolve_upstream_export_keys(binding, source, base_path, schemas).unwrap_or_default()
     })
@@ -1413,7 +1382,7 @@ fn infer_for_binding_type(
     schemas: &carina_core::schema::SchemaRegistry,
     exports_cache: &mut std::collections::HashMap<
         String,
-        std::collections::HashMap<String, Option<carina_core::parser::TypeExpr>>,
+        carina_core::upstream_exports::UpstreamExportEntries,
     >,
 ) -> Option<carina_core::parser::TypeExpr> {
     use super::top_level::ForBindingSlot;
@@ -1430,16 +1399,18 @@ fn infer_for_binding_type(
                 binding: iterable.binding.clone(),
                 source: std::path::PathBuf::from(source),
             };
-            let (resolved, _errors) =
+            let (mut resolved, _errors) =
                 carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
                     base,
                     &[upstream],
                     &Default::default(),
                     Some(schemas),
                 );
-            resolved.get(&iterable.binding).cloned().unwrap_or_default()
+            // Move the entry out of `resolved` rather than cloning so we
+            // don't pay a deep `Value` clone on the per-keystroke path.
+            resolved.remove(&iterable.binding).unwrap_or_default()
         });
-    let export_type = exports.get(&iterable.export)?.as_ref()?;
+    let export_type = exports.get(&iterable.export)?.type_expr.as_ref()?;
 
     match (export_type, binding.slot) {
         (TypeExpr::List(inner), ForBindingSlot::Value | ForBindingSlot::PairValue) => {
