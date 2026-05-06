@@ -54,6 +54,11 @@ impl StateFile {
     /// the state backend writes after auto-creating its own storage —
     /// see [`ResourceState::managed_state_bucket`] for the shape.
     ///
+    /// `resource_name` must equal the desired resource's resolved name
+    /// (e.g. `aws_s3_bucket_<hash>` for the auto-injected anonymous block);
+    /// `bucket_name` is the AWS bucket identifier the provider acts on.
+    /// Conflating the two reproduces #2533.
+    ///
     /// Single-resource by design: today only the S3 backend bootstraps a
     /// single storage resource. A backend that needs to seed multiple
     /// resources (e.g. a DynamoDB lock table alongside an S3 bucket)
@@ -65,20 +70,23 @@ impl StateFile {
     /// let state = StateFile::with_managed_state_bucket(
     ///     "aws",
     ///     "s3.Bucket",
+    ///     "aws_s3_bucket_a3f2b1c8",
     ///     "my-state-bucket",
     /// );
     /// assert_eq!(state.resources.len(), 1);
-    /// assert_eq!(state.resources[0].name, "my-state-bucket");
+    /// assert_eq!(state.resources[0].name, "aws_s3_bucket_a3f2b1c8");
     /// ```
     pub fn with_managed_state_bucket(
         provider: impl Into<String>,
         resource_type: impl Into<String>,
+        resource_name: impl Into<String>,
         bucket_name: impl Into<String>,
     ) -> Self {
         let mut state = Self::new();
         state.upsert_resource(ResourceState::managed_state_bucket(
             provider,
             resource_type,
+            resource_name,
             bucket_name,
         ));
         state
@@ -532,13 +540,21 @@ impl ResourceState {
     /// existing — without `identifier`, `StateFile::build_state_for_resource`
     /// returns "not found" and the next apply re-issues `CreateBucket`,
     /// reproducing #2533 (`BucketAlreadyOwnedByYou`).
+    ///
+    /// `resource_name` is the state-side resource name and must equal the
+    /// resolved name of the desired resource (anonymous resources get a
+    /// hash-derived id like `aws_s3_bucket_<hash>`); `bucket_name` is the
+    /// AWS bucket name used as the provider identifier and as the value
+    /// of the `bucket` attribute. Mixing the two breaks the differ — see
+    /// #2533 for the failure mode.
     pub fn managed_state_bucket(
         provider: impl Into<String>,
         resource_type: impl Into<String>,
+        resource_name: impl Into<String>,
         bucket_name: impl Into<String>,
     ) -> Self {
         let bucket_name = bucket_name.into();
-        Self::new(resource_type, &bucket_name, provider)
+        Self::new(resource_type, resource_name, provider)
             .with_identifier(&bucket_name)
             .with_attribute("bucket", serde_json::json!(bucket_name))
             .with_protected(true)

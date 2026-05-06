@@ -347,32 +347,21 @@ impl StateBackend for S3Backend {
     }
 
     async fn init(&self) -> BackendResult<()> {
-        // Track whether we just created the bucket: if so, the bucket is
-        // unambiguously owned by carina and must be seeded into state. Without
-        // the seed, plan diffs an empty state against a desired aws.s3.Bucket
-        // and the next apply re-issues CreateBucket — failing with
-        // BucketAlreadyOwnedByYou (#2533).
-        let mut bucket_was_just_created = false;
+        // Seeding the state bucket as a managed resource needs the resolved
+        // anonymous identifier of the desired aws.s3.Bucket block in the
+        // user's .crn — not reachable from this layer. The carina-cli apply
+        // bootstrap path owns that responsibility (it parses the .crn,
+        // resolves the identifier, then writes the seeded StateFile).
         if !self.bucket_exists().await? {
             if self.auto_create {
                 self.create_bucket().await?;
-                bucket_was_just_created = true;
             } else {
                 return Err(BackendError::BucketNotFound(self.bucket.clone()));
             }
         }
 
         if self.read_state().await?.is_none() {
-            let state = if bucket_was_just_created {
-                StateFile::with_managed_state_bucket(
-                    BACKEND_PROVIDER_NAME,
-                    BACKEND_RESOURCE_TYPE,
-                    &self.bucket,
-                )
-            } else {
-                StateFile::new()
-            };
-            self.write_state(&state).await?;
+            self.write_state(&StateFile::new()).await?;
         }
 
         Ok(())
