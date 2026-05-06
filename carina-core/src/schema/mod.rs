@@ -835,6 +835,22 @@ impl AttributeType {
         let AttributeType::List { inner, .. } = self else {
             unreachable!("validate_list called on non-List");
         };
+        // `Value::StringList` is the canonicalized form for fields
+        // typed as `Union[String, list(String)]` (see #2510). When
+        // validated against a `list(String)` member of that Union, it
+        // is structurally equivalent to a `Value::List` of strings —
+        // accept it the same way.
+        if let Value::StringList(items) = value {
+            for (i, s) in items.iter().enumerate() {
+                inner.validate(&Value::String(s.clone())).map_err(|e| {
+                    TypeError::ListItemError {
+                        index: i,
+                        inner: Box::new(e),
+                    }
+                })?;
+            }
+            return Ok(());
+        }
         let Value::List(items) = value else {
             return Err(TypeError::TypeMismatch {
                 expected: self.type_name(),

@@ -2423,4 +2423,35 @@ mod tests {
             state.attributes.get("subject"),
         );
     }
+
+    // ---- LSP / display catch-up tests (#2481, #2514) ----
+
+    #[test]
+    fn validate_list_accepts_string_list() {
+        // The schema's `validate_list` must accept `Value::StringList`
+        // as the structural equivalent of `Value::List([String, ...])`,
+        // so a Union[String, list(String)] member's `list(String)`
+        // branch validates the canonical form cleanly.
+        use crate::schema::AttributeType;
+        let list_of_string = AttributeType::list(AttributeType::String);
+        let v = Value::StringList(vec!["a".to_string(), "b".to_string()]);
+        assert!(list_of_string.validate(&v).is_ok());
+    }
+
+    #[test]
+    fn validate_union_accepts_canonical_string_list() {
+        let union = string_or_list_of_strings();
+        let v = Value::StringList(vec!["x".to_string()]);
+        assert!(union.validate(&v).is_ok());
+    }
+
+    #[test]
+    fn format_value_string_list_renders_brackets() {
+        // `format_value` must render `Value::StringList` with bracket
+        // syntax — not a `_` wildcard fallback that would print debug
+        // garbage in plan output.
+        let v = Value::StringList(vec!["a".to_string(), "b".to_string()]);
+        let formatted = format_value(&v);
+        assert_eq!(formatted, "[\"a\", \"b\"]");
+    }
 }
