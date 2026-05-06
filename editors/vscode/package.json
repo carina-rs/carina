@@ -44,7 +44,12 @@
     "configurationDefaults": {
       "[carina]": {
         "editor.formatOnSave": true,
-        "editor.wordBasedSuggestions": "off"
+        "editor.wordBasedSuggestions": "off",
+        "editor.quickSuggestions": {
+          "other": "on",
+          "comments": "off",
+          "strings": "on"
+        }
       }
     }
   },

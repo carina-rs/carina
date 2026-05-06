@@ -3335,3 +3335,50 @@ fn interpolation_completion_dot_after_binding_offers_exports() {
         labels
     );
 }
+
+#[test]
+fn interpolation_completion_works_inside_deeply_nested_struct() {
+    // Mirrors the real `infra/aws/management/carina-state/main.crn` shape:
+    // `${o<cursor>` deep inside `aws.s3.BucketPolicy { policy = { statement { principal = { aws = "...${o" } } } }`.
+    // The intermediate nested blocks must not suppress completion.
+    let provider = test_provider();
+    let main = "\
+aws.s3.BucketPolicy {
+  bucket = bucket.bucket_name
+  policy = {
+    version = '2012-10-17'
+    statement {
+      sid    = 'AllowRegistryDevUpstreamRead'
+      effect = 'Allow'
+      principal = {
+        aws = \"arn:aws:iam::${o\"
+      }
+      action   = 's3:GetObject'
+    }
+  }
+}
+";
+    let (_tmp, base) = set_up_interpolation_project(main);
+    let main_src = std::fs::read_to_string(base.join("main.crn")).unwrap();
+    let doc = create_document(&main_src);
+    // Line index 8 (0-based) is `        aws = "arn:aws:iam::${o"`.
+    let (line_idx, line) = main_src
+        .lines()
+        .enumerate()
+        .find(|(_, l)| l.contains("${o\""))
+        .expect("could not locate `${o\"` in fixture");
+    // Cursor at the `o`, just after `${`.
+    let cursor_col = line.find("${o").expect("contains `${o`") + "${o".chars().count();
+    let position = Position {
+        line: line_idx as u32,
+        character: cursor_col as u32,
+    };
+
+    let completions = provider.complete(&doc, position, Some(&base));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"orgs"),
+        "expected `orgs` inside deeply-nested `${{o`, got: {:?}",
+        labels
+    );
+}
