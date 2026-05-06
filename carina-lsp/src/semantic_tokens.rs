@@ -46,63 +46,63 @@ impl SemanticTokensProvider {
         let mut prev_line = 0u32;
         let mut prev_start = 0u32;
         let mut block_comment_depth: usize = 0;
-        let mut heredoc_marker: Option<String> = None;
+        // Track both the closing marker and whether the heredoc is
+        // quoted (`<<'EOT'`). Quoted heredocs are literal — `${...}`
+        // is NOT expanded by the parser, so the LSP must not split
+        // MACRO tokens inside their bodies. See #2482.
+        let mut heredoc_state: Option<(String, bool)> = None;
 
         for (line_idx, line) in text.lines().enumerate() {
-            // Handle heredoc state: if we're inside a heredoc, highlight the whole line as string
-            if let Some(ref marker) = heredoc_marker {
+            // Heredoc bodies allow `${...}` interpolation iff the
+            // marker is unquoted (#2473 / #2482); reuse the same
+            // splitter so the highlight matches the parser. The
+            // helper short-circuits when no `$` is present, so plain
+            // bodies and closing-marker lines still emit a single
+            // STRING token.
+            if let Some((marker, quoted)) = heredoc_state.as_ref() {
                 let trimmed = line.trim();
-                let line_len = position::char_len(line);
+                let line_chars: Vec<char> = line.chars().collect();
+                let line_len = line_chars.len() as u32;
                 if line_len > 0 {
-                    let delta_line = line_idx as u32 - prev_line;
-                    // Heredoc body is always on a new line, so delta_start is 0
-                    let delta_start = 0;
-                    tokens.push(SemanticToken {
-                        delta_line,
-                        delta_start,
-                        length: line_len,
-                        token_type: 4, // STRING
-                        token_modifiers_bitset: 0,
-                    });
-                    prev_line = line_idx as u32;
-                    prev_start = 0;
+                    let mut body_tokens: Vec<(u32, u32, u32)> = Vec::new();
+                    push_interpolation_aware_string(
+                        &line_chars,
+                        0,
+                        line_len,
+                        !quoted,
+                        &mut body_tokens,
+                    );
+                    push_with_delta(
+                        &mut tokens,
+                        &mut prev_line,
+                        &mut prev_start,
+                        line_idx as u32,
+                        body_tokens,
+                    );
                 }
                 if trimmed == marker {
-                    heredoc_marker = None;
+                    heredoc_state = None;
                 }
                 continue;
             }
 
             // Check if this line starts a heredoc
-            if let Some(marker) = carina_core::heredoc::find_heredoc_marker(line) {
-                // Tokenize the part before the heredoc normally
+            if let Some((marker, quoted)) =
+                carina_core::heredoc::find_heredoc_marker_with_quoted(line)
+            {
                 let line_tokens = self.tokenize_line_with_block_comments(
                     line,
                     line_idx as u32,
                     &mut block_comment_depth,
                 );
-
-                for (start, length, token_type) in line_tokens {
-                    let delta_line = line_idx as u32 - prev_line;
-                    let delta_start = if delta_line == 0 {
-                        start - prev_start
-                    } else {
-                        start
-                    };
-
-                    tokens.push(SemanticToken {
-                        delta_line,
-                        delta_start,
-                        length,
-                        token_type,
-                        token_modifiers_bitset: 0,
-                    });
-
-                    prev_line = line_idx as u32;
-                    prev_start = start;
-                }
-
-                heredoc_marker = Some(marker);
+                push_with_delta(
+                    &mut tokens,
+                    &mut prev_line,
+                    &mut prev_start,
+                    line_idx as u32,
+                    line_tokens,
+                );
+                heredoc_state = Some((marker, quoted));
                 continue;
             }
 
@@ -111,26 +111,13 @@ impl SemanticTokensProvider {
                 line_idx as u32,
                 &mut block_comment_depth,
             );
-
-            for (start, length, token_type) in line_tokens {
-                let delta_line = line_idx as u32 - prev_line;
-                let delta_start = if delta_line == 0 {
-                    start - prev_start
-                } else {
-                    start
-                };
-
-                tokens.push(SemanticToken {
-                    delta_line,
-                    delta_start,
-                    length,
-                    token_type,
-                    token_modifiers_bitset: 0,
-                });
-
-                prev_line = line_idx as u32;
-                prev_start = start;
-            }
+            push_with_delta(
+                &mut tokens,
+                &mut prev_line,
+                &mut prev_start,
+                line_idx as u32,
+                line_tokens,
+            );
         }
 
         tokens
@@ -449,11 +436,11 @@ impl SemanticTokensProvider {
                     } else if c == '\\' {
                         escaped = true;
                     } else if c == string_quote_char {
-                        push_string_with_interpolations(
+                        push_interpolation_aware_string(
                             &line_chars,
                             string_start_char,
                             char_idx + 1,
-                            string_quote_char,
+                            string_quote_char == '"',
                             &mut tokens,
                         );
                         in_string = false;
@@ -749,22 +736,57 @@ fn skip_string_literal(chars: &[char], start: usize) -> usize {
     chars.len()
 }
 
-/// Brace-balancing inside the interpolation lets nested object/struct
-/// literals like `${ {a = 1}.a }` close at the matching `}` rather than
-/// the first one; nested string literals are skipped via
+/// Convert raw `(start, length, token_type)` tuples for a single line
+/// into LSP-encoded `SemanticToken`s appended to `tokens`. Updates
+/// `prev_line` / `prev_start` to track the running delta cursor across
+/// the next call.
+fn push_with_delta(
+    tokens: &mut Vec<SemanticToken>,
+    prev_line: &mut u32,
+    prev_start: &mut u32,
+    line_idx: u32,
+    raw_tokens: Vec<(u32, u32, u32)>,
+) {
+    for (start, length, token_type) in raw_tokens {
+        let delta_line = line_idx - *prev_line;
+        let delta_start = if delta_line == 0 {
+            start - *prev_start
+        } else {
+            start
+        };
+        tokens.push(SemanticToken {
+            delta_line,
+            delta_start,
+            length,
+            token_type,
+            token_modifiers_bitset: 0,
+        });
+        *prev_line = line_idx;
+        *prev_start = start;
+    }
+}
+
+/// Emit STRING tokens for the literal segments of `line_chars[start..end]`
+/// and MACRO tokens for any `${...}` interpolation spans inside it, when
+/// `allow_interpolation` is true. Brace-balancing lets nested object /
+/// struct literals like `${ {a = 1}.a }` close at the matching `}`
+/// rather than the first one; nested string literals are skipped via
 /// `skip_string_literal` so a `}` inside them doesn't terminate the
 /// interpolation early.
-fn push_string_with_interpolations(
+///
+/// Callers that host interpolation (double-quoted strings, heredoc
+/// bodies) pass `true`; literal-only contexts (single-quoted strings)
+/// pass `false` and get a single STRING token covering the range.
+fn push_interpolation_aware_string(
     line_chars: &[char],
     start: u32,
     end: u32,
-    quote: char,
+    allow_interpolation: bool,
     tokens: &mut Vec<(u32, u32, u32)>,
 ) {
-    // Single-quoted strings are literal-only (no interpolation in the
-    // grammar), and double-quoted strings without `$` cannot host one
-    // either — bail to a single STRING token in either case.
-    if quote != '"' || !line_chars[start as usize..end as usize].contains(&'$') {
+    // Literal-only contexts and ranges without `$` short-circuit to a
+    // single STRING token covering the whole range.
+    if !allow_interpolation || !line_chars[start as usize..end as usize].contains(&'$') {
         tokens.push((start, end - start, 4));
         return;
     }
@@ -1535,15 +1557,22 @@ mod tests {
     }
 
     #[test]
-    fn test_find_heredoc_marker() {
-        use carina_core::heredoc::find_heredoc_marker;
+    fn find_heredoc_marker_classifies_quoted_form() {
+        use carina_core::heredoc::find_heredoc_marker_with_quoted;
         assert_eq!(
-            find_heredoc_marker("policy = <<EOT"),
-            Some("EOT".to_string())
+            find_heredoc_marker_with_quoted("policy = <<EOT"),
+            Some(("EOT".to_string(), false))
         );
-        assert_eq!(find_heredoc_marker("x = <<-EOF"), Some("EOF".to_string()));
-        assert_eq!(find_heredoc_marker("x = \"<<EOT\""), None);
-        assert_eq!(find_heredoc_marker("x = 123"), None);
+        assert_eq!(
+            find_heredoc_marker_with_quoted("x = <<-EOF"),
+            Some(("EOF".to_string(), false))
+        );
+        assert_eq!(
+            find_heredoc_marker_with_quoted("x = <<'EOT'"),
+            Some(("EOT".to_string(), true))
+        );
+        assert_eq!(find_heredoc_marker_with_quoted("x = \"<<EOT\""), None);
+        assert_eq!(find_heredoc_marker_with_quoted("x = 123"), None);
     }
 
     // Issue #1948 — the LSP stopped emitting semantic-token `KEYWORD`s for DSL
@@ -1898,6 +1927,134 @@ mod tests {
             abs.iter().all(|(_, _, _, k)| *k != 9),
             "single-quoted strings must not produce MACRO tokens; got: {:?}",
             abs
+        );
+    }
+
+    // =====================================================================
+    // Heredoc body `${...}` MACRO split (#2482, parity with #2473)
+    // =====================================================================
+
+    #[test]
+    fn heredoc_body_emits_macro_for_interpolation() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let input = "policy = <<EOT\nhello ${name}\nEOT";
+        let tokens = provider.tokenize(input);
+        let abs = absolute_tokens(&tokens);
+        let macro_tokens: Vec<_> = abs.iter().filter(|(_, _, _, k)| *k == 9).collect();
+        assert_eq!(
+            macro_tokens.len(),
+            1,
+            "expected one MACRO token in heredoc body for `${{name}}`; got: {:?}",
+            abs
+        );
+        // `${name}` is 7 chars (`$`, `{`, `n`, `a`, `m`, `e`, `}`).
+        assert_eq!(
+            macro_tokens[0].2, 7,
+            "MACRO span must cover the full `${{name}}`; got: {:?}",
+            abs
+        );
+    }
+
+    #[test]
+    fn heredoc_body_without_dollar_stays_one_string_token() {
+        let provider = SemanticTokensProvider::new(&[]);
+        // No `$` anywhere — must still produce a single STRING token per
+        // body line, not split.
+        let input = "policy = <<EOT\nplain literal text\nEOT";
+        let tokens = provider.tokenize(input);
+        let abs = absolute_tokens(&tokens);
+        let body_line: Vec<_> = abs
+            .iter()
+            .filter(|(line, _, _, _)| *line == 1)
+            .copied()
+            .collect();
+        assert!(
+            body_line.iter().all(|(_, _, _, k)| *k != 9),
+            "heredoc body without `$` must not emit MACRO; got: {:?}",
+            body_line
+        );
+    }
+
+    #[test]
+    fn heredoc_body_handles_multiple_interpolations_per_line() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let input = "policy = <<EOT\n${a} and ${b}\nEOT";
+        let tokens = provider.tokenize(input);
+        let abs = absolute_tokens(&tokens);
+        let macro_count = abs.iter().filter(|(_, _, _, k)| *k == 9).count();
+        assert_eq!(
+            macro_count, 2,
+            "two interpolations on one heredoc body line must produce two MACRO tokens; got: {:?}",
+            abs
+        );
+    }
+
+    #[test]
+    fn heredoc_quoted_marker_does_not_split_interpolation() {
+        // `<<'EOT'` is a literal heredoc — `${name}` is NOT expanded
+        // by the parser, so the LSP must not split MACRO tokens
+        // inside it either. See #2482.
+        let provider = SemanticTokensProvider::new(&[]);
+        let input = "policy = <<'EOT'\nhello ${name}\nEOT";
+        let tokens = provider.tokenize(input);
+        let abs = absolute_tokens(&tokens);
+        assert!(
+            abs.iter().all(|(_, _, _, k)| *k != 9),
+            "quoted heredoc body must not produce MACRO tokens; got: {:?}",
+            abs
+        );
+    }
+
+    #[test]
+    fn heredoc_indented_marker_still_splits_interpolation() {
+        // `<<-EOT` (indented form) behaves the same as `<<EOT` for
+        // interpolation purposes — the body still expands `${...}`.
+        let provider = SemanticTokensProvider::new(&[]);
+        let input = "policy = <<-EOT\n  hello ${name}\n  EOT";
+        let tokens = provider.tokenize(input);
+        let abs = absolute_tokens(&tokens);
+        let macro_count = abs.iter().filter(|(_, _, _, k)| *k == 9).count();
+        assert_eq!(
+            macro_count, 1,
+            "`<<-EOT` body must split `${{name}}` as MACRO; got: {:?}",
+            abs
+        );
+    }
+
+    #[test]
+    fn heredoc_escaped_dollar_brace_does_not_split() {
+        // `\${name}` is a literal escape inside the heredoc body —
+        // the splitter must skip the `\$` pair and not emit MACRO.
+        let provider = SemanticTokensProvider::new(&[]);
+        let input = "policy = <<EOT\n\\${name}\nEOT";
+        let tokens = provider.tokenize(input);
+        let abs = absolute_tokens(&tokens);
+        assert!(
+            abs.iter().all(|(_, _, _, k)| *k != 9),
+            "escaped `\\${{` must not produce MACRO; got: {:?}",
+            abs
+        );
+    }
+
+    #[test]
+    fn heredoc_closing_marker_line_stays_string() {
+        // The closing marker line itself (e.g. `EOT`) is highlighted as
+        // STRING by the existing path. The new split must not turn the
+        // marker into something else.
+        let provider = SemanticTokensProvider::new(&[]);
+        let input = "policy = <<EOT\n${name}\nEOT";
+        let tokens = provider.tokenize(input);
+        let abs = absolute_tokens(&tokens);
+        let last = abs
+            .iter()
+            .filter(|(line, _, _, _)| *line == 2)
+            .copied()
+            .next()
+            .expect("expected a token on the closing-marker line");
+        assert_eq!(
+            last.3, 4,
+            "closing marker must remain STRING; got kind {} on line 2",
+            last.3
         );
     }
 }

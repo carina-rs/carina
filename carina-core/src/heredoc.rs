@@ -247,11 +247,13 @@ fn escape_for_double_quote_interpolating(s: &str) -> String {
         .replace('\t', "\\t")
 }
 
-/// Check if a line contains a heredoc start (`<<MARKER` or `<<-MARKER`).
-/// Returns the marker string if found, skipping occurrences inside string literals.
-/// Used by the LSP for semantic token highlighting.
-pub fn find_heredoc_marker(line: &str) -> Option<String> {
-    find_heredoc_start(line).map(|h| h.marker.to_string())
+/// Check if a line contains a heredoc start (`<<MARKER` or `<<-MARKER`),
+/// returning `(marker, quoted)`. The `quoted` flag distinguishes
+/// `<<'EOT'` (literal — `${...}` is NOT expanded) from `<<EOT`
+/// (interpolation-hosting). Used by the LSP for semantic token
+/// highlighting; occurrences inside string literals are skipped.
+pub fn find_heredoc_marker_with_quoted(line: &str) -> Option<(String, bool)> {
+    find_heredoc_start(line).map(|h| (h.marker.to_string(), h.quoted))
 }
 
 /// Error during heredoc preprocessing.
