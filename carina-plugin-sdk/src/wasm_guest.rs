@@ -234,6 +234,92 @@ macro_rules! export_provider {
                 }
             }
 
+            fn proto_to_wit_provider_error(err: proto::ProviderError) -> wit_types::ProviderError {
+                let detail = wit_types::ErrorDetail {
+                    message: err.message,
+                    resource_id: err.resource_id.as_ref().map(proto_to_wit_resource_id),
+                    cause: err.cause,
+                    provider_name: err.provider_name,
+                };
+                match err.kind {
+                    proto::ProviderErrorKind::InvalidInput => {
+                        wit_types::ProviderError::InvalidInput(detail)
+                    }
+                    proto::ProviderErrorKind::ApiError => {
+                        wit_types::ProviderError::ApiError(detail)
+                    }
+                    proto::ProviderErrorKind::NotFound => {
+                        wit_types::ProviderError::NotFound(detail)
+                    }
+                    proto::ProviderErrorKind::Timeout => {
+                        wit_types::ProviderError::Timeout(detail)
+                    }
+                    proto::ProviderErrorKind::Internal => {
+                        wit_types::ProviderError::Internal(detail)
+                    }
+                }
+            }
+
+            fn validate_string_to_provider_error(
+                msg: String,
+            ) -> wit_types::ProviderError {
+                wit_types::ProviderError::InvalidInput(wit_types::ErrorDetail {
+                    message: msg,
+                    resource_id: None,
+                    cause: None,
+                    provider_name: None,
+                })
+            }
+
+            fn wit_to_proto_patch_op_kind(k: wit_types::PatchOpKind) -> proto::PatchOpKind {
+                match k {
+                    wit_types::PatchOpKind::Add => proto::PatchOpKind::Add,
+                    wit_types::PatchOpKind::Replace => proto::PatchOpKind::Replace,
+                    wit_types::PatchOpKind::Remove => proto::PatchOpKind::Remove,
+                }
+            }
+
+            fn wit_to_proto_update_request(
+                req: wit_types::UpdateRequest,
+                proto_id: &proto::ResourceId,
+            ) -> proto::UpdateRequest {
+                let from = wit_to_proto_state(proto_id, &req.current);
+                let ops = req
+                    .patch
+                    .ops
+                    .into_iter()
+                    .map(|op| proto::PatchOp {
+                        kind: wit_to_proto_patch_op_kind(op.kind),
+                        key: op.key,
+                        value: op.value.as_ref().map(wit_to_proto_value),
+                    })
+                    .collect();
+                proto::UpdateRequest {
+                    from,
+                    patch: proto::UpdatePatch { ops },
+                }
+            }
+
+            fn wit_to_proto_create_request(
+                req: wit_types::CreateRequest,
+            ) -> proto::CreateRequest {
+                proto::CreateRequest {
+                    resource: wit_to_proto_resource(&req.res),
+                }
+            }
+
+            fn wit_to_proto_delete_request(
+                req: wit_types::DeleteRequest,
+            ) -> proto::DeleteRequest {
+                proto::DeleteRequest {
+                    lifecycle: proto::LifecycleConfig {
+                        force_delete: req.lifecycle.force_delete,
+                        create_before_destroy: req.lifecycle.create_before_destroy,
+                        prevent_destroy: req.lifecycle.prevent_destroy,
+                    },
+                }
+            }
+
             struct WasmGuest;
 
             impl exports::carina::provider::provider::Guest for WasmGuest {
@@ -259,97 +345,99 @@ macro_rules! export_provider {
 
                 fn validate_config(
                     attrs: Vec<(String, wit_types::Value)>,
-                ) -> Result<(), String> {
+                ) -> Result<(), wit_types::ProviderError> {
                     let provider = get_provider().lock().unwrap();
                     let map = wit_to_proto_value_map(&attrs);
                     $crate::CarinaProvider::validate_config(&*provider, &map)
+                        .map_err(validate_string_to_provider_error)
                 }
 
                 fn initialize(
                     attrs: Vec<(String, wit_types::Value)>,
-                ) -> Result<(), String> {
+                ) -> Result<(), wit_types::ProviderError> {
                     let mut provider = get_provider().lock().unwrap();
                     let map = wit_to_proto_value_map(&attrs);
                     $crate::CarinaProvider::initialize(&mut *provider, &map)
+                        .map_err(validate_string_to_provider_error)
                 }
 
                 fn read(
                     id: wit_types::ResourceId,
-                    identifier: Option<String>,
-                ) -> Result<wit_types::State, String> {
+                    identifier: String,
+                    _request: wit_types::ReadRequest,
+                ) -> Result<wit_types::State, wit_types::ProviderError> {
                     let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
                     match $crate::CarinaProvider::read(
                         &*provider,
                         &proto_id,
-                        identifier.as_deref(),
+                        &identifier,
+                        proto::ReadRequest,
                     ) {
                         Ok(state) => Ok(proto_to_wit_state(&state)),
-                        Err(e) => Err(serde_json::to_string(&e).unwrap_or_else(|_| e.message.clone())),
+                        Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
 
                 fn read_data_source(
                     res: wit_types::ResourceDef,
-                ) -> Result<wit_types::State, String> {
+                ) -> Result<wit_types::State, wit_types::ProviderError> {
                     let provider = get_provider().lock().unwrap();
                     let proto_res = wit_to_proto_resource(&res);
                     match $crate::CarinaProvider::read_data_source(&*provider, &proto_res) {
                         Ok(state) => Ok(proto_to_wit_state(&state)),
-                        Err(e) => Err(serde_json::to_string(&e).unwrap_or_else(|_| e.message.clone())),
+                        Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
 
                 fn create(
-                    res: wit_types::ResourceDef,
-                ) -> Result<wit_types::State, String> {
+                    id: wit_types::ResourceId,
+                    request: wit_types::CreateRequest,
+                ) -> Result<wit_types::State, wit_types::ProviderError> {
                     let provider = get_provider().lock().unwrap();
-                    let proto_res = wit_to_proto_resource(&res);
-                    match $crate::CarinaProvider::create(&*provider, &proto_res) {
+                    let proto_id = wit_to_proto_resource_id(&id);
+                    let proto_request = wit_to_proto_create_request(request);
+                    match $crate::CarinaProvider::create(&*provider, &proto_id, proto_request) {
                         Ok(state) => Ok(proto_to_wit_state(&state)),
-                        Err(e) => Err(serde_json::to_string(&e).unwrap_or_else(|_| e.message.clone())),
+                        Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
 
                 fn update(
                     id: wit_types::ResourceId,
                     identifier: String,
-                    current: wit_types::State,
-                    to: wit_types::ResourceDef,
-                ) -> Result<wit_types::State, String> {
+                    request: wit_types::UpdateRequest,
+                ) -> Result<wit_types::State, wit_types::ProviderError> {
                     let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
-                    let proto_from = wit_to_proto_state(&proto_id, &current);
-                    let proto_to = wit_to_proto_resource(&to);
+                    let proto_request = wit_to_proto_update_request(request, &proto_id);
                     match $crate::CarinaProvider::update(
                         &*provider,
                         &proto_id,
                         &identifier,
-                        &proto_from,
-                        &proto_to,
+                        proto_request,
                     ) {
                         Ok(state) => Ok(proto_to_wit_state(&state)),
-                        Err(e) => Err(serde_json::to_string(&e).unwrap_or_else(|_| e.message.clone())),
+                        Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
 
                 fn delete(
                     id: wit_types::ResourceId,
                     identifier: String,
-                    options: String,
-                ) -> Result<(), String> {
+                    request: wit_types::DeleteRequest,
+                ) -> Result<(), wit_types::ProviderError> {
                     let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
-                    let lifecycle: proto::LifecycleConfig =
-                        serde_json::from_str(&options).unwrap_or_default();
+                    let proto_request = wit_to_proto_delete_request(request);
                     match $crate::CarinaProvider::delete(
                         &*provider,
                         &proto_id,
                         &identifier,
-                        &lifecycle,
+                        proto_request,
                     ) {
                         Ok(()) => Ok(()),
-                        Err(e) => Err(serde_json::to_string(&e).unwrap_or_else(|_| e.message.clone())),
+                        Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
 
@@ -367,13 +455,14 @@ macro_rules! export_provider {
                 fn validate_custom_type(
                     type_name: String,
                     value: String,
-                ) -> Result<(), String> {
+                ) -> Result<(), wit_types::ProviderError> {
                     let provider = get_provider().lock().unwrap();
                     $crate::CarinaProvider::validate_custom_type(
                         &*provider,
                         &type_name,
                         &value,
                     )
+                    .map_err(validate_string_to_provider_error)
                 }
 
                 fn get_enum_aliases() -> String {
@@ -597,6 +686,92 @@ macro_rules! export_provider {
 
             // -- Guest trait implementation --
 
+            fn proto_to_wit_provider_error(err: proto::ProviderError) -> wit_types::ProviderError {
+                let detail = wit_types::ErrorDetail {
+                    message: err.message,
+                    resource_id: err.resource_id.as_ref().map(proto_to_wit_resource_id),
+                    cause: err.cause,
+                    provider_name: err.provider_name,
+                };
+                match err.kind {
+                    proto::ProviderErrorKind::InvalidInput => {
+                        wit_types::ProviderError::InvalidInput(detail)
+                    }
+                    proto::ProviderErrorKind::ApiError => {
+                        wit_types::ProviderError::ApiError(detail)
+                    }
+                    proto::ProviderErrorKind::NotFound => {
+                        wit_types::ProviderError::NotFound(detail)
+                    }
+                    proto::ProviderErrorKind::Timeout => {
+                        wit_types::ProviderError::Timeout(detail)
+                    }
+                    proto::ProviderErrorKind::Internal => {
+                        wit_types::ProviderError::Internal(detail)
+                    }
+                }
+            }
+
+            fn validate_string_to_provider_error(
+                msg: String,
+            ) -> wit_types::ProviderError {
+                wit_types::ProviderError::InvalidInput(wit_types::ErrorDetail {
+                    message: msg,
+                    resource_id: None,
+                    cause: None,
+                    provider_name: None,
+                })
+            }
+
+            fn wit_to_proto_patch_op_kind(k: wit_types::PatchOpKind) -> proto::PatchOpKind {
+                match k {
+                    wit_types::PatchOpKind::Add => proto::PatchOpKind::Add,
+                    wit_types::PatchOpKind::Replace => proto::PatchOpKind::Replace,
+                    wit_types::PatchOpKind::Remove => proto::PatchOpKind::Remove,
+                }
+            }
+
+            fn wit_to_proto_update_request(
+                req: wit_types::UpdateRequest,
+                proto_id: &proto::ResourceId,
+            ) -> proto::UpdateRequest {
+                let from = wit_to_proto_state(proto_id, &req.current);
+                let ops = req
+                    .patch
+                    .ops
+                    .into_iter()
+                    .map(|op| proto::PatchOp {
+                        kind: wit_to_proto_patch_op_kind(op.kind),
+                        key: op.key,
+                        value: op.value.as_ref().map(wit_to_proto_value),
+                    })
+                    .collect();
+                proto::UpdateRequest {
+                    from,
+                    patch: proto::UpdatePatch { ops },
+                }
+            }
+
+            fn wit_to_proto_create_request(
+                req: wit_types::CreateRequest,
+            ) -> proto::CreateRequest {
+                proto::CreateRequest {
+                    resource: wit_to_proto_resource(&req.res),
+                }
+            }
+
+            fn wit_to_proto_delete_request(
+                req: wit_types::DeleteRequest,
+            ) -> proto::DeleteRequest {
+                proto::DeleteRequest {
+                    lifecycle: proto::LifecycleConfig {
+                        force_delete: req.lifecycle.force_delete,
+                        create_before_destroy: req.lifecycle.create_before_destroy,
+                        prevent_destroy: req.lifecycle.prevent_destroy,
+                    },
+                }
+            }
+
             struct WasmGuest;
 
             impl exports::carina::provider::provider::Guest for WasmGuest {
@@ -622,97 +797,99 @@ macro_rules! export_provider {
 
                 fn validate_config(
                     attrs: Vec<(String, wit_types::Value)>,
-                ) -> Result<(), String> {
+                ) -> Result<(), wit_types::ProviderError> {
                     let provider = get_provider().lock().unwrap();
                     let map = wit_to_proto_value_map(&attrs);
                     $crate::CarinaProvider::validate_config(&*provider, &map)
+                        .map_err(validate_string_to_provider_error)
                 }
 
                 fn initialize(
                     attrs: Vec<(String, wit_types::Value)>,
-                ) -> Result<(), String> {
+                ) -> Result<(), wit_types::ProviderError> {
                     let mut provider = get_provider().lock().unwrap();
                     let map = wit_to_proto_value_map(&attrs);
                     $crate::CarinaProvider::initialize(&mut *provider, &map)
+                        .map_err(validate_string_to_provider_error)
                 }
 
                 fn read(
                     id: wit_types::ResourceId,
-                    identifier: Option<String>,
-                ) -> Result<wit_types::State, String> {
+                    identifier: String,
+                    _request: wit_types::ReadRequest,
+                ) -> Result<wit_types::State, wit_types::ProviderError> {
                     let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
                     match $crate::CarinaProvider::read(
                         &*provider,
                         &proto_id,
-                        identifier.as_deref(),
+                        &identifier,
+                        proto::ReadRequest,
                     ) {
                         Ok(state) => Ok(proto_to_wit_state(&state)),
-                        Err(e) => Err(serde_json::to_string(&e).unwrap_or_else(|_| e.message.clone())),
+                        Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
 
                 fn read_data_source(
                     res: wit_types::ResourceDef,
-                ) -> Result<wit_types::State, String> {
+                ) -> Result<wit_types::State, wit_types::ProviderError> {
                     let provider = get_provider().lock().unwrap();
                     let proto_res = wit_to_proto_resource(&res);
                     match $crate::CarinaProvider::read_data_source(&*provider, &proto_res) {
                         Ok(state) => Ok(proto_to_wit_state(&state)),
-                        Err(e) => Err(serde_json::to_string(&e).unwrap_or_else(|_| e.message.clone())),
+                        Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
 
                 fn create(
-                    res: wit_types::ResourceDef,
-                ) -> Result<wit_types::State, String> {
+                    id: wit_types::ResourceId,
+                    request: wit_types::CreateRequest,
+                ) -> Result<wit_types::State, wit_types::ProviderError> {
                     let provider = get_provider().lock().unwrap();
-                    let proto_res = wit_to_proto_resource(&res);
-                    match $crate::CarinaProvider::create(&*provider, &proto_res) {
+                    let proto_id = wit_to_proto_resource_id(&id);
+                    let proto_request = wit_to_proto_create_request(request);
+                    match $crate::CarinaProvider::create(&*provider, &proto_id, proto_request) {
                         Ok(state) => Ok(proto_to_wit_state(&state)),
-                        Err(e) => Err(serde_json::to_string(&e).unwrap_or_else(|_| e.message.clone())),
+                        Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
 
                 fn update(
                     id: wit_types::ResourceId,
                     identifier: String,
-                    current: wit_types::State,
-                    to: wit_types::ResourceDef,
-                ) -> Result<wit_types::State, String> {
+                    request: wit_types::UpdateRequest,
+                ) -> Result<wit_types::State, wit_types::ProviderError> {
                     let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
-                    let proto_from = wit_to_proto_state(&proto_id, &current);
-                    let proto_to = wit_to_proto_resource(&to);
+                    let proto_request = wit_to_proto_update_request(request, &proto_id);
                     match $crate::CarinaProvider::update(
                         &*provider,
                         &proto_id,
                         &identifier,
-                        &proto_from,
-                        &proto_to,
+                        proto_request,
                     ) {
                         Ok(state) => Ok(proto_to_wit_state(&state)),
-                        Err(e) => Err(serde_json::to_string(&e).unwrap_or_else(|_| e.message.clone())),
+                        Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
 
                 fn delete(
                     id: wit_types::ResourceId,
                     identifier: String,
-                    options: String,
-                ) -> Result<(), String> {
+                    request: wit_types::DeleteRequest,
+                ) -> Result<(), wit_types::ProviderError> {
                     let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
-                    let lifecycle: proto::LifecycleConfig =
-                        serde_json::from_str(&options).unwrap_or_default();
+                    let proto_request = wit_to_proto_delete_request(request);
                     match $crate::CarinaProvider::delete(
                         &*provider,
                         &proto_id,
                         &identifier,
-                        &lifecycle,
+                        proto_request,
                     ) {
                         Ok(()) => Ok(()),
-                        Err(e) => Err(serde_json::to_string(&e).unwrap_or_else(|_| e.message.clone())),
+                        Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
 
@@ -730,13 +907,14 @@ macro_rules! export_provider {
                 fn validate_custom_type(
                     type_name: String,
                     value: String,
-                ) -> Result<(), String> {
+                ) -> Result<(), wit_types::ProviderError> {
                     let provider = get_provider().lock().unwrap();
                     $crate::CarinaProvider::validate_custom_type(
                         &*provider,
                         &type_name,
                         &value,
                     )
+                    .map_err(validate_string_to_provider_error)
                 }
 
                 fn get_enum_aliases() -> String {

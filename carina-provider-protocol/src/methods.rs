@@ -48,7 +48,12 @@ pub struct InitializeResult {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReadParams {
     pub id: ResourceId,
-    pub identifier: Option<String>,
+    pub identifier: String,
+    /// Per-operation request record. Present so future fields (e.g.
+    /// freshness hint) can be added without breaking existing
+    /// providers. Defaults to an empty record on the wire.
+    #[serde(default)]
+    pub request: ReadRequest,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -60,7 +65,8 @@ pub struct ReadResult {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateParams {
-    pub resource: Resource,
+    pub id: ResourceId,
+    pub request: CreateRequest,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -74,8 +80,7 @@ pub struct CreateResult {
 pub struct UpdateParams {
     pub id: ResourceId,
     pub identifier: String,
-    pub from: State,
-    pub to: Resource,
+    pub request: UpdateRequest,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -89,8 +94,7 @@ pub struct UpdateResult {
 pub struct DeleteParams {
     pub id: ResourceId,
     pub identifier: String,
-    #[serde(default)]
-    pub lifecycle: LifecycleConfig,
+    pub request: DeleteRequest,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

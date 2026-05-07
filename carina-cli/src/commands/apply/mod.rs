@@ -13,7 +13,7 @@ use carina_core::differ::{cascade_dependent_updates, create_plan};
 use carina_core::effect::Effect;
 use carina_core::executor::{ExecutionInput, ExecutionResult};
 use carina_core::plan::Plan;
-use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
+use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ReadRequest};
 use carina_core::resolver::resolve_refs_with_state_and_remote;
 use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::value::format_value;
@@ -373,7 +373,7 @@ pub async fn detect_drift(
         let identifier = planned_state.and_then(|s| s.identifier.as_deref());
 
         let actual_state = provider
-            .read(&resource.id, identifier)
+            .read(&resource.id, identifier.unwrap_or(""), ReadRequest)
             .await
             .map_err(AppError::Provider)?;
 
@@ -541,7 +541,15 @@ pub async fn run_apply(
                     .unwrap_or_default();
                 let bucket_provider = factory.create_provider(&provider_config_attrs).await?;
 
-                match bucket_provider.create(bucket_resource).await {
+                match bucket_provider
+                    .create(
+                        &bucket_resource.id,
+                        carina_core::provider::CreateRequest {
+                            resource: bucket_resource.clone(),
+                        },
+                    )
+                    .await
+                {
                     Ok(_) => {
                         println!("  {} Created state bucket: {}", "✓".green(), bucket_name);
                     }

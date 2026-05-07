@@ -1,6 +1,9 @@
 use super::*;
 use crate::plan::Plan;
-use crate::provider::{BoxFuture, ProviderError, ProviderResult};
+use crate::provider::{
+    BoxFuture, CreateRequest, DeleteRequest, ProviderError, ProviderResult, ReadRequest,
+    UpdateRequest,
+};
 use crate::resource::{LifecycleConfig, Resource, Value};
 use parallel::{build_dependency_levels, build_dependency_map};
 use std::sync::{Arc, Mutex};
@@ -61,7 +64,8 @@ impl Provider for MockProvider {
     fn read(
         &self,
         id: &ResourceId,
-        _identifier: Option<&str>,
+        _identifier: &str,
+        _request: ReadRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id_str = id.to_string();
         self.call_log
@@ -73,11 +77,15 @@ impl Provider for MockProvider {
     }
 
     fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-        self.read(&resource.id, None)
+        self.read(&resource.id, "", ReadRequest)
     }
 
-    fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-        let id_str = resource.id.to_string();
+    fn create(
+        &self,
+        id: &ResourceId,
+        _request: CreateRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let id_str = id.to_string();
         self.call_log
             .lock()
             .unwrap()
@@ -90,8 +98,7 @@ impl Provider for MockProvider {
         &self,
         id: &ResourceId,
         _identifier: &str,
-        _from: &State,
-        _to: &Resource,
+        _request: UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id_str = id.to_string();
         self.call_log
@@ -106,7 +113,7 @@ impl Provider for MockProvider {
         &self,
         id: &ResourceId,
         _identifier: &str,
-        _lifecycle: &LifecycleConfig,
+        _request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         let id_str = id.to_string();
         self.call_log
@@ -288,7 +295,7 @@ async fn test_failed_effect_propagates_to_dependent() {
     plan.add(Effect::Create(rb));
 
     // First create fails
-    provider.push_create(Err(ProviderError::new("create failed")));
+    provider.push_create(Err(ProviderError::api_error("create failed")));
 
     let input = ExecutionInput {
         plan: &plan,
@@ -663,7 +670,7 @@ async fn test_parallel_failure_skips_dependents() {
 
     provider.push_create(Ok(ok_state(&vpc_id)));
     // subnet_a fails, subnet_b succeeds
-    provider.push_create(Err(ProviderError::new("create failed")));
+    provider.push_create(Err(ProviderError::api_error("create failed")));
     provider.push_create(Ok(ok_state(&subnet_b_id)));
 
     let input = ExecutionInput {
@@ -857,18 +864,23 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
         fn read(
             &self,
             _id: &ResourceId,
-            _identifier: Option<&str>,
+            _identifier: &str,
+            _request: ReadRequest,
         ) -> BoxFuture<'_, ProviderResult<State>> {
-            Box::pin(async { Err(ProviderError::new("not implemented")) })
+            Box::pin(async { Err(ProviderError::internal("not implemented")) })
         }
 
         fn read_data_source(&self, _resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-            Box::pin(async { Err(ProviderError::new("not implemented")) })
+            Box::pin(async { Err(ProviderError::internal("not implemented")) })
         }
 
-        fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-            let id = resource.id.clone();
-            let name = resource.id.name_str().to_string();
+        fn create(
+            &self,
+            id: &ResourceId,
+            _request: CreateRequest,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            let id_clone = id.clone();
+            let name = id.name_str().to_string();
             let delay = self.delays.get(&name).copied().unwrap_or(Duration::ZERO);
             let log = self.call_log.clone();
             Box::pin(async move {
@@ -876,7 +888,7 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
                 log.lock()
                     .unwrap()
                     .push(("create".to_string(), name, Instant::now()));
-                Ok(State::existing(id, HashMap::new()).with_identifier("id-123"))
+                Ok(State::existing(id_clone, HashMap::new()).with_identifier("id-123"))
             })
         }
 
@@ -884,19 +896,18 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
             &self,
             _id: &ResourceId,
             _identifier: &str,
-            _from: &State,
-            _to: &Resource,
+            _request: UpdateRequest,
         ) -> BoxFuture<'_, ProviderResult<State>> {
-            Box::pin(async { Err(ProviderError::new("not implemented")) })
+            Box::pin(async { Err(ProviderError::internal("not implemented")) })
         }
 
         fn delete(
             &self,
             _id: &ResourceId,
             _identifier: &str,
-            _lifecycle: &LifecycleConfig,
+            _request: DeleteRequest,
         ) -> BoxFuture<'_, ProviderResult<()>> {
-            Box::pin(async { Err(ProviderError::new("not implemented")) })
+            Box::pin(async { Err(ProviderError::internal("not implemented")) })
         }
     }
 
@@ -1286,18 +1297,23 @@ impl Provider for RecordingMockProvider {
     fn read(
         &self,
         _id: &ResourceId,
-        _identifier: Option<&str>,
+        _identifier: &str,
+        _request: ReadRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        Box::pin(async { Err(ProviderError::new("not implemented")) })
+        Box::pin(async { Err(ProviderError::internal("not implemented")) })
     }
 
     fn read_data_source(&self, _resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-        Box::pin(async { Err(ProviderError::new("not implemented")) })
+        Box::pin(async { Err(ProviderError::internal("not implemented")) })
     }
 
-    fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-        let id_str = resource.id.to_string();
-        let attrs = resource.resolved_attributes();
+    fn create(
+        &self,
+        id: &ResourceId,
+        request: CreateRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let id_str = id.to_string();
+        let attrs = request.resource.resolved_attributes();
         self.create_log.lock().unwrap().push((id_str, attrs));
         let result = self.create_results.lock().unwrap().remove(0);
         Box::pin(async move { result })
@@ -1307,19 +1323,18 @@ impl Provider for RecordingMockProvider {
         &self,
         _id: &ResourceId,
         _identifier: &str,
-        _from: &State,
-        _to: &Resource,
+        _request: UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        Box::pin(async { Err(ProviderError::new("not implemented")) })
+        Box::pin(async { Err(ProviderError::internal("not implemented")) })
     }
 
     fn delete(
         &self,
         _id: &ResourceId,
         _identifier: &str,
-        _lifecycle: &LifecycleConfig,
+        _request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
-        Box::pin(async { Err(ProviderError::new("not implemented")) })
+        Box::pin(async { Err(ProviderError::internal("not implemented")) })
     }
 }
 

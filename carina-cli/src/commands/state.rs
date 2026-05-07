@@ -551,7 +551,7 @@ async fn run_state_bucket_delete(
         .delete(
             &bucket_id,
             bucket_name,
-            &carina_core::resource::LifecycleConfig::default(),
+            carina_core::provider::DeleteRequest::default(),
         )
         .await
     {
@@ -680,7 +680,11 @@ pub(crate) async fn run_state_refresh_locked(
         }
 
         let fresh_state = provider
-            .read(&resource.id, identifier.as_deref())
+            .read(
+                &resource.id,
+                identifier.as_deref().unwrap_or(""),
+                carina_core::provider::ReadRequest,
+            )
             .await
             .map_err(AppError::Provider)?;
         current_states.insert(resource.id.clone(), fresh_state);
@@ -706,7 +710,7 @@ pub(crate) async fn run_state_refresh_locked(
 
     for (id, identifier) in &orphan_ids {
         let fresh_state = provider
-            .read(id, Some(identifier.as_str()))
+            .read(id, identifier.as_str(), carina_core::provider::ReadRequest)
             .await
             .map_err(AppError::Provider)?;
         current_states.insert(id.clone(), fresh_state);

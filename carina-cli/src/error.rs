@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn from_provider_error() {
-        let provider_err = ProviderError::new("timeout");
+        let provider_err = ProviderError::timeout("timeout");
         let app_err: AppError = provider_err.into();
         assert!(matches!(app_err, AppError::Provider(_)));
         assert!(app_err.to_string().contains("timeout"));

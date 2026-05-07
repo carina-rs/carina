@@ -43,7 +43,12 @@ impl CarinaProvider for MockProcessProvider {
         Ok(())
     }
 
-    fn read(&self, id: &ResourceId, _identifier: Option<&str>) -> Result<State, ProviderError> {
+    fn read(
+        &self,
+        id: &ResourceId,
+        _identifier: &str,
+        _request: ReadRequest,
+    ) -> Result<State, ProviderError> {
         let states = self.states.lock().unwrap();
         let key = Self::resource_key(id);
 
@@ -79,15 +84,16 @@ impl CarinaProvider for MockProcessProvider {
         })
     }
 
-    fn create(&self, resource: &Resource) -> Result<State, ProviderError> {
+    fn create(&self, id: &ResourceId, request: CreateRequest) -> Result<State, ProviderError> {
         let mut states = self.states.lock().unwrap();
-        let key = Self::resource_key(&resource.id);
+        let key = Self::resource_key(id);
+        let resource = request.resource;
         states.insert(key, resource.attributes.clone());
 
         Ok(State {
-            id: resource.id.clone(),
+            id: id.clone(),
             identifier: Some("mock-id".into()),
-            attributes: resource.attributes.clone(),
+            attributes: resource.attributes,
             exists: true,
         })
     }
@@ -96,17 +102,48 @@ impl CarinaProvider for MockProcessProvider {
         &self,
         id: &ResourceId,
         _identifier: &str,
-        _from: &State,
-        to: &Resource,
+        request: UpdateRequest,
     ) -> Result<State, ProviderError> {
+        // Apply the patch on top of `from` to construct the post-update
+        // attribute map. Also echo the patch op kinds into a sentinel
+        // attribute so integration tests can assert the patch
+        // round-tripped through the WIT boundary.
+        let mut attributes = request.from.attributes.clone();
+        let mut applied_op_kinds: Vec<Value> = Vec::with_capacity(request.patch.ops.len());
+        for op in &request.patch.ops {
+            applied_op_kinds.push(Value::String(format!(
+                "{}:{}",
+                match op.kind {
+                    PatchOpKind::Add => "add",
+                    PatchOpKind::Replace => "replace",
+                    PatchOpKind::Remove => "remove",
+                },
+                op.key,
+            )));
+            match op.kind {
+                PatchOpKind::Add | PatchOpKind::Replace => {
+                    if let Some(value) = op.value.clone() {
+                        attributes.insert(op.key.clone(), value);
+                    }
+                }
+                PatchOpKind::Remove => {
+                    attributes.remove(&op.key);
+                }
+            }
+        }
+        attributes.insert(
+            "__mock_patch_ops__".to_string(),
+            Value::List(applied_op_kinds),
+        );
+
         let mut states = self.states.lock().unwrap();
         let key = Self::resource_key(id);
-        states.insert(key, to.attributes.clone());
+        states.insert(key, attributes.clone());
 
         Ok(State {
             id: id.clone(),
             identifier: Some("mock-id".into()),
-            attributes: to.attributes.clone(),
+            attributes,
             exists: true,
         })
     }
@@ -115,7 +152,7 @@ impl CarinaProvider for MockProcessProvider {
         &self,
         id: &ResourceId,
         _identifier: &str,
-        _lifecycle: &LifecycleConfig,
+        _request: DeleteRequest,
     ) -> Result<(), ProviderError> {
         let mut states = self.states.lock().unwrap();
         let key = Self::resource_key(id);

@@ -208,7 +208,8 @@ impl Provider for NoopProvider {
     fn read(
         &self,
         _id: &ResourceId,
-        _identifier: Option<&str>,
+        _identifier: &str,
+        _request: carina_core::provider::ReadRequest,
     ) -> BoxFuture<'_, carina_core::provider::ProviderResult<State>> {
         Box::pin(async { unimplemented!("e2e parity tests do not exercise apply") })
     }
@@ -218,15 +219,18 @@ impl Provider for NoopProvider {
     ) -> BoxFuture<'_, carina_core::provider::ProviderResult<State>> {
         Box::pin(async { unimplemented!("e2e parity tests do not exercise apply") })
     }
-    fn create(&self, _r: &Resource) -> BoxFuture<'_, carina_core::provider::ProviderResult<State>> {
+    fn create(
+        &self,
+        _id: &ResourceId,
+        _request: carina_core::provider::CreateRequest,
+    ) -> BoxFuture<'_, carina_core::provider::ProviderResult<State>> {
         Box::pin(async { unimplemented!("e2e parity tests do not exercise apply") })
     }
     fn update(
         &self,
         _id: &ResourceId,
         _identifier: &str,
-        _from: &State,
-        _to: &Resource,
+        _request: carina_core::provider::UpdateRequest,
     ) -> BoxFuture<'_, carina_core::provider::ProviderResult<State>> {
         Box::pin(async { unimplemented!("e2e parity tests do not exercise apply") })
     }
@@ -234,7 +238,7 @@ impl Provider for NoopProvider {
         &self,
         _id: &ResourceId,
         _identifier: &str,
-        _lifecycle: &carina_core::resource::LifecycleConfig,
+        _request: carina_core::provider::DeleteRequest,
     ) -> BoxFuture<'_, carina_core::provider::ProviderResult<()>> {
         Box::pin(async { unimplemented!("e2e parity tests do not exercise apply") })
     }

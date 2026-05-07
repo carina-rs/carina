@@ -687,7 +687,13 @@ async fn run_destroy_locked(
             in_flight.push(async move {
                 let started = Instant::now();
                 let delete_result = provider_ref
-                    .delete(&resource_id, &identifier, &lifecycle)
+                    .delete(
+                        &resource_id,
+                        &identifier,
+                        carina_core::provider::DeleteRequest {
+                            lifecycle: lifecycle.clone(),
+                        },
+                    )
                     .await;
                 (
                     idx,
@@ -792,7 +798,7 @@ async fn run_destroy_locked(
                 success_count += 1;
                 destroyed_ids.push(resource_id);
             }
-            Err(e) if e.is_timeout => {
+            Err(carina_core::provider::ProviderError::Timeout(_)) => {
                 let msg = format!(
                     "{} {} - Operation timed out, waiting for completion...",
                     "⏳".yellow(),
@@ -931,7 +937,6 @@ async fn run_destroy_locked(
 mod tests {
     use super::*;
     use carina_core::provider::{BoxFuture, Provider, ProviderError, ProviderResult};
-    use carina_core::resource::LifecycleConfig;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A mock provider whose `read()` returns a sequence of results.
@@ -959,7 +964,8 @@ mod tests {
         fn read(
             &self,
             id: &ResourceId,
-            _identifier: Option<&str>,
+            _identifier: &str,
+            _request: carina_core::provider::ReadRequest,
         ) -> BoxFuture<'_, ProviderResult<State>> {
             let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
             let id = id.clone();
@@ -968,7 +974,7 @@ mod tests {
                     // Recreate the result since ProviderResult is not Clone
                     match &self.responses[idx] {
                         Ok(state) => Ok(state.clone()),
-                        Err(e) => Err(ProviderError::new(e.message.clone())),
+                        Err(e) => Err(ProviderError::api_error(e.message().to_string())),
                     }
                 } else {
                     Ok(State::not_found(id))
@@ -977,10 +983,14 @@ mod tests {
         }
 
         fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-            self.read(&resource.id, None)
+            self.read(&resource.id, "", carina_core::provider::ReadRequest)
         }
 
-        fn create(&self, _resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+        fn create(
+            &self,
+            _id: &ResourceId,
+            _request: carina_core::provider::CreateRequest,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
             Box::pin(async { unreachable!() })
         }
 
@@ -988,8 +998,7 @@ mod tests {
             &self,
             _id: &ResourceId,
             _identifier: &str,
-            _from: &State,
-            _to: &Resource,
+            _request: carina_core::provider::UpdateRequest,
         ) -> BoxFuture<'_, ProviderResult<State>> {
             Box::pin(async { unreachable!() })
         }
@@ -998,7 +1007,7 @@ mod tests {
             &self,
             _id: &ResourceId,
             _identifier: &str,
-            _lifecycle: &LifecycleConfig,
+            _request: carina_core::provider::DeleteRequest,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { unreachable!() })
         }
@@ -1006,7 +1015,7 @@ mod tests {
 
     #[test]
     fn is_retryable_detects_dependency_violation() {
-        let err = ProviderError::new(
+        let err = ProviderError::api_error(
             "DependencyViolation: Network vpc-xxx has some mapped public address(es)",
         );
         assert!(is_retryable_delete_error(&err));
@@ -1014,19 +1023,19 @@ mod tests {
 
     #[test]
     fn is_retryable_detects_has_dependent_object() {
-        let err = ProviderError::new("resource has a dependent object");
+        let err = ProviderError::api_error("resource has a dependent object");
         assert!(is_retryable_delete_error(&err));
     }
 
     #[test]
     fn is_retryable_returns_false_for_generic_error() {
-        let err = ProviderError::new("AccessDenied: not authorized");
+        let err = ProviderError::api_error("AccessDenied: not authorized");
         assert!(!is_retryable_delete_error(&err));
     }
 
     #[test]
     fn is_retryable_returns_false_for_timeout() {
-        let err = ProviderError::new("DependencyViolation: something").timeout();
+        let err = ProviderError::timeout("DependencyViolation: something");
         assert!(!is_retryable_delete_error(&err));
     }
 
@@ -1071,7 +1080,7 @@ mod tests {
     #[tokio::test]
     async fn wait_for_deletion_returns_read_error_on_provider_error() {
         let id = ResourceId::new("s3.Bucket", "test");
-        let provider = SequenceProvider::new(vec![Err(ProviderError::new("auth expired"))]);
+        let provider = SequenceProvider::new(vec![Err(ProviderError::api_error("auth expired"))]);
 
         let result = wait_for_deletion(
             &provider,
@@ -1099,7 +1108,7 @@ mod tests {
         // deletion, causing live infrastructure to be orphaned while the user
         // was told it was destroyed.
         let id = ResourceId::new("s3.Bucket", "test");
-        let provider = SequenceProvider::new(vec![Err(ProviderError::new("network timeout"))]);
+        let provider = SequenceProvider::new(vec![Err(ProviderError::timeout("network timeout"))]);
 
         let result = wait_for_deletion(
             &provider,

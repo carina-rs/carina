@@ -59,42 +59,46 @@ impl Provider for TestProvider {
     fn read(
         &self,
         id: &ResourceId,
-        identifier: Option<&str>,
+        identifier: &str,
+        _request: carina_core::provider::ReadRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        let key = (id.to_string(), identifier.unwrap_or_default().to_string());
+        let key = (id.to_string(), identifier.to_string());
         let result = self
             .read_results
             .get(&key)
             .cloned()
             .unwrap_or_else(|| panic!("missing read state for {:?}", key));
-        Box::pin(async move { result.map_err(ProviderError::new) })
+        Box::pin(async move { result.map_err(ProviderError::internal) })
     }
 
     fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-        self.read(&resource.id, None)
+        self.read(&resource.id, "", carina_core::provider::ReadRequest)
     }
 
-    fn create(&self, _resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-        Box::pin(async { Err(ProviderError::new("unexpected create")) })
+    fn create(
+        &self,
+        _id: &ResourceId,
+        _request: carina_core::provider::CreateRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        Box::pin(async { Err(ProviderError::internal("unexpected create")) })
     }
 
     fn update(
         &self,
         _id: &ResourceId,
         _identifier: &str,
-        _from: &State,
-        _to: &Resource,
+        _request: carina_core::provider::UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        Box::pin(async { Err(ProviderError::new("unexpected update")) })
+        Box::pin(async { Err(ProviderError::internal("unexpected update")) })
     }
 
     fn delete(
         &self,
         _id: &ResourceId,
         _identifier: &str,
-        _lifecycle: &LifecycleConfig,
+        _request: carina_core::provider::DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
-        Box::pin(async { Err(ProviderError::new("unexpected delete")) })
+        Box::pin(async { Err(ProviderError::internal("unexpected delete")) })
     }
 }
 
@@ -1567,26 +1571,29 @@ impl Provider for RecordingProvider {
     fn read(
         &self,
         id: &ResourceId,
-        _identifier: Option<&str>,
+        _identifier: &str,
+        _request: carina_core::provider::ReadRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id = id.clone();
         Box::pin(async move { Ok(State::not_found(id)) })
     }
 
     fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-        self.read(&resource.id, None)
+        self.read(&resource.id, "", carina_core::provider::ReadRequest)
     }
 
-    fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+    fn create(
+        &self,
+        id: &ResourceId,
+        request: carina_core::provider::CreateRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
         // Return a state with a new identifier to simulate resource creation
-        let mut attrs = resource.attributes.clone();
+        let mut attrs = request.resource.attributes.clone();
         // Simulate AWS returning a new ID
         attrs.insert("vpc_id".to_string(), Value::String("vpc-NEW".to_string()));
-        let state = State::existing(
-            resource.id.clone(),
-            carina_core::resource::attrs_to_hashmap(&attrs),
-        )
-        .with_identifier("vpc-NEW");
+        let id = id.clone();
+        let state = State::existing(id, carina_core::resource::attrs_to_hashmap(&attrs))
+            .with_identifier("vpc-NEW");
         Box::pin(async move { Ok(state) })
     }
 
@@ -1594,15 +1601,30 @@ impl Provider for RecordingProvider {
         &self,
         id: &ResourceId,
         _identifier: &str,
-        _from: &State,
-        to: &Resource,
+        request: carina_core::provider::UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        self.update_calls
-            .lock()
-            .unwrap()
-            .push((id.to_string(), to.clone()));
-        let state =
-            State::existing(id.clone(), to.resolved_attributes()).with_identifier("subnet-123");
+        // Reconstruct a Resource view of the desired post-update state for
+        // existing tests that introspect the recorded `to`.
+        let mut attrs = request.from.attributes.clone();
+        for op in &request.patch.ops {
+            match op.kind {
+                carina_core::provider::PatchOpKind::Add
+                | carina_core::provider::PatchOpKind::Replace => {
+                    if let Some(v) = op.value.clone() {
+                        attrs.insert(op.key.clone(), v);
+                    }
+                }
+                carina_core::provider::PatchOpKind::Remove => {
+                    attrs.remove(&op.key);
+                }
+            }
+        }
+        let mut to = Resource::with_provider(&id.provider, &id.resource_type, id.name_str());
+        for (k, v) in &attrs {
+            to.set_attr(k.clone(), v.clone());
+        }
+        self.update_calls.lock().unwrap().push((id.to_string(), to));
+        let state = State::existing(id.clone(), attrs).with_identifier("subnet-123");
         Box::pin(async move { Ok(state) })
     }
 
@@ -1610,7 +1632,7 @@ impl Provider for RecordingProvider {
         &self,
         _id: &ResourceId,
         _identifier: &str,
-        _lifecycle: &LifecycleConfig,
+        _request: carina_core::provider::DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async { Ok(()) })
     }
@@ -1627,18 +1649,23 @@ impl Provider for RenameFailProvider {
     fn read(
         &self,
         id: &ResourceId,
-        _identifier: Option<&str>,
+        _identifier: &str,
+        _request: carina_core::provider::ReadRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id = id.clone();
         Box::pin(async move { Ok(State::not_found(id)) })
     }
 
     fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-        self.read(&resource.id, None)
+        self.read(&resource.id, "", carina_core::provider::ReadRequest)
     }
 
-    fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-        let state = State::existing(resource.id.clone(), resource.resolved_attributes())
+    fn create(
+        &self,
+        id: &ResourceId,
+        request: carina_core::provider::CreateRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let state = State::existing(id.clone(), request.resource.resolved_attributes())
             .with_identifier("temp-name-abc");
         Box::pin(async move { Ok(state) })
     }
@@ -1647,17 +1674,16 @@ impl Provider for RenameFailProvider {
         &self,
         _id: &ResourceId,
         _identifier: &str,
-        _from: &State,
-        _to: &Resource,
+        _request: carina_core::provider::UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        Box::pin(async { Err(ProviderError::new("rename failed: API error")) })
+        Box::pin(async { Err(ProviderError::api_error("rename failed: API error")) })
     }
 
     fn delete(
         &self,
         _id: &ResourceId,
         _identifier: &str,
-        _lifecycle: &LifecycleConfig,
+        _request: carina_core::provider::DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async { Ok(()) })
     }
