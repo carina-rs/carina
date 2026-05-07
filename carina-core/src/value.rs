@@ -786,11 +786,13 @@ impl<'a> PrettyLayout<'a> {
 ///
 /// Behavior:
 /// - Scalar variants are identical to `format_value_with_key(value, None)`.
-/// - `Value::List` of all `Value::Map` always renders vertically with each
-///   element's keys at `parent_indent_cols + 2`; map keys are sorted
-///   alphabetically. Consecutive elements are separated by a blank line
-///   (#2545; before then a YAML-style `- ` marker prefixed each element's
-///   first key, but it collided with the destroy action marker).
+/// - `Value::List` of all `Value::Map` always renders vertically. Each
+///   element's first key is prefixed with `* ` at `parent_indent_cols + 2`;
+///   continuation keys align at `parent_indent_cols + 4`. Map keys are
+///   sorted alphabetically. Consecutive elements are also separated by
+///   a blank line. The marker is `*` rather than `-` because `-`
+///   collides with the destroy action marker at the resource-row level
+///   (#2545 dropped the marker, #2552 brought it back as `*`).
 /// - `Value::List` of scalars renders inline `[a, b, c]` if the entire line
 ///   (`<indent>key: <inline>`) fits within `PRETTY_LINE_LIMIT`; otherwise
 ///   expands to a bracketed multi-line form.
@@ -879,14 +881,17 @@ pub(crate) fn inline_width(value: &Value, budget: usize) -> Option<usize> {
         .map(|()| counter.width())
 }
 
-/// Render a list-of-maps vertically. All keys of every element align at
-/// `entry_indent_cols`, matching the column `format_map_vertical` would
-/// use under the same parent. Consecutive elements are separated by a
-/// blank line. The YAML-style `- ` marker was dropped in #2545 because
-/// it collided visually with the destroy action marker at the
-/// resource-row level.
+/// Render a list-of-maps vertically. The first key of each element is
+/// prefixed with a `* ` marker at `entry_indent_cols`; remaining keys
+/// align under it at `entry_indent_cols + 2`. Consecutive elements are
+/// also separated by a blank line. The marker uses `*` rather than the
+/// YAML-style `-` because `-` collides with the destroy action marker
+/// at the resource-row level (#2545 dropped the marker; #2552 brings
+/// it back as `*` to restore the per-element visual anchor without
+/// recreating the collision).
 fn format_list_of_maps_vertical(items: &[Value], entry_indent_cols: usize) -> String {
-    let key_indent = " ".repeat(entry_indent_cols);
+    let entry_indent = " ".repeat(entry_indent_cols);
+    let continuation_indent = " ".repeat(entry_indent_cols + 2);
     let mut out = String::new();
     let mut first_element = true;
     for item in items {
@@ -897,14 +902,19 @@ fn format_list_of_maps_vertical(items: &[Value], entry_indent_cols: usize) -> St
             first_element = false;
             let mut keys: Vec<_> = map.keys().collect();
             keys.sort();
-            for k in &keys {
+            for (i, k) in keys.iter().enumerate() {
                 let child_layout = PrettyLayout {
-                    parent_indent_cols: entry_indent_cols,
+                    parent_indent_cols: entry_indent_cols + 2,
                     key: k,
                 };
                 let val_str = format_value_pretty(&map[*k], child_layout);
                 out.push('\n');
-                out.push_str(&key_indent);
+                if i == 0 {
+                    out.push_str(&entry_indent);
+                    out.push_str("* ");
+                } else {
+                    out.push_str(&continuation_indent);
+                }
                 out.push_str(k);
                 out.push_str(": ");
                 out.push_str(&val_str);
@@ -936,27 +946,18 @@ fn format_list_of_scalars_vertical(items: &[Value], item_indent_cols: usize) -> 
 }
 
 /// Render a map vertically. Each key is at `key_indent_cols` and its value
-/// recurses with that key as the new parent key. A blank line is injected
-/// before any key that follows a multi-element list-of-maps so the list
-/// boundary stays visible after the marker drop (#2545); the blank is only
-/// inserted when a sibling actually follows, avoiding orphan whitespace at
-/// the end of a block.
+/// recurses with that key as the new parent key.
 fn format_map_vertical(map: &IndexMap<String, Value>, key_indent_cols: usize) -> String {
     let mut keys: Vec<_> = map.keys().collect();
     keys.sort();
     let key_indent = " ".repeat(key_indent_cols);
     let mut out = String::new();
-    let mut prev_needs_separator = false;
     for k in keys {
         let child_layout = PrettyLayout {
             parent_indent_cols: key_indent_cols,
             key: k,
         };
         let val_str = format_value_pretty(&map[k], child_layout);
-        if prev_needs_separator {
-            out.push('\n');
-        }
-        prev_needs_separator = needs_trailing_separator(&map[k]);
         out.push('\n');
         out.push_str(&key_indent);
         out.push_str(k);
@@ -973,18 +974,6 @@ pub fn is_list_of_maps(value: &Value) -> bool {
     } else {
         false
     }
-}
-
-/// Whether `value` renders to a vertical block whose final line sits at
-/// the element's key column, leaving a sibling key visually attached
-/// to the last element. A blank line should follow such a value before
-/// the next sibling key. Currently only multi-element list-of-maps
-/// matches — single-element lists are deliberately not separated
-/// because adding a blank for every list-of-maps would noisify common
-/// single-statement policies, and a lone element is visually no more
-/// ambiguous than a regular map under the parent key. (#2545)
-pub fn needs_trailing_separator(value: &Value) -> bool {
-    is_list_of_maps(value) && matches!(value, Value::List(items) if items.len() >= 2)
 }
 
 /// Count the number of shared key-value pairs between two map Values.
@@ -2004,13 +1993,13 @@ mod tests {
         s2.insert("effect".to_string(), Value::String("Deny".to_string()));
         let v = Value::List(vec![Value::Map(s1), Value::Map(s2)]);
 
-        // parent_indent_cols=6 → keys at column 8 (parent + 2), the same
-        // column `format_map_vertical` would use under the same parent.
-        // Element boundaries are signaled by a blank line — the `- `
-        // marker was dropped in #2545 because it collided with the
-        // destroy action marker.
+        // parent_indent_cols=6 → entry_indent_cols=8, where `* ` marker
+        // sits; first key follows at col 10, continuation keys also at
+        // col 10. Element boundaries also get a blank line. The `*`
+        // marker (#2552) replaces the `- ` marker that #2545 dropped to
+        // avoid the destroy-marker collision.
         let out = format_value_pretty(&v, layout(6, "statement"));
-        let expected = "\n        effect: \"Allow\"\n        sid: \"First\"\n\n        effect: \"Deny\"\n        sid: \"Second\"";
+        let expected = "\n        * effect: \"Allow\"\n          sid: \"First\"\n\n        * effect: \"Deny\"\n          sid: \"Second\"";
         assert_eq!(out, expected);
     }
 
@@ -2019,9 +2008,10 @@ mod tests {
         let mut m = IndexMap::new();
         m.insert("k".to_string(), Value::String("v".to_string()));
         let v = Value::List(vec![Value::Map(m)]);
-        // parent_indent_cols=4 → key at column 6, no marker.
+        // parent_indent_cols=4 → entry_indent_cols=6, `* ` at col 6, key
+        // at col 8.
         let out = format_value_pretty(&v, layout(4, "items"));
-        assert_eq!(out, "\n      k: \"v\"");
+        assert_eq!(out, "\n      * k: \"v\"");
         // Single element must not introduce a blank-line separator.
         assert!(
             !out.contains("\n\n"),
@@ -2049,56 +2039,6 @@ mod tests {
         assert!(
             !out.ends_with("\n\n"),
             "trailing whitespace must not double the resource block separator: {out:?}"
-        );
-    }
-
-    /// Inside a vertical Map, a multi-element list-of-maps key followed
-    /// by a sibling key gets a blank-line separator so the boundary
-    /// stays visible after the `- ` marker drop (#2545). The element
-    /// values are deliberately long to force the outer Map to expand
-    /// vertically rather than render inline.
-    #[test]
-    fn format_value_pretty_map_with_list_of_maps_then_sibling_separates() {
-        let long = "x".repeat(40);
-        let mut s1 = IndexMap::new();
-        s1.insert("sid".to_string(), Value::String(long.clone()));
-        let mut s2 = IndexMap::new();
-        s2.insert("sid".to_string(), Value::String(long.clone()));
-        let mut outer = IndexMap::new();
-        outer.insert(
-            "statement".to_string(),
-            Value::List(vec![Value::Map(s1), Value::Map(s2)]),
-        );
-        outer.insert("version".to_string(), Value::String("2012".to_string()));
-        let v = Value::Map(outer);
-        let out = format_value_pretty(&v, layout(2, "config"));
-        assert!(
-            out.contains(&format!("sid: \"{long}\"\n\n")),
-            "blank line must follow last list-of-maps element before sibling: {out:?}"
-        );
-    }
-
-    /// A multi-element list-of-maps that is the LAST key of its parent
-    /// must NOT receive a trailing blank, otherwise the resource-block
-    /// separator above it doubles into two blank lines (#2545).
-    #[test]
-    fn format_value_pretty_map_with_trailing_list_of_maps_no_orphan_blank() {
-        let long = "x".repeat(40);
-        let mut s1 = IndexMap::new();
-        s1.insert("sid".to_string(), Value::String(long.clone()));
-        let mut s2 = IndexMap::new();
-        s2.insert("sid".to_string(), Value::String(long.clone()));
-        let mut outer = IndexMap::new();
-        outer.insert("version".to_string(), Value::String("2012".to_string()));
-        outer.insert(
-            "statement".to_string(),
-            Value::List(vec![Value::Map(s1), Value::Map(s2)]),
-        );
-        let v = Value::Map(outer);
-        let out = format_value_pretty(&v, layout(2, "config"));
-        assert!(
-            !out.ends_with("\n\n"),
-            "trailing list-of-maps must not leave an orphan blank: {out:?}"
         );
     }
 
@@ -2191,11 +2131,12 @@ mod tests {
         entry.insert("sid".to_string(), Value::String("X".to_string()));
         entry.insert("condition".to_string(), Value::Map(inner));
         let v = Value::List(vec![Value::Map(entry)]);
-        // parent_indent_cols=4 → keys at col 6 (no marker, #2545).
+        // parent_indent_cols=4 → entry_indent_cols=6; first sorted key
+        // is preceded by `* ` at col 6 (#2552).
         let out = format_value_pretty(&v, layout(4, "statement"));
         assert!(
-            out.contains("      condition:"),
-            "expected `condition:` at col 6, got: {out}"
+            out.contains("      * condition:"),
+            "expected `* condition:` at col 6, got: {out}"
         );
         assert!(out.contains("sid: \"X\""), "expected sid line, got: {out}");
     }
