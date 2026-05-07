@@ -126,7 +126,17 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
                 header_line = header_line.style(Style::default().bg(Color::DarkGray));
             }
             lines.push(header_line);
+            let mut prev_needs_separator = false;
             for entry in entries {
+                // Inject a blank line after a multi-element list-of-maps
+                // before the next sibling key so the list boundary stays
+                // visible — the `*` marker disambiguates element starts
+                // but not element ends (#2555). Mirrors the same logic
+                // in `carina-cli/src/display/mod.rs::MapExpanded`.
+                if prev_needs_separator {
+                    lines.push(Line::from(""));
+                }
+                prev_needs_separator = carina_core::value::needs_trailing_separator(&entry.value);
                 let layout = carina_core::value::PrettyLayout {
                     parent_indent_cols: 4,
                     key: &entry.key,
@@ -348,5 +358,100 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use carina_core::detail_rows::MapExpandedEntry;
+    use carina_core::resource::Value;
+    use indexmap::IndexMap;
+
+    /// A multi-element list-of-maps entry inside a `MapExpanded` row
+    /// must be followed by a blank `Line` before the next sibling
+    /// entry, mirroring the CLI behavior added in #2555. A `*` marker
+    /// alone is not enough to delimit the *end* of the list.
+    #[test]
+    fn map_expanded_inserts_blank_after_multi_element_list_of_maps() {
+        let stmt = |sid: &str| {
+            let mut m = IndexMap::new();
+            m.insert("sid".to_string(), Value::String(sid.to_string()));
+            Value::Map(m)
+        };
+        let row = DetailRow::MapExpanded {
+            key: "policy_document".to_string(),
+            entries: vec![
+                MapExpandedEntry {
+                    key: "statement".to_string(),
+                    value: Value::List(vec![stmt("A"), stmt("B")]),
+                    annotation: None,
+                },
+                MapExpandedEntry {
+                    key: "version".to_string(),
+                    value: Value::String("2012-10-17".to_string()),
+                    annotation: None,
+                },
+            ],
+        };
+
+        let mut lines: Vec<Line> = Vec::new();
+        render_detail_row_to_lines(&mut lines, &row, false);
+
+        let version_idx = lines
+            .iter()
+            .position(|l| line_text(l).contains("version:"))
+            .expect("version line must be rendered");
+        assert!(
+            version_idx >= 1,
+            "version must not be the first rendered line"
+        );
+        assert!(
+            line_text(&lines[version_idx - 1]).trim().is_empty(),
+            "expected blank line immediately before version: lines={lines:?}",
+        );
+    }
+
+    /// A multi-element list-of-maps that is the LAST entry in a
+    /// `MapExpanded` row must NOT receive a trailing blank line —
+    /// avoids orphan whitespace before the resource-block separator.
+    #[test]
+    fn map_expanded_no_orphan_blank_after_trailing_list_of_maps() {
+        let stmt = |sid: &str| {
+            let mut m = IndexMap::new();
+            m.insert("sid".to_string(), Value::String(sid.to_string()));
+            Value::Map(m)
+        };
+        let row = DetailRow::MapExpanded {
+            key: "policy_document".to_string(),
+            entries: vec![
+                MapExpandedEntry {
+                    key: "version".to_string(),
+                    value: Value::String("2012-10-17".to_string()),
+                    annotation: None,
+                },
+                MapExpandedEntry {
+                    key: "statement".to_string(),
+                    value: Value::List(vec![stmt("A"), stmt("B")]),
+                    annotation: None,
+                },
+            ],
+        };
+
+        let mut lines: Vec<Line> = Vec::new();
+        render_detail_row_to_lines(&mut lines, &row, false);
+
+        let last = lines.last().expect("at least one line");
+        assert!(
+            !line_text(last).trim().is_empty(),
+            "trailing list-of-maps must not leave an orphan blank line: lines={lines:?}",
+        );
+    }
+
+    fn line_text(line: &Line) -> String {
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
     }
 }
