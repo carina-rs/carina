@@ -22,6 +22,7 @@ Execution Plan:
             effect: "Allow"
             resource: "arn:aws:iam::*:oidc-provider/token.actions.githubusercontent.com"
             sid: "ReadOIDCProvider"
+
         version: "2012-10-17"
 
 Plan: 1 to add, 0 to change, 0 to destroy.

@@ -884,11 +884,15 @@ pub(crate) fn inline_width(value: &Value, budget: usize) -> Option<usize> {
 /// Render a list-of-maps vertically. The first key of each element is
 /// prefixed with a `* ` marker at `entry_indent_cols`; remaining keys
 /// align under it at `entry_indent_cols + 2`. Consecutive elements are
-/// also separated by a blank line. The marker uses `*` rather than the
+/// separated by a blank line. The marker uses `*` rather than the
 /// YAML-style `-` because `-` collides with the destroy action marker
-/// at the resource-row level (#2545 dropped the marker; #2552 brings
-/// it back as `*` to restore the per-element visual anchor without
-/// recreating the collision).
+/// at the resource-row level (#2545 dropped the marker; #2552 brought
+/// it back as `*`). Callers that iterate sibling keys (`format_map_vertical`
+/// here, `DetailRow::MapExpanded` in `carina-cli/src/display/mod.rs` and
+/// `carina-tui/src/ui/detail.rs`) consult `needs_trailing_separator` to
+/// insert a blank line before any sibling key that follows a multi-element
+/// list-of-maps so the boundary stays visible (#2555); this function only
+/// handles the inter-element separators inside the list itself.
 fn format_list_of_maps_vertical(items: &[Value], entry_indent_cols: usize) -> String {
     let entry_indent = " ".repeat(entry_indent_cols);
     let continuation_indent = " ".repeat(entry_indent_cols + 2);
@@ -946,18 +950,28 @@ fn format_list_of_scalars_vertical(items: &[Value], item_indent_cols: usize) -> 
 }
 
 /// Render a map vertically. Each key is at `key_indent_cols` and its value
-/// recurses with that key as the new parent key.
+/// recurses with that key as the new parent key. A blank line is injected
+/// before any key that follows a multi-element list-of-maps so the list
+/// boundary stays visible — the `*` per-element marker disambiguates
+/// element starts but not element *ends* (#2555). The blank is only
+/// inserted when a sibling actually follows, avoiding orphan whitespace
+/// at the end of a block.
 fn format_map_vertical(map: &IndexMap<String, Value>, key_indent_cols: usize) -> String {
     let mut keys: Vec<_> = map.keys().collect();
     keys.sort();
     let key_indent = " ".repeat(key_indent_cols);
     let mut out = String::new();
+    let mut prev_needs_separator = false;
     for k in keys {
         let child_layout = PrettyLayout {
             parent_indent_cols: key_indent_cols,
             key: k,
         };
         let val_str = format_value_pretty(&map[k], child_layout);
+        if prev_needs_separator {
+            out.push('\n');
+        }
+        prev_needs_separator = needs_trailing_separator(&map[k]);
         out.push('\n');
         out.push_str(&key_indent);
         out.push_str(k);
@@ -974,6 +988,17 @@ pub fn is_list_of_maps(value: &Value) -> bool {
     } else {
         false
     }
+}
+
+/// Whether `value` renders to a vertical block whose final line sits at
+/// the element's key column, leaving a sibling key visually attached
+/// to the last element. A blank line should follow such a value before
+/// the next sibling key. Currently only multi-element list-of-maps
+/// matches — a lone element is visually no more ambiguous than a
+/// regular map under the parent key, and skipping the blank for it
+/// avoids noise around common single-statement policies. (#2555)
+pub fn needs_trailing_separator(value: &Value) -> bool {
+    is_list_of_maps(value) && matches!(value, Value::List(items) if items.len() >= 2)
 }
 
 /// Count the number of shared key-value pairs between two map Values.
@@ -2028,9 +2053,11 @@ mod tests {
         };
         let v = Value::List(vec![make("A"), make("B"), make("C")]);
         let out = format_value_pretty(&v, layout(4, "items"));
-        // Exactly N-1 = 2 blank-line separators between three elements,
-        // and no trailing blank that would double-up with the resource
-        // block separator when the list-of-maps is the last attribute.
+        // Exactly N-1 = 2 blank-line separators between three elements.
+        // The trailing blank before the next sibling key (#2555) is
+        // emitted by the parent (`format_map_vertical` /
+        // `display::MapExpanded`), not by this function — so the bare
+        // output contains no trailing whitespace.
         let blank_separators = out.matches("\n\n").count();
         assert_eq!(
             blank_separators, 2,
@@ -2039,6 +2066,61 @@ mod tests {
         assert!(
             !out.ends_with("\n\n"),
             "trailing whitespace must not double the resource block separator: {out:?}"
+        );
+    }
+
+    /// Inside a vertical Map, a multi-element list-of-maps key followed
+    /// by a sibling key gets a blank-line separator so the boundary
+    /// stays visible — the `*` marker disambiguates element starts but
+    /// not element *ends*. The element values are deliberately long to
+    /// force the outer Map to expand vertically rather than render
+    /// inline. (#2555)
+    #[test]
+    fn format_value_pretty_map_with_list_of_maps_then_sibling_separates() {
+        let long = "x".repeat(40);
+        let mut s1 = IndexMap::new();
+        s1.insert("sid_a".to_string(), Value::String(long.clone()));
+        let mut s2 = IndexMap::new();
+        s2.insert("sid_b".to_string(), Value::String(long.clone()));
+        let mut outer = IndexMap::new();
+        outer.insert(
+            "statement".to_string(),
+            Value::List(vec![Value::Map(s1), Value::Map(s2)]),
+        );
+        outer.insert("version".to_string(), Value::String("2012".to_string()));
+        let v = Value::Map(outer);
+        let out = format_value_pretty(&v, layout(2, "config"));
+        // The blank-line MUST sit between the last element's last key
+        // and the sibling `version:` key. Use unique key names so the
+        // assertion can't be satisfied by the inter-element blank
+        // between two `sid:`s.
+        assert!(
+            out.contains(&format!("sid_b: \"{long}\"\n\n")),
+            "blank line must follow last list-of-maps element before sibling: {out:?}"
+        );
+    }
+
+    /// A multi-element list-of-maps that is the LAST key of its parent
+    /// must NOT receive a trailing blank, otherwise the resource-block
+    /// separator above it doubles into two blank lines. (#2555)
+    #[test]
+    fn format_value_pretty_map_with_trailing_list_of_maps_no_orphan_blank() {
+        let long = "x".repeat(40);
+        let mut s1 = IndexMap::new();
+        s1.insert("sid".to_string(), Value::String(long.clone()));
+        let mut s2 = IndexMap::new();
+        s2.insert("sid".to_string(), Value::String(long.clone()));
+        let mut outer = IndexMap::new();
+        outer.insert("version".to_string(), Value::String("2012".to_string()));
+        outer.insert(
+            "statement".to_string(),
+            Value::List(vec![Value::Map(s1), Value::Map(s2)]),
+        );
+        let v = Value::Map(outer);
+        let out = format_value_pretty(&v, layout(2, "config"));
+        assert!(
+            !out.ends_with("\n\n"),
+            "trailing list-of-maps must not leave an orphan blank: {out:?}"
         );
     }
 
