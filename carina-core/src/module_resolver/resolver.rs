@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::parser::{ParsedFile, ProviderContext, UseStatement};
+use crate::parser::{ArgumentParameter, ParsedFile, ProviderContext, UseStatement};
 
 use super::error::ModuleError;
 use super::expander::instance_prefix_for_call;
@@ -174,12 +174,18 @@ impl<'cfg> ModuleResolver<'cfg> {
             return Err(e);
         }
 
-        // Expand the module's own module_calls
+        // Expand the module's own module_calls. Pass the parent module's
+        // argument signature so the inner type-check can resolve any
+        // pass-through arg refs (#2549). The `module_calls` clone is
+        // needed because the loop body extends `parsed.resources` while
+        // iterating; the borrow checker treats the two as one borrow even
+        // though the fields are disjoint.
         let module_calls = parsed.module_calls.clone();
+        let enclosing_args: &[ArgumentParameter] = &parsed.arguments;
         for call in &module_calls {
             let instance_prefix = instance_prefix_for_call(call);
 
-            match self.expand_module_call(call, &instance_prefix) {
+            match self.expand_module_call(call, &instance_prefix, Some(enclosing_args)) {
                 Ok(expanded) => parsed.resources.extend(expanded), // allow: direct — module expansion, handled separately
                 Err(e) => {
                     self.base_dir = original_base_dir;
@@ -225,7 +231,7 @@ pub fn resolve_modules_with_config<E>(
     // Expand module calls
     for call in &parsed.module_calls {
         let instance_prefix = instance_prefix_for_call(call);
-        let expanded = resolver.expand_module_call(call, &instance_prefix)?;
+        let expanded = resolver.expand_module_call(call, &instance_prefix, None)?;
         parsed.resources.extend(expanded); // allow: direct — module expansion, handled separately
     }
 

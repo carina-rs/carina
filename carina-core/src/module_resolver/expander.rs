@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use indexmap::IndexMap;
 
-use crate::parser::ModuleCall;
+use crate::parser::{ArgumentParameter, ModuleCall};
 use crate::resource::{LifecycleConfig, Resource, ResourceId, ResourceKind, ResourceName, Value};
 
 use super::error::ModuleError;
@@ -19,10 +19,18 @@ impl ModuleResolver<'_> {
     /// If the module defines `attributes` and the call has a `binding_name`,
     /// a virtual resource is created to expose the module's attribute values.
     /// The virtual resource has `ResourceKind::Virtual` and is skipped by the differ.
+    ///
+    /// `enclosing_args` is the argument signature of the module the call
+    /// lives inside (`None` for a top-level call). When this call is being
+    /// expanded from inside another module, the inner type-check needs the
+    /// enclosing module's declared types so a pass-through arg ref like
+    /// `inner_arg = outer_arg` can be checked structurally before the
+    /// parent's argument substitution erases the type tag (#2549).
     pub fn expand_module_call(
         &self,
         call: &ModuleCall,
         instance_prefix: &str,
+        enclosing_args: Option<&[ArgumentParameter]>,
     ) -> Result<Vec<Resource>, ModuleError> {
         let module = self
             .imported_modules
@@ -88,6 +96,7 @@ impl ModuleResolver<'_> {
                 &arg.type_expr,
                 value,
                 self.config,
+                enclosing_args,
             )?;
         }
 

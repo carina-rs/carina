@@ -168,7 +168,9 @@ fn test_expand_anonymous_resource_in_named_module_keeps_name_pending() {
         arguments: HashMap::new(),
     };
 
-    let expanded = resolver.expand_module_call(&call, "bootstrap").unwrap();
+    let expanded = resolver
+        .expand_module_call(&call, "bootstrap", None)
+        .unwrap();
     assert_eq!(expanded.len(), 1);
     let policy = &expanded[0];
     assert!(
@@ -208,7 +210,9 @@ fn test_expand_module_call() {
         },
     };
 
-    let expanded = resolver.expand_module_call(&call, "my_instance").unwrap();
+    let expanded = resolver
+        .expand_module_call(&call, "my_instance", None)
+        .unwrap();
     assert_eq!(expanded.len(), 1);
 
     let sg = &expanded[0];
@@ -322,8 +326,10 @@ fn test_multiple_module_instances_no_collision() {
         },
     };
 
-    let expanded_a = resolver.expand_module_call(&call_a, "prod").unwrap();
-    let expanded_b = resolver.expand_module_call(&call_b, "staging").unwrap();
+    let expanded_a = resolver.expand_module_call(&call_a, "prod", None).unwrap();
+    let expanded_b = resolver
+        .expand_module_call(&call_b, "staging", None)
+        .unwrap();
 
     // binding must be prefixed so they don't collide (using dot notation)
     assert_eq!(
@@ -437,7 +443,7 @@ fn test_expand_module_call_creates_virtual_resource() {
         arguments: HashMap::new(),
     };
 
-    let expanded = resolver.expand_module_call(&call, "web").unwrap();
+    let expanded = resolver.expand_module_call(&call, "web", None).unwrap();
     // 1 real resource + 1 virtual resource
     assert_eq!(expanded.len(), 2);
 
@@ -486,7 +492,9 @@ fn test_expand_module_call_without_binding_no_virtual() {
         arguments: HashMap::new(),
     };
 
-    let expanded = resolver.expand_module_call(&call, "web_tier").unwrap();
+    let expanded = resolver
+        .expand_module_call(&call, "web_tier", None)
+        .unwrap();
     // Only real resources, no virtual
     let virtual_count = expanded.iter().filter(|r| r.is_virtual()).count();
     assert_eq!(virtual_count, 0);
@@ -964,7 +972,7 @@ fn test_missing_required_argument() {
         arguments: HashMap::new(), // Missing vpc_id
     };
 
-    let result = resolver.expand_module_call(&call, "my_instance");
+    let result = resolver.expand_module_call(&call, "my_instance", None);
     assert!(matches!(result, Err(ModuleError::MissingArgument { .. })));
 }
 
@@ -987,7 +995,9 @@ fn test_expand_module_call_uses_dot_path_addressing() {
         },
     };
 
-    let expanded = resolver.expand_module_call(&call, "my_instance").unwrap();
+    let expanded = resolver
+        .expand_module_call(&call, "my_instance", None)
+        .unwrap();
     assert_eq!(expanded.len(), 1);
 
     let sg = &expanded[0];
@@ -1014,7 +1024,7 @@ fn test_module_dot_path_bindings_and_refs() {
         },
     };
 
-    let expanded = resolver.expand_module_call(&call, "prod").unwrap();
+    let expanded = resolver.expand_module_call(&call, "prod", None).unwrap();
 
     // Resource names should use dot notation
     assert_eq!(expanded[0].id.name_str(), "prod.main_vpc");
@@ -1050,7 +1060,7 @@ fn test_module_virtual_resource_dot_path_refs() {
         arguments: HashMap::new(),
     };
 
-    let expanded = resolver.expand_module_call(&call, "web").unwrap();
+    let expanded = resolver.expand_module_call(&call, "web", None).unwrap();
 
     let virtual_res = expanded
         .iter()
@@ -1122,7 +1132,7 @@ fn test_unknown_argument_rejected() {
         },
     };
 
-    let result = resolver.expand_module_call(&call, "my_instance");
+    let result = resolver.expand_module_call(&call, "my_instance", None);
     assert!(
         matches!(result, Err(ModuleError::UnknownArgument { .. })),
         "Expected UnknownArgument error, got {:?}",
@@ -1255,7 +1265,7 @@ fn test_expand_module_call_with_interpolation() {
         },
     };
 
-    let expanded = resolver.expand_module_call(&call, "dev_vpc").unwrap();
+    let expanded = resolver.expand_module_call(&call, "dev_vpc", None).unwrap();
     assert_eq!(expanded.len(), 1);
 
     let vpc = &expanded[0];
@@ -1394,7 +1404,7 @@ fn test_expand_module_call_with_function_call_argument() {
         },
     };
 
-    let expanded = resolver.expand_module_call(&call, "dev_vpc").unwrap();
+    let expanded = resolver.expand_module_call(&call, "dev_vpc", None).unwrap();
     assert_eq!(expanded.len(), 1);
 
     let vpc = &expanded[0];
@@ -1568,7 +1578,7 @@ fn test_argument_validation_passes_with_valid_value() {
         },
     };
 
-    let result = resolver.expand_module_call(&call, "web");
+    let result = resolver.expand_module_call(&call, "web", None);
     assert!(result.is_ok());
 }
 
@@ -1589,7 +1599,7 @@ fn test_argument_validation_passes_with_default_value() {
         arguments: HashMap::new(), // Uses default 8080
     };
 
-    let result = resolver.expand_module_call(&call, "web");
+    let result = resolver.expand_module_call(&call, "web", None);
     assert!(result.is_ok());
 }
 
@@ -1614,7 +1624,7 @@ fn test_argument_validation_fails_with_invalid_value() {
         },
     };
 
-    let result = resolver.expand_module_call(&call, "web");
+    let result = resolver.expand_module_call(&call, "web", None);
     assert!(result.is_err());
     let err = result.unwrap_err();
     match err {
@@ -1654,7 +1664,7 @@ fn test_argument_validation_fails_with_negative_value() {
         },
     };
 
-    let result = resolver.expand_module_call(&call, "web");
+    let result = resolver.expand_module_call(&call, "web", None);
     assert!(result.is_err());
 }
 
@@ -1679,7 +1689,7 @@ fn test_argument_validation_fails_too_large() {
         },
     };
 
-    let result = resolver.expand_module_call(&call, "web");
+    let result = resolver.expand_module_call(&call, "web", None);
     assert!(result.is_err());
 }
 
@@ -1734,7 +1744,7 @@ fn test_argument_validation_no_message_uses_default() {
         },
     };
 
-    let result = resolver.expand_module_call(&call, "c");
+    let result = resolver.expand_module_call(&call, "c", None);
     assert!(result.is_err());
     let err = result.unwrap_err();
     match err {
@@ -1802,7 +1812,7 @@ fn test_argument_validation_len_with_list() {
             args
         },
     };
-    assert!(resolver.expand_module_call(&call, "t").is_ok());
+    assert!(resolver.expand_module_call(&call, "t", None).is_ok());
 
     // Invalid: empty list
     let call = ModuleCall {
@@ -1814,7 +1824,7 @@ fn test_argument_validation_len_with_list() {
             args
         },
     };
-    let result = resolver.expand_module_call(&call, "t");
+    let result = resolver.expand_module_call(&call, "t", None);
     assert!(result.is_err());
     match result.unwrap_err() {
         ModuleError::ArgumentValidationFailed { message, .. } => {
@@ -1896,7 +1906,7 @@ fn test_require_block_passes() {
             args
         },
     };
-    assert!(resolver.expand_module_call(&call, "w").is_ok());
+    assert!(resolver.expand_module_call(&call, "w", None).is_ok());
 }
 
 #[test]
@@ -1962,7 +1972,7 @@ fn test_require_block_fails_with_not_expr() {
             args
         },
     };
-    let result = resolver.expand_module_call(&call, "w");
+    let result = resolver.expand_module_call(&call, "w", None);
     assert!(result.is_err());
     match result.unwrap_err() {
         ModuleError::RequireConstraintFailed { message, .. } => {
@@ -2033,7 +2043,7 @@ fn test_require_block_len_function() {
             args
         },
     };
-    assert!(resolver.expand_module_call(&call, "lb").is_ok());
+    assert!(resolver.expand_module_call(&call, "lb", None).is_ok());
 
     // One subnet: should fail
     let call = ModuleCall {
@@ -2048,7 +2058,7 @@ fn test_require_block_len_function() {
             args
         },
     };
-    let result = resolver.expand_module_call(&call, "lb");
+    let result = resolver.expand_module_call(&call, "lb", None);
     assert!(result.is_err());
     match result.unwrap_err() {
         ModuleError::RequireConstraintFailed { message, .. } => {
@@ -2120,7 +2130,7 @@ fn test_require_block_multiple_constraints() {
             args
         },
     };
-    assert!(resolver.expand_module_call(&call, "a").is_ok());
+    assert!(resolver.expand_module_call(&call, "a", None).is_ok());
 
     // min_size > max_size: should fail
     let call = ModuleCall {
@@ -2133,7 +2143,7 @@ fn test_require_block_multiple_constraints() {
             args
         },
     };
-    let result = resolver.expand_module_call(&call, "a");
+    let result = resolver.expand_module_call(&call, "a", None);
     assert!(result.is_err());
     match result.unwrap_err() {
         ModuleError::RequireConstraintFailed { message, .. } => {
@@ -2163,7 +2173,7 @@ fn test_argument_type_mismatch_int_for_string() {
         },
     };
 
-    let result = resolver.expand_module_call(&call, "my_instance");
+    let result = resolver.expand_module_call(&call, "my_instance", None);
     assert!(
         matches!(result, Err(ModuleError::InvalidArgumentType { .. })),
         "Expected InvalidArgumentType error, got {:?}",
@@ -2195,7 +2205,7 @@ fn test_argument_type_mismatch_string_for_bool() {
         },
     };
 
-    let result = resolver.expand_module_call(&call, "my_instance");
+    let result = resolver.expand_module_call(&call, "my_instance", None);
     assert!(
         matches!(result, Err(ModuleError::InvalidArgumentType { .. })),
         "Expected InvalidArgumentType error, got {:?}",
@@ -2254,7 +2264,7 @@ fn test_argument_type_custom_validator() {
             args
         },
     };
-    assert!(resolver.expand_module_call(&call, "a").is_ok());
+    assert!(resolver.expand_module_call(&call, "a", None).is_ok());
 
     // Invalid ARN fails
     let call_bad = ModuleCall {
@@ -2269,7 +2279,7 @@ fn test_argument_type_custom_validator() {
             args
         },
     };
-    let result = resolver.expand_module_call(&call_bad, "b");
+    let result = resolver.expand_module_call(&call_bad, "b", None);
     assert!(
         matches!(result, Err(ModuleError::InvalidArgumentType { .. })),
         "Expected InvalidArgumentType error for invalid ARN, got {:?}",
@@ -2330,7 +2340,7 @@ fn test_argument_type_list_of_custom_type() {
             args
         },
     };
-    assert!(resolver.expand_module_call(&call, "a").is_ok());
+    assert!(resolver.expand_module_call(&call, "a", None).is_ok());
 
     // List with invalid ARN fails
     let call_bad = ModuleCall {
@@ -2348,7 +2358,7 @@ fn test_argument_type_list_of_custom_type() {
             args
         },
     };
-    let result = resolver.expand_module_call(&call_bad, "b");
+    let result = resolver.expand_module_call(&call_bad, "b", None);
     assert!(
         matches!(result, Err(ModuleError::InvalidArgumentType { .. })),
         "Expected InvalidArgumentType for list with invalid ARN, got {:?}",
@@ -2765,4 +2775,507 @@ fn test_load_module_directory_merge_order_is_deterministic() {
     );
 
     let _ = fs::remove_dir_all(&tmp_dir);
+}
+
+/// Regression for #2549: a `list(String)` argument forwarded unchanged
+/// from an outer (usecase) module to an inner module call must type-check.
+#[test]
+fn test_list_argument_passthrough_between_modules() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Inner module: declares a list(String) argument.
+    let inner_dir = tmp.path().join("modules/github_oidc");
+    fs::create_dir_all(&inner_dir).unwrap();
+    fs::write(
+        inner_dir.join("main.crn"),
+        r#"
+arguments {
+  github_repo:      String
+  subject_patterns: list(String) = ["repo:${github_repo}:*"]
+}
+
+let role = awscc.iam.Role {
+  role_name = github_repo
+  assume_role_policy_document = {}
+}
+"#,
+    )
+    .unwrap();
+
+    // Outer (usecase) module: receives the same list(String) and forwards
+    // it unchanged to the inner module.
+    let outer_dir = tmp.path().join("usecases/bootstrap");
+    fs::create_dir_all(&outer_dir).unwrap();
+    fs::write(
+        outer_dir.join("main.crn"),
+        r#"
+arguments {
+  github_repo:      String
+  subject_patterns: list(String) = [
+    'repo:carina-rs/infra:ref:refs/heads/main',
+    'repo:carina-rs/infra:pull_request',
+  ]
+}
+
+let github = use {
+  source = '../../modules/github_oidc'
+}
+
+let bootstrap = github {
+  github_repo      = github_repo
+  subject_patterns = subject_patterns
+}
+"#,
+    )
+    .unwrap();
+
+    // Caller of the usecase.
+    let root_dir = tmp.path().join("root");
+    fs::create_dir_all(&root_dir).unwrap();
+    fs::write(
+        root_dir.join("main.crn"),
+        r#"
+let bootstrap = use {
+  source = '../usecases/bootstrap'
+}
+
+let prod = bootstrap {
+  github_repo = 'carina-rs/infra'
+}
+"#,
+    )
+    .unwrap();
+
+    let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
+    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    resolve_modules(&mut parsed, &root_dir)
+        .expect("list(String) should flow through usecase to inner module");
+}
+
+/// Real infra shape: `let subjects = subject_patterns` rebinding before
+/// pass-through. The forwarded value's binding name is `subjects`, not
+/// `subject_patterns`, so the arg-table lookup must follow the alias.
+#[test]
+fn test_list_passthrough_through_let_alias() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let inner_dir = tmp.path().join("modules/github_oidc");
+    fs::create_dir_all(&inner_dir).unwrap();
+    fs::write(
+        inner_dir.join("main.crn"),
+        r#"
+arguments {
+  patterns: list(String)
+}
+
+let role = awscc.iam.Role {
+  role_name = 'r'
+  assume_role_policy_document = {}
+}
+"#,
+    )
+    .unwrap();
+
+    let outer_dir = tmp.path().join("usecases/outer");
+    fs::create_dir_all(&outer_dir).unwrap();
+    fs::write(
+        outer_dir.join("main.crn"),
+        r#"
+arguments {
+  subject_patterns: list(String) = [
+    'repo:carina-rs/infra:ref:refs/heads/main',
+  ]
+}
+
+let github = use {
+  source = '../../modules/github_oidc'
+}
+
+let subjects = subject_patterns
+let bound = github {
+  patterns = subjects
+}
+"#,
+    )
+    .unwrap();
+
+    let root_dir = tmp.path().join("root");
+    fs::create_dir_all(&root_dir).unwrap();
+    fs::write(
+        root_dir.join("main.crn"),
+        r#"
+let outer = use {
+  source = '../usecases/outer'
+}
+
+let prod = outer {}
+"#,
+    )
+    .unwrap();
+
+    let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
+    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    resolve_modules(&mut parsed, &root_dir)
+        .expect("list(String) via let alias should pass-through to inner module");
+}
+
+/// Same shape as the list-pass-through test but for `map(String)`. The fix
+/// has to cover every container type, not only list — root cause is shared.
+#[test]
+fn test_map_argument_passthrough_between_modules() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let inner_dir = tmp.path().join("modules/inner");
+    fs::create_dir_all(&inner_dir).unwrap();
+    fs::write(
+        inner_dir.join("main.crn"),
+        r#"
+arguments {
+  tags: map(String)
+}
+
+let role = awscc.iam.Role {
+  role_name = 'r'
+  assume_role_policy_document = {}
+}
+"#,
+    )
+    .unwrap();
+
+    let outer_dir = tmp.path().join("usecases/outer");
+    fs::create_dir_all(&outer_dir).unwrap();
+    fs::write(
+        outer_dir.join("main.crn"),
+        r#"
+arguments {
+  tags: map(String) = { env = 'prod' }
+}
+
+let inner = use {
+  source = '../../modules/inner'
+}
+
+let bound = inner {
+  tags = tags
+}
+"#,
+    )
+    .unwrap();
+
+    let root_dir = tmp.path().join("root");
+    fs::create_dir_all(&root_dir).unwrap();
+    fs::write(
+        root_dir.join("main.crn"),
+        r#"
+let outer = use {
+  source = '../usecases/outer'
+}
+
+let prod = outer {}
+"#,
+    )
+    .unwrap();
+
+    let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
+    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    resolve_modules(&mut parsed, &root_dir)
+        .expect("map(String) should flow through usecase to inner module");
+}
+
+/// A `String`-typed outer arg forwarded into a `list(String)` inner arg
+/// is a type mismatch and must be rejected at the inner call site, even
+/// though the inner call typechecks before the parent's arg substitution
+/// runs. The inner typecheck looks the ref up in the enclosing module's
+/// argument signatures and compares declared types.
+#[test]
+fn test_mismatched_argument_passthrough_is_rejected() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let inner_dir = tmp.path().join("modules/inner");
+    fs::create_dir_all(&inner_dir).unwrap();
+    fs::write(
+        inner_dir.join("main.crn"),
+        r#"
+arguments {
+  patterns: list(String)
+}
+
+let role = awscc.iam.Role {
+  role_name = 'r'
+  assume_role_policy_document = {}
+}
+"#,
+    )
+    .unwrap();
+
+    let outer_dir = tmp.path().join("usecases/outer");
+    fs::create_dir_all(&outer_dir).unwrap();
+    fs::write(
+        outer_dir.join("main.crn"),
+        r#"
+arguments {
+  s: String
+}
+
+let inner = use {
+  source = '../../modules/inner'
+}
+
+let bound = inner {
+  patterns = s
+}
+"#,
+    )
+    .unwrap();
+
+    let root_dir = tmp.path().join("root");
+    fs::create_dir_all(&root_dir).unwrap();
+    fs::write(
+        root_dir.join("main.crn"),
+        r#"
+let outer = use {
+  source = '../usecases/outer'
+}
+
+let prod = outer {
+  s = 'hello'
+}
+"#,
+    )
+    .unwrap();
+
+    let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
+    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let result = resolve_modules(&mut parsed, &root_dir);
+    assert!(
+        matches!(&result, Err(ModuleError::InvalidArgumentType { .. })),
+        "String forwarded to list(String) should be rejected, got {:?}",
+        result
+    );
+}
+
+/// Cross-scalar mismatch (Int → String) on a pass-through arg ref must
+/// also be rejected — exercises `type_expr_compatible` on plain scalars,
+/// which the list/map cases don't cover.
+#[test]
+fn test_int_argument_forwarded_to_string_arg_is_rejected() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let inner_dir = tmp.path().join("modules/inner");
+    fs::create_dir_all(&inner_dir).unwrap();
+    fs::write(
+        inner_dir.join("main.crn"),
+        r#"
+arguments {
+  name: String
+}
+
+let role = awscc.iam.Role {
+  role_name = name
+  assume_role_policy_document = {}
+}
+"#,
+    )
+    .unwrap();
+
+    let outer_dir = tmp.path().join("usecases/outer");
+    fs::create_dir_all(&outer_dir).unwrap();
+    fs::write(
+        outer_dir.join("main.crn"),
+        r#"
+arguments {
+  count: Int
+}
+
+let inner = use {
+  source = '../../modules/inner'
+}
+
+let bound = inner {
+  name = count
+}
+"#,
+    )
+    .unwrap();
+
+    let root_dir = tmp.path().join("root");
+    fs::create_dir_all(&root_dir).unwrap();
+    fs::write(
+        root_dir.join("main.crn"),
+        r#"
+let outer = use {
+  source = '../usecases/outer'
+}
+
+let prod = outer {
+  count = 3
+}
+"#,
+    )
+    .unwrap();
+
+    let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
+    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let result = resolve_modules(&mut parsed, &root_dir);
+    assert!(
+        matches!(&result, Err(ModuleError::InvalidArgumentType { .. })),
+        "Int forwarded to String should be rejected, got {:?}",
+        result
+    );
+}
+
+/// Pass-through where the inner element type itself differs (`list(Int)`
+/// → `list(String)`) must reject — exercises the recursive `(List, List)`
+/// arm of `type_expr_compatible` rather than the top-level container
+/// shape.
+#[test]
+fn test_list_inner_element_mismatch_is_rejected() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let inner_dir = tmp.path().join("modules/inner");
+    fs::create_dir_all(&inner_dir).unwrap();
+    fs::write(
+        inner_dir.join("main.crn"),
+        r#"
+arguments {
+  patterns: list(String)
+}
+
+let role = awscc.iam.Role {
+  role_name = 'r'
+  assume_role_policy_document = {}
+}
+"#,
+    )
+    .unwrap();
+
+    let outer_dir = tmp.path().join("usecases/outer");
+    fs::create_dir_all(&outer_dir).unwrap();
+    fs::write(
+        outer_dir.join("main.crn"),
+        r#"
+arguments {
+  numbers: list(Int)
+}
+
+let inner = use {
+  source = '../../modules/inner'
+}
+
+let bound = inner {
+  patterns = numbers
+}
+"#,
+    )
+    .unwrap();
+
+    let root_dir = tmp.path().join("root");
+    fs::create_dir_all(&root_dir).unwrap();
+    fs::write(
+        root_dir.join("main.crn"),
+        r#"
+let outer = use {
+  source = '../usecases/outer'
+}
+
+let prod = outer {
+  numbers = [1, 2, 3]
+}
+"#,
+    )
+    .unwrap();
+
+    let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
+    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let result = resolve_modules(&mut parsed, &root_dir);
+    assert!(
+        matches!(&result, Err(ModuleError::InvalidArgumentType { .. })),
+        "list(Int) forwarded to list(String) should be rejected, got {:?}",
+        result
+    );
+}
+
+/// Three-deep pass-through: outer → middle → inner all forwarding the
+/// same `list(String)` arg. Each enclosing scope contributes its own
+/// arg signature; the chain must hold across both module-call hops.
+#[test]
+fn test_list_passthrough_three_levels_deep() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let inner_dir = tmp.path().join("modules/inner");
+    fs::create_dir_all(&inner_dir).unwrap();
+    fs::write(
+        inner_dir.join("main.crn"),
+        r#"
+arguments {
+  patterns: list(String)
+}
+
+let role = awscc.iam.Role {
+  role_name = 'r'
+  assume_role_policy_document = {}
+}
+"#,
+    )
+    .unwrap();
+
+    let middle_dir = tmp.path().join("modules/middle");
+    fs::create_dir_all(&middle_dir).unwrap();
+    fs::write(
+        middle_dir.join("main.crn"),
+        r#"
+arguments {
+  patterns: list(String)
+}
+
+let inner = use {
+  source = '../inner'
+}
+
+let bound = inner {
+  patterns = patterns
+}
+"#,
+    )
+    .unwrap();
+
+    let outer_dir = tmp.path().join("usecases/outer");
+    fs::create_dir_all(&outer_dir).unwrap();
+    fs::write(
+        outer_dir.join("main.crn"),
+        r#"
+arguments {
+  patterns: list(String)
+}
+
+let middle = use {
+  source = '../../modules/middle'
+}
+
+let bound = middle {
+  patterns = patterns
+}
+"#,
+    )
+    .unwrap();
+
+    let root_dir = tmp.path().join("root");
+    fs::create_dir_all(&root_dir).unwrap();
+    fs::write(
+        root_dir.join("main.crn"),
+        r#"
+let outer = use {
+  source = '../usecases/outer'
+}
+
+let prod = outer {
+  patterns = ['a', 'b']
+}
+"#,
+    )
+    .unwrap();
+
+    let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
+    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    resolve_modules(&mut parsed, &root_dir).expect("3-deep list pass-through should resolve");
 }
