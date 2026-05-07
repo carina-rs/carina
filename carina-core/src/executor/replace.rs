@@ -112,8 +112,16 @@ pub(super) async fn execute_cbd_replace_parallel(
                     }
                 };
                 let cascade_identifier = cascade.from.identifier.as_deref().unwrap_or("");
+                let cascade_changed =
+                    super::basic::compute_changed_attributes(&cascade.from, &resolved_to);
                 match provider
-                    .update(&cascade.id, cascade_identifier, &cascade.from, &resolved_to)
+                    .update(
+                        &cascade.id,
+                        cascade_identifier,
+                        &cascade.from,
+                        &resolved_to,
+                        &cascade_changed,
+                    )
                     .await
                 {
                     Ok(cascade_state) => {
@@ -172,8 +180,9 @@ pub(super) async fn execute_cbd_replace_parallel(
                             temp.attribute.clone(),
                             Value::String(temp.original_value.clone()),
                         );
+                        let rename_changed = vec![temp.attribute.clone()];
                         match provider
-                            .update(ctx.id, new_identifier, &state, &rename_to)
+                            .update(ctx.id, new_identifier, &state, &rename_to, &rename_changed)
                             .await
                         {
                             Ok(renamed_state) => {

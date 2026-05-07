@@ -102,13 +102,23 @@ pub trait CarinaProvider {
     /// Create a new resource.
     fn create(&self, resource: &Resource) -> Result<State, ProviderError>;
 
-    /// Update an existing resource.
+    /// Update an existing resource toward the desired `to` state.
+    ///
+    /// `changed_attributes` is the set of attribute keys the user explicitly
+    /// intends to add, replace, or remove on this update; fields not in this
+    /// list MUST be left untouched by the provider. Computed by the host
+    /// from the user's current desired configuration vs. the previously
+    /// recorded desired configuration in state. Providers that build
+    /// partial-update payloads (e.g. CloudControl JSON Patch) MUST gate
+    /// their patch operations on this list rather than comparing `from`
+    /// and `to` directly.
     fn update(
         &self,
         id: &ResourceId,
         identifier: &str,
         from: &State,
         to: &Resource,
+        changed_attributes: &[String],
     ) -> Result<State, ProviderError>;
 
     /// Delete an existing resource.
@@ -295,7 +305,13 @@ fn dispatch(provider: &mut impl CarinaProvider, request: &Request) -> Response {
                 Ok(p) => p,
                 Err(e) => return Response::error(id, -32602, e),
             };
-            match provider.update(&params.id, &params.identifier, &params.from, &params.to) {
+            match provider.update(
+                &params.id,
+                &params.identifier,
+                &params.from,
+                &params.to,
+                &params.changed_attributes,
+            ) {
                 Ok(state) => Response::success(id, methods::UpdateResult { state }),
                 Err(e) => Response::error(id, -1, e.message),
             }

@@ -316,6 +316,7 @@ macro_rules! export_provider {
                     identifier: String,
                     current: wit_types::State,
                     to: wit_types::ResourceDef,
+                    changed_attributes: Vec<String>,
                 ) -> Result<wit_types::State, String> {
                     let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
@@ -327,6 +328,7 @@ macro_rules! export_provider {
                         &identifier,
                         &proto_from,
                         &proto_to,
+                        &changed_attributes,
                     ) {
                         Ok(state) => Ok(proto_to_wit_state(&state)),
                         Err(e) => Err(serde_json::to_string(&e).unwrap_or_else(|_| e.message.clone())),
@@ -679,6 +681,7 @@ macro_rules! export_provider {
                     identifier: String,
                     current: wit_types::State,
                     to: wit_types::ResourceDef,
+                    changed_attributes: Vec<String>,
                 ) -> Result<wit_types::State, String> {
                     let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
@@ -690,6 +693,7 @@ macro_rules! export_provider {
                         &identifier,
                         &proto_from,
                         &proto_to,
+                        &changed_attributes,
                     ) {
                         Ok(state) => Ok(proto_to_wit_state(&state)),
                         Err(e) => Err(serde_json::to_string(&e).unwrap_or_else(|_| e.message.clone())),

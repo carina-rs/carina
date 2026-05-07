@@ -156,8 +156,15 @@ async fn test_wasm_mock_provider_update_and_delete() {
         ("size".into(), Value::Int(20)),
     ]);
 
+    let changed_attributes = vec!["color".to_string(), "size".to_string()];
     let updated = provider
-        .update(&id, "mock-id", &created, &updated_resource)
+        .update(
+            &id,
+            "mock-id",
+            &created,
+            &updated_resource,
+            &changed_attributes,
+        )
         .await
         .expect("update should succeed");
     assert_eq!(
@@ -165,6 +172,37 @@ async fn test_wasm_mock_provider_update_and_delete() {
         Some(&Value::String("blue".into()))
     );
     assert_eq!(updated.attributes.get("size"), Some(&Value::Int(20)));
+
+    // Issue #2565: the host MUST forward `changed_attributes` to the wasm
+    // guest verbatim (preserving order). The mock guest echoes the value it
+    // received back into state under the `__mock_changed_attributes__` key
+    // so this test can prove the WIT round-trip.
+    let echoed = updated
+        .attributes
+        .get("__mock_changed_attributes__")
+        .expect("mock should echo changed_attributes back into state");
+    assert_eq!(
+        echoed,
+        &Value::List(vec![
+            Value::String("color".into()),
+            Value::String("size".into()),
+        ]),
+        "wasm guest must observe the same list (and order) the host passed in"
+    );
+
+    // Empty `changed_attributes` must also round-trip (signals "nothing
+    // changed"; provider should leave the resource untouched). Verifies the
+    // host->guest channel does not silently drop empty vecs.
+    let empty_changed: Vec<String> = Vec::new();
+    let updated_empty = provider
+        .update(&id, "mock-id", &created, &updated_resource, &empty_changed)
+        .await
+        .expect("update with empty changed_attributes should succeed");
+    assert_eq!(
+        updated_empty.attributes.get("__mock_changed_attributes__"),
+        Some(&Value::List(Vec::new())),
+        "empty list semantics must be preserved across the WIT boundary"
+    );
 
     // Read to verify update persisted in memory
     let read_state = provider

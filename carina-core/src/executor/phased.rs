@@ -564,12 +564,17 @@ pub(super) async fn execute_effects_phased(
                                         };
                                     let cascade_identifier =
                                         cascade.from.identifier.as_deref().unwrap_or("");
+                                    let cascade_changed = super::basic::compute_changed_attributes(
+                                        &cascade.from,
+                                        &resolved_to,
+                                    );
                                     match provider
                                         .update(
                                             &cascade.id,
                                             cascade_identifier,
                                             &cascade.from,
                                             &resolved_to,
+                                            &cascade_changed,
                                         )
                                         .await
                                     {
@@ -984,8 +989,15 @@ pub(super) async fn execute_effects_phased(
                                     temp.attribute.clone(),
                                     Value::String(temp.original_value.clone()),
                                 );
+                                let rename_changed = vec![temp.attribute.clone()];
                                 match provider
-                                    .update(&id, new_identifier, &state, &rename_to)
+                                    .update(
+                                        &id,
+                                        new_identifier,
+                                        &state,
+                                        &rename_to,
+                                        &rename_changed,
+                                    )
                                     .await
                                 {
                                     Ok(renamed_state) => {

@@ -108,6 +108,7 @@ impl Provider for MockProvider {
         _identifier: &str,
         _from: &State,
         to: &Resource,
+        _changed_attributes: &[String],
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id = id.clone();
         let to = to.clone();

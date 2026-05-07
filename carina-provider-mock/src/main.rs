@@ -98,15 +98,30 @@ impl CarinaProvider for MockProcessProvider {
         _identifier: &str,
         _from: &State,
         to: &Resource,
+        changed_attributes: &[String],
     ) -> Result<State, ProviderError> {
         let mut states = self.states.lock().unwrap();
         let key = Self::resource_key(id);
         states.insert(key, to.attributes.clone());
 
+        // Echo the host-supplied `changed_attributes` back into state under a
+        // sentinel key so integration tests can verify the WIT round-trip
+        // (host -> guest -> host) preserves order and empty-vec semantics.
+        let mut attributes = to.attributes.clone();
+        attributes.insert(
+            "__mock_changed_attributes__".to_string(),
+            Value::List(
+                changed_attributes
+                    .iter()
+                    .map(|s| Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+
         Ok(State {
             id: id.clone(),
             identifier: Some("mock-id".into()),
-            attributes: to.attributes.clone(),
+            attributes,
             exists: true,
         })
     }

@@ -478,16 +478,17 @@ impl WasmBindings {
         identifier: &str,
         from: &wit_types::State,
         to: &wit_types::ResourceDef,
+        changed_attributes: &[String],
     ) -> wasmtime::Result<Result<wit_types::State, String>> {
         match self {
             WasmBindings::Basic(b) => {
                 b.carina_provider_provider()
-                    .call_update(store, id, identifier, from, to)
+                    .call_update(store, id, identifier, from, to, changed_attributes)
                     .await
             }
             WasmBindings::Http(b) => {
                 b.carina_provider_provider()
-                    .call_update(store, id, identifier, from, to)
+                    .call_update(store, id, identifier, from, to, changed_attributes)
                     .await
             }
         }
@@ -1431,6 +1432,7 @@ impl Provider for WasmProvider {
         identifier: &str,
         from: &State,
         to: &Resource,
+        changed_attributes: &[String],
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let wit_id = wasm_convert::core_to_wit_resource_id(id);
         let identifier = identifier.to_string();
@@ -1442,6 +1444,7 @@ impl Provider for WasmProvider {
             Ok(v) => v,
             Err(e) => return early_provider_err(e),
         };
+        let changed_attributes = changed_attributes.to_vec();
         let id = id.clone();
         Box::pin(async move {
             let mut store = self.instance.store.lock().await;
@@ -1449,7 +1452,14 @@ impl Provider for WasmProvider {
             let result = self
                 .instance
                 .bindings
-                .call_update(&mut store, &wit_id, &identifier, &wit_from, &wit_to)
+                .call_update(
+                    &mut store,
+                    &wit_id,
+                    &identifier,
+                    &wit_from,
+                    &wit_to,
+                    &changed_attributes,
+                )
                 .await
                 .map_err(|e| {
                     let msg = format!("{e}");

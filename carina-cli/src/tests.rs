@@ -84,6 +84,7 @@ impl Provider for TestProvider {
         _identifier: &str,
         _from: &State,
         _to: &Resource,
+        _changed_attributes: &[String],
     ) -> BoxFuture<'_, ProviderResult<State>> {
         Box::pin(async { Err(ProviderError::new("unexpected update")) })
     }
@@ -1596,6 +1597,7 @@ impl Provider for RecordingProvider {
         _identifier: &str,
         _from: &State,
         to: &Resource,
+        _changed_attributes: &[String],
     ) -> BoxFuture<'_, ProviderResult<State>> {
         self.update_calls
             .lock()
@@ -1649,6 +1651,7 @@ impl Provider for RenameFailProvider {
         _identifier: &str,
         _from: &State,
         _to: &Resource,
+        _changed_attributes: &[String],
     ) -> BoxFuture<'_, ProviderResult<State>> {
         Box::pin(async { Err(ProviderError::new("rename failed: API error")) })
     }

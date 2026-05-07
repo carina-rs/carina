@@ -13,6 +13,41 @@ use crate::resource::{Resource, ResourceId, State, Value};
 
 use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
 
+/// Compute the list of attribute keys that differ between `from` (current
+/// recorded state) and `to` (desired resource).
+///
+/// Used by cascading-update and rename code paths inside the executor where
+/// the planner did not pre-compute a `changed_attributes` list (because these
+/// updates are derived at apply time, not at plan time). Mirrors the differ's
+/// behaviour conservatively: any key present in only one side, or whose value
+/// differs by `PartialEq`, is reported as changed.
+///
+/// The differ's plan-time `find_changed_attributes` is more precise (it
+/// excludes provider-returned computed fields by consulting `prev_desired_keys`),
+/// but cascade/rename inputs do not carry that history; falling back to a
+/// straight key-by-key comparison is correct for the apply-time signal we
+/// actually have.
+pub(super) fn compute_changed_attributes(from: &State, to: &Resource) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let to_attrs = &to.attributes;
+    let from_attrs = &from.attributes;
+
+    for (key, to_value) in to_attrs.iter() {
+        match from_attrs.get(key) {
+            Some(from_value) if from_value == to_value => {}
+            _ => out.push(key.clone()),
+        }
+    }
+    for key in from_attrs.keys() {
+        if !to_attrs.contains_key(key) {
+            out.push(key.clone());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Result of executing a basic effect (Create, Update, or Delete).
 ///
 /// This is the shared result type used by `execute_basic_effect` to avoid
@@ -261,7 +296,12 @@ pub(super) async fn execute_basic_effect<'a>(
                 }
             }
         }
-        Effect::Update { id, from, to, .. } => {
+        Effect::Update {
+            id,
+            from,
+            to,
+            changed_attributes,
+        } => {
             let resolve_source = unresolved.get(id).unwrap_or(to);
             let resolved_to = match resolve_resource_with_source(to, resolve_source, bindings) {
                 Ok(r) => r,
@@ -279,7 +319,10 @@ pub(super) async fn execute_basic_effect<'a>(
                 }
             };
             let identifier = from.identifier.as_deref().unwrap_or("");
-            match provider.update(id, identifier, from, &resolved_to).await {
+            match provider
+                .update(id, identifier, from, &resolved_to, changed_attributes)
+                .await
+            {
                 Ok(state) => {
                     observer.on_event(&ExecutionEvent::EffectSucceeded {
                         effect,

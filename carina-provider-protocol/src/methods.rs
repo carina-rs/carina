@@ -76,6 +76,11 @@ pub struct UpdateParams {
     pub identifier: String,
     pub from: State,
     pub to: Resource,
+    /// Attribute keys the user explicitly intends to add, replace, or remove
+    /// on this update. Fields not in this list MUST be left untouched by the
+    /// provider. See `Provider::update` doc-comment for the full contract.
+    #[serde(default)]
+    pub changed_attributes: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

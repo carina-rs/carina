@@ -92,6 +92,7 @@ impl Provider for MockProvider {
         _identifier: &str,
         _from: &State,
         _to: &Resource,
+        _changed_attributes: &[String],
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id_str = id.to_string();
         self.call_log
@@ -886,6 +887,7 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
             _identifier: &str,
             _from: &State,
             _to: &Resource,
+            _changed_attributes: &[String],
         ) -> BoxFuture<'_, ProviderResult<State>> {
             Box::pin(async { Err(ProviderError::new("not implemented")) })
         }
@@ -1309,6 +1311,7 @@ impl Provider for RecordingMockProvider {
         _identifier: &str,
         _from: &State,
         _to: &Resource,
+        _changed_attributes: &[String],
     ) -> BoxFuture<'_, ProviderResult<State>> {
         Box::pin(async { Err(ProviderError::new("not implemented")) })
     }

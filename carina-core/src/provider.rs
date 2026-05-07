@@ -131,15 +131,26 @@ pub trait Provider: Send + Sync {
     /// Returns State with identifier set to the AWS internal ID (e.g., vpc-xxx)
     fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>>;
 
-    /// Update a resource
+    /// Update a resource toward the desired `to` state.
     ///
-    /// The identifier is the AWS internal ID (e.g., vpc-xxx)
+    /// The identifier is the cloud-side internal ID (e.g., `vpc-xxx`).
+    ///
+    /// `changed_attributes` is the set of attribute keys the user explicitly
+    /// intends to add, replace, or remove on this update; fields not in this
+    /// list MUST be left untouched by the provider. The list is computed by
+    /// the differ from the user's current desired configuration vs. the
+    /// previously-recorded desired configuration in state, so it excludes
+    /// provider-returned computed fields and fields the user has never
+    /// specified. Providers that build partial-update payloads (e.g.
+    /// CloudControl JSON Patch) MUST gate their patch operations on this
+    /// list rather than comparing `from` and `to` directly.
     fn update(
         &self,
         id: &ResourceId,
         identifier: &str,
         from: &State,
         to: &Resource,
+        changed_attributes: &[String],
     ) -> BoxFuture<'_, ProviderResult<State>>;
 
     /// Delete a resource
@@ -355,9 +366,10 @@ impl Provider for ProviderRouter {
         identifier: &str,
         from: &State,
         to: &Resource,
+        changed_attributes: &[String],
     ) -> BoxFuture<'_, ProviderResult<State>> {
         match self.get_provider_or_error(&id.provider) {
-            Ok(provider) => provider.update(id, identifier, from, to),
+            Ok(provider) => provider.update(id, identifier, from, to, changed_attributes),
             Err(e) => Box::pin(async move { Err(e) }),
         }
     }
@@ -683,8 +695,9 @@ impl Provider for Box<dyn Provider> {
         identifier: &str,
         from: &State,
         to: &Resource,
+        changed_attributes: &[String],
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        (**self).update(id, identifier, from, to)
+        (**self).update(id, identifier, from, to, changed_attributes)
     }
 
     fn delete(
@@ -739,6 +752,7 @@ mod tests {
             _identifier: &str,
             _from: &State,
             to: &Resource,
+            _changed_attributes: &[String],
         ) -> BoxFuture<'_, ProviderResult<State>> {
             let id = id.clone();
             let attrs = to.attributes.clone();
@@ -816,6 +830,7 @@ mod tests {
             _identifier: &str,
             _from: &State,
             _to: &Resource,
+            _changed_attributes: &[String],
         ) -> BoxFuture<'_, ProviderResult<State>> {
             Box::pin(async { Err(ProviderError::new("not supported")) })
         }
@@ -988,8 +1003,84 @@ mod tests {
         let id = ResourceId::with_provider("mock", "test", "example");
         let from = State::existing(id.clone(), HashMap::new());
         let to = Resource::with_provider("mock", "test", "example");
-        let state = router.update(&id, "mock-id-123", &from, &to).await.unwrap();
+        let state = router
+            .update(&id, "mock-id-123", &from, &to, &[])
+            .await
+            .unwrap();
         assert!(state.exists);
+    }
+
+    #[tokio::test]
+    async fn provider_update_receives_changed_attributes_verbatim() {
+        // Issue #2565: the executor must pass Effect::Update.changed_attributes
+        // verbatim into Provider::update so providers can build precise
+        // partial-update payloads.
+        use std::sync::Mutex;
+
+        struct RecordingProvider {
+            received: Mutex<Vec<String>>,
+        }
+
+        impl Provider for RecordingProvider {
+            fn name(&self) -> &str {
+                "recording"
+            }
+            fn read(
+                &self,
+                id: &ResourceId,
+                _identifier: Option<&str>,
+            ) -> BoxFuture<'_, ProviderResult<State>> {
+                let id = id.clone();
+                Box::pin(async move { Ok(State::not_found(id)) })
+            }
+            fn read_data_source(
+                &self,
+                resource: &Resource,
+            ) -> BoxFuture<'_, ProviderResult<State>> {
+                self.read(&resource.id, None)
+            }
+            fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+                let id = resource.id.clone();
+                Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
+            }
+            fn update(
+                &self,
+                id: &ResourceId,
+                _identifier: &str,
+                _from: &State,
+                _to: &Resource,
+                changed_attributes: &[String],
+            ) -> BoxFuture<'_, ProviderResult<State>> {
+                *self.received.lock().unwrap() = changed_attributes.to_vec();
+                let id = id.clone();
+                Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
+            }
+            fn delete(
+                &self,
+                _id: &ResourceId,
+                _identifier: &str,
+                _lifecycle: &LifecycleConfig,
+            ) -> BoxFuture<'_, ProviderResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let provider = RecordingProvider {
+            received: Mutex::new(Vec::new()),
+        };
+        let id = ResourceId::with_provider("recording", "test", "x");
+        let from = State::existing(id.clone(), HashMap::new());
+        let to = Resource::with_provider("recording", "test", "x");
+        let changed = vec!["color".to_string(), "size".to_string()];
+        provider
+            .update(&id, "ident", &from, &to, &changed)
+            .await
+            .unwrap();
+        assert_eq!(*provider.received.lock().unwrap(), changed);
+
+        // Empty list also round-trips correctly (signaling "nothing changed").
+        let _ = provider.update(&id, "ident", &from, &to, &[]).await;
+        assert!(provider.received.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1191,6 +1282,7 @@ mod tests {
                 _identifier: &str,
                 _from: &State,
                 _to: &Resource,
+                _changed_attributes: &[String],
             ) -> BoxFuture<'_, ProviderResult<State>> {
                 let id = id.clone();
                 Box::pin(async move { Ok(State::not_found(id)) })

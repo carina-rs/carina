@@ -990,6 +990,7 @@ mod tests {
             _identifier: &str,
             _from: &State,
             _to: &Resource,
+            _changed_attributes: &[String],
         ) -> BoxFuture<'_, ProviderResult<State>> {
             Box::pin(async { unreachable!() })
         }
