@@ -1064,7 +1064,18 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
         DetailRow::MapExpanded { key, entries } => {
             writeln!(out, "{}{}:", attr_prefix, key).unwrap();
             let entry_indent_cols = attr_prefix.chars().count() + 2;
+            let mut prev_needs_separator = false;
             for entry in entries {
+                // Inject a blank line after any value that ends inside
+                // its element-column (e.g. a multi-element list-of-maps
+                // after the `-` marker drop, #2545) so the next sibling
+                // isn't mistaken for a continuation. The blank only fires
+                // when a sibling actually follows — keeps trailing
+                // whitespace out of the last entry.
+                if prev_needs_separator {
+                    writeln!(out).unwrap();
+                }
+                prev_needs_separator = carina_core::value::needs_trailing_separator(&entry.value);
                 let layout = carina_core::value::PrettyLayout {
                     parent_indent_cols: entry_indent_cols,
                     key: &entry.key,
