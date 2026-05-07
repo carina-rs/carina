@@ -1609,7 +1609,14 @@ pub async fn read_with_retry(
 ) -> Result<State, ProviderError> {
     let max_retries = 3;
     for attempt in 0..=max_retries {
-        match provider.read(id, identifier).await {
+        match provider
+            .read(
+                id,
+                identifier.unwrap_or(""),
+                carina_core::provider::ReadRequest,
+            )
+            .await
+        {
             Ok(state) => return Ok(state),
             Err(e) if attempt < max_retries && is_throttling_error(&e) => {
                 let delay = Duration::from_secs(1 << attempt); // 1s, 2s, 4s

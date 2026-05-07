@@ -2,6 +2,12 @@
 
 use std::collections::HashMap;
 
+use carina_core::provider::{
+    CreateRequest as CoreCreateRequest, DeleteRequest as CoreDeleteRequest,
+    ErrorDetail as CoreErrorDetail, PatchOp as CorePatchOp, PatchOpKind as CorePatchOpKind,
+    ProviderError as CoreProviderError, ReadRequest as CoreReadRequest,
+    UpdatePatch as CoreUpdatePatch, UpdateRequest as CoreUpdateRequest,
+};
 use carina_core::resource::{
     LifecycleConfig, Resource as CoreResource, ResourceId as CoreResourceId, State as CoreState,
     Value as CoreValue,
@@ -300,30 +306,169 @@ pub fn lifecycle_to_json(lifecycle: &LifecycleConfig) -> String {
     serde_json::to_string(lifecycle).unwrap_or_else(|_| "{}".to_string())
 }
 
-/// Deserialize a JSON error string to a core ProviderError.
-pub fn json_to_provider_error(json: &str) -> carina_core::provider::ProviderError {
-    if let Ok(proto_err) = serde_json::from_str::<proto::ProviderError>(json) {
-        carina_core::provider::ProviderError {
-            message: proto_err.message,
-            resource_id: proto_err.resource_id.map(|pid| {
-                Box::new(CoreResourceId::with_provider(
-                    &pid.provider,
-                    &pid.resource_type,
-                    &pid.name,
-                ))
-            }),
-            cause: None,
-            is_timeout: proto_err.is_timeout,
-            provider_name: None,
-        }
-    } else {
-        carina_core::provider::ProviderError {
-            message: json.to_string(),
-            resource_id: None,
-            cause: None,
-            is_timeout: false,
-            provider_name: None,
-        }
+// -- ProviderError --
+
+/// Convert a host-side core [`CoreProviderError`] into the WIT
+/// `provider-error` variant. The boxed `cause` chain is flattened to a
+/// string because WIT cannot represent `dyn std::error::Error`.
+pub fn core_to_wit_provider_error(err: &CoreProviderError) -> wit::ProviderError {
+    let detail = err.detail();
+    let wit_detail = wit::ErrorDetail {
+        message: detail.message.clone(),
+        resource_id: detail
+            .resource_id
+            .as_ref()
+            .map(|id| core_to_wit_resource_id(id)),
+        cause: detail.cause.as_ref().map(|c| c.to_string()),
+        provider_name: detail.provider_name.clone(),
+    };
+    match err {
+        CoreProviderError::InvalidInput(_) => wit::ProviderError::InvalidInput(wit_detail),
+        CoreProviderError::ApiError(_) => wit::ProviderError::ApiError(wit_detail),
+        CoreProviderError::NotFound(_) => wit::ProviderError::NotFound(wit_detail),
+        CoreProviderError::Timeout(_) => wit::ProviderError::Timeout(wit_detail),
+        CoreProviderError::Internal(_) => wit::ProviderError::Internal(wit_detail),
+    }
+}
+
+/// Convert a WIT [`wit::ProviderError`] into the host-side core
+/// [`CoreProviderError`]. The variant is preserved exactly; the
+/// `cause` string is rehydrated as an `Option<String>` inside
+/// [`CoreErrorDetail`].
+pub fn wit_to_core_provider_error(err: wit::ProviderError) -> CoreProviderError {
+    let (detail, ctor): (wit::ErrorDetail, fn(CoreErrorDetail) -> CoreProviderError) = match err {
+        wit::ProviderError::InvalidInput(d) => (d, CoreProviderError::InvalidInput),
+        wit::ProviderError::ApiError(d) => (d, CoreProviderError::ApiError),
+        wit::ProviderError::NotFound(d) => (d, CoreProviderError::NotFound),
+        wit::ProviderError::Timeout(d) => (d, CoreProviderError::Timeout),
+        wit::ProviderError::Internal(d) => (d, CoreProviderError::Internal),
+    };
+    let core_detail = CoreErrorDetail {
+        message: detail.message,
+        resource_id: detail
+            .resource_id
+            .map(|id| Box::new(wit_to_core_resource_id(&id))),
+        cause: detail
+            .cause
+            .map(|s| Box::new(FlattenedCause(s)) as Box<dyn std::error::Error + Send + Sync>),
+        provider_name: detail.provider_name,
+    };
+    ctor(core_detail)
+}
+
+/// Synthetic `Error` wrapping a flattened-cause string from the WIT
+/// boundary. We can't rehydrate a real cause chain across WIT
+/// (`dyn Error` doesn't fit through a record), so we wrap the string
+/// in a minimal `Error` shape so callers reading
+/// `ProviderError::source()` still see a non-empty message.
+#[derive(Debug)]
+struct FlattenedCause(String);
+
+impl std::fmt::Display for FlattenedCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FlattenedCause {}
+
+// -- Update request and patch --
+
+/// Build a [`wit::UpdateRequest`] from the host-side core
+/// [`CoreUpdateRequest`]. Patch op order is preserved.
+pub fn core_to_wit_update_request(
+    request: &CoreUpdateRequest,
+) -> Result<wit::UpdateRequest, SerializationError> {
+    Ok(wit::UpdateRequest {
+        current: core_to_wit_state(&request.from)?,
+        patch: core_to_wit_update_patch(&request.patch)?,
+    })
+}
+
+/// Build a [`wit::CreateRequest`] from the host-side core
+/// [`CoreCreateRequest`].
+pub fn core_to_wit_create_request(
+    request: &CoreCreateRequest,
+) -> Result<wit::CreateRequest, SerializationError> {
+    Ok(wit::CreateRequest {
+        res: core_to_wit_resource(&request.resource)?,
+    })
+}
+
+/// Build a [`wit::ReadRequest`].
+///
+/// `ReadRequest` carries no operationally meaningful fields; the
+/// `reserved` placeholder exists because the wasm component model
+/// rejects records with zero fields.
+pub fn core_to_wit_read_request(_request: &CoreReadRequest) -> wit::ReadRequest {
+    wit::ReadRequest { reserved: false }
+}
+
+/// Build a [`wit::DeleteRequest`] from the host-side core
+/// [`CoreDeleteRequest`].
+pub fn core_to_wit_delete_request(request: &CoreDeleteRequest) -> wit::DeleteRequest {
+    wit::DeleteRequest {
+        lifecycle: core_to_wit_lifecycle_config(&request.lifecycle),
+    }
+}
+
+/// Convert a [`LifecycleConfig`] to a [`wit::LifecycleConfig`].
+pub fn core_to_wit_lifecycle_config(lifecycle: &LifecycleConfig) -> wit::LifecycleConfig {
+    wit::LifecycleConfig {
+        force_delete: lifecycle.force_delete,
+        create_before_destroy: lifecycle.create_before_destroy,
+        prevent_destroy: lifecycle.prevent_destroy,
+    }
+}
+
+/// Convert a host-side [`CoreUpdatePatch`] to a [`wit::UpdatePatch`].
+/// Op order is preserved.
+pub fn core_to_wit_update_patch(
+    patch: &CoreUpdatePatch,
+) -> Result<wit::UpdatePatch, SerializationError> {
+    let ops = patch
+        .ops
+        .iter()
+        .map(core_to_wit_patch_op)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(wit::UpdatePatch { ops })
+}
+
+/// Convert a host-side [`CorePatchOp`] to a [`wit::PatchOp`].
+pub fn core_to_wit_patch_op(op: &CorePatchOp) -> Result<wit::PatchOp, SerializationError> {
+    let value = match &op.value {
+        Some(v) => Some(core_to_wit_value(v)?),
+        None => None,
+    };
+    Ok(wit::PatchOp {
+        kind: match op.kind {
+            CorePatchOpKind::Add => wit::PatchOpKind::Add,
+            CorePatchOpKind::Replace => wit::PatchOpKind::Replace,
+            CorePatchOpKind::Remove => wit::PatchOpKind::Remove,
+        },
+        key: op.key.clone(),
+        value,
+    })
+}
+
+/// Convert a [`wit::UpdatePatch`] back to a host-side
+/// [`CoreUpdatePatch`]. Used by tests and round-trip verification.
+pub fn wit_to_core_update_patch(patch: &wit::UpdatePatch) -> CoreUpdatePatch {
+    CoreUpdatePatch {
+        ops: patch.ops.iter().map(wit_to_core_patch_op).collect(),
+    }
+}
+
+/// Convert a [`wit::PatchOp`] to a host-side [`CorePatchOp`].
+pub fn wit_to_core_patch_op(op: &wit::PatchOp) -> CorePatchOp {
+    CorePatchOp {
+        kind: match op.kind {
+            wit::PatchOpKind::Add => CorePatchOpKind::Add,
+            wit::PatchOpKind::Replace => CorePatchOpKind::Replace,
+            wit::PatchOpKind::Remove => CorePatchOpKind::Remove,
+        },
+        key: op.key.clone(),
+        value: op.value.as_ref().map(wit_to_core_value),
     }
 }
 
@@ -883,20 +1028,101 @@ mod tests {
     }
 
     #[test]
-    fn test_json_to_provider_error_valid() {
-        let json = r#"{"message":"something failed","resource_id":{"provider":"aws","resource_type":"s3.Bucket","name":"test"},"is_timeout":true}"#;
-        let err = json_to_provider_error(json);
-        assert_eq!(err.message, "something failed");
-        assert!(err.is_timeout);
-        assert_eq!(err.resource_id.as_ref().unwrap().provider, "aws");
+    fn test_provider_error_variant_round_trip_through_wit() {
+        // Build host-side core errors of every variant, convert them
+        // to the WIT shape, then back. The variant tag must be
+        // preserved exactly so host code matching on the variant
+        // still works after a round trip across the WIT boundary.
+        type VariantCheck = fn(&CoreProviderError) -> bool;
+        let cases: Vec<(CoreProviderError, VariantCheck)> = vec![
+            (CoreProviderError::invalid_input("bad input"), |e| {
+                matches!(e, CoreProviderError::InvalidInput(_))
+            }),
+            (CoreProviderError::api_error("rejected"), |e| {
+                matches!(e, CoreProviderError::ApiError(_))
+            }),
+            (CoreProviderError::not_found("missing"), |e| {
+                matches!(e, CoreProviderError::NotFound(_))
+            }),
+            (CoreProviderError::timeout("slow"), |e| {
+                matches!(e, CoreProviderError::Timeout(_))
+            }),
+            (CoreProviderError::internal("bug"), |e| {
+                matches!(e, CoreProviderError::Internal(_))
+            }),
+        ];
+
+        for (err, is_variant) in cases {
+            let wit_err = core_to_wit_provider_error(&err);
+            let back = wit_to_core_provider_error(wit_err);
+            assert!(is_variant(&back), "variant lost for {}", err.variant_name());
+            assert_eq!(back.message(), err.message(), "message lost");
+        }
     }
 
     #[test]
-    fn test_json_to_provider_error_plain_string() {
-        let err = json_to_provider_error("some error message");
-        assert_eq!(err.message, "some error message");
-        assert!(!err.is_timeout);
-        assert!(err.resource_id.is_none());
+    fn test_provider_error_detail_fields_round_trip() {
+        // Resource id, cause string, and provider name must all
+        // survive a host -> WIT -> host round trip. cause is
+        // flattened to a string at the boundary because WIT cannot
+        // carry `dyn std::error::Error`.
+        let cause = std::io::Error::other("inner io error");
+        let id = CoreResourceId::with_provider("aws", "s3.Bucket", "my-bucket");
+        let err = CoreProviderError::api_error("Failed to read")
+            .with_cause(cause)
+            .for_resource(id.clone())
+            .for_provider("aws");
+
+        let wit_err = core_to_wit_provider_error(&err);
+        let back = wit_to_core_provider_error(wit_err);
+        assert!(matches!(back, CoreProviderError::ApiError(_)));
+        let detail = back.detail();
+        assert_eq!(detail.message, "Failed to read");
+        assert_eq!(detail.provider_name.as_deref(), Some("aws"));
+        let rid = detail.resource_id.as_ref().expect("resource_id preserved");
+        assert_eq!(rid.provider, "aws");
+        assert_eq!(rid.resource_type, "s3.Bucket");
+        assert_eq!(rid.name_str(), "my-bucket");
+        let cause_str = detail
+            .cause
+            .as_ref()
+            .map(|c| c.to_string())
+            .expect("cause preserved as string");
+        assert_eq!(cause_str, "inner io error");
+    }
+
+    #[test]
+    fn test_update_patch_round_trip_preserves_op_order_and_kinds() {
+        use carina_core::resource::Value as CV;
+        let patch = CoreUpdatePatch {
+            ops: vec![
+                CorePatchOp {
+                    kind: CorePatchOpKind::Add,
+                    key: "a".to_string(),
+                    value: Some(CV::String("alpha".into())),
+                },
+                CorePatchOp {
+                    kind: CorePatchOpKind::Replace,
+                    key: "b".to_string(),
+                    value: Some(CV::Int(42)),
+                },
+                CorePatchOp {
+                    kind: CorePatchOpKind::Remove,
+                    key: "c".to_string(),
+                    value: None,
+                },
+            ],
+        };
+        let wit_patch = core_to_wit_update_patch(&patch).unwrap();
+        let back = wit_to_core_update_patch(&wit_patch);
+        assert_eq!(back.ops.len(), 3);
+        assert_eq!(back.ops[0].kind, CorePatchOpKind::Add);
+        assert_eq!(back.ops[0].key, "a");
+        assert_eq!(back.ops[1].kind, CorePatchOpKind::Replace);
+        assert_eq!(back.ops[1].key, "b");
+        assert_eq!(back.ops[2].kind, CorePatchOpKind::Remove);
+        assert_eq!(back.ops[2].key, "c");
+        assert!(back.ops[2].value.is_none(), "Remove must carry None");
     }
 
     #[test]

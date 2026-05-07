@@ -5,11 +5,49 @@ use std::time::Instant;
 
 use crate::binding_index::ResolvedBindings;
 use crate::effect::Effect;
-use crate::provider::Provider;
+use crate::provider::{
+    CreateRequest, DeleteRequest, PatchOp, PatchOpKind, Provider, UpdatePatch, UpdateRequest,
+    build_update_patch,
+};
 use crate::resource::{Resource, ResourceId, State, Value};
 
 use super::basic::{BasicEffectResult, resolve_resource, resolve_resource_with_source};
 use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
+
+/// Build a full attribute-diff [`UpdatePatch`] between an existing
+/// `from` state and a desired `to` resource, used by the cascade
+/// path of replacements (cascade has no precomputed
+/// `changed_attributes` list, so the patch is derived from the
+/// from/to comparison directly).
+pub(super) fn compute_full_diff_patch(from: &State, to: &Resource) -> UpdatePatch {
+    use std::collections::HashSet;
+
+    let mut keys: HashSet<&str> = HashSet::new();
+    keys.extend(from.attributes.keys().map(String::as_str));
+    keys.extend(to.attributes.keys().map(String::as_str));
+    let mut sorted_keys: Vec<&str> = keys.into_iter().collect();
+    sorted_keys.sort();
+
+    let changed: Vec<String> = sorted_keys
+        .into_iter()
+        .filter(|k| from.attributes.get(*k) != to.attributes.get(*k))
+        .map(|k| k.to_string())
+        .collect();
+    build_update_patch(&changed, to, from)
+}
+
+/// Build a single-attribute [`UpdatePatch`] for the rename path of
+/// CBD replace, where exactly one attribute is being flipped from
+/// the temporary value back to the original.
+pub(super) fn single_attribute_patch(key: String, value: Value) -> UpdatePatch {
+    UpdatePatch {
+        ops: vec![PatchOp {
+            kind: PatchOpKind::Replace,
+            key,
+            value: Some(value),
+        }],
+    }
+}
 
 /// Result of executing a single effect.
 pub(super) enum SingleEffectResult {
@@ -85,7 +123,15 @@ pub(super) async fn execute_cbd_replace_parallel(
     };
     let mut refreshes = Vec::new();
 
-    match provider.create(&resolved).await {
+    match provider
+        .create(
+            &ctx.to.id,
+            CreateRequest {
+                resource: resolved.clone(),
+            },
+        )
+        .await
+    {
         Ok(state) => {
             // Build a local bindings clone for cascade resolution
             let mut local_bindings = ctx.bindings.clone();
@@ -112,8 +158,13 @@ pub(super) async fn execute_cbd_replace_parallel(
                     }
                 };
                 let cascade_identifier = cascade.from.identifier.as_deref().unwrap_or("");
+                let cascade_patch = compute_full_diff_patch(&cascade.from, &resolved_to);
+                let cascade_request = UpdateRequest {
+                    from: (*cascade.from).clone(),
+                    patch: cascade_patch,
+                };
                 match provider
-                    .update(&cascade.id, cascade_identifier, &cascade.from, &resolved_to)
+                    .update(&cascade.id, cascade_identifier, cascade_request)
                     .await
                 {
                     Ok(cascade_state) => {
@@ -156,7 +207,16 @@ pub(super) async fn execute_cbd_replace_parallel(
 
             // Delete the old resource
             let identifier = ctx.from.identifier.as_deref().unwrap_or("");
-            match provider.delete(ctx.id, identifier, ctx.lifecycle).await {
+            match provider
+                .delete(
+                    ctx.id,
+                    identifier,
+                    DeleteRequest {
+                        lifecycle: ctx.lifecycle.clone(),
+                    },
+                )
+                .await
+            {
                 Ok(()) => {
                     // Handle rename
                     let mut permanent_overrides = None;
@@ -167,13 +227,16 @@ pub(super) async fn execute_cbd_replace_parallel(
                         && temp.can_rename
                     {
                         let new_identifier = state.identifier.as_deref().unwrap_or("");
-                        let mut rename_to = ctx.to.clone();
-                        rename_to.set_attr(
+                        let rename_patch = single_attribute_patch(
                             temp.attribute.clone(),
                             Value::String(temp.original_value.clone()),
                         );
+                        let rename_request = UpdateRequest {
+                            from: state.clone(),
+                            patch: rename_patch,
+                        };
                         match provider
-                            .update(ctx.id, new_identifier, &state, &rename_to)
+                            .update(ctx.id, new_identifier, rename_request)
                             .await
                         {
                             Ok(renamed_state) => {
@@ -293,7 +356,16 @@ pub(super) async fn execute_dbd_replace_parallel(
     let identifier = ctx.from.identifier.as_deref().unwrap_or("");
     let mut refreshes = Vec::new();
 
-    match provider.delete(ctx.id, identifier, ctx.lifecycle).await {
+    match provider
+        .delete(
+            ctx.id,
+            identifier,
+            DeleteRequest {
+                lifecycle: ctx.lifecycle.clone(),
+            },
+        )
+        .await
+    {
         Ok(()) => {
             let resolve_source = ctx.unresolved.get(&ctx.to.id).unwrap_or(ctx.to);
             let resolved = match resolve_resource_with_source(ctx.to, resolve_source, ctx.bindings)
@@ -318,7 +390,15 @@ pub(super) async fn execute_dbd_replace_parallel(
                     };
                 }
             };
-            match provider.create(&resolved).await {
+            match provider
+                .create(
+                    &ctx.to.id,
+                    CreateRequest {
+                        resource: resolved.clone(),
+                    },
+                )
+                .await
+            {
                 Ok(state) => {
                     observer.on_event(&ExecutionEvent::EffectSucceeded {
                         effect: ctx.effect,

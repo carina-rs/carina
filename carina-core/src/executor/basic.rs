@@ -7,7 +7,9 @@ use std::time::Instant;
 
 use crate::binding_index::ResolvedBindings;
 use crate::effect::Effect;
-use crate::provider::Provider;
+use crate::provider::{
+    CreateRequest, DeleteRequest, Provider, ReadRequest, UpdateRequest, build_update_patch,
+};
 use crate::resolver::resolve_ref_value;
 use crate::resource::{Resource, ResourceId, State, Value};
 
@@ -76,7 +78,7 @@ pub(super) async fn refresh_pending_states(
     let mut failed_refreshes = std::collections::HashSet::new();
 
     for (id, identifier) in refreshes {
-        match provider.read(id, Some(identifier)).await {
+        match provider.read(id, identifier, ReadRequest).await {
             Ok(state) => {
                 observer.on_event(&ExecutionEvent::RefreshSucceeded { id });
                 current_states.insert(id.clone(), state);
@@ -231,7 +233,15 @@ pub(super) async fn execute_basic_effect<'a>(
                     };
                 }
             };
-            match provider.create(&resolved).await {
+            match provider
+                .create(
+                    &resource.id,
+                    CreateRequest {
+                        resource: resolved.clone(),
+                    },
+                )
+                .await
+            {
                 Ok(state) => {
                     observer.on_event(&ExecutionEvent::EffectSucceeded {
                         effect,
@@ -261,7 +271,12 @@ pub(super) async fn execute_basic_effect<'a>(
                 }
             }
         }
-        Effect::Update { id, from, to, .. } => {
+        Effect::Update {
+            id,
+            from,
+            to,
+            changed_attributes,
+        } => {
             let resolve_source = unresolved.get(id).unwrap_or(to);
             let resolved_to = match resolve_resource_with_source(to, resolve_source, bindings) {
                 Ok(r) => r,
@@ -279,7 +294,31 @@ pub(super) async fn execute_basic_effect<'a>(
                 }
             };
             let identifier = from.identifier.as_deref().unwrap_or("");
-            match provider.update(id, identifier, from, &resolved_to).await {
+            // Augment plan-time `changed_attributes` with any
+            // ResourceRef-derived attributes whose resolved value at
+            // apply time differs from `from`. This catches the case
+            // where a dependency was just replaced (and the binding
+            // map flipped to a new computed value) but the plan-time
+            // diff did not see the change because both the old and
+            // new ResourceRef expressions are syntactically identical.
+            // Without this, the patch would omit the changed
+            // reference value and the provider would never be told
+            // to update it.
+            let mut effective_changed: Vec<String> = changed_attributes.clone();
+            for (key, new_value) in &resolved_to.attributes {
+                if effective_changed.iter().any(|k| k == key) {
+                    continue;
+                }
+                if from.attributes.get(key) != Some(new_value) {
+                    effective_changed.push(key.clone());
+                }
+            }
+            let patch = build_update_patch(&effective_changed, &resolved_to, from);
+            let request = UpdateRequest {
+                from: (**from).clone(),
+                patch,
+            };
+            match provider.update(id, identifier, request).await {
                 Ok(state) => {
                     observer.on_event(&ExecutionEvent::EffectSucceeded {
                         effect,
@@ -314,7 +353,16 @@ pub(super) async fn execute_basic_effect<'a>(
             identifier,
             lifecycle,
             ..
-        } => match provider.delete(id, identifier, lifecycle).await {
+        } => match provider
+            .delete(
+                id,
+                identifier,
+                DeleteRequest {
+                    lifecycle: lifecycle.clone(),
+                },
+            )
+            .await
+        {
             Ok(()) => {
                 observer.on_event(&ExecutionEvent::EffectSucceeded {
                     effect,

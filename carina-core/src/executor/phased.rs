@@ -8,7 +8,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::deps::{find_failed_dependency, get_resource_dependencies};
 use crate::effect::Effect;
-use crate::provider::Provider;
+use crate::provider::{CreateRequest, DeleteRequest, Provider, UpdateRequest};
 use crate::resource::{Resource, ResourceId, State, Value};
 
 use super::basic::{
@@ -16,6 +16,7 @@ use super::basic::{
     process_basic_result, queue_state_refresh, refresh_pending_states, resolve_resource,
     resolve_resource_with_source,
 };
+use super::replace::{compute_full_diff_patch, single_attribute_patch};
 use super::{ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, ProgressInfo};
 
 /// Check if the plan contains multiple Replace effects that depend on each other.
@@ -526,7 +527,15 @@ pub(super) async fn execute_effects_phased(
                             }
                         };
 
-                        match provider.create(&resolved).await {
+                        match provider
+                            .create(
+                                &to.id,
+                                CreateRequest {
+                                    resource: resolved.clone(),
+                                },
+                            )
+                            .await
+                        {
                             Ok(state) => {
                                 let mut local_bindings = binding_snapshot.clone();
                                 local_bindings.record_applied(
@@ -564,13 +573,14 @@ pub(super) async fn execute_effects_phased(
                                         };
                                     let cascade_identifier =
                                         cascade.from.identifier.as_deref().unwrap_or("");
+                                    let cascade_patch =
+                                        compute_full_diff_patch(&cascade.from, &resolved_to);
+                                    let cascade_request = UpdateRequest {
+                                        from: (*cascade.from).clone(),
+                                        patch: cascade_patch,
+                                    };
                                     match provider
-                                        .update(
-                                            &cascade.id,
-                                            cascade_identifier,
-                                            &cascade.from,
-                                            &resolved_to,
-                                        )
+                                        .update(&cascade.id, cascade_identifier, cascade_request)
                                         .await
                                     {
                                         Ok(cascade_state) => {
@@ -840,7 +850,16 @@ pub(super) async fn execute_effects_phased(
                     } = effect
                     {
                         let identifier = from.identifier.as_deref().unwrap_or("");
-                        match provider.delete(id, identifier, lifecycle).await {
+                        match provider
+                            .delete(
+                                id,
+                                identifier,
+                                DeleteRequest {
+                                    lifecycle: lifecycle.clone(),
+                                },
+                            )
+                            .await
+                        {
                             Ok(()) => (idx, PhaseEffectResult::ReplaceDeleteSuccess),
                             Err(e) => {
                                 let error_str = e.to_string();
@@ -979,15 +998,15 @@ pub(super) async fn execute_effects_phased(
                                 && temp.can_rename
                             {
                                 let new_identifier = state.identifier.as_deref().unwrap_or("");
-                                let mut rename_to = to.clone();
-                                rename_to.set_attr(
+                                let rename_patch = single_attribute_patch(
                                     temp.attribute.clone(),
                                     Value::String(temp.original_value.clone()),
                                 );
-                                match provider
-                                    .update(&id, new_identifier, &state, &rename_to)
-                                    .await
-                                {
+                                let rename_request = UpdateRequest {
+                                    from: state.clone(),
+                                    patch: rename_patch,
+                                };
+                                match provider.update(&id, new_identifier, rename_request).await {
                                     Ok(renamed_state) => {
                                         observer.on_event(&ExecutionEvent::RenameSucceeded {
                                             id: &id,
@@ -1099,7 +1118,15 @@ pub(super) async fn execute_effects_phased(
                                     }
                                 };
 
-                                match provider.create(&resolved).await {
+                                match provider
+                                    .create(
+                                        &to.id,
+                                        CreateRequest {
+                                            resource: resolved.clone(),
+                                        },
+                                    )
+                                    .await
+                                {
                                     Ok(state) => {
                                         observer.on_event(&ExecutionEvent::EffectSucceeded {
                                             effect,

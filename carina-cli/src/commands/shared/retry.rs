@@ -1,6 +1,6 @@
 //! Retry helpers for `destroy`: delete-error classification and deletion polling.
 
-use carina_core::provider::Provider;
+use carina_core::provider::{Provider, ReadRequest};
 use carina_core::resource::ResourceId;
 
 /// Check if a delete error is retryable due to implicit dependency ordering.
@@ -10,7 +10,7 @@ use carina_core::resource::ResourceId;
 /// ResourceRef dependency. These errors are retryable: once the blocker is
 /// deleted, the retry will succeed.
 pub(crate) fn is_retryable_delete_error(e: &carina_core::provider::ProviderError) -> bool {
-    if e.is_timeout {
+    if matches!(e, carina_core::provider::ProviderError::Timeout(_)) {
         return false;
     }
     let msg = e.to_string();
@@ -53,7 +53,7 @@ pub(crate) async fn wait_for_deletion(
 ) -> WaitResult {
     for _ in 0..max_attempts {
         tokio::time::sleep(poll_interval).await;
-        match provider.read(id, Some(identifier)).await {
+        match provider.read(id, identifier, ReadRequest).await {
             Ok(state) if !state.exists => return WaitResult::Deleted,
             Ok(_) => {
                 // Still exists, keep waiting

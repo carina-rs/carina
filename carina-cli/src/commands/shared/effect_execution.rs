@@ -3,7 +3,7 @@
 use carina_core::effect::Effect;
 use carina_core::executor::ExecutionResult;
 use carina_core::plan::Plan;
-use carina_core::provider::Provider;
+use carina_core::provider::{Provider, ReadRequest};
 use colored::Colorize;
 
 /// Execute import effects by reading the resource from the provider.
@@ -19,7 +19,7 @@ pub(crate) async fn execute_import_effects(
     for effect in plan.effects() {
         if let Effect::Import { id, identifier } = effect {
             println!("  {} Importing {} (id: {})...", "<-".cyan(), id, identifier);
-            match provider.read(id, Some(identifier)).await {
+            match provider.read(id, identifier, ReadRequest).await {
                 Ok(state) => {
                     if state.exists {
                         println!("  {} Imported {}", "✓".green(), id);

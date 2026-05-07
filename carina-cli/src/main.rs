@@ -472,8 +472,10 @@ fn render_app_error(e: &error::AppError) -> AppErrorRendering {
             exit_code: 130,
         },
         error::AppError::Provider(pe) => {
-            let body = error::format_account_guard_error(&pe.message, pe.provider_name.as_deref())
-                .unwrap_or_else(|| e.to_string());
+            let detail = pe.detail();
+            let body =
+                error::format_account_guard_error(&detail.message, detail.provider_name.as_deref())
+                    .unwrap_or_else(|| e.to_string());
             AppErrorRendering {
                 stderr: format_error_lines(&body),
                 exit_code: 1,
@@ -531,7 +533,7 @@ mod error_format_tests {
     #[test]
     fn provider_account_guard_renders_structured_block() {
         colored::control::set_override(false);
-        let pe = carina_core::provider::ProviderError::new(
+        let pe = carina_core::provider::ProviderError::invalid_input(
             "Provider initialization failed: AWS account ID '019115212452' \
              is not in the provider's allowed_account_ids [\"151116838382\"]. \
              Refusing to operate against this account. \
@@ -585,7 +587,7 @@ mod error_format_tests {
         // credentials chain, etc.) must still be surfaced — just not
         // through the structured account-guard renderer.
         colored::control::set_override(false);
-        let pe = carina_core::provider::ProviderError::new(
+        let pe = carina_core::provider::ProviderError::invalid_input(
             "Provider initialization failed: failed to load AWS credentials \
              from the environment",
         );
@@ -621,7 +623,7 @@ mod error_format_tests {
         // it instead of the "aws" default. Catches awscc-vs-aws
         // mislabeling.
         colored::control::set_override(false);
-        let pe = carina_core::provider::ProviderError::new(
+        let pe = carina_core::provider::ProviderError::invalid_input(
             "Provider initialization failed: AWS account ID '019115212452' \
              is not in the provider's allowed_account_ids [\"151116838382\"]. \
              Refusing to operate against this account.",

@@ -2,8 +2,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-use carina_core::provider::{BoxFuture, Provider, ProviderError, ProviderResult};
-use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
+use carina_core::provider::{
+    BoxFuture, CreateRequest, DeleteRequest, PatchOpKind, Provider, ProviderError, ProviderResult,
+    ReadRequest, UpdateRequest,
+};
+use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::value::{json_to_dsl_value, value_to_json};
 
 pub struct MockProvider {
@@ -55,7 +58,8 @@ impl Provider for MockProvider {
     fn read(
         &self,
         id: &ResourceId,
-        _identifier: Option<&str>,
+        _identifier: &str,
+        _request: ReadRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id = id.clone();
         Box::pin(async move {
@@ -75,30 +79,32 @@ impl Provider for MockProvider {
     }
 
     fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-        self.read(&resource.id, None)
+        self.read(&resource.id, "", ReadRequest)
     }
 
-    fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-        let resource = resource.clone();
+    fn create(
+        &self,
+        id: &ResourceId,
+        request: CreateRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let id = id.clone();
+        let resource = request.resource;
         Box::pin(async move {
             let mut states = self.load_states();
-            let key = Self::resource_key(&resource.id);
+            let key = Self::resource_key(&id);
 
             let attrs: HashMap<String, serde_json::Value> = resource
                 .attributes
                 .iter()
                 .map(|(k, v)| value_to_json(v).map(|jv| (k.clone(), jv)))
                 .collect::<Result<_, _>>()
-                .map_err(|e| ProviderError::new(format!("Failed to convert value: {}", e)))?;
+                .map_err(|e| ProviderError::internal(format!("Failed to convert value: {}", e)))?;
 
             states.insert(key, attrs);
             self.save_states(&states)
-                .map_err(|e| ProviderError::new("Failed to save state").with_cause(e))?;
+                .map_err(|e| ProviderError::internal("Failed to save state").with_cause(e))?;
 
-            Ok(
-                State::existing(resource.id.clone(), resource.resolved_attributes())
-                    .with_identifier("mock-id"),
-            )
+            Ok(State::existing(id, resource.resolved_attributes()).with_identifier("mock-id"))
         })
     }
 
@@ -106,27 +112,41 @@ impl Provider for MockProvider {
         &self,
         id: &ResourceId,
         _identifier: &str,
-        _from: &State,
-        to: &Resource,
+        request: UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id = id.clone();
-        let to = to.clone();
         Box::pin(async move {
+            // Apply the patch on top of `from` to construct the post-update
+            // attribute map. The mock writes only what the user changed —
+            // matching the Level 3 contract that providers MUST NOT touch
+            // unspecified fields.
+            let mut attributes = request.from.attributes.clone();
+            for op in request.patch.ops {
+                match op.kind {
+                    PatchOpKind::Add | PatchOpKind::Replace => {
+                        if let Some(value) = op.value {
+                            attributes.insert(op.key, value);
+                        }
+                    }
+                    PatchOpKind::Remove => {
+                        attributes.remove(&op.key);
+                    }
+                }
+            }
+
             let mut states = self.load_states();
             let key = Self::resource_key(&id);
-
-            let attrs: HashMap<String, serde_json::Value> = to
-                .attributes
+            let attrs: HashMap<String, serde_json::Value> = attributes
                 .iter()
                 .map(|(k, v)| value_to_json(v).map(|jv| (k.clone(), jv)))
                 .collect::<Result<_, _>>()
-                .map_err(|e| ProviderError::new(format!("Failed to convert value: {}", e)))?;
+                .map_err(|e| ProviderError::internal(format!("Failed to convert value: {}", e)))?;
 
             states.insert(key, attrs);
             self.save_states(&states)
-                .map_err(|e| ProviderError::new("Failed to save state").with_cause(e))?;
+                .map_err(|e| ProviderError::internal("Failed to save state").with_cause(e))?;
 
-            Ok(State::existing(id, to.resolved_attributes()))
+            Ok(State::existing(id, attributes))
         })
     }
 
@@ -134,7 +154,7 @@ impl Provider for MockProvider {
         &self,
         id: &ResourceId,
         _identifier: &str,
-        _lifecycle: &LifecycleConfig,
+        _request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         let id = id.clone();
         Box::pin(async move {
@@ -143,7 +163,7 @@ impl Provider for MockProvider {
 
             states.remove(&key);
             self.save_states(&states)
-                .map_err(|e| ProviderError::new("Failed to save state").with_cause(e))?;
+                .map_err(|e| ProviderError::internal("Failed to save state").with_cause(e))?;
 
             Ok(())
         })

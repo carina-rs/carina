@@ -103,6 +103,63 @@ pub struct State {
     pub exists: bool,
 }
 
+/// Kind of a single [`PatchOp`]. Mirrors `patch-op-kind` in
+/// `wit/types.wit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatchOpKind {
+    Add,
+    Replace,
+    Remove,
+}
+
+/// One operation inside an [`UpdatePatch`]. Mirrors `patch-op` in
+/// `wit/types.wit`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchOp {
+    pub kind: PatchOpKind,
+    pub key: String,
+    /// `Some(_)` for `Add`/`Replace`; `None` for `Remove`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
+}
+
+/// Structured description of the user's intended change to a resource.
+/// Mirrors `update-patch` in `wit/types.wit`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdatePatch {
+    #[serde(default)]
+    pub ops: Vec<PatchOp>,
+}
+
+/// Per-operation request record for `read`. Mirrors `read-request`
+/// in `wit/types.wit`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReadRequest;
+
+/// Per-operation request record for `create`. Mirrors
+/// `create-request` in `wit/types.wit`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateRequest {
+    pub resource: Resource,
+}
+
+/// Per-operation request record for `update`. Mirrors
+/// `update-request` in `wit/types.wit`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateRequest {
+    pub from: State,
+    pub patch: UpdatePatch,
+}
+
+/// Per-operation request record for `delete`. Mirrors
+/// `delete-request` in `wit/types.wit`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeleteRequest {
+    #[serde(default)]
+    pub lifecycle: LifecycleConfig,
+}
+
 /// Lifecycle configuration for a resource.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LifecycleConfig {
@@ -141,14 +198,41 @@ pub struct CompletionValue {
     pub description: String,
 }
 
+/// Variant tag of [`ProviderError`].
+///
+/// Mirrors `provider-error` in `wit/types.wit`. Carried as a separate
+/// `kind` field so the wire format stays a flat record (easier to
+/// inspect than a serde-tagged enum, and matches the WIT variant
+/// directly).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderErrorKind {
+    InvalidInput,
+    ApiError,
+    NotFound,
+    Timeout,
+    #[default]
+    Internal,
+}
+
 /// Provider error returned from operations.
+///
+/// Mirrors `(provider-error, error-detail)` in `wit/types.wit`. The
+/// variant lives in [`ProviderErrorKind`]; the metadata fields mirror
+/// `error-detail`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderError {
+    #[serde(default)]
+    pub kind: ProviderErrorKind,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_id: Option<ResourceId>,
-    #[serde(default)]
-    pub is_timeout: bool,
+    /// Flattened representation of the underlying cause chain, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
+    /// Provider name (e.g. `"aws"`, `"awscc"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_name: Option<String>,
 }
 
 /// Serializable validator types that can cross the WASM boundary.

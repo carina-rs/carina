@@ -3,7 +3,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use carina_core::provider::{Provider, ProviderFactory};
+use carina_core::provider::{
+    CreateRequest, DeleteRequest, PatchOp, PatchOpKind, Provider, ProviderFactory, ReadRequest,
+    UpdatePatch, UpdateRequest,
+};
 use carina_core::resource::{Resource, ResourceId, Value};
 use carina_plugin_host::WasmProviderFactory;
 
@@ -76,7 +79,7 @@ async fn test_wasm_mock_provider_create_and_read() {
     // Read before create - should return a state with no identifier and empty attributes
     let id = ResourceId::with_provider("mock", "test.resource", "my-resource");
     let state = provider
-        .read(&id, None)
+        .read(&id, "", ReadRequest)
         .await
         .expect("read should not error");
     assert!(state.identifier.is_none());
@@ -91,7 +94,12 @@ async fn test_wasm_mock_provider_create_and_read() {
     ]);
 
     let created = provider
-        .create(&resource)
+        .create(
+            &id,
+            CreateRequest {
+                resource: resource.clone(),
+            },
+        )
         .await
         .expect("create should succeed");
     assert_eq!(created.identifier, Some("mock-id".into()));
@@ -107,7 +115,7 @@ async fn test_wasm_mock_provider_create_and_read() {
 
     // Read back - should return the created state
     let read_state = provider
-        .read(&id, Some("mock-id"))
+        .read(&id, "mock-id", ReadRequest)
         .await
         .expect("read should not error");
     assert_eq!(read_state.identifier, Some("mock-id".into()));
@@ -141,7 +149,12 @@ async fn test_wasm_mock_provider_update_and_delete() {
     ]);
 
     let created = provider
-        .create(&resource)
+        .create(
+            &id,
+            CreateRequest {
+                resource: resource.clone(),
+            },
+        )
         .await
         .expect("create should succeed");
     assert_eq!(
@@ -149,15 +162,33 @@ async fn test_wasm_mock_provider_update_and_delete() {
         Some(&Value::String("red".into()))
     );
 
-    // Update with new attributes
-    let mut updated_resource = Resource::with_provider("mock", "test.resource", "updatable");
-    updated_resource.attributes = indexmap::IndexMap::from([
-        ("color".into(), Value::String("blue".into())),
-        ("size".into(), Value::Int(20)),
-    ]);
+    // Build an UpdatePatch describing the user's intended changes
+    // (color: red→blue, size: 10→20). Both ops are Replace because
+    // they exist in `from`.
+    let patch = UpdatePatch {
+        ops: vec![
+            PatchOp {
+                kind: PatchOpKind::Replace,
+                key: "color".to_string(),
+                value: Some(Value::String("blue".into())),
+            },
+            PatchOp {
+                kind: PatchOpKind::Replace,
+                key: "size".to_string(),
+                value: Some(Value::Int(20)),
+            },
+        ],
+    };
 
     let updated = provider
-        .update(&id, "mock-id", &created, &updated_resource)
+        .update(
+            &id,
+            "mock-id",
+            UpdateRequest {
+                from: created.clone(),
+                patch,
+            },
+        )
         .await
         .expect("update should succeed");
     assert_eq!(
@@ -165,10 +196,23 @@ async fn test_wasm_mock_provider_update_and_delete() {
         Some(&Value::String("blue".into()))
     );
     assert_eq!(updated.attributes.get("size"), Some(&Value::Int(20)));
+    // The mock echoes the applied patch op kinds + keys as a sentinel
+    // attribute so we can verify the patch round-tripped through the
+    // WIT boundary in op order.
+    let echoed = updated
+        .attributes
+        .get("__mock_patch_ops__")
+        .expect("mock should echo patch ops");
+    let Value::List(ops) = echoed else {
+        panic!("__mock_patch_ops__ should be a list, got {echoed:?}");
+    };
+    assert_eq!(ops.len(), 2);
+    assert_eq!(ops[0], Value::String("replace:color".into()));
+    assert_eq!(ops[1], Value::String("replace:size".into()));
 
     // Read to verify update persisted in memory
     let read_state = provider
-        .read(&id, Some("mock-id"))
+        .read(&id, "mock-id", ReadRequest)
         .await
         .expect("read should not error");
     assert_eq!(
@@ -177,15 +221,14 @@ async fn test_wasm_mock_provider_update_and_delete() {
     );
 
     // Delete
-    let lifecycle = Default::default();
     provider
-        .delete(&id, "mock-id", &lifecycle)
+        .delete(&id, "mock-id", DeleteRequest::default())
         .await
         .expect("delete should succeed");
 
     // Read after delete - should return empty state (no identifier, no attributes)
     let deleted_state = provider
-        .read(&id, None)
+        .read(&id, "", ReadRequest)
         .await
         .expect("read should not error");
     assert!(deleted_state.identifier.is_none());

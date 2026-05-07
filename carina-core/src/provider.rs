@@ -12,29 +12,63 @@ use std::pin::Pin;
 use crate::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use crate::schema::SchemaRegistry;
 
-/// Error type for Provider operations
-#[derive(Debug)]
-pub struct ProviderError {
+/// Contextual metadata attached to every [`ProviderError`] variant.
+///
+/// Mirrors `error-detail` in `wit/types.wit`. The `cause` chain stays
+/// host-side (boxed `dyn Error`) and is flattened to a string when the
+/// error crosses the WIT boundary.
+#[derive(Debug, Default)]
+pub struct ErrorDetail {
+    /// Human-readable message.
     pub message: String,
+    /// Resource the error pertains to, if known.
     pub resource_id: Option<Box<ResourceId>>,
+    /// Underlying cause chain. Lost when the error crosses the WIT
+    /// boundary — flattened to a string there.
     pub cause: Option<Box<dyn std::error::Error + Send + Sync>>,
-    pub is_timeout: bool,
-    /// Optional provider name (e.g. `"aws"`, `"awscc"`) attached when
-    /// the error is raised at provider boundary points where the name
-    /// is known but no specific resource is in scope (e.g. provider
-    /// init / `create_provider`). Display ignores this field; CLI
-    /// renderers can read it to label structured output.
+    /// Provider name (e.g. `"aws"`, `"awscc"`) attached when the error
+    /// is raised at provider-init / `create_provider` boundary points
+    /// where the name is known but no specific resource is in scope.
+    /// Display ignores this field; CLI renderers can read it to label
+    /// structured output.
     pub provider_name: Option<String>,
+}
+
+/// Structured error returned by every provider operation.
+///
+/// Variants mirror `provider-error` in `wit/types.wit`. Host-side code
+/// can match exhaustively to dispatch retry / abort / not-found /
+/// escalate strategies in a type-safe way.
+#[derive(Debug)]
+pub enum ProviderError {
+    /// User-supplied input is invalid (bad attribute value, schema
+    /// violation, configuration mismatch). Not retriable.
+    InvalidInput(ErrorDetail),
+    /// The cloud API rejected the request (HTTP 4xx/5xx, server-side
+    /// error). May be retriable depending on the cause.
+    ApiError(ErrorDetail),
+    /// Resource was not found at the cloud API. `read` returns this
+    /// instead of an empty state when the underlying resource has been
+    /// deleted out-of-band. `delete` returns this when the resource is
+    /// already gone.
+    NotFound(ErrorDetail),
+    /// Operation timed out before completing. Retriable with backoff.
+    Timeout(ErrorDetail),
+    /// Provider-internal failure (panic, unexpected state, missing
+    /// schema entry, etc.). Should be escalated as a bug rather than
+    /// retried.
+    Internal(ErrorDetail),
 }
 
 impl std::fmt::Display for ProviderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(ref id) = self.resource_id {
-            write!(f, "[{}.{}] {}", id.resource_type, id.name, self.message)?;
+        let detail = self.detail();
+        if let Some(ref id) = detail.resource_id {
+            write!(f, "[{}.{}] {}", id.resource_type, id.name, detail.message)?;
         } else {
-            write!(f, "{}", self.message)?;
+            write!(f, "{}", detail.message)?;
         }
-        if let Some(ref cause) = self.cause {
+        if let Some(ref cause) = detail.cause {
             write!(f, ": {}", cause)?;
         }
         Ok(())
@@ -43,35 +77,86 @@ impl std::fmt::Display for ProviderError {
 
 impl std::error::Error for ProviderError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.cause
+        self.detail()
+            .cause
             .as_ref()
             .map(|e| e.as_ref() as &dyn std::error::Error)
     }
 }
 
 impl ProviderError {
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            resource_id: None,
-            cause: None,
-            is_timeout: false,
-            provider_name: None,
+    /// Borrow the inner [`ErrorDetail`] regardless of variant.
+    pub fn detail(&self) -> &ErrorDetail {
+        match self {
+            ProviderError::InvalidInput(d)
+            | ProviderError::ApiError(d)
+            | ProviderError::NotFound(d)
+            | ProviderError::Timeout(d)
+            | ProviderError::Internal(d) => d,
         }
     }
 
+    /// Mutably borrow the inner [`ErrorDetail`] regardless of variant.
+    pub fn detail_mut(&mut self) -> &mut ErrorDetail {
+        match self {
+            ProviderError::InvalidInput(d)
+            | ProviderError::ApiError(d)
+            | ProviderError::NotFound(d)
+            | ProviderError::Timeout(d)
+            | ProviderError::Internal(d) => d,
+        }
+    }
+
+    /// Variant name as a static string (used by serialization layers).
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            ProviderError::InvalidInput(_) => "invalid_input",
+            ProviderError::ApiError(_) => "api_error",
+            ProviderError::NotFound(_) => "not_found",
+            ProviderError::Timeout(_) => "timeout",
+            ProviderError::Internal(_) => "internal",
+        }
+    }
+
+    /// Convenience accessor for the human-readable message.
+    pub fn message(&self) -> &str {
+        &self.detail().message
+    }
+
+    /// User-supplied input is invalid.
+    pub fn invalid_input(message: impl Into<String>) -> Self {
+        ProviderError::InvalidInput(ErrorDetail::new(message))
+    }
+
+    /// The cloud API rejected the request.
+    pub fn api_error(message: impl Into<String>) -> Self {
+        ProviderError::ApiError(ErrorDetail::new(message))
+    }
+
+    /// Resource was not found at the cloud API.
+    pub fn not_found(message: impl Into<String>) -> Self {
+        ProviderError::NotFound(ErrorDetail::new(message))
+    }
+
+    /// Operation timed out.
+    pub fn timeout(message: impl Into<String>) -> Self {
+        ProviderError::Timeout(ErrorDetail::new(message))
+    }
+
+    /// Provider-internal failure / unexpected state.
+    pub fn internal(message: impl Into<String>) -> Self {
+        ProviderError::Internal(ErrorDetail::new(message))
+    }
+
+    /// Attach a resource id to the inner detail.
     pub fn for_resource(mut self, id: ResourceId) -> Self {
-        self.resource_id = Some(Box::new(id));
+        self.detail_mut().resource_id = Some(Box::new(id));
         self
     }
 
+    /// Attach a cause chain to the inner detail.
     pub fn with_cause(mut self, cause: impl std::error::Error + Send + Sync + 'static) -> Self {
-        self.cause = Some(Box::new(cause));
-        self
-    }
-
-    pub fn timeout(mut self) -> Self {
-        self.is_timeout = true;
+        self.detail_mut().cause = Some(Box::new(cause));
         self
     }
 
@@ -80,12 +165,153 @@ impl ProviderError {
     /// `create_provider` / provider init failures). Used by the CLI
     /// renderer to label structured account-guard output.
     pub fn for_provider(mut self, provider_name: impl Into<String>) -> Self {
-        self.provider_name = Some(provider_name.into());
+        self.detail_mut().provider_name = Some(provider_name.into());
         self
     }
 }
 
+impl ErrorDetail {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            resource_id: None,
+            cause: None,
+            provider_name: None,
+        }
+    }
+}
+
 pub type ProviderResult<T> = Result<T, ProviderError>;
+
+/// Per-operation request record for [`Provider::create`].
+///
+/// Mirrors `create-request` in `wit/types.wit`.
+#[derive(Debug, Clone)]
+pub struct CreateRequest {
+    /// Full desired state for the new resource.
+    pub resource: Resource,
+}
+
+/// Per-operation request record for [`Provider::read`].
+///
+/// Mirrors `read-request` in `wit/types.wit`. Has no operationally
+/// meaningful fields today; the record exists so future fields (e.g.
+/// a freshness hint or an attribute projection) can be added without
+/// breaking the `read` signature.
+#[derive(Debug, Clone, Default)]
+pub struct ReadRequest;
+
+/// Per-operation request record for [`Provider::update`].
+///
+/// Mirrors `update-request` in `wit/types.wit`. `from` is the current
+/// provider-side state; `patch` carries only the user's intended
+/// changes. The patch is the sole source of truth for what the
+/// provider should write — there is no separate `to: Resource`
+/// because exposing the full desired resource invites providers to
+/// touch fields the user never specified (the root cause of
+/// `carina-rs/carina#2559`).
+#[derive(Debug, Clone)]
+pub struct UpdateRequest {
+    /// Current provider-side state. May be used for read-modify-write
+    /// paths or for resolving server-assigned identifiers; MUST NOT be
+    /// used to derive additional fields to write back.
+    pub from: State,
+    /// Structured description of the user's intended change.
+    pub patch: UpdatePatch,
+}
+
+/// Per-operation request record for [`Provider::delete`].
+///
+/// Mirrors `delete-request` in `wit/types.wit`.
+#[derive(Debug, Clone, Default)]
+pub struct DeleteRequest {
+    /// Lifecycle policy for the resource.
+    pub lifecycle: LifecycleConfig,
+}
+
+/// A structured description of the user's intended change to a resource.
+///
+/// Mirrors `update-patch` in `wit/types.wit`. Each [`PatchOp`]
+/// corresponds to a key the user explicitly specified or removed in
+/// the desired state. Fields the user has never specified do not
+/// appear in the patch.
+///
+/// Providers MUST NOT modify any attribute that is not represented in
+/// `ops`.
+#[derive(Debug, Clone, Default)]
+pub struct UpdatePatch {
+    pub ops: Vec<PatchOp>,
+}
+
+/// A single operation inside an [`UpdatePatch`].
+///
+/// Mirrors `patch-op` in `wit/types.wit`.
+#[derive(Debug, Clone)]
+pub struct PatchOp {
+    pub kind: PatchOpKind,
+    /// Top-level attribute name. Nested-field patches are a future
+    /// extension.
+    pub key: String,
+    /// `Some(_)` for `Add` and `Replace`; `None` for `Remove`.
+    pub value: Option<Value>,
+}
+
+/// Kind of a single [`PatchOp`].
+///
+/// Mirrors `patch-op-kind` in `wit/types.wit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchOpKind {
+    /// User added a key that did not previously appear in the desired state.
+    Add,
+    /// User changed the value of an existing key in the desired state.
+    Replace,
+    /// User removed a key that previously appeared in the desired state.
+    Remove,
+}
+
+/// Build an [`UpdatePatch`] from a list of changed attribute names plus
+/// the desired (`to`) and current (`from`) views.
+///
+/// For each `key` in `changed_attributes`:
+/// - present in `to` but missing in `from` → [`PatchOpKind::Add`]
+/// - present in both                       → [`PatchOpKind::Replace`]
+/// - missing in `to` but present in `from` → [`PatchOpKind::Remove`]
+///
+/// `Remove` ops carry `value: None`; others carry a clone of the
+/// value from `to`.
+pub fn build_update_patch(
+    changed_attributes: &[String],
+    to: &Resource,
+    from: &State,
+) -> UpdatePatch {
+    let ops = changed_attributes
+        .iter()
+        .map(|key| {
+            let in_to = to.attributes.contains_key(key);
+            let in_from = from.attributes.contains_key(key);
+            let kind = match (in_to, in_from) {
+                (true, false) => PatchOpKind::Add,
+                (true, true) => PatchOpKind::Replace,
+                (false, true) => PatchOpKind::Remove,
+                // Neither side has it. Treat as Replace with None value;
+                // this should not happen with well-formed inputs but the
+                // provider will see a no-op-ish entry rather than a panic.
+                (false, false) => PatchOpKind::Remove,
+            };
+            let value = if matches!(kind, PatchOpKind::Remove) {
+                None
+            } else {
+                to.attributes.get(key).cloned()
+            };
+            PatchOp {
+                kind,
+                key: key.clone(),
+                value,
+            }
+        })
+        .collect();
+    UpdatePatch { ops }
+}
 
 /// Return type for async operations
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -100,18 +326,27 @@ pub type SavedAttrs = HashMap<ResourceId, HashMap<String, Value>>;
 ///
 /// Each infrastructure provider (AWS, GCP, etc.) implements this trait
 /// to perform actual API calls against its infrastructure.
+///
+/// Every CRUD op (except [`Provider::read_data_source`]) takes a
+/// per-operation `*Request` record. Request records mirror the
+/// records of the same name in `wit/types.wit`; future per-op
+/// parameters become non-breaking record-field additions instead of
+/// trait-signature churn.
 pub trait Provider: Send + Sync {
     /// Name of this Provider (e.g., "aws")
     fn name(&self) -> &str;
 
-    /// Get the current state of a resource
+    /// Read the current provider-side state of an existing resource.
     ///
-    /// If identifier is provided, use it to read the resource directly.
-    /// Returns `State::not_found()` if no identifier is provided or the resource does not exist.
+    /// `identifier` is the cloud-side identifier (e.g. `vpc-0abc...`).
+    /// `request` carries no operationally meaningful fields today; it
+    /// exists so future fields (e.g. a freshness hint or an attribute
+    /// projection) can be added without breaking the signature.
     fn read(
         &self,
         id: &ResourceId,
-        identifier: Option<&str>,
+        identifier: &str,
+        request: ReadRequest,
     ) -> BoxFuture<'_, ProviderResult<State>>;
 
     /// Read a data source resource.
@@ -123,33 +358,49 @@ pub trait Provider: Send + Sync {
     ///
     /// Each provider must implement this explicitly. For zero-input data
     /// sources (e.g. `aws.sts.caller_identity`), the implementation can
-    /// simply delegate to `self.read(&resource.id, None)`.
+    /// simply delegate to a state-only read against `resource.id`.
     fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>>;
 
-    /// Create a resource
-    ///
-    /// Returns State with identifier set to the AWS internal ID (e.g., vpc-xxx)
-    fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>>;
+    /// Create the resource described by `request.resource` and return
+    /// the resulting state (with `identifier` set to the cloud-side
+    /// internal ID, e.g. `vpc-xxx`).
+    fn create(
+        &self,
+        id: &ResourceId,
+        request: CreateRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>>;
 
-    /// Update a resource
+    /// Update an existing resource by applying `request.patch`.
     ///
-    /// The identifier is the AWS internal ID (e.g., vpc-xxx)
+    /// Each [`PatchOp`] corresponds to a key the user explicitly
+    /// specified or removed in the desired state. Fields the user has
+    /// never specified do not appear in the patch.
+    ///
+    /// **Providers MUST NOT modify any attribute that is not
+    /// represented in `request.patch.ops`.** The patch is the sole
+    /// source of truth for the update payload.
+    ///
+    /// `request.from` is the current provider-side state and may be
+    /// used for read-modify-write paths or for resolving
+    /// server-assigned identifiers; it MUST NOT be used to derive
+    /// additional fields to write back.
     fn update(
         &self,
         id: &ResourceId,
         identifier: &str,
-        from: &State,
-        to: &Resource,
+        request: UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<State>>;
 
-    /// Delete a resource
+    /// Delete an existing resource. `identifier` is the cloud-side
+    /// internal ID (e.g. `vpc-xxx`).
     ///
-    /// The identifier is the AWS internal ID (e.g., vpc-xxx)
+    /// `request.lifecycle` carries the resource's lifecycle policy
+    /// (force-delete, create-before-destroy, prevent-destroy).
     fn delete(
         &self,
         id: &ResourceId,
         identifier: &str,
-        lifecycle: &LifecycleConfig,
+        request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>>;
 }
 
@@ -315,7 +566,7 @@ impl ProviderRouter {
         self.providers
             .get(provider_name)
             .map(|p| p.as_ref())
-            .ok_or_else(|| ProviderError::new(format!("Unknown provider: {}", provider_name)))
+            .ok_or_else(|| ProviderError::internal(format!("Unknown provider: {}", provider_name)))
     }
 }
 
@@ -327,10 +578,11 @@ impl Provider for ProviderRouter {
     fn read(
         &self,
         id: &ResourceId,
-        identifier: Option<&str>,
+        identifier: &str,
+        request: ReadRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         match self.get_provider_or_error(&id.provider) {
-            Ok(provider) => provider.read(id, identifier),
+            Ok(provider) => provider.read(id, identifier, request),
             Err(e) => Box::pin(async move { Err(e) }),
         }
     }
@@ -342,9 +594,13 @@ impl Provider for ProviderRouter {
         }
     }
 
-    fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-        match self.get_provider_or_error(&resource.id.provider) {
-            Ok(provider) => provider.create(resource),
+    fn create(
+        &self,
+        id: &ResourceId,
+        request: CreateRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        match self.get_provider_or_error(&id.provider) {
+            Ok(provider) => provider.create(id, request),
             Err(e) => Box::pin(async move { Err(e) }),
         }
     }
@@ -353,11 +609,10 @@ impl Provider for ProviderRouter {
         &self,
         id: &ResourceId,
         identifier: &str,
-        from: &State,
-        to: &Resource,
+        request: UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         match self.get_provider_or_error(&id.provider) {
-            Ok(provider) => provider.update(id, identifier, from, to),
+            Ok(provider) => provider.update(id, identifier, request),
             Err(e) => Box::pin(async move { Err(e) }),
         }
     }
@@ -366,10 +621,10 @@ impl Provider for ProviderRouter {
         &self,
         id: &ResourceId,
         identifier: &str,
-        lifecycle: &LifecycleConfig,
+        request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         match self.get_provider_or_error(&id.provider) {
-            Ok(provider) => provider.delete(id, identifier, lifecycle),
+            Ok(provider) => provider.delete(id, identifier, request),
             Err(e) => Box::pin(async move { Err(e) }),
         }
     }
@@ -664,36 +919,40 @@ impl Provider for Box<dyn Provider> {
     fn read(
         &self,
         id: &ResourceId,
-        identifier: Option<&str>,
+        identifier: &str,
+        request: ReadRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        (**self).read(id, identifier)
+        (**self).read(id, identifier, request)
     }
 
     fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
         (**self).read_data_source(resource)
     }
 
-    fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-        (**self).create(resource)
+    fn create(
+        &self,
+        id: &ResourceId,
+        request: CreateRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        (**self).create(id, request)
     }
 
     fn update(
         &self,
         id: &ResourceId,
         identifier: &str,
-        from: &State,
-        to: &Resource,
+        request: UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        (**self).update(id, identifier, from, to)
+        (**self).update(id, identifier, request)
     }
 
     fn delete(
         &self,
         id: &ResourceId,
         identifier: &str,
-        lifecycle: &LifecycleConfig,
+        request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
-        (**self).delete(id, identifier, lifecycle)
+        (**self).delete(id, identifier, request)
     }
 }
 
@@ -712,19 +971,25 @@ mod tests {
         fn read(
             &self,
             id: &ResourceId,
-            _identifier: Option<&str>,
+            _identifier: &str,
+            _request: ReadRequest,
         ) -> BoxFuture<'_, ProviderResult<State>> {
             let id = id.clone();
             Box::pin(async move { Ok(State::not_found(id)) })
         }
 
         fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-            self.read(&resource.id, None)
+            let id = resource.id.clone();
+            Box::pin(async move { Ok(State::not_found(id)) })
         }
 
-        fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-            let id = resource.id.clone();
-            let attrs = resource.attributes.clone();
+        fn create(
+            &self,
+            id: &ResourceId,
+            request: CreateRequest,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            let id = id.clone();
+            let attrs = request.resource.attributes.clone();
             Box::pin(async move {
                 Ok(
                     State::existing(id, crate::resource::attrs_to_hashmap(&attrs))
@@ -737,24 +1002,32 @@ mod tests {
             &self,
             id: &ResourceId,
             _identifier: &str,
-            _from: &State,
-            to: &Resource,
+            request: UpdateRequest,
         ) -> BoxFuture<'_, ProviderResult<State>> {
             let id = id.clone();
-            let attrs = to.attributes.clone();
-            Box::pin(async move {
-                Ok(State::existing(
-                    id,
-                    crate::resource::attrs_to_hashmap(&attrs),
-                ))
-            })
+            // Apply the patch on top of `from` so the test sees the
+            // user-specified changes round-tripped into State.
+            let mut attrs = request.from.attributes.clone();
+            for op in request.patch.ops {
+                match op.kind {
+                    PatchOpKind::Add | PatchOpKind::Replace => {
+                        if let Some(v) = op.value {
+                            attrs.insert(op.key, v);
+                        }
+                    }
+                    PatchOpKind::Remove => {
+                        attrs.remove(&op.key);
+                    }
+                }
+            }
+            Box::pin(async move { Ok(State::existing(id, attrs)) })
         }
 
         fn delete(
             &self,
             _id: &ResourceId,
             _identifier: &str,
-            _lifecycle: &LifecycleConfig,
+            _request: DeleteRequest,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Ok(()) })
         }
@@ -764,7 +1037,7 @@ mod tests {
     async fn mock_provider_read_returns_not_found() {
         let provider = MockProvider;
         let id = ResourceId::new("test", "example");
-        let state = provider.read(&id, None).await.unwrap();
+        let state = provider.read(&id, "", ReadRequest).await.unwrap();
         assert!(!state.exists);
     }
 
@@ -782,14 +1055,15 @@ mod tests {
         fn read(
             &self,
             id: &ResourceId,
-            _identifier: Option<&str>,
+            _identifier: &str,
+            _request: ReadRequest,
         ) -> BoxFuture<'_, ProviderResult<State>> {
             let id = id.clone();
             // Intentionally fails if the data source path doesn't deliver
-            // the full Resource — the legacy `read(&id, None)` route has no
-            // access to input attributes.
+            // the full Resource — the regular `read` route has no access
+            // to input attributes.
             Box::pin(async move {
-                Err(ProviderError::new("read(&id, None) cannot see inputs").for_resource(id))
+                Err(ProviderError::internal("read cannot see inputs").for_resource(id))
             })
         }
 
@@ -806,25 +1080,28 @@ mod tests {
             })
         }
 
-        fn create(&self, _resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-            Box::pin(async { Err(ProviderError::new("not supported")) })
+        fn create(
+            &self,
+            _id: &ResourceId,
+            _request: CreateRequest,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            Box::pin(async { Err(ProviderError::internal("not supported")) })
         }
 
         fn update(
             &self,
             _id: &ResourceId,
             _identifier: &str,
-            _from: &State,
-            _to: &Resource,
+            _request: UpdateRequest,
         ) -> BoxFuture<'_, ProviderResult<State>> {
-            Box::pin(async { Err(ProviderError::new("not supported")) })
+            Box::pin(async { Err(ProviderError::internal("not supported")) })
         }
 
         fn delete(
             &self,
             _id: &ResourceId,
             _identifier: &str,
-            _lifecycle: &LifecycleConfig,
+            _request: DeleteRequest,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Ok(()) })
         }
@@ -906,7 +1183,11 @@ mod tests {
     async fn mock_provider_create_returns_existing() {
         let provider = MockProvider;
         let resource = Resource::new("test", "example");
-        let state = provider.create(&resource).await.unwrap();
+        let id = resource.id.clone();
+        let state = provider
+            .create(&id, CreateRequest { resource })
+            .await
+            .unwrap();
         assert!(state.exists);
         assert_eq!(state.identifier, Some("mock-id-123".to_string()));
     }
@@ -917,7 +1198,7 @@ mod tests {
         router.add_provider("mock".to_string(), Box::new(MockProvider));
 
         let id = ResourceId::with_provider("mock", "test", "example");
-        let state = router.read(&id, None).await.unwrap();
+        let state = router.read(&id, "", ReadRequest).await.unwrap();
         assert!(!state.exists);
     }
 
@@ -927,7 +1208,11 @@ mod tests {
         router.add_provider("mock".to_string(), Box::new(MockProvider));
 
         let resource = Resource::with_provider("mock", "test", "example");
-        let state = router.create(&resource).await.unwrap();
+        let id = resource.id.clone();
+        let state = router
+            .create(&id, CreateRequest { resource })
+            .await
+            .unwrap();
         assert!(state.exists);
         assert_eq!(state.identifier, Some("mock-id-123".to_string()));
     }
@@ -936,7 +1221,7 @@ mod tests {
     fn provider_error_source_returns_cause() {
         use std::error::Error;
         let cause = std::io::Error::other("connection refused");
-        let err = ProviderError::new("Failed to create resource").with_cause(cause);
+        let err = ProviderError::api_error("Failed to create resource").with_cause(cause);
         let source = err.source().expect("source should be Some");
         assert_eq!(source.to_string(), "connection refused");
     }
@@ -944,7 +1229,7 @@ mod tests {
     #[test]
     fn provider_error_display_includes_cause() {
         let cause = std::io::Error::other("connection refused");
-        let err = ProviderError::new("Failed to create resource").with_cause(cause);
+        let err = ProviderError::api_error("Failed to create resource").with_cause(cause);
         let display = format!("{}", err);
         assert!(
             display.contains("connection refused"),
@@ -955,7 +1240,7 @@ mod tests {
 
     #[test]
     fn provider_error_display_without_cause() {
-        let err = ProviderError::new("simple error");
+        let err = ProviderError::internal("simple error");
         let display = format!("{}", err);
         assert_eq!(display, "simple error");
     }
@@ -964,7 +1249,7 @@ mod tests {
     fn provider_error_display_with_resource_id_and_cause() {
         let cause = std::io::Error::other("timeout");
         let id = ResourceId::new("s3.Bucket", "my-bucket");
-        let err = ProviderError::new("Failed to read")
+        let err = ProviderError::api_error("Failed to read")
             .with_cause(cause)
             .for_resource(id);
         let display = format!("{}", err);
@@ -980,6 +1265,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn provider_error_variant_constructors() {
+        let inv = ProviderError::invalid_input("bad");
+        assert!(matches!(inv, ProviderError::InvalidInput(_)));
+        assert_eq!(inv.message(), "bad");
+
+        let api = ProviderError::api_error("rejected");
+        assert!(matches!(api, ProviderError::ApiError(_)));
+
+        let nf = ProviderError::not_found("missing");
+        assert!(matches!(nf, ProviderError::NotFound(_)));
+
+        let to = ProviderError::timeout("slow");
+        assert!(matches!(to, ProviderError::Timeout(_)));
+
+        let intl = ProviderError::internal("bug");
+        assert!(matches!(intl, ProviderError::Internal(_)));
+    }
+
+    #[test]
+    fn build_update_patch_classifies_ops() {
+        let id = ResourceId::new("test", "example");
+        let mut from_attrs = HashMap::new();
+        from_attrs.insert("a".to_string(), Value::String("old".into()));
+        from_attrs.insert("c".to_string(), Value::String("removed".into()));
+        let from = State::existing(id.clone(), from_attrs);
+
+        let mut to = Resource::new("test", "example");
+        to.set_attr("a".to_string(), Value::String("new".into()));
+        to.set_attr("b".to_string(), Value::String("added".into()));
+
+        let changed = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let patch = build_update_patch(&changed, &to, &from);
+        assert_eq!(patch.ops.len(), 3);
+
+        let by_key: HashMap<&str, &PatchOp> =
+            patch.ops.iter().map(|op| (op.key.as_str(), op)).collect();
+        let a = by_key["a"];
+        assert_eq!(a.kind, PatchOpKind::Replace);
+        assert_eq!(a.value, Some(Value::String("new".into())));
+        let b = by_key["b"];
+        assert_eq!(b.kind, PatchOpKind::Add);
+        assert_eq!(b.value, Some(Value::String("added".into())));
+        let c = by_key["c"];
+        assert_eq!(c.kind, PatchOpKind::Remove);
+        assert_eq!(c.value, None);
+    }
+
     #[tokio::test]
     async fn provider_router_dispatches_update_by_provider_name() {
         let mut router = ProviderRouter::new();
@@ -987,8 +1320,11 @@ mod tests {
 
         let id = ResourceId::with_provider("mock", "test", "example");
         let from = State::existing(id.clone(), HashMap::new());
-        let to = Resource::with_provider("mock", "test", "example");
-        let state = router.update(&id, "mock-id-123", &from, &to).await.unwrap();
+        let request = UpdateRequest {
+            from,
+            patch: UpdatePatch::default(),
+        };
+        let state = router.update(&id, "mock-id-123", request).await.unwrap();
         assert!(state.exists);
     }
 
@@ -998,8 +1334,8 @@ mod tests {
         router.add_provider("mock".to_string(), Box::new(MockProvider));
 
         let id = ResourceId::with_provider("mock", "test", "example");
-        let lifecycle = crate::resource::LifecycleConfig::default();
-        let result = router.delete(&id, "mock-id-123", &lifecycle).await;
+        let request = DeleteRequest::default();
+        let result = router.delete(&id, "mock-id-123", request).await;
         assert!(result.is_ok());
     }
 
@@ -1007,14 +1343,11 @@ mod tests {
     async fn provider_router_returns_error_for_unknown_provider() {
         let router = ProviderRouter::new();
         let id = ResourceId::with_provider("nonexistent", "test", "example");
-        let result = router.read(&id, None).await;
+        let result = router.read(&id, "", ReadRequest).await;
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .message
-                .contains("Unknown provider: nonexistent")
-        );
+        let err = result.unwrap_err();
+        assert!(matches!(err, ProviderError::Internal(_)));
+        assert!(err.message().contains("Unknown provider: nonexistent"));
     }
 
     #[tokio::test]
@@ -1050,7 +1383,7 @@ mod tests {
                 _attrs: &IndexMap<String, Value>,
             ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
                 Box::pin(async {
-                    Err(ProviderError::new(
+                    Err(ProviderError::invalid_input(
                         "AWS account ID '019115212452' is not in the provider's \
                          allowed_account_ids [\"151116838382\"]. Refusing to operate \
                          against this account. Check the AWS credentials in your environment.",
@@ -1069,7 +1402,7 @@ mod tests {
             Err(e) => e,
         };
         // Inner message must be preserved verbatim; no implementation-detail wrapper.
-        let msg = err.message;
+        let msg = err.message().to_string();
         assert!(
             msg.contains("019115212452"),
             "actual account missing: {msg}"
@@ -1166,7 +1499,8 @@ mod tests {
             fn read(
                 &self,
                 id: &ResourceId,
-                _identifier: Option<&str>,
+                _identifier: &str,
+                _request: ReadRequest,
             ) -> BoxFuture<'_, ProviderResult<State>> {
                 let id = id.clone();
                 Box::pin(async move { Ok(State::not_found(id)) })
@@ -1180,8 +1514,12 @@ mod tests {
                 Box::pin(async move { Ok(State::not_found(id)) })
             }
 
-            fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-                let id = resource.id.clone();
+            fn create(
+                &self,
+                id: &ResourceId,
+                _request: CreateRequest,
+            ) -> BoxFuture<'_, ProviderResult<State>> {
+                let id = id.clone();
                 Box::pin(async move { Ok(State::not_found(id)) })
             }
 
@@ -1189,8 +1527,7 @@ mod tests {
                 &self,
                 id: &ResourceId,
                 _identifier: &str,
-                _from: &State,
-                _to: &Resource,
+                _request: UpdateRequest,
             ) -> BoxFuture<'_, ProviderResult<State>> {
                 let id = id.clone();
                 Box::pin(async move { Ok(State::not_found(id)) })
@@ -1200,7 +1537,7 @@ mod tests {
                 &self,
                 _id: &ResourceId,
                 _identifier: &str,
-                _lifecycle: &LifecycleConfig,
+                _request: DeleteRequest,
             ) -> BoxFuture<'_, ProviderResult<()>> {
                 Box::pin(async { Ok(()) })
             }

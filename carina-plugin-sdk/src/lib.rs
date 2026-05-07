@@ -52,6 +52,7 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 
 /// Trait that provider authors implement.
+#[allow(clippy::result_large_err)]
 pub trait CarinaProvider {
     /// Return provider name and display name.
     fn info(&self) -> ProviderInfo;
@@ -86,7 +87,12 @@ pub trait CarinaProvider {
     }
 
     /// Read current state of a resource.
-    fn read(&self, id: &ResourceId, identifier: Option<&str>) -> Result<State, ProviderError>;
+    fn read(
+        &self,
+        id: &ResourceId,
+        identifier: &str,
+        request: ReadRequest,
+    ) -> Result<State, ProviderError>;
 
     /// Read a data source resource.
     ///
@@ -96,19 +102,22 @@ pub trait CarinaProvider {
     ///
     /// Each provider must implement this explicitly. For zero-input data
     /// sources (e.g. `aws.sts.caller_identity`), the implementation can
-    /// simply delegate to `self.read(&resource.id, None)`.
+    /// delegate to a state-only read against `resource.id`.
     fn read_data_source(&self, resource: &Resource) -> Result<State, ProviderError>;
 
     /// Create a new resource.
-    fn create(&self, resource: &Resource) -> Result<State, ProviderError>;
+    fn create(&self, id: &ResourceId, request: CreateRequest) -> Result<State, ProviderError>;
 
     /// Update an existing resource.
+    ///
+    /// Providers MUST NOT modify any attribute that is not represented in
+    /// `request.patch.ops`. The patch is the sole source of truth for the
+    /// update payload.
     fn update(
         &self,
         id: &ResourceId,
         identifier: &str,
-        from: &State,
-        to: &Resource,
+        request: UpdateRequest,
     ) -> Result<State, ProviderError>;
 
     /// Delete an existing resource.
@@ -116,7 +125,7 @@ pub trait CarinaProvider {
         &self,
         id: &ResourceId,
         identifier: &str,
-        lifecycle: &LifecycleConfig,
+        request: DeleteRequest,
     ) -> Result<(), ProviderError>;
 
     /// Return provider config attribute completions.
@@ -273,7 +282,7 @@ fn dispatch(provider: &mut impl CarinaProvider, request: &Request) -> Response {
                 Ok(p) => p,
                 Err(e) => return Response::error(id, -32602, e),
             };
-            match provider.read(&params.id, params.identifier.as_deref()) {
+            match provider.read(&params.id, &params.identifier, params.request) {
                 Ok(state) => Response::success(id, methods::ReadResult { state }),
                 Err(e) => Response::error(id, -1, e.message),
             }
@@ -284,7 +293,7 @@ fn dispatch(provider: &mut impl CarinaProvider, request: &Request) -> Response {
                 Ok(p) => p,
                 Err(e) => return Response::error(id, -32602, e),
             };
-            match provider.create(&params.resource) {
+            match provider.create(&params.id, params.request) {
                 Ok(state) => Response::success(id, methods::CreateResult { state }),
                 Err(e) => Response::error(id, -1, e.message),
             }
@@ -295,7 +304,7 @@ fn dispatch(provider: &mut impl CarinaProvider, request: &Request) -> Response {
                 Ok(p) => p,
                 Err(e) => return Response::error(id, -32602, e),
             };
-            match provider.update(&params.id, &params.identifier, &params.from, &params.to) {
+            match provider.update(&params.id, &params.identifier, params.request) {
                 Ok(state) => Response::success(id, methods::UpdateResult { state }),
                 Err(e) => Response::error(id, -1, e.message),
             }
@@ -306,7 +315,7 @@ fn dispatch(provider: &mut impl CarinaProvider, request: &Request) -> Response {
                 Ok(p) => p,
                 Err(e) => return Response::error(id, -32602, e),
             };
-            match provider.delete(&params.id, &params.identifier, &params.lifecycle) {
+            match provider.delete(&params.id, &params.identifier, params.request) {
                 Ok(()) => Response::success(id, methods::DeleteResult { ok: true }),
                 Err(e) => Response::error(id, -1, e.message),
             }

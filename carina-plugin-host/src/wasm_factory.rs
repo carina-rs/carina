@@ -21,10 +21,10 @@ use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use carina_core::provider::{
-    BoxFuture, Provider, ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult,
-    SavedAttrs,
+    BoxFuture, CreateRequest, DeleteRequest, Provider, ProviderError, ProviderFactory,
+    ProviderNormalizer, ProviderResult, ReadRequest, SavedAttrs, UpdateRequest,
 };
-use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
+use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::schema::{CompletionValue, ResourceSchema};
 use carina_core::value::SerializationError;
 
@@ -38,7 +38,7 @@ use crate::wasm_convert;
 /// async block so the future is `'static`.
 fn early_provider_err<T: 'static>(e: SerializationError) -> BoxFuture<'static, ProviderResult<T>> {
     let msg = e.to_string();
-    Box::pin(async move { Err(ProviderError::new(msg)) })
+    Box::pin(async move { Err(ProviderError::internal(msg)) })
 }
 
 /// Unwrap a `core_to_wit_*` result that **must** succeed by invariant.
@@ -359,7 +359,7 @@ impl WasmBindings {
         &self,
         store: &mut Store<HostState>,
         attrs: &[(String, wit_types::Value)],
-    ) -> wasmtime::Result<Result<(), String>> {
+    ) -> wasmtime::Result<Result<(), wit_types::ProviderError>> {
         match self {
             WasmBindings::Basic(b) => {
                 b.carina_provider_provider()
@@ -379,7 +379,7 @@ impl WasmBindings {
         store: &mut Store<HostState>,
         type_name: &str,
         value: &str,
-    ) -> wasmtime::Result<Result<(), String>> {
+    ) -> wasmtime::Result<Result<(), wit_types::ProviderError>> {
         match self {
             WasmBindings::Basic(b) => {
                 b.carina_provider_provider()
@@ -398,7 +398,7 @@ impl WasmBindings {
         &self,
         store: &mut Store<HostState>,
         attrs: &[(String, wit_types::Value)],
-    ) -> wasmtime::Result<Result<(), String>> {
+    ) -> wasmtime::Result<Result<(), wit_types::ProviderError>> {
         match self {
             WasmBindings::Basic(b) => {
                 b.carina_provider_provider()
@@ -417,17 +417,18 @@ impl WasmBindings {
         &self,
         store: &mut Store<HostState>,
         id: &wit_types::ResourceId,
-        identifier: Option<&str>,
-    ) -> wasmtime::Result<Result<wit_types::State, String>> {
+        identifier: &str,
+        request: wit_types::ReadRequest,
+    ) -> wasmtime::Result<Result<wit_types::State, wit_types::ProviderError>> {
         match self {
             WasmBindings::Basic(b) => {
                 b.carina_provider_provider()
-                    .call_read(store, id, identifier)
+                    .call_read(store, id, identifier, request)
                     .await
             }
             WasmBindings::Http(b) => {
                 b.carina_provider_provider()
-                    .call_read(store, id, identifier)
+                    .call_read(store, id, identifier, request)
                     .await
             }
         }
@@ -437,7 +438,7 @@ impl WasmBindings {
         &self,
         store: &mut Store<HostState>,
         resource: &wit_types::ResourceDef,
-    ) -> wasmtime::Result<Result<wit_types::State, String>> {
+    ) -> wasmtime::Result<Result<wit_types::State, wit_types::ProviderError>> {
         match self {
             WasmBindings::Basic(b) => {
                 b.carina_provider_provider()
@@ -455,17 +456,18 @@ impl WasmBindings {
     async fn call_create(
         &self,
         store: &mut Store<HostState>,
-        resource: &wit_types::ResourceDef,
-    ) -> wasmtime::Result<Result<wit_types::State, String>> {
+        id: &wit_types::ResourceId,
+        request: &wit_types::CreateRequest,
+    ) -> wasmtime::Result<Result<wit_types::State, wit_types::ProviderError>> {
         match self {
             WasmBindings::Basic(b) => {
                 b.carina_provider_provider()
-                    .call_create(store, resource)
+                    .call_create(store, id, request)
                     .await
             }
             WasmBindings::Http(b) => {
                 b.carina_provider_provider()
-                    .call_create(store, resource)
+                    .call_create(store, id, request)
                     .await
             }
         }
@@ -476,18 +478,17 @@ impl WasmBindings {
         store: &mut Store<HostState>,
         id: &wit_types::ResourceId,
         identifier: &str,
-        from: &wit_types::State,
-        to: &wit_types::ResourceDef,
-    ) -> wasmtime::Result<Result<wit_types::State, String>> {
+        request: &wit_types::UpdateRequest,
+    ) -> wasmtime::Result<Result<wit_types::State, wit_types::ProviderError>> {
         match self {
             WasmBindings::Basic(b) => {
                 b.carina_provider_provider()
-                    .call_update(store, id, identifier, from, to)
+                    .call_update(store, id, identifier, request)
                     .await
             }
             WasmBindings::Http(b) => {
                 b.carina_provider_provider()
-                    .call_update(store, id, identifier, from, to)
+                    .call_update(store, id, identifier, request)
                     .await
             }
         }
@@ -498,17 +499,17 @@ impl WasmBindings {
         store: &mut Store<HostState>,
         id: &wit_types::ResourceId,
         identifier: &str,
-        options: &str,
-    ) -> wasmtime::Result<Result<(), String>> {
+        request: wit_types::DeleteRequest,
+    ) -> wasmtime::Result<Result<(), wit_types::ProviderError>> {
         match self {
             WasmBindings::Basic(b) => {
                 b.carina_provider_provider()
-                    .call_delete(store, id, identifier, options)
+                    .call_delete(store, id, identifier, request)
                     .await
             }
             WasmBindings::Http(b) => {
                 b.carina_provider_provider()
-                    .call_delete(store, id, identifier, options)
+                    .call_delete(store, id, identifier, request)
                     .await
             }
         }
@@ -1131,7 +1132,10 @@ impl WasmProviderFactory {
             .call_initialize(&mut store, &wit_attrs)
             .await
             .map_err(|e| format!("Failed to call initialize(): {e}"))?
-            .map_err(|e| format!("Provider initialization failed: {e}"))?;
+            .map_err(|e| {
+                let core_err = wasm_convert::wit_to_core_provider_error(e);
+                format!("Provider initialization failed: {}", core_err.message())
+            })?;
 
         Ok((store, bindings))
     }
@@ -1212,6 +1216,11 @@ impl ProviderFactory for WasmProviderFactory {
                     .call_validate_config(store, &wit_attrs)
                     .await
                     .map_err(|e| format!("Failed to call validate_config(): {e}"))?
+                    .map_err(|e| {
+                        wasm_convert::wit_to_core_provider_error(e)
+                            .message()
+                            .to_string()
+                    })
             })
         })
     }
@@ -1226,6 +1235,11 @@ impl ProviderFactory for WasmProviderFactory {
                     .call_validate_custom_type(store, type_name, value)
                     .await
                     .map_err(|e| format!("Failed to call validate_custom_type(): {e}"))?
+                    .map_err(|e| {
+                        wasm_convert::wit_to_core_provider_error(e)
+                            .message()
+                            .to_string()
+                    })
             })
         })
     }
@@ -1276,7 +1290,7 @@ impl ProviderFactory for WasmProviderFactory {
             let instance = self
                 .get_or_create_shared_instance(&attrs)
                 .await
-                .map_err(ProviderError::new)?;
+                .map_err(ProviderError::invalid_input)?;
             Ok(Box::new(WasmProvider {
                 instance,
                 name: self.name.clone(),
@@ -1327,34 +1341,35 @@ impl Provider for WasmProvider {
     fn read(
         &self,
         id: &ResourceId,
-        identifier: Option<&str>,
+        identifier: &str,
+        request: ReadRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let wit_id = wasm_convert::core_to_wit_resource_id(id);
+        let wit_request = wasm_convert::core_to_wit_read_request(&request);
+        let identifier = identifier.to_string();
         let id = id.clone();
-        let identifier = identifier.map(|s| s.to_string());
         Box::pin(async move {
             let mut store = self.instance.store.lock().await;
             store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
             let result = self
                 .instance
                 .bindings
-                .call_read(&mut store, &wit_id, identifier.as_deref())
+                .call_read(&mut store, &wit_id, &identifier, wit_request)
                 .await
                 .map_err(|e| {
                     let msg = format!("{e}");
                     if is_epoch_trap_message(&msg) {
-                        ProviderError::new(format!(
+                        ProviderError::timeout(format!(
                             "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in read \
                              (check AWS credentials)"
                         ))
-                        .timeout()
                     } else {
-                        ProviderError::new(format!("WASM trap in read: {e}"))
+                        ProviderError::internal(format!("WASM trap in read: {e}"))
                     }
                 })?;
             match result {
                 Ok(wit_state) => Ok(wasm_convert::wit_to_core_state(&wit_state, &id)),
-                Err(err_json) => Err(wasm_convert::json_to_provider_error(&err_json)),
+                Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
             }
         })
     }
@@ -1376,69 +1391,28 @@ impl Provider for WasmProvider {
                 .map_err(|e| {
                     let msg = format!("{e}");
                     if is_epoch_trap_message(&msg) {
-                        ProviderError::new(format!(
+                        ProviderError::timeout(format!(
                             "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in \
                              read_data_source (check AWS credentials)"
                         ))
-                        .timeout()
                     } else {
-                        ProviderError::new(format!("WASM trap in read_data_source: {e}"))
+                        ProviderError::internal(format!("WASM trap in read_data_source: {e}"))
                     }
                 })?;
             match result {
                 Ok(wit_state) => Ok(wasm_convert::wit_to_core_state(&wit_state, &id)),
-                Err(err_json) => Err(wasm_convert::json_to_provider_error(&err_json)),
+                Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
             }
         })
     }
 
-    fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-        let wit_resource = match wasm_convert::core_to_wit_resource(resource) {
-            Ok(v) => v,
-            Err(e) => return early_provider_err(e),
-        };
-        let id = resource.id.clone();
-        Box::pin(async move {
-            let mut store = self.instance.store.lock().await;
-            store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
-            let result = self
-                .instance
-                .bindings
-                .call_create(&mut store, &wit_resource)
-                .await
-                .map_err(|e| {
-                    let msg = format!("{e}");
-                    if is_epoch_trap_message(&msg) {
-                        ProviderError::new(format!(
-                            "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in create \
-                             (check AWS credentials)"
-                        ))
-                        .timeout()
-                    } else {
-                        ProviderError::new(format!("WASM trap in create: {e}"))
-                    }
-                })?;
-            match result {
-                Ok(wit_state) => Ok(wasm_convert::wit_to_core_state(&wit_state, &id)),
-                Err(err_json) => Err(wasm_convert::json_to_provider_error(&err_json)),
-            }
-        })
-    }
-
-    fn update(
+    fn create(
         &self,
         id: &ResourceId,
-        identifier: &str,
-        from: &State,
-        to: &Resource,
+        request: CreateRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let wit_id = wasm_convert::core_to_wit_resource_id(id);
-        let identifier = identifier.to_string();
-        let wit_from = match wasm_convert::core_to_wit_state(from) {
-            Ok(v) => v,
-            Err(e) => return early_provider_err(e),
-        };
-        let wit_to = match wasm_convert::core_to_wit_resource(to) {
+        let wit_request = match wasm_convert::core_to_wit_create_request(&request) {
             Ok(v) => v,
             Err(e) => return early_provider_err(e),
         };
@@ -1449,23 +1423,61 @@ impl Provider for WasmProvider {
             let result = self
                 .instance
                 .bindings
-                .call_update(&mut store, &wit_id, &identifier, &wit_from, &wit_to)
+                .call_create(&mut store, &wit_id, &wit_request)
                 .await
                 .map_err(|e| {
                     let msg = format!("{e}");
                     if is_epoch_trap_message(&msg) {
-                        ProviderError::new(format!(
-                            "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in update \
+                        ProviderError::timeout(format!(
+                            "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in create \
                              (check AWS credentials)"
                         ))
-                        .timeout()
                     } else {
-                        ProviderError::new(format!("WASM trap in update: {e}"))
+                        ProviderError::internal(format!("WASM trap in create: {e}"))
                     }
                 })?;
             match result {
                 Ok(wit_state) => Ok(wasm_convert::wit_to_core_state(&wit_state, &id)),
-                Err(err_json) => Err(wasm_convert::json_to_provider_error(&err_json)),
+                Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
+            }
+        })
+    }
+
+    fn update(
+        &self,
+        id: &ResourceId,
+        identifier: &str,
+        request: UpdateRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let wit_id = wasm_convert::core_to_wit_resource_id(id);
+        let identifier = identifier.to_string();
+        let wit_request = match wasm_convert::core_to_wit_update_request(&request) {
+            Ok(v) => v,
+            Err(e) => return early_provider_err(e),
+        };
+        let id = id.clone();
+        Box::pin(async move {
+            let mut store = self.instance.store.lock().await;
+            store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
+            let result = self
+                .instance
+                .bindings
+                .call_update(&mut store, &wit_id, &identifier, &wit_request)
+                .await
+                .map_err(|e| {
+                    let msg = format!("{e}");
+                    if is_epoch_trap_message(&msg) {
+                        ProviderError::timeout(format!(
+                            "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in update \
+                             (check AWS credentials)"
+                        ))
+                    } else {
+                        ProviderError::internal(format!("WASM trap in update: {e}"))
+                    }
+                })?;
+            match result {
+                Ok(wit_state) => Ok(wasm_convert::wit_to_core_state(&wit_state, &id)),
+                Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
             }
         })
     }
@@ -1474,34 +1486,33 @@ impl Provider for WasmProvider {
         &self,
         id: &ResourceId,
         identifier: &str,
-        lifecycle: &LifecycleConfig,
+        request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         let wit_id = wasm_convert::core_to_wit_resource_id(id);
         let identifier = identifier.to_string();
-        let options_json = wasm_convert::lifecycle_to_json(lifecycle);
+        let wit_request = wasm_convert::core_to_wit_delete_request(&request);
         Box::pin(async move {
             let mut store = self.instance.store.lock().await;
             store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
             let result = self
                 .instance
                 .bindings
-                .call_delete(&mut store, &wit_id, &identifier, &options_json)
+                .call_delete(&mut store, &wit_id, &identifier, wit_request)
                 .await
                 .map_err(|e| {
                     let msg = format!("{e}");
                     if is_epoch_trap_message(&msg) {
-                        ProviderError::new(format!(
+                        ProviderError::timeout(format!(
                             "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in delete \
                              (check AWS credentials)"
                         ))
-                        .timeout()
                     } else {
-                        ProviderError::new(format!("WASM trap in delete: {e}"))
+                        ProviderError::internal(format!("WASM trap in delete: {e}"))
                     }
                 })?;
             match result {
                 Ok(()) => Ok(()),
-                Err(err_json) => Err(wasm_convert::json_to_provider_error(&err_json)),
+                Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
             }
         })
     }
