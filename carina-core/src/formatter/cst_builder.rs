@@ -131,6 +131,16 @@ impl<'a> CstBuilder<'a> {
                 self.build_node(NodeKind::ExportsParam, pair),
             )),
             Rule::type_expr => Some(CstChild::Node(self.build_node(NodeKind::TypeExpr, pair))),
+            // `type_expr_atom` is the new wrapper introduced for
+            // `'dev' | 'prod'`-style closed-set string types
+            // (carina-rs/carina#2611). The CST flattens it into the
+            // existing `TypeExpr` node so downstream formatters
+            // continue to see an unwrapped sequence of children.
+            Rule::type_expr_atom => Some(CstChild::Node(self.build_node(NodeKind::TypeExpr, pair))),
+            Rule::type_string_literal => {
+                Some(CstChild::Token(Token::new(pair.as_str().to_string(), span)))
+            }
+            Rule::pipe => Some(CstChild::Token(Token::new(pair.as_str().to_string(), span))),
             Rule::type_primitive => {
                 Some(CstChild::Token(Token::new(pair.as_str().to_string(), span)))
             }

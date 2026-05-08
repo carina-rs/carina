@@ -137,8 +137,15 @@ exports_param = {
 }
 
 // Type expression: string, bool, int, cidr, arn, etc., list(type), map(type), aws.resource (resource ref), struct { field: type, ... }
-type_expr = {
-    type_struct | type_ref | type_list | type_map | type_primitive
+//
+// Closed-set string types (carina-rs/carina#2611) parse as
+// `type_expr_atom (PIPE type_expr_atom)*`. The atom layer carries
+// every shape including `type_string_literal` so unions like
+// `'dev' | 'prod'` round-trip through fmt without losing layout.
+type_expr = { type_expr_atom ~ (trivia* ~ pipe ~ trivia* ~ type_expr_atom)* }
+
+type_expr_atom = {
+    type_struct | type_ref | type_list | type_map | type_string_literal | type_primitive
 }
 
 type_primitive = @{ identifier }
@@ -150,6 +157,10 @@ type_map = { kw_map ~ trivia* ~ open_paren ~ trivia* ~ type_expr ~ trivia* ~ clo
 type_ref = { namespaced_id }
 
 type_struct = { kw_struct ~ trivia* ~ open_brace ~ trivia* ~ struct_field_list? ~ trivia* ~ close_brace }
+
+type_string_literal = { string }
+
+pipe = { "|" }
 
 struct_field_list = { struct_field ~ (trivia* ~ comma ~ trivia* ~ struct_field)* ~ (trivia* ~ comma)? }
 

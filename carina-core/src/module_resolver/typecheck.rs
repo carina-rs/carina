@@ -179,6 +179,27 @@ pub(super) fn check_type_match(
             }
             TypeCheckResult::Ok
         }
+        // Closed-set string literal type (`'dev'` etc., carina-rs/carina#2611).
+        // Only an exact-string `Value::String` match is accepted.
+        TypeExpr::StringLiteral(expected) => {
+            if matches!(value, Value::String(s) if s == expected) {
+                TypeCheckResult::Ok
+            } else {
+                TypeCheckResult::Mismatch
+            }
+        }
+        // Union: `T1 | T2 | ...` accepts the value if any member does.
+        TypeExpr::Union(members) => {
+            for m in members {
+                if matches!(
+                    check_type_match(m, value, config, enclosing_args),
+                    TypeCheckResult::Ok
+                ) {
+                    return TypeCheckResult::Ok;
+                }
+            }
+            TypeCheckResult::Mismatch
+        }
         // Sentinel for failed inference (#2360 stage 2). Module signatures
         // are user-declared and should never carry Unknown — reaching this
         // arm is a defensive fallthrough, treated as a mismatch.
@@ -195,7 +216,11 @@ fn type_expr_compatible(expected: &TypeExpr, actual: &TypeExpr) -> TypeCheckResu
     fn is_string_shaped(t: &TypeExpr) -> bool {
         matches!(
             t,
-            TypeExpr::String | TypeExpr::Simple(_) | TypeExpr::Ref(_) | TypeExpr::SchemaType { .. }
+            TypeExpr::String
+                | TypeExpr::Simple(_)
+                | TypeExpr::Ref(_)
+                | TypeExpr::SchemaType { .. }
+                | TypeExpr::StringLiteral(_)
         )
     }
 
@@ -220,6 +245,30 @@ fn type_expr_compatible(expected: &TypeExpr, actual: &TypeExpr) -> TypeCheckResu
                 }
             }
             TypeCheckResult::Ok
+        }
+        // Union compatibility: actual must satisfy *some* member of
+        // expected when expected is a union; expected actual union
+        // must satisfy expected on at least one member when actual is
+        // a union. See carina-rs/carina#2611.
+        (TypeExpr::Union(members), other) => {
+            if members
+                .iter()
+                .any(|m| matches!(type_expr_compatible(m, other), TypeCheckResult::Ok))
+            {
+                TypeCheckResult::Ok
+            } else {
+                TypeCheckResult::Mismatch
+            }
+        }
+        (other, TypeExpr::Union(members)) => {
+            if members
+                .iter()
+                .any(|m| matches!(type_expr_compatible(other, m), TypeCheckResult::Ok))
+            {
+                TypeCheckResult::Ok
+            } else {
+                TypeCheckResult::Mismatch
+            }
         }
         // Unknown is the failed-inference sentinel; anything paired with
         // it is a defensive mismatch.

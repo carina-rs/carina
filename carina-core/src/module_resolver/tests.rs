@@ -3279,3 +3279,101 @@ let prod = outer {
     let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
     resolve_modules(&mut parsed, &root_dir).expect("3-deep list pass-through should resolve");
 }
+
+// carina-rs/carina#2611: closed-set string types in `arguments`.
+// These tests cover the *caller* side — when a module is declared
+// with `env: 'dev' | 'prod' = 'dev'`, the call site
+// `mod_call { env = 'dpv' }` must be rejected by typecheck. Without
+// the StringLiteral/Union arms in `module_resolver::typecheck`, the
+// typo would slip through to plan because the parser's pre-#2611
+// fallback was `String`.
+
+fn create_module_with_environment_union() -> ParsedFile {
+    ParsedFile {
+        providers: vec![],
+        resources: vec![],
+        variables: IndexMap::new(),
+        uses: vec![],
+        module_calls: vec![],
+        arguments: vec![ArgumentParameter {
+            name: "environment".to_string(),
+            type_expr: TypeExpr::Union(vec![
+                TypeExpr::StringLiteral("dev".to_string()),
+                TypeExpr::StringLiteral("prod".to_string()),
+            ]),
+            default: Some(Value::String("dev".to_string())),
+            description: None,
+            validations: Vec::new(),
+        }],
+        attribute_params: vec![],
+        export_params: vec![],
+        backend: None,
+        state_blocks: vec![],
+        user_functions: HashMap::new(),
+        upstream_states: vec![],
+        requires: vec![],
+        structural_bindings: HashSet::new(),
+        warnings: vec![],
+        deferred_for_expressions: vec![],
+    }
+}
+
+#[test]
+fn caller_side_typo_against_string_literal_union_is_rejected() {
+    let resolver = {
+        let mut r = ModuleResolver::new(".");
+        r.imported_modules.insert(
+            "env_module".to_string(),
+            create_module_with_environment_union(),
+        );
+        r
+    };
+
+    let call = ModuleCall {
+        module_name: "env_module".to_string(),
+        binding_name: Some("my_env".to_string()),
+        arguments: {
+            let mut args = HashMap::new();
+            // Typo: 'dpv' is outside the declared 'dev' | 'prod' union.
+            args.insert("environment".to_string(), Value::String("dpv".to_string()));
+            args
+        },
+    };
+
+    let result = resolver.expand_module_call(&call, "my_env", None);
+    assert!(
+        matches!(result, Err(ModuleError::InvalidArgumentType { .. })),
+        "Caller passing 'dpv' to `'dev' | 'prod'` must be rejected — \
+         carina-rs/carina#2611. Got: {:?}",
+        result
+    );
+}
+
+#[test]
+fn caller_side_value_in_string_literal_union_is_accepted() {
+    let resolver = {
+        let mut r = ModuleResolver::new(".");
+        r.imported_modules.insert(
+            "env_module".to_string(),
+            create_module_with_environment_union(),
+        );
+        r
+    };
+
+    let call = ModuleCall {
+        module_name: "env_module".to_string(),
+        binding_name: Some("my_env".to_string()),
+        arguments: {
+            let mut args = HashMap::new();
+            args.insert("environment".to_string(), Value::String("prod".to_string()));
+            args
+        },
+    };
+
+    let result = resolver.expand_module_call(&call, "my_env", None);
+    assert!(
+        result.is_ok(),
+        "Caller passing 'prod' (in the declared union) must be accepted. Got: {:?}",
+        result
+    );
+}
