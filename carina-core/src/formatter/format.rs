@@ -1860,4 +1860,104 @@ aws.s3.Bucket {
         let second = format(&first, &config).unwrap();
         assert_eq!(first, second, "multi-line list fmt must be idempotent");
     }
+
+    // carina-rs/carina#2588: comments inside list literals must not
+    // be silently dropped. Multi-line lists keep their comments
+    // (leading-of-element or trailing-of-element); a single-line
+    // list with a line comment is promoted to multi-line because a
+    // line comment intrinsically ends the line.
+
+    #[test]
+    fn test_format_preserves_leading_line_comment_in_list() {
+        let input = "\
+aws.s3.Bucket {
+  action = [
+    # read ops
+    's3:GetObject',
+    's3:ListBucket',
+  ]
+}
+";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert_eq!(
+            result, input,
+            "leading line comment inside multi-line list must be preserved. Got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_preserves_trailing_line_comment_in_list() {
+        // Per-element trailing comments stay on the same line as the
+        // element they follow (terraform-style P-trailing).
+        let input = "\
+aws.s3.Bucket {
+  action = [
+    's3:GetObject', # read
+    's3:PutObject', # write
+  ]
+}
+";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert_eq!(
+            result, input,
+            "trailing per-element line comments must stay attached. Got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_preserves_block_comment_in_list_singleline() {
+        let input = "aws.s3.Bucket {\n  action = ['a', /* mid */ 'b']\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert_eq!(
+            result, input,
+            "inline block comment in single-line list must be preserved. Got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_promotes_singleline_list_with_line_comment_to_multiline() {
+        // A single-line list that contains a line comment cannot stay
+        // single-line — the comment intrinsically runs to end of line.
+        let input = "aws.s3.Bucket {\n  action = ['a', # post\n           'b']\n}\n";
+        let expected = "\
+aws.s3.Bucket {
+  action = [
+    'a', # post
+    'b',
+  ]
+}
+";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert_eq!(
+            result, expected,
+            "line comment in list must promote to multi-line. Got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_list_comments_idempotent() {
+        let input = "\
+aws.s3.Bucket {
+  action = [
+    # read ops
+    's3:GetObject', # one
+    's3:ListBucket',
+    # write ops
+    's3:PutObject',
+  ]
+}
+";
+        let config = FormatConfig::default();
+        let first = format(input, &config).unwrap();
+        let second = format(&first, &config).unwrap();
+        assert_eq!(first, second, "list with comments fmt must be idempotent");
+    }
 }
