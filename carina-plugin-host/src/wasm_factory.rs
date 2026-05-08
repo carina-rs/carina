@@ -572,6 +572,26 @@ impl WasmBindings {
             }
         }
     }
+
+    async fn call_merge_default_tags(
+        &self,
+        store: &mut Store<HostState>,
+        resources: &[wit_types::ResourceDef],
+        default_tags: &[(String, wit_types::Value)],
+    ) -> wasmtime::Result<Vec<wit_types::ResourceDef>> {
+        match self {
+            WasmBindings::Basic(b) => {
+                b.carina_provider_provider()
+                    .call_merge_default_tags(store, resources, default_tags)
+                    .await
+            }
+            WasmBindings::Http(b) => {
+                b.carina_provider_provider()
+                    .call_merge_default_tags(store, resources, default_tags)
+                    .await
+            }
+        }
+    }
 }
 
 /// Build `StoreLimits` used for every WASM plugin store.
@@ -1655,6 +1675,64 @@ impl ProviderNormalizer for WasmProviderNormalizer {
                 }
             }
             Err(e) => log::error!("WASM trap in hydrate_read_state: {e}"),
+        }
+    }
+
+    fn merge_default_tags(
+        &self,
+        resources: &mut [Resource],
+        default_tags: &IndexMap<String, Value>,
+        _registry: &carina_core::schema::SchemaRegistry,
+    ) {
+        if default_tags.is_empty() {
+            return;
+        }
+
+        let wit_resources: Vec<_> = expect_unresolvable_absent(
+            resources
+                .iter()
+                .map(wasm_convert::core_to_wit_resource)
+                .collect::<Result<Vec<_>, _>>(),
+            "merge_default_tags",
+        );
+
+        // Per-key skip on serialize failure (vs. `core_to_wit_value_map`'s
+        // all-or-nothing) — one bad default tag must not nuke the whole
+        // merge for a multi-resource plan.
+        let wit_default_tags: Vec<(String, wit_types::Value)> = default_tags
+            .iter()
+            .filter_map(|(k, v)| match wasm_convert::core_to_wit_value(v) {
+                Ok(wit_value) => Some((k.clone(), wit_value)),
+                Err(e) => {
+                    log::error!("Skipping default_tag '{k}' with unresolvable value: {e}");
+                    None
+                }
+            })
+            .collect();
+
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let mut store = self.instance.store.lock().await;
+                store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
+                self.instance
+                    .bindings
+                    .call_merge_default_tags(&mut store, &wit_resources, &wit_default_tags)
+                    .await
+            })
+        });
+
+        match result {
+            Ok(result) => {
+                // Guest preserves resource order; zip and overwrite
+                // attributes (merge may add `tags` and `_default_tag_keys`).
+                for (core_res, wit_res) in resources.iter_mut().zip(result.iter()) {
+                    let resolved = wasm_convert::wit_to_core_value_map(&wit_res.attributes);
+                    for (key, value) in resolved {
+                        core_res.attributes.insert(key, value);
+                    }
+                }
+            }
+            Err(e) => log::error!("WASM trap in merge_default_tags: {e}"),
         }
     }
 }

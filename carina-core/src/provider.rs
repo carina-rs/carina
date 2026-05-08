@@ -471,7 +471,23 @@ pub trait ProviderNormalizer: Send + Sync {
     /// Records which tag keys came from defaults in the `_default_tag_keys` internal
     /// metadata attribute.
     ///
-    /// Default implementation is a no-op for providers without tag support.
+    /// No default: an implicit no-op silently swallowed
+    /// `WasmProviderNormalizer`'s missing dispatch in
+    /// carina-rs/carina-provider-awscc#192. Every implementation now picks
+    /// explicitly between [`merge_default_tags_for_provider`], a custom
+    /// merge, or [`NoopNormalizer`]'s deliberate no-op.
+    fn merge_default_tags(
+        &self,
+        resources: &mut [Resource],
+        default_tags: &IndexMap<String, Value>,
+        registry: &SchemaRegistry,
+    );
+}
+
+/// A no-op normalizer for providers that don't need plan-time normalization.
+#[derive(Debug, Clone, Copy)]
+pub struct NoopNormalizer;
+impl ProviderNormalizer for NoopNormalizer {
     fn merge_default_tags(
         &self,
         _resources: &mut [Resource],
@@ -480,11 +496,6 @@ pub trait ProviderNormalizer: Send + Sync {
     ) {
     }
 }
-
-/// A no-op normalizer for providers that don't need plan-time normalization.
-#[derive(Debug, Clone, Copy)]
-pub struct NoopNormalizer;
-impl ProviderNormalizer for NoopNormalizer {}
 
 /// Shared implementation for merging default tags into resources.
 ///
@@ -1525,6 +1536,14 @@ mod tests {
                     }
                 }
             }
+
+            fn merge_default_tags(
+                &self,
+                _resources: &mut [Resource],
+                _default_tags: &IndexMap<String, Value>,
+                _registry: &SchemaRegistry,
+            ) {
+            }
         }
 
         // Test normalize_desired
@@ -1625,6 +1644,14 @@ mod tests {
                         }
                     }
                 }
+            }
+
+            fn merge_default_tags(
+                &self,
+                _resources: &mut [Resource],
+                _default_tags: &IndexMap<String, Value>,
+                _registry: &SchemaRegistry,
+            ) {
             }
         }
 
