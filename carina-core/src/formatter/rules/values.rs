@@ -190,58 +190,75 @@ impl Formatter {
     }
 
     pub(in crate::formatter) fn format_list(&mut self, node: &CstNode) {
-        // carina-rs/carina#2586: preserve the user's list layout.
-        // If the source had any newline between `[` and `]`, render
-        // multi-line (one element per line, trailing comma); otherwise
-        // stay on a single line. Indentation and the comma-space
-        // between elements are normalized either way; we never reflow
-        // for line width.
-        let multiline = list_is_multiline(node);
+        // carina-rs/carina#2586 + #2588: preserve the user's list
+        // layout AND any comments inside the list. Multi-line input
+        // renders multi-line; comments above an element become its
+        // leading comments (own line at element indent), comments on
+        // the same line as the closing comma become trailing
+        // comments (kept inline with the element). Single-line input
+        // stays single-line *unless* it contains a line comment, in
+        // which case it is promoted to multi-line — a line comment
+        // intrinsically ends its line and cannot live inline.
+        let items = collect_list_items(node);
+        let multiline = list_is_multiline(node) || any_line_comment(&items);
 
         self.write("[");
         if multiline {
             self.write_newline();
             self.current_indent += 1;
-        }
-        let mut first = true;
-        for child in &node.children {
-            let is_element = match child {
-                CstChild::Token(token) => !matches!(token.text.as_str(), "[" | "]" | ","),
-                CstChild::Node(_) => true,
-                CstChild::Trivia(_) => false,
-            };
-            if !is_element {
-                continue;
-            }
-            if !first {
-                if multiline {
-                    self.write(",");
+            for item in &items {
+                for c in &item.leading_comments {
+                    self.write_indent();
+                    self.write_trivia(c);
                     self.write_newline();
-                } else {
-                    self.write(", ");
                 }
-            }
-            if multiline {
                 self.write_indent();
-            }
-            match child {
-                CstChild::Token(token) => self.write_token(&token.text),
-                CstChild::Node(n) => self.format_node(n),
-                CstChild::Trivia(_) => unreachable!(),
-            }
-            first = false;
-        }
-        if multiline {
-            if !first {
-                // Trailing comma after the last element, then newline
-                // before the closing bracket at the parent indent.
+                self.emit_list_element(&item.element);
                 self.write(",");
+                for c in &item.trailing_comments {
+                    self.write(" ");
+                    self.write_trivia(c);
+                }
+                self.write_newline();
+            }
+            // Trailing comments after the last element but before `]`
+            // (e.g. a comment block at the very bottom of the list).
+            for c in &trailing_after_last(node) {
+                self.write_indent();
+                self.write_trivia(c);
                 self.write_newline();
             }
             self.current_indent -= 1;
             self.write_indent();
+        } else {
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    self.write(", ");
+                }
+                // Block comments that became leading-of-this-element
+                // (e.g. `'a', /* mid */ 'b'`) must stay inline.
+                // `any_line_comment` already promoted any list with
+                // line comments to multi-line, so we know these are
+                // all `BlockComment`.
+                for c in &item.leading_comments {
+                    self.write_trivia(c);
+                    self.write(" ");
+                }
+                self.emit_list_element(&item.element);
+                for c in &item.trailing_comments {
+                    self.write(" ");
+                    self.write_trivia(c);
+                }
+            }
         }
         self.write("]");
+    }
+
+    fn emit_list_element(&mut self, element: &ListElement<'_>) {
+        match element {
+            ListElement::Token(t) => self.write_token(t),
+            ListElement::Node(n) => self.format_node(n),
+        }
     }
 
     pub(in crate::formatter) fn format_map(&mut self, node: &CstNode) {
@@ -443,4 +460,218 @@ fn list_is_multiline(node: &CstNode) -> bool {
     node.children
         .iter()
         .any(|c| matches!(c, CstChild::Trivia(Trivia::Newline)))
+}
+
+/// One element of a list literal, paired with its leading comments
+/// (above, on their own line in the source) and trailing comments
+/// (on the same line as the element's closing comma in the source).
+///
+/// Used by `format_list` to keep both kinds of comments attached to
+/// the right element when re-emitting — see carina-rs/carina#2588.
+pub(in crate::formatter) struct ListItem<'a> {
+    element: ListElement<'a>,
+    leading_comments: Vec<&'a Trivia>,
+    trailing_comments: Vec<&'a Trivia>,
+}
+
+/// A list element is either a leaf token (a string/number literal)
+/// or a nested node (an expression or sub-list).
+pub(in crate::formatter) enum ListElement<'a> {
+    Token(&'a str),
+    Node(&'a CstNode),
+}
+
+/// Returns true if any item has a `LineComment` attached. A line
+/// comment intrinsically ends its line, so a single-line list that
+/// contains one must be promoted to multi-line on emit.
+fn any_line_comment(items: &[ListItem<'_>]) -> bool {
+    items.iter().any(|i| {
+        i.leading_comments
+            .iter()
+            .chain(i.trailing_comments.iter())
+            .any(|t| matches!(t, Trivia::LineComment(_)))
+    })
+}
+
+/// Walk the list CST node and group its children into `ListItem`s.
+///
+/// Trivia attachment rule (terraform-style P-trailing):
+///
+/// - A `LineComment` on the same logical line as the preceding
+///   element (i.e. between that element's comma and the next
+///   `Newline`) becomes that element's **trailing** comment, even
+///   when it physically sits *after* the comma. Line comments run
+///   to end of line, so they intrinsically belong to that line.
+/// - A `BlockComment` on the same logical line as the preceding
+///   element, but *after* that element's comma, becomes the
+///   **leading** comment of the next element — terraform's natural
+///   reading of `'a', /* mid */ 'b'`.
+/// - Any comment that crosses a `Newline` after the previous
+///   element becomes a **leading** comment of the next element.
+/// - Comments at the very end of the list (after the last comma,
+///   below the last element) are collected separately by
+///   `trailing_after_last`.
+fn collect_list_items(node: &CstNode) -> Vec<ListItem<'_>> {
+    let mut items: Vec<ListItem<'_>> = Vec::new();
+    let mut pending_leading: Vec<&Trivia> = Vec::new();
+    // Comments that appeared after the most recent element but
+    // before its closing comma (e.g. `'a' /* x */ , 'b'`). Get
+    // attached to the previous element as trailing on the next
+    // newline (or to the next element as leading on a fresh comma).
+    let mut pre_comma_pending: Vec<&Trivia> = Vec::new();
+    // Comments that appeared after the most recent element's comma
+    // but before the next newline. Line comments here go back onto
+    // the previous element as trailing; block comments go forward
+    // as leading for the next element.
+    let mut post_comma_pending: Vec<&Trivia> = Vec::new();
+    // What we've passed since pushing the last element.
+    let mut seen_comma = false;
+    let mut crossed_newline = false;
+
+    // Resolve `post_comma_pending` against the just-emitted-or-
+    // about-to-be-emitted state. Line comments go back as trailing
+    // of the previous element; block comments stay as leading of
+    // the next element.
+    fn flush_post_comma<'a>(
+        items: &mut Vec<ListItem<'a>>,
+        pending_leading: &mut Vec<&'a Trivia>,
+        post_comma_pending: &mut Vec<&'a Trivia>,
+    ) {
+        for t in std::mem::take(post_comma_pending) {
+            match t {
+                Trivia::LineComment(_) => {
+                    if let Some(prev) = items.last_mut() {
+                        prev.trailing_comments.push(t);
+                    } else {
+                        pending_leading.push(t);
+                    }
+                }
+                _ => pending_leading.push(t),
+            }
+        }
+    }
+
+    for child in &node.children {
+        match child {
+            CstChild::Token(token) => {
+                let text = token.text.as_str();
+                if text == "[" || text == "]" {
+                    continue;
+                }
+                if text == "," {
+                    // Comments seen between the element and the
+                    // comma are still pre-comma — flush them as
+                    // leading for the *next* element (rare shape).
+                    pending_leading.append(&mut pre_comma_pending);
+                    seen_comma = true;
+                    crossed_newline = false;
+                    continue;
+                }
+                flush_post_comma(&mut items, &mut pending_leading, &mut post_comma_pending);
+                items.push(ListItem {
+                    element: ListElement::Token(text),
+                    leading_comments: std::mem::take(&mut pending_leading),
+                    trailing_comments: Vec::new(),
+                });
+                seen_comma = false;
+                crossed_newline = false;
+            }
+            CstChild::Node(n) => {
+                flush_post_comma(&mut items, &mut pending_leading, &mut post_comma_pending);
+                items.push(ListItem {
+                    element: ListElement::Node(n),
+                    leading_comments: std::mem::take(&mut pending_leading),
+                    trailing_comments: Vec::new(),
+                });
+                seen_comma = false;
+                crossed_newline = false;
+            }
+            CstChild::Trivia(t) => match t {
+                Trivia::Whitespace(_) => {}
+                Trivia::Newline => {
+                    if !crossed_newline {
+                        // First newline since the previous element:
+                        // line comments are trailing-of-previous;
+                        // block comments are leading-of-next.
+                        flush_post_comma(&mut items, &mut pending_leading, &mut post_comma_pending);
+                        // pre-comma pending (rare) also becomes
+                        // leading for the next element on newline.
+                        pending_leading.append(&mut pre_comma_pending);
+                    }
+                    crossed_newline = true;
+                }
+                Trivia::LineComment(_) | Trivia::BlockComment(_) => {
+                    if crossed_newline {
+                        pending_leading.push(t);
+                    } else if seen_comma {
+                        post_comma_pending.push(t);
+                    } else if items.is_empty() {
+                        pending_leading.push(t);
+                    } else {
+                        pre_comma_pending.push(t);
+                    }
+                }
+            },
+        }
+    }
+
+    // Anything still in post_comma_pending / pre_comma_pending /
+    // pending_leading at end belongs after the last element and is
+    // collected separately by `trailing_after_last`.
+    items
+}
+
+/// Trivia (line/block comments) that appears after the last list
+/// element's *trailing* slot (i.e. on its own line below the last
+/// element) but before the closing `]`. These are emitted as
+/// standalone indented lines in multi-line output so a comment block
+/// at the very bottom of a list is not lost.
+///
+/// Comments that sit on the same logical line as the last element
+/// (between its comma and the next newline) are *not* collected
+/// here — `collect_list_items` has already attached them as trailing
+/// comments on that element.
+fn trailing_after_last<'a>(node: &'a CstNode) -> Vec<&'a Trivia> {
+    let mut comments: Vec<&'a Trivia> = Vec::new();
+    let mut seen_any_element = false;
+    let mut crossed_newline_since_last_element = false;
+
+    for child in &node.children {
+        match child {
+            CstChild::Token(token) => {
+                let text = token.text.as_str();
+                if text == "[" {
+                    continue;
+                }
+                if text == "]" {
+                    break;
+                }
+                if text == "," {
+                    continue;
+                }
+                seen_any_element = true;
+                crossed_newline_since_last_element = false;
+                comments.clear();
+            }
+            CstChild::Node(_) => {
+                seen_any_element = true;
+                crossed_newline_since_last_element = false;
+                comments.clear();
+            }
+            CstChild::Trivia(t) => match t {
+                Trivia::Newline => {
+                    if seen_any_element {
+                        crossed_newline_since_last_element = true;
+                    }
+                }
+                Trivia::LineComment(_) | Trivia::BlockComment(_) => {
+                    if seen_any_element && crossed_newline_since_last_element {
+                        comments.push(t);
+                    }
+                }
+                Trivia::Whitespace(_) => {}
+            },
+        }
+    }
+    comments
 }
