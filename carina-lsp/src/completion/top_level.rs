@@ -335,6 +335,22 @@ impl CompletionProvider {
             .collect()
     }
 
+    /// Resolve a `let X = use { ... }` binding to the called module's
+    /// parsed `ParsedFile`. Returns `None` if the import path can't be
+    /// found, the call lacks a `base_path`, or the module fails to
+    /// parse.
+    fn load_called_module(
+        &self,
+        module_name: &str,
+        text: &str,
+        base_path: Option<&Path>,
+    ) -> Option<carina_core::parser::ParsedFile> {
+        let import_path = self.find_module_import_path(module_name, text, base_path)?;
+        let base = base_path?;
+        let module_path = base.join(&import_path);
+        carina_core::module_resolver::load_module(&module_path)
+    }
+
     pub(super) fn module_parameter_completions(
         &self,
         module_name: &str,
@@ -343,43 +359,55 @@ impl CompletionProvider {
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
 
-        // Find the import statement for this module — across the buffer
-        // and every sibling `.crn` in the same directory (#2446).
-        let import_path = self.find_module_import_path(module_name, text, base_path);
+        if let Some(parsed) = self.load_called_module(module_name, text, base_path) {
+            for input in &parsed.arguments {
+                let type_str = self.format_type_expr(&input.type_expr);
+                let required_marker = if input.default.is_some() {
+                    ""
+                } else {
+                    " (required)"
+                };
 
-        if let Some(import_path) = import_path
-            && let Some(base) = base_path
-        {
-            let module_path = base.join(&import_path);
-            if let Some(parsed) = carina_core::module_resolver::load_module(&module_path) {
-                // Extract argument parameters from the module
-                for input in &parsed.arguments {
-                    let type_str = self.format_type_expr(&input.type_expr);
-                    let required_marker = if input.default.is_some() {
-                        ""
-                    } else {
-                        " (required)"
-                    };
+                let trigger_suggest = Command {
+                    title: "Trigger Suggest".to_string(),
+                    command: "editor.action.triggerSuggest".to_string(),
+                    arguments: None,
+                };
 
-                    let trigger_suggest = Command {
-                        title: "Trigger Suggest".to_string(),
-                        command: "editor.action.triggerSuggest".to_string(),
-                        arguments: None,
-                    };
-
-                    completions.push(CompletionItem {
-                        label: input.name.clone(),
-                        kind: Some(CompletionItemKind::PROPERTY),
-                        detail: Some(format!("{}{}", type_str, required_marker)),
-                        insert_text: Some(format!("{} = ", input.name)),
-                        command: Some(trigger_suggest),
-                        ..Default::default()
-                    });
-                }
+                completions.push(CompletionItem {
+                    label: input.name.clone(),
+                    kind: Some(CompletionItemKind::PROPERTY),
+                    detail: Some(format!("{}{}", type_str, required_marker)),
+                    insert_text: Some(format!("{} = ", input.name)),
+                    command: Some(trigger_suggest),
+                    ..Default::default()
+                });
             }
         }
 
         completions
+    }
+
+    /// Value-position completion inside a module call. Resolves the
+    /// called module's `arguments {}` declaration, looks up `arg_name`'s
+    /// type, and emits candidates derived from that type. Today this
+    /// covers string-literal unions (#2611, e.g. `'dev' | 'prod'`) and
+    /// single string literals; richer types fall silent rather than dump
+    /// generic built-ins. See #2621.
+    pub(super) fn module_call_arg_value_completions(
+        &self,
+        module_name: &str,
+        arg_name: &str,
+        text: &str,
+        base_path: Option<&Path>,
+    ) -> Vec<CompletionItem> {
+        let Some(parsed) = self.load_called_module(module_name, text, base_path) else {
+            return Vec::new();
+        };
+        let Some(arg) = parsed.arguments.iter().find(|a| a.name == arg_name) else {
+            return Vec::new();
+        };
+        completions_from_type_expr(&arg.type_expr)
     }
 
     pub(super) fn format_type_expr(&self, type_expr: &parser::TypeExpr) -> String {
@@ -863,6 +891,41 @@ pub(super) fn extract_for_bindings_in_scope(
         .into_iter()
         .flat_map(|(bindings, _)| bindings)
         .collect()
+}
+
+/// Derive value-position completion candidates from a [`parser::TypeExpr`].
+///
+/// Today this covers closed-set string types (#2611) — the only carina
+/// type whose membership is fully enumerable from the syntax tree alone:
+///
+/// - [`parser::TypeExpr::StringLiteral`] → one candidate, the literal.
+/// - [`parser::TypeExpr::Union`] of literals → one candidate per literal.
+///
+/// Any other shape returns an empty list. Adding richer types here
+/// (e.g. `Bool` → `true`/`false`) is a natural extension but out of
+/// scope for the original #2621 fix.
+fn completions_from_type_expr(type_expr: &parser::TypeExpr) -> Vec<CompletionItem> {
+    fn literal_item(value: &str) -> CompletionItem {
+        let label = format!("'{value}'");
+        CompletionItem {
+            label: label.clone(),
+            kind: Some(CompletionItemKind::VALUE),
+            detail: Some("string literal".to_string()),
+            insert_text: Some(label),
+            ..Default::default()
+        }
+    }
+    match type_expr {
+        parser::TypeExpr::StringLiteral(s) => vec![literal_item(s)],
+        parser::TypeExpr::Union(members) => members
+            .iter()
+            .filter_map(|m| match m {
+                parser::TypeExpr::StringLiteral(s) => Some(literal_item(s)),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 #[cfg(test)]

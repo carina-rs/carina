@@ -139,6 +139,10 @@ impl CompletionProvider {
                 type_expr_text,
                 in_nested,
             } => self.exports_value_completions(&type_expr_text, in_nested, &text, base_path),
+            CompletionContext::AfterEqualsInModuleCall {
+                module_name,
+                arg_name,
+            } => self.module_call_arg_value_completions(&module_name, &arg_name, &text, base_path),
             CompletionContext::InsideStructBlock {
                 resource_type,
                 attr_path,
@@ -519,6 +523,18 @@ impl CompletionProvider {
                 }
                 // Extract attribute name from current line
                 let attr_name = self.extract_attr_name(&prefix);
+                // Module call value position: route to a module-aware
+                // handler that loads the called module's `arguments {}`
+                // and emits type-driven candidates (#2621).
+                if let Some(module) = module_name.as_ref()
+                    && resource_type.is_empty()
+                    && !attr_name.is_empty()
+                {
+                    return CompletionContext::AfterEqualsInModuleCall {
+                        module_name: module.clone(),
+                        arg_name: attr_name,
+                    };
+                }
                 return CompletionContext::AfterEquals {
                     resource_type: resource_type.clone(),
                     attr_name,
@@ -769,6 +785,16 @@ enum CompletionContext {
     AfterEqualsInExports {
         type_expr_text: String,
         in_nested: bool,
+    },
+    /// Cursor is at a value position inside a `let X = <module> { ... }`
+    /// block for one of the module's declared `arguments {}` parameters.
+    /// The handler resolves `module_name` → its source directory →
+    /// `arguments` declaration to look up `arg_name`'s `TypeExpr`, then
+    /// emits candidates derived from that type (e.g. literal members of
+    /// a `'dev' | 'prod'` union). See #2621.
+    AfterEqualsInModuleCall {
+        module_name: String,
+        arg_name: String,
     },
     InsideStructBlock {
         resource_type: String,

@@ -1899,3 +1899,216 @@ fn top_level_module_call_completion_with_sibling_use_decl() {
         "expected `github` module-call completion from sibling `let X = use {{...}}`, got: {labels:?}"
     );
 }
+
+/// Issue #2621: value-position completion inside a module call must
+/// surface candidates derived from the called module's `arguments {}`
+/// declaration. For closed-set string types (`'dev' | 'prod'`,
+/// introduced in #2611), the candidates are the literal members.
+#[test]
+fn module_call_value_completion_string_literal_union() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let provider = test_provider();
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let base_path = temp_dir.path();
+
+    let module_dir = base_path.join("usecases").join("registry-deploy");
+    fs::create_dir_all(&module_dir).expect("Failed to create module dir");
+    let module_main = r#"arguments {
+  environment: 'dev' | 'prod'
+}
+"#;
+    fs::write(module_dir.join("main.crn"), module_main).expect("Failed to write module");
+
+    // Consumer: `let rd = registry_deploy { environment = <CURSOR> }`.
+    let main_content = r#"let registry_deploy = use {
+  source = './usecases/registry-deploy'
+}
+
+let rd = registry_deploy {
+  environment =
+}
+"#;
+    let doc = create_document(main_content);
+
+    // Cursor sits one past the `= ` on line 5 (0-indexed).
+    let position = Position {
+        line: 5,
+        character: 16,
+    };
+    let completions = provider.complete(&doc, position, Some(base_path));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"'dev'"),
+        "expected 'dev' literal candidate after `environment = `, got: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"'prod'"),
+        "expected 'prod' literal candidate after `environment = `, got: {labels:?}"
+    );
+}
+
+/// Issue #2621: a module-call argument with `arguments {}` declared in
+/// `main.crn` (not `exports.crn`) must still expose its parameter names
+/// for completion. Mirrors the `usecases/<name>/main.crn` shape from
+/// the issue body.
+#[test]
+fn module_call_arg_name_completion_arguments_in_main_crn() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let provider = test_provider();
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let base_path = temp_dir.path();
+
+    let module_dir = base_path.join("usecases").join("registry-deploy");
+    fs::create_dir_all(&module_dir).expect("Failed to create module dir");
+    let module_main = r#"arguments {
+  oidc_provider_arn: IamOidcProviderArn
+  environment      : 'dev' | 'prod'
+}
+"#;
+    fs::write(module_dir.join("main.crn"), module_main).expect("Failed to write module");
+
+    let main_content = r#"let registry_deploy = use {
+  source = './usecases/registry-deploy'
+}
+
+let rd = registry_deploy {
+  o
+}
+"#;
+    let doc = create_document(main_content);
+
+    let position = Position {
+        line: 5,
+        character: 3,
+    };
+    let completions = provider.complete(&doc, position, Some(base_path));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"oidc_provider_arn"),
+        "expected `oidc_provider_arn` arg-name completion, got: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"environment"),
+        "expected `environment` arg-name completion, got: {labels:?}"
+    );
+}
+
+/// Issue #2621: value-position completion must work when the
+/// `let X = use { ... }` declaration lives in a sibling `.crn`, not the
+/// edited buffer. This is the real-infra shape (#2446-style cross-file
+/// resolution).
+#[test]
+fn module_call_value_completion_with_sibling_use_decl() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let provider = test_provider();
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let base_path = temp_dir.path();
+
+    let module_dir = base_path.join("usecases").join("registry-deploy");
+    fs::create_dir_all(&module_dir).expect("Failed to create module dir");
+    fs::write(
+        module_dir.join("main.crn"),
+        "arguments {\n  environment: 'dev' | 'prod'\n}\n",
+    )
+    .expect("Failed to write module");
+
+    // `let X = use { ... }` in a sibling file; consumer in the buffer.
+    fs::write(
+        base_path.join("imports.crn"),
+        "let registry_deploy = use {\n  source = './usecases/registry-deploy'\n}\n",
+    )
+    .expect("Failed to write imports");
+
+    let main_content = "let rd = registry_deploy {\n  environment =\n}\n";
+    let doc = create_document(main_content);
+    let position = Position {
+        line: 1,
+        character: 16,
+    };
+    let completions = provider.complete(&doc, position, Some(base_path));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"'dev'"),
+        "expected 'dev' literal candidate (sibling-`use` shape), got: {labels:?}"
+    );
+}
+
+/// Issue #2621: negative paths must fall silent. A typo'd module name,
+/// typo'd argument name, or argument with a non-enumerable type
+/// produces no candidates instead of dumping built-in functions like
+/// `cidr_subnet`.
+#[test]
+fn module_call_value_completion_silent_on_unresolvable() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let provider = test_provider();
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let base_path = temp_dir.path();
+
+    let module_dir = base_path.join("usecases").join("registry-deploy");
+    fs::create_dir_all(&module_dir).expect("Failed to create module dir");
+    fs::write(
+        module_dir.join("main.crn"),
+        "arguments {\n  environment: 'dev' | 'prod'\n  freeform: String\n}\n",
+    )
+    .expect("Failed to write module");
+
+    // (a) Typo'd arg name `enviromnet` → no candidates.
+    let main_typo_arg = r#"let registry_deploy = use {
+  source = './usecases/registry-deploy'
+}
+
+let rd = registry_deploy {
+  enviromnet =
+}
+"#;
+    let doc = create_document(main_typo_arg);
+    let completions = provider.complete(
+        &doc,
+        Position {
+            line: 5,
+            character: 15,
+        },
+        Some(base_path),
+    );
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        !labels
+            .iter()
+            .any(|l| l.starts_with("cidr_") || *l == "concat"),
+        "typo'd arg should fall silent, not dump built-ins; got: {labels:?}"
+    );
+
+    // (b) Non-enumerable type (`String`) → no candidates.
+    let main_string_arg = r#"let registry_deploy = use {
+  source = './usecases/registry-deploy'
+}
+
+let rd = registry_deploy {
+  freeform =
+}
+"#;
+    let doc = create_document(main_string_arg);
+    let completions = provider.complete(
+        &doc,
+        Position {
+            line: 5,
+            character: 13,
+        },
+        Some(base_path),
+    );
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        !labels
+            .iter()
+            .any(|l| l.starts_with("cidr_") || *l == "concat"),
+        "String-typed arg should fall silent (no enumerable candidates), got: {labels:?}"
+    );
+}
