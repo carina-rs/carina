@@ -46,7 +46,7 @@ impl CarinaProvider for MockProcessProvider {
     fn read(
         &self,
         id: &ResourceId,
-        _identifier: &str,
+        _identifier: Option<&str>,
         _request: ReadRequest,
     ) -> Result<State, ProviderError> {
         let states = self.states.lock().unwrap();

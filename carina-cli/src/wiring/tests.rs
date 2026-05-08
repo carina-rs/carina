@@ -1074,3 +1074,117 @@ fn validate_passes_when_no_empty_interpolation() {
         errors
     );
 }
+
+// carina-rs/carina#2594 / #2596: read_with_retry must short-circuit
+// to State::not_found when the identifier is None. This guarantees a
+// fresh component (no saved state) does not produce an empty-string
+// `GetResource` call against the provider.
+#[cfg(test)]
+mod read_with_retry_identifier_tests {
+    use super::*;
+    use carina_core::provider::{ProviderResult, ReadRequest};
+    use carina_core::resource::{Resource, State};
+    use futures::future::BoxFuture;
+    use std::sync::Mutex;
+
+    /// A provider whose `read` records every invocation. Used to verify
+    /// that `read_with_retry` does *not* call into the provider when
+    /// `identifier` is None.
+    struct RecordingProvider {
+        calls: Mutex<Vec<(ResourceId, Option<String>)>>,
+    }
+
+    impl RecordingProvider {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Provider for RecordingProvider {
+        fn name(&self) -> &str {
+            "recording"
+        }
+
+        fn read(
+            &self,
+            id: &ResourceId,
+            identifier: Option<&str>,
+            _request: ReadRequest,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((id.clone(), identifier.map(|s| s.to_string())));
+            let id = id.clone();
+            Box::pin(async move { Ok(State::existing(id, std::collections::HashMap::new())) })
+        }
+
+        fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+            let id = resource.id.clone();
+            Box::pin(async move { Ok(State::not_found(id)) })
+        }
+
+        fn create(
+            &self,
+            id: &ResourceId,
+            _request: carina_core::provider::CreateRequest,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            let id = id.clone();
+            Box::pin(async move { Ok(State::not_found(id)) })
+        }
+
+        fn update(
+            &self,
+            id: &ResourceId,
+            _identifier: &str,
+            _request: carina_core::provider::UpdateRequest,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            let id = id.clone();
+            Box::pin(async move { Ok(State::not_found(id)) })
+        }
+
+        fn delete(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _request: carina_core::provider::DeleteRequest,
+        ) -> BoxFuture<'_, ProviderResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn read_with_retry_short_circuits_when_identifier_is_none() {
+        let provider = RecordingProvider::new();
+        let id = ResourceId::with_provider("awscc", "iam.Role", "fresh");
+
+        let state = read_with_retry(&provider, &id, None).await.unwrap();
+
+        assert!(
+            !state.exists,
+            "missing identifier must yield not_found state, not a real read"
+        );
+        assert_eq!(
+            provider.calls.lock().unwrap().len(),
+            0,
+            "provider.read must NOT be called when identifier is None \
+             (regression guard for carina#2594)"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_with_retry_forwards_when_identifier_is_some() {
+        let provider = RecordingProvider::new();
+        let id = ResourceId::with_provider("awscc", "iam.Role", "existing");
+
+        let _state = read_with_retry(&provider, &id, Some("AROABC123"))
+            .await
+            .unwrap();
+
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "provider.read must be called exactly once");
+        assert_eq!(calls[0].1.as_deref(), Some("AROABC123"));
+    }
+}

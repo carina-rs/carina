@@ -373,7 +373,7 @@ pub async fn detect_drift(
         let identifier = planned_state.and_then(|s| s.identifier.as_deref());
 
         let actual_state = provider
-            .read(&resource.id, identifier.unwrap_or(""), ReadRequest)
+            .read(&resource.id, identifier, ReadRequest)
             .await
             .map_err(AppError::Provider)?;
 

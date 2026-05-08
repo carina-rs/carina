@@ -682,7 +682,7 @@ pub(crate) async fn run_state_refresh_locked(
         let fresh_state = provider
             .read(
                 &resource.id,
-                identifier.as_deref().unwrap_or(""),
+                identifier.as_deref(),
                 carina_core::provider::ReadRequest,
             )
             .await
@@ -710,7 +710,11 @@ pub(crate) async fn run_state_refresh_locked(
 
     for (id, identifier) in &orphan_ids {
         let fresh_state = provider
-            .read(id, identifier.as_str(), carina_core::provider::ReadRequest)
+            .read(
+                id,
+                Some(identifier.as_str()),
+                carina_core::provider::ReadRequest,
+            )
             .await
             .map_err(AppError::Provider)?;
         current_states.insert(id.clone(), fresh_state);

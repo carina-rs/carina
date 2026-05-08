@@ -58,7 +58,7 @@ impl Provider for MockProvider {
     fn read(
         &self,
         id: &ResourceId,
-        _identifier: &str,
+        _identifier: Option<&str>,
         _request: ReadRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id = id.clone();
@@ -79,7 +79,7 @@ impl Provider for MockProvider {
     }
 
     fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-        self.read(&resource.id, "", ReadRequest)
+        self.read(&resource.id, None, ReadRequest)
     }
 
     fn create(

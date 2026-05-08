@@ -363,7 +363,7 @@ macro_rules! export_provider {
 
                 fn read(
                     id: wit_types::ResourceId,
-                    identifier: String,
+                    identifier: Option<String>,
                     _request: wit_types::ReadRequest,
                 ) -> Result<wit_types::State, wit_types::ProviderError> {
                     let provider = get_provider().lock().unwrap();
@@ -371,7 +371,7 @@ macro_rules! export_provider {
                     match $crate::CarinaProvider::read(
                         &*provider,
                         &proto_id,
-                        &identifier,
+                        identifier.as_deref(),
                         proto::ReadRequest,
                     ) {
                         Ok(state) => Ok(proto_to_wit_state(&state)),
@@ -815,7 +815,7 @@ macro_rules! export_provider {
 
                 fn read(
                     id: wit_types::ResourceId,
-                    identifier: String,
+                    identifier: Option<String>,
                     _request: wit_types::ReadRequest,
                 ) -> Result<wit_types::State, wit_types::ProviderError> {
                     let provider = get_provider().lock().unwrap();
@@ -823,7 +823,7 @@ macro_rules! export_provider {
                     match $crate::CarinaProvider::read(
                         &*provider,
                         &proto_id,
-                        &identifier,
+                        identifier.as_deref(),
                         proto::ReadRequest,
                     ) {
                         Ok(state) => Ok(proto_to_wit_state(&state)),

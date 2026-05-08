@@ -964,7 +964,7 @@ mod tests {
         fn read(
             &self,
             id: &ResourceId,
-            _identifier: &str,
+            _identifier: Option<&str>,
             _request: carina_core::provider::ReadRequest,
         ) -> BoxFuture<'_, ProviderResult<State>> {
             let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
@@ -983,7 +983,7 @@ mod tests {
         }
 
         fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-            self.read(&resource.id, "", carina_core::provider::ReadRequest)
+            self.read(&resource.id, None, carina_core::provider::ReadRequest)
         }
 
         fn create(

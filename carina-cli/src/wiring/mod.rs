@@ -1607,14 +1607,19 @@ pub async fn read_with_retry(
     id: &ResourceId,
     identifier: Option<&str>,
 ) -> Result<State, ProviderError> {
+    // carina-rs/carina#2594: when no prior identifier exists for this
+    // resource (a fresh component, or a newly added resource on top
+    // of an existing component), there is nothing to refresh — short-
+    // circuit to `not_found` and let the planner emit a Create. The
+    // earlier shape passed `""` through to the provider, which AWS
+    // CloudControl rejected with `ValidationException`.
+    if identifier.is_none() {
+        return Ok(State::not_found(id.clone()));
+    }
     let max_retries = 3;
     for attempt in 0..=max_retries {
         match provider
-            .read(
-                id,
-                identifier.unwrap_or(""),
-                carina_core::provider::ReadRequest,
-            )
+            .read(id, identifier, carina_core::provider::ReadRequest)
             .await
         {
             Ok(state) => return Ok(state),

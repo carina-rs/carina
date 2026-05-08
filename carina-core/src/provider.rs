@@ -338,14 +338,23 @@ pub trait Provider: Send + Sync {
 
     /// Read the current provider-side state of an existing resource.
     ///
-    /// `identifier` is the cloud-side identifier (e.g. `vpc-0abc...`).
+    /// `identifier` is the cloud-side identifier (e.g. `vpc-0abc...`),
+    /// or `None` when no prior identifier exists for this resource —
+    /// typically because the saved state has no entry for it yet (a
+    /// fresh component or a newly added resource). When `identifier`
+    /// is `None` the provider MUST return [`State::not_found`]
+    /// without contacting any external API. Encoding presence in the
+    /// type lets the compiler enforce that contract on every
+    /// implementation, replacing the earlier `&str` shape that used
+    /// `""` as a sentinel and produced carina-rs/carina#2594.
+    ///
     /// `request` carries no operationally meaningful fields today; it
     /// exists so future fields (e.g. a freshness hint or an attribute
     /// projection) can be added without breaking the signature.
     fn read(
         &self,
         id: &ResourceId,
-        identifier: &str,
+        identifier: Option<&str>,
         request: ReadRequest,
     ) -> BoxFuture<'_, ProviderResult<State>>;
 
@@ -578,7 +587,7 @@ impl Provider for ProviderRouter {
     fn read(
         &self,
         id: &ResourceId,
-        identifier: &str,
+        identifier: Option<&str>,
         request: ReadRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         match self.get_provider_or_error(&id.provider) {
@@ -919,7 +928,7 @@ impl Provider for Box<dyn Provider> {
     fn read(
         &self,
         id: &ResourceId,
-        identifier: &str,
+        identifier: Option<&str>,
         request: ReadRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         (**self).read(id, identifier, request)
@@ -971,7 +980,7 @@ mod tests {
         fn read(
             &self,
             id: &ResourceId,
-            _identifier: &str,
+            _identifier: Option<&str>,
             _request: ReadRequest,
         ) -> BoxFuture<'_, ProviderResult<State>> {
             let id = id.clone();
@@ -1037,7 +1046,7 @@ mod tests {
     async fn mock_provider_read_returns_not_found() {
         let provider = MockProvider;
         let id = ResourceId::new("test", "example");
-        let state = provider.read(&id, "", ReadRequest).await.unwrap();
+        let state = provider.read(&id, None, ReadRequest).await.unwrap();
         assert!(!state.exists);
     }
 
@@ -1055,7 +1064,7 @@ mod tests {
         fn read(
             &self,
             id: &ResourceId,
-            _identifier: &str,
+            _identifier: Option<&str>,
             _request: ReadRequest,
         ) -> BoxFuture<'_, ProviderResult<State>> {
             let id = id.clone();
@@ -1198,7 +1207,7 @@ mod tests {
         router.add_provider("mock".to_string(), Box::new(MockProvider));
 
         let id = ResourceId::with_provider("mock", "test", "example");
-        let state = router.read(&id, "", ReadRequest).await.unwrap();
+        let state = router.read(&id, None, ReadRequest).await.unwrap();
         assert!(!state.exists);
     }
 
@@ -1343,7 +1352,7 @@ mod tests {
     async fn provider_router_returns_error_for_unknown_provider() {
         let router = ProviderRouter::new();
         let id = ResourceId::with_provider("nonexistent", "test", "example");
-        let result = router.read(&id, "", ReadRequest).await;
+        let result = router.read(&id, None, ReadRequest).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, ProviderError::Internal(_)));
@@ -1499,7 +1508,7 @@ mod tests {
             fn read(
                 &self,
                 id: &ResourceId,
-                _identifier: &str,
+                _identifier: Option<&str>,
                 _request: ReadRequest,
             ) -> BoxFuture<'_, ProviderResult<State>> {
                 let id = id.clone();

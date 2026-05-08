@@ -19,7 +19,10 @@ pub(crate) async fn execute_import_effects(
     for effect in plan.effects() {
         if let Effect::Import { id, identifier } = effect {
             println!("  {} Importing {} (id: {})...", "<-".cyan(), id, identifier);
-            match provider.read(id, identifier, ReadRequest).await {
+            match provider
+                .read(id, Some(identifier.as_str()), ReadRequest)
+                .await
+            {
                 Ok(state) => {
                     if state.exists {
                         println!("  {} Imported {}", "✓".green(), id);

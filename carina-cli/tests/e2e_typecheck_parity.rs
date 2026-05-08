@@ -208,7 +208,7 @@ impl Provider for NoopProvider {
     fn read(
         &self,
         _id: &ResourceId,
-        _identifier: &str,
+        _identifier: Option<&str>,
         _request: carina_core::provider::ReadRequest,
     ) -> BoxFuture<'_, carina_core::provider::ProviderResult<State>> {
         Box::pin(async { unimplemented!("e2e parity tests do not exercise apply") })
