@@ -9,7 +9,7 @@ use aws_sdk_s3::types::{PublicAccessBlockConfiguration, ServerSideEncryption};
 
 use carina_core::utils::convert_region_value;
 
-use crate::backend::{BackendConfig, BackendError, BackendResult, StateBackend};
+use crate::backend::{AwsError, BackendConfig, BackendError, BackendResult, StateBackend};
 use crate::lock::LockInfo;
 use crate::state::{self, StateFile};
 
@@ -92,10 +92,13 @@ impl S3Backend {
 
         match result {
             Ok(output) => {
-                let etag = output
-                    .e_tag()
-                    .map(ToOwned::to_owned)
-                    .ok_or_else(|| BackendError::Aws("Lock object missing ETag".to_string()))?;
+                let etag = output.e_tag().map(ToOwned::to_owned).ok_or_else(|| {
+                    BackendError::Configuration(format!(
+                        "Lock object {}/{} missing ETag",
+                        self.bucket,
+                        self.lock_key()
+                    ))
+                })?;
                 let body = output
                     .body
                     .collect()
@@ -111,7 +114,11 @@ impl S3Backend {
                 if is_not_found_error(&err) {
                     Ok(None)
                 } else {
-                    Err(BackendError::Aws(err.to_string()))
+                    Err(BackendError::Aws(Box::new(
+                        AwsError::new("s3.GetObject", err)
+                            .bucket(&self.bucket)
+                            .key(self.lock_key()),
+                    )))
                 }
             }
         }
@@ -165,19 +172,30 @@ impl S3Backend {
         match request.send().await {
             Ok(_) => Ok(true),
             Err(err) if is_conditional_write_conflict(&err) => Ok(false),
-            Err(err) => Err(BackendError::Aws(err.to_string())),
+            Err(err) => Err(BackendError::Aws(Box::new(
+                AwsError::new("s3.PutObject", err)
+                    .bucket(&self.bucket)
+                    .key(self.lock_key()),
+            ))),
         }
     }
 
     /// Delete the lock file from S3
     async fn delete_lock(&self) -> BackendResult<()> {
+        let lock_key = self.lock_key();
         self.client
             .delete_object()
             .bucket(&self.bucket)
-            .key(self.lock_key())
+            .key(&lock_key)
             .send()
             .await
-            .map_err(|e| BackendError::Aws(e.to_string()))?;
+            .map_err(|e| {
+                BackendError::Aws(Box::new(
+                    AwsError::new("s3.DeleteObject", e)
+                        .bucket(&self.bucket)
+                        .key(&lock_key),
+                ))
+            })?;
 
         Ok(())
     }
@@ -219,7 +237,11 @@ impl StateBackend for S3Backend {
                 if is_not_found_error(&err) {
                     Ok(None)
                 } else {
-                    Err(BackendError::Aws(err.to_string()))
+                    Err(BackendError::Aws(Box::new(
+                        AwsError::new("s3.GetObject", err)
+                            .bucket(&self.bucket)
+                            .key(&self.key),
+                    )))
                 }
             }
         }
@@ -241,10 +263,13 @@ impl StateBackend for S3Backend {
             request = request.server_side_encryption(ServerSideEncryption::Aes256);
         }
 
-        request
-            .send()
-            .await
-            .map_err(|e| BackendError::Aws(e.to_string()))?;
+        request.send().await.map_err(|e| {
+            BackendError::Aws(Box::new(
+                AwsError::new("s3.PutObject", e)
+                    .bucket(&self.bucket)
+                    .key(&self.key),
+            ))
+        })?;
 
         Ok(())
     }
@@ -376,7 +401,9 @@ impl StateBackend for S3Backend {
                 if is_missing_head_bucket_response(&err) {
                     Ok(false)
                 } else {
-                    Err(BackendError::Aws(err.to_string()))
+                    Err(BackendError::Aws(Box::new(
+                        AwsError::new("s3.HeadBucket", err).bucket(&self.bucket),
+                    )))
                 }
             }
         }
@@ -427,7 +454,11 @@ impl StateBackend for S3Backend {
             .public_access_block_configuration(public_access_block)
             .send()
             .await
-            .map_err(|e| BackendError::Aws(format!("Failed to block public access: {}", e)))?;
+            .map_err(|e| {
+                BackendError::Aws(Box::new(
+                    AwsError::new("s3.PutPublicAccessBlock", e).bucket(&self.bucket),
+                ))
+            })?;
 
         Ok(())
     }
