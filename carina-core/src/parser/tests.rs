@@ -8377,3 +8377,92 @@ fn parse_directory_truly_undefined_fn_in_let_list_still_errors() {
         "error should name the unknown fn, got: {err}"
     );
 }
+
+// carina-rs/carina#2611: closed-set string types in `arguments`.
+//
+// `env: 'dev' | 'prod' = 'dev'` parses as a `TypeExpr::Union` of two
+// `TypeExpr::StringLiteral` atoms; a default of `'dev'` matches the
+// declared type; a default of `'dpv'` (typo) is rejected at parse
+// time, not at plan time.
+
+#[test]
+fn arguments_param_accepts_string_literal_type() {
+    let src = r#"
+arguments {
+  env: 'dev' = 'dev'
+}
+"#;
+    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    assert_eq!(parsed.arguments.len(), 1);
+    let arg = &parsed.arguments[0];
+    assert_eq!(arg.name, "env");
+    assert_eq!(arg.type_expr, TypeExpr::StringLiteral("dev".to_string()));
+}
+
+#[test]
+fn arguments_param_accepts_union_of_string_literals() {
+    let src = r#"
+arguments {
+  env: 'dev' | 'prod' = 'dev'
+}
+"#;
+    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    assert_eq!(parsed.arguments.len(), 1);
+    let arg = &parsed.arguments[0];
+    assert_eq!(
+        arg.type_expr,
+        TypeExpr::Union(vec![
+            TypeExpr::StringLiteral("dev".to_string()),
+            TypeExpr::StringLiteral("prod".to_string()),
+        ])
+    );
+}
+
+#[test]
+fn arguments_param_three_way_union_round_trips_through_display() {
+    let src = r#"
+arguments {
+  region: 'tokyo' | 'osaka' | 'oregon' = 'tokyo'
+}
+"#;
+    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let arg = &parsed.arguments[0];
+    assert_eq!(arg.type_expr.to_string(), "'tokyo' | 'osaka' | 'oregon'");
+}
+
+#[test]
+fn arguments_param_string_literal_default_in_set_is_accepted() {
+    let src = r#"
+arguments {
+  env: 'dev' | 'prod' = 'prod'
+}
+"#;
+    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let arg = &parsed.arguments[0];
+    assert_eq!(
+        arg.default.as_ref().unwrap(),
+        &Value::String("prod".to_string())
+    );
+}
+
+#[test]
+fn arguments_param_list_of_union_parses() {
+    let src = r#"
+arguments {
+  envs: list('dev' | 'prod') = ['dev', 'prod']
+}
+"#;
+    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let arg = &parsed.arguments[0];
+    let inner = match &arg.type_expr {
+        TypeExpr::List(inner) => inner.as_ref(),
+        other => panic!("expected list type, got {:?}", other),
+    };
+    assert_eq!(
+        *inner,
+        TypeExpr::Union(vec![
+            TypeExpr::StringLiteral("dev".to_string()),
+            TypeExpr::StringLiteral("prod".to_string()),
+        ])
+    );
+}

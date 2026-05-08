@@ -8,8 +8,33 @@ use super::error::{ParseError, ParseWarning};
 use super::util::{pascal_to_snake, snake_to_pascal};
 use super::{ProviderContext, Rule, first_inner, next_pair};
 
-/// Parse type expression
+/// Parse type expression. Handles unions of atomic types
+/// (`'dev' | 'prod'`, see carina-rs/carina#2611) by collecting every
+/// `type_expr_atom` child and folding 2+ atoms into a [`TypeExpr::Union`];
+/// a single atom returns the atom unchanged so existing call sites
+/// keep their shape.
 pub(super) fn parse_type_expr(
+    pair: pest::iterators::Pair<Rule>,
+    config: &ProviderContext,
+    warnings: &mut Vec<ParseWarning>,
+) -> Result<TypeExpr, ParseError> {
+    // Top-level `type_expr` is one or more `type_expr_atom`s separated
+    // by `|`. Collect each atom; the `|` tokens are silent in pest, so
+    // pair iteration yields only `type_expr_atom` children.
+    let mut atoms: Vec<TypeExpr> = Vec::new();
+    for child in pair.into_inner() {
+        if child.as_rule() == Rule::type_expr_atom {
+            atoms.push(parse_type_expr_atom(child, config, warnings)?);
+        }
+    }
+    match atoms.len() {
+        0 => Ok(TypeExpr::String),
+        1 => Ok(atoms.into_iter().next().unwrap()),
+        _ => Ok(TypeExpr::Union(atoms)),
+    }
+}
+
+fn parse_type_expr_atom(
     pair: pest::iterators::Pair<Rule>,
     config: &ProviderContext,
     warnings: &mut Vec<ParseWarning>,
@@ -17,6 +42,23 @@ pub(super) fn parse_type_expr(
     let _ = warnings;
     let inner = first_inner(pair, "type", "type expression")?;
     match inner.as_rule() {
+        Rule::type_string_literal => {
+            // type_string_literal wraps a `string` rule. Unquote and
+            // strip interpolation: type-position string literals are
+            // by construction simple literals (the grammar accepts
+            // only the same `string` form, but interpolation in a
+            // type position has no semantics and is rejected as
+            // "unknown type" upstream rather than crashed on here).
+            let raw = inner.as_str();
+            let unquoted = if (raw.starts_with('\'') && raw.ends_with('\''))
+                || (raw.starts_with('"') && raw.ends_with('"'))
+            {
+                &raw[1..raw.len() - 1]
+            } else {
+                raw
+            };
+            Ok(TypeExpr::StringLiteral(unquoted.to_string()))
+        }
         Rule::type_simple => {
             let line = inner.as_span().start_pos().line_col().0;
             let text = inner.as_str();

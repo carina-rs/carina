@@ -330,6 +330,29 @@ fn check_fn_arg_type(
             }
         }
         TypeExpr::Struct { .. } => matches!(value, Value::Map(_)),
+        // Closed-set string literal: only the exact string matches.
+        // Interpolations and ResourceRefs are rejected here because
+        // their runtime expansion is not knowable at parse time.
+        // See carina-rs/carina#2611.
+        TypeExpr::StringLiteral(expected) => {
+            matches!(value, Value::String(s) if s == expected)
+        }
+        // Union: matches if at least one member's structural-shape
+        // arm accepts the value. We only inspect literal/string-shape
+        // members here — that is what `'dev' | 'prod'`-style unions
+        // need today. Mixed unions (`String | Int`) become reachable
+        // when the grammar opens up further; this arm is the
+        // single point that needs updating then.
+        TypeExpr::Union(members) => members.iter().any(|m| match m {
+            TypeExpr::StringLiteral(expected) => {
+                matches!(value, Value::String(s) if s == expected)
+            }
+            TypeExpr::String => matches!(
+                value,
+                Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
+            ),
+            _ => false,
+        }),
         // Inference sentinel: never matches a concrete value.
         TypeExpr::Unknown => false,
     };
@@ -400,6 +423,24 @@ fn check_fn_return_type(
             }
         }
         TypeExpr::Struct { .. } => matches!(value, Value::Map(_)),
+        // Closed-set string literal: only the exact string matches.
+        // See carina-rs/carina#2611.
+        TypeExpr::StringLiteral(expected) => {
+            matches!(value, Value::String(s) if s == expected)
+        }
+        // Union: matches if at least one member accepts the value.
+        // Same shape as in `check_fn_arg_type` — only literal/string
+        // members are inspected today.
+        TypeExpr::Union(members) => members.iter().any(|m| match m {
+            TypeExpr::StringLiteral(expected) => {
+                matches!(value, Value::String(s) if s == expected)
+            }
+            TypeExpr::String => matches!(
+                value,
+                Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
+            ),
+            _ => false,
+        }),
         // Inference sentinel: never matches a concrete value.
         TypeExpr::Unknown => false,
     };

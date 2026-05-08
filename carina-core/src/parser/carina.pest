@@ -91,7 +91,15 @@ exports_param = {
 }
 
 // Type expression: string, bool, int, float, cidr, arn, etc., list(type), map(type), aws.vpc (resource ref), struct { field: type, ... }
-type_expr = { type_struct | type_ref | type_generic | type_simple }
+//
+// `type_expr_atom` is a single non-union type. `type_expr` then chains
+// 1+ atoms with `|` so closed-set string types like `'dev' | 'prod'`
+// parse without breaking the existing single-atom forms — see
+// carina-rs/carina#2611. The `type_string_literal` atom uses the same
+// `string` rule as value-position string literals so
+// `arguments { env: 'dev' = 'dev' }` parses uniformly on both sides.
+type_expr = { type_expr_atom ~ ("|" ~ type_expr_atom)* }
+type_expr_atom = { type_struct | type_ref | type_generic | type_string_literal | type_simple }
 type_simple = @{ identifier }
 type_generic = { ("list" | "map") ~ "(" ~ type_expr ~ ")" }
 type_ref = { resource_type_path }
@@ -99,6 +107,7 @@ resource_type_path = @{ identifier ~ ("." ~ identifier)+ }
 type_struct = { "struct" ~ "{" ~ struct_field_list? ~ "}" }
 struct_field_list = { struct_field ~ ("," ~ struct_field)* ~ ","? }
 struct_field = { identifier ~ ":" ~ type_expr }
+type_string_literal = { string }
 
 // Use expression: use { source = "<path>" }
 // Loads a Carina module from the given source directory.

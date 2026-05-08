@@ -126,6 +126,19 @@ pub enum TypeExpr {
     Struct {
         fields: Vec<(String, TypeExpr)>,
     },
+    /// Singleton string literal type: `'dev'` accepts only the value
+    /// `Value::String("dev")` (carina-rs/carina#2611). Composes with
+    /// [`TypeExpr::Union`] to produce closed-set string types like
+    /// `'dev' | 'prod'`, and with [`TypeExpr::List`] / `Map` to nest
+    /// (`list('dev' | 'prod')`).
+    StringLiteral(String),
+    /// Union of two or more types: `T1 | T2 | ...`. A value matches
+    /// the union if it matches at least one member type. Today the
+    /// only grammar-reachable shape is unions of [`TypeExpr::StringLiteral`]
+    /// — `'dev' | 'prod'` — but the AST shape stays general so future
+    /// additions (`String | Int`, nullable types via `T | none`) drop
+    /// in without another structural change. See carina-rs/carina#2611.
+    Union(Vec<TypeExpr>),
     /// Sentinel for inference failure: an unannotated export whose
     /// rhs could not be statically typed. Produced *only* by
     /// `apply_inference`, never by the parser. Type-comparison
@@ -195,6 +208,16 @@ impl std::fmt::Display for TypeExpr {
                     }
                     write!(f, " }}")
                 }
+            }
+            TypeExpr::StringLiteral(s) => write!(f, "'{}'", s),
+            TypeExpr::Union(members) => {
+                for (i, m) in members.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " | ")?;
+                    }
+                    write!(f, "{}", m)?;
+                }
+                Ok(())
             }
             TypeExpr::Unknown => write!(f, "<unknown>"),
         }
