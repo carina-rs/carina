@@ -1221,7 +1221,7 @@ fn format_effect_delete_uses_binding_name() {
         binding: Some("my_vpc".to_string()),
         dependencies: HashSet::new(),
     };
-    assert_eq!(format_effect(&effect), "Delete awscc.ec2.Vpc.my_vpc");
+    assert_eq!(format_effect(&effect), "Delete awscc.ec2.Vpc my_vpc");
 }
 
 #[test]
@@ -1235,7 +1235,94 @@ fn format_effect_delete_falls_back_to_id_name() {
     };
     assert_eq!(
         format_effect(&effect),
-        "Delete awscc.ec2.Vpc.ec2_vpc_fb75c929"
+        "Delete awscc.ec2.Vpc ec2_vpc_fb75c929"
+    );
+}
+
+/// Each `format_effect` variant must separate `provider.resource_type`
+/// from the resource name with a single space (carina-rs/carina#2572)
+/// so the type/address boundary is visible in plan/apply output.
+#[test]
+fn format_effect_create_separates_type_and_name_with_space() {
+    let mut r = Resource::new("s3.Bucket", "state_bucket");
+    r.id = ResourceId::with_provider("aws", "s3.Bucket", "state_bucket");
+    let effect = Effect::Create(r);
+    assert_eq!(format_effect(&effect), "Create aws.s3.Bucket state_bucket");
+}
+
+#[test]
+fn format_effect_update_separates_type_and_name_with_space() {
+    let id = ResourceId::with_provider("awscc", "iam.Role", "bs.bootstrap.role");
+    let mut to = Resource::new("iam.Role", "bs.bootstrap.role");
+    to.id = id.clone();
+    let effect = Effect::Update {
+        id,
+        from: Box::new(State::not_found(ResourceId::with_provider(
+            "awscc",
+            "iam.Role",
+            "bs.bootstrap.role",
+        ))),
+        to,
+        changed_attributes: Vec::new(),
+    };
+    assert_eq!(
+        format_effect(&effect),
+        "Update awscc.iam.Role bs.bootstrap.role"
+    );
+}
+
+#[test]
+fn format_effect_replace_separates_type_and_name_with_space() {
+    let id = ResourceId::with_provider("awscc", "ec2.Vpc", "vpc");
+    let mut to = Resource::new("ec2.Vpc", "vpc");
+    to.id = id.clone();
+    let effect = Effect::Replace {
+        id,
+        from: Box::new(State::not_found(ResourceId::with_provider(
+            "awscc", "ec2.Vpc", "vpc",
+        ))),
+        to,
+        lifecycle: LifecycleConfig::default(),
+        changed_create_only: Vec::new(),
+        cascading_updates: Vec::<CascadingUpdate>::new(),
+        temporary_name: None,
+        cascade_ref_hints: Vec::new(),
+    };
+    assert_eq!(format_effect(&effect), "Replace awscc.ec2.Vpc vpc");
+}
+
+#[test]
+fn format_effect_import_separates_type_and_name_with_space() {
+    let effect = Effect::Import {
+        id: ResourceId::with_provider("aws", "s3.Bucket", "logs"),
+        identifier: "my-logs-bucket".to_string(),
+    };
+    assert_eq!(
+        format_effect(&effect),
+        "Import aws.s3.Bucket logs (id: my-logs-bucket)"
+    );
+}
+
+#[test]
+fn format_effect_remove_separates_type_and_name_with_space() {
+    let effect = Effect::Remove {
+        id: ResourceId::with_provider("awscc", "ec2.Vpc", "old_vpc"),
+    };
+    assert_eq!(
+        format_effect(&effect),
+        "Remove awscc.ec2.Vpc old_vpc from state"
+    );
+}
+
+#[test]
+fn format_effect_move_separates_type_and_name_with_space() {
+    let effect = Effect::Move {
+        from: ResourceId::with_provider("awscc", "ec2.Vpc", "vpc_a"),
+        to: ResourceId::with_provider("awscc", "ec2.Vpc", "vpc_b"),
+    };
+    assert_eq!(
+        format_effect(&effect),
+        "Move awscc.ec2.Vpc vpc_a -> awscc.ec2.Vpc vpc_b"
     );
 }
 

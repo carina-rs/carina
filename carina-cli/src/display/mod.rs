@@ -1421,8 +1421,8 @@ fn render_modified_fields(fields: &[ListOfMapsDiffField]) -> String {
 
 pub fn format_effect(effect: &Effect) -> String {
     match effect {
-        Effect::Create(r) => format!("Create {}", r.id),
-        Effect::Update { id, .. } => format!("Update {}", id),
+        Effect::Create(r) => format!("Create {}", r.id.human()),
+        Effect::Update { id, .. } => format!("Update {}", id.human()),
         Effect::Replace {
             id,
             lifecycle,
@@ -1431,33 +1431,33 @@ pub fn format_effect(effect: &Effect) -> String {
         } => {
             if lifecycle.create_before_destroy {
                 if cascading_updates.is_empty() {
-                    format!("Replace {} (create-before-destroy)", id)
+                    format!("Replace {} (create-before-destroy)", id.human())
                 } else {
                     format!(
                         "Replace {} (create-before-destroy, {} cascade)",
-                        id,
+                        id.human(),
                         cascading_updates.len()
                     )
                 }
             } else {
-                format!("Replace {}", id)
+                format!("Replace {}", id.human())
             }
         }
         Effect::Delete { id, binding, .. } => {
             let display_name = binding.as_deref().unwrap_or(id.name_str());
-            format!("Delete {}.{}", id.display_type(), display_name)
+            format!("Delete {} {}", id.display_type(), display_name)
         }
         Effect::Read { resource } => {
-            format!("Read {}", resource.id)
+            format!("Read {}", resource.id.human())
         }
         Effect::Import { id, identifier } => {
-            format!("Import {} (id: {})", id, identifier)
+            format!("Import {} (id: {})", id.human(), identifier)
         }
         Effect::Remove { id } => {
-            format!("Remove {} from state", id)
+            format!("Remove {} from state", id.human())
         }
         Effect::Move { from, to } => {
-            format!("Move {} -> {}", from, to)
+            format!("Move {} -> {}", from.human(), to.human())
         }
     }
 }
