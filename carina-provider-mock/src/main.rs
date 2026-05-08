@@ -159,6 +159,34 @@ impl CarinaProvider for MockProcessProvider {
         states.remove(&key);
         Ok(())
     }
+
+    /// Echo the host-provided `default_tags` back into each resource's
+    /// attributes under a sentinel `__mock_merged_default_tags__` key so
+    /// integration tests can verify the WIT bridge dispatched the call.
+    /// Real providers would call `merge_default_tags_for_provider` here;
+    /// the mock provider's job is just to prove the call landed.
+    fn merge_default_tags(
+        &self,
+        resources: &mut Vec<Resource>,
+        default_tags: &HashMap<String, Value>,
+        _schemas: &Vec<ResourceSchema>,
+    ) {
+        let snapshot: Vec<Value> = default_tags
+            .iter()
+            .map(|(k, v)| {
+                Value::Map(HashMap::from([
+                    ("k".to_string(), Value::String(k.clone())),
+                    ("v".to_string(), v.clone()),
+                ]))
+            })
+            .collect();
+        for r in resources.iter_mut() {
+            r.attributes.insert(
+                "__mock_merged_default_tags__".to_string(),
+                Value::List(snapshot.clone()),
+            );
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

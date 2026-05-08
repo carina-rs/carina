@@ -527,6 +527,27 @@ macro_rules! export_provider {
                         .map(|(k, s)| (k, proto_to_wit_state(&s)))
                         .collect()
                 }
+
+                fn merge_default_tags(
+                    resources: Vec<wit_types::ResourceDef>,
+                    default_tags: Vec<(String, wit_types::Value)>,
+                ) -> Vec<wit_types::ResourceDef> {
+                    let provider = get_provider().lock().unwrap();
+                    let mut proto_resources: Vec<_> =
+                        resources.iter().map(wit_to_proto_resource).collect();
+                    let proto_tags: HashMap<String, proto::Value> = default_tags
+                        .iter()
+                        .map(|(k, v)| (k.clone(), wit_to_proto_value(v)))
+                        .collect();
+                    let schemas = $crate::CarinaProvider::schemas(&*provider);
+                    $crate::CarinaProvider::merge_default_tags(
+                        &*provider,
+                        &mut proto_resources,
+                        &proto_tags,
+                        &schemas,
+                    );
+                    proto_resources.iter().map(proto_to_wit_resource).collect()
+                }
             }
 
             export!(WasmGuest);
@@ -978,6 +999,27 @@ macro_rules! export_provider {
                         .into_iter()
                         .map(|(k, s)| (k, proto_to_wit_state(&s)))
                         .collect()
+                }
+
+                fn merge_default_tags(
+                    resources: Vec<wit_types::ResourceDef>,
+                    default_tags: Vec<(String, wit_types::Value)>,
+                ) -> Vec<wit_types::ResourceDef> {
+                    let provider = get_provider().lock().unwrap();
+                    let mut proto_resources: Vec<_> =
+                        resources.iter().map(wit_to_proto_resource).collect();
+                    let proto_tags: HashMap<String, proto::Value> = default_tags
+                        .iter()
+                        .map(|(k, v)| (k.clone(), wit_to_proto_value(v)))
+                        .collect();
+                    let schemas = $crate::CarinaProvider::schemas(&*provider);
+                    $crate::CarinaProvider::merge_default_tags(
+                        &*provider,
+                        &mut proto_resources,
+                        &proto_tags,
+                        &schemas,
+                    );
+                    proto_resources.iter().map(proto_to_wit_resource).collect()
                 }
             }
 

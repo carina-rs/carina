@@ -265,6 +265,89 @@ async fn test_wasm_mock_provider_normalizer() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_mock_provider_merge_default_tags_dispatches_through_wit() {
+    // Regression test for carina-rs/carina-provider-awscc#192 and
+    // carina-rs/carina-provider-aws#242. Before the WIT contract gained
+    // `merge-default-tags`, the host's `WasmProviderNormalizer` had no
+    // way to dispatch the call to the guest, so provider-level
+    // `default_tags` silently never reached resources. The mock guest
+    // echoes the host-supplied `default_tags` into a sentinel attribute;
+    // its presence proves the WIT bridge round-tripped.
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory.create_normalizer(&indexmap::IndexMap::new()).await;
+
+    let registry = carina_core::schema::SchemaRegistry::new();
+    let mut resources = vec![Resource::with_provider("mock", "test.resource", "tag-test")];
+    let default_tags = indexmap::IndexMap::from([
+        ("Env".to_string(), Value::String("dev".to_string())),
+        ("Owner".to_string(), Value::String("platform".to_string())),
+    ]);
+
+    normalizer.merge_default_tags(&mut resources, &default_tags, &registry);
+
+    let echoed = resources[0]
+        .get_attr("__mock_merged_default_tags__")
+        .expect("guest's merge_default_tags must run via the WIT bridge");
+    let Value::List(items) = echoed else {
+        panic!("expected list, got {echoed:?}");
+    };
+    assert_eq!(items.len(), 2, "both default_tags should arrive at guest");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_mock_provider_merge_default_tags_empty_short_circuits() {
+    // Empty `default_tags` must skip the WIT round-trip entirely; if it
+    // didn't, the mock guest would still write its sentinel attribute.
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory.create_normalizer(&indexmap::IndexMap::new()).await;
+
+    let registry = carina_core::schema::SchemaRegistry::new();
+    let mut resources = vec![Resource::with_provider("mock", "test.resource", "no-tags")];
+    let default_tags: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
+
+    normalizer.merge_default_tags(&mut resources, &default_tags, &registry);
+
+    assert!(
+        resources[0]
+            .get_attr("__mock_merged_default_tags__")
+            .is_none(),
+        "empty default_tags must short-circuit before reaching the guest"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_mock_provider_merge_default_tags_preserves_order() {
+    // Multi-resource ordering: the host zips the guest's response by
+    // index, so the guest must return resources in input order.
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory.create_normalizer(&indexmap::IndexMap::new()).await;
+
+    let registry = carina_core::schema::SchemaRegistry::new();
+    let mut resources = vec![
+        Resource::with_provider("mock", "test.resource", "alpha"),
+        Resource::with_provider("mock", "test.resource", "beta"),
+        Resource::with_provider("mock", "test.resource", "gamma"),
+    ];
+    let default_tags =
+        indexmap::IndexMap::from([("Env".to_string(), Value::String("dev".to_string()))]);
+
+    normalizer.merge_default_tags(&mut resources, &default_tags, &registry);
+
+    assert_eq!(resources[0].id.name.as_str(), "alpha");
+    assert_eq!(resources[1].id.name.as_str(), "beta");
+    assert_eq!(resources[2].id.name.as_str(), "gamma");
+    for r in &resources {
+        assert!(
+            r.get_attr("__mock_merged_default_tags__").is_some(),
+            "every resource should receive the merged sentinel"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
     // Regression test for carina-rs/carina#1677: the plugin boundary must
     // route `read_data_source` through to the guest's implementation so
