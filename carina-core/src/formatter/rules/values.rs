@@ -68,6 +68,11 @@ impl Formatter {
                         self.write("(");
                     } else if token.text == ")" {
                         self.write(")");
+                    } else if token.text == "|" {
+                        // Closed-set string type union separator: surface as
+                        // ` | ` so unions read as cleanly as the surrounding
+                        // ` = ` (#2615).
+                        self.write(" | ");
                     } else {
                         self.write_token(&token.text);
                     }

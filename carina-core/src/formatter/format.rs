@@ -1078,6 +1078,55 @@ mod tests {
     }
 
     #[test]
+    fn format_arguments_string_literal_union_adds_spaces() {
+        let input = "arguments {\n  environment: 'dev'|'prod' = 'dev'\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        let expected = "arguments {\n  environment: 'dev' | 'prod' = 'dev'\n}\n";
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn format_arguments_string_literal_union_three_members() {
+        let input = "arguments {\n  region: 'us-east-1'|'ap-northeast-1'|'eu-west-1' = 'ap-northeast-1'\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        let expected = "arguments {\n  region: 'us-east-1' | 'ap-northeast-1' | 'eu-west-1' = 'ap-northeast-1'\n}\n";
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn format_arguments_string_literal_union_idempotent() {
+        let input = "arguments {\n  environment: 'dev' | 'prod' = 'dev'\n}\n";
+        let config = FormatConfig::default();
+        let first = format(input, &config).unwrap();
+        let second = format(&first, &config).unwrap();
+        assert_eq!(first, input);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn format_arguments_single_string_literal_no_pipe() {
+        // The grammar folds 0/1 atoms back to a plain TypeExpr, so a
+        // single-literal annotation must not emit a stray ` | `.
+        let input = "arguments {\n  environment: 'dev' = 'dev'\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn format_arguments_string_literal_union_inside_list() {
+        // The grammar permits `list('a' | 'b')`; the union arm must apply
+        // recursively inside generic type constructors.
+        let input = "arguments {\n  envs: list('dev'|'prod') = ['dev']\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        let expected = "arguments {\n  envs: list('dev' | 'prod') = ['dev']\n}\n";
+        assert_eq!(result, expected);
+    }
+
+    #[test]
     fn format_arguments_mixed_simple_and_block_form() {
         let input = r#"arguments {
   enable_https: Bool = true
