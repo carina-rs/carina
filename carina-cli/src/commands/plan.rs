@@ -635,7 +635,7 @@ pub(crate) async fn load_upstream_states(
         }
 
         let backend_result =
-            build_upstream_backend(us, &source_abs, provider_context, cycle_guard, policy).await;
+            build_upstream_backend(us, &source_abs, provider_context, cycle_guard).await;
         cycle_guard.remove(&source_abs);
         let backend = backend_result?;
 
@@ -667,16 +667,14 @@ pub(crate) async fn load_upstream_states(
 }
 
 /// Resolve an upstream's backend: parse its `.crn`, walk its own upstream
-/// chain (cycle detection), then build the backend honoring local-path
-/// anchoring. Shared between strict and lenient upstream loaders so the
-/// only behavioral difference is how a `None` from `read_state()` is
-/// handled.
+/// chain (cycle detection only — never state I/O — see
+/// carina-rs/carina#2608), then build the backend honoring local-path
+/// anchoring. Shared between strict and lenient upstream loaders.
 async fn build_upstream_backend(
     us: &UpstreamState,
     source_abs: &Path,
     provider_context: &ProviderContext,
     cycle_guard: &mut HashSet<PathBuf>,
-    policy: UpstreamMissingStatePolicy,
 ) -> Result<Box<dyn StateBackend>, AppError> {
     let loaded = load_configuration_with_config(
         source_abs,
@@ -685,17 +683,18 @@ async fn build_upstream_backend(
     )
     .map_err(|e| AppError::Config(format!("upstream_state '{}': {}", us.binding, e)))?;
 
-    // Walk the upstream's own upstream_state blocks so cycles are detected
-    // even when the chain is longer than one hop. The returned bindings are
-    // discarded; the downstream only needs this upstream's own exports.
-    // Propagate `policy` so a chained upstream that is itself unapplied
-    // produces a warning under Lenient instead of breaking the plan (#2366).
-    Box::pin(load_upstream_states(
+    // Walk the upstream's own `upstream_state` chain so cycles longer
+    // than one hop still surface — but do NOT fetch their state from
+    // S3 (or any other backend). The downstream only needs this
+    // upstream's own exports; pulling B's transitive upstreams forces
+    // A's runtime credentials to cover state buckets B happens to use
+    // internally, puncturing the encapsulation that `exports.crn` is
+    // supposed to provide (carina-rs/carina#2608).
+    Box::pin(walk_upstream_cycles_only(
         &loaded.parsed.upstream_states,
         source_abs,
         provider_context,
         cycle_guard,
-        policy,
     ))
     .await?;
 
@@ -724,6 +723,68 @@ async fn build_upstream_backend(
     };
 
     Ok(backend)
+}
+
+/// Walk an upstream's transitive `upstream_state` chain *without*
+/// performing any state I/O. Detects cycles (as `load_upstream_states`
+/// did) but never fetches a state file from a backend — the downstream
+/// only needs this upstream's own `exports`, which arrives through the
+/// upstream's *own* state file fetched directly by
+/// [`load_upstream_states`]. See carina-rs/carina#2608 for the
+/// authorization-leak problem the I/O-free walk fixes.
+///
+/// Returns `Ok(())` on success; the caller does not consume any
+/// bindings — there are none.
+async fn walk_upstream_cycles_only(
+    upstream_states: &[UpstreamState],
+    base_dir: &Path,
+    provider_context: &ProviderContext,
+    cycle_guard: &mut HashSet<PathBuf>,
+) -> Result<(), AppError> {
+    for us in upstream_states {
+        let source_abs = base_dir.join(&us.source).canonicalize().map_err(|e| {
+            AppError::Config(format!(
+                "upstream_state '{}': cannot resolve source '{}': {}",
+                us.binding,
+                us.source.display(),
+                e
+            ))
+        })?;
+
+        if !cycle_guard.insert(source_abs.clone()) {
+            return Err(AppError::Config(format!(
+                "upstream_state '{}': cycle detected at {}",
+                us.binding,
+                source_abs.display()
+            )));
+        }
+
+        // Parse the upstream so we can see its own `upstream_state`
+        // blocks. We deliberately do NOT touch its backend.
+        let loaded = load_configuration_with_config(
+            &source_abs,
+            provider_context,
+            &carina_core::schema::SchemaRegistry::new(),
+        )
+        .map_err(|e| AppError::Config(format!("upstream_state '{}': {}", us.binding, e)));
+
+        let result = match loaded {
+            Ok(loaded) => {
+                Box::pin(walk_upstream_cycles_only(
+                    &loaded.parsed.upstream_states,
+                    &source_abs,
+                    provider_context,
+                    cycle_guard,
+                ))
+                .await
+            }
+            Err(e) => Err(e),
+        };
+
+        cycle_guard.remove(&source_abs);
+        result?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -907,6 +968,153 @@ mod load_upstream_states_tests {
         assert!(
             result["orgs"].is_empty(),
             "no exports available, so the inner map must be empty"
+        );
+    }
+
+    /// carina-rs/carina#2608: when component A reads B's
+    /// `upstream_state`, carina must NOT walk into B's own
+    /// transitive upstreams' state files. If it does, A's runtime
+    /// credentials need read access to state objects A never
+    /// references — puncturing the encapsulation that
+    /// `exports.crn` is supposed to provide.
+    ///
+    /// The fixture: A reads B; B internally reads C. A's
+    /// `load_upstream_states` should fetch B's state file (which
+    /// has its `exports` already serialized), but must NEVER touch
+    /// C's state file. We assert the latter by deliberately giving
+    /// C a state file at a path that would parse but with sentinel
+    /// `exports`, then by *not* asserting anything about C — and by
+    /// covering the related path (cycle detection still walks the
+    /// chain) with the existing `cycle_detected_*` tests.
+    ///
+    /// Direct repro of the authorization-leak shape: we delete C's
+    /// state file. A pre-fix run loads C and crashes with
+    /// `no state found at <C>` under Strict policy; a post-fix
+    /// run does not visit C at all.
+    #[tokio::test]
+    async fn load_upstream_states_does_not_fetch_transitive_upstream_state() {
+        let root = tempfile::tempdir().unwrap();
+        let a_dir = root.path().join("a");
+        let b_dir = root.path().join("b");
+        let c_dir = root.path().join("c");
+        fs::create_dir_all(&a_dir).unwrap();
+        fs::create_dir_all(&b_dir).unwrap();
+        fs::create_dir_all(&c_dir).unwrap();
+
+        // C declares a backend; we deliberately do NOT write a
+        // state file. Loading C's state would fail with
+        // `BackendError` under Strict policy — the post-fix path
+        // must skip this entirely.
+        fs::write(
+            c_dir.join("main.crn"),
+            r#"backend local { path = "carina.state.json" }"#,
+        )
+        .unwrap();
+
+        // B reads C as an upstream and has its own backend with
+        // exports serialized into its state file.
+        fs::write(
+            b_dir.join("main.crn"),
+            format!(
+                r#"backend local {{ path = "carina.state.json" }}
+let internal = upstream_state {{ source = '{}' }}"#,
+                c_dir.display()
+            ),
+        )
+        .unwrap();
+        write_state(
+            &b_dir,
+            &[("oidc_provider_arn", serde_json::json!("arn:..."))],
+        );
+
+        // A reads B.
+        let upstream_states = vec![UpstreamState {
+            binding: "bootstrap".to_string(),
+            source: b_dir.clone(),
+        }];
+
+        let result = load_upstream_states(
+            &upstream_states,
+            &a_dir,
+            &ProviderContext::default(),
+            &mut HashSet::new(),
+            UpstreamMissingStatePolicy::Strict,
+        )
+        .await;
+
+        // The successful return is the assertion: C had no state
+        // file, but the loader must not have tried to read it. If
+        // the pre-fix transitive-fetch behavior were still active,
+        // this would fail with "no state found at <c>".
+        let bindings = result.expect(
+            "loader must succeed without visiting C; carina-rs/carina#2608 \
+             regression if this becomes `no state found at <c>`",
+        );
+        assert_eq!(
+            bindings["bootstrap"]["oidc_provider_arn"],
+            Value::String("arn:...".to_string()),
+            "B's exports must come through unchanged"
+        );
+    }
+
+    /// Regression guard: cycles longer than one hop are still
+    /// detected even though we no longer fetch transitive state.
+    /// A → B → A must error, not stack-overflow or deadlock.
+    #[tokio::test]
+    async fn load_upstream_states_detects_two_hop_cycle_without_fetching_state() {
+        let root = tempfile::tempdir().unwrap();
+        let a_dir = root.path().join("a");
+        let b_dir = root.path().join("b");
+        fs::create_dir_all(&a_dir).unwrap();
+        fs::create_dir_all(&b_dir).unwrap();
+
+        // A declares an upstream pointing at B; B declares an
+        // upstream pointing back at A — a cycle.
+        fs::write(
+            a_dir.join("main.crn"),
+            format!(
+                r#"backend local {{ path = "carina.state.json" }}
+let back = upstream_state {{ source = '{}' }}"#,
+                b_dir.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            b_dir.join("main.crn"),
+            format!(
+                r#"backend local {{ path = "carina.state.json" }}
+let back = upstream_state {{ source = '{}' }}"#,
+                a_dir.display()
+            ),
+        )
+        .unwrap();
+
+        // Pretend a "downstream" reads A; the loader must catch the
+        // A → B → A cycle.
+        let upstream_states = vec![UpstreamState {
+            binding: "a".to_string(),
+            source: a_dir.clone(),
+        }];
+
+        let mut guard = HashSet::new();
+        // Seed the guard so A → B → A detection still triggers
+        // when the downstream itself is the seed; mirrors how the
+        // CLI seeds with the project root before recursing.
+        guard.insert(root.path().canonicalize().unwrap());
+
+        let err = load_upstream_states(
+            &upstream_states,
+            root.path(),
+            &ProviderContext::default(),
+            &mut guard,
+            UpstreamMissingStatePolicy::Strict,
+        )
+        .await
+        .expect_err("two-hop cycle must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cycle detected"),
+            "cycle detection must still fire post-#2608 fix, got: {msg}"
         );
     }
 }
