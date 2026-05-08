@@ -35,7 +35,7 @@ Resource Type definition for AWS::IAM::OIDCProvider
 
 ### `arn`
 
-- **Type:** Arn
+- **Type:** IamOidcProviderArn
 
 Amazon Resource Name (ARN) of the OIDC provider
 
