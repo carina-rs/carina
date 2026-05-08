@@ -690,7 +690,7 @@ fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode
 
     match effect {
         Effect::Read { resource } => TreeNode {
-            effect_label: format!("{}", resource.id),
+            effect_label: format!("{}", resource.id.human()),
             resource_type: resource.id.display_type(),
             name_part: resource.id.name_str().to_string(),
             symbol: "<=".to_string(),
@@ -701,7 +701,7 @@ fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode
             parent: None,
         },
         Effect::Create(resource) => TreeNode {
-            effect_label: format!("{}", resource.id),
+            effect_label: format!("{}", resource.id.human()),
             resource_type: resource.id.display_type(),
             name_part: resource.id.name_str().to_string(),
             symbol: "+".to_string(),
@@ -712,7 +712,7 @@ fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode
             parent: None,
         },
         Effect::Update { id, .. } => TreeNode {
-            effect_label: format!("{}", id),
+            effect_label: format!("{}", id.human()),
             resource_type: id.display_type(),
             name_part: id.name_str().to_string(),
             symbol: "~".to_string(),
@@ -729,7 +729,7 @@ fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode
                 "-/+".to_string()
             };
             TreeNode {
-                effect_label: format!("{}", id),
+                effect_label: format!("{}", id.human()),
                 resource_type: id.display_type(),
                 name_part: id.name_str().to_string(),
                 symbol,
@@ -753,7 +753,7 @@ fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode
                 });
             }
             TreeNode {
-                effect_label: format!("{}", id),
+                effect_label: format!("{}", id.human()),
                 resource_type: id.display_type(),
                 name_part: id.name_str().to_string(),
                 symbol: "-".to_string(),
@@ -765,7 +765,7 @@ fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode
             }
         }
         Effect::Import { id, .. } => TreeNode {
-            effect_label: format!("{}", id),
+            effect_label: format!("{}", id.human()),
             resource_type: id.display_type(),
             name_part: id.name_str().to_string(),
             symbol: "<-".to_string(),
@@ -776,7 +776,7 @@ fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode
             parent: None,
         },
         Effect::Remove { id } => TreeNode {
-            effect_label: format!("{}", id),
+            effect_label: format!("{}", id.human()),
             resource_type: id.display_type(),
             name_part: id.name_str().to_string(),
             symbol: "x".to_string(),
@@ -787,7 +787,7 @@ fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode
             parent: None,
         },
         Effect::Move { from, to } => TreeNode {
-            effect_label: format!("{} -> {}", from, to),
+            effect_label: format!("{} -> {}", from.human(), to.human()),
             resource_type: to.display_type(),
             name_part: to.name_str().to_string(),
             symbol: "->".to_string(),

@@ -1118,3 +1118,40 @@ fn unknown_cannot_round_trip_through_serde_json() {
         r
     );
 }
+
+#[test]
+fn human_display_separates_type_from_name_with_space() {
+    let id = ResourceId::with_provider("awscc", "iam.OidcProvider", "bs.bootstrap.oidc_provider");
+    assert_eq!(
+        format!("{}", id.human()),
+        "awscc.iam.OidcProvider bs.bootstrap.oidc_provider",
+        "human format must put a single space between provider.resource_type and name, \
+         so the type/address boundary is visible (carina-rs/carina#2572)"
+    );
+}
+
+#[test]
+fn human_display_omits_provider_segment_when_empty() {
+    // ResourceId::new (no provider) is used in some early-pipeline code paths
+    // and in tests. The human format must still separate type from name.
+    let id = ResourceId::new("s3.Bucket", "state_bucket");
+    assert_eq!(format!("{}", id.human()), "s3.Bucket state_bucket");
+}
+
+#[test]
+fn human_display_does_not_alter_logical_display() {
+    // The default Display remains the canonical dotted form because state
+    // files, hashmap keys, binding fallbacks, and DSL identifiers all rely
+    // on it. Only the human() wrapper changes shape.
+    let id = ResourceId::with_provider("aws", "s3.Bucket", "state_bucket");
+    assert_eq!(format!("{}", id), "aws.s3.Bucket.state_bucket");
+}
+
+#[test]
+fn human_display_handles_pending_name() {
+    // ResourceName::Pending renders as empty in Display; human() should
+    // still emit the separating space so callers can rely on a stable shape.
+    let mut id = ResourceId::with_provider("awscc", "ec2.Vpc", "");
+    id.name = ResourceName::Pending;
+    assert_eq!(format!("{}", id.human()), "awscc.ec2.Vpc ");
+}

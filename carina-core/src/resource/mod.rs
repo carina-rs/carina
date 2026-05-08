@@ -130,6 +130,46 @@ impl ResourceId {
             format!("{}.{}", self.provider, self.resource_type)
         }
     }
+
+    /// Borrow this id as a human-facing display value.
+    ///
+    /// Unlike the default `Display`, which renders the canonical dotted
+    /// form (`provider.resource_type.name`) used as a logical identifier
+    /// for hashmap keys, binding fallbacks, and DSL syntax, this wrapper
+    /// renders `provider.resource_type` and `name` separated by a single
+    /// space — making the type/address boundary visible to readers
+    /// (carina-rs/carina#2572).
+    ///
+    /// Use this in progress UIs and human-readable plan/apply output;
+    /// keep using `Display` for any context that round-trips through
+    /// state files, lookup keys, or DSL.
+    pub fn human(&self) -> ResourceIdDisplay<'_> {
+        ResourceIdDisplay(self)
+    }
+}
+
+/// Human-facing display wrapper for [`ResourceId`].
+///
+/// Construct with [`ResourceId::human`]; renders via `Display` as
+/// `provider.resource_type<SPACE>name` (or `resource_type<SPACE>name`
+/// when the provider segment is empty).
+///
+/// The wrapper exists as a distinct type, rather than as a second
+/// inherent method that returns `String`, so the choice between
+/// "human-readable display" and "canonical logical identifier" is
+/// visible at every call site instead of being a string-formatting
+/// convention. See carina-rs/carina#2572 for context.
+pub struct ResourceIdDisplay<'a>(&'a ResourceId);
+
+impl std::fmt::Display for ResourceIdDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let id = self.0;
+        if id.provider.is_empty() {
+            write!(f, "{} {}", id.resource_type, id.name)
+        } else {
+            write!(f, "{}.{} {}", id.provider, id.resource_type, id.name)
+        }
+    }
 }
 
 impl ResourceName {

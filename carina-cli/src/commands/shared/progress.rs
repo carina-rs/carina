@@ -55,7 +55,7 @@ impl RefreshProgress {
     pub fn begin_multi(multi: &MultiProgress, id: &ResourceId) -> Self {
         let pb = multi.add(ProgressBar::new_spinner());
         pb.set_style(spinner_style());
-        pb.set_message(format!("{}", id));
+        pb.set_message(format!("{}", id.human()));
         pb.enable_steady_tick(Duration::from_millis(80));
         Self {
             pb,
