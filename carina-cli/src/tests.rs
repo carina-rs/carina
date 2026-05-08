@@ -59,10 +59,10 @@ impl Provider for TestProvider {
     fn read(
         &self,
         id: &ResourceId,
-        identifier: &str,
+        identifier: Option<&str>,
         _request: carina_core::provider::ReadRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        let key = (id.to_string(), identifier.to_string());
+        let key = (id.to_string(), identifier.unwrap_or("").to_string());
         let result = self
             .read_results
             .get(&key)
@@ -72,7 +72,7 @@ impl Provider for TestProvider {
     }
 
     fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-        self.read(&resource.id, "", carina_core::provider::ReadRequest)
+        self.read(&resource.id, None, carina_core::provider::ReadRequest)
     }
 
     fn create(
@@ -1571,7 +1571,7 @@ impl Provider for RecordingProvider {
     fn read(
         &self,
         id: &ResourceId,
-        _identifier: &str,
+        _identifier: Option<&str>,
         _request: carina_core::provider::ReadRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id = id.clone();
@@ -1579,7 +1579,7 @@ impl Provider for RecordingProvider {
     }
 
     fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-        self.read(&resource.id, "", carina_core::provider::ReadRequest)
+        self.read(&resource.id, None, carina_core::provider::ReadRequest)
     }
 
     fn create(
@@ -1649,7 +1649,7 @@ impl Provider for RenameFailProvider {
     fn read(
         &self,
         id: &ResourceId,
-        _identifier: &str,
+        _identifier: Option<&str>,
         _request: carina_core::provider::ReadRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id = id.clone();
@@ -1657,7 +1657,7 @@ impl Provider for RenameFailProvider {
     }
 
     fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-        self.read(&resource.id, "", carina_core::provider::ReadRequest)
+        self.read(&resource.id, None, carina_core::provider::ReadRequest)
     }
 
     fn create(

@@ -87,10 +87,18 @@ pub trait CarinaProvider {
     }
 
     /// Read current state of a resource.
+    ///
+    /// `identifier` is `None` when no prior identifier exists (a fresh
+    /// component, or a newly added resource on top of an existing
+    /// component). In that case the provider MUST return
+    /// [`State::not_found`] without contacting any external API.
+    /// Encoding presence in the type — instead of using `""` as a
+    /// sentinel — makes that contract enforceable at compile time
+    /// (carina-rs/carina#2594 / #2596).
     fn read(
         &self,
         id: &ResourceId,
-        identifier: &str,
+        identifier: Option<&str>,
         request: ReadRequest,
     ) -> Result<State, ProviderError>;
 
@@ -282,7 +290,7 @@ fn dispatch(provider: &mut impl CarinaProvider, request: &Request) -> Response {
                 Ok(p) => p,
                 Err(e) => return Response::error(id, -32602, e),
             };
-            match provider.read(&params.id, &params.identifier, params.request) {
+            match provider.read(&params.id, params.identifier.as_deref(), params.request) {
                 Ok(state) => Response::success(id, methods::ReadResult { state }),
                 Err(e) => Response::error(id, -1, e.message),
             }

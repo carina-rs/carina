@@ -417,7 +417,7 @@ impl WasmBindings {
         &self,
         store: &mut Store<HostState>,
         id: &wit_types::ResourceId,
-        identifier: &str,
+        identifier: Option<&str>,
         request: wit_types::ReadRequest,
     ) -> wasmtime::Result<Result<wit_types::State, wit_types::ProviderError>> {
         match self {
@@ -1341,12 +1341,12 @@ impl Provider for WasmProvider {
     fn read(
         &self,
         id: &ResourceId,
-        identifier: &str,
+        identifier: Option<&str>,
         request: ReadRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let wit_id = wasm_convert::core_to_wit_resource_id(id);
         let wit_request = wasm_convert::core_to_wit_read_request(&request);
-        let identifier = identifier.to_string();
+        let identifier = identifier.map(|s| s.to_string());
         let id = id.clone();
         Box::pin(async move {
             let mut store = self.instance.store.lock().await;
@@ -1354,7 +1354,7 @@ impl Provider for WasmProvider {
             let result = self
                 .instance
                 .bindings
-                .call_read(&mut store, &wit_id, &identifier, wit_request)
+                .call_read(&mut store, &wit_id, identifier.as_deref(), wit_request)
                 .await
                 .map_err(|e| {
                     let msg = format!("{e}");

@@ -78,7 +78,10 @@ pub(super) async fn refresh_pending_states(
     let mut failed_refreshes = std::collections::HashSet::new();
 
     for (id, identifier) in refreshes {
-        match provider.read(id, identifier, ReadRequest).await {
+        match provider
+            .read(id, Some(identifier.as_str()), ReadRequest)
+            .await
+        {
             Ok(state) => {
                 observer.on_event(&ExecutionEvent::RefreshSucceeded { id });
                 current_states.insert(id.clone(), state);

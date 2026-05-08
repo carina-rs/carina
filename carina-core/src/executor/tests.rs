@@ -64,7 +64,7 @@ impl Provider for MockProvider {
     fn read(
         &self,
         id: &ResourceId,
-        _identifier: &str,
+        _identifier: Option<&str>,
         _request: ReadRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id_str = id.to_string();
@@ -77,7 +77,7 @@ impl Provider for MockProvider {
     }
 
     fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-        self.read(&resource.id, "", ReadRequest)
+        self.read(&resource.id, None, ReadRequest)
     }
 
     fn create(
@@ -864,7 +864,7 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
         fn read(
             &self,
             _id: &ResourceId,
-            _identifier: &str,
+            _identifier: Option<&str>,
             _request: ReadRequest,
         ) -> BoxFuture<'_, ProviderResult<State>> {
             Box::pin(async { Err(ProviderError::internal("not implemented")) })
@@ -1297,7 +1297,7 @@ impl Provider for RecordingMockProvider {
     fn read(
         &self,
         _id: &ResourceId,
-        _identifier: &str,
+        _identifier: Option<&str>,
         _request: ReadRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         Box::pin(async { Err(ProviderError::internal("not implemented")) })

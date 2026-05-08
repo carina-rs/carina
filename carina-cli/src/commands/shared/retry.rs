@@ -53,7 +53,7 @@ pub(crate) async fn wait_for_deletion(
 ) -> WaitResult {
     for _ in 0..max_attempts {
         tokio::time::sleep(poll_interval).await;
-        match provider.read(id, identifier, ReadRequest).await {
+        match provider.read(id, Some(identifier), ReadRequest).await {
             Ok(state) if !state.exists => return WaitResult::Deleted,
             Ok(_) => {
                 // Still exists, keep waiting

@@ -48,7 +48,11 @@ pub struct InitializeResult {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReadParams {
     pub id: ResourceId,
-    pub identifier: String,
+    /// `None` when no prior identifier exists for this resource.
+    /// Mirrors the `option<string>` shape in the WIT contract; see
+    /// carina-rs/carina#2596.
+    #[serde(default)]
+    pub identifier: Option<String>,
     /// Per-operation request record. Present so future fields (e.g.
     /// freshness hint) can be added without breaking existing
     /// providers. Defaults to an empty record on the wire.

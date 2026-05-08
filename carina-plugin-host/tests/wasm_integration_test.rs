@@ -79,7 +79,7 @@ async fn test_wasm_mock_provider_create_and_read() {
     // Read before create - should return a state with no identifier and empty attributes
     let id = ResourceId::with_provider("mock", "test.resource", "my-resource");
     let state = provider
-        .read(&id, "", ReadRequest)
+        .read(&id, None, ReadRequest)
         .await
         .expect("read should not error");
     assert!(state.identifier.is_none());
@@ -115,7 +115,7 @@ async fn test_wasm_mock_provider_create_and_read() {
 
     // Read back - should return the created state
     let read_state = provider
-        .read(&id, "mock-id", ReadRequest)
+        .read(&id, Some("mock-id"), ReadRequest)
         .await
         .expect("read should not error");
     assert_eq!(read_state.identifier, Some("mock-id".into()));
@@ -212,7 +212,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
 
     // Read to verify update persisted in memory
     let read_state = provider
-        .read(&id, "mock-id", ReadRequest)
+        .read(&id, Some("mock-id"), ReadRequest)
         .await
         .expect("read should not error");
     assert_eq!(
@@ -228,7 +228,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
 
     // Read after delete - should return empty state (no identifier, no attributes)
     let deleted_state = provider
-        .read(&id, "", ReadRequest)
+        .read(&id, None, ReadRequest)
         .await
         .expect("read should not error");
     assert!(deleted_state.identifier.is_none());
