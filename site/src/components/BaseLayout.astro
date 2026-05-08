@@ -1,0 +1,64 @@
+---
+import Head from './Head.astro';
+import Topbar from './Topbar.astro';
+import Sidebar from './Sidebar.astro';
+import Footer from './Footer.astro';
+import '../styles/tokens.css';
+
+interface Props {
+  title?: string;
+  description?: string;
+  showSidebar?: boolean;
+}
+
+const {
+  title = 'Carina',
+  description = 'A strongly typed infrastructure management tool written in Rust.',
+  showSidebar = true,
+} = Astro.props;
+---
+<html lang="en">
+  <Head title={title} description={description} />
+  <body>
+    <Topbar />
+    <div class:list={['layout', { 'no-sidebar': !showSidebar }]}>
+      {showSidebar && <Sidebar />}
+      <main class:list={['main', { 'has-sidebar': showSidebar }]}>
+        <slot />
+      </main>
+    </div>
+    <Footer />
+  </body>
+</html>
+
+<style>
+  body {
+    margin: 0;
+    min-height: 100vh;
+  }
+
+  .layout {
+    display: grid;
+    grid-template-columns: 280px 1fr;
+    max-width: 1280px;
+    margin: 0 auto;
+    min-height: calc(100vh - 64px - 200px);
+  }
+
+  .layout.no-sidebar {
+    grid-template-columns: 1fr;
+  }
+
+  .main {
+    padding: var(--space-8) var(--space-6);
+    min-width: 0;
+  }
+
+  .main:not(.has-sidebar) {
+    padding: 0;
+  }
+
+  @media (max-width: 50rem) {
+    .layout { grid-template-columns: 1fr; }
+  }
+</style>

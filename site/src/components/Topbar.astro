@@ -1,0 +1,79 @@
+---
+// Top navigation bar: logo + primary nav + GitHub link.
+---
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a href="/" class="brand" aria-label="Carina home">
+      <span class="brand-star" aria-hidden="true">★</span>
+      <span class="brand-name">Carina</span>
+    </a>
+
+    <nav class="topbar-nav" aria-label="Primary">
+      <a href="/getting-started/installation/">Docs</a>
+      <a href="/reference/">Reference</a>
+      <a href="https://github.com/carina-rs/carina" class="external">GitHub →</a>
+    </nav>
+  </div>
+</header>
+
+<style>
+  .topbar {
+    height: 64px;
+    background: var(--topbar-bg);
+  }
+
+  .topbar-inner {
+    height: 100%;
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 0 var(--space-6);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-6);
+  }
+
+  .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    text-decoration: none;
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: var(--text-lg);
+  }
+
+  .brand-star {
+    color: var(--accent);
+    font-size: var(--text-base);
+    line-height: 1;
+  }
+
+  .brand-name {
+    color: var(--topbar-brand-color);
+    letter-spacing: 0.02em;
+  }
+
+  .topbar-nav {
+    display: flex;
+    align-items: center;
+    gap: var(--space-6);
+  }
+
+  .topbar-nav a {
+    color: var(--topbar-icon-color);
+    text-decoration: none;
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    font-weight: 500;
+    transition: color 0.15s ease;
+  }
+
+  .topbar-nav a:hover { color: var(--topbar-icon-hover); }
+
+  @media (max-width: 50rem) {
+    .topbar-inner { padding: 0 var(--space-4); gap: var(--space-3); }
+    .topbar-nav { gap: var(--space-4); }
+  }
+</style>

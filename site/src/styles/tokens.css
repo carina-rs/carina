@@ -1,0 +1,374 @@
+/* ============================================================
+   Carina Design System — Tokens
+   "Canopus Deep Navy" palette (lifted from docs/src/styles/custom.css)
+   + Canopus Gold accent + Cyan secondary + semantic effect colours.
+   ============================================================ */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
+
+:root {
+  /* ---------- Slate grayscale (Tailwind Slate, hue 215) ---------- */
+  --slate-50:  #f8fafc;
+  --slate-100: #f1f5f9;
+  --slate-200: #e2e8f0;
+  --slate-300: #cbd5e1;
+  --slate-400: #94a3b8;
+  --slate-500: #64748b;
+  --slate-600: #475569;
+  --slate-700: #334155;
+  --slate-800: #1e293b;
+  --slate-900: #0f172a;
+  --slate-950: #020617;
+
+  /* ---------- Canopus Gold (brand accent, Tailwind Yellow/Amber) ---------- */
+  --gold-100: #fef9c3;
+  --gold-300: #fcd34d;
+  --gold-400: #fbbf24;   /* brand mark — Canopus */
+  --gold-500: #f59e0b;
+  --gold-low: hsl(32, 60%, 15%);  /* dark amber ground for accent tints */
+
+  /* ---------- Cyan (secondary, dividers & links) ---------- */
+  --cyan-400: #22d3ee;
+  --cyan-500: #06b6d4;
+  --cyan-600: #0891b2;   /* OGP divider colour */
+  --cyan-700: #0e7490;
+
+  /* ---------- Semantic effect colours (CLI vocabulary) ---------- */
+  --effect-create:  #22c55e;   /* green  —  +   */
+  --effect-update:  #fbbf24;   /* gold   —  ~   */
+  --effect-delete:  #ef4444;   /* red    —  -   */
+  --effect-replace: #d946ef;   /* magenta—  +/- */
+  --effect-read:    #22d3ee;   /* cyan   —  <=  */
+  --effect-noop:    #64748b;   /* slate  —  =   */
+
+  /* ---------- Foreground / background aliases ---------- */
+  --bg:        var(--slate-950);
+  --bg-raise: var(--slate-900);
+  --bg-panel: var(--slate-800);
+  --bg-panel-head: #162032;      /* expressive-code frame header */
+  --fg1:       var(--slate-100); /* primary text */
+  --fg2:       var(--slate-200); /* body copy */
+  --fg3:       var(--slate-400); /* muted / captions */
+  --fg4:       var(--slate-500); /* disabled / hint */
+  --border:    var(--slate-800);
+  --border-strong: var(--slate-700);
+  --accent:    var(--gold-400);
+  --accent-low: var(--gold-low);
+  --accent-high: var(--gold-100);
+  --link:      var(--cyan-500);
+
+  /* ---------- Type families ---------- */
+  --font-display: 'Space Grotesk', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-sans:    'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
+  --font-mono:    'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* ---------- Type scale (rem) ---------- */
+  --text-xs:   0.75rem;   /* 12 */
+  --text-sm:   0.875rem;  /* 14 */
+  --text-base: 1rem;      /* 16 */
+  --text-lg:   1.125rem;  /* 18 */
+  --text-xl:   1.25rem;   /* 20 */
+  --text-2xl:  1.5rem;    /* 24 */
+  --text-3xl:  1.875rem;  /* 30 */
+  --text-4xl:  2.25rem;   /* 36 */
+  --text-5xl:  3rem;      /* 48 */
+  --text-6xl:  3.75rem;   /* 60 */
+
+  /* ---------- Line heights ---------- */
+  --lh-tight: 1.15;
+  --lh-snug:  1.3;
+  --lh-body:  1.6;
+
+  /* ---------- Spacing scale ---------- */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --space-12: 3rem;
+  --space-16: 4rem;
+
+  /* ---------- Radii ---------- */
+  --radius-sm: 0.25rem;
+  --radius:    0.5rem;
+  --radius-lg: 0.75rem;
+
+  /* ---------- Borders ---------- */
+  --border-width: 1px;
+  --card-accent-width: 3px;
+
+  /* ---------- Letter spacing ---------- */
+  --track-brand: 0.22em; /* "CARINA" wordmark */
+  --track-eyebrow: 0.18em;
+}
+
+/* ---------- Semantic base styles ---------- */
+html, body {
+  background: var(--bg);
+  color: var(--fg2);
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  line-height: var(--lh-body);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+h1, .h1 {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: var(--text-5xl);
+  line-height: var(--lh-tight);
+  color: var(--fg1);
+  letter-spacing: -0.01em;
+  margin: 0 0 var(--space-4);
+}
+h2, .h2 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: var(--text-3xl);
+  line-height: var(--lh-snug);
+  color: var(--fg1);
+  margin: 0 0 var(--space-3);
+}
+h3, .h3 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: var(--text-xl);
+  line-height: var(--lh-snug);
+  color: var(--fg1);
+  margin: 0 0 var(--space-2);
+}
+h4, .h4 {
+  font-family: var(--font-sans);
+  font-weight: 600;
+  font-size: var(--text-lg);
+  color: var(--fg1);
+  margin: 0 0 var(--space-2);
+}
+p {
+  color: var(--fg2);
+  line-height: var(--lh-body);
+  margin: 0 0 var(--space-4);
+}
+small, .caption {
+  color: var(--fg3);
+  font-size: var(--text-sm);
+}
+
+/* Brand wordmark utility */
+.wordmark {
+  font-family: var(--font-sans);
+  font-weight: 700;
+  letter-spacing: var(--track-brand);
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.eyebrow {
+  font-family: var(--font-sans);
+  font-weight: 600;
+  font-size: var(--text-xs);
+  letter-spacing: var(--track-eyebrow);
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+/* Code */
+code, pre, .mono { font-family: var(--font-mono); }
+code {
+  font-size: 0.9em;
+  background: var(--bg-panel);
+  color: var(--accent-high);
+  padding: 0.1em 0.35em;
+  border-radius: var(--radius-sm);
+}
+pre {
+  background: var(--bg-panel);
+  color: var(--slate-100);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: var(--space-4);
+  overflow: auto;
+  font-size: var(--text-sm);
+  line-height: 1.55;
+}
+
+/* Link */
+a {
+  color: var(--link);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in oklab, var(--link) 40%, transparent);
+  text-underline-offset: 2px;
+}
+a:hover { color: var(--accent-high); }
+
+/* Card — the one strong visual pattern */
+.card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-left: var(--card-accent-width) solid var(--accent);
+  border-radius: var(--radius);
+  padding: var(--space-5);
+  transition: border-color 0.2s ease;
+}
+.card:hover { border-color: var(--accent); }
+
+/* Effect glyph utility */
+.effect {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  display: inline-block;
+  min-width: 1.5em;
+  text-align: center;
+}
+.effect-create  { color: var(--effect-create);  }
+.effect-update  { color: var(--effect-update);  }
+.effect-delete  { color: var(--effect-delete);  }
+.effect-replace { color: var(--effect-replace); }
+.effect-read    { color: var(--effect-read);    }
+.effect-noop    { color: var(--effect-noop);    }
+
+/* ============================================================
+   COMPONENT LAYER — tokens for site implementations.
+   Site CSS should reference ONLY these (or semantic aliases above).
+   Never reference --slate-* / --gold-* / --cyan-* directly from site code.
+   ============================================================ */
+:root {
+  /* ----- Topbar ----- */
+  --topbar-bg:               var(--bg);
+  --topbar-border:           var(--border);
+  --topbar-brand-color:      var(--accent);
+  --topbar-search-bg:        var(--bg-raise);
+  --topbar-search-border:    var(--border-strong);
+  --topbar-search-text:      var(--fg4);
+  --topbar-search-kbd-bg:    var(--bg);
+  --topbar-icon-color:       var(--fg2);
+  --topbar-icon-hover:       var(--accent);
+
+  /* ----- Sidebar ----- */
+  --sidebar-bg:              transparent;
+  --sidebar-group-head-color: var(--fg1);
+  --sidebar-link-color:      var(--fg3);
+  --sidebar-link-hover-color: var(--fg1);
+  --sidebar-link-active-color: var(--accent);
+  --sidebar-link-active-bg:  var(--accent-low);
+  --sidebar-link-active-border: var(--accent);
+
+  /* ----- Page content ----- */
+  --page-title-color:        var(--fg1);
+  --page-title-font:         var(--font-display);
+  --page-h2-color:           var(--fg1);
+  --page-h2-font:            var(--font-display);
+  --page-body-color:         var(--fg2);
+  --page-link-color:         var(--cyan-400);
+  --page-link-hover-color:   var(--accent);
+
+  /* ----- Inline + block code ----- */
+  --code-inline-bg:          var(--bg-panel);
+  --code-inline-color:       var(--accent-high);
+  --code-block-bg:           var(--bg-panel);
+  --code-block-border:       var(--border-strong);
+  --code-block-header-bg:    var(--bg-panel-head);
+  --code-block-text:         var(--slate-100);
+
+  /* ----- Aside / callout (4 variants) ----- */
+  --aside-bg:                hsl(32, 60%, 8%);
+  --aside-border:            var(--border-strong);
+  --aside-accent:            var(--accent);
+  --aside-title-color:       var(--fg1);
+  --aside-body-color:        var(--fg2);
+  --aside-tip-bg:            hsl(192, 80%, 7%);
+  --aside-tip-accent:        var(--cyan-400);
+  --aside-warn-bg:           hsl(0, 60%, 8%);
+  --aside-warn-accent:       var(--effect-delete);
+  --aside-success-bg:        hsl(140, 50%, 7%);
+  --aside-success-accent:    var(--effect-create);
+
+  /* ----- Terminal / plan panel ----- */
+  --terminal-bg:             var(--bg-panel);
+  --terminal-border:         var(--border-strong);
+  --terminal-header-bg:      var(--bg-panel-head);
+  --terminal-header-text:    var(--fg4);
+  --terminal-body-text:      var(--slate-100);
+  --terminal-prompt:         var(--accent);
+  --terminal-muted:          var(--fg4);
+  --terminal-string:         #86efac;
+  --terminal-tree:           var(--fg4);
+  --terminal-summary:        var(--accent);
+  --terminal-dot-red:        #f43f5e;
+  --terminal-dot-yellow:     #f59e0b;
+  --terminal-dot-green:      #10b981;
+
+  /* ----- Experimental banner (landing hero) ----- */
+  --banner-experimental-bg:        hsl(0, 50%, 10%);
+  --banner-experimental-border:    hsl(0, 60%, 25%);
+  --banner-experimental-label-bg:  hsl(0, 72%, 50%);
+  --banner-experimental-label-fg:  #ffffff;
+  --banner-experimental-text:      hsl(0, 86%, 90%);
+
+  /* ----- Code syntax highlighting (.crn DSL + plan output) ----- */
+  --code-keyword:            var(--accent);          /* provider, let     */
+  --code-attr:               var(--slate-300);       /* attribute names   */
+  --code-type:               var(--slate-300);       /* awscc.ec2.vpc     */
+  --code-id:                 var(--slate-100);       /* identifiers       */
+  --code-string:             var(--terminal-string); /* '...'             */
+  --code-bool:               #fde68a;                /* true / false      */
+  --code-enum:               var(--accent-high);     /* aws.Region.*      */
+  --code-add:                #10b981;                /* + create line     */
+  --code-prompt:             var(--accent);          /* $                 */
+  --code-muted:              var(--fg4);             /* Planning...       */
+  --code-summary:            var(--accent);          /* Plan: 2 to create */
+
+  /* ----- Status glyphs (validate output) ----- */
+  --status-ok:               var(--effect-create);
+  --status-fail:             var(--effect-delete);
+  --status-skip:             var(--fg4);
+
+  /* ----- TOC ----- */
+  --toc-label-color:         var(--fg1);
+  --toc-link-color:          var(--fg3);
+  --toc-link-hover-color:    var(--fg1);
+  --toc-link-current-color:  var(--accent);
+
+  /* ----- Buttons ----- */
+  --btn-primary-bg:          var(--gold-500);
+  --btn-primary-bg-hover:    var(--accent);
+  --btn-primary-text:        #ffffff;
+  --btn-secondary-border:    var(--border-strong);
+  --btn-secondary-text:      var(--fg3);
+  --btn-secondary-text-hover: var(--fg1);
+
+  /* ----- Footer ----- */
+  --footer-divider:          var(--cyan-600);
+  --footer-quote-color:      var(--fg3);
+  --footer-meta-color:       var(--fg4);
+
+  /* ----- Hero / landing ----- */
+  --hero-bg-from:            var(--slate-900);
+  --hero-bg-to:              var(--slate-800);
+  --hero-halo:               hsla(192, 91%, 36%, 0.10);
+  --hero-divider-gold:       var(--accent);
+  --hero-divider-cyan:       var(--cyan-600);
+  /* Faded horizons used in the original Hero.astro: centered 1-px gradient
+     lines, transparent at the edges, brand colour in the middle. */
+  --hero-horizon-gold:       linear-gradient(90deg, transparent 0%, var(--accent) 50%, transparent 100%);
+  --hero-horizon-cyan:       linear-gradient(90deg, transparent 0%, var(--cyan-600) 50%, transparent 100%);
+  --hero-horizon-opacity:    0.55;
+  --hero-horizon-max:        52rem;
+  --hero-eyebrow-color:      var(--accent);
+  --hero-wordmark-color:     var(--fg1);
+  --hero-tagline-color:      var(--fg2);
+  --hero-meta-color:         var(--fg4);
+  --hero-star-color:         var(--accent);
+  --hero-grid-line:          color-mix(in oklab, var(--slate-700) 40%, transparent);
+
+  /* ----- Feature card (landing) ----- */
+  --feature-card-bg:         var(--bg);
+  --feature-card-border:     var(--border);
+  --feature-card-accent:     var(--accent);
+  --feature-card-title:      var(--fg1);
+  --feature-card-body:       var(--fg3);
+  --feature-card-icon-bg:    var(--bg-panel);
+  --feature-card-icon-color: var(--accent);
+}

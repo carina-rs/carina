@@ -1,0 +1,64 @@
+---
+const year = new Date().getFullYear();
+---
+
+<footer class="site-footer">
+  <div class="site-footer-inner">
+    <p class="copyright">© {year} Carina contributors · MIT License</p>
+    <nav class="footer-links" aria-label="Footer">
+      <a href="https://github.com/carina-rs/carina">GitHub</a>
+      <span class="sep" aria-hidden="true">·</span>
+      <a href="https://crates.io/crates/carina">crates.io</a>
+      <span class="sep" aria-hidden="true">·</span>
+      <a href="/docs">Docs</a>
+    </nav>
+  </div>
+</footer>
+
+<style>
+  .site-footer {
+    margin-top: var(--space-12);
+    padding: var(--space-6) var(--space-6);
+  }
+
+  .site-footer-inner {
+    max-width: 1280px;
+    margin: 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-4);
+    flex-wrap: wrap;
+  }
+
+  .copyright {
+    margin: 0;
+    color: var(--footer-meta-color);
+    font-size: var(--text-xs);
+  }
+
+  .footer-links {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    font-size: var(--text-xs);
+    color: var(--footer-meta-color);
+  }
+
+  .footer-links a {
+    color: var(--footer-quote-color);
+    text-decoration: none;
+    transition: color 0.15s ease;
+  }
+
+  .footer-links a:hover { color: var(--accent); }
+
+  .footer-links .sep { color: var(--footer-meta-color); }
+
+  @media (max-width: 50rem) {
+    .site-footer-inner {
+      justify-content: center;
+      text-align: center;
+    }
+  }
+</style>

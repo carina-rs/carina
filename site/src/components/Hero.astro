@@ -1,0 +1,313 @@
+---
+const PAGE_TITLE_ID = '_top';
+
+const codeHtml = `<span class="kw">provider</span> <span class="id">aws</span> {
+  <span class="attr">region =</span> <span class="enum">aws.Region.ap_northeast_1</span>
+}
+
+<span class="kw">let</span> <span class="id">vpc</span> = <span class="type">awscc.ec2.vpc</span> {
+  <span class="attr">cidr_block =</span> <span class="str">'10.0.0.0/16'</span>
+  <span class="attr">enable_dns_support =</span> <span class="bool">true</span>
+}
+
+<span class="type">awscc.ec2.subnet</span> {
+  <span class="attr">vpc_id =</span> <span class="id">vpc</span>.vpc_id
+  <span class="attr">cidr_block =</span> <span class="str">'10.0.1.0/24'</span>
+}`;
+
+const planHtml = `<span class="prompt">$</span> carina plan
+<span class="muted">Planning...</span>
+
+<span class="add">+</span> <span class="id">awscc.ec2.vpc</span>
+  <span class="attr">cidr_block:</span> <span class="str">'10.0.0.0/16'</span>
+  <span class="attr">enable_dns_support:</span> <span class="bool">true</span>
+
+<span class="add">+</span> <span class="id">awscc.ec2.subnet</span>
+  <span class="attr">vpc_id:</span> <span class="id">vpc</span>.vpc_id
+  <span class="attr">cidr_block:</span> <span class="str">'10.0.1.0/24'</span>
+
+<span class="plan-summary">Plan: 2 to create, 0 to update, 0 to delete.</span>`;
+---
+
+<div class="hero-custom">
+  <div class="horizon-line gold" aria-hidden="true"></div>
+
+  <div class="hero-header">
+    <div class="hero-halo" aria-hidden="true"></div>
+    <div class="hero-star"></div>
+    <h1 id={PAGE_TITLE_ID} data-page-title>Carina</h1>
+    <p class="hero-tagline">A strongly typed infrastructure management tool written in Rust.</p>
+  </div>
+
+  <div class="hero-banner">
+    <span class="banner-label">Experimental</span>
+    <span class="banner-text">Carina is under active development. APIs and DSL syntax may change without notice. Not recommended for production use yet.</span>
+  </div>
+
+  <div class="hero-panels">
+    <div class="hero-panel">
+      <div class="panel-header">
+        <span class="panel-tab">main.crn</span>
+      </div>
+      <div class="panel-body">
+        <pre><code set:html={codeHtml} /></pre>
+      </div>
+    </div>
+
+    <div class="hero-panel">
+      <div class="panel-header terminal-header">
+        <span class="terminal-dot dot-red"></span>
+        <span class="terminal-dot dot-yellow"></span>
+        <span class="terminal-dot dot-green"></span>
+        <span class="panel-tab-terminal">terminal</span>
+      </div>
+      <div class="panel-body">
+        <pre><code set:html={planHtml} /></pre>
+      </div>
+    </div>
+  </div>
+
+  <div class="hero-actions">
+    <a href="/getting-started/installation/" class="hero-btn primary">Get Started</a>
+    <a href="/docs" class="hero-btn secondary">Documentation</a>
+  </div>
+
+  <div class="horizon-line cyan" aria-hidden="true"></div>
+</div>
+
+<style>
+  .hero-custom {
+    padding: clamp(2rem, 6vw, 4rem) 0 var(--space-8);
+    text-align: center;
+    position: relative;
+  }
+
+  /* ───────── Brand horizons ───────── */
+  .horizon-line {
+    height: 1px;
+    width: min(52rem, 80vw);
+    margin: 0 auto;
+    opacity: var(--hero-horizon-opacity, 0.55);
+    background: linear-gradient(
+      90deg,
+      transparent 0%,
+      currentColor 20%,
+      currentColor 80%,
+      transparent 100%
+    );
+  }
+  .horizon-line.gold {
+    color: var(--hero-divider-gold);
+    margin-bottom: clamp(1.5rem, 4vw, 3rem);
+  }
+  .horizon-line.cyan {
+    color: var(--hero-divider-cyan);
+    margin-top: clamp(1.5rem, 4vw, 2.5rem);
+  }
+
+  /* ───────── Header with halo ───────── */
+  .hero-header {
+    position: relative;
+  }
+
+  .hero-halo {
+    position: absolute;
+    top: -40px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 420px;
+    max-width: 80vw;
+    height: 260px;
+    background: radial-gradient(
+      ellipse at center,
+      color-mix(in oklab, var(--accent) 14%, transparent) 0%,
+      color-mix(in oklab, var(--cyan-600) 8%, transparent) 35%,
+      transparent 70%
+    );
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .hero-star {
+    position: relative;
+    z-index: 1;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #fef3c7;
+    box-shadow: 0 0 16px #fde68a, 0 0 40px rgba(253, 230, 138, 0.45);
+    margin: 0 auto var(--space-3);
+  }
+
+  h1 {
+    position: relative;
+    z-index: 1;
+    font-family: var(--font-display);
+    font-size: clamp(var(--text-4xl), calc(0.25rem + 5vw), var(--text-6xl));
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    line-height: var(--lh-tight);
+    color: var(--accent);
+    margin: 0;
+  }
+
+  .hero-tagline {
+    position: relative;
+    z-index: 1;
+    font-size: clamp(var(--text-base), calc(0.0625rem + 2vw), var(--text-xl));
+    color: var(--fg2);
+    margin: var(--space-2) auto 0;
+    max-width: 40rem;
+  }
+
+  /* ───────── Experimental banner ───────── */
+  .hero-banner {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    max-width: 52rem;
+    margin: var(--space-6) auto 0;
+    padding: 0.625rem var(--space-4);
+    border: 1px solid var(--banner-experimental-border);
+    border-radius: var(--radius);
+    background: var(--banner-experimental-bg);
+    font-size: var(--text-sm);
+    text-align: left;
+  }
+
+  .banner-label {
+    flex-shrink: 0;
+    padding: 0.125rem var(--space-2);
+    border-radius: var(--radius-sm);
+    background: var(--banner-experimental-label-bg);
+    color: var(--banner-experimental-label-fg);
+    font-size: var(--text-xs);
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .banner-text {
+    color: var(--banner-experimental-text);
+    line-height: 1.5;
+  }
+
+  /* ───────── Code + terminal panels ───────── */
+  .hero-panels {
+    display: flex;
+    gap: var(--space-3);
+    margin: var(--space-8) auto 0;
+    max-width: 52rem;
+    padding: 0 var(--space-4);
+  }
+
+  .hero-panel {
+    flex: 1;
+    background: var(--terminal-bg);
+    border: 1px solid var(--terminal-border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    text-align: left;
+  }
+
+  .panel-header {
+    background: var(--terminal-header-bg);
+    padding: 0.4rem var(--space-3);
+    border-bottom: 1px solid var(--terminal-border);
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .panel-tab {
+    color: var(--accent);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    font-weight: 600;
+  }
+
+  .terminal-header { gap: var(--space-1); }
+
+  .terminal-dot {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+  }
+  .dot-red { background: var(--terminal-dot-red); }
+  .dot-yellow { background: var(--terminal-dot-yellow); }
+  .dot-green { background: var(--terminal-dot-green); }
+
+  .panel-tab-terminal {
+    color: var(--terminal-header-text);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    margin-left: var(--space-1);
+  }
+
+  .panel-body { padding: var(--space-3); }
+
+  .panel-body pre {
+    margin: 0;
+    background: transparent !important;
+    border: none !important;
+    padding: 0 !important;
+  }
+
+  .panel-body code {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    line-height: 1.7;
+    color: var(--terminal-body-text);
+  }
+
+  :global(.kw) { color: var(--code-keyword); }
+  :global(.id) { color: var(--code-id); }
+  :global(.attr) { color: var(--code-attr); }
+  :global(.str) { color: var(--code-string); }
+  :global(.bool) { color: var(--code-bool); }
+  :global(.enum) { color: var(--code-enum); }
+  :global(.type) { color: var(--code-type); }
+  :global(.prompt) { color: var(--code-prompt); }
+  :global(.muted) { color: var(--code-muted); }
+  :global(.add) { color: var(--code-add); font-weight: 700; }
+  :global(.computed) { color: var(--code-bool); }
+  :global(.plan-summary) { color: var(--code-summary); font-weight: 600; }
+
+  /* ───────── Buttons ───────── */
+  .hero-actions {
+    display: flex;
+    gap: var(--space-3);
+    justify-content: center;
+    margin-top: var(--space-6);
+    flex-wrap: wrap;
+  }
+
+  .hero-btn {
+    padding: var(--space-2) var(--space-5);
+    border-radius: var(--radius-sm);
+    font-size: var(--text-sm);
+    font-weight: 600;
+    text-decoration: none;
+    transition: background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+  }
+
+  .hero-btn.primary {
+    background: var(--btn-primary-bg);
+    color: var(--btn-primary-text);
+  }
+  .hero-btn.primary:hover { background: var(--btn-primary-bg-hover); }
+
+  .hero-btn.secondary {
+    border: 1px solid var(--btn-secondary-border);
+    color: var(--btn-secondary-text);
+  }
+  .hero-btn.secondary:hover {
+    border-color: var(--border-strong);
+    color: var(--btn-secondary-text-hover);
+  }
+
+  @media (max-width: 50rem) {
+    .hero-panels { flex-direction: column; }
+    .hero-halo { height: 180px; top: -20px; }
+  }
+</style>

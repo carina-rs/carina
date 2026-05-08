@@ -1,0 +1,10 @@
+# Astro
+dist/
+.astro/
+
+# Node
+node_modules/
+
+# Env
+.env
+.env.production
