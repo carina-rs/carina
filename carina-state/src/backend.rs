@@ -57,13 +57,98 @@ pub enum BackendError {
     #[error("I/O error: {0}")]
     Io(String),
 
-    /// AWS SDK error
-    #[error("AWS error: {0}")]
-    Aws(String),
+    /// AWS SDK error with structured context.
+    ///
+    /// The bucket/key/operation labels and the full source-chain
+    /// rendering of `source` (e.g. AWS error `code`, message,
+    /// request id) make the failure actionable at first glance —
+    /// see carina-rs/carina#2603. The earlier `Aws(String)` shape
+    /// flattened SDK errors via `.to_string()`, which collapses to
+    /// the literal `"service error"` for most `SdkError::ServiceError`
+    /// values and drops the entire context chain on the floor.
+    #[error("{}", aws_err_display(.0))]
+    Aws(Box<AwsError>),
 
     /// Serialization/deserialization error
     #[error("Serialization error: {0}")]
     Serialization(String),
+}
+
+/// Structured context attached to a [`BackendError::Aws`].
+///
+/// Each AWS SDK call site populates `operation` (e.g. `"s3.HeadObject"`)
+/// and the relevant resource fields (`bucket`, `key`); `source` keeps
+/// the underlying SDK error so the `Display` impl can walk the full
+/// chain and surface the AWS error code, message, and request id.
+#[derive(Debug)]
+pub struct AwsError {
+    /// Service-qualified API operation, e.g. `"s3.HeadObject"`,
+    /// `"s3.GetObject"`. Always present; chosen by the call site.
+    pub operation: &'static str,
+    /// S3 bucket the call targeted, when applicable.
+    pub bucket: Option<String>,
+    /// S3 object key the call targeted, when applicable.
+    pub key: Option<String>,
+    /// The underlying SDK error chain.
+    pub source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl AwsError {
+    /// Build a new structured AWS error. Use the `bucket`/`key`
+    /// builders to attach resource context.
+    pub fn new(
+        operation: &'static str,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            operation,
+            bucket: None,
+            key: None,
+            source: Box::new(source),
+        }
+    }
+
+    pub fn bucket(mut self, bucket: impl Into<String>) -> Self {
+        self.bucket = Some(bucket.into());
+        self
+    }
+
+    pub fn key(mut self, key: impl Into<String>) -> Self {
+        self.key = Some(key.into());
+        self
+    }
+}
+
+/// Render an [`AwsError`] as a multi-line, fully-expanded message:
+/// service/operation, the targeted bucket/key (if known), and the
+/// full source-chain text from the SDK error. Used by
+/// `BackendError::Aws`'s `Display` impl.
+fn aws_err_display(err: &AwsError) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "AWS error");
+    let _ = writeln!(out, "  operation: {}", err.operation);
+    if let Some(bucket) = &err.bucket {
+        let _ = writeln!(out, "  bucket: {}", bucket);
+    }
+    if let Some(key) = &err.key {
+        let _ = writeln!(out, "  key: {}", key);
+    }
+    // Walk the source chain so the AWS error code, message, request
+    // id, and any wrapped causes all surface.
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err.source.as_ref());
+    let mut depth = 0usize;
+    while let Some(e) = current {
+        let _ = writeln!(out, "  cause[{}]: {}", depth, e);
+        depth += 1;
+        current = e.source();
+    }
+    // Drop the trailing newline so the formatter ("Error: {}") does
+    // not emit a blank line at the very end.
+    while out.ends_with('\n') {
+        out.pop();
+    }
+    out
 }
 
 impl BackendError {
@@ -258,5 +343,116 @@ mod tests {
         assert_eq!(state_config.backend_type, "s3");
         assert_eq!(state_config.get_string("bucket"), Some("my-bucket"));
         assert_eq!(state_config.get_string("key"), Some("state.json"));
+    }
+
+    // carina-rs/carina#2603: BackendError::Aws must surface the
+    // operation, bucket/key context, and the entire source-error
+    // chain (AWS code, message, request id, ...) — not collapse to
+    // the literal `"AWS error: service error"` that hid every clue
+    // the user needed when CI failures happened in OIDC-assumed
+    // roles where reproducing locally is awkward.
+
+    /// Stand-in for an SDK error chain. Wrapped causes flow through
+    /// `source()`, mirroring how `aws-smithy-runtime` exposes the
+    /// underlying response/code/message.
+    #[derive(Debug)]
+    struct ChainErr {
+        msg: &'static str,
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    }
+
+    impl std::fmt::Display for ChainErr {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.msg)
+        }
+    }
+
+    impl std::error::Error for ChainErr {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source.as_deref().map(|e| e as &dyn std::error::Error)
+        }
+    }
+
+    #[test]
+    fn aws_error_display_renders_operation_and_source_chain() {
+        let inner = ChainErr {
+            msg: "AccessDenied: User: arn:aws:sts::… is not authorized to perform: s3:HeadBucket",
+            source: None,
+        };
+        let outer = ChainErr {
+            msg: "service error",
+            source: Some(Box::new(inner)),
+        };
+        let aws = AwsError::new("s3.HeadBucket", outer).bucket("carina-registry-state-dev");
+        let err = BackendError::Aws(Box::new(aws));
+
+        let rendered = err.to_string();
+        assert!(rendered.starts_with("AWS error\n"), "got:\n{}", rendered);
+        assert!(
+            rendered.contains("operation: s3.HeadBucket"),
+            "operation must be visible. got:\n{}",
+            rendered
+        );
+        assert!(
+            rendered.contains("bucket: carina-registry-state-dev"),
+            "bucket must be visible. got:\n{}",
+            rendered
+        );
+        assert!(
+            rendered.contains("cause[0]: service error"),
+            "outer cause must be visible. got:\n{}",
+            rendered
+        );
+        assert!(
+            rendered.contains("AccessDenied"),
+            "the deeper source chain (AWS error code) must surface. got:\n{}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn aws_error_display_includes_key_when_set() {
+        let aws = AwsError::new(
+            "s3.GetObject",
+            ChainErr {
+                msg: "NoSuchKey",
+                source: None,
+            },
+        )
+        .bucket("my-bucket")
+        .key("path/to/state.json");
+        let err = BackendError::Aws(Box::new(aws));
+
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("operation: s3.GetObject")
+                && rendered.contains("bucket: my-bucket")
+                && rendered.contains("key: path/to/state.json"),
+            "operation/bucket/key must all be present. got:\n{}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn aws_error_display_omits_optional_fields_when_unset() {
+        // Some operations (e.g. HeadBucket) have no key; a future
+        // operation may also have no bucket. The renderer should
+        // simply skip those lines instead of writing empty stubs.
+        let aws = AwsError::new(
+            "s3.HeadBucket",
+            ChainErr {
+                msg: "AccessDenied",
+                source: None,
+            },
+        )
+        .bucket("my-bucket");
+        let err = BackendError::Aws(Box::new(aws));
+        let rendered = err.to_string();
+        assert!(rendered.contains("bucket: my-bucket"));
+        assert!(
+            !rendered.contains("key:"),
+            "no key was set; the key line must be omitted. got:\n{}",
+            rendered
+        );
     }
 }

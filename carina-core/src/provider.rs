@@ -68,8 +68,18 @@ impl std::fmt::Display for ProviderError {
         } else {
             write!(f, "{}", detail.message)?;
         }
+        // carina-rs/carina#2603: walk the entire `source()` chain
+        // rather than printing only the first level. AWS SDK errors
+        // typically carry the actionable detail (error code, raw
+        // response message, request id) two or three levels deep;
+        // a single `: {cause}` would still hide e.g. "AccessDenied"
+        // behind a generic "service error" wrapper.
         if let Some(ref cause) = detail.cause {
-            write!(f, ": {}", cause)?;
+            let mut current: Option<&(dyn std::error::Error + 'static)> = Some(cause.as_ref());
+            while let Some(c) = current {
+                write!(f, ": {}", c)?;
+                current = c.source();
+            }
         }
         Ok(())
     }
@@ -1252,6 +1262,56 @@ mod tests {
         let err = ProviderError::internal("simple error");
         let display = format!("{}", err);
         assert_eq!(display, "simple error");
+    }
+
+    /// carina-rs/carina#2603: AWS SDK errors typically carry the
+    /// actionable detail (error code, message, request id) wrapped
+    /// two or three levels deep behind `source()`. A `Display` impl
+    /// that prints only the first level hides the part the user
+    /// actually needs. Walk the whole chain.
+    #[test]
+    fn provider_error_display_walks_entire_source_chain() {
+        #[derive(Debug)]
+        struct ChainErr {
+            msg: &'static str,
+            source: Option<Box<dyn std::error::Error + Send + Sync>>,
+        }
+        impl std::fmt::Display for ChainErr {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.msg)
+            }
+        }
+        impl std::error::Error for ChainErr {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.source
+                    .as_deref()
+                    .map(|e| e as &(dyn std::error::Error + 'static))
+            }
+        }
+
+        let inner = ChainErr {
+            msg: "AccessDenied: User is not authorized to perform: s3:HeadBucket",
+            source: None,
+        };
+        let outer = ChainErr {
+            msg: "service error",
+            source: Some(Box::new(inner)),
+        };
+        let err = ProviderError::api_error("AWS error").with_cause(outer);
+
+        let rendered = format!("{}", err);
+        assert!(
+            rendered.contains("service error"),
+            "outer cause must surface, got: {}",
+            rendered
+        );
+        assert!(
+            rendered.contains("AccessDenied"),
+            "deeper source-chain text (the part the user actually needs) \
+             must surface — single-level Display is the carina#2603 bug. \
+             Got: {}",
+            rendered
+        );
     }
 
     #[test]
