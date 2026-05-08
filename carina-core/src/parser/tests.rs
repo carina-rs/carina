@@ -6485,6 +6485,10 @@ exports {
 
 #[test]
 fn parse_exports_block_list_round_trips_through_formatter() {
+    // carina-rs/carina#2586: a multi-line list in source must round-trip
+    // through the formatter as a multi-line list (one element per line,
+    // trailing comma, normalized indentation). The formatter never
+    // collapses multi-line layouts onto a single line.
     let input = r#"
 provider awscc {
   region = awscc.Region.ap_northeast_1
@@ -6517,7 +6521,9 @@ let vpc = awscc.ec2.Vpc {
 }
 
 exports {
-  vpc_ids: list(String) = [vpc.vpc_id]
+  vpc_ids: list(String) = [
+    vpc.vpc_id,
+  ]
 }
 "#
     );

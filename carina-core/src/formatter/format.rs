@@ -1727,4 +1727,137 @@ require   port >= 1 && port <= 65535  , "port must be valid"
         let second = format(&result, &config).unwrap();
         assert_eq!(result, second, "must be idempotent");
     }
+
+    // carina-rs/carina#2586: fmt must preserve the user's list layout —
+    // a multi-line list (with a newline between `[` and `]`) stays
+    // multi-line, and a single-line list stays single-line. The
+    // formatter only normalizes indentation and the comma-space
+    // between elements; it never reflows for line width.
+
+    #[test]
+    fn test_format_preserves_multiline_list_layout() {
+        let input = "\
+aws.s3.Bucket {
+  action = [
+    's3:GetObject',
+    's3:PutObject',
+    's3:DeleteObject',
+  ]
+}
+";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert_eq!(
+            result, input,
+            "multi-line list must round-trip unchanged. Got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_preserves_singleline_list_layout() {
+        let input = "aws.s3.Bucket {\n  action = ['s3:GetObject', 's3:PutObject']\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert_eq!(
+            result, input,
+            "single-line list must stay single-line. Got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_does_not_collapse_long_multiline_list() {
+        // Reproduces the carina#2586 bug: long multi-line lists were
+        // being collapsed onto a single ~1100-character line. The
+        // formatter must leave the multi-line shape alone.
+        let input = "\
+aws.s3.Bucket {
+  action = [
+    's3:CreateBucket',
+    's3:DeleteBucket',
+    's3:GetBucketAcl',
+    's3:GetBucketCORS',
+    's3:GetBucketLocation',
+    's3:GetBucketLogging',
+    's3:GetBucketObjectLockConfiguration',
+    's3:GetBucketOwnershipControls',
+    's3:GetBucketPolicy',
+    's3:GetBucketPolicyStatus',
+    's3:GetBucketPublicAccessBlock',
+    's3:GetBucketRequestPayment',
+    's3:GetBucketTagging',
+    's3:GetBucketVersioning',
+    's3:GetBucketWebsite',
+  ]
+}
+";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert_eq!(
+            result, input,
+            "long multi-line list must NOT be collapsed to a single line. Got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_normalizes_singleline_list_spacing() {
+        // Single-line stays single-line, but commas without spaces
+        // must be normalized to comma-space.
+        let input = "aws.s3.Bucket {\n  action = ['a','b','c']\n}\n";
+        let expected = "aws.s3.Bucket {\n  action = ['a', 'b', 'c']\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert_eq!(
+            result, expected,
+            "single-line list spacing must normalize to ', '. Got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_normalizes_multiline_list_indentation() {
+        // Multi-line stays multi-line, but mis-indented elements get
+        // normalized to the correct indent level.
+        let input = "\
+aws.s3.Bucket {
+  action = [
+        's3:GetObject',
+   's3:PutObject',
+  ]
+}
+";
+        let expected = "\
+aws.s3.Bucket {
+  action = [
+    's3:GetObject',
+    's3:PutObject',
+  ]
+}
+";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert_eq!(
+            result, expected,
+            "multi-line list indentation must normalize. Got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_multiline_list_is_idempotent() {
+        let input = "\
+aws.s3.Bucket {
+  action = [
+    's3:GetObject',
+    's3:PutObject',
+  ]
+}
+";
+        let config = FormatConfig::default();
+        let first = format(input, &config).unwrap();
+        let second = format(&first, &config).unwrap();
+        assert_eq!(first, second, "multi-line list fmt must be idempotent");
+    }
 }
