@@ -190,36 +190,57 @@ impl Formatter {
     }
 
     pub(in crate::formatter) fn format_list(&mut self, node: &CstNode) {
+        // carina-rs/carina#2586: preserve the user's list layout.
+        // If the source had any newline between `[` and `]`, render
+        // multi-line (one element per line, trailing comma); otherwise
+        // stay on a single line. Indentation and the comma-space
+        // between elements are normalized either way; we never reflow
+        // for line width.
+        let multiline = list_is_multiline(node);
+
         self.write("[");
-        let mut first = true;
-
-        for child in &node.children {
-            match child {
-                CstChild::Token(token) => {
-                    if token.text == "[" || token.text == "]" {
-                        continue;
-                    }
-                    if token.text == "," {
-                        continue;
-                    }
-                    // String or other literal
-                    if !first {
-                        self.write(", ");
-                    }
-                    self.write_token(&token.text);
-                    first = false;
-                }
-                CstChild::Node(n) => {
-                    if !first {
-                        self.write(", ");
-                    }
-                    self.format_node(n);
-                    first = false;
-                }
-                CstChild::Trivia(_) => {}
-            }
+        if multiline {
+            self.write_newline();
+            self.current_indent += 1;
         }
-
+        let mut first = true;
+        for child in &node.children {
+            let is_element = match child {
+                CstChild::Token(token) => !matches!(token.text.as_str(), "[" | "]" | ","),
+                CstChild::Node(_) => true,
+                CstChild::Trivia(_) => false,
+            };
+            if !is_element {
+                continue;
+            }
+            if !first {
+                if multiline {
+                    self.write(",");
+                    self.write_newline();
+                } else {
+                    self.write(", ");
+                }
+            }
+            if multiline {
+                self.write_indent();
+            }
+            match child {
+                CstChild::Token(token) => self.write_token(&token.text),
+                CstChild::Node(n) => self.format_node(n),
+                CstChild::Trivia(_) => unreachable!(),
+            }
+            first = false;
+        }
+        if multiline {
+            if !first {
+                // Trailing comma after the last element, then newline
+                // before the closing bracket at the parent indent.
+                self.write(",");
+                self.write_newline();
+            }
+            self.current_indent -= 1;
+            self.write_indent();
+        }
         self.write("]");
     }
 
@@ -410,4 +431,16 @@ impl Formatter {
 
         self.write_newline();
     }
+}
+
+/// Was this list written across multiple lines in the source?
+///
+/// True iff any `Trivia::Newline` appears among the list node's
+/// children (i.e. between `[` and `]`). Used by `format_list` to
+/// preserve the user's layout instead of forcing every list onto
+/// one line — see carina-rs/carina#2586.
+fn list_is_multiline(node: &CstNode) -> bool {
+    node.children
+        .iter()
+        .any(|c| matches!(c, CstChild::Trivia(Trivia::Newline)))
 }

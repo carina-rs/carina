@@ -1882,7 +1882,12 @@ fn exports_type_warning_survives_formatter_round_trip() {
         .find(|d| d.message.contains("expected Bool, got string"))
         .map(|d| d.message.clone());
 
-    assert_eq!(formatted, "exports {\n  values: list(Bool) = ['nope']\n}\n");
+    // carina-rs/carina#2586: source list is multi-line, so the
+    // formatter preserves the multi-line shape.
+    assert_eq!(
+        formatted,
+        "exports {\n  values: list(Bool) = [\n    'nope',\n  ]\n}\n"
+    );
     assert_eq!(before_warning, after_warning);
     assert!(
         after_warning.is_some(),
@@ -1925,9 +1930,12 @@ exports {
         .find(|d| d.message.contains("export 'values': type mismatch"))
         .map(|d| d.message.clone());
 
+    // carina-rs/carina#2586: the source list is multi-line, so the
+    // formatter preserves the multi-line layout (one element per line,
+    // trailing comma, normalized indentation).
     assert_eq!(
         formatted,
-        "let item = test.sample.resource {\n  enabled = true\n}\n\nexports {\n  values: list(String) = [item.enabled]\n}\n"
+        "let item = test.sample.resource {\n  enabled = true\n}\n\nexports {\n  values: list(String) = [\n    item.enabled,\n  ]\n}\n"
     );
     assert_eq!(before_warning, after_warning);
     assert!(
