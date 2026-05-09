@@ -2668,23 +2668,21 @@ m {
     assert_eq!(policy_map.get("y_value"), Some(&Value::Int(42)));
 }
 
-// #2393 — argument defaults are still resolved in strict declaration
-// order by `substitute_arguments` (see `expander.rs`). A forward-ref
-// default like `prefix = later` cannot pick up `later`'s value at
-// substitution time because `later` hasn't been processed yet.
+// #2393 — argument defaults whose RHS references *another* argument
+// (`prefix: String = later`) used to be resolved in strict declaration
+// order by `substitute_arguments` in `expander.rs`. A forward
+// reference therefore degraded — first to a literal
+// `Value::String("later")` (pre-#2817), then to an unresolved
+// `Value::ResourceRef("later")` (post-#2817 PR1).
 //
-// Before #2817, the parser also degraded the forward identifier `later`
-// to a literal `Value::String("later")`, hiding the order-sensitive
-// nature behind a wrong-but-plausible string. With the directory-aware
-// parse pipeline, every argument name is seeded into the per-file
-// `ParseContext`, so the forward identifier surfaces as a structured
-// `ResourceRef` placeholder. That is strictly more honest — downstream
-// scope / type checks now see the unresolved reference and can flag
-// it. Wiring a fixed-point or topological resolution that completes
-// the substitution is a separate follow-up; this test pins the new
-// surface behavior.
+// This pass adds a fixed-point loop around `substitute_arguments`
+// (#2817 follow-up): each iteration replaces every `ResourceRef`
+// whose binding matches an already-resolved argument; the loop
+// terminates when an iteration produces no changes. Cycles
+// (`a = b`, `b = a`) hit a hard iteration cap and leave the still-
+// unresolved refs in place for the post-merge scope check to flag.
 #[test]
-fn test_argument_default_forward_ref_stays_as_ref_under_seeded_parse() {
+fn test_argument_default_forward_ref_resolves_under_fixpoint() {
     let parsed = resolve_default_arg_fixture(
         r#"
 arguments {
@@ -2704,18 +2702,55 @@ m {}
 "#,
     );
 
+    assert_eq!(
+        role_attr(&parsed, "role_name"),
+        &Value::String("L".to_string()),
+        "forward-ref default `prefix = later` resolves to `later`'s value `'L'` \
+         once the fix-point loop runs in `expander.rs::substitute_arguments`"
+    );
+}
+
+/// Argument-default fix-point loop must terminate even when the
+/// dependency graph is cyclic. With `a: String = b` and `b: String = a`
+/// neither side ever reduces, so each iteration leaves both as
+/// `ResourceRef`. The hard iteration cap stops the loop and surfaces
+/// the unresolved refs to the scope check.
+#[test]
+fn test_argument_default_cycle_terminates_with_unresolved_refs() {
+    let parsed = resolve_default_arg_fixture(
+        r#"
+arguments {
+  a: String = b
+  b: String = a
+}
+
+let role = awscc.iam.Role {
+  role_name                   = a
+  assume_role_policy_document = {}
+}
+"#,
+        r#"
+let m = use { source = '../modules/m' }
+
+m {}
+"#,
+    );
+
     let role_name = role_attr(&parsed, "role_name");
     match role_name {
         Value::ResourceRef { path } => {
-            assert_eq!(path.binding(), "later");
-            assert_eq!(path.attribute(), "");
-            assert!(path.field_path().is_empty());
-            assert!(path.subscripts().is_empty());
+            // The cycle leaves both `a` and `b` as ResourceRef; which one
+            // surfaces as `role_name` depends on substitute_arguments's
+            // walk order. Either is fine — the contract is that the
+            // loop terminates without panicking and produces a
+            // structured ref the scope check can flag.
+            assert!(
+                path.binding() == "a" || path.binding() == "b",
+                "expected cyclic ref to point at `a` or `b`, got: {:?}",
+                path.binding()
+            );
         }
-        other => panic!(
-            "forward-ref default should surface as `ResourceRef(later)` post-seeding; \
-             got {other:?}"
-        ),
+        other => panic!("expected unresolved ResourceRef from cycle; got {other:?}"),
     }
 }
 
