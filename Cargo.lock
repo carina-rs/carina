@@ -939,6 +939,7 @@ dependencies = [
  "carina-plugin-sdk",
  "carina-provider-protocol",
  "serde_json",
+ "tempfile",
  "wit-bindgen 0.51.0",
 ]
 
