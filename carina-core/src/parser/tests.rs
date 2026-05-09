@@ -2360,6 +2360,28 @@ fn parse_provider_block_defers_non_literal_default_tags() {
 }
 
 #[test]
+fn provider_block_undefined_let_reference_flagged() {
+    // `nonexistent.tags` is a ResourceRef (bare identifiers without field
+    // access parse to Value::String per parser/expressions/primary.rs and
+    // are intentionally not scope-checked). The `.tags` access is what
+    // upgrades the value into a ResourceRef whose root must resolve.
+    let input = r#"
+        provider awscc {
+          source       = "github.com/carina-rs/carina-provider-awscc"
+          revision     = "main"
+          default_tags = nonexistent.tags
+        }
+    "#;
+
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let errs = check_identifier_scope(&parsed);
+    assert!(
+        errs.iter().any(|e| format!("{e}").contains("nonexistent")),
+        "expected UndefinedIdentifier for `nonexistent`, got: {errs:?}"
+    );
+}
+
+#[test]
 fn provider_config_carries_unresolved_attributes_field() {
     use crate::parser::ast::ProviderConfig;
     use indexmap::IndexMap;
