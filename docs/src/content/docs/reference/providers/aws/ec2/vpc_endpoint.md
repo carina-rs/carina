@@ -100,13 +100,13 @@ The tags for the resource.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `Gateway` | `aws.ec2.VpcEndpoint.VpcEndpointType.Gateway` |
-| `GatewayLoadBalancer` | `aws.ec2.VpcEndpoint.VpcEndpointType.GatewayLoadBalancer` |
-| `Interface` | `aws.ec2.VpcEndpoint.VpcEndpointType.Interface` |
-| `Resource` | `aws.ec2.VpcEndpoint.VpcEndpointType.Resource` |
-| `ServiceNetwork` | `aws.ec2.VpcEndpoint.VpcEndpointType.ServiceNetwork` |
+| `Gateway` | `aws.ec2.VpcEndpoint.VpcEndpointType.gateway` |
+| `GatewayLoadBalancer` | `aws.ec2.VpcEndpoint.VpcEndpointType.gateway_load_balancer` |
+| `Interface` | `aws.ec2.VpcEndpoint.VpcEndpointType.interface` |
+| `Resource` | `aws.ec2.VpcEndpoint.VpcEndpointType.resource` |
+| `ServiceNetwork` | `aws.ec2.VpcEndpoint.VpcEndpointType.service_network` |
 
-Shorthand formats: `Gateway` or `VpcEndpointType.Gateway`
+Shorthand formats: `gateway` or `VpcEndpointType.gateway`
 
 ## Attribute Reference
 

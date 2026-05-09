@@ -23,10 +23,10 @@ Specifies the feature set supported by the new organization. Each feature set su
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ALL` | `aws.organizations.Organization.FeatureSet.ALL` |
-| `CONSOLIDATED_BILLING` | `aws.organizations.Organization.FeatureSet.CONSOLIDATED_BILLING` |
+| `ALL` | `aws.organizations.Organization.FeatureSet.all` |
+| `CONSOLIDATED_BILLING` | `aws.organizations.Organization.FeatureSet.consolidated_billing` |
 
-Shorthand formats: `ALL` or `FeatureSet.ALL`
+Shorthand formats: `all` or `FeatureSet.all`
 
 ## Attribute Reference
 
