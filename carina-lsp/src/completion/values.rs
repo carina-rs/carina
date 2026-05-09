@@ -23,6 +23,25 @@ struct BindingDotContext {
     resource_type: String,
 }
 
+/// Caller mode for [`CompletionProvider::in_scope_binding_completions`].
+///
+/// The two arms reflect the two real call sites — partial-replacing
+/// (for-iterable / interpolation) and value-position (resource / nested
+/// struct attribute = ▉). Splitting them keeps illegal mixes (e.g.
+/// `range: Some(_)` *and* `current_binding: Some(_)`) unrepresentable.
+pub(super) enum InScopeBindingMode<'a> {
+    /// `for ... in <HERE>` and `"${<HERE>}"` — accepting a candidate
+    /// replaces the partial the user has already typed, so emit a
+    /// `text_edit` covering that range.
+    PartialReplace { range: Range },
+    /// Value position inside a resource block (`attr = ▉`). No partial
+    /// to replace; emit `insert_text` and skip self-references via
+    /// `current_binding`. The fuller `argument: <type>` detail is
+    /// surfaced here because compatibility with the surrounding
+    /// attribute is part of the popup's job.
+    ValuePosition { current_binding: Option<&'a str> },
+}
+
 fn type_completion_item(label: String, detail: String, range: Range) -> CompletionItem {
     CompletionItem {
         label: label.clone(),
@@ -604,52 +623,58 @@ impl CompletionProvider {
         ]
     }
 
-    /// Surface every binding that `check_deferred_for_iterables` treats
-    /// as in-scope at a bare-identifier expression position: `let`,
-    /// `upstream_state`, module calls, imports, and argument parameters.
-    /// Used by the `for ... in <HERE>` iterable detector and by the
-    /// `"${<HERE>"` interpolation detector — both want the same
-    /// candidates.
-    ///
-    /// Bindings commonly live in sibling `.crn` files (e.g.
+    /// Surface every in-scope identifier — `let` bindings (resource,
+    /// module use, upstream_state) and `arguments {}` parameters — as
+    /// candidates. Bindings commonly live in sibling `.crn` files (e.g.
     /// `let orgs = upstream_state { ... }` in `backend.crn` referenced
-    /// from `main.crn`), so we read every `.crn` in `base_path`, not
-    /// just the current buffer.
+    /// from `main.crn`), so we read every `.crn` in `base_path`.
+    ///
+    /// Two callers share this:
+    ///   - `for ... in <HERE>` and `"${<HERE>"` (partial-replacing): a
+    ///     `Range` is supplied so accepting a candidate replaces the
+    ///     already-typed prefix.
+    ///   - Value position inside a resource / nested struct (#2624):
+    ///     `range = None`, `current_binding = Some(...)` to skip
+    ///     self-references.
     pub(super) fn in_scope_binding_completions(
         &self,
         text: &str,
-        position: Position,
-        partial: &str,
         base_path: Option<&Path>,
+        mode: InScopeBindingMode<'_>,
     ) -> Vec<CompletionItem> {
-        let partial_chars = partial.chars().count() as u32;
-        let range = Range {
-            start: Position {
-                line: position.line,
-                character: position.character.saturating_sub(partial_chars),
-            },
-            end: position,
+        let current_binding = match &mode {
+            InScopeBindingMode::ValuePosition { current_binding } => *current_binding,
+            InScopeBindingMode::PartialReplace { .. } => None,
         };
 
         let mut items = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let push = |items: &mut Vec<CompletionItem>,
-                    seen: &mut std::collections::HashSet<String>,
-                    name: String,
-                    detail: &str| {
+        let mut push = |name: String, detail: String| {
+            if current_binding.is_some_and(|cb| cb == name) {
+                return;
+            }
             if !seen.insert(name.clone()) {
                 return;
             }
-            items.push(CompletionItem {
+            let mut item = CompletionItem {
                 label: name.clone(),
                 kind: Some(CompletionItemKind::VARIABLE),
-                detail: Some(detail.to_string()),
-                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
-                    range,
-                    new_text: name,
-                })),
+                detail: Some(detail),
                 ..Default::default()
-            });
+            };
+            match &mode {
+                InScopeBindingMode::PartialReplace { range } => {
+                    item.text_edit =
+                        Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                            range: *range,
+                            new_text: name,
+                        }));
+                }
+                InScopeBindingMode::ValuePosition { .. } => {
+                    item.insert_text = Some(name);
+                }
+            }
+            items.push(item);
         };
 
         let mut src_buf = String::new();
@@ -662,10 +687,14 @@ impl CompletionProvider {
             } else {
                 "binding"
             };
-            push(&mut items, &mut seen, name, detail);
+            push(name, detail.to_string());
         }
-        for (name, _) in self.extract_argument_parameters(src) {
-            push(&mut items, &mut seen, name, "argument");
+        for (name, type_hint) in self.extract_argument_parameters(src) {
+            let detail = match mode {
+                InScopeBindingMode::ValuePosition { .. } => format!("argument: {}", type_hint),
+                InScopeBindingMode::PartialReplace { .. } => "argument".to_string(),
+            };
+            push(name, detail);
         }
 
         items
