@@ -231,18 +231,11 @@ pub fn resolve_resource_refs_with_config(
         }
     }
 
-    // Resolve references inside provider blocks' deferred attributes
-    // (#2717). Without this, `default_tags = some_binding.field` would
-    // remain a `Value::ResourceRef` after resolve and `finalize_provider_configs`
-    // would reject it as "must resolve to a map".
-    for provider in &mut parsed.providers {
-        let mut resolved: IndexMap<String, Value> = IndexMap::new();
-        for (key, expr) in &provider.unresolved_attributes {
-            let r = resolve_value_with_config(expr, &binding_map, &fn_ctx)?;
-            resolved.insert(key.clone(), r);
-        }
-        provider.unresolved_attributes = resolved;
-    }
+    // Provider attribute resolution lives in
+    // `resolve_provider_unresolved_attributes` (generic over export-
+    // parameter shape so it works on both `ParsedFile` and `InferredFile`),
+    // and is called by consumers after `module_resolver::resolve_modules_with_config`
+    // produces virtual resources. See #2717.
 
     Ok(())
 }
@@ -534,17 +527,67 @@ fn resolve_function_calls_only(
     }
 }
 
+/// Resolve `ResourceRef` values inside provider blocks'
+/// `unresolved_attributes` against the merged binding map produced by
+/// `parsed.resources` + `parsed.arguments` + `parsed.module_calls` +
+/// `parsed.upstream_states`.
+///
+/// Call this **after** `module_resolver::resolve_modules_with_config`
+/// has produced virtual resources for module-call bindings, so that
+/// `default_tags = mod.tags` can see the module's exported attribute
+/// values. Then call [`finalize_provider_configs`] to drain the
+/// (now-literal) values into the typed `default_tags` field.
+///
+/// Generic over the export-parameter shape so callers can pass either
+/// `ParsedFile` or `InferredFile` — we only touch
+/// `provider.unresolved_attributes`, never `export_params`.
+pub fn resolve_provider_unresolved_attributes<E>(
+    parsed: &mut super::File<E>,
+    config: &ProviderContext,
+) -> Result<(), ParseError> {
+    let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+    for resource in &parsed.resources {
+        if let Some(ref binding_name) = resource.binding {
+            binding_map.insert(binding_name.clone(), resource.resolved_attributes());
+        }
+    }
+    for arg in &parsed.arguments {
+        binding_map.entry(arg.name.clone()).or_default();
+    }
+    for call in &parsed.module_calls {
+        if let Some(ref name) = call.binding_name {
+            binding_map.entry(name.clone()).or_default();
+        }
+    }
+    for us in &parsed.upstream_states {
+        binding_map.entry(us.binding.clone()).or_default();
+    }
+    let mut fn_ctx = super::ParseContext::new(config);
+    fn_ctx.user_functions = parsed.user_functions.clone();
+
+    for provider in &mut parsed.providers {
+        let mut resolved: IndexMap<String, Value> = IndexMap::new();
+        for (key, expr) in &provider.unresolved_attributes {
+            let r = resolve_value_with_config(expr, &binding_map, &fn_ctx)?;
+            resolved.insert(key.clone(), r);
+        }
+        provider.unresolved_attributes = resolved;
+    }
+    Ok(())
+}
+
 /// Drain `ProviderConfig.unresolved_attributes` and promote resolved
 /// well-known attributes into their typed fields. Run **after**
-/// [`resolve_resource_refs`] so deferred references have a chance to
-/// resolve to literals first.
+/// [`resolve_resource_refs`] (and, for module-call deferrals,
+/// [`resolve_provider_unresolved_attributes`]) so deferred references
+/// have a chance to resolve to literals first.
 ///
 /// Today only `default_tags` is handled; `source` / `version` /
 /// `revision` peel sites still use the legacy parse-time shape (#2757).
 ///
 /// Errors when a resolved value has the wrong shape (e.g.
 /// `default_tags = "string"`).
-pub fn finalize_provider_configs(parsed: &mut ParsedFile) -> Result<(), ParseError> {
+pub fn finalize_provider_configs<E>(parsed: &mut super::File<E>) -> Result<(), ParseError> {
     for provider in parsed.providers.iter_mut() {
         if let Some(value) = provider.unresolved_attributes.shift_remove("default_tags") {
             match value {

@@ -23,7 +23,8 @@ use super::expressions::pipe::parse_coalesce_expr;
 use super::functions::parse_fn_def;
 use super::let_binding::parse_let_binding_extended;
 use super::resolve::{
-    finalize_provider_configs, resolve_forward_references, resolve_resource_refs,
+    finalize_provider_configs, resolve_forward_references, resolve_provider_unresolved_attributes,
+    resolve_resource_refs,
 };
 use crate::eval_value::EvalValue;
 use crate::resource::{Resource, Value};
@@ -330,10 +331,19 @@ pub(crate) fn parse_expression_eval(
     parse_coalesce_expr(inner, ctx)
 }
 
-/// Parse a .crn file and resolve resource references
+/// Parse a .crn file and resolve resource references.
+///
+/// `finalize_provider_configs` is called at the end so deferred
+/// `default_tags` (etc.) values are promoted into their typed fields.
+/// This works for single-string inputs without `module_call` expansion.
+/// Directory-scoped flows (`parse_directory_with_overrides`,
+/// `load_configuration_with_config`) finalize **after**
+/// `module_resolver::resolve_modules_with_config` so that virtual
+/// resources from module expansion are visible to the resolver pass.
 pub fn parse_and_resolve(input: &str) -> Result<ParsedFile, ParseError> {
     let mut parsed = parse(input, &ProviderContext::default())?;
     resolve_resource_refs(&mut parsed)?;
+    resolve_provider_unresolved_attributes(&mut parsed, &ProviderContext::default())?;
     finalize_provider_configs(&mut parsed)?;
     Ok(parsed)
 }

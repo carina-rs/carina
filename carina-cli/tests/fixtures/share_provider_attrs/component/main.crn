@@ -1,0 +1,2 @@
+# Empty component body. The acceptance test asserts on the resolved
+# `default_tags` produced from `providers.crn` + `modules/standard-tags`.

@@ -31,7 +31,8 @@ pub(crate) use functions::evaluate_user_function;
 pub use functions::{provider_context_lookup, validate_custom_type};
 pub use resolve::{
     check_identifier_scope, collect_known_bindings_merged, finalize_provider_configs,
-    resolve_resource_refs, resolve_resource_refs_with_config,
+    resolve_provider_unresolved_attributes, resolve_resource_refs,
+    resolve_resource_refs_with_config,
 };
 pub use types::parse_type_expr_str;
 pub(crate) use util::{eval_type_name, value_type_name};

@@ -1,0 +1,14 @@
+arguments {
+  environment: String
+  component:   String
+}
+
+attributes {
+  tags: map(String) = {
+    ManagedBy   = 'carina'
+    Project     = 'carina-rs'
+    Repository  = 'carina-rs/infra'
+    Environment = environment
+    Component   = component
+  }
+}
