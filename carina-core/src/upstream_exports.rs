@@ -1636,7 +1636,8 @@ mod tests {
             "#,
         );
         let exports = mk_exports(&[("orgs", &["accounts"])]);
-        assert!(check_upstream_state_field_references(&parsed, &exports).is_empty());
+        let errs = check_upstream_state_field_references(&parsed, &exports);
+        assert!(errs.is_empty(), "got: {errs:?}");
     }
 
     #[test]

@@ -139,6 +139,10 @@ fn register_argument_binding(ctx: &mut ParseContext, name: &str) {
     ctx.set_variable(name.to_string(), placeholder_ref);
     let placeholder = Resource::new("_argument", name);
     ctx.set_resource_binding(name.to_string(), placeholder);
+    // The local declaration is the real one for this file; drop the
+    // seed mark (if any) so a later real duplicate (`let <name> = ...`
+    // in the same file) is still flagged. #2817.
+    ctx.unmark_seeded(name);
 }
 
 /// Parse attributes block

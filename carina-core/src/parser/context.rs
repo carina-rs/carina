@@ -40,6 +40,12 @@ pub(crate) struct ParseContext<'cfg> {
     pub(super) warnings: Vec<ParseWarning>,
     /// Deferred for-expressions collected during parsing
     pub(super) deferred_for_expressions: Vec<DeferredForExpression>,
+    /// Names pre-registered via the directory-aware seed pass
+    /// (`parse_with_seeded_bindings`). Excluded from local duplicate-
+    /// binding checks, so a `let role = ...` in this file does not
+    /// collide with the seed installed because the same name is
+    /// declared in a sibling `.crn`. See #2817.
+    pub(super) seeded_bindings: HashSet<String>,
 }
 
 impl<'cfg> ParseContext<'cfg> {
@@ -55,7 +61,25 @@ impl<'cfg> ParseContext<'cfg> {
             upstream_states: HashMap::new(),
             warnings: Vec::new(),
             deferred_for_expressions: Vec::new(),
+            seeded_bindings: HashSet::new(),
         }
+    }
+
+    /// True if `name` was pre-registered via the directory-aware seed
+    /// pass and not yet shadowed by a local declaration. Used by entry
+    /// points that perform duplicate-binding checks (`let`, `arguments`)
+    /// to allow a local declaration to overwrite the seeded placeholder
+    /// without falsely flagging a duplicate. See #2817.
+    pub(in crate::parser) fn is_seeded_binding(&self, name: &str) -> bool {
+        self.seeded_bindings.contains(name)
+    }
+
+    /// Drop `name` from the seeded set. Called as soon as a local
+    /// declaration overwrites the seeded placeholder, so subsequent
+    /// `let foo = ...` redeclarations within the same file *are* still
+    /// flagged as duplicates.
+    pub(in crate::parser) fn unmark_seeded(&mut self, name: &str) {
+        self.seeded_bindings.remove(name);
     }
 
     pub(super) fn set_variable(&mut self, name: String, value: impl Into<EvalValue>) {
