@@ -339,7 +339,7 @@ impl CompletionProvider {
     /// parsed `ParsedFile`. Returns `None` if the import path can't be
     /// found, the call lacks a `base_path`, or the module fails to
     /// parse.
-    fn load_called_module(
+    pub(super) fn load_called_module(
         &self,
         module_name: &str,
         text: &str,

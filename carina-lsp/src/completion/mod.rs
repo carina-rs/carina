@@ -566,7 +566,7 @@ impl CompletionProvider {
 
     /// Extract resource type from a line like "aws.ec2.Vpc {" or "let x = aws.ec2.Vpc {"
     /// Returns the resource type (e.g., "aws.ec2.Vpc") for schema lookups
-    fn extract_resource_type(&self, line: &str) -> Option<String> {
+    pub(super) fn extract_resource_type(&self, line: &str) -> Option<String> {
         let trimmed = line.trim();
 
         // Match against schema keys (sorted longest first for correct matching)
@@ -870,7 +870,7 @@ fn is_let_upstream_state_line(trimmed: &str) -> bool {
 /// whitespace). Anything else — provider-prefixed paths, `read`, dotted
 /// expressions, function calls — is rejected so callers can rely on this
 /// only matching the module-call shape.
-fn extract_let_module_call_name(trimmed: &str) -> Option<String> {
+pub(super) fn extract_let_module_call_name(trimmed: &str) -> Option<String> {
     let (_, rhs) = crate::let_parse::parse_let_header(trimmed)?;
     let rhs = rhs.trim_end_matches('{').trim_end();
     if rhs.is_empty() {

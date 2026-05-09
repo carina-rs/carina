@@ -1003,26 +1003,68 @@ impl CompletionProvider {
         let mut items: Vec<CompletionItem> = Vec::new();
         let mut src_buf = String::new();
         let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
-        for (binding_name, resource_type) in self.extract_resource_bindings(src) {
-            if resource_type.is_empty() {
+
+        // Walk every `let` binding once; classify each by RHS shape so
+        // resource bindings (provider-schema-driven) and module-call
+        // bindings (export-driven) both contribute candidates. Without
+        // the module-call path the consumer of e.g. a `bootstrap`
+        // usecase wouldn't see `bootstrap.<exported_name>` after `=`.
+        for (binding_name, rhs) in Self::extract_let_bindings(src) {
+            // Resource binding: schema-driven, every attr considered.
+            if let Some(resource_type) = self.extract_resource_type(&rhs)
+                && let Some(schema) = self.lookup_schema(&resource_type)
+            {
+                for attr in schema.attributes.values() {
+                    if !attr.attr_type.is_assignable_to(target) {
+                        continue;
+                    }
+                    let full_ref = format!("{}.{}", binding_name, attr.name);
+                    items.push(CompletionItem {
+                        label: full_ref.clone(),
+                        kind: Some(CompletionItemKind::REFERENCE),
+                        detail: Some(format!(
+                            "Reference to {}'s {} ({})",
+                            binding_name,
+                            attr.name,
+                            attr.attr_type.type_name()
+                        )),
+                        insert_text: Some(full_ref),
+                        ..Default::default()
+                    });
+                }
                 continue;
             }
-            let Some(schema) = self.lookup_schema(&resource_type) else {
+            // Module-call binding: walk the called module's
+            // `export_params` and surface each typed export whose
+            // declared `TypeExpr` is compatible with `target`. This is
+            // the path the issue body's `bootstrap.oidc_provider_arn`
+            // shape goes through (#2621).
+            let header = format!(
+                "let {} = {} {{",
+                binding_name,
+                rhs.trim_end_matches('{').trim()
+            );
+            let Some(module_name) = super::extract_let_module_call_name(header.trim()) else {
                 continue;
             };
-            for attr in schema.attributes.values() {
-                if !attr.attr_type.is_assignable_to(target) {
+            let Some(parsed) = self.load_called_module(&module_name, text, base_path) else {
+                continue;
+            };
+            for export in &parsed.export_params {
+                let Some(ref export_ty) = export.type_expr else {
+                    continue;
+                };
+                if !carina_core::validation::is_type_expr_compatible_with_schema(export_ty, target)
+                {
                     continue;
                 }
-                let full_ref = format!("{}.{}", binding_name, attr.name);
+                let full_ref = format!("{}.{}", binding_name, export.name);
                 items.push(CompletionItem {
                     label: full_ref.clone(),
                     kind: Some(CompletionItemKind::REFERENCE),
                     detail: Some(format!(
-                        "Reference to {}'s {} ({})",
-                        binding_name,
-                        attr.name,
-                        attr.attr_type.type_name()
+                        "Reference to {}'s exported {} ({})",
+                        binding_name, export.name, export_ty,
                     )),
                     insert_text: Some(full_ref),
                     ..Default::default()

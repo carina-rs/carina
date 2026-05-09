@@ -2128,6 +2128,74 @@ let t = toggle {
     );
 }
 
+/// Issue #2621: at the value position of a module-call argument the
+/// LSP must offer `<binding>.<exported_name>` candidates for any
+/// in-scope module-call binding whose `exports {}` declared a type
+/// assignable to the cursor's target type. This is the issue body's
+/// `bootstrap.oidc_provider_arn` shape, the common case for a
+/// `usecase` consumed by a downstream component.
+#[test]
+fn module_call_value_completion_offers_module_binding_export_ref() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let provider = test_provider();
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let base_path = temp_dir.path();
+
+    // Producer module: bootstrap exports an `oidc_provider_arn` of
+    // type `IamOidcProviderArn`.
+    let bootstrap_dir = base_path.join("usecases").join("bootstrap");
+    fs::create_dir_all(&bootstrap_dir).expect("Failed to create bootstrap dir");
+    // Bootstrap publishes the OIDC provider ARN. The export needs an
+    // assignable value at parse time (#2360 inference); a synthetic
+    // resource binding that "produces" the right type is the cheapest
+    // way to keep this fixture self-contained.
+    fs::write(
+        bootstrap_dir.join("main.crn"),
+        "arguments {\n  oidc_provider_arn: IamOidcProviderArn\n}\n\nexports {\n  oidc_provider_arn: IamOidcProviderArn = oidc_provider_arn\n}\n",
+    )
+    .expect("Failed to write bootstrap exports");
+
+    // Consumer module: receives an `IamOidcProviderArn` argument.
+    let deploy_dir = base_path.join("usecases").join("registry-deploy");
+    fs::create_dir_all(&deploy_dir).expect("Failed to create deploy dir");
+    fs::write(
+        deploy_dir.join("main.crn"),
+        "arguments {\n  oidc_provider_arn: IamOidcProviderArn\n}\n",
+    )
+    .expect("Failed to write deploy module");
+
+    // Caller: instantiates both, with the cursor at the value position
+    // for the deploy's `oidc_provider_arn` argument.
+    let main_content = r#"let bootstrap = use {
+  source = './usecases/bootstrap'
+}
+
+let registry_deploy = use {
+  source = './usecases/registry-deploy'
+}
+
+let bs = bootstrap {
+}
+
+let rd = registry_deploy {
+  oidc_provider_arn =
+}
+"#;
+    let doc = create_document(main_content);
+    let position = Position {
+        line: 12,
+        character: 22,
+    };
+    let completions = provider.complete(&doc, position, Some(base_path));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"bs.oidc_provider_arn"),
+        "expected `bs.oidc_provider_arn` binding-ref candidate, got: {labels:?}"
+    );
+}
+
 /// Issue #2621: a `String`-typed module-call argument routes through
 /// the shared value-completion entry point, so type-relevant built-in
 /// functions (`concat`, `join`, `lower`, `upper`, …) are offered even
