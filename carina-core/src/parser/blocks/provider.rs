@@ -38,11 +38,18 @@ pub(in crate::parser) fn parse_provider_block(
     }
 
     // `shift_remove` keeps the surviving attributes in source order.
-    // Extract default_tags from attributes if present
-    let default_tags = if let Some(Value::Map(tags)) = attributes.shift_remove("default_tags") {
-        tags
-    } else {
-        IndexMap::new()
+    // Extract default_tags from attributes if present. Non-literal values
+    // cannot be peeled at parse time — route them into `unresolved_attributes`
+    // for the post-resolver finalize step. Otherwise they would silently
+    // fall through to an empty map (#2717).
+    let mut unresolved_attributes: IndexMap<String, Value> = IndexMap::new();
+    let default_tags = match attributes.shift_remove("default_tags") {
+        Some(Value::Map(tags)) => tags,
+        Some(other) => {
+            unresolved_attributes.insert("default_tags".to_string(), other);
+            IndexMap::new()
+        }
+        None => IndexMap::new(),
     };
 
     // Extract source from attributes if present
@@ -91,7 +98,7 @@ pub(in crate::parser) fn parse_provider_block(
         source,
         version,
         revision,
-        unresolved_attributes: IndexMap::new(),
+        unresolved_attributes,
     })
 }
 
