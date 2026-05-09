@@ -74,12 +74,19 @@ fn parse_namespaced_id_value(
     }
 
     // Subscripts (`a.b['k']`, `a.b[0]`) unambiguously mean binding
-    // access — no enum shorthand uses `[...]`. So when the head is not
-    // yet known as a resource binding in this file, emit a structured
-    // `ResourceRef` anyway and let cross-file resolution / scope checks
-    // either confirm the binding (e.g. an `upstream_state` declared in
-    // a sibling `.crn`) or surface an undefined-identifier diagnostic
-    // post-merge. Issue #2435.
+    // access — no enum shorthand uses `[...]`. When the head is not a
+    // resource binding in this file, emit a structured `ResourceRef`
+    // and let `check_identifier_scope` flag genuine typos post-merge.
+    //
+    // Under the directory-aware parse pipeline (#2817), sibling-defined
+    // bindings are seeded into `ctx.resource_bindings` so the early
+    // return at the top of this function covers the cross-file case
+    // directly. This branch retained as a safety net for the truly-
+    // undefined identifier path (typos, mid-edit references in the LSP
+    // single-file fallback parses) — without it, an unknown subscripted
+    // ID would fall through to the enum-shorthand `Value::String`
+    // fallback below and silently mistype as a string. Originally added
+    // for #2435.
     if !subscripts.is_empty() {
         return Ok(as_resource_ref(subscripts));
     }
@@ -97,10 +104,16 @@ fn parse_namespaced_id_value(
         });
     }
 
-    // Dotted IDs that aren't an enum shorthand are binding refs; the
-    // head may live in a sibling `.crn`, so emit a structured
-    // `ResourceRef` and let `check_identifier_scope` flag genuine typos
-    // post-merge. Symmetric with the subscript fallback above. #2447.
+    // Dotted IDs that aren't an enum shorthand are binding refs; emit
+    // a structured `ResourceRef` and let `check_identifier_scope` flag
+    // genuine typos post-merge.
+    //
+    // Symmetric with the subscript fallback above, and with the same
+    // post-#2817 status: the directory-aware parse pipeline seeds every
+    // sibling-defined binding into `ctx.resource_bindings`, so the
+    // cross-file case is covered by the top-of-function early return.
+    // Branch retained as a safety net for typos and LSP single-file
+    // fallback parses. Originally added for #2447.
     if crate::utils::NamespacedId::parse(full_str).is_none() {
         return Ok(as_resource_ref(Vec::new()));
     }

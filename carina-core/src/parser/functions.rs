@@ -601,6 +601,13 @@ fn try_evaluate_fn_value(value: Value, ctx: &ParseContext) -> Result<Value, Pars
                         // names are caught at the post-merge resolver
                         // pass (`resolve_value_with_config`), which has
                         // the full directory's `user_functions`.
+                        //
+                        // The directory-aware parse pipeline (#2817)
+                        // does not seed `user_functions` into the
+                        // per-file `ctx` — only `variables` and
+                        // `resource_bindings` are seeded — so this
+                        // defer path remains the route by which a
+                        // sibling-defined user fn becomes resolvable.
                         Ok(Value::FunctionCall {
                             name: name.clone(),
                             args: evaluated_args,
