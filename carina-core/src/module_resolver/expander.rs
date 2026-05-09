@@ -196,7 +196,16 @@ impl ModuleResolver<'_> {
             for (key, expr) in &new_resource.attributes {
                 let rewritten =
                     rewrite_intra_module_refs(expr, instance_prefix, &intra_module_bindings);
-                let substituted = substitute_arguments(&rewritten, &argument_values);
+                let mut substituted = substitute_arguments(&rewritten, &argument_values);
+                // After substitution, an `Interpolation` whose `${...}`
+                // parts collapsed to literal scalars must canonicalize
+                // back to a flat `String`. Without this, `role_name =
+                // "test-role-${env}"` keeps a single-arg `Interpolation`
+                // with `Expr(String("dev"))` instead of `String("test-role-dev")`,
+                // and downstream consumers that match on `Value::String`
+                // (state diff, plan rendering) miss the resolved value.
+                // Symmetric with the default-evaluation path above. #2815.
+                substituted.canonicalize_in_place();
                 substituted_attrs.insert(key.clone(), substituted);
             }
             new_resource.attributes = substituted_attrs;
@@ -216,7 +225,12 @@ impl ModuleResolver<'_> {
                     // Rewrite intra-module refs and substitute arguments
                     let rewritten =
                         rewrite_intra_module_refs(value, instance_prefix, &intra_module_bindings);
-                    let substituted = substitute_arguments(&rewritten, &argument_values);
+                    let mut substituted = substitute_arguments(&rewritten, &argument_values);
+                    // Same post-substitution canonicalize as the resource
+                    // attribute path above — collapse `Interpolation`
+                    // whose `${arg}` slots resolved to scalars back to a
+                    // flat `String`. #2815.
+                    substituted.canonicalize_in_place();
                     virtual_attrs.insert(attr_param.name.clone(), substituted);
                 }
             }

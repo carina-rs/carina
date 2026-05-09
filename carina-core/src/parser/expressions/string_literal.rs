@@ -71,7 +71,7 @@ pub(crate) fn parse_string_value(
                     // — the LSP surfaces it as a diagnostic; downstream
                     // resolvers carry it as an unresolved value. See #2480.
                     let value = match inner.into_inner().next() {
-                        Some(expr_pair) => parse_expression(expr_pair, ctx)?,
+                        Some(expr_pair) => parse_interpolation_expr(expr_pair, ctx)?,
                         None => Value::Unknown(UnknownReason::EmptyInterpolation),
                     };
                     parts.push(InterpolationPart::Expr(value));
@@ -101,6 +101,66 @@ pub(crate) fn parse_string_value(
             .collect::<String>();
         Ok(Value::String(s))
     }
+}
+
+/// Parse the expression inside `${ ... }`. Mostly a thin wrapper around
+/// [`parse_expression`], with one carve-out: a bare identifier with no
+/// field/index access whose name is not bound in this file lowers to a
+/// `ResourceRef` placeholder rather than a `Value::String` literal.
+///
+/// `parse_expression` keeps the legacy "unknown bare identifier becomes
+/// `Value::String`" fallback because outside interpolation it covers
+/// schema enum shorthand (e.g. `instance_tenancy = dedicated`). Inside
+/// `${...}` an enum shorthand makes no sense, so the same fallback turns
+/// `${env}` into a literal `"env"` and module argument substitution
+/// downstream sees nothing to substitute. The placeholder shape lets
+/// `module_resolver::expander::substitute_arguments` and
+/// `parser::resolve_resource_refs_with_config` find and rewrite the
+/// reference at the directory aggregate, so an `arguments {}` block in
+/// `main.crn` is visible from sibling `.crn` files (#2815).
+fn parse_interpolation_expr(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+) -> Result<Value, ParseError> {
+    if let Some(name) = bare_variable_ref_name(&pair)
+        && ctx.get_variable(&name).is_none()
+    {
+        return Ok(Value::resource_ref(name, String::new(), vec![]));
+    }
+    parse_expression(pair, ctx)
+}
+
+/// If `pair` is an `expression` whose only payload is a bare
+/// `variable_ref` (no field or index access), return the identifier
+/// name. Otherwise return `None`. Used by the interpolation parser to
+/// decide whether the unbound-identifier fallback should be a
+/// `ResourceRef` placeholder instead of a `Value::String` literal.
+fn bare_variable_ref_name(pair: &pest::iterators::Pair<Rule>) -> Option<String> {
+    fn descend(pair: pest::iterators::Pair<Rule>) -> Option<String> {
+        match pair.as_rule() {
+            Rule::variable_ref => {
+                let mut inner = pair.into_inner();
+                let ident = inner.next()?;
+                if ident.as_rule() != Rule::identifier {
+                    return None;
+                }
+                let name = ident.as_str().to_string();
+                if inner.next().is_some() {
+                    return None;
+                }
+                Some(name)
+            }
+            _ => {
+                let mut iter = pair.into_inner();
+                let only = iter.next()?;
+                if iter.next().is_some() {
+                    return None;
+                }
+                descend(only)
+            }
+        }
+    }
+    descend(pair.clone())
 }
 
 /// Handle escape sequences in string literals

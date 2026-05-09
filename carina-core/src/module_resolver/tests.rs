@@ -1242,8 +1242,6 @@ fn create_module_with_interpolation() -> ParsedFile {
 
 #[test]
 fn test_expand_module_call_with_interpolation() {
-    use crate::resource::InterpolationPart;
-
     let resolver = {
         let mut r = ModuleResolver::new(".");
         r.imported_modules
@@ -1277,13 +1275,14 @@ fn test_expand_module_call_with_interpolation() {
     );
     assert_eq!(vpc.get_attr("env"), Some(&Value::String("dev".to_string())));
 
-    // Interpolation with argument should have the argument value substituted
+    // Interpolation with argument substitutes and canonicalizes back to
+    // a flat `String` so downstream `Value::String` consumers (state
+    // diff, plan rendering) see the resolved value. Without the post-
+    // substitution canonicalize, this would stay as
+    // `Interpolation([Literal("test-"), Expr(String("dev"))])` (#2815).
     assert_eq!(
         vpc.get_attr("name"),
-        Some(&Value::Interpolation(vec![
-            InterpolationPart::Literal("test-".to_string()),
-            InterpolationPart::Expr(Value::String("dev".to_string())),
-        ]))
+        Some(&Value::String("test-dev".to_string())),
     );
 }
 
@@ -3375,5 +3374,61 @@ fn caller_side_value_in_string_literal_union_is_accepted() {
         result.is_ok(),
         "Caller passing 'prod' (in the declared union) must be accepted. Got: {:?}",
         result
+    );
+}
+
+/// Regression for #2815: an `arguments {}` block declared in `main.crn`
+/// must be visible to identifier references in *sibling* `.crn` files in
+/// the same module directory. Before the fix, the argument name was only
+/// registered in the per-file `ParseContext`, so `${env}` in `role.crn`
+/// degraded to a literal `Value::String("env")` — `role_name` rendered as
+/// `"test-role-env"` instead of `"test-role-dev"`.
+#[test]
+fn test_arguments_visible_to_sibling_crn_files() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let module_dir = tmp.path().join("modules/usecase");
+    fs::create_dir_all(&module_dir).unwrap();
+    fs::write(
+        module_dir.join("main.crn"),
+        r#"
+arguments {
+  env: String
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        module_dir.join("role.crn"),
+        r#"
+let role = awscc.iam.Role {
+  role_name = "test-role-${env}"
+  assume_role_policy_document = {}
+}
+"#,
+    )
+    .unwrap();
+
+    let root_dir = tmp.path().join("root");
+    fs::create_dir_all(&root_dir).unwrap();
+    fs::write(
+        root_dir.join("main.crn"),
+        r#"
+let uc = use { source = '../modules/usecase' }
+let r  = uc { env = 'dev' }
+"#,
+    )
+    .unwrap();
+
+    let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
+    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    resolve_modules(&mut parsed, &root_dir).expect("resolve_modules should succeed");
+
+    assert_eq!(
+        role_names(&parsed),
+        ["test-role-dev".to_string()]
+            .into_iter()
+            .collect::<HashSet<_>>(),
+        "argument `env` declared in `main.crn` must substitute into `${{env}}` \
+         interpolation in sibling `role.crn`",
     );
 }
