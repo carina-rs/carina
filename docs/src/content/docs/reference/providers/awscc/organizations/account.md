@@ -53,32 +53,32 @@ A list of tags that you want to attach to the newly created account. For each ta
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `INVITED` | `awscc.organizations.Account.JoinedMethod.INVITED` |
-| `CREATED` | `awscc.organizations.Account.JoinedMethod.CREATED` |
+| `INVITED` | `awscc.organizations.Account.JoinedMethod.invited` |
+| `CREATED` | `awscc.organizations.Account.JoinedMethod.created` |
 
-Shorthand formats: `INVITED` or `JoinedMethod.INVITED`
+Shorthand formats: `invited` or `JoinedMethod.invited`
 
 ### state (State)
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `PENDING_ACTIVATION` | `awscc.organizations.Account.State.PENDING_ACTIVATION` |
-| `ACTIVE` | `awscc.organizations.Account.State.ACTIVE` |
-| `SUSPENDED` | `awscc.organizations.Account.State.SUSPENDED` |
-| `PENDING_CLOSURE` | `awscc.organizations.Account.State.PENDING_CLOSURE` |
-| `CLOSED` | `awscc.organizations.Account.State.CLOSED` |
+| `PENDING_ACTIVATION` | `awscc.organizations.Account.State.pending_activation` |
+| `ACTIVE` | `awscc.organizations.Account.State.active` |
+| `SUSPENDED` | `awscc.organizations.Account.State.suspended` |
+| `PENDING_CLOSURE` | `awscc.organizations.Account.State.pending_closure` |
+| `CLOSED` | `awscc.organizations.Account.State.closed` |
 
-Shorthand formats: `PENDING_ACTIVATION` or `State.PENDING_ACTIVATION`
+Shorthand formats: `pending_activation` or `State.pending_activation`
 
 ### status (Status)
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ACTIVE` | `awscc.organizations.Account.Status.ACTIVE` |
-| `SUSPENDED` | `awscc.organizations.Account.Status.SUSPENDED` |
-| `PENDING_CLOSURE` | `awscc.organizations.Account.Status.PENDING_CLOSURE` |
+| `ACTIVE` | `awscc.organizations.Account.Status.active` |
+| `SUSPENDED` | `awscc.organizations.Account.Status.suspended` |
+| `PENDING_CLOSURE` | `awscc.organizations.Account.Status.pending_closure` |
 
-Shorthand formats: `ACTIVE` or `Status.ACTIVE`
+Shorthand formats: `active` or `Status.active`
 
 ## Attribute Reference
 

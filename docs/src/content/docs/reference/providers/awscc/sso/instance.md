@@ -28,11 +28,11 @@ The name you want to assign to this Identity Center (SSO) Instance
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `CREATE_IN_PROGRESS` | `awscc.sso.Instance.Status.CREATE_IN_PROGRESS` |
-| `DELETE_IN_PROGRESS` | `awscc.sso.Instance.Status.DELETE_IN_PROGRESS` |
-| `ACTIVE` | `awscc.sso.Instance.Status.ACTIVE` |
+| `CREATE_IN_PROGRESS` | `awscc.sso.Instance.Status.create_in_progress` |
+| `DELETE_IN_PROGRESS` | `awscc.sso.Instance.Status.delete_in_progress` |
+| `ACTIVE` | `awscc.sso.Instance.Status.active` |
 
-Shorthand formats: `CREATE_IN_PROGRESS` or `Status.CREATE_IN_PROGRESS`
+Shorthand formats: `create_in_progress` or `Status.create_in_progress`
 
 ## Attribute Reference
 

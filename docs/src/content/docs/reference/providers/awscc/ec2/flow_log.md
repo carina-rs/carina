@@ -17,8 +17,8 @@ let vpc = awscc.ec2.Vpc {
 
 awscc.ec2.FlowLog {
   resource_id          = vpc.vpc_id
-  resource_type        = VPC
-  traffic_type         = ALL
+  resource_type        = vpc
+  traffic_type         = all
   log_destination_type = s3
   log_destination      = 'arn:aws:s3:::example-flow-logs-bucket'
 
@@ -148,24 +148,24 @@ Shorthand formats: `cloud_watch_logs` or `LogDestinationType.cloud_watch_logs`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `NetworkInterface` | `awscc.ec2.FlowLog.ResourceType.NetworkInterface` |
-| `Subnet` | `awscc.ec2.FlowLog.ResourceType.Subnet` |
-| `VPC` | `awscc.ec2.FlowLog.ResourceType.VPC` |
-| `TransitGateway` | `awscc.ec2.FlowLog.ResourceType.TransitGateway` |
-| `TransitGatewayAttachment` | `awscc.ec2.FlowLog.ResourceType.TransitGatewayAttachment` |
-| `RegionalNatGateway` | `awscc.ec2.FlowLog.ResourceType.RegionalNatGateway` |
+| `NetworkInterface` | `awscc.ec2.FlowLog.ResourceType.network_interface` |
+| `Subnet` | `awscc.ec2.FlowLog.ResourceType.subnet` |
+| `VPC` | `awscc.ec2.FlowLog.ResourceType.vpc` |
+| `TransitGateway` | `awscc.ec2.FlowLog.ResourceType.transit_gateway` |
+| `TransitGatewayAttachment` | `awscc.ec2.FlowLog.ResourceType.transit_gateway_attachment` |
+| `RegionalNatGateway` | `awscc.ec2.FlowLog.ResourceType.regional_nat_gateway` |
 
-Shorthand formats: `NetworkInterface` or `ResourceType.NetworkInterface`
+Shorthand formats: `network_interface` or `ResourceType.network_interface`
 
 ### traffic_type (TrafficType)
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ACCEPT` | `awscc.ec2.FlowLog.TrafficType.ACCEPT` |
-| `ALL` | `awscc.ec2.FlowLog.TrafficType.ALL` |
-| `REJECT` | `awscc.ec2.FlowLog.TrafficType.REJECT` |
+| `ACCEPT` | `awscc.ec2.FlowLog.TrafficType.accept` |
+| `ALL` | `awscc.ec2.FlowLog.TrafficType.all` |
+| `REJECT` | `awscc.ec2.FlowLog.TrafficType.reject` |
 
-Shorthand formats: `ACCEPT` or `TrafficType.ACCEPT`
+Shorthand formats: `accept` or `TrafficType.accept`
 
 ## Struct Definitions
 

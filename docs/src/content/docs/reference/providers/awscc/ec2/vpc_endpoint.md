@@ -43,7 +43,7 @@ awscc.ec2.SecurityGroupIngress {
 awscc.ec2.VpcEndpoint {
   vpc_id              = vpc.vpc_id
   service_name        = 'com.amazonaws.ap-northeast-1.ecr.dkr'
-  vpc_endpoint_type   = 'Interface'
+  vpc_endpoint_type   = interface
   subnet_ids          = [subnet.subnet_id]
   security_group_ids  = [sg.group_id]
   private_dns_enabled = true
@@ -174,22 +174,22 @@ Shorthand formats: `ipv4` or `DnsRecordIpType.ipv4`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `OnlyInboundResolver` | `awscc.ec2.VpcEndpoint.PrivateDnsOnlyForInboundResolverEndpoint.OnlyInboundResolver` |
-| `AllResolvers` | `awscc.ec2.VpcEndpoint.PrivateDnsOnlyForInboundResolverEndpoint.AllResolvers` |
-| `NotSpecified` | `awscc.ec2.VpcEndpoint.PrivateDnsOnlyForInboundResolverEndpoint.NotSpecified` |
+| `OnlyInboundResolver` | `awscc.ec2.VpcEndpoint.PrivateDnsOnlyForInboundResolverEndpoint.only_inbound_resolver` |
+| `AllResolvers` | `awscc.ec2.VpcEndpoint.PrivateDnsOnlyForInboundResolverEndpoint.all_resolvers` |
+| `NotSpecified` | `awscc.ec2.VpcEndpoint.PrivateDnsOnlyForInboundResolverEndpoint.not_specified` |
 
-Shorthand formats: `OnlyInboundResolver` or `PrivateDnsOnlyForInboundResolverEndpoint.OnlyInboundResolver`
+Shorthand formats: `only_inbound_resolver` or `PrivateDnsOnlyForInboundResolverEndpoint.only_inbound_resolver`
 
 ### private_dns_preference (PrivateDnsPreference)
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `VERIFIED_DOMAINS_ONLY` | `awscc.ec2.VpcEndpoint.PrivateDnsPreference.VERIFIED_DOMAINS_ONLY` |
-| `ALL_DOMAINS` | `awscc.ec2.VpcEndpoint.PrivateDnsPreference.ALL_DOMAINS` |
-| `VERIFIED_DOMAINS_AND_SPECIFIED_DOMAINS` | `awscc.ec2.VpcEndpoint.PrivateDnsPreference.VERIFIED_DOMAINS_AND_SPECIFIED_DOMAINS` |
-| `SPECIFIED_DOMAINS_ONLY` | `awscc.ec2.VpcEndpoint.PrivateDnsPreference.SPECIFIED_DOMAINS_ONLY` |
+| `VERIFIED_DOMAINS_ONLY` | `awscc.ec2.VpcEndpoint.PrivateDnsPreference.verified_domains_only` |
+| `ALL_DOMAINS` | `awscc.ec2.VpcEndpoint.PrivateDnsPreference.all_domains` |
+| `VERIFIED_DOMAINS_AND_SPECIFIED_DOMAINS` | `awscc.ec2.VpcEndpoint.PrivateDnsPreference.verified_domains_and_specified_domains` |
+| `SPECIFIED_DOMAINS_ONLY` | `awscc.ec2.VpcEndpoint.PrivateDnsPreference.specified_domains_only` |
 
-Shorthand formats: `VERIFIED_DOMAINS_ONLY` or `PrivateDnsPreference.VERIFIED_DOMAINS_ONLY`
+Shorthand formats: `verified_domains_only` or `PrivateDnsPreference.verified_domains_only`
 
 ### ip_address_type (IpAddressType)
 
@@ -206,13 +206,13 @@ Shorthand formats: `ipv4` or `IpAddressType.ipv4`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `Interface` | `awscc.ec2.VpcEndpoint.VpcEndpointType.Interface` |
-| `Gateway` | `awscc.ec2.VpcEndpoint.VpcEndpointType.Gateway` |
-| `GatewayLoadBalancer` | `awscc.ec2.VpcEndpoint.VpcEndpointType.GatewayLoadBalancer` |
-| `ServiceNetwork` | `awscc.ec2.VpcEndpoint.VpcEndpointType.ServiceNetwork` |
-| `Resource` | `awscc.ec2.VpcEndpoint.VpcEndpointType.Resource` |
+| `Interface` | `awscc.ec2.VpcEndpoint.VpcEndpointType.interface` |
+| `Gateway` | `awscc.ec2.VpcEndpoint.VpcEndpointType.gateway` |
+| `GatewayLoadBalancer` | `awscc.ec2.VpcEndpoint.VpcEndpointType.gateway_load_balancer` |
+| `ServiceNetwork` | `awscc.ec2.VpcEndpoint.VpcEndpointType.service_network` |
+| `Resource` | `awscc.ec2.VpcEndpoint.VpcEndpointType.resource` |
 
-Shorthand formats: `Interface` or `VpcEndpointType.Interface`
+Shorthand formats: `interface` or `VpcEndpointType.interface`
 
 ## Struct Definitions
 
