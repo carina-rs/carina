@@ -425,9 +425,12 @@ impl CompletionProvider {
         if !literal_items.is_empty() {
             return literal_items;
         }
-        // Type-driven fast path: lift to AttributeType and delegate.
+        // Type-driven path: lift to AttributeType and delegate to the
+        // shared value-completion entry point so module-call values
+        // get the same coverage as `exports {}` values (built-ins,
+        // binding refs, and structural type candidates).
         if let Some(attr_type) = type_expr_to_attribute_type(&arg.type_expr) {
-            return self.completions_for_type(&attr_type, None);
+            return self.value_completions_for_attribute_type(&attr_type, text, base_path);
         }
         Vec::new()
     }

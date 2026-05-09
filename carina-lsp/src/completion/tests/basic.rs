@@ -2128,6 +2128,50 @@ let t = toggle {
     );
 }
 
+/// Issue #2621: a `String`-typed module-call argument routes through
+/// the shared value-completion entry point, so type-relevant built-in
+/// functions (`concat`, `join`, `lower`, `upper`, …) are offered even
+/// though `String` carries no specific values of its own.
+#[test]
+fn module_call_value_completion_string_offers_string_builtins() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let provider = test_provider();
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let base_path = temp_dir.path();
+
+    let module_dir = base_path.join("modules").join("notes");
+    fs::create_dir_all(&module_dir).expect("Failed to create module dir");
+    fs::write(
+        module_dir.join("main.crn"),
+        "arguments {\n  note: String\n}\n",
+    )
+    .expect("Failed to write module");
+
+    let main_content = r#"let notes = use {
+  source = './modules/notes'
+}
+
+let n = notes {
+  note =
+}
+"#;
+    let doc = create_document(main_content);
+    let position = Position {
+        line: 5,
+        character: 9,
+    };
+    let completions = provider.complete(&doc, position, Some(base_path));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    for expected in &["join", "lower", "upper", "trim"] {
+        assert!(
+            labels.contains(expected),
+            "expected `{expected}` builtin candidate for String arg, got: {labels:?}"
+        );
+    }
+}
+
 /// Issue #2621: negative paths must fall silent. A typo'd module name,
 /// typo'd argument name, or argument with a non-enumerable type
 /// produces no candidates instead of dumping built-in functions like
@@ -2175,7 +2219,9 @@ let rd = registry_deploy {
         "typo'd arg should fall silent, not dump built-ins; got: {labels:?}"
     );
 
-    // (b) Non-enumerable type (`String`) → no candidates.
+    // (b) `String`-typed arg → no specific values, but type-relevant
+    // built-in functions (e.g. `join`, `lower`, `upper`, `trim`) are
+    // surfaced via the shared value-completion entry point.
     let main_string_arg = r#"let registry_deploy = use {
   source = './usecases/registry-deploy'
 }
@@ -2195,9 +2241,7 @@ let rd = registry_deploy {
     );
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
-        !labels
-            .iter()
-            .any(|l| l.starts_with("cidr_") || *l == "concat"),
-        "String-typed arg should fall silent (no enumerable candidates), got: {labels:?}"
+        labels.contains(&"join"),
+        "String-typed arg should offer string-returning built-ins like `join`, got: {labels:?}"
     );
 }

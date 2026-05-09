@@ -953,8 +953,39 @@ impl CompletionProvider {
             annotation
         };
 
-        let mut items = Self::builtin_function_completions_for_type(&effective);
-        items.extend(self.resource_ref_completions_for_type(&effective, text, base_path));
+        self.value_completions_for_attribute_type(&effective, text, base_path)
+    }
+
+    /// Single entry point for "given a value-position attribute type,
+    /// what should we offer the user?" — shared by the `exports {}`
+    /// value position (#2043) and the module-call value position
+    /// (#2621).
+    ///
+    /// Three layers, all driven by the same `AttributeType`:
+    ///
+    /// 1. **Structural / type-driven candidates** —
+    ///    [`Self::completions_for_type`] knows that `Bool` →
+    ///    `true`/`false`, `Cidr` → CIDR snippets, `Arn` → an ARN
+    ///    template, `StringEnum` → the enum members, etc. Lifts unions
+    ///    and unwraps lists/maps recursively.
+    /// 2. **Built-in function calls** whose return type is assignable
+    ///    to the target — `concat`, `join`, `format!`, … filtered by
+    ///    [`Self::builtin_function_completions_for_type`].
+    /// 3. **Existing-binding references** (`<binding>.<field>`) whose
+    ///    leaf attribute is assignable to the target —
+    ///    [`Self::resource_ref_completions_for_type`].
+    ///
+    /// Adding new value-completion call sites should funnel through
+    /// here so the three layers stay in sync.
+    pub(super) fn value_completions_for_attribute_type(
+        &self,
+        attr_type: &AttributeType,
+        text: &str,
+        base_path: Option<&Path>,
+    ) -> Vec<CompletionItem> {
+        let mut items = self.completions_for_type(attr_type, None);
+        items.extend(Self::builtin_function_completions_for_type(attr_type));
+        items.extend(self.resource_ref_completions_for_type(attr_type, text, base_path));
         items
     }
 
