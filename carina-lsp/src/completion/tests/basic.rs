@@ -2039,14 +2039,16 @@ fn module_call_value_completion_with_sibling_use_decl() {
     );
 }
 
-/// Issue #2621: value-position completion for ARN-family semantic
-/// types (e.g. `IamOidcProviderArn`) must surface the generic ARN
-/// snippet. Lifts `TypeExpr::Simple("iam_oidc_provider_arn")` to
-/// `AttributeType::Custom { semantic_name: "IamOidcProviderArn", .. }`
-/// and reuses the schema-level dispatcher; the `*Arn` suffix
-/// heuristic in `completions_for_type` then routes to `arn_completions`.
+/// Issue #2621: a specific ARN-family semantic type
+/// (e.g. `IamOidcProviderArn`) must NOT surface the generic
+/// `arn:partition:service:region:account:resource` snippet — its
+/// shape is too loose to satisfy the type's constraints, and a
+/// properly-typed binding ref (offered separately via the
+/// `<binding>.<field>` path) is the right candidate. The generic
+/// snippet stays available for the bare `Arn` type. See #2621
+/// (post-#2621-mvp tightening).
 #[test]
-fn module_call_value_completion_arn_semantic_type() {
+fn module_call_value_completion_specific_arn_type_skips_generic_snippet() {
     use std::fs;
     use tempfile::tempdir;
 
@@ -2078,8 +2080,11 @@ let rd = registry_deploy {
     let completions = provider.complete(&doc, position, Some(base_path));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
-        labels.iter().any(|l| l.contains("arn:")),
-        "expected ARN snippet candidate for IamOidcProviderArn, got: {labels:?}"
+        !labels
+            .iter()
+            .any(|l| l.starts_with("'arn:") && l.contains("partition")),
+        "specific ARN types must not surface the generic ARN-snippet template, \
+         got: {labels:?}"
     );
 }
 

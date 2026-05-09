@@ -202,7 +202,24 @@ pub fn resolve_upstream_exports_with_schemas(
             continue;
         }
         match parse_directory(&source_abs, config) {
-            Ok(parsed) => {
+            Ok(mut parsed) => {
+                // Expand module calls before inference so that
+                // `attributes { ... }`-typed `Virtual` resources land in
+                // `parsed.resources` (#2493). Without this the inferer
+                // sees module-call bindings as known-but-non-inferable
+                // and any `exports` value referencing
+                // `<module_call_binding>.<attr>` (e.g.
+                // `oidc_provider_arn = bs.oidc_provider_arn` at
+                // `infra/registry/dev/bootstrap/exports.crn`) collapses
+                // to `Unknown` even when the type is fully derivable.
+                // `resolve_modules_with_config` is the same expansion
+                // pass `load_configuration` runs, so the inference reach
+                // here matches what the CLI sees post-expansion.
+                let _ = crate::module_resolver::resolve_modules_with_config(
+                    &mut parsed,
+                    &source_abs,
+                    config,
+                );
                 // When schemas are available, hoist the upstream parse
                 // through `apply_inference` so every export carries a
                 // bare `TypeExpr` (possibly the `Unknown` sentinel for
