@@ -382,8 +382,13 @@ pub async fn run_plan(
     if let Some(out_path) = out {
         let plan_file = build_plan_file(path, &parsed, &state_file, &ctx)
             .map_err(|e| format_plan_save_error(&e, "--out"))?;
-        let json_out = serde_json::to_string_pretty(&plan_file)
+        let mut json_out = serde_json::to_string_pretty(&plan_file)
             .map_err(|e| format!("Failed to serialize plan: {}", e))?;
+        // Match the trailing-newline convention used by
+        // carina-backend.lock, carina.state.json, and
+        // carina-providers.lock so POSIX tooling and "add final
+        // newline" editors agree on the file shape.
+        json_out.push('\n');
         fs::write(out_path, json_out).map_err(|e| format!("Failed to write plan file: {}", e))?;
 
         println!();
@@ -1196,6 +1201,50 @@ exports { region: String = "ap-northeast-1" }"#,
         assert_eq!(
             bindings["a"]["region"],
             Value::String("ap-northeast-1".to_string())
+        );
+    }
+}
+
+#[cfg(test)]
+mod run_plan_out_tests {
+    use super::*;
+    use std::fs;
+
+    // Pin the byte-level shape so plan files written by `plan --out`
+    // match the trailing-newline convention used by carina-backend.lock,
+    // carina.state.json, and carina-providers.lock (#2583).
+    #[tokio::test]
+    async fn run_plan_out_file_ends_with_trailing_newline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fs::write(
+            dir.join("main.crn"),
+            r#"exports { region: String = "ap-northeast-1" }"#,
+        )
+        .unwrap();
+
+        crate::commands::ensure_backend_lock(dir, None).unwrap();
+
+        let plan_path = dir.join("plan.json");
+        run_plan(
+            dir,
+            Some(&plan_path),
+            DetailLevel::None,
+            false,
+            false,
+            true,
+            false,
+            &ProviderContext::default(),
+        )
+        .await
+        .expect("run_plan should succeed");
+
+        let bytes = fs::read(&plan_path).expect("plan file written");
+        assert_eq!(
+            bytes.last().copied(),
+            Some(b'\n'),
+            "plan --out file must end with a trailing newline; got {:?}",
+            bytes.last().map(|b| *b as char),
         );
     }
 }
