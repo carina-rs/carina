@@ -12,7 +12,7 @@ pub(crate) use dsl_source::DslSource;
 use std::path::Path;
 use std::sync::Arc;
 
-use tower_lsp::lsp_types::{Command, CompletionItem, CompletionItemKind, Position};
+use tower_lsp::lsp_types::{Command, CompletionItem, CompletionItemKind, Position, Range};
 
 use crate::document::Document;
 use carina_core::schema::{
@@ -108,7 +108,13 @@ impl CompletionProvider {
         // suppresses completion entirely — the value-position path
         // declines once `after_eq` starts with a double quote.
         if let Some(partial) = detect_interpolation_bare_partial(&text, position) {
-            return self.in_scope_binding_completions(&text, position, &partial, base_path);
+            return self.in_scope_binding_completions(
+                &text,
+                base_path,
+                values::InScopeBindingMode::PartialReplace {
+                    range: range_for_partial(position, &partial),
+                },
+            );
         }
 
         let context = self.get_completion_context(&text, position);
@@ -151,7 +157,15 @@ impl CompletionProvider {
                 resource_type,
                 attr_path,
                 field_name,
-            } => self.value_completions_for_struct_field(&resource_type, &attr_path, &field_name),
+                current_binding,
+            } => self.value_completions_for_struct_field(
+                &resource_type,
+                &attr_path,
+                &field_name,
+                &text,
+                current_binding.as_deref(),
+                base_path,
+            ),
             CompletionContext::InsideProviderBlock { .. } => self.provider_block_completions(),
             CompletionContext::AfterProviderRegion { provider_name } => {
                 self.region_completions_for_provider(&provider_name)
@@ -163,9 +177,13 @@ impl CompletionProvider {
             CompletionContext::InsideUpstreamStateSource { partial_path } => {
                 self.upstream_state_source_completions(&partial_path, position, base_path)
             }
-            CompletionContext::ForIterable { partial } => {
-                self.in_scope_binding_completions(&text, position, &partial, base_path)
-            }
+            CompletionContext::ForIterable { partial } => self.in_scope_binding_completions(
+                &text,
+                base_path,
+                values::InScopeBindingMode::PartialReplace {
+                    range: range_for_partial(position, &partial),
+                },
+            ),
             CompletionContext::None => vec![],
         }
     }
@@ -437,6 +455,7 @@ impl CompletionProvider {
                         resource_type: resource_type.clone(),
                         attr_path: nested_block_names,
                         field_name,
+                        current_binding: current_binding.clone(),
                     };
                 }
             }
@@ -741,21 +760,34 @@ impl CompletionProvider {
         }
     }
 
-    /// Provide value completions for a specific struct field
+    /// Provide value completions for a specific struct field — both
+    /// type-driven candidates from the field's `AttributeType` and
+    /// in-scope identifiers (arguments, `let` bindings) reachable at
+    /// this cursor. The in-scope half closes #2624 — without it a
+    /// deeply-nested struct value position offered nothing beyond the
+    /// type's literal values.
     fn value_completions_for_struct_field(
         &self,
         resource_type: &str,
         attr_path: &[String],
         field_name: &str,
+        text: &str,
+        current_binding: Option<&str>,
+        base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {
+        let mut completions = Vec::new();
         if let Some(schema) = self.lookup_schema(resource_type)
             && let Some(fields) = self.resolve_struct_fields_for_path(schema, attr_path)
             && let Some(field) = fields.iter().find(|f| f.name == field_name)
         {
-            self.completions_for_type(&field.field_type, Some(resource_type))
-        } else {
-            vec![]
+            completions.extend(self.completions_for_type(&field.field_type, Some(resource_type)));
         }
+        completions.extend(self.in_scope_binding_completions(
+            text,
+            base_path,
+            values::InScopeBindingMode::ValuePosition { current_binding },
+        ));
+        completions
     }
 }
 
@@ -804,6 +836,10 @@ enum CompletionContext {
         resource_type: String,
         attr_path: Vec<String>,
         field_name: String,
+        /// Name of the enclosing `let <binding> = <resource> { ... }` if any.
+        /// Used to skip self-references when offering in-scope identifiers
+        /// at value position inside a nested struct body (#2624).
+        current_binding: Option<String>,
     },
     InsideProviderBlock {
         provider_name: String,
@@ -1105,6 +1141,19 @@ fn parse_trailing_dotted_segments(prefix: &str, n: usize) -> Option<Vec<&str>> {
 
 fn is_identifier(s: &str) -> bool {
     carina_core::utils::is_identifier_safe(s)
+}
+
+/// Range covering the trailing `partial` characters at `position` —
+/// what `text_edit` should replace when the editor accepts a candidate.
+fn range_for_partial(position: Position, partial: &str) -> Range {
+    let partial_chars = partial.chars().count() as u32;
+    Range {
+        start: Position {
+            line: position.line,
+            character: position.character.saturating_sub(partial_chars),
+        },
+        end: position,
+    }
 }
 
 /// Look up the `source = '...'` path for `binding` declared in any

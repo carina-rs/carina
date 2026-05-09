@@ -136,6 +136,7 @@ outer {
                 ref resource_type,
                 ref attr_path,
                 ref field_name,
+                ..
             } if resource_type == "test.nested.resource"
                 && attr_path == &["outer".to_string(), "inner".to_string()]
                 && field_name == "leaf_field"
@@ -3497,6 +3498,271 @@ aws.s3.BucketPolicy {
     assert!(
         labels.contains(&"orgs"),
         "expected `orgs` inside deeply-nested `${{o`, got: {:?}",
+        labels
+    );
+}
+
+// =====================================================================
+// Value-position in-scope identifier completion (#2624)
+//
+// Inside a value position — the right-hand side of `attr =` whether at
+// a top-level resource attribute or deep inside a nested struct block —
+// the LSP must offer arguments declared in `arguments {}`, `let`
+// bindings declared elsewhere in scope, and `<binding>.<export>`
+// references to `upstream_state` exports. The struct-nested case
+// previously yielded only type-driven candidates, so the user got no
+// help typing identifiers that were perfectly in scope.
+// =====================================================================
+
+#[test]
+fn nested_struct_value_position_offers_argument_parameters() {
+    // The repro from #2624: a `let` binding wraps a deeply-nested struct
+    // body and an `arguments { ... }` block declares parameters that
+    // should be reachable as bare identifiers inside the body.
+    let provider = test_provider_with_nested_structs();
+    let text = "\
+arguments {
+  oidc_provider_arn: String
+  environment: String
+}
+
+let role = test.nested.resource {
+  outer {
+    inner {
+      leaf_field =
+    }
+  }
+}
+";
+    let doc = create_document(text);
+    let position = Position {
+        line: 8,
+        character: "      leaf_field = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"oidc_provider_arn"),
+        "expected `oidc_provider_arn` (argument) at nested struct value position. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"environment"),
+        "expected `environment` (argument) at nested struct value position. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn nested_struct_value_position_offers_let_bindings() {
+    // Sibling `let` bindings in the same file should appear as
+    // candidates at a value position deep inside another resource's
+    // nested struct body. The current binding (`role`) itself is
+    // intentionally excluded because referencing it from inside its own
+    // body makes no sense.
+    let provider = test_provider_with_nested_structs();
+    let text = "\
+let helper = test.nested.resource {
+  outer {
+    inner {
+      leaf_field = \"hello\"
+    }
+  }
+}
+
+let role = test.nested.resource {
+  outer {
+    inner {
+      leaf_field =
+    }
+  }
+}
+";
+    let doc = create_document(text);
+    let position = Position {
+        line: 11,
+        character: "      leaf_field = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"helper"),
+        "expected sibling `let` binding `helper` at nested struct value position. Got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.contains(&"role"),
+        "current binding `role` must not appear inside its own body. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn nested_struct_value_position_offers_upstream_state_references() {
+    // Cross-file: an `upstream_state` binding declared in a sibling
+    // file should surface as the bare binding name (`orgs`) at a value
+    // position inside a nested struct body. Once the user types the
+    // trailing dot, the depth-1 detector takes over and offers the
+    // upstream's exports — covered separately by
+    // `nested_struct_value_position_dot_after_upstream_state_offers_exports`.
+    let provider = test_provider_with_nested_structs();
+    let tmp = tempfile::tempdir().unwrap();
+    let upstream = tmp.path().join("organizations");
+    std::fs::create_dir(&upstream).unwrap();
+    std::fs::write(
+        upstream.join("exports.crn"),
+        "exports {\n  accounts: map(String) = \"x\"\n}\n",
+    )
+    .unwrap();
+    let base = tmp.path().join("downstream");
+    std::fs::create_dir(&base).unwrap();
+    std::fs::write(
+        base.join("backend.crn"),
+        "let orgs = upstream_state { source = '../organizations' }\n",
+    )
+    .unwrap();
+    let main = "\
+let role = test.nested.resource {
+  outer {
+    inner {
+      leaf_field =
+    }
+  }
+}
+";
+    std::fs::write(base.join("main.crn"), main).unwrap();
+    let doc = create_document(main);
+    let position = Position {
+        line: 3,
+        character: "      leaf_field = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, Some(&base));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    // The bare binding name (`orgs`) is also useful so the user can
+    // tab-trigger it and then type `.` to descend into exports.
+    assert!(
+        labels.contains(&"orgs"),
+        "expected upstream_state binding `orgs` at nested struct value position. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn nested_struct_value_position_dot_after_upstream_state_offers_exports() {
+    // Once the user types `orgs.` at the value position, the dot
+    // detector takes over from `AfterEqualsInStruct` and offers the
+    // upstream's exports — the same depth-1 detector used in flatter
+    // contexts works just as well inside a nested struct body. Without
+    // this, completing through to e.g. `<binding>.<export>` (item 3 in
+    // #2624's expected sources) would still fail.
+    let provider = test_provider_with_nested_structs();
+    let tmp = tempfile::tempdir().unwrap();
+    let upstream = tmp.path().join("organizations");
+    std::fs::create_dir(&upstream).unwrap();
+    std::fs::write(
+        upstream.join("exports.crn"),
+        "exports {\n  accounts: map(String) = \"x\"\n}\n",
+    )
+    .unwrap();
+    let base = tmp.path().join("downstream");
+    std::fs::create_dir(&base).unwrap();
+    std::fs::write(
+        base.join("backend.crn"),
+        "let orgs = upstream_state { source = '../organizations' }\n",
+    )
+    .unwrap();
+    let main = "\
+let role = test.nested.resource {
+  outer {
+    inner {
+      leaf_field = orgs.
+    }
+  }
+}
+";
+    std::fs::write(base.join("main.crn"), main).unwrap();
+    let doc = create_document(main);
+    let position = Position {
+        line: 3,
+        character: "      leaf_field = orgs.".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, Some(&base));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"accounts"),
+        "expected upstream export `accounts` after `orgs.` at nested struct value position. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn nested_struct_value_position_in_anonymous_resource() {
+    // Anonymous resource (no enclosing `let`): `current_binding` is
+    // `None`, so the self-skip is a no-op and all in-scope identifiers
+    // still surface. Locks in the behavior so a future tightening of
+    // the filter can't silently break the bare-resource case.
+    let provider = test_provider_with_nested_structs();
+    let text = "\
+arguments {
+  oidc_provider_arn: String
+}
+
+test.nested.resource {
+  outer {
+    inner {
+      leaf_field =
+    }
+  }
+}
+";
+    let doc = create_document(text);
+    let position = Position {
+        line: 7,
+        character: "      leaf_field = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"oidc_provider_arn"),
+        "expected `oidc_provider_arn` even without enclosing `let`. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn nested_struct_value_position_argument_from_sibling_file() {
+    // The `arguments {}` block lives in a sibling `.crn` file from the
+    // file the user is editing — a directory-scoped feature must merge
+    // sibling files before scanning for arguments. Mirrors the real
+    // `arguments.crn` + `main.crn` shape.
+    let provider = test_provider_with_nested_structs();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().to_path_buf();
+    std::fs::write(
+        base.join("arguments.crn"),
+        "arguments {\n  oidc_provider_arn: String\n}\n",
+    )
+    .unwrap();
+    let main = "\
+let role = test.nested.resource {
+  outer {
+    inner {
+      leaf_field =
+    }
+  }
+}
+";
+    std::fs::write(base.join("main.crn"), main).unwrap();
+    let doc = create_document(main);
+    let position = Position {
+        line: 3,
+        character: "      leaf_field = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, Some(&base));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"oidc_provider_arn"),
+        "expected sibling-file argument `oidc_provider_arn` at nested struct value position. Got: {:?}",
         labels
     );
 }
