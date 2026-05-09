@@ -12,7 +12,7 @@ use crate::module::DependencyGraph;
 pub use crate::resource::ModuleSource;
 use crate::resource::ResourceId;
 
-/// Error when a plan would violate a lifecycle constraint
+/// Error when a plan would violate a directive constraint
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanError {
     /// The resource that triggered the error
@@ -31,7 +31,7 @@ impl std::fmt::Display for PlanError {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Plan {
     effects: Vec<Effect>,
-    /// Lifecycle constraint violations detected during plan generation
+    /// Directive constraint violations detected during plan generation
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     errors: Vec<PlanError>,
 }
@@ -53,17 +53,17 @@ impl Plan {
         self.effects.is_empty()
     }
 
-    /// Add a lifecycle constraint violation error
+    /// Add a directive constraint violation error
     pub fn add_error(&mut self, error: PlanError) {
         self.errors.push(error);
     }
 
-    /// Returns lifecycle constraint violation errors
+    /// Returns directive constraint violation errors
     pub fn errors(&self) -> &[PlanError] {
         &self.errors
     }
 
-    /// Returns true if there are lifecycle constraint violations
+    /// Returns true if there are directive constraint violations
     pub fn has_errors(&self) -> bool {
         !self.errors.is_empty()
     }
@@ -110,7 +110,7 @@ impl Plan {
         &mut self,
         resource_id: &crate::resource::ResourceId,
         cascade_attrs: Vec<String>,
-        lifecycle: crate::resource::LifecycleConfig,
+        directives: crate::resource::Directives,
         ref_hints: Vec<(String, String)>,
     ) {
         for effect in &mut self.effects {
@@ -144,7 +144,7 @@ impl Plan {
                             id,
                             from,
                             to,
-                            lifecycle,
+                            directives,
                             changed_create_only: cascade_attrs,
                             cascading_updates: vec![],
                             temporary_name: None,
@@ -165,10 +165,10 @@ impl Plan {
     /// to avoid breaking dependents during replacement.
     pub fn promote_to_create_before_destroy(&mut self, resource_id: &crate::resource::ResourceId) {
         for effect in &mut self.effects {
-            if let Effect::Replace { id, lifecycle, .. } = effect
+            if let Effect::Replace { id, directives, .. } = effect
                 && id == resource_id
             {
-                lifecycle.create_before_destroy = true;
+                directives.create_before_destroy = true;
                 return;
             }
         }
@@ -380,8 +380,8 @@ fn format_effect_brief(effect: &Effect) -> String {
     match effect {
         Effect::Create(r) => format!("+ {}", r.id),
         Effect::Update { id, .. } => format!("~ {}", id),
-        Effect::Replace { id, lifecycle, .. } => {
-            if lifecycle.create_before_destroy {
+        Effect::Replace { id, directives, .. } => {
+            if directives.create_before_destroy {
                 format!("+/- {}", id)
             } else {
                 format!("-/+ {}", id)
@@ -415,7 +415,7 @@ mod tests {
         plan.add(Effect::Delete {
             id: crate::resource::ResourceId::new("s3.Bucket", "c"),
             identifier: String::new(),
-            lifecycle: crate::resource::LifecycleConfig::default(),
+            directives: crate::resource::Directives::default(),
             binding: None,
             dependencies: std::collections::HashSet::new(),
         });
@@ -485,7 +485,7 @@ mod tests {
     fn plan_summary_counts_cascading_updates() {
         use crate::effect::CascadingUpdate;
         use crate::resource::State;
-        use crate::resource::{LifecycleConfig, ResourceId};
+        use crate::resource::{Directives, ResourceId};
 
         let mut plan = Plan::new();
 
@@ -504,7 +504,7 @@ mod tests {
             id: ResourceId::new("ec2.Vpc", "vpc"),
             from: Box::new(from),
             to,
-            lifecycle: LifecycleConfig::default(),
+            directives: Directives::default(),
             changed_create_only: vec!["cidr_block".to_string()],
             cascading_updates: vec![cascading],
             temporary_name: None,
@@ -522,7 +522,7 @@ mod tests {
     fn plan_summary_display_includes_cascading_updates() {
         use crate::effect::CascadingUpdate;
         use crate::resource::State;
-        use crate::resource::{LifecycleConfig, ResourceId};
+        use crate::resource::{Directives, ResourceId};
 
         let mut plan = Plan::new();
 
@@ -540,7 +540,7 @@ mod tests {
             id: ResourceId::new("ec2.Vpc", "vpc"),
             from: Box::new(from),
             to,
-            lifecycle: LifecycleConfig::default(),
+            directives: Directives::default(),
             changed_create_only: vec!["cidr_block".to_string()],
             cascading_updates: vec![cascading],
             temporary_name: None,
@@ -569,7 +569,7 @@ mod tests {
         plan.add(Effect::Delete {
             id: ResourceId::new("s3.Bucket", "b"),
             identifier: "b-id".to_string(),
-            lifecycle: crate::resource::LifecycleConfig::default(),
+            directives: crate::resource::Directives::default(),
             binding: None,
             dependencies: std::collections::HashSet::new(),
         });

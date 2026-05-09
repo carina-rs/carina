@@ -1,5 +1,5 @@
 use super::*;
-use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
+use carina_core::resource::{Directives, Resource, ResourceId, State, Value};
 use carina_core::value::format_value;
 
 #[test]
@@ -17,7 +17,7 @@ fn app_from_plan_with_effects() {
     plan.add(Effect::Delete {
         id: ResourceId::new("s3.Bucket", "old-bucket"),
         identifier: "old-bucket-id".to_string(),
-        lifecycle: LifecycleConfig::default(),
+        directives: Directives::default(),
         binding: None,
         dependencies: HashSet::new(),
     });
@@ -141,7 +141,7 @@ fn replace_effect_symbols() {
         id: ResourceId::new("ec2.Vpc", "my-vpc"),
         from: from.clone(),
         to: Resource::new("ec2.Vpc", "my-vpc"),
-        lifecycle: LifecycleConfig {
+        directives: Directives {
             create_before_destroy: true,
             ..Default::default()
         },
@@ -156,7 +156,7 @@ fn replace_effect_symbols() {
         id: ResourceId::new("ec2.Vpc", "my-vpc2"),
         from,
         to: Resource::new("ec2.Vpc", "my-vpc2"),
-        lifecycle: LifecycleConfig::default(),
+        directives: Directives::default(),
         changed_create_only: vec!["cidr".to_string()],
         cascading_updates: vec![],
         temporary_name: None,
@@ -683,7 +683,7 @@ fn move_suppressed_when_replace_exists_for_same_target() {
                 .collect(),
         )),
         to: Resource::new("ec2.Vpc", "new-vpc"),
-        lifecycle: LifecycleConfig::default(),
+        directives: Directives::default(),
         changed_create_only: vec!["cidr".to_string()],
         cascading_updates: vec![],
         temporary_name: None,

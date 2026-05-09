@@ -455,7 +455,7 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
 ///
 /// For each `(old_name, new_name)` pair, find the matching `ResourceState`
 /// in `state_file.resources` and overwrite its `name` field. Downstream maps
-/// (`build_saved_attrs`, `build_desired_keys`, `build_lifecycles`) then key
+/// (`build_saved_attrs`, `build_desired_keys`, `build_directives`) then key
 /// off the new name, so the differ sees the resource under its updated
 /// identifier instead of an orphan-delete + create pair.
 pub fn apply_provider_prefix_renames(renames: &[(String, String)], state_file: &mut StateFile) {
@@ -1327,15 +1327,15 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
     let preprocessor = PlanPreprocessor::new(&provider, &ctx);
     preprocessor.prepare(&mut resources, &mut current_states, &parsed.providers);
 
-    // Build lifecycles map from state file for orphaned resource deletion
-    let lifecycles = state_file
+    // Build directives map from state file for orphaned resource deletion
+    let directives_map = state_file
         .as_ref()
-        .map(|sf| sf.build_lifecycles())
+        .map(|sf| sf.build_directives())
         .unwrap_or_default();
     let mut plan = create_plan(
         &resources,
         &current_states,
-        &lifecycles,
+        &directives_map,
         ctx.schemas(),
         &saved_attrs,
         &prev_desired_keys,

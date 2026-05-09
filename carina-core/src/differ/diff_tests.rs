@@ -469,12 +469,12 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
 }
 
 #[test]
-fn replace_carries_create_before_destroy_lifecycle() {
+fn replace_carries_create_before_destroy_directives() {
     use crate::schema::{AttributeSchema, AttributeType};
 
     let mut resource = Resource::new("ec2.Vpc", "my-vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
-    resource.lifecycle.create_before_destroy = true;
+    resource.directives.create_before_destroy = true;
 
     let resources = vec![resource];
 
@@ -509,11 +509,11 @@ fn replace_carries_create_before_destroy_lifecycle() {
     assert_eq!(plan.effects().len(), 1);
     match &plan.effects()[0] {
         Effect::Replace {
-            lifecycle,
+            directives,
             changed_create_only,
             ..
         } => {
-            assert!(lifecycle.create_before_destroy);
+            assert!(directives.create_before_destroy);
             assert_eq!(changed_create_only, &vec!["cidr_block".to_string()]);
         }
         other => panic!("Expected Replace, got {:?}", other),

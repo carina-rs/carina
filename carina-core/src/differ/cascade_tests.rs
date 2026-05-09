@@ -54,7 +54,7 @@ fn cascade_dependent_updates_adds_update_for_dependent() {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: vpc.clone().with_binding("vpc"),
-        lifecycle: LifecycleConfig {
+        directives: Directives {
             create_before_destroy: true,
             ..Default::default()
         },
@@ -141,7 +141,7 @@ fn cascade_skips_resources_already_in_plan() {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: vpc.clone(),
-        lifecycle: LifecycleConfig {
+        directives: Directives {
             create_before_destroy: true,
             ..Default::default()
         },
@@ -209,7 +209,7 @@ fn cascade_no_op_without_create_before_destroy() {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: vpc.clone(),
-        lifecycle: LifecycleConfig::default(), // create_before_destroy = false
+        directives: Directives::default(), // create_before_destroy = false
         changed_create_only: vec!["cidr_block".to_string()],
         cascading_updates: vec![],
         temporary_name: None,
@@ -292,7 +292,7 @@ fn cascade_transitive_dependencies() {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: vpc.clone(),
-        lifecycle: LifecycleConfig {
+        directives: Directives {
             create_before_destroy: true,
             ..Default::default()
         },
@@ -362,7 +362,7 @@ fn cascade_anonymous_resource_dependent() {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: vpc.clone(),
-        lifecycle: LifecycleConfig {
+        directives: Directives {
             create_before_destroy: true,
             ..Default::default()
         },
@@ -460,7 +460,7 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: vpc.clone().with_binding("vpc"),
-        lifecycle: LifecycleConfig {
+        directives: Directives {
             create_before_destroy: true,
             ..Default::default()
         },
@@ -616,7 +616,7 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: vpc.clone().with_binding("vpc"),
-        lifecycle: LifecycleConfig {
+        directives: Directives {
             create_before_destroy: true,
             ..Default::default()
         },
@@ -629,7 +629,7 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
         id: subnet_id.clone(),
         from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
         to: subnet.clone().with_binding("subnet"),
-        lifecycle: LifecycleConfig::default(),
+        directives: Directives::default(),
         changed_create_only: vec!["availability_zone".to_string()],
         cascading_updates: vec![],
         temporary_name: None,
@@ -679,7 +679,7 @@ fn auto_detect_create_before_destroy_when_resource_has_dependents() {
     // automatically use create_before_destroy strategy instead of the default
     // delete-then-create.
     //
-    // VPC cidr_block changes (create-only) → VPC Replace with default lifecycle
+    // VPC cidr_block changes (create-only) → VPC Replace with default directives
     // Subnet depends on VPC via vpc_id (ResourceRef)
     // Expected: VPC Replace should auto-detect create_before_destroy = true
     // because the subnet references it.
@@ -743,13 +743,13 @@ fn auto_detect_create_before_destroy_when_resource_has_dependents() {
     schemas.insert("", vpc_schema);
     schemas.insert("", subnet_schema);
 
-    // Build a plan with Replace for VPC using DEFAULT lifecycle (no explicit CBD)
+    // Build a plan with Replace for VPC using DEFAULT directives (no explicit CBD)
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: vpc.clone().with_binding("vpc"),
-        lifecycle: LifecycleConfig::default(), // create_before_destroy = false (user didn't set it)
+        directives: Directives::default(), // create_before_destroy = false (user didn't set it)
         changed_create_only: vec!["cidr_block".to_string()],
         cascading_updates: vec![],
         temporary_name: None,
@@ -768,9 +768,9 @@ fn auto_detect_create_before_destroy_when_resource_has_dependents() {
         .find(|e| *e.resource_id() == vpc_id)
         .expect("VPC Replace effect should exist");
 
-    if let Effect::Replace { lifecycle, .. } = vpc_effect {
+    if let Effect::Replace { directives, .. } = vpc_effect {
         assert!(
-            lifecycle.create_before_destroy,
+            directives.create_before_destroy,
             "VPC Replace should have create_before_destroy auto-detected \
              because subnet references it, but got create_before_destroy = false"
         );
@@ -856,7 +856,7 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: vpc.clone().with_binding("vpc"),
-        lifecycle: LifecycleConfig {
+        directives: Directives {
             create_before_destroy: true,
             ..Default::default()
         },
@@ -924,7 +924,7 @@ fn cascade_prevent_destroy_blocks_promotion_to_replace() {
             Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         )
         .with_attribute("cidr_block", Value::String("10.1.1.0/24".to_string()));
-    subnet.lifecycle.prevent_destroy = true;
+    subnet.directives.prevent_destroy = true;
 
     let unresolved_resources = vec![vpc.clone(), subnet.clone()];
 
@@ -969,7 +969,7 @@ fn cascade_prevent_destroy_blocks_promotion_to_replace() {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: vpc.clone().with_binding("vpc"),
-        lifecycle: LifecycleConfig {
+        directives: Directives {
             create_before_destroy: true,
             ..Default::default()
         },
@@ -1032,7 +1032,7 @@ fn cascade_prevent_destroy_blocks_merge_upgrade_to_replace() {
         )
         .with_attribute("tags", Value::String("new-tag".to_string()))
         .with_attribute("cidr_block", Value::String("10.1.1.0/24".to_string()));
-    subnet.lifecycle.prevent_destroy = true;
+    subnet.directives.prevent_destroy = true;
 
     let unresolved_resources = vec![vpc.clone(), subnet.clone()];
 
@@ -1079,7 +1079,7 @@ fn cascade_prevent_destroy_blocks_merge_upgrade_to_replace() {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: vpc.clone().with_binding("vpc"),
-        lifecycle: LifecycleConfig {
+        directives: Directives {
             create_before_destroy: true,
             ..Default::default()
         },

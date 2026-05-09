@@ -6,7 +6,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use indexmap::IndexMap;
 
 use crate::parser::{ArgumentParameter, ModuleCall};
-use crate::resource::{LifecycleConfig, Resource, ResourceId, ResourceKind, ResourceName, Value};
+use crate::resource::{Directives, Resource, ResourceId, ResourceKind, ResourceName, Value};
 
 use super::error::ModuleError;
 use super::resolver::ModuleResolver;
@@ -264,7 +264,7 @@ impl ModuleResolver<'_> {
                     module_name: call.module_name.clone(),
                     instance: instance_prefix.to_string(),
                 },
-                lifecycle: LifecycleConfig::default(),
+                directives: Directives::default(),
                 prefixes: HashMap::new(),
                 binding: Some(binding_name.clone()),
                 dependency_bindings: BTreeSet::new(),

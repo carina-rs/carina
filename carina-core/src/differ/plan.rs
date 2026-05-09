@@ -6,7 +6,7 @@ use crate::deps::get_resource_dependencies;
 use crate::effect::{CascadingUpdate, Effect, TemporaryName};
 use crate::identifier::generate_random_suffix;
 use crate::plan::{Plan, PlanError};
-use crate::resource::{LifecycleConfig, Resource, ResourceId, ResourceKind, State, Value};
+use crate::resource::{Directives, Resource, ResourceId, ResourceKind, State, Value};
 use crate::schema::{ResourceSchema, SchemaKind, SchemaRegistry};
 
 use super::{Diff, diff};
@@ -15,7 +15,7 @@ use super::{Diff, diff};
 struct CascadeMerge {
     resource_id: ResourceId,
     create_only_attrs: Vec<String>,
-    lifecycle: LifecycleConfig,
+    directives: Directives,
     ref_hints: Vec<(String, String)>,
 }
 
@@ -122,9 +122,10 @@ fn generate_temporary_name(
 
 /// Compute Diff for multiple resources and generate a Plan
 ///
-/// The `lifecycles` map provides lifecycle configuration for orphaned resources
-/// (resources in state but not in desired). For desired resources, the lifecycle
-/// is read directly from the Resource struct.
+/// The `directives_map` provides Carina-side directives for orphaned
+/// resources (resources in state but not in desired). For desired
+/// resources, the directives are read directly from the `Resource`
+/// struct.
 ///
 /// The `saved_attrs` map provides the last-known attribute values from the state file.
 /// This is used to merge unmanaged nested fields into desired values before comparison,
@@ -137,7 +138,7 @@ fn generate_temporary_name(
 pub fn create_plan(
     desired: &[Resource],
     current_states: &HashMap<ResourceId, State>,
-    lifecycles: &HashMap<ResourceId, LifecycleConfig>,
+    directives_map: &HashMap<ResourceId, Directives>,
     registry: &SchemaRegistry,
     saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
     prev_desired_keys: &HashMap<ResourceId, Vec<String>>,
@@ -232,7 +233,7 @@ pub fn create_plan(
                     });
                 } else {
                     // Replace involves destroying the old resource
-                    if resource.lifecycle.prevent_destroy {
+                    if resource.directives.prevent_destroy {
                         plan.add_error(PlanError {
                             resource_id: id.clone(),
                             message:
@@ -241,8 +242,8 @@ pub fn create_plan(
                         });
                         continue;
                     }
-                    let lifecycle = resource.lifecycle.clone();
-                    let temporary_name = if lifecycle.create_before_destroy {
+                    let directives = resource.directives.clone();
+                    let temporary_name = if directives.create_before_destroy {
                         registry
                             .get(
                                 &resource.id.provider,
@@ -270,7 +271,7 @@ pub fn create_plan(
                         id,
                         from,
                         to,
-                        lifecycle,
+                        directives,
                         changed_create_only,
                         cascading_updates: vec![],
                         temporary_name,
@@ -280,7 +281,7 @@ pub fn create_plan(
             }
             Diff::NoChange(_) => {}
             Diff::Delete(id) => {
-                if resource.lifecycle.prevent_destroy {
+                if resource.directives.prevent_destroy {
                     plan.add_error(PlanError {
                         resource_id: id.clone(),
                         message: "resource has prevent_destroy set, but the plan would delete it"
@@ -292,13 +293,13 @@ pub fn create_plan(
                     .get(&id)
                     .and_then(|s| s.identifier.clone())
                     .unwrap_or_default();
-                let lifecycle = resource.lifecycle.clone();
+                let directives = resource.directives.clone();
                 let binding = resource.binding.clone();
                 let dependencies = get_resource_dependencies(resource);
                 plan.add(Effect::Delete {
                     id,
                     identifier,
-                    lifecycle,
+                    directives,
                     binding,
                     dependencies,
                 });
@@ -309,8 +310,8 @@ pub fn create_plan(
     // Detect orphaned resources: exist in current_states but not in desired
     for (id, state) in current_states {
         if state.exists && !desired_ids.contains(id) {
-            let lifecycle = lifecycles.get(id).cloned().unwrap_or_default();
-            if lifecycle.prevent_destroy {
+            let directives = directives_map.get(id).cloned().unwrap_or_default();
+            if directives.prevent_destroy {
                 plan.add_error(PlanError {
                     resource_id: id.clone(),
                     message:
@@ -338,7 +339,7 @@ pub fn create_plan(
                     // a plain clone-through `wrap_map` is fine.
                     attributes: state.attributes.clone().into_iter().collect(),
                     kind: ResourceKind::Managed,
-                    lifecycle: lifecycle.clone(),
+                    directives: directives.clone(),
                     prefixes: HashMap::new(),
                     binding: None,
                     dependency_bindings: BTreeSet::new(),
@@ -350,7 +351,7 @@ pub fn create_plan(
             plan.add(Effect::Delete {
                 id: id.clone(),
                 identifier,
-                lifecycle,
+                directives,
                 binding,
                 dependencies,
             });
@@ -403,9 +404,9 @@ pub fn cascade_dependent_updates(
             .effects()
             .iter()
             .filter_map(|e| {
-                if let Effect::Replace { id, lifecycle, .. } = e {
+                if let Effect::Replace { id, directives, .. } = e {
                     // Only consider Replace effects that are NOT already CBD
-                    if !lifecycle.create_before_destroy {
+                    if !directives.create_before_destroy {
                         e.binding_name().map(|b| (b, id.clone()))
                     } else {
                         None
@@ -526,7 +527,7 @@ pub fn cascade_dependent_updates(
                     .effects()
                     .iter()
                     .any(|e| matches!(e, Effect::Update { id, .. } if *id == resource.id));
-                if is_update_in_plan && resource.lifecycle.prevent_destroy {
+                if is_update_in_plan && resource.directives.prevent_destroy {
                     plan.add_error(PlanError {
                         resource_id: resource.id.clone(),
                         message:
@@ -544,7 +545,7 @@ pub fn cascade_dependent_updates(
                 merge_operations.push(CascadeMerge {
                     resource_id: resource.id.clone(),
                     create_only_attrs: create_only_refs,
-                    lifecycle: resource.lifecycle.clone(),
+                    directives: resource.directives.clone(),
                     ref_hints: filtered_hints,
                 });
             }
@@ -556,7 +557,7 @@ pub fn cascade_dependent_updates(
         plan.merge_cascade_create_only(
             &merge.resource_id,
             merge.create_only_attrs,
-            merge.lifecycle,
+            merge.directives,
             merge.ref_hints,
         );
     }
@@ -608,7 +609,7 @@ pub fn cascade_dependent_updates(
                             from: Box::new(from),
                             to: (*unresolved).clone(),
                         });
-                } else if unresolved.lifecycle.prevent_destroy {
+                } else if unresolved.directives.prevent_destroy {
                     // Cascade would promote to Replace (destroy + recreate),
                     // but prevent_destroy blocks this.
                     plan.add_error(PlanError {
@@ -641,7 +642,7 @@ pub fn cascade_dependent_updates(
                         id: unresolved.id.clone(),
                         from: Box::new(from),
                         to: (*unresolved).clone(),
-                        lifecycle: unresolved.lifecycle.clone(),
+                        directives: unresolved.directives.clone(),
                         changed_create_only: create_only_refs,
                         cascading_updates: vec![],
                         temporary_name: None,

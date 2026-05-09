@@ -17,7 +17,7 @@
         "tags": { "Name": "test-vpc" }
       },
       "protected": false,
-      "lifecycle": {},
+      "directives": {},
       "prefixes": {},
       "name_overrides": {},
       "desired_keys": ["cidr_block", "enable_dns_support", "enable_dns_hostnames", "tags"],
@@ -37,7 +37,7 @@
         "tags": { "Name": "test-subnet" }
       },
       "protected": false,
-      "lifecycle": {},
+      "directives": {},
       "prefixes": {},
       "name_overrides": {},
       "desired_keys": ["vpc_id", "cidr_block", "availability_zone", "tags"],

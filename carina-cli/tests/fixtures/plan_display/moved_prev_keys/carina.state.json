@@ -17,7 +17,7 @@
         ]
       },
       "protected": false,
-      "lifecycle": { "force_delete": false, "create_before_destroy": false },
+      "directives": { "force_delete": false, "create_before_destroy": false },
       "prefixes": {},
       "name_overrides": {},
       "desired_keys": ["cidr_block", "tags"],

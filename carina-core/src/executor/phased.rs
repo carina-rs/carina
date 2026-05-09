@@ -448,7 +448,7 @@ pub(super) async fn execute_effects_phased(
             .iter()
             .copied()
             .filter(|&idx| {
-                matches!(&effects[idx], Effect::Replace { lifecycle, .. } if lifecycle.create_before_destroy)
+                matches!(&effects[idx], Effect::Replace { directives, .. } if directives.create_before_destroy)
             })
             .collect();
 
@@ -736,13 +736,13 @@ pub(super) async fn execute_effects_phased(
             .copied()
             .filter(|&idx| {
                 let effect = &effects[idx];
-                if let Effect::Replace { lifecycle, .. } = effect {
+                if let Effect::Replace { directives, .. } = effect {
                     // Skip if dependency failed
                     if find_failed_dependency(effect, &failed_bindings).is_some() {
                         return false;
                     }
                     // For CBD, skip if create didn't succeed
-                    if lifecycle.create_before_destroy && !cbd_create_states.contains_key(&idx) {
+                    if directives.create_before_destroy && !cbd_create_states.contains_key(&idx) {
                         return false;
                     }
                     true
@@ -815,7 +815,7 @@ pub(super) async fn execute_effects_phased(
                 dispatched.insert(idx);
                 let effect = &effects[idx];
                 let progress = replace_progress[&idx];
-                let is_cbd = matches!(effect, Effect::Replace { lifecycle, .. } if lifecycle.create_before_destroy);
+                let is_cbd = matches!(effect, Effect::Replace { directives, .. } if directives.create_before_destroy);
 
                 // For non-CBD replaces, this is where the effect starts
                 if !is_cbd {
@@ -845,7 +845,7 @@ pub(super) async fn execute_effects_phased(
                     if let Effect::Replace {
                         id,
                         from,
-                        lifecycle,
+                        directives,
                         ..
                     } = effect
                     {
@@ -855,7 +855,7 @@ pub(super) async fn execute_effects_phased(
                                 id,
                                 identifier,
                                 DeleteRequest {
-                                    lifecycle: lifecycle.clone(),
+                                    directives: directives.clone(),
                                 },
                             )
                             .await
@@ -971,7 +971,7 @@ pub(super) async fn execute_effects_phased(
                 if let Effect::Replace {
                     id,
                     to,
-                    lifecycle,
+                    directives,
                     temporary_name,
                     ..
                 } = effect
@@ -981,7 +981,7 @@ pub(super) async fn execute_effects_phased(
                         .copied()
                         .unwrap_or_else(Instant::now);
 
-                    if lifecycle.create_before_destroy {
+                    if directives.create_before_destroy {
                         // CBD finalization: skip if create phase failed
                         let Some(state) = cbd_create_states.remove(&idx) else {
                             completed_indices.insert(idx);

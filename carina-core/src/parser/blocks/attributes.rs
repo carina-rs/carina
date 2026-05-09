@@ -1,5 +1,5 @@
 //! `arguments { }`, `attributes { }`, `exports { }` block parsers and the
-//! `lifecycle { }` meta-argument extractor.
+//! `directives { }` meta-argument extractor.
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
@@ -12,7 +12,7 @@ use crate::parser::expressions::string_literal::parse_string_value;
 use crate::parser::expressions::validate_expr::parse_validate_expr;
 use crate::parser::parse_expression;
 use crate::parser::types::parse_type_expr;
-use crate::resource::{LifecycleConfig, Resource, Value};
+use crate::resource::{Directives, Resource, Value};
 use indexmap::IndexMap;
 
 /// Parse arguments block. See `register_argument_binding` for the
@@ -225,26 +225,27 @@ pub(in crate::parser) fn parse_exports_block(
     Ok(export_params)
 }
 
-/// Extract lifecycle configuration from a resource's attributes.
+/// Extract Carina-side directives from a resource's attributes.
 ///
-/// The parser parses `lifecycle { ... }` as a nested block, which becomes
-/// a List of Maps in attributes. We extract it and convert to LifecycleConfig.
-pub(in crate::parser) fn extract_lifecycle_config(
+/// The parser parses `directives { ... }` as a nested block, which
+/// becomes a List of Maps in attributes. We extract it and convert to
+/// `Directives`.
+pub(in crate::parser) fn extract_directives(
     attributes: &mut IndexMap<String, Value>,
-) -> LifecycleConfig {
-    if let Some(Value::List(blocks)) = attributes.shift_remove("lifecycle") {
-        // Take the first lifecycle block (there should only be one)
+) -> Directives {
+    if let Some(Value::List(blocks)) = attributes.shift_remove("directives") {
+        // Take the first directives block (there should only be one)
         if let Some(Value::Map(map)) = blocks.into_iter().next() {
             let force_delete = matches!(map.get("force_delete"), Some(Value::Bool(true)));
             let create_before_destroy =
                 matches!(map.get("create_before_destroy"), Some(Value::Bool(true)));
             let prevent_destroy = matches!(map.get("prevent_destroy"), Some(Value::Bool(true)));
-            return LifecycleConfig {
+            return Directives {
                 force_delete,
                 create_before_destroy,
                 prevent_destroy,
             };
         }
     }
-    LifecycleConfig::default()
+    Directives::default()
 }

@@ -354,14 +354,14 @@ pub(super) async fn execute_basic_effect<'a>(
         Effect::Delete {
             id,
             identifier,
-            lifecycle,
+            directives,
             ..
         } => match provider
             .delete(
                 id,
                 identifier,
                 DeleteRequest {
-                    lifecycle: lifecycle.clone(),
+                    directives: directives.clone(),
                 },
             )
             .await

@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::resource::{LifecycleConfig, Resource, ResourceId, State};
+use crate::resource::{Directives, Resource, ResourceId, State};
 
 /// Temporary name used during create-before-destroy replacement.
 ///
@@ -63,7 +63,7 @@ pub enum Effect {
         from: Box<State>,
         to: Resource,
         #[serde(default)]
-        lifecycle: LifecycleConfig,
+        directives: Directives,
         /// Which create-only attributes forced the replacement
         changed_create_only: Vec<String>,
         /// Dependent resources to update between create and delete (create_before_destroy only)
@@ -84,7 +84,7 @@ pub enum Effect {
         id: ResourceId,
         identifier: String,
         #[serde(default)]
-        lifecycle: LifecycleConfig,
+        directives: Directives,
         /// The binding name of the deleted resource (for plan tree display)
         #[serde(default)]
         binding: Option<String>,
@@ -221,7 +221,7 @@ mod tests {
         let effect = Effect::Delete {
             id: ResourceId::new("test", "a"),
             identifier: "id-123".to_string(),
-            lifecycle: LifecycleConfig::default(),
+            directives: Directives::default(),
             binding: None,
             dependencies: HashSet::new(),
         };
@@ -278,7 +278,7 @@ mod tests {
                 )),
                 to: Resource::new("ec2.Vpc", "my-vpc")
                     .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string())),
-                lifecycle: LifecycleConfig::default(),
+                directives: Directives::default(),
                 changed_create_only: vec!["cidr_block".to_string()],
                 cascading_updates: vec![],
                 temporary_name: None,
@@ -287,7 +287,7 @@ mod tests {
             Effect::Delete {
                 id: ResourceId::new("s3.Bucket", "old-bucket"),
                 identifier: "old-bucket".to_string(),
-                lifecycle: LifecycleConfig::default(),
+                directives: Directives::default(),
                 binding: None,
                 dependencies: HashSet::new(),
             },

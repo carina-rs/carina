@@ -73,7 +73,7 @@ mod tests {
         // The formatter grammar's block_content only allows trivia | attribute,
         // but the main grammar also allows nested_block (identifier ~ "{" ~ ... ~ "}").
         // This affects files that use nested block syntax for List<Struct> fields
-        // like security_group_ingress, lifecycle, etc.
+        // like security_group_ingress, directives, etc.
         let input = r#"awscc.ec2.SecurityGroup {
   vpc_id = "vpc-123"
 
@@ -121,13 +121,13 @@ mod tests {
     }
 
     #[test]
-    fn issue_904_lifecycle_block_in_anonymous_resource() {
-        // lifecycle { ... } is a nested block inside a resource body.
+    fn issue_904_directives_block_in_anonymous_resource() {
+        // directives { ... } is a nested block inside a resource body.
         // Without nested_block support in block_content, this fails.
         let input = r#"awscc.s3.Bucket {
   bucket_name_prefix = "test-"
 
-  lifecycle {
+  directives {
     force_delete = true
   }
 }
@@ -136,7 +136,7 @@ mod tests {
         let result = parse(input);
         assert!(
             result.is_ok(),
-            "Lifecycle block in anonymous resource should parse, got: {}",
+            "directives block in anonymous resource should parse, got: {}",
             result.unwrap_err()
         );
     }

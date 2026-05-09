@@ -1221,11 +1221,11 @@ fn parse_read_with_regular_resources() {
 }
 
 #[test]
-fn parse_lifecycle_force_delete() {
+fn parse_directives_force_delete() {
     let input = r#"
         let bucket = awscc.s3_bucket {
             bucket_name = "my-bucket"
-            lifecycle {
+            directives {
                 force_delete = true
             }
         }
@@ -1236,13 +1236,13 @@ fn parse_lifecycle_force_delete() {
 
     let resource = &result.resources[0];
     assert_eq!(resource.id.resource_type, "s3_bucket");
-    assert!(resource.lifecycle.force_delete);
-    // lifecycle should NOT appear in attributes
-    assert!(!resource.attributes.contains_key("lifecycle"));
+    assert!(resource.directives.force_delete);
+    // directives should NOT appear in attributes
+    assert!(!resource.attributes.contains_key("directives"));
 }
 
 #[test]
-fn parse_lifecycle_default_when_absent() {
+fn parse_directives_default_when_absent() {
     let input = r#"
         let bucket = awscc.s3_bucket {
             bucket_name = "my-bucket"
@@ -1251,16 +1251,16 @@ fn parse_lifecycle_default_when_absent() {
 
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(result.resources.len(), 1);
-    assert!(!result.resources[0].lifecycle.force_delete);
-    assert!(!result.resources[0].lifecycle.prevent_destroy);
+    assert!(!result.resources[0].directives.force_delete);
+    assert!(!result.resources[0].directives.prevent_destroy);
 }
 
 #[test]
-fn parse_lifecycle_anonymous_resource() {
+fn parse_directives_anonymous_resource() {
     let input = r#"
         awscc.s3_bucket {
             bucket_name = "my-bucket"
-            lifecycle {
+            directives {
                 force_delete = true
             }
         }
@@ -1268,8 +1268,8 @@ fn parse_lifecycle_anonymous_resource() {
 
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(result.resources.len(), 1);
-    assert!(result.resources[0].lifecycle.force_delete);
-    assert!(!result.resources[0].attributes.contains_key("lifecycle"));
+    assert!(result.resources[0].directives.force_delete);
+    assert!(!result.resources[0].attributes.contains_key("directives"));
 }
 
 /// Regression test for issue #146: anonymous AWSCC resources should not have
@@ -1319,11 +1319,11 @@ fn let_bound_resource_no_spurious_name_attribute() {
 }
 
 #[test]
-fn parse_lifecycle_create_before_destroy() {
+fn parse_directives_create_before_destroy() {
     let input = r#"
         let vpc = awscc.ec2.Vpc {
             cidr_block = "10.0.0.0/16"
-            lifecycle {
+            directives {
                 create_before_destroy = true
             }
         }
@@ -1333,17 +1333,17 @@ fn parse_lifecycle_create_before_destroy() {
     assert_eq!(result.resources.len(), 1);
 
     let resource = &result.resources[0];
-    assert!(resource.lifecycle.create_before_destroy);
-    assert!(!resource.lifecycle.force_delete);
-    assert!(!resource.attributes.contains_key("lifecycle"));
+    assert!(resource.directives.create_before_destroy);
+    assert!(!resource.directives.force_delete);
+    assert!(!resource.attributes.contains_key("directives"));
 }
 
 #[test]
-fn parse_lifecycle_both_force_delete_and_create_before_destroy() {
+fn parse_directives_both_force_delete_and_create_before_destroy() {
     let input = r#"
         let bucket = awscc.s3_bucket {
             bucket_name = "my-bucket"
-            lifecycle {
+            directives {
                 force_delete = true
                 create_before_destroy = true
             }
@@ -1354,9 +1354,9 @@ fn parse_lifecycle_both_force_delete_and_create_before_destroy() {
     assert_eq!(result.resources.len(), 1);
 
     let resource = &result.resources[0];
-    assert!(resource.lifecycle.force_delete);
-    assert!(resource.lifecycle.create_before_destroy);
-    assert!(!resource.attributes.contains_key("lifecycle"));
+    assert!(resource.directives.force_delete);
+    assert!(resource.directives.create_before_destroy);
+    assert!(!resource.attributes.contains_key("directives"));
 }
 
 #[test]

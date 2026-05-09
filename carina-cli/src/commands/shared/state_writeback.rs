@@ -282,7 +282,7 @@ pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateF
             }
             Effect::Import { .. } => {
                 // Already handled in the sorted_resources loop above via applied_states.
-                // Re-upserting here would overwrite metadata (lifecycle, prefixes,
+                // Re-upserting here would overwrite metadata (directives, prefixes,
                 // desired_keys, binding, dependency_bindings) with bare defaults.
             }
             Effect::Remove { id } => {
@@ -339,7 +339,7 @@ pub(crate) fn build_orphan_resource(sf: &carina_state::StateFile, id: &ResourceI
         id: id.clone(),
         attributes: attributes.into_iter().collect(),
         kind: carina_core::resource::ResourceKind::Managed,
-        lifecycle: rs.lifecycle.clone(),
+        directives: rs.directives.clone(),
         prefixes: rs.prefixes.clone(),
         binding: rs.binding.clone(),
         dependency_bindings: rs.dependency_bindings.clone(),

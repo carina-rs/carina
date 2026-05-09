@@ -20,7 +20,7 @@
         }
       },
       "protected": false,
-      "lifecycle": {},
+      "directives": {},
       "prefixes": {},
       "name_overrides": {},
       "desired_keys": ["cidr_block", "config"],

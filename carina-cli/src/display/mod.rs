@@ -414,8 +414,8 @@ impl<'a> TreeRenderContext<'a> {
         let colored_symbol = match effect {
             Effect::Create(_) => "+".green().bold(),
             Effect::Update { .. } => "~".yellow().bold(),
-            Effect::Replace { lifecycle, .. } => {
-                if lifecycle.create_before_destroy {
+            Effect::Replace { directives, .. } => {
+                if directives.create_before_destroy {
                     "+/-".magenta().bold()
                 } else {
                     "-/+".magenta().bold()
@@ -505,9 +505,9 @@ impl<'a> TreeRenderContext<'a> {
                 }
             }
             Effect::Replace {
-                id, to, lifecycle, ..
+                id, to, directives, ..
             } => {
-                let replace_note = if lifecycle.create_before_destroy {
+                let replace_note = if directives.create_before_destroy {
                     "(must be replaced, create before destroy)"
                 } else {
                     "(must be replaced)"
@@ -1425,11 +1425,11 @@ pub fn format_effect(effect: &Effect) -> String {
         Effect::Update { id, .. } => format!("Update {}", id.human()),
         Effect::Replace {
             id,
-            lifecycle,
+            directives,
             cascading_updates,
             ..
         } => {
-            if lifecycle.create_before_destroy {
+            if directives.create_before_destroy {
                 if cascading_updates.is_empty() {
                     format!("Replace {} (create-before-destroy)", id.human())
                 } else {

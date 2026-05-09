@@ -4,7 +4,7 @@ use crate::provider::{
     BoxFuture, CreateRequest, DeleteRequest, ProviderError, ProviderResult, ReadRequest,
     UpdateRequest,
 };
-use crate::resource::{LifecycleConfig, Resource, Value};
+use crate::resource::{Directives, Resource, Value};
 use parallel::{build_dependency_levels, build_dependency_map};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -262,7 +262,7 @@ async fn test_simple_delete() {
     plan.add(Effect::Delete {
         id: rid.clone(),
         identifier: "id-123".to_string(),
-        lifecycle: LifecycleConfig::default(),
+        directives: Directives::default(),
         binding: None,
         dependencies: HashSet::new(),
     });
@@ -331,7 +331,7 @@ async fn test_cbd_creates_before_deletes() {
         id: rid.clone(),
         from: Box::new(from),
         to,
-        lifecycle: LifecycleConfig {
+        directives: Directives {
             create_before_destroy: true,
             ..Default::default()
         },
@@ -375,7 +375,7 @@ async fn test_dbd_deletes_before_creates() {
         id: rid.clone(),
         from: Box::new(from),
         to,
-        lifecycle: LifecycleConfig::default(),
+        directives: Directives::default(),
         changed_create_only: vec!["attr".to_string()],
         cascading_updates: vec![],
         temporary_name: None,
@@ -424,7 +424,7 @@ async fn test_phased_cbd_creates_in_forward_order_deletes_in_reverse() {
     subnet_to.binding = Some("subnet".to_string());
     subnet_to.dependency_bindings = std::collections::BTreeSet::from(["vpc".to_string()]);
 
-    let cbd_lifecycle = LifecycleConfig {
+    let cbd_directives = Directives {
         create_before_destroy: true,
         ..Default::default()
     };
@@ -435,7 +435,7 @@ async fn test_phased_cbd_creates_in_forward_order_deletes_in_reverse() {
         id: vpc_id.clone(),
         from: Box::new(vpc_from),
         to: vpc_to,
-        lifecycle: cbd_lifecycle.clone(),
+        directives: cbd_directives.clone(),
         changed_create_only: vec!["attr".to_string()],
         cascading_updates: vec![],
         temporary_name: None,
@@ -445,7 +445,7 @@ async fn test_phased_cbd_creates_in_forward_order_deletes_in_reverse() {
         id: subnet_id.clone(),
         from: Box::new(subnet_from),
         to: subnet_to,
-        lifecycle: cbd_lifecycle,
+        directives: cbd_directives,
         changed_create_only: vec!["attr".to_string()],
         cascading_updates: vec![],
         temporary_name: None,
@@ -501,14 +501,14 @@ async fn test_phased_noncbd_creates_after_deletes() {
     subnet_to.binding = Some("subnet".to_string());
     subnet_to.dependency_bindings = std::collections::BTreeSet::from(["vpc".to_string()]);
 
-    let dbd_lifecycle = LifecycleConfig::default();
+    let dbd_directives = Directives::default();
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(vpc_from),
         to: vpc_to,
-        lifecycle: dbd_lifecycle.clone(),
+        directives: dbd_directives.clone(),
         changed_create_only: vec!["attr".to_string()],
         cascading_updates: vec![],
         temporary_name: None,
@@ -518,7 +518,7 @@ async fn test_phased_noncbd_creates_after_deletes() {
         id: subnet_id.clone(),
         from: Box::new(subnet_from),
         to: subnet_to,
-        lifecycle: dbd_lifecycle,
+        directives: dbd_directives,
         changed_create_only: vec!["attr".to_string()],
         cascading_updates: vec![],
         temporary_name: None,
@@ -1030,14 +1030,14 @@ fn test_build_dependency_levels_respects_delete_dependencies() {
     plan.add(Effect::Delete {
         id: ResourceId::new("ec2.Vpc", "my-vpc"),
         identifier: "vpc-123".to_string(),
-        lifecycle: LifecycleConfig::default(),
+        directives: Directives::default(),
         binding: Some("vpc".to_string()),
         dependencies: HashSet::new(), // vpc has no deps
     });
     plan.add(Effect::Delete {
         id: ResourceId::new("ec2.Subnet", "my-subnet"),
         identifier: "subnet-456".to_string(),
-        lifecycle: LifecycleConfig::default(),
+        directives: Directives::default(),
         binding: Some("subnet".to_string()),
         dependencies: HashSet::from(["vpc".to_string()]), // subnet depends on vpc
     });
@@ -1154,14 +1154,14 @@ fn test_build_dependency_map_respects_delete_dependencies() {
     plan.add(Effect::Delete {
         id: ResourceId::new("ec2.Vpc", "my-vpc"),
         identifier: "vpc-123".to_string(),
-        lifecycle: LifecycleConfig::default(),
+        directives: Directives::default(),
         binding: Some("vpc".to_string()),
         dependencies: HashSet::new(),
     });
     plan.add(Effect::Delete {
         id: ResourceId::new("ec2.Subnet", "my-subnet"),
         identifier: "subnet-456".to_string(),
-        lifecycle: LifecycleConfig::default(),
+        directives: Directives::default(),
         binding: Some("subnet".to_string()),
         dependencies: HashSet::from(["vpc".to_string()]),
     });
@@ -1367,7 +1367,7 @@ async fn test_delete_waits_for_replace_cbd_of_dependent() {
     attachment_to.binding = Some("attachment".to_string());
     attachment_to.dependency_bindings = std::collections::BTreeSet::from(["tgw_b".to_string()]);
 
-    let cbd_lifecycle = LifecycleConfig {
+    let cbd_directives = Directives {
         create_before_destroy: true,
         ..Default::default()
     };
@@ -1383,7 +1383,7 @@ async fn test_delete_waits_for_replace_cbd_of_dependent() {
     plan.add(Effect::Delete {
         id: tgw_a_id.clone(),
         identifier: "tgw-old".to_string(),
-        lifecycle: Default::default(),
+        directives: Default::default(),
         binding: Some("tgw_a".to_string()),
         dependencies: tgw_a_deps,
     });
@@ -1393,7 +1393,7 @@ async fn test_delete_waits_for_replace_cbd_of_dependent() {
         id: attachment_id.clone(),
         from: Box::new(attachment_from),
         to: attachment_to,
-        lifecycle: cbd_lifecycle,
+        directives: cbd_directives,
         changed_create_only: vec!["transit_gateway_id".to_string()],
         cascading_updates: vec![],
         temporary_name: None,
@@ -1456,7 +1456,7 @@ async fn test_delete_waits_for_replace_cbd_even_when_delete_binding_is_none() {
     attachment_to.binding = Some("attachment".to_string());
     attachment_to.dependency_bindings = std::collections::BTreeSet::from(["tgw_b".to_string()]);
 
-    let cbd_lifecycle = LifecycleConfig {
+    let cbd_directives = Directives {
         create_before_destroy: true,
         ..Default::default()
     };
@@ -1472,7 +1472,7 @@ async fn test_delete_waits_for_replace_cbd_even_when_delete_binding_is_none() {
     plan.add(Effect::Delete {
         id: tgw_a_id.clone(),
         identifier: "tgw-old".to_string(),
-        lifecycle: Default::default(),
+        directives: Default::default(),
         binding: None,
         dependencies: tgw_a_deps,
     });
@@ -1482,7 +1482,7 @@ async fn test_delete_waits_for_replace_cbd_even_when_delete_binding_is_none() {
         id: attachment_id.clone(),
         from: Box::new(attachment_from),
         to: attachment_to,
-        lifecycle: cbd_lifecycle,
+        directives: cbd_directives,
         changed_create_only: vec!["transit_gateway_id".to_string()],
         cascading_updates: vec![],
         temporary_name: None,

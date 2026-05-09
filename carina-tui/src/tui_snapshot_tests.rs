@@ -10,7 +10,7 @@ use ratatui::backend::TestBackend;
 
 use carina_core::effect::Effect;
 use carina_core::plan::Plan;
-use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
+use carina_core::resource::{Directives, Resource, ResourceId, State, Value};
 use carina_core::schema::SchemaRegistry;
 
 use crate::app::App;
@@ -108,7 +108,7 @@ fn build_mixed_operations_plan() -> Plan {
     plan.add(Effect::Delete {
         id: ResourceId::new("ec2.Subnet", "old-subnet"),
         identifier: "subnet-12345678".to_string(),
-        lifecycle: LifecycleConfig::default(),
+        directives: Directives::default(),
         binding: Some("old_subnet".to_string()),
         dependencies: HashSet::new(),
     });
