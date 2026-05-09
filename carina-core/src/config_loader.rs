@@ -179,6 +179,13 @@ pub fn load_configuration_with_config(
             return Err(e.to_string());
         }
 
+        // Promote any deferred provider attributes (e.g. non-literal
+        // `default_tags`) into their typed fields now that resolution
+        // is complete. See `finalize_provider_configs` (#2717).
+        if let Err(e) = parser::finalize_provider_configs(&mut merged) {
+            return Err(e.to_string());
+        }
+
         // Identifier-scope checks are accumulated rather than short-
         // circuited so `carina validate` can keep going and report every
         // static error in one pass (#2102, #2126, #2138).
@@ -277,6 +284,13 @@ pub fn parse_directory_with_overrides(
 
     // Resolve cross-file references on the merged result
     if let Err(e) = parser::resolve_resource_refs_with_config(&mut merged, config) {
+        return Err(e.to_string());
+    }
+
+    // Promote any deferred provider attributes (e.g. non-literal
+    // `default_tags`) into their typed fields now that resolution
+    // is complete. See `finalize_provider_configs` (#2717).
+    if let Err(e) = parser::finalize_provider_configs(&mut merged) {
         return Err(e.to_string());
     }
 
