@@ -111,12 +111,8 @@ impl BackendLock {
     /// Persist this lock snapshot at the project root.
     pub fn save(&self, base_dir: &Path) -> BackendResult<()> {
         let path = Self::lock_path(base_dir);
-        let mut contents = serde_json::to_string_pretty(self)
+        let contents = carina_core::utils::pretty_with_newline(self)
             .map_err(|e| BackendError::Serialization(e.to_string()))?;
-        // Match the trailing-newline convention used by
-        // `carina-providers.lock` so POSIX tooling and "add final
-        // newline" editors agree on the file shape.
-        contents.push('\n');
         std::fs::write(&path, contents)
             .map_err(|e| BackendError::Io(format!("Failed to write {}: {}", path.display(), e)))?;
         Ok(())

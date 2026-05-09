@@ -35,12 +35,7 @@ impl MockProvider {
         if let Some(parent) = self.state_file.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut content = serde_json::to_string_pretty(states)?;
-        // Match the trailing-newline convention used by
-        // carina.state.json (#2721) and carina-backend.lock (#2583)
-        // so POSIX tooling and "add final newline" editors agree on
-        // the file shape.
-        content.push('\n');
+        let content = carina_core::utils::pretty_with_newline(states)?;
         fs::write(&self.state_file, content)
     }
 

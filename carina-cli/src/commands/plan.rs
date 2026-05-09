@@ -382,13 +382,8 @@ pub async fn run_plan(
     if let Some(out_path) = out {
         let plan_file = build_plan_file(path, &parsed, &state_file, &ctx)
             .map_err(|e| format_plan_save_error(&e, "--out"))?;
-        let mut json_out = serde_json::to_string_pretty(&plan_file)
+        let json_out = carina_core::utils::pretty_with_newline(&plan_file)
             .map_err(|e| format!("Failed to serialize plan: {}", e))?;
-        // Match the trailing-newline convention used by
-        // carina-backend.lock, carina.state.json, and
-        // carina-providers.lock so POSIX tooling and "add final
-        // newline" editors agree on the file shape.
-        json_out.push('\n');
         fs::write(out_path, json_out).map_err(|e| format!("Failed to write plan file: {}", e))?;
 
         println!();
