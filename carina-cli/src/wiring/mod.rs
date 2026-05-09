@@ -198,6 +198,22 @@ pub fn validate_resources_with_ctx<E>(
     ))
 }
 
+/// Surface `directives.depends_on` analysis-pass error diagnostics as
+/// `AppError::Validation`. Warnings are emitted to stderr (no
+/// AppError::Warning variant exists today) so they don't fail the
+/// command but remain visible.
+pub fn validate_depends_on_with_ctx<E>(parsed: &carina_core::parser::File<E>) -> Vec<AppError> {
+    use carina_core::validation::depends_on::{Severity, validate_depends_on};
+    let mut errors = Vec::new();
+    for diag in validate_depends_on(parsed) {
+        match diag.severity {
+            Severity::Error => errors.push(AppError::Validation(diag.message)),
+            Severity::Warning => eprintln!("warning: {}", diag.message),
+        }
+    }
+    errors
+}
+
 pub fn validate_resource_ref_types_with_ctx<E>(
     ctx: &WiringContext,
     parsed: &carina_core::parser::File<E>,

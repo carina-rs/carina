@@ -161,6 +161,45 @@ fn directives_serde_default() {
 }
 
 #[test]
+fn directives_depends_on_defaults_to_empty() {
+    let d = Directives::default();
+    assert_eq!(d.depends_on, Vec::<String>::new());
+}
+
+#[test]
+fn directives_depends_on_round_trips_serde() {
+    let d = Directives {
+        depends_on: vec!["role".to_string(), "key".to_string()],
+        ..Directives::default()
+    };
+    let json = serde_json::to_string(&d).unwrap();
+    let back: Directives = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.depends_on, d.depends_on);
+}
+
+#[test]
+fn directives_serialises_without_depends_on_when_empty() {
+    // Avoid state-file noise: an empty depends_on must not appear as
+    // `"depends_on": []` in serialised JSON, otherwise every legacy
+    // state file will gain a meaningless key on first re-write.
+    let d = Directives::default();
+    let json = serde_json::to_string(&d).unwrap();
+    assert!(
+        !json.contains("depends_on"),
+        "empty depends_on should be skipped in serialisation, got {}",
+        json
+    );
+}
+
+#[test]
+fn directives_depends_on_deserialises_from_legacy_json_without_field() {
+    let legacy =
+        r#"{ "force_delete": false, "create_before_destroy": false, "prevent_destroy": false }"#;
+    let d: Directives = serde_json::from_str(legacy).unwrap();
+    assert_eq!(d.depends_on, Vec::<String>::new());
+}
+
+#[test]
 fn directives_with_force_delete() {
     let config = Directives {
         force_delete: true,

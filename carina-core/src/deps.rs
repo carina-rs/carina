@@ -29,6 +29,9 @@ pub fn get_resource_dependencies(resource: &Resource) -> HashSet<String> {
     for name in &resource.dependency_bindings {
         deps.insert(name.clone());
     }
+    for name in &resource.directives.depends_on {
+        deps.insert(name.clone());
+    }
     deps
 }
 
@@ -37,6 +40,23 @@ fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
     value.visit_refs(&mut |path| {
         deps.insert(path.binding().to_string());
     });
+}
+
+/// Like [`get_resource_dependencies`], but excludes `directives.depends_on`.
+///
+/// The parser/resolver snapshots this into `Resource.dependency_bindings`
+/// before reference resolution. Keeping the depends_on edges out of that
+/// snapshot is what lets the validation pass tell a redundant edge apart
+/// from a depends_on-only edge.
+pub fn get_resource_value_ref_dependencies(resource: &Resource) -> HashSet<String> {
+    let mut deps = HashSet::new();
+    for value in resource.attributes.values() {
+        collect_dependencies(value, &mut deps);
+    }
+    for name in &resource.dependency_bindings {
+        deps.insert(name.clone());
+    }
+    deps
 }
 
 /// Sort resources topologically based on dependencies.
@@ -803,5 +823,32 @@ mod tests {
 
         let result = find_failed_dependent("c", &dependents_map, &failed_bindings);
         assert_eq!(result, Some(&"a".to_string()));
+    }
+
+    #[test]
+    fn directives_depends_on_is_unioned_into_resource_dependencies() {
+        let mut bucket = Resource::new("s3.Bucket", "bucket");
+        bucket.directives.depends_on = vec!["role".to_string()];
+
+        let deps = get_resource_dependencies(&bucket);
+        assert!(
+            deps.contains("role"),
+            "expected directives.depends_on entry to surface in get_resource_dependencies, got {:?}",
+            deps
+        );
+    }
+
+    #[test]
+    fn directives_depends_on_unions_with_value_refs() {
+        let mut bucket = Resource::new("s3.Bucket", "bucket");
+        bucket.set_attr(
+            "encryption_key".to_string(),
+            Value::resource_ref("key", "arn", vec![]),
+        );
+        bucket.directives.depends_on = vec!["role".to_string()];
+
+        let deps = get_resource_dependencies(&bucket);
+        assert!(deps.contains("key"), "value-ref dep missing");
+        assert!(deps.contains("role"), "directives.depends_on dep missing");
     }
 }

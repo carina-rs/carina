@@ -1959,4 +1959,58 @@ impl DiagnosticEngine {
         }
         out
     }
+
+    /// Mirror `validate_depends_on` errors/warnings in the editor.
+    /// Diagnostics anchor at the first `depends_on` token in the buffer
+    /// — per-element spans need pest spans plumbed through the
+    /// validation pass and are deferred.
+    pub(super) fn check_depends_on(&self, doc: &Document, parsed: &ParsedFile) -> Vec<Diagnostic> {
+        use carina_core::validation::depends_on::{Severity, validate_depends_on};
+        let diags = validate_depends_on(parsed);
+        if diags.is_empty() {
+            return Vec::new();
+        }
+        let text = doc.text();
+        let (line, col, end_col) = find_first_depends_on(&text).unwrap_or((0, 0, 0));
+        diags
+            .into_iter()
+            .map(|d| {
+                let severity = match d.severity {
+                    Severity::Error => DiagnosticSeverity::ERROR,
+                    Severity::Warning => DiagnosticSeverity::WARNING,
+                };
+                carina_diagnostic(line, col, end_col, severity, d.message)
+            })
+            .collect()
+    }
+}
+
+/// Locate the first `depends_on` token in the buffer for diagnostic
+/// anchoring. Skips comment lines and verifies the match isn't a
+/// substring of a longer identifier (e.g., `depends_on_role`).
+/// Returns `(line, start_col, end_col)` in character columns.
+fn find_first_depends_on(text: &str) -> Option<(u32, u32, u32)> {
+    for (line_idx, line) in text.lines().enumerate() {
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        let mut search_from = 0;
+        while let Some(rel) = line[search_from..].find("depends_on") {
+            let byte_col = search_from + rel;
+            let after = byte_col + "depends_on".len();
+            let prev_ok = byte_col == 0
+                || !line.as_bytes()[byte_col - 1].is_ascii_alphanumeric()
+                    && line.as_bytes()[byte_col - 1] != b'_';
+            let next_ok = after == line.len()
+                || !line.as_bytes()[after].is_ascii_alphanumeric()
+                    && line.as_bytes()[after] != b'_';
+            if prev_ok && next_ok {
+                let prefix = &line[..byte_col];
+                let col = prefix.chars().count() as u32;
+                return Some((line_idx as u32, col, col + "depends_on".len() as u32));
+            }
+            search_from = after;
+        }
+    }
+    None
 }

@@ -140,7 +140,7 @@ pub fn resolve_resource_refs_with_config(
     // This preserves direct dependencies that would be lost by recursive resolution
     // (e.g., tgw_attach.transit_gateway_id resolves to tgw.id, losing the tgw_attach dep).
     for resource in &mut parsed.resources {
-        let deps = crate::deps::get_resource_dependencies(resource);
+        let deps = crate::deps::get_resource_value_ref_dependencies(resource);
         if !deps.is_empty() {
             resource.dependency_bindings = deps.into_iter().collect();
         }

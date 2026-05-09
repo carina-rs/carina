@@ -1,0 +1,14 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  + aws.iam.Role role
+      assume_role_policy_document: "{}"
+      role_name: "my-role"
+        │
+        └─ + aws.s3.Bucket 
+              bucket_name: "my-bucket"
+
+Plan: 2 to add, 0 to change, 0 to destroy.

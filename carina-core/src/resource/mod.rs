@@ -1077,6 +1077,12 @@ pub struct Directives {
     /// If true, prevent the resource from being destroyed
     #[serde(default)]
     pub prevent_destroy: bool,
+    /// Explicit ordering edges declared by the user. Each element is the
+    /// binding name of a sibling `let` (resource / wait / module).
+    /// Set semantics (deduplicated, order-insensitive); represented as
+    /// Vec to preserve source order for `carina fmt` round-tripping.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
 }
 
 /// Source of a resource (root or from a module)

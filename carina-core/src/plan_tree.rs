@@ -342,3 +342,36 @@ pub fn shorten_service_name<'a>(attr_name: &str, value: &'a str) -> Cow<'a, str>
     }
     Cow::Borrowed(value)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::Plan;
+    use crate::resource::Resource;
+
+    #[test]
+    fn explicit_only_depends_on_edge_is_in_dependency_graph() {
+        let role = Resource::new("iam.Role", "role").with_binding("role".to_string());
+        let mut bucket = Resource::new("s3.Bucket", "bucket").with_binding("bucket".to_string());
+        bucket.directives.depends_on = vec!["role".to_string()];
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(role));
+        plan.add(Effect::Create(bucket));
+        let graph = build_dependency_graph(&plan);
+
+        let bucket_idx = *graph
+            .binding_to_effect
+            .get("bucket")
+            .expect("bucket effect indexed by binding");
+        let bucket_deps = graph
+            .effect_deps
+            .get(&bucket_idx)
+            .expect("bucket effect has deps map entry");
+        assert!(
+            bucket_deps.contains("role"),
+            "explicit depends_on edge should be in dependency graph; got {:?}",
+            bucket_deps
+        );
+    }
+}

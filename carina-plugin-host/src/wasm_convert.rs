@@ -1020,6 +1020,7 @@ mod tests {
             force_delete: true,
             create_before_destroy: false,
             prevent_destroy: false,
+            depends_on: Vec::new(),
         };
         let json = directives_to_json(&directives);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();

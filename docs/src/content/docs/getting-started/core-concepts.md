@@ -135,3 +135,32 @@ Available directives:
 | `force_delete` | `false` | Force-delete the resource (e.g., non-empty S3 buckets) |
 | `create_before_destroy` | `false` | Create the replacement before destroying the old resource |
 | `prevent_destroy` | `false` | Block any plan that would destroy this resource |
+| `depends_on` | `[]` | Explicit ordering edges to sibling `let` bindings — see below |
+
+#### `depends_on`
+
+Most ordering between resources comes from value references — when
+resource B references `a.id`, Carina knows B must be created after A.
+Some dependencies are not value references, though: an IAM Role grants
+permissions another resource needs at create-time, but the dependent
+resource never names the role by ARN. `depends_on` declares those
+explicit ordering edges:
+
+```crn
+let role = aws.iam.Role {
+  role_name                   = 'my-role'
+  assume_role_policy_document = '{}'
+}
+
+aws.s3.Bucket {
+  bucket_name = 'my-bucket'
+  directives { depends_on = [role] }
+}
+```
+
+Elements must be **bare binding identifiers**, not string literals
+(`[role]` ✓, `["role"]` ✗) and not attribute selectors (`[role.id]` ✗).
+`depends_on` accepts resource and module bindings. Data sources and
+`upstream_state` bindings are rejected at validate time. A redundant
+edge (one already implied by a value reference) is reported as a
+warning.
