@@ -986,6 +986,65 @@ impl CompletionProvider {
         let mut items = self.completions_for_type(attr_type, None);
         items.extend(Self::builtin_function_completions_for_type(attr_type));
         items.extend(self.resource_ref_completions_for_type(attr_type, text, base_path));
+        items.extend(self.upstream_state_ref_completions_for_type(attr_type, text, base_path));
+        items
+    }
+
+    /// `<upstream_binding>.<exported_name>` references whose declared
+    /// `TypeExpr` is compatible with `target`. Mirrors
+    /// [`Self::resource_ref_completions_for_type`] but the source of
+    /// truth is the upstream project's `exports {}` block (read via
+    /// `resolve_upstream_exports_cached`) rather than a local schema.
+    /// Shared by every `value_completions_for_attribute_type` caller —
+    /// without this the consumer of an upstream `oidc_provider_arn`
+    /// wouldn't see `<upstream>.oidc_provider_arn` after `=` (#2621).
+    fn upstream_state_ref_completions_for_type(
+        &self,
+        target: &AttributeType,
+        text: &str,
+        base_path: Option<&Path>,
+    ) -> Vec<CompletionItem> {
+        let mut items: Vec<CompletionItem> = Vec::new();
+        let mut src_buf = String::new();
+        let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
+        let upstream_sources = super::collect_upstream_state_bindings(src);
+        let mut exports_cache: std::collections::HashMap<
+            String,
+            carina_core::upstream_exports::UpstreamExportEntries,
+        > = std::collections::HashMap::new();
+        for (binding, source) in &upstream_sources {
+            let exports = resolve_upstream_exports_cached(
+                binding,
+                source,
+                base_path,
+                &self.schemas,
+                &mut exports_cache,
+            );
+            for (export_name, entry) in exports {
+                let Some(export_type) = &entry.type_expr else {
+                    continue;
+                };
+                if !carina_core::validation::is_type_expr_compatible_with_schema(
+                    export_type,
+                    target,
+                ) {
+                    continue;
+                }
+                let full_ref = format!("{}.{}", binding, export_name);
+                items.push(CompletionItem {
+                    label: full_ref.clone(),
+                    kind: Some(CompletionItemKind::REFERENCE),
+                    detail: Some(format!(
+                        "export from upstream_state `{}` ({})",
+                        binding,
+                        self.format_type_expr(export_type)
+                    )),
+                    insert_text: Some(full_ref),
+                    ..Default::default()
+                });
+            }
+        }
+        items.sort_by(|a, b| a.label.cmp(&b.label));
         items
     }
 
