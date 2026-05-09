@@ -24,6 +24,7 @@ pub use ast::{
     ValidateExpr, ValidationBlock,
 };
 pub use config::{DecryptorFn, ProviderContext, ValidatorFn};
+pub(crate) use entry::parse_with_seeded_bindings;
 pub use entry::{parse, parse_and_resolve};
 pub(crate) use entry::{parse_expression, parse_expression_eval};
 pub use error::{ParseError, ParseWarning};

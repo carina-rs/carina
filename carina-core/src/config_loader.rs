@@ -65,103 +65,71 @@ pub fn load_configuration_with_config(
             return Err(format!("No .crn files found in {}", path.display()));
         }
 
-        let empty_parsed = ParsedFile::default;
-        let mut merged = empty_parsed();
-        let mut unresolved_merged = empty_parsed();
-        let mut parse_errors = Vec::new();
-        let mut backend_file: Option<PathBuf> = None;
-
+        // Read every file once and run the directory-aware parse so
+        // each file's `ParseContext` is seeded with the binding-name
+        // union from sibling `.crn`s. Without this, e.g. an
+        // `arguments {}` in `main.crn` would be invisible to `${env}`
+        // interpolations in sibling `role.crn` (#2815, #2817).
+        let mut file_inputs: Vec<(PathBuf, String)> = Vec::with_capacity(files.len());
         for file in &files {
             let content = fs::read_to_string(file)
                 .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
-            match parser::parse(&content, config) {
-                Ok(mut parsed) => {
-                    // Stamp the full source path onto warnings and deferred
-                    // for-expressions. Bare filenames are ambiguous when a
-                    // project spans multiple `.crn` files (and identically
-                    // named files in sibling directories), and they break
-                    // editor jump-to-location.
-                    let file_path = Some(file.display().to_string());
-                    for w in &mut parsed.warnings {
-                        w.file = file_path.clone();
-                    }
-                    for d in &mut parsed.deferred_for_expressions {
-                        d.file = file_path.clone();
-                    }
+            file_inputs.push((file.clone(), content));
+        }
+        let parsed_files = match parse_directory_files(&file_inputs, config) {
+            Ok(v) => v,
+            Err(e) => return Err(format!("{}: {}", path.display(), e)),
+        };
 
-                    let unresolved = parsed.clone();
-                    if let Err(e) = parser::resolve_resource_refs_with_config(&mut parsed, config) {
-                        parse_errors.push(format!("{}: {}", file.display(), e));
-                        continue;
-                    }
+        let empty_parsed = ParsedFile::default;
+        let mut merged = empty_parsed();
+        let mut unresolved_merged = empty_parsed();
+        let mut parse_errors: Vec<String> = Vec::new();
+        let mut backend_file: Option<PathBuf> = None;
 
-                    // Merge unresolved
-                    unresolved_merged.providers.extend(unresolved.providers);
-                    unresolved_merged.resources.extend(unresolved.resources);
-                    unresolved_merged.variables.extend(unresolved.variables);
-                    unresolved_merged.uses.extend(unresolved.uses);
-                    unresolved_merged
-                        .module_calls
-                        .extend(unresolved.module_calls);
-                    unresolved_merged.arguments.extend(unresolved.arguments);
-                    unresolved_merged
-                        .attribute_params
-                        .extend(unresolved.attribute_params);
-                    unresolved_merged
-                        .export_params
-                        .extend(unresolved.export_params);
-                    unresolved_merged
-                        .state_blocks
-                        .extend(unresolved.state_blocks);
-                    unresolved_merged
-                        .user_functions
-                        .extend(unresolved.user_functions);
-                    unresolved_merged
-                        .upstream_states
-                        .extend(unresolved.upstream_states);
-                    unresolved_merged
-                        .structural_bindings
-                        .extend(unresolved.structural_bindings);
-                    unresolved_merged.warnings.extend(unresolved.warnings);
-                    unresolved_merged
-                        .deferred_for_expressions
-                        .extend(unresolved.deferred_for_expressions);
+        for (file, mut parsed) in parsed_files {
+            // Stamp the full source path onto warnings and deferred
+            // for-expressions. Bare filenames are ambiguous when a
+            // project spans multiple `.crn` files (and identically
+            // named files in sibling directories), and they break
+            // editor jump-to-location.
+            let file_path = Some(file.display().to_string());
+            for w in &mut parsed.warnings {
+                w.file = file_path.clone();
+            }
+            for d in &mut parsed.deferred_for_expressions {
+                d.file = file_path.clone();
+            }
 
-                    // Merge resolved
-                    merged.providers.extend(parsed.providers);
-                    merged.resources.extend(parsed.resources);
-                    merged.variables.extend(parsed.variables);
-                    merged.uses.extend(parsed.uses);
-                    merged.module_calls.extend(parsed.module_calls);
-                    merged.arguments.extend(parsed.arguments);
-                    merged.attribute_params.extend(parsed.attribute_params);
-                    merged.export_params.extend(parsed.export_params);
-                    merged.state_blocks.extend(parsed.state_blocks);
-                    merged.user_functions.extend(parsed.user_functions);
-                    merged.upstream_states.extend(parsed.upstream_states);
-                    merged.requires.extend(parsed.requires);
-                    merged
-                        .structural_bindings
-                        .extend(parsed.structural_bindings);
-                    merged.warnings.extend(parsed.warnings);
-                    merged
-                        .deferred_for_expressions
-                        .extend(parsed.deferred_for_expressions);
-                    // Merge backend (only one allowed)
-                    if let Some(backend) = parsed.backend {
-                        if merged.backend.is_some() {
-                            parse_errors.push(format!(
-                                "{}: multiple backend blocks defined",
-                                file.display()
-                            ));
-                        } else {
-                            merged.backend = Some(backend);
-                            backend_file = Some(file.clone());
-                        }
-                    }
-                }
-                Err(e) => {
-                    parse_errors.push(format!("{}: {}", file.display(), e));
+            let mut unresolved = parsed.clone();
+            if let Err(e) = parser::resolve_resource_refs_with_config(&mut parsed, config) {
+                parse_errors.push(format!("{}: {}", file.display(), e));
+                continue;
+            }
+
+            // The legacy form unrolled both `merge_parsed_file` calls
+            // because the match arm needed independent control over
+            // backend collision. Now that the match is gone, both
+            // merges can delegate to the same helper. Backend collision
+            // for `merged` is checked explicitly below (mirroring the
+            // legacy "multiple backend blocks defined" error); the
+            // unresolved copy only ever stored a single backend, so we
+            // strip it before merging to avoid accidentally overwriting
+            // `unresolved_merged.backend`.
+            unresolved.backend = None;
+            merge_parsed_file(&mut unresolved_merged, unresolved);
+
+            let backend = parsed.backend.take();
+            merge_parsed_file(&mut merged, parsed);
+            if let Some(backend) = backend {
+                if merged.backend.is_some() {
+                    parse_errors.push(format!(
+                        "{}: multiple backend blocks defined",
+                        file.display()
+                    ));
+                } else {
+                    merged.backend = Some(backend);
+                    backend_file = Some(file.clone());
                 }
             }
         }
@@ -252,34 +220,34 @@ pub fn parse_directory_with_overrides(
         return Err(format!("No .crn files found in {}", dir.display()));
     }
 
-    let mut merged = ParsedFile::default();
-    let mut parse_errors = Vec::new();
-
+    // Resolve every file's source text (disk or override) up front so
+    // the directory-aware parse helper sees the right inputs. #2817.
+    let mut file_inputs: Vec<(PathBuf, String)> = Vec::with_capacity(paths.len());
     for (file, name) in &paths {
         let content = match overrides.get(name) {
             Some(buffer) => buffer.clone(),
             None => fs::read_to_string(file)
                 .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?,
         };
-        match parser::parse(&content, config) {
-            Ok(mut parsed) => {
-                let file_path = Some(file.display().to_string());
-                for w in &mut parsed.warnings {
-                    w.file = file_path.clone();
-                }
-                for d in &mut parsed.deferred_for_expressions {
-                    d.file = file_path.clone();
-                }
-                merge_parsed_file(&mut merged, parsed);
-            }
-            Err(e) => {
-                parse_errors.push(format!("{}: {}", file.display(), e));
-            }
-        }
+        file_inputs.push((file.clone(), content));
     }
 
-    if !parse_errors.is_empty() {
-        return Err(parse_errors.join("\n"));
+    let parsed_files = match parse_directory_files(&file_inputs, config) {
+        Ok(v) => v,
+        Err(e) => return Err(format!("{}: {}", dir.display(), e)),
+    };
+
+    let mut merged = ParsedFile::default();
+
+    for (file, mut parsed) in parsed_files {
+        let file_path = Some(file.display().to_string());
+        for w in &mut parsed.warnings {
+            w.file = file_path.clone();
+        }
+        for d in &mut parsed.deferred_for_expressions {
+            d.file = file_path.clone();
+        }
+        merge_parsed_file(&mut merged, parsed);
     }
 
     // Resolve cross-file references on the merged result
@@ -326,6 +294,58 @@ pub(crate) fn merge_parsed_file(target: &mut ParsedFile, source: ParsedFile) {
     if let Some(backend) = source.backend {
         target.backend = Some(backend);
     }
+}
+
+/// Parse every `(path, source)` pair as part of a single directory unit.
+///
+/// Two-pass implementation that addresses the sibling-scope class
+/// (#2817):
+///
+/// - **Pass 1** parses every input with an empty seed list. This is the
+///   legacy per-file parse — sibling-defined names are not in scope, so
+///   ResourceRef / String fallback paths fire as before. The Pass-1
+///   `ParsedFile`s are merged only to collect the *binding-name union*
+///   from sibling files; the merged result itself is discarded.
+/// - **Pass 2** parses every input again, this time seeding the per-file
+///   `ParseContext` with the binding-name union from Pass 1. Names that
+///   originate in *sibling* files now resolve through the normal
+///   `ctx.get_variable` / `ctx.is_resource_binding` paths, so an
+///   `arguments {}` block in `main.crn` is visible from `role.crn`,
+///   a `let` declared in `helpers.crn` is visible from `main.crn`,
+///   etc.
+///
+/// The returned vector preserves the input order. Any per-file parse
+/// error from Pass 2 short-circuits and is returned to the caller; Pass
+/// 1 swallows nothing — if Pass 1 fails on a file, Pass 2 will fail on
+/// the same file with the same error.
+///
+/// Pass-1 cost is paid once per directory load. Each call to
+/// `parse_with_seeded_bindings` with an empty seed list is a no-op
+/// in `seed_bindings`, so single-file callers (parser tests, the
+/// `parse(input, config)` wrapper) pay zero overhead.
+pub fn parse_directory_files(
+    files: &[(PathBuf, String)],
+    config: &ProviderContext,
+) -> Result<Vec<(PathBuf, ParsedFile)>, parser::ParseError> {
+    // Pass 1: collect the binding-name union from a regular per-file
+    // parse. Errors here propagate identically to Pass 2 (same input,
+    // same parser path), so don't try to be clever about saving them.
+    let mut union = ParsedFile::default();
+    for (_, content) in files {
+        let parsed = parser::parse(content, config)?;
+        merge_parsed_file(&mut union, parsed);
+    }
+    let seeds: Vec<&str> = parser::collect_known_bindings_merged(&union)
+        .into_iter()
+        .collect();
+
+    // Pass 2: re-parse each file with the union seeded into `ctx`.
+    let mut out = Vec::with_capacity(files.len());
+    for (path, content) in files {
+        let parsed = parser::parse_with_seeded_bindings(content, config, &seeds)?;
+        out.push((path.clone(), parsed));
+    }
+    Ok(out)
 }
 
 /// Get base directory for module resolution.

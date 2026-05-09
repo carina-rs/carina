@@ -114,15 +114,25 @@ impl<'cfg> ModuleResolver<'cfg> {
     }
 
     /// Load all .crn files from a directory and merge them into a single ParsedFile.
+    ///
+    /// Routed through [`crate::config_loader::parse_directory_files`] so
+    /// every file's `ParseContext` is seeded with the binding-name union
+    /// from sibling `.crn` files. Without this, `arguments {}` declared
+    /// in `main.crn` would be invisible to `${env}` interpolations in
+    /// sibling `role.crn` (#2815). #2817.
     fn load_directory_module(&self, dir_path: &Path) -> Result<ParsedFile, ModuleError> {
-        let mut merged = ParsedFile::default();
+        let paths = sorted_crn_paths_in(dir_path)?;
+        let mut files: Vec<(std::path::PathBuf, String)> = Vec::with_capacity(paths.len());
+        for path in paths {
+            let content = std::fs::read_to_string(&path)?;
+            files.push((path, content));
+        }
+        let parsed_files = crate::config_loader::parse_directory_files(&files, self.config)?;
 
-        for file_path in sorted_crn_paths_in(dir_path)? {
-            let content = std::fs::read_to_string(&file_path)?;
-            let parsed = crate::parser::parse(&content, self.config)?;
+        let mut merged = ParsedFile::default();
+        for (_, parsed) in parsed_files {
             crate::config_loader::merge_parsed_file(&mut merged, parsed);
         }
-
         Ok(merged)
     }
 

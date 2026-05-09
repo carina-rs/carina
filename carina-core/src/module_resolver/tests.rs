@@ -1242,8 +1242,6 @@ fn create_module_with_interpolation() -> ParsedFile {
 
 #[test]
 fn test_expand_module_call_with_interpolation() {
-    use crate::resource::InterpolationPart;
-
     let resolver = {
         let mut r = ModuleResolver::new(".");
         r.imported_modules
@@ -1277,13 +1275,14 @@ fn test_expand_module_call_with_interpolation() {
     );
     assert_eq!(vpc.get_attr("env"), Some(&Value::String("dev".to_string())));
 
-    // Interpolation with argument should have the argument value substituted
+    // Interpolation with argument substitutes and canonicalizes back to
+    // a flat `String` so downstream `Value::String` consumers (state
+    // diff, plan rendering) see the resolved value. Without the post-
+    // substitution canonicalize, this would stay as
+    // `Interpolation([Literal("test-"), Expr(String("dev"))])` (#2815, #2817).
     assert_eq!(
         vpc.get_attr("name"),
-        Some(&Value::Interpolation(vec![
-            InterpolationPart::Literal("test-".to_string()),
-            InterpolationPart::Expr(Value::String("dev".to_string())),
-        ]))
+        Some(&Value::String("test-dev".to_string())),
     );
 }
 
@@ -2669,13 +2668,23 @@ m {
     assert_eq!(policy_map.get("y_value"), Some(&Value::Int(42)));
 }
 
-// #2393 — argument defaults are resolved in declaration order; a default
-// that refers to a later-declared argument has no in-scope binding when its
-// expression is parsed and degrades to the literal identifier name. This
-// test pins the current behavior so any future change (e.g. moving to a
-// two-pass resolution that allows forward refs) is explicit.
+// #2393 — argument defaults are still resolved in strict declaration
+// order by `substitute_arguments` (see `expander.rs`). A forward-ref
+// default like `prefix = later` cannot pick up `later`'s value at
+// substitution time because `later` hasn't been processed yet.
+//
+// Before #2817, the parser also degraded the forward identifier `later`
+// to a literal `Value::String("later")`, hiding the order-sensitive
+// nature behind a wrong-but-plausible string. With the directory-aware
+// parse pipeline, every argument name is seeded into the per-file
+// `ParseContext`, so the forward identifier surfaces as a structured
+// `ResourceRef` placeholder. That is strictly more honest — downstream
+// scope / type checks now see the unresolved reference and can flag
+// it. Wiring a fixed-point or topological resolution that completes
+// the substitution is a separate follow-up; this test pins the new
+// surface behavior.
 #[test]
-fn test_argument_default_forward_ref_degrades_to_literal() {
+fn test_argument_default_forward_ref_stays_as_ref_under_seeded_parse() {
     let parsed = resolve_default_arg_fixture(
         r#"
 arguments {
@@ -2695,12 +2704,19 @@ m {}
 "#,
     );
 
-    assert_eq!(
-        role_attr(&parsed, "role_name"),
-        &Value::String("later".to_string()),
-        "forward-ref default falls back to the literal identifier name; \
-         resolution is order-sensitive (see #2393)"
-    );
+    let role_name = role_attr(&parsed, "role_name");
+    match role_name {
+        Value::ResourceRef { path } => {
+            assert_eq!(path.binding(), "later");
+            assert_eq!(path.attribute(), "");
+            assert!(path.field_path().is_empty());
+            assert!(path.subscripts().is_empty());
+        }
+        other => panic!(
+            "forward-ref default should surface as `ResourceRef(later)` post-seeding; \
+             got {other:?}"
+        ),
+    }
 }
 
 // #2393 — caller-supplied ResourceRefs (cross-module data flow) must NOT be
@@ -3375,5 +3391,121 @@ fn caller_side_value_in_string_literal_union_is_accepted() {
         result.is_ok(),
         "Caller passing 'prod' (in the declared union) must be accepted. Got: {:?}",
         result
+    );
+}
+
+/// Acceptance test for #2815 / #2817. An `arguments {}` block declared in
+/// `main.crn` must be visible to identifier references in *sibling* `.crn`
+/// files in the same module directory. Before #2817, the per-file
+/// `ParseContext` could not see sibling-defined symbols, so `${env}` in
+/// `role.crn` lowered to a literal `Value::String("env")` — `role_name`
+/// rendered as `"test-role-env"` instead of `"test-role-dev"`. The
+/// directory-aware parse pipeline seeds every file's `ParseContext` with
+/// the union of declared names from all sibling files, so the normal
+/// `ctx.get_variable` path resolves the reference uniformly.
+#[test]
+fn test_arguments_visible_to_sibling_crn_files() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let module_dir = tmp.path().join("modules/usecase");
+    fs::create_dir_all(&module_dir).unwrap();
+    fs::write(
+        module_dir.join("main.crn"),
+        r#"
+arguments {
+  env: String
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        module_dir.join("role.crn"),
+        r#"
+let role = awscc.iam.Role {
+  role_name = "test-role-${env}"
+  assume_role_policy_document = {}
+}
+"#,
+    )
+    .unwrap();
+
+    let root_dir = tmp.path().join("root");
+    fs::create_dir_all(&root_dir).unwrap();
+    fs::write(
+        root_dir.join("main.crn"),
+        r#"
+let uc = use { source = '../modules/usecase' }
+let r  = uc { env = 'dev' }
+"#,
+    )
+    .unwrap();
+
+    let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
+    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    resolve_modules(&mut parsed, &root_dir).expect("resolve_modules should succeed");
+
+    assert_eq!(
+        role_names(&parsed),
+        ["test-role-dev".to_string()]
+            .into_iter()
+            .collect::<HashSet<_>>(),
+        "argument `env` declared in `main.crn` must substitute into `${{env}}` \
+         interpolation in sibling `role.crn`",
+    );
+}
+
+/// Regression for the seeding-vs-local-duplicate corner of #2817.
+///
+/// Inside the directory-aware Pass-2 parse, every binding name from
+/// the merged Pass-1 result is seeded into the per-file
+/// `ParseContext`. The seeded name MUST NOT mask a real in-file
+/// duplicate (`arguments { foo }` and `let foo = ...` in the same
+/// file). The shadow logic is to drop the seed mark the moment a
+/// local declaration overwrites it; if a *second* local declaration
+/// then appears, the regular duplicate-binding error must still
+/// trigger.
+#[test]
+fn test_local_duplicate_still_detected_under_seeded_parse() {
+    // The duplicate is `let foo = "y"` colliding with `arguments { foo }`,
+    // which both register `foo` as a binding. Seeding (a sibling file
+    // with `let foo = ...`) primed the seed mark; the `arguments` block
+    // must drop it so the subsequent `let foo` is still a duplicate.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let module_dir = tmp.path().join("modules/dup");
+    fs::create_dir_all(&module_dir).unwrap();
+    fs::write(
+        module_dir.join("main.crn"),
+        r#"
+arguments {
+  foo: String
+}
+
+let foo = "y"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        module_dir.join("sibling.crn"),
+        "# also has foo via let later\nlet foo_other = \"z\"\n",
+    )
+    .unwrap();
+
+    let root_dir = tmp.path().join("root");
+    fs::create_dir_all(&root_dir).unwrap();
+    fs::write(
+        root_dir.join("main.crn"),
+        r#"
+let m = use { source = '../modules/dup' }
+m { foo = 'x' }
+"#,
+    )
+    .unwrap();
+
+    let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
+    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let err = resolve_modules(&mut parsed, &root_dir).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("DuplicateBinding") && msg.contains("foo"),
+        "expected DuplicateBinding for `foo`; got {msg}"
     );
 }

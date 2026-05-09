@@ -51,15 +51,24 @@ pub(super) fn sorted_crn_paths_in(dir_path: &Path) -> std::io::Result<Vec<PathBu
 ///
 /// Returns `None` if the directory cannot be read or contains no module
 /// definitions (no arguments/attributes).
+///
+/// Routed through [`crate::config_loader::parse_directory_files`] so
+/// every file's `ParseContext` is seeded with the binding-name union
+/// from sibling `.crn` files (#2817).
 pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
-    let mut merged = ParsedFile::default();
-
-    for path in sorted_crn_paths_in(dir_path).ok()? {
-        if let Ok(content) = fs::read_to_string(&path)
-            && let Ok(parsed) = crate::parser::parse(&content, &ProviderContext::default())
-        {
-            crate::config_loader::merge_parsed_file(&mut merged, parsed);
+    let paths = sorted_crn_paths_in(dir_path).ok()?;
+    let mut files: Vec<(PathBuf, String)> = Vec::with_capacity(paths.len());
+    for path in paths {
+        if let Ok(content) = fs::read_to_string(&path) {
+            files.push((path, content));
         }
+    }
+    let parsed_files =
+        crate::config_loader::parse_directory_files(&files, &ProviderContext::default()).ok()?;
+
+    let mut merged = ParsedFile::default();
+    for (_, parsed) in parsed_files {
+        crate::config_loader::merge_parsed_file(&mut merged, parsed);
     }
 
     if merged.arguments.is_empty() && merged.attribute_params.is_empty() {
@@ -106,16 +115,26 @@ pub fn derive_module_name(path: &Path) -> String {
 ///
 /// Unlike [`load_directory_module`], this returns a `Result` with descriptive
 /// error messages and does not check for module definitions (inputs/outputs).
+///
+/// Routed through [`crate::config_loader::parse_directory_files`] for
+/// directory-aware parse (#2817).
 pub fn load_module_from_directory(dir: &Path) -> Result<ParsedFile, String> {
     let paths = sorted_crn_paths_in(dir)
         .map_err(|e| format!("Failed to read directory {}: {}", dir.display(), e))?;
 
-    let mut merged = ParsedFile::default();
+    let mut files: Vec<(PathBuf, String)> = Vec::with_capacity(paths.len());
     for path in paths {
         let content = fs::read_to_string(&path)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-        let parsed = crate::parser::parse(&content, &ProviderContext::default())
-            .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
+        files.push((path, content));
+    }
+
+    let parsed_files =
+        crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
+            .map_err(|e| format!("Failed to parse directory {}: {}", dir.display(), e))?;
+
+    let mut merged = ParsedFile::default();
+    for (_, parsed) in parsed_files {
         crate::config_loader::merge_parsed_file(&mut merged, parsed);
     }
 

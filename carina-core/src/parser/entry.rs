@@ -35,7 +35,45 @@ use pest::Parser;
 ///
 /// The config allows injecting a decryptor function for `decrypt()` calls
 /// and custom type validators from provider crates.
+///
+/// **Single-file API.** Sibling-defined names (a `let` in another `.crn`,
+/// an `arguments {}` declared in `main.crn` and referenced from a
+/// sibling) are *not* in scope. Production code paths that read a
+/// directory of `.crn` files must go through
+/// [`crate::config_loader::parse_directory_files`], which collects the
+/// sibling binding-name union in Pass 1 and re-parses every file with
+/// the union seeded into `ParseContext` in Pass 2. See #2817
+/// (directory-aware parse) for the broader contract.
 pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseError> {
+    parse_with_seeded_bindings(input, config, &[])
+}
+
+/// Parse a .crn file with `seeds` pre-registered as lexical bindings.
+///
+/// Each name in `seeds` is registered in the per-file [`ParseContext`]
+/// the same way `register_argument_binding` does: a placeholder
+/// `Value::ResourceRef { binding: <name>, attribute: "", … }` is
+/// installed in `ctx.variables`, and a placeholder `Resource` is
+/// installed in `ctx.resource_bindings`. This means subsequent
+/// expressions resolve the name via the normal `ctx.get_variable` /
+/// `ctx.is_resource_binding` paths instead of degrading to the literal-
+/// string fallback in `primary.rs::variable_ref` / `parse_namespaced_id_value`.
+///
+/// The seed list is the directory aggregate: every binding declared in
+/// any sibling `.crn` (resource bindings, argument names, attribute
+/// names, export names, user-function names, `use` aliases,
+/// `upstream_state` bindings). The caller is responsible for collecting
+/// it via a Phase-1 unseeded parse and passing the union here.
+///
+/// Names already declared inside `input` itself (re-introduced by the
+/// regular parse) win over the seeded placeholder — the parser overwrites
+/// the seed entry the moment it processes the local `let` / `arguments`
+/// / etc. that introduces the name.
+pub fn parse_with_seeded_bindings(
+    input: &str,
+    config: &ProviderContext,
+    seeds: &[&str],
+) -> Result<ParsedFile, ParseError> {
     let preprocess_result =
         crate::heredoc::preprocess_heredocs(input).map_err(|e| ParseError::InvalidExpression {
             line: 0,
@@ -44,6 +82,7 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
     let pairs = CarinaParser::parse(Rule::file, &preprocess_result.source)?;
 
     let mut ctx = ParseContext::new(config);
+    seed_bindings(&mut ctx, seeds);
     let mut providers = Vec::new();
     let mut resources = Vec::new();
     let mut uses = Vec::new();
@@ -181,12 +220,36 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
                                 let is_discard = name == "_";
                                 let is_upstream_state = ctx.upstream_states.contains_key(&name);
                                 if !is_discard {
-                                    if ctx.variables.contains_key(&name)
-                                        || ctx.resource_bindings.contains_key(&name)
+                                    // A seeded placeholder (from a sibling-file
+                                    // declaration during the directory-aware
+                                    // Pass-2 parse, #2817) is not a real
+                                    // duplicate — the local declaration is the
+                                    // real one for *this* file. Drop the seed
+                                    // mark so subsequent in-file redeclarations
+                                    // still trip the duplicate check.
+                                    let shadows_seed = ctx.is_seeded_binding(&name);
+                                    if !shadows_seed
+                                        && (ctx.variables.contains_key(&name)
+                                            || ctx.resource_bindings.contains_key(&name))
                                     {
                                         return Err(ParseError::DuplicateBinding { name, line });
                                     }
-                                    if !is_upstream_state {
+                                    if shadows_seed {
+                                        ctx.unmark_seeded(&name);
+                                    }
+                                    if is_upstream_state {
+                                        // upstream_state lets do not bind a
+                                        // user-facing value; legacy semantics
+                                        // is "no entry in `variables`". When a
+                                        // seed pre-installed a placeholder
+                                        // under this name, drop it so the
+                                        // ParsedFile we hand back doesn't
+                                        // leak the seeded `ResourceRef` into
+                                        // downstream walkers (#2817).
+                                        if shadows_seed {
+                                            ctx.variables.shift_remove(&name);
+                                        }
+                                    } else {
                                         ctx.set_variable(name.clone(), value);
                                     }
                                 }
@@ -296,6 +359,23 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
         warnings: ctx.warnings,
         deferred_for_expressions: ctx.deferred_for_expressions,
     })
+}
+
+/// Pre-register `seeds` as lexical bindings in `ctx`. Mirrors the
+/// shape of `register_argument_binding` so seeded names resolve through
+/// the same `ctx.get_variable` / `ctx.is_resource_binding` paths that
+/// locally-declared `let` / `arguments` names use after parsing.
+///
+/// Empty seed list is a no-op — single-file callers (the legacy
+/// `parse(input, config)` wrapper, parser tests) pay no cost.
+fn seed_bindings(ctx: &mut ParseContext<'_>, seeds: &[&str]) {
+    for &name in seeds {
+        let placeholder_ref = Value::resource_ref(name.to_string(), String::new(), vec![]);
+        ctx.set_variable(name.to_string(), placeholder_ref);
+        let placeholder = Resource::new("_seeded", name);
+        ctx.set_resource_binding(name.to_string(), placeholder);
+        ctx.seeded_bindings.insert(name.to_string());
+    }
 }
 
 /// Parse an expression. The result is a fully-reduced `Value`: any
