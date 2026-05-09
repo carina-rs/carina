@@ -242,9 +242,14 @@ impl StateBackend for LocalBackend {
     }
 
     async fn write_state(&self, state: &StateFile) -> BackendResult<()> {
-        let content = serde_json::to_string_pretty(state).map_err(|e| {
+        let mut content = serde_json::to_string_pretty(state).map_err(|e| {
             BackendError::Serialization(format!("Failed to serialize state: {}", e))
         })?;
+        // Match the trailing-newline convention used by
+        // carina-backend.lock and carina-providers.lock so POSIX
+        // tooling and "add final newline" editors agree on the
+        // file shape.
+        content.push('\n');
 
         // Write to a temp file in the same directory, then rename atomically
         let tmp_path = self.state_path.with_extension("json.tmp");
@@ -568,6 +573,26 @@ mod tests {
         assert!(read_state.is_some());
         let read_state = read_state.unwrap();
         assert_eq!(read_state.serial, 1);
+    }
+
+    // Pin the byte-level shape so carina.state.json matches the
+    // trailing-newline convention used by carina-backend.lock and
+    // carina-providers.lock (#2583).
+    #[tokio::test]
+    async fn state_file_ends_with_trailing_newline() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("test.state.json");
+        let backend = LocalBackend::with_path(state_path.clone());
+        let mut state_file = StateFile::new();
+        state_file.increment_serial();
+        backend.write_state(&state_file).await.unwrap();
+        let bytes = std::fs::read(&state_path).unwrap();
+        assert_eq!(
+            bytes.last().copied(),
+            Some(b'\n'),
+            "carina.state.json must end with a trailing newline; got {:?}",
+            bytes.last().map(|b| *b as char),
+        );
     }
 
     #[tokio::test]
