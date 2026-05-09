@@ -392,6 +392,14 @@ impl DiagnosticEngine {
     /// Run a directory-scoped parse with the current editor buffer substituted
     /// for its on-disk copy, so diagnostics that need cross-file context
     /// (upstream-state exports, for-iterable bindings) update on keystrokes.
+    ///
+    /// After the directory parse, run module expansion +
+    /// `resolve_provider_unresolved_attributes` + `finalize_provider_configs`
+    /// so deferred provider attributes (e.g. `default_tags = mod.tags`) reach
+    /// their typed fields and the LSP catches the same errors `carina validate`
+    /// would (#2717). A finalize error is non-fatal here: the merged parse is
+    /// still returned so identifier-scope and other diagnostics keep running;
+    /// the error itself surfaces via [`Self::finalize_provider_diagnostic`].
     pub(super) fn parse_merged_with_buffer(
         &self,
         doc: &Document,
@@ -402,12 +410,63 @@ impl DiagnosticEngine {
         if let Some(name) = current_file_name {
             overrides.insert(name.to_string(), doc.text());
         }
-        carina_core::config_loader::parse_directory_with_overrides(
+        let mut merged = carina_core::config_loader::parse_directory_with_overrides(
             base_path,
             &self.provider_context,
             &overrides,
         )
-        .ok()
+        .ok()?;
+        // Module expansion is a no-op for configs without `module_call`, and
+        // safe to ignore-if-fails for module-loading errors (sibling LSP
+        // checks like `check_module_calls` already report those). We only
+        // care about reaching finalize on the typical case.
+        let _ = carina_core::module_resolver::resolve_modules_with_config(
+            &mut merged,
+            base_path,
+            &self.provider_context,
+        );
+        let _ = carina_core::parser::resolve_provider_unresolved_attributes(
+            &mut merged,
+            &self.provider_context,
+        );
+        let _ = carina_core::parser::finalize_provider_configs(&mut merged);
+        Some(merged)
+    }
+
+    /// Run finalize-against-a-buffer in isolation so the engine can surface
+    /// `default_tags must resolve to a map` etc. as diagnostics. The merged
+    /// parse + module-expansion + resolve pair is rebuilt here intentionally:
+    /// `parse_merged_with_buffer` swallows the finalize error to keep
+    /// identifier-scope diagnostics running, but that error must surface
+    /// somewhere (#2717 / #2753).
+    pub(super) fn finalize_provider_diagnostic(
+        &self,
+        doc: &Document,
+        current_file_name: Option<&str>,
+        base_path: &std::path::Path,
+    ) -> Option<carina_core::parser::ParseError> {
+        let mut overrides: HashMap<String, String> = HashMap::new();
+        if let Some(name) = current_file_name {
+            overrides.insert(name.to_string(), doc.text());
+        }
+        let mut merged = carina_core::config_loader::parse_directory_with_overrides(
+            base_path,
+            &self.provider_context,
+            &overrides,
+        )
+        .ok()?;
+        let _ = carina_core::module_resolver::resolve_modules_with_config(
+            &mut merged,
+            base_path,
+            &self.provider_context,
+        );
+        if let Err(e) = carina_core::parser::resolve_provider_unresolved_attributes(
+            &mut merged,
+            &self.provider_context,
+        ) {
+            return Some(e);
+        }
+        carina_core::parser::finalize_provider_configs(&mut merged).err()
     }
 
     /// Collect every binding name declared anywhere in `base_path` by

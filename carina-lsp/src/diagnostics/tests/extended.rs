@@ -3685,3 +3685,61 @@ fn empty_interpolation_diagnostic_is_warning_not_error() {
         "empty interpolation is a mid-edit hint, not a hard error"
     );
 }
+
+#[test]
+fn lsp_flags_undefined_let_reference_in_provider_block() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    let file = base.join("providers.crn");
+    std::fs::write(
+        &file,
+        r#"
+provider awscc {
+  source       = "github.com/carina-rs/carina-provider-awscc"
+  revision     = "main"
+  default_tags = nonexistent.tags
+}
+"#,
+    )
+    .unwrap();
+
+    let engine = test_engine();
+    let buffer = std::fs::read_to_string(&file).unwrap();
+    let diags = analyze_with_buffer(&engine, base, "providers.crn", &buffer);
+
+    assert!(
+        diags.iter().any(|d| d.message.contains("nonexistent")),
+        "LSP must surface UndefinedIdentifier for `nonexistent`; got: {:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn lsp_flags_non_map_default_tags() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    let file = base.join("providers.crn");
+    std::fs::write(
+        &file,
+        r#"
+let bad = "not a map"
+
+provider awscc {
+  source       = "github.com/carina-rs/carina-provider-awscc"
+  revision     = "main"
+  default_tags = bad
+}
+"#,
+    )
+    .unwrap();
+
+    let engine = test_engine();
+    let buffer = std::fs::read_to_string(&file).unwrap();
+    let diags = analyze_with_buffer(&engine, base, "providers.crn", &buffer);
+
+    assert!(
+        diags.iter().any(|d| d.message.contains("default_tags")),
+        "LSP must surface non-map default_tags error; got: {:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+    );
+}
