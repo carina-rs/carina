@@ -3,10 +3,40 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
+use pest::Parser;
+
 use super::ast::{ResourceTypePath, TypeExpr};
 use super::error::{ParseError, ParseWarning};
 use super::util::{pascal_to_snake, snake_to_pascal};
 use super::{ProviderContext, Rule, first_inner, next_pair};
+
+/// Parse a standalone type-expression text snippet (e.g. `"String"`,
+/// `"List(Int)"`, `"'dev' | 'prod'"`) into a [`TypeExpr`].
+///
+/// Returns `None` when the input doesn't match the type-expression
+/// grammar — callers can use this to short-circuit type-aware
+/// behavior (e.g. LSP completion ranking) without aborting; an
+/// unparseable type hint just falls back to the un-typed path.
+///
+/// The full trimmed input must match — trailing tokens cause `None`
+/// rather than a silent prefix match. This matters for mid-edit
+/// buffers like `param: Bool foo` where pest's default greedy
+/// behavior would otherwise accept `Bool` and drop ` foo`, producing
+/// a wrong type that would then drive completion filtering.
+///
+/// This wraps the internal pest entry point so consumers outside
+/// the parser module (LSP, tests, tooling) can lift textual type
+/// hints into the type system without re-implementing pest plumbing.
+pub fn parse_type_expr_str(input: &str, config: &ProviderContext) -> Option<TypeExpr> {
+    let trimmed = input.trim();
+    let mut pairs = super::CarinaParser::parse(super::Rule::type_expr, trimmed).ok()?;
+    let pair = pairs.next()?;
+    if pair.as_span().end() != trimmed.len() {
+        return None;
+    }
+    let mut warnings: Vec<ParseWarning> = Vec::new();
+    parse_type_expr(pair, config, &mut warnings).ok()
+}
 
 /// Parse type expression. Handles unions of atomic types
 /// (`'dev' | 'prod'`, see carina-rs/carina#2611) by collecting every
@@ -170,5 +200,61 @@ fn parse_type_expr_atom(
             Ok(TypeExpr::Struct { fields })
         }
         _ => Ok(TypeExpr::String),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_type_expr_str_accepts_primitive() {
+        let ctx = ProviderContext::default();
+        assert!(matches!(
+            parse_type_expr_str("Bool", &ctx),
+            Some(TypeExpr::Bool)
+        ));
+        assert!(matches!(
+            parse_type_expr_str("String", &ctx),
+            Some(TypeExpr::String)
+        ));
+    }
+
+    #[test]
+    fn parse_type_expr_str_trims_surrounding_whitespace() {
+        let ctx = ProviderContext::default();
+        assert!(matches!(
+            parse_type_expr_str("  String  ", &ctx),
+            Some(TypeExpr::String)
+        ));
+    }
+
+    #[test]
+    fn parse_type_expr_str_rejects_trailing_junk() {
+        // Without the end-of-input check this would silently match
+        // `Bool` and drop ` foo`, producing a wrong type. Mid-edit
+        // buffers where the user has typed past the type need the
+        // bypass — `None` here lets the completion filter fall
+        // through to "show everything".
+        let ctx = ProviderContext::default();
+        assert_eq!(parse_type_expr_str("Bool foo", &ctx), None);
+    }
+
+    #[test]
+    fn parse_type_expr_str_pascal_simple() {
+        let ctx = ProviderContext::default();
+        // PascalCase identifier → TypeExpr::Simple(snake_case)
+        assert!(matches!(
+            parse_type_expr_str("IamOidcProviderArn", &ctx),
+            Some(TypeExpr::Simple(ref s)) if s == "iam_oidc_provider_arn"
+        ));
+    }
+
+    #[test]
+    fn parse_type_expr_str_rejects_unparseable() {
+        let ctx = ProviderContext::default();
+        assert_eq!(parse_type_expr_str("!!!", &ctx), None);
+        assert_eq!(parse_type_expr_str("List(", &ctx), None);
+        assert_eq!(parse_type_expr_str("", &ctx), None);
     }
 }

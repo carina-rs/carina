@@ -401,8 +401,23 @@ pub fn is_type_expr_compatible_with_schema(
         TypeExpr::Int => matches!(attr_type, AttributeType::Int),
         TypeExpr::Float => matches!(attr_type, AttributeType::Float),
         TypeExpr::Simple(name) => {
-            // Walk the base chain: if any type in the chain matches, it's compatible.
-            // e.g., Simple("arn") accepts KmsKeyArn (chain: KmsKeyArn → Arn ✓)
+            // Two compatibility directions both succeed:
+            //
+            // 1. Receiver more specific than value. Walk the
+            //    receiver's `Custom` chain looking for a level whose
+            //    `type_name()` matches `name`. `Simple("arn")` is
+            //    accepted by `Custom { KmsKeyArn → Arn }` because
+            //    the chain contains `Arn`. Sibling Customs
+            //    (`kms_key_arn` vs `IamRoleArn`) stay rejected
+            //    because no chain level matches. Issue #1874.
+            //
+            // 2. Value more specific than receiver (subtyping into
+            //    plain string). `Simple(name)` represents a
+            //    particular kind of string; flowing it into a plain
+            //    `String` receiver erases nothing. The reverse
+            //    direction (`String` value into a Custom-with-
+            //    semantic-name receiver) stays rejected by
+            //    `attr_type_demands_specific_custom`.
             let mut current = attr_type;
             loop {
                 let type_snake = crate::parser::pascal_to_snake(&current.type_name());
@@ -411,9 +426,10 @@ pub fn is_type_expr_compatible_with_schema(
                 }
                 match current {
                     AttributeType::Custom { base, .. } => current = base,
-                    _ => return false,
+                    _ => break,
                 }
             }
+            is_plain_string_or_string_union(attr_type)
         }
         TypeExpr::List(inner) => match attr_type {
             AttributeType::List {
@@ -476,6 +492,19 @@ pub fn is_string_compatible_type(attr_type: &AttributeType) -> bool {
             true
         }
         AttributeType::Union(types) => types.iter().all(is_string_compatible_type),
+        _ => false,
+    }
+}
+
+/// Returns `true` only for receivers that name no specific identity:
+/// plain `String` or a `Union` of plain Strings. The wider sibling
+/// [`is_string_compatible_type`] also accepts `Custom` and `StringEnum`
+/// receivers, but those carry constraints (specific identity / fixed
+/// value set) that would be erased by accepting a `Simple(name)` value.
+fn is_plain_string_or_string_union(attr_type: &AttributeType) -> bool {
+    match attr_type {
+        AttributeType::String => true,
+        AttributeType::Union(types) => types.iter().all(is_plain_string_or_string_union),
         _ => false,
     }
 }

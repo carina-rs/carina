@@ -612,7 +612,18 @@ let igw_attachment = awscc.ec2.vpc_gateway_attachment {
 }
 
 #[test]
-fn builtin_function_completions_in_value_position() {
+fn builtin_function_completions_suppressed_at_value_position() {
+    // Built-in functions are intentionally NOT emitted at the bare
+    // value position. The return-type filter in
+    // `builtin_function_completions_for_type` is too coarse to honor
+    // `Custom { semantic_name: ... }` receivers, so a popup including
+    // every String-returning builtin promised correctness it couldn't
+    // deliver and crowded out the in-scope reference candidates.
+    // Builtins remain reachable by typing the function name directly;
+    // a follow-up can add a `<id>(`-triggered surface if explicit
+    // function-call completion is wanted. Pre-existing precedents:
+    // `971f1b78` (Struct attrs hide builtins) and `45f9d0b6`
+    // (post-`binding.` hides builtins). #2643.
     let provider = test_provider();
     let doc = create_document(
         r#"awscc.ec2.Vpc {
@@ -627,22 +638,14 @@ fn builtin_function_completions_in_value_position() {
     let completions = provider.complete(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
-    // Should include built-in function names
-    assert!(
-        labels.contains(&"join"),
-        "Should suggest 'join' function. Got: {:?}",
-        labels
-    );
-    assert!(
-        labels.contains(&"upper"),
-        "Should suggest 'upper' function. Got: {:?}",
-        labels
-    );
-    assert!(
-        labels.contains(&"cidr_subnet"),
-        "Should suggest 'cidr_subnet' function. Got: {:?}",
-        labels
-    );
+    for builtin in ["join", "upper", "cidr_subnet", "lower", "lookup", "length"] {
+        assert!(
+            !labels.contains(&builtin),
+            "Built-in `{}` must NOT appear at bare value position. Got: {:?}",
+            builtin,
+            labels
+        );
+    }
 }
 
 #[test]
@@ -2348,10 +2351,14 @@ fn namespaced_enum_completions_offer_full_form_not_bare_tail() {
     );
 }
 
-/// A plain `String` attribute still sees string-returning built-ins, and
-/// list-returning ones stay filtered out — guards against over-filtering.
+/// Builtins are intentionally suppressed at the bare value position
+/// (#2643): the return-type filter is too coarse to honor Custom
+/// receivers, and a popup full of String-returning helpers crowded
+/// out the in-scope identifiers users actually wanted. Even on a
+/// plain `String` attribute, no builtin should reach the popup —
+/// users who want to call one type the name directly.
 #[test]
-fn string_returning_builtins_still_offered_for_plain_string_attr() {
+fn builtins_suppressed_at_plain_string_value_position() {
     let provider = test_provider_single_attr();
     let doc = create_document(
         r#"test.foo.bar {
@@ -2365,19 +2372,14 @@ fn string_returning_builtins_still_offered_for_plain_string_attr() {
     };
     let completions = provider.complete(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
-    for builtin in ["join", "upper", "lower"] {
+    for builtin in ["join", "upper", "lower", "concat", "length", "keys"] {
         assert!(
-            labels.contains(&builtin),
-            "string-returning '{}' must appear at plain String attr. Got: {:?}",
+            !labels.contains(&builtin),
+            "builtin '{}' must NOT appear at plain String value position. Got: {:?}",
             builtin,
             labels
         );
     }
-    assert!(
-        !labels.contains(&"concat"),
-        "list-returning 'concat' must not appear at String attr. Got: {:?}",
-        labels
-    );
 }
 
 #[test]
@@ -3908,6 +3910,259 @@ let role = test.foo.bar {
     assert!(
         labels.contains(&"helper"),
         "expected sibling-file `let` binding `helper` at value position. Got: {:?}",
+        labels
+    );
+}
+
+// =====================================================================
+// Type-aware filtering of value-position candidates (#2643)
+//
+// At a typed value position (`attr = ▉` where the schema declares a
+// concrete type), arguments and builtin functions whose declared
+// return type is incompatible with the target attribute's type must
+// not appear in the popup. The filter uses
+// `carina_core::validation::is_type_expr_compatible_with_schema`,
+// already used elsewhere in the same handler for `for-loop` bindings
+// and `upstream_state` exports.
+//
+// Bare `let` binding names stay unfiltered (they have no scalar
+// value type — `<binding>.<attr>` REFERENCE candidates remain the
+// type-precise way to reach them, and that path already filters by
+// `Custom` semantic-name match).
+//
+// When the target attribute's type can't be resolved (schema lookup
+// missed, no attr_name matched, etc.), the filter is bypassed —
+// "show everything" is the safer fallback than "show nothing."
+// =====================================================================
+
+#[test]
+fn value_position_excludes_type_incompatible_argument() {
+    // `cidr_block` is typed `String`. An argument typed `bool` cannot
+    // produce a String, so it must not appear at this cursor.
+    let provider = test_provider_with_vpc_and_security_group();
+    let text = "\
+arguments {
+  cidr: String
+  enabled: Bool
+}
+
+awscc.ec2.Vpc {
+  cidr_block =
+}
+";
+    let doc = create_document(text);
+    let position = Position {
+        line: 6,
+        character: "  cidr_block = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"cidr"),
+        "type-compatible argument `cidr` (String) must appear at String cursor. Got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.contains(&"enabled"),
+        "type-incompatible argument `enabled` (bool) must not appear at String cursor. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn value_position_suppresses_all_builtins() {
+    // Builtins are intentionally NOT emitted at the bare value
+    // position regardless of target type. Even String-returning
+    // helpers like `lower` / `upper` / `join` are suppressed —
+    // their return types are too coarse to honor a Custom-typed
+    // receiver, and the popup noise crowded out the in-scope
+    // reference candidates that are the real point. Users who
+    // want to call a builtin type the name directly. (#2643)
+    let provider = test_provider_with_vpc_and_security_group();
+    let text = "\
+awscc.ec2.Vpc {
+  cidr_block =
+}
+";
+    let doc = create_document(text);
+    let position = Position {
+        line: 1,
+        character: "  cidr_block = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    for builtin in ["lower", "upper", "join", "env", "length", "keys", "flatten"] {
+        assert!(
+            !labels.contains(&builtin),
+            "builtin `{}` must NOT appear at value position. Got: {:?}",
+            builtin,
+            labels
+        );
+    }
+}
+
+#[test]
+fn value_position_suppresses_builtins_when_target_type_unknown() {
+    // Cursor inside an `attributes {}` block — schema lookup fails
+    // so the target type is unknown. Builtins are still suppressed
+    // (#2643): when the receiver type can't be resolved, every
+    // builtin would be ungrounded noise. The popup can be empty
+    // here; that's the safer signal than a list of candidates with
+    // no type backing.
+    let provider = test_provider_with_vpc_and_security_group();
+    let text = "\
+attributes {
+  whatever =
+}
+";
+    let doc = create_document(text);
+    let position = Position {
+        line: 1,
+        character: "  whatever = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    for builtin in ["length", "lower", "upper", "join"] {
+        assert!(
+            !labels.contains(&builtin),
+            "builtin `{}` must NOT appear when target type is unresolved. Got: {:?}",
+            builtin,
+            labels
+        );
+    }
+}
+
+#[test]
+fn value_position_let_binding_name_kept_when_target_typed() {
+    // The bare `let` binding name (`vpc`) has no scalar value type to
+    // judge against the target. It must still appear regardless of
+    // the target attr's type — typing `vpc.` then descends into the
+    // schema-precise REFERENCE pass, which already filters by Custom
+    // semantic-name match. Removing the bare name would break the
+    // tab-trigger UX delivered by #2642.
+    let provider = test_provider_with_vpc_and_security_group();
+    let text = "\
+let vpc = awscc.ec2.Vpc {
+  cidr_block = \"10.0.0.0/16\"
+}
+
+awscc.ec2.SecurityGroup {
+  vpc_id =
+}
+";
+    let doc = create_document(text);
+    let position = Position {
+        line: 5,
+        character: "  vpc_id = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"vpc"),
+        "bare `let` binding `vpc` must remain regardless of target type. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn value_position_filters_generic_string_arg_against_specific_custom_target() {
+    // Motivating case from #2640's report: `vpc_id` is a
+    // `Custom { semantic_name: Some("VpcId"), base: String }`. A
+    // generic-`String` argument cannot satisfy that — the receiver
+    // names a specific identity, and any `String` value would erase
+    // that proof. Conversely, an argument typed `vpc_id` (Simple) is
+    // structurally compatible.
+    let provider = test_provider_with_vpc_and_security_group();
+    let text = "\
+arguments {
+  generic: String
+  the_vpc: VpcId
+}
+
+awscc.ec2.SecurityGroup {
+  vpc_id =
+}
+";
+    let doc = create_document(text);
+    let position = Position {
+        line: 6,
+        character: "  vpc_id = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"the_vpc"),
+        "argument `the_vpc: VpcId` must appear at `vpc_id` cursor (Custom semantic match). Got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.contains(&"generic"),
+        "generic `String` argument must NOT appear at a `Custom {{ semantic_name: VpcId }}` cursor — the type system rejects this narrowing. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn value_position_keeps_argument_when_type_hint_unparseable() {
+    // Mid-edit safety: when an argument's type hint fails to parse
+    // (the buffer is partway through a refactor, or grammar evolved),
+    // `parse_type_expr_str` returns `None`. The filter must let that
+    // argument through rather than silently hide it — "show
+    // everything" beats "show nothing" when type info is missing.
+    let provider = test_provider_with_vpc_and_security_group();
+    // `!!!` isn't a valid type expression. The argument should still
+    // appear at a typed cursor.
+    let text = "\
+arguments {
+  broken: !!!
+}
+
+awscc.ec2.Vpc {
+  cidr_block =
+}
+";
+    let doc = create_document(text);
+    let position = Position {
+        line: 5,
+        character: "  cidr_block = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"broken"),
+        "argument with unparseable type hint must remain (mid-edit fallback). Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn value_position_no_filter_keeps_argument_when_target_type_unknown() {
+    // Companion to `value_position_no_filter_when_target_type_unknown`
+    // — that one only proves builtins are emitted unfiltered; this
+    // one proves the *argument*-filter branch also bypasses when
+    // the target type is unresolved (here: cursor inside an
+    // `attributes {}` block, so `value_completions_for_attr` receives
+    // `resource_type = ""` and the schema lookup fails).
+    let provider = test_provider_with_vpc_and_security_group();
+    let text = "\
+arguments {
+  enabled: Bool
+}
+
+attributes {
+  whatever =
+}
+";
+    let doc = create_document(text);
+    let position = Position {
+        line: 5,
+        character: "  whatever = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"enabled"),
+        "argument `enabled: Bool` must remain when target type is unresolved (filter bypassed). Got: {:?}",
         labels
     );
 }

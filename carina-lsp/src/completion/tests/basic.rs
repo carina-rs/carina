@@ -1263,8 +1263,11 @@ fn unknown_attribute_fallback_has_no_type_pollution() {
     // When value completion cannot resolve the attribute's type (the
     // attribute isn't in the schema), the fallback must not inject
     // concrete values of arbitrary types. `true`/`false` belong to Bool;
-    // `aws.Region.*` belong to Region. Built-in functions are fine —
-    // they're type-neutral.
+    // `aws.Region.*` belong to Region. Built-in functions are no longer
+    // emitted at the bare value position either (#2643) — their return
+    // types are too coarse to honor a Custom-typed receiver, and a
+    // popup full of builtins crowded out the in-scope reference
+    // candidates that the user was actually after.
     use carina_core::schema::{AttributeSchema, AttributeType, CompletionValue, ResourceSchema};
     use std::sync::Arc;
 
@@ -1302,10 +1305,13 @@ fn unknown_attribute_fallback_has_no_type_pollution() {
         "Region values must not leak into unknown-attribute fallback. Got: {:?}",
         labels
     );
-    // Sanity: built-in functions are still offered (type-neutral).
+    // Built-ins are intentionally suppressed at the bare value
+    // position (#2643). The pre-existing precedents in `971f1b78`
+    // (struct attrs hide builtins) and `45f9d0b6` (post-`binding.`
+    // hides builtins) extend here.
     assert!(
-        labels.contains(&"join"),
-        "Built-in functions should still appear. Got: {:?}",
+        !labels.contains(&"join"),
+        "Built-in functions should not appear at bare value position (#2643). Got: {:?}",
         labels
     );
 }

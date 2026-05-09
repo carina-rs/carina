@@ -108,6 +108,10 @@ impl CompletionProvider {
         completions
     }
 
+    // 8 args is over clippy's 7-default; bundling them into a context
+    // struct is a worthwhile cleanup but out of scope for #2643. Track
+    // it as a follow-up if the param list grows again.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn value_completions_for_attr(
         &self,
         resource_type: &str,
@@ -116,6 +120,7 @@ impl CompletionProvider {
         current_binding: Option<&str>,
         position: Position,
         base_path: Option<&Path>,
+        provider_ctx: &carina_core::parser::ProviderContext,
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
 
@@ -261,17 +266,54 @@ impl CompletionProvider {
             }
         }
 
-        // Bare-identifier candidates: `let` bindings declared in this
-        // directory plus `arguments {}` parameters. Without the `let`
-        // half, a binding could only reach the popup as a REFERENCE
-        // (`<binding>.<attr>`), and only when the target attr's
-        // `Custom` semantic type happened to match a binding-attr's —
-        // a too-narrow filter that hid the most common intra-file
-        // reference style. See #2642.
-        completions.extend(self.in_scope_binding_completions_with_src(
+        // Target attribute type, if the schema knows about this
+        // (resource_type, attr_name) pair. Used by both the arguments
+        // filter just below and the for-binding filter further down.
+        let target_attr_type = self
+            .lookup_schema(resource_type)
+            .and_then(|s| s.attributes.get(attr_name))
+            .map(|a| &a.attr_type);
+
+        // In-scope bare identifiers: `let` bindings + `arguments {}`
+        // parameters (#2624 / #2642). When the target attribute's
+        // type resolves, drop arguments whose declared `TypeExpr`
+        // can't produce that type — a `Bool` argument can't satisfy
+        // a `String` cursor, a generic `String` can't satisfy a
+        // `Custom { semantic_name: Some(_) }`. Bare `let` names are
+        // never filtered (no scalar value type to judge), and the
+        // filter is bypassed when the target type is unknown or the
+        // argument's type hint fails to parse — "show everything"
+        // is safer than "show nothing" mid-edit. (#2643)
+        let in_scope = self.in_scope_binding_completions_with_src(
             src,
             InScopeBindingMode::ValuePosition { current_binding },
-        ));
+        );
+        match target_attr_type {
+            None => completions.extend(in_scope),
+            Some(attr_type) => {
+                // Argument count is small (usually < 10), so a Vec
+                // walked linearly is cheaper than a HashMap.
+                let typed_arguments: Vec<(String, carina_core::parser::TypeExpr)> = self
+                    .extract_argument_parameters(src)
+                    .into_iter()
+                    .filter_map(|(name, type_hint)| {
+                        carina_core::parser::parse_type_expr_str(&type_hint, provider_ctx)
+                            .map(|t| (name, t))
+                    })
+                    .collect();
+                completions.extend(in_scope.into_iter().filter(|item| {
+                    let Some((_, arg_type_expr)) =
+                        typed_arguments.iter().find(|(n, _)| n == &item.label)
+                    else {
+                        return true;
+                    };
+                    carina_core::validation::is_type_expr_compatible_with_schema(
+                        arg_type_expr,
+                        attr_type,
+                    )
+                }));
+            }
+        }
 
         // Add for-loop binding names in scope, filtered by inferred element
         // type where possible. When the iterable is an `upstream_state`
@@ -281,10 +323,7 @@ impl CompletionProvider {
         // no schema for the target attribute) falls back to an
         // unconditional suggest so the user still gets autocomplete on
         // the bare name.
-        let attr_type_for_for_filter = self
-            .lookup_schema(resource_type)
-            .and_then(|s| s.attributes.get(attr_name))
-            .map(|a| &a.attr_type);
+        let attr_type_for_for_filter = target_attr_type;
         let for_bindings = super::top_level::extract_for_bindings_in_scope(text, position);
         for binding in &for_bindings {
             if let Some(attr_type) = attr_type_for_for_filter
@@ -328,13 +367,20 @@ impl CompletionProvider {
                 return completions;
             }
 
-            // Built-in function completions filtered by return-type fit.
-            // Offering every built-in at e.g. an `aws_account_id` cursor
-            // would pollute the popup with suggestions that can't produce
-            // the right value.
-            completions.extend(Self::builtin_function_completions_for_type(
-                &attr_schema.attr_type,
-            ));
+            // Built-in functions are intentionally NOT emitted at the
+            // bare value position. The return-type filter is too coarse
+            // to honor `Custom { semantic_name: ... }` receivers — it
+            // lets `lower(x): String` reach a `Custom { IamRoleName }`
+            // cursor even though no String can satisfy that identity.
+            // Continuing to surface them at every typed position taught
+            // "anything goes" and crowded out the in-scope reference
+            // candidates that are the real point of the popup. The
+            // pre-existing precedents are `971f1b78` (Struct attrs hide
+            // builtins) and `45f9d0b6` (post-`binding.` hides builtins) —
+            // this extends the same principle to bare value position.
+            // Builtins are still reachable by typing the function name
+            // directly; a future PR can add a `<id>(`-triggered surface
+            // if we want explicit completion for that intent. (#2643)
 
             // First check if schema defines completions for this attribute
             if let Some(schema_completions) = &attr_schema.completions {
@@ -353,11 +399,11 @@ impl CompletionProvider {
             return completions;
         }
 
-        // No schema found — offer only type-neutral candidates. Built-in
-        // functions are safe (their concrete value types depend on use),
-        // but injecting `true`/`false` or every region would pollute the
-        // list with values that can't possibly fit an unknown attribute.
-        completions.extend(self.builtin_function_completions());
+        // No schema found — return whatever in-scope identifiers the
+        // earlier passes already pushed. Builtins are intentionally
+        // suppressed here too: when the receiver type is unknown we
+        // cannot honor it, and the noise drowns out the actual scope
+        // candidates. See the comment on the typed branch above.
         completions
     }
 
@@ -959,7 +1005,13 @@ impl CompletionProvider {
             .collect()
     }
 
-    /// Provide completions for built-in function names.
+    /// Provide completions for built-in function names. No callers
+    /// in production after #2643 (builtin suppression at value
+    /// position). Kept available for unit tests that assert label /
+    /// signature shape and full coverage of the builtin registry,
+    /// and as the hook for a future `<id>(`-triggered completion
+    /// surface. Remove once that surface lands or the tests move.
+    #[allow(dead_code)]
     pub(super) fn builtin_function_completions(&self) -> Vec<CompletionItem> {
         Self::builtin_completions_matching(|_| true)
     }

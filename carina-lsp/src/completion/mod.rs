@@ -82,6 +82,7 @@ impl CompletionProvider {
         base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {
         let text = doc.text();
+        let provider_ctx = doc.provider_context();
 
         // `<binding>.<key>.<partial>` (depth-2) is checked first because
         // its prefix shape also matches the depth-1 walker's tail (which
@@ -140,6 +141,7 @@ impl CompletionProvider {
                 current_binding.as_deref(),
                 position,
                 base_path,
+                provider_ctx,
             ),
             CompletionContext::AfterEqualsInExports {
                 type_expr_text,

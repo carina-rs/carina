@@ -1738,9 +1738,27 @@ fn type_compat_exact_match() {
 }
 
 #[test]
-fn type_compat_plain_string_rejected_for_simple() {
-    // Simple("aws_account_id") rejects plain String
+fn type_compat_simple_rejected_by_mixed_string_int_union_receiver() {
+    // The subtyping branch only fires when *every* member of a
+    // `Union` receiver is plain String. A receiver typed
+    // `Union<[String, Int]>` cannot accept a `Simple(name)` value
+    // because the Int member would silently reinterpret the data.
+    let mixed = AttributeType::Union(vec![AttributeType::String, AttributeType::Int]);
     assert!(!is_type_expr_compatible_with_schema(
+        &TypeExpr::Simple("aws_account_id".to_string()),
+        &mixed,
+    ));
+}
+
+#[test]
+fn type_compat_simple_subtypes_into_plain_string() {
+    // `Simple("aws_account_id")` is a particular kind of string;
+    // the plain-`String` receiver wants any string, so the value
+    // satisfies it. The reverse direction (plain `String` value
+    // into a `Custom { semantic_name: AwsAccountId }` receiver) is
+    // rejected by `attr_type_demands_specific_custom`. See #1874
+    // and #2643.
+    assert!(is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("aws_account_id".to_string()),
         &AttributeType::String,
     ));
