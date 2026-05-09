@@ -154,7 +154,7 @@ fn list_string_enum_completions() {
         name: "Protocol".to_string(),
         values: vec!["tcp".to_string(), "udp".to_string(), "icmp".to_string()],
         namespace: None,
-        to_dsl: None,
+        dsl_aliases: vec![],
     });
 
     let schema = ResourceSchema::new("list.resource")
@@ -171,7 +171,7 @@ fn list_string_enum_completions() {
             name: "Protocol".to_string(),
             values: vec!["tcp".to_string(), "udp".to_string(), "icmp".to_string()],
             namespace: None,
-            to_dsl: None,
+            dsl_aliases: vec![],
         }),
         None,
     );
@@ -219,7 +219,7 @@ fn union_completions_include_member_types() {
                 name: "Mode".to_string(),
                 values: vec!["active".to_string(), "passive".to_string()],
                 namespace: None,
-                to_dsl: None,
+                dsl_aliases: vec![],
             },
             AttributeType::Bool,
         ]),
@@ -1027,7 +1027,7 @@ fn map_key_completions_from_string_enum_key_type() {
             name: "ConditionOperator".to_string(),
             values: condition_keys.clone(),
             namespace: None,
-            to_dsl: None,
+            dsl_aliases: vec![],
         },
         AttributeType::map(AttributeType::String),
     );

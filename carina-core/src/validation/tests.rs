@@ -1394,7 +1394,7 @@ fn is_type_expr_compatible_string_accepts_union_of_only_strings() {
             name: "Mode".to_string(),
             values: vec!["A".to_string(), "B".to_string()],
             namespace: None,
-            to_dsl: None,
+            dsl_aliases: vec![],
         },
     ]);
     assert!(
@@ -1880,7 +1880,7 @@ fn type_compat_simple_rejected_when_union_has_string_shaped_peer() {
             name: "Status".to_string(),
             values: vec!["enabled".to_string(), "disabled".to_string()],
             namespace: None,
-            to_dsl: None,
+            dsl_aliases: vec![],
         },
     ]);
     assert!(!is_type_expr_compatible_with_schema(
@@ -2094,7 +2094,7 @@ fn enum_membership_violation_in_for_body_is_flagged() {
                     name: "Mode".to_string(),
                     values: vec!["on".to_string(), "off".to_string()],
                     namespace: None,
-                    to_dsl: None,
+                    dsl_aliases: vec![],
                 },
             )],
         ),
@@ -2129,7 +2129,7 @@ fn mode_schema() -> SchemaRegistry {
                     name: "Mode".to_string(),
                     values: vec!["fast".to_string(), "slow".to_string()],
                     namespace: Some("test.r".to_string()),
-                    to_dsl: None,
+                    dsl_aliases: vec![],
                 },
             )],
         ),

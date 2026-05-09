@@ -39,7 +39,7 @@ fn validate_string_enum_type() {
         name: "AddressFamily".to_string(),
         values: vec!["IPv4".to_string(), "IPv6".to_string()],
         namespace: Some("awscc.ec2.ipam_pool".to_string()),
-        to_dsl: None,
+        dsl_aliases: vec![],
     };
     assert!(
         t.validate(&Value::String(
@@ -58,13 +58,13 @@ fn string_enum_type_name_uses_declared_name() {
         name: "VersioningStatus".to_string(),
         values: vec!["Enabled".to_string(), "Suspended".to_string()],
         namespace: Some("aws.s3.Bucket".to_string()),
-        to_dsl: None,
+        dsl_aliases: vec![],
     };
     assert_eq!(t.type_name(), "VersioningStatus");
 }
 
 #[test]
-fn validate_string_enum_accepts_to_dsl_alias() {
+fn validate_string_enum_accepts_dsl_alias() {
     let t = AttributeType::StringEnum {
         name: "IpProtocol".to_string(),
         values: vec![
@@ -75,10 +75,7 @@ fn validate_string_enum_accepts_to_dsl_alias() {
             "-1".to_string(),
         ],
         namespace: Some("awscc.ec2.SecurityGroup".to_string()),
-        to_dsl: Some(|s: &str| match s {
-            "-1" => "all".to_string(),
-            _ => s.replace('-', "_"),
-        }),
+        dsl_aliases: vec![("-1".to_string(), "all".to_string())],
     };
     // Canonical value "-1" should be accepted
     assert!(t.validate(&Value::String("-1".to_string())).is_ok());
@@ -96,10 +93,9 @@ fn validate_string_enum_accepts_to_dsl_alias() {
 }
 
 #[test]
-fn validate_string_enum_all_without_to_dsl_requires_explicit_variant() {
-    // When StringEnum goes through the protocol layer (external process
-    // providers), to_dsl and namespace are lost. Without "all" as a direct
-    // variant, it cannot be accepted (issue #1428).
+fn validate_string_enum_all_without_dsl_aliases_requires_explicit_variant() {
+    // Without "all" as a direct variant or in `dsl_aliases`, the bare
+    // identifier `all` is not accepted. Issue #1428.
     let without_all = AttributeType::StringEnum {
         name: String::new(),
         values: vec![
@@ -110,16 +106,16 @@ fn validate_string_enum_all_without_to_dsl_requires_explicit_variant() {
             "-1".to_string(),
         ],
         namespace: None,
-        to_dsl: None,
+        dsl_aliases: vec![],
     };
-    // Without "all" in values and no to_dsl alias, "all" is rejected
+    // Without "all" in values and no dsl_aliases entry mapping to "all", it is rejected
     assert!(
         without_all
             .validate(&Value::String("all".to_string()))
             .is_err()
     );
 
-    // With "all" added to values, it is accepted even without to_dsl
+    // With "all" added to values, it is accepted even without dsl_aliases
     let with_all = AttributeType::StringEnum {
         name: String::new(),
         values: vec![
@@ -131,7 +127,7 @@ fn validate_string_enum_all_without_to_dsl_requires_explicit_variant() {
             "all".to_string(),
         ],
         namespace: None,
-        to_dsl: None,
+        dsl_aliases: vec![],
     };
     assert!(with_all.validate(&Value::String("all".to_string())).is_ok());
 }
@@ -144,7 +140,7 @@ fn validate_string_enum_accepts_values_with_dots() {
         name: "Type".to_string(),
         values: vec!["ipsec.1".to_string()],
         namespace: Some("awscc.ec2.vpn_gateway".to_string()),
-        to_dsl: None,
+        dsl_aliases: vec![],
     };
     // Quoted string with dot should match directly
     assert!(t.validate(&Value::String("ipsec.1".to_string())).is_ok());
@@ -168,7 +164,7 @@ fn invalid_enum_error_preserves_user_typed_string_literal() {
         name: "TargetType".to_string(),
         values: vec!["AWS_ACCOUNT".to_string()],
         namespace: Some("awscc.sso.Assignment".to_string()),
-        to_dsl: None,
+        dsl_aliases: vec![],
     };
     let err = t.validate(&Value::String("aaa".to_string())).unwrap_err();
     let msg = err.to_string();
@@ -192,7 +188,7 @@ fn invalid_enum_error_names_the_enum_type_and_fully_qualified_variants() {
         name: "TargetType".to_string(),
         values: vec!["AWS_ACCOUNT".to_string()],
         namespace: Some("awscc.sso.Assignment".to_string()),
-        to_dsl: None,
+        dsl_aliases: vec![],
     };
     let err = t.validate(&Value::String("aaa".to_string())).unwrap_err();
     let msg = err.to_string();
@@ -215,7 +211,7 @@ fn with_attribute_adds_attribute_name_to_enum_error() {
         name: "TargetType".to_string(),
         values: vec!["AWS_ACCOUNT".to_string()],
         namespace: Some("awscc.sso.Assignment".to_string()),
-        to_dsl: None,
+        dsl_aliases: vec![],
     };
     let err = t
         .validate(&Value::String("aaa".to_string()))
@@ -262,7 +258,7 @@ fn schema_validate_wraps_enum_error_with_attribute_name() {
                 name: "TargetType".to_string(),
                 values: vec!["AWS_ACCOUNT".to_string()],
                 namespace: Some("awscc.sso.Assignment".to_string()),
-                to_dsl: None,
+                dsl_aliases: vec![],
             },
         )
         .required(),
@@ -385,7 +381,7 @@ fn schema_validate_with_origins_emits_string_literal_diagnostic_for_quoted_enum(
                 name: "TargetType".to_string(),
                 values: vec!["AWS_ACCOUNT".to_string()],
                 namespace: Some("awscc.sso.Assignment".to_string()),
-                to_dsl: None,
+                dsl_aliases: vec![],
             },
         )
         .required(),
@@ -427,7 +423,7 @@ fn schema_validate_with_origins_leaves_valid_values_alone() {
                 name: "TargetType".to_string(),
                 values: vec!["AWS_ACCOUNT".to_string()],
                 namespace: Some("awscc.sso.Assignment".to_string()),
-                to_dsl: None,
+                dsl_aliases: vec![],
             },
         )
         .required(),
@@ -502,7 +498,7 @@ fn invalid_enum_error_without_namespace_uses_bare_variants() {
         name: "Mode".to_string(),
         values: vec!["fast".to_string(), "slow".to_string()],
         namespace: None,
-        to_dsl: None,
+        dsl_aliases: vec![],
     };
     let err = t.validate(&Value::String("zzz".to_string())).unwrap_err();
     let msg = err.to_string();
@@ -527,7 +523,7 @@ fn invalid_enum_error_preserves_bare_identifier_form() {
         name: "TargetType".to_string(),
         values: vec!["AWS_ACCOUNT".to_string()],
         namespace: Some("awscc.sso.Assignment".to_string()),
-        to_dsl: None,
+        dsl_aliases: vec![],
     };
     let input = "awscc.sso.Assignment.TargetType.NOT_REAL".to_string();
     let err = t.validate(&Value::String(input.clone())).unwrap_err();
@@ -548,7 +544,7 @@ fn validate_string_enum_rejects_double_namespace() {
             "host".to_string(),
         ],
         namespace: Some("awscc.ec2.Vpc".to_string()),
-        to_dsl: None,
+        dsl_aliases: vec![],
     };
     // Double-namespace must be rejected
     assert!(
@@ -2823,14 +2819,14 @@ fn expected_includes_to_dsl_aliases_with_alias_flag() {
     // value and the alias appear in `expected`. The alias must be
     // marked `is_alias = true` so consumers (LSP code action) can
     // prefer the canonical form.
-    fn lower(v: &str) -> String {
-        v.to_ascii_lowercase()
-    }
     let t = AttributeType::StringEnum {
         name: "VersioningStatus".to_string(),
         values: vec!["Enabled".to_string(), "Suspended".to_string()],
         namespace: Some("aws.s3.Bucket".to_string()),
-        to_dsl: Some(lower),
+        dsl_aliases: vec![
+            ("Enabled".to_string(), "enabled".to_string()),
+            ("Suspended".to_string(), "suspended".to_string()),
+        ],
     };
     let err = t.validate(&Value::String("zzz".to_string())).unwrap_err();
     let TypeError::InvalidEnumVariant { expected, .. } = err else {
@@ -2979,7 +2975,7 @@ fn union_string_vs_string_enum_picks_enum_error_for_string_input() {
             name: "Mode".to_string(),
             values: vec!["fast".to_string(), "slow".to_string()],
             namespace: None,
-            to_dsl: None,
+            dsl_aliases: vec![],
         },
     ]);
     let err = union_type
@@ -3361,4 +3357,127 @@ fn walk_custom_lookup_skips_value_unknown() {
         errors.is_empty(),
         "Value::Unknown must not invoke the custom validator, got: {errors:?}"
     );
+}
+
+// =====================================================================
+// carina#2831: `StringEnum.dsl_aliases` is the data form that survives
+// the WASM-component boundary, replacing the closure-based `to_dsl`
+// pointer that could not. The validator must accept both the API
+// spelling and every DSL alias, including in fully-qualified form
+// (`awscc.<service>.<TypeName>.<dsl_spelling>`), and must list both
+// in the diagnostic for an unknown value.
+// =====================================================================
+
+#[test]
+fn dsl_aliases_validator_accepts_both_api_and_dsl_spellings() {
+    // Pinned to the awscc#199 / aws#247 reproducer:
+    // `object_ownership = bucket_owner_enforced` was rejected because
+    // the WASM-loaded schema lost the alias map. With the data form the
+    // host validator sees both spellings.
+    let t = AttributeType::StringEnum {
+        name: "ObjectOwnership".to_string(),
+        values: vec![
+            "ObjectWriter".to_string(),
+            "BucketOwnerPreferred".to_string(),
+            "BucketOwnerEnforced".to_string(),
+        ],
+        namespace: Some("awscc.s3.Bucket".to_string()),
+        dsl_aliases: vec![
+            ("ObjectWriter".to_string(), "object_writer".to_string()),
+            (
+                "BucketOwnerPreferred".to_string(),
+                "bucket_owner_preferred".to_string(),
+            ),
+            (
+                "BucketOwnerEnforced".to_string(),
+                "bucket_owner_enforced".to_string(),
+            ),
+        ],
+    };
+
+    // Bare API spelling: accepted (canonical).
+    assert!(
+        t.validate(&Value::String("BucketOwnerEnforced".to_string()))
+            .is_ok()
+    );
+    // Bare DSL spelling: accepted (alias).
+    assert!(
+        t.validate(&Value::String("bucket_owner_enforced".to_string()))
+            .is_ok()
+    );
+    // Fully-qualified API spelling: accepted.
+    assert!(
+        t.validate(&Value::String(
+            "awscc.s3.Bucket.ObjectOwnership.BucketOwnerEnforced".to_string()
+        ))
+        .is_ok()
+    );
+    // Fully-qualified DSL spelling: accepted (the awscc#199 case).
+    assert!(
+        t.validate(&Value::String(
+            "awscc.s3.Bucket.ObjectOwnership.bucket_owner_enforced".to_string()
+        ))
+        .is_ok()
+    );
+    // An unrelated value: rejected, with both spellings listed.
+    let err = t
+        .validate(&Value::String("garbage".to_string()))
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("BucketOwnerEnforced"),
+        "diagnostic must list the API spelling, got: {msg}"
+    );
+    assert!(
+        msg.contains("bucket_owner_enforced"),
+        "diagnostic must list the DSL spelling, got: {msg}"
+    );
+}
+
+#[test]
+fn dsl_aliases_diagnostic_tags_alias_entries_distinct_from_canonical() {
+    // The `expected` list carried by `TypeError::InvalidEnumVariant`
+    // tags each entry with `is_alias`, so an LSP code action can
+    // suggest the canonical form. Pin the tagging.
+    let t = AttributeType::StringEnum {
+        name: "VersioningStatus".to_string(),
+        values: vec!["Enabled".to_string(), "Suspended".to_string()],
+        namespace: Some("aws.s3.Bucket".to_string()),
+        dsl_aliases: vec![
+            ("Enabled".to_string(), "enabled".to_string()),
+            ("Suspended".to_string(), "suspended".to_string()),
+        ],
+    };
+    let err = t.validate(&Value::String("zzz".to_string())).unwrap_err();
+    let TypeError::InvalidEnumVariant { expected, .. } = err else {
+        panic!("expected InvalidEnumVariant");
+    };
+    let canonical: Vec<&str> = expected
+        .iter()
+        .filter(|e| !e.is_alias)
+        .map(|e| e.value.as_str())
+        .collect();
+    let aliases: Vec<&str> = expected
+        .iter()
+        .filter(|e| e.is_alias)
+        .map(|e| e.value.as_str())
+        .collect();
+    assert_eq!(canonical, vec!["Enabled", "Suspended"]);
+    assert_eq!(aliases, vec!["enabled", "suspended"]);
+}
+
+#[test]
+fn dsl_aliases_empty_keeps_api_only_validation() {
+    // An empty `dsl_aliases` is the wire-format default for older
+    // providers and for enums whose API spelling already matches the
+    // DSL spelling. Validation must continue to accept the API
+    // spelling and nothing else.
+    let t = AttributeType::StringEnum {
+        name: "Status".to_string(),
+        values: vec!["active".to_string(), "inactive".to_string()],
+        namespace: Some("test.r".to_string()),
+        dsl_aliases: vec![],
+    };
+    assert!(t.validate(&Value::String("active".to_string())).is_ok());
+    assert!(t.validate(&Value::String("nope".to_string())).is_err());
 }

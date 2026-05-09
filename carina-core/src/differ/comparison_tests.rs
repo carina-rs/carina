@@ -219,7 +219,7 @@ fn type_aware_string_enum_namespaced_vs_raw() {
             "aws:kms:dsse".to_string(),
         ],
         namespace: Some("awscc.s3.Bucket".to_string()),
-        to_dsl: None,
+        dsl_aliases: vec![],
     };
 
     // Namespaced form vs raw string
@@ -278,7 +278,7 @@ fn type_aware_struct_ignores_default_string_enum_empty() {
                     name: "Status".to_string(),
                     values: vec!["Active".to_string(), "Inactive".to_string()],
                     namespace: None,
-                    to_dsl: None,
+                    dsl_aliases: vec![],
                 },
             ),
         ],

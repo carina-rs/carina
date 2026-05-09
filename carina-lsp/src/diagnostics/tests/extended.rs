@@ -268,7 +268,7 @@ fn list_item_type_validation() {
         name: "Protocol".to_string(),
         values: vec!["tcp".to_string(), "udp".to_string()],
         namespace: None,
-        to_dsl: None,
+        dsl_aliases: vec![],
     });
 
     let schema = ResourceSchema::new("list.resource")
@@ -349,7 +349,7 @@ fn union_static_value_validated() {
                     name: "Mode".to_string(),
                     values: vec!["active".to_string(), "passive".to_string()],
                     namespace: None,
-                    to_dsl: None,
+                    dsl_aliases: vec![],
                 },
                 AttributeType::Int,
             ]),
@@ -402,7 +402,7 @@ fn union_valid_static_value_no_warning() {
                     name: "Mode".to_string(),
                     values: vec!["active".to_string(), "passive".to_string()],
                     namespace: None,
-                    to_dsl: None,
+                    dsl_aliases: vec![],
                 },
                 AttributeType::Int,
             ]),
@@ -448,7 +448,7 @@ fn union_valid_int_value_no_warning() {
                     name: "Mode".to_string(),
                     values: vec!["active".to_string(), "passive".to_string()],
                     namespace: None,
-                    to_dsl: None,
+                    dsl_aliases: vec![],
                 },
                 AttributeType::Int,
             ]),
@@ -1319,7 +1319,7 @@ fn resource_ref_type_check_helper_regression() {
                 name: "Status".to_string(),
                 values: vec!["active".to_string(), "inactive".to_string()],
                 namespace: None,
-                to_dsl: None,
+                dsl_aliases: vec![],
             },
         ))
         .attribute(AttributeSchema::new(
@@ -1675,7 +1675,7 @@ fn map_key_validation_warns_on_invalid_key() {
             name: "ConditionOperator".to_string(),
             values: vec!["string_equals".to_string(), "string_like".to_string()],
             namespace: None,
-            to_dsl: None,
+            dsl_aliases: vec![],
         },
         AttributeType::map(AttributeType::String),
     );

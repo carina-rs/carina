@@ -926,10 +926,7 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
                         "all".to_string(),
                     ],
                     namespace: Some("awscc.ec2.SecurityGroup".to_string()),
-                    to_dsl: Some(|s: &str| match s {
-                        "-1" => "all".to_string(),
-                        _ => s.to_string(),
-                    }),
+                    dsl_aliases: vec![("-1".to_string(), "all".to_string())],
                 },
             ),
             StructField::new("to_port", AttributeType::Int),

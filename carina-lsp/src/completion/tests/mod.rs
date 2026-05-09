@@ -152,7 +152,7 @@ pub(super) fn test_provider_with_enum_and_regions() -> CompletionProvider {
         name: "VersioningStatus".to_string(),
         values: vec!["Enabled".to_string(), "Suspended".to_string()],
         namespace: None,
-        to_dsl: None,
+        dsl_aliases: vec![],
     };
     let schema = ResourceSchema::new("s3.Bucket")
         .attribute(AttributeSchema::new("versioning_status", status_enum));
@@ -185,7 +185,7 @@ pub(super) fn test_provider_with_nameless_enum() -> CompletionProvider {
         name: "VersioningStatus".to_string(),
         values: vec!["Enabled".to_string(), "Suspended".to_string()],
         namespace: None,
-        to_dsl: None,
+        dsl_aliases: vec![],
     };
 
     // Nested struct field with StringEnum (no namespace)
@@ -259,7 +259,7 @@ pub(super) fn test_provider_with_custom_semantic_attr() -> CompletionProvider {
         name: "PrincipalType".to_string(),
         values: vec!["GROUP".to_string(), "USER".to_string()],
         namespace: Some("awscc.sso.Assignment".to_string()),
-        to_dsl: None,
+        dsl_aliases: vec![],
     };
     let schema = ResourceSchema::new("sso.Assignment")
         .attribute(AttributeSchema::new("principal_type", principal_type))

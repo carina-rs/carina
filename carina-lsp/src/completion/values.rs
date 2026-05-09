@@ -556,7 +556,7 @@ impl CompletionProvider {
                 name,
                 values,
                 namespace,
-                to_dsl,
+                dsl_aliases,
             } => {
                 // Use explicit namespace if available, otherwise derive from resource_type
                 let effective_ns = namespace.as_deref().or(if !name.is_empty() {
@@ -564,7 +564,7 @@ impl CompletionProvider {
                 } else {
                     None
                 });
-                self.string_enum_completions(name, values, effective_ns, *to_dsl)
+                self.string_enum_completions(name, values, effective_ns, dsl_aliases)
             }
             AttributeType::Int => {
                 vec![] // No specific completions for integers
@@ -1517,7 +1517,7 @@ impl CompletionProvider {
         type_name: &str,
         values: &[String],
         namespace: Option<&str>,
-        to_dsl: Option<fn(&str) -> String>,
+        dsl_aliases: &[(String, String)],
     ) -> Vec<CompletionItem> {
         match namespace {
             Some(ns) => {
@@ -1529,7 +1529,10 @@ impl CompletionProvider {
                 values
                     .iter()
                     .map(|value| {
-                        let dsl_value = to_dsl.map_or_else(|| value.clone(), |f| f(value));
+                        let dsl_value = dsl_aliases
+                            .iter()
+                            .find_map(|(api, dsl)| (api == value).then(|| dsl.clone()))
+                            .unwrap_or_else(|| value.clone());
                         let full = format!("{}.{}.{}", ns, type_name, dsl_value);
                         CompletionItem {
                             label: full.clone(),

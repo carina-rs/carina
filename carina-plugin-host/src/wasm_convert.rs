@@ -598,11 +598,12 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
             values,
             name,
             namespace,
+            dsl_aliases,
         } => CoreAttributeType::StringEnum {
             name: name.clone(),
             values: values.clone(),
             namespace: namespace.clone(),
-            to_dsl: None,
+            dsl_aliases: dsl_aliases.clone(),
         },
         proto::AttributeType::List { inner, ordered } => CoreAttributeType::List {
             inner: Box::new(proto_attr_type_to_core(inner)),
@@ -1454,6 +1455,60 @@ mod tests {
             schemas[0].exclusive_required,
             vec![vec!["a".to_string(), "b".to_string()]]
         );
+    }
+
+    /// carina#2831: a proto `StringEnum` that carries `dsl_aliases`
+    /// reaches the core schema with the alias list populated, so the
+    /// host validator can accept the DSL spelling. Before this change
+    /// `proto_attr_type_to_core` discarded the alias info because the
+    /// equivalent `to_dsl` field was a non-serializable `fn` pointer.
+    #[test]
+    fn proto_string_enum_dsl_aliases_propagate_to_core() {
+        let proto_attr = proto::AttributeType::StringEnum {
+            values: vec![
+                "ObjectWriter".to_string(),
+                "BucketOwnerEnforced".to_string(),
+            ],
+            name: "ObjectOwnership".to_string(),
+            namespace: Some("awscc.s3.Bucket".to_string()),
+            dsl_aliases: vec![
+                ("ObjectWriter".to_string(), "object_writer".to_string()),
+                (
+                    "BucketOwnerEnforced".to_string(),
+                    "bucket_owner_enforced".to_string(),
+                ),
+            ],
+        };
+        let core_attr = proto_attr_type_to_core(&proto_attr);
+        match core_attr {
+            CoreAttributeType::StringEnum { dsl_aliases, .. } => {
+                assert_eq!(dsl_aliases.len(), 2);
+                assert!(
+                    dsl_aliases
+                        .iter()
+                        .any(|(a, d)| a == "BucketOwnerEnforced" && d == "bucket_owner_enforced"),
+                    "dsl_aliases lost in proto -> core conversion: {dsl_aliases:?}"
+                );
+            }
+            other => panic!("expected StringEnum, got {other:?}"),
+        }
+    }
+
+    /// Older provider components emit no `dsl_aliases` field; the
+    /// proto deserializes it as an empty vec, which converts to a core
+    /// `StringEnum` with an empty alias list. Validation behaves like
+    /// the old `to_dsl: None` path: API-only spellings.
+    #[test]
+    fn proto_string_enum_without_aliases_yields_empty_core_aliases() {
+        let json = r#"{"type":"string_enum","values":["A","B"],"name":"X"}"#;
+        let proto_attr: proto::AttributeType = serde_json::from_str(json).unwrap();
+        let core_attr = proto_attr_type_to_core(&proto_attr);
+        match core_attr {
+            CoreAttributeType::StringEnum { dsl_aliases, .. } => {
+                assert!(dsl_aliases.is_empty());
+            }
+            other => panic!("expected StringEnum, got {other:?}"),
+        }
     }
 
     #[test]
