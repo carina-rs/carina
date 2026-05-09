@@ -35,7 +35,12 @@ impl MockProvider {
         if let Some(parent) = self.state_file.parent() {
             fs::create_dir_all(parent)?;
         }
-        let content = serde_json::to_string_pretty(states)?;
+        let mut content = serde_json::to_string_pretty(states)?;
+        // Match the trailing-newline convention used by
+        // carina.state.json (#2721) and carina-backend.lock (#2583)
+        // so POSIX tooling and "add final newline" editors agree on
+        // the file shape.
+        content.push('\n');
         fs::write(&self.state_file, content)
     }
 
@@ -167,5 +172,34 @@ impl Provider for MockProvider {
 
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Pin the byte-level shape so MockProvider's state file matches
+    // the trailing-newline convention used by carina.state.json
+    // (#2721) and carina-backend.lock (#2583).
+    #[test]
+    fn state_file_ends_with_trailing_newline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_file = tmp.path().join("mock-state.json");
+        let provider = MockProvider {
+            state_file: state_file.clone(),
+        };
+        let mut states = HashMap::new();
+        let mut entry = HashMap::new();
+        entry.insert("k".to_string(), serde_json::json!("v"));
+        states.insert("aws.s3.Bucket.b".to_string(), entry);
+        provider.save_states(&states).unwrap();
+        let bytes = fs::read(&state_file).unwrap();
+        assert_eq!(
+            bytes.last().copied(),
+            Some(b'\n'),
+            "MockProvider state file must end with a trailing newline; got {:?}",
+            bytes.last().map(|b| *b as char),
+        );
     }
 }
