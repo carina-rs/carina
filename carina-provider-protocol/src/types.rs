@@ -350,6 +350,13 @@ pub enum AttributeType {
         /// `{namespace}.{name}.{value}` in the DSL.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         namespace: Option<String>,
+        /// API-canonical -> DSL spelling pairs, for every value where the
+        /// two differ. The host-side validator accepts both spellings.
+        /// Empty means the API spelling IS the DSL spelling for every
+        /// value, which is also the value used by older provider
+        /// components that predate this field (carina#2831).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dsl_aliases: Vec<(String, String)>,
     },
     #[serde(rename = "list")]
     List {
@@ -542,5 +549,87 @@ mod tests {
         let json = r#"{"resource_type":"ec2.Vpc","attributes":{}}"#;
         let schema: ResourceSchema = serde_json::from_str(json).unwrap();
         assert!(schema.operation_config.is_none());
+    }
+
+    /// carina#2831: `StringEnum.dsl_aliases` carries the API->DSL spelling
+    /// map that the host-side validator consults. Round-trips through
+    /// JSON so a WASM provider's serialized schema reaches the host with
+    /// the field intact.
+    #[test]
+    fn string_enum_dsl_aliases_round_trip() {
+        let attr = AttributeType::StringEnum {
+            name: "ObjectOwnership".to_string(),
+            values: vec![
+                "ObjectWriter".to_string(),
+                "BucketOwnerEnforced".to_string(),
+            ],
+            namespace: Some("awscc.s3.Bucket".to_string()),
+            dsl_aliases: vec![
+                ("ObjectWriter".to_string(), "object_writer".to_string()),
+                (
+                    "BucketOwnerEnforced".to_string(),
+                    "bucket_owner_enforced".to_string(),
+                ),
+            ],
+        };
+        let json = serde_json::to_string(&attr).unwrap();
+        assert!(json.contains("dsl_aliases"));
+        assert!(json.contains("bucket_owner_enforced"));
+        let back: AttributeType = serde_json::from_str(&json).unwrap();
+        match back {
+            AttributeType::StringEnum {
+                dsl_aliases: aliases,
+                ..
+            } => {
+                assert_eq!(aliases.len(), 2);
+                assert!(
+                    aliases
+                        .iter()
+                        .any(|(a, d)| a == "BucketOwnerEnforced" && d == "bucket_owner_enforced"),
+                    "alias pair lost in round trip: {aliases:?}"
+                );
+            }
+            other => panic!("expected StringEnum, got {other:?}"),
+        }
+    }
+
+    /// `dsl_aliases` defaults to empty so older WASM providers that
+    /// predate this field (carina#2831 stage 1) still parse — they
+    /// emit no `dsl_aliases` key and the host treats every value as
+    /// already in DSL form.
+    #[test]
+    fn string_enum_without_dsl_aliases_defaults_empty() {
+        let json = r#"{"type":"string_enum","values":["A","B"],"name":"X"}"#;
+        let attr: AttributeType = serde_json::from_str(json).unwrap();
+        match attr {
+            AttributeType::StringEnum {
+                dsl_aliases: aliases,
+                ..
+            } => {
+                assert!(
+                    aliases.is_empty(),
+                    "missing dsl_aliases must deserialize as empty vec"
+                );
+            }
+            other => panic!("expected StringEnum, got {other:?}"),
+        }
+    }
+
+    /// Empty `dsl_aliases` skips serialization so the wire format
+    /// stays compact for the common case (no aliases) and older host
+    /// builds (which do not know the field) round-trip unchanged.
+    #[test]
+    fn string_enum_empty_dsl_aliases_skipped_on_serialize() {
+        let attr = AttributeType::StringEnum {
+            name: "X".to_string(),
+            values: vec!["A".to_string()],
+            namespace: None,
+            dsl_aliases: vec![],
+        };
+        let json = serde_json::to_string(&attr).unwrap();
+        assert!(
+            !json.contains("dsl_aliases"),
+            "empty dsl_aliases must be omitted, got: {json}"
+        );
     }
 }

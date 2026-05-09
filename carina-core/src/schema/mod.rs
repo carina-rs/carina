@@ -156,13 +156,52 @@ fn walk_custom_lookup(
     }
 }
 
-pub type StringEnumParts<'a> = (
-    &'a str,
-    &'a [String],
-    Option<&'a str>,
-    Option<fn(&str) -> String>,
-);
-pub type NamespacedEnumParts<'a> = (&'a str, &'a str, Option<fn(&str) -> String>);
+pub type StringEnumParts<'a> = (&'a str, &'a [String], Option<&'a str>, DslMap<'a>);
+
+pub type NamespacedEnumParts<'a> = (&'a str, &'a str, DslMap<'a>);
+
+/// API-canonical → DSL-spelling mapping carried by a `StringEnum`
+/// (data) or a `Custom` (closure). Both sources answer the same
+/// question: "given an API spelling, what is the DSL spelling?"
+///
+/// `Aliases` is the data form populated by codegen on `StringEnum`.
+/// `Closure` is the host-side fallback used by a few `Custom` types
+/// (e.g. AZ hyphen-to-underscore) whose value space is too large to
+/// enumerate. The closure form does not cross the WASM boundary —
+/// `Custom`'s validation already runs host-side via
+/// `ProviderContext.validators`, so the closure stays in the host
+/// process.
+#[derive(Clone, Copy)]
+pub enum DslMap<'a> {
+    /// Alias table from `StringEnum.dsl_aliases`. Empty means every
+    /// API spelling equals its DSL spelling.
+    Aliases(&'a [(String, String)]),
+    /// Function-pointer fallback for `Custom`-typed namespaces.
+    Closure(Option<fn(&str) -> String>),
+}
+
+impl<'a> DslMap<'a> {
+    /// Translate an API spelling to its DSL spelling. Returns the
+    /// input unchanged when no mapping applies.
+    pub fn dsl_for(&self, api: &str) -> String {
+        match self {
+            DslMap::Aliases(map) => map
+                .iter()
+                .find_map(|(a, d)| (a == api).then(|| d.clone()))
+                .unwrap_or_else(|| api.to_string()),
+            DslMap::Closure(Some(f)) => f(api),
+            DslMap::Closure(None) => api.to_string(),
+        }
+    }
+
+    /// True when the mapping carries no DSL-side rewrites.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            DslMap::Aliases(map) => map.is_empty(),
+            DslMap::Closure(opt) => opt.is_none(),
+        }
+    }
+}
 
 /// A field within a Struct type
 #[derive(Debug, Clone)]
@@ -225,12 +264,24 @@ pub enum AttributeType {
     Float,
     /// Boolean
     Bool,
-    /// String enum with optional namespace-aware DSL syntax support
+    /// String enum with optional namespace-aware DSL syntax support.
+    ///
+    /// `dsl_aliases` is a list of `(api, dsl)` pairs that map a canonical
+    /// (API) value to the DSL spelling, for every value where the two
+    /// differ. The validator accepts both spellings; diagnostics list
+    /// both. An empty list means the API spelling IS the DSL spelling
+    /// for every value.
+    ///
+    /// This field replaces an earlier `to_dsl: Option<fn(&str) -> String>`
+    /// closure. The closure could not cross the WASM-component boundary
+    /// because `fn` pointers are not serializable, so provider plugins
+    /// silently lost their alias map and validation rejected legitimate
+    /// DSL spellings (carina#2831, awscc#199, aws#247).
     StringEnum {
         name: String,
         values: Vec<String>,
         namespace: Option<String>,
-        to_dsl: Option<fn(&str) -> String>,
+        dsl_aliases: Vec<(String, String)>,
     },
     /// Custom type (with validation function)
     Custom {
@@ -291,13 +342,13 @@ impl fmt::Debug for AttributeType {
                 name,
                 values,
                 namespace,
-                to_dsl,
+                dsl_aliases,
             } => f
                 .debug_struct("StringEnum")
                 .field("name", name)
                 .field("values", values)
                 .field("namespace", namespace)
-                .field("to_dsl", to_dsl)
+                .field("dsl_aliases", dsl_aliases)
                 .finish(),
             AttributeType::Custom {
                 semantic_name,
@@ -456,8 +507,13 @@ impl AttributeType {
                 name,
                 values,
                 namespace,
-                to_dsl,
-            } => Some((name, values, namespace.as_deref(), *to_dsl)),
+                dsl_aliases,
+            } => Some((
+                name,
+                values,
+                namespace.as_deref(),
+                DslMap::Aliases(dsl_aliases),
+            )),
             _ => None,
         }
     }
@@ -467,15 +523,15 @@ impl AttributeType {
             AttributeType::StringEnum {
                 name,
                 namespace: Some(namespace),
-                to_dsl,
+                dsl_aliases,
                 ..
-            }
-            | AttributeType::Custom {
+            } => Some((name, namespace, DslMap::Aliases(dsl_aliases))),
+            AttributeType::Custom {
                 semantic_name: Some(name),
                 namespace: Some(namespace),
                 to_dsl,
                 ..
-            } => Some((name, namespace, *to_dsl)),
+            } => Some((name, namespace, DslMap::Closure(*to_dsl))),
             _ => None,
         }
     }
@@ -700,7 +756,7 @@ impl AttributeType {
             name,
             values,
             namespace,
-            to_dsl,
+            dsl_aliases,
         } = self
         else {
             unreachable!("validate_string_enum called on non-StringEnum");
@@ -758,15 +814,13 @@ impl AttributeType {
                 }
             }
             let matches_canonical = values.iter().any(|v| string_enum_value_matches(variant, v));
-            let matches_alias = to_dsl.is_some_and(|f| {
-                values
-                    .iter()
-                    .any(|v| string_enum_value_matches(variant, &f(v)))
-            });
+            let matches_alias = dsl_aliases
+                .iter()
+                .any(|(_api, dsl)| string_enum_value_matches(variant, dsl));
             if matches_canonical || matches_alias {
                 Ok(())
             } else {
-                // Aliases produced by `to_dsl` are tagged `is_alias = true`
+                // Aliases from `dsl_aliases` are tagged `is_alias = true`
                 // so LSP code actions can prefer the canonical form.
                 let mut expected: Vec<ExpectedEnumVariant> = Vec::new();
                 let mut push = |variant_value: &str, is_alias: bool| {
@@ -783,12 +837,9 @@ impl AttributeType {
                 for v in values {
                     push(v, false);
                 }
-                if let Some(f) = to_dsl {
-                    for v in values {
-                        let alias = f(v);
-                        if alias != *v {
-                            push(&alias, true);
-                        }
+                for (api, dsl) in dsl_aliases {
+                    if dsl != api {
+                        push(dsl, true);
                     }
                 }
                 Err(TypeError::InvalidEnumVariant {

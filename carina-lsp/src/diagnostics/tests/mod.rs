@@ -66,7 +66,7 @@ pub(super) fn test_engine_with_enum_attr() -> DiagnosticEngine {
         name: "Mode".to_string(),
         values: vec!["fast".to_string(), "slow".to_string()],
         namespace: None,
-        to_dsl: None,
+        dsl_aliases: vec![],
     };
 
     let schema =
@@ -93,7 +93,7 @@ pub(super) fn test_engine_with_namespaced_enum_attr() -> DiagnosticEngine {
         name: "Mode".to_string(),
         values: vec!["fast".to_string(), "slow".to_string()],
         namespace: Some("test.r".to_string()),
-        to_dsl: None,
+        dsl_aliases: vec![],
     };
 
     let schema =

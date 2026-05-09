@@ -43,7 +43,7 @@ fn enum_schemas() -> SchemaRegistry {
         name: "Mode".to_string(),
         values: vec!["fast".to_string(), "slow".to_string()],
         namespace: Some("test.r".to_string()),
-        to_dsl: None,
+        dsl_aliases: vec![],
     };
     single_schema_map(
         ResourceSchema::new("r.mode_holder")

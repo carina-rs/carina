@@ -47,7 +47,7 @@ fn invalid_enum_variant_namespaced_display() {
                 name: "VersioningStatus".to_string(),
                 values: vec!["Enabled".to_string(), "Suspended".to_string()],
                 namespace: Some("aws.s3.Bucket".to_string()),
-                to_dsl: None,
+                dsl_aliases: vec![],
             },
         )
         .required(),
@@ -66,22 +66,22 @@ fn invalid_enum_variant_bare_display() {
         name: "Mode".to_string(),
         values: vec!["fast".to_string(), "slow".to_string()],
         namespace: None,
-        to_dsl: None,
+        dsl_aliases: vec![],
     };
     let err = t.validate(&Value::String("zzz".to_string())).unwrap_err();
     insta::assert_snapshot!(err.to_string());
 }
 
 #[test]
-fn invalid_enum_variant_with_to_dsl_aliases_display() {
-    fn lower(v: &str) -> String {
-        v.to_ascii_lowercase()
-    }
+fn invalid_enum_variant_with_dsl_aliases_display() {
     let t = AttributeType::StringEnum {
         name: "VersioningStatus".to_string(),
         values: vec!["Enabled".to_string(), "Suspended".to_string()],
         namespace: Some("aws.s3.Bucket".to_string()),
-        to_dsl: Some(lower),
+        dsl_aliases: vec![
+            ("Enabled".to_string(), "enabled".to_string()),
+            ("Suspended".to_string(), "suspended".to_string()),
+        ],
     };
     let err = t.validate(&Value::String("zzz".to_string())).unwrap_err();
     insta::assert_snapshot!(err.to_string());
@@ -96,7 +96,7 @@ fn string_literal_expected_enum_string_enum_display() {
                 name: "TargetType".to_string(),
                 values: vec!["AWS_ACCOUNT".to_string(), "GROUP".to_string()],
                 namespace: Some("awscc.sso.Assignment".to_string()),
-                to_dsl: None,
+                dsl_aliases: vec![],
             },
         )
         .required(),

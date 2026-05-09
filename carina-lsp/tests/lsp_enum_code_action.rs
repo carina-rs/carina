@@ -22,14 +22,14 @@ use support::fixture::{analyze, engine_with_schemas, write_fixture};
 use tower_lsp::lsp_types::{Diagnostic, Url};
 
 fn versioning_schema() -> SchemaRegistry {
-    fn lower(v: &str) -> String {
-        v.to_ascii_lowercase()
-    }
     let versioning = AttributeType::StringEnum {
         name: "VersioningStatus".to_string(),
         values: vec!["Enabled".to_string(), "Suspended".to_string()],
         namespace: Some("aws.s3.Bucket".to_string()),
-        to_dsl: Some(lower),
+        dsl_aliases: vec![
+            ("Enabled".to_string(), "enabled".to_string()),
+            ("Suspended".to_string(), "suspended".to_string()),
+        ],
     };
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -173,7 +173,7 @@ fn bare_mode_schema() -> SchemaRegistry {
         name: "Mode".to_string(),
         values: vec!["fast".to_string(), "slow".to_string()],
         namespace: None,
-        to_dsl: None,
+        dsl_aliases: vec![],
     };
     let mut schemas = SchemaRegistry::new();
     schemas.insert(

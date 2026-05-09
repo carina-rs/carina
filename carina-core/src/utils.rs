@@ -450,7 +450,7 @@ pub fn validate_enum_namespace(s: &str, type_name: &str, namespace: &str) -> Res
 
 /// Resolve a single string value to its fully-qualified namespaced DSL format.
 ///
-/// Given a value and the enum parts (type_name, namespace, optional to_dsl converter),
+/// Given a value and the enum parts (type_name, namespace, DSL alias map),
 /// resolves:
 /// - Bare identifiers: `"Enabled"` -> `"aws.s3.Bucket.VersioningStatus.Enabled"`
 /// - TypeName.value shorthand: `"VersioningStatus.Enabled"` -> `"aws.s3.Bucket.VersioningStatus.Enabled"`
@@ -458,11 +458,11 @@ pub fn validate_enum_namespace(s: &str, type_name: &str, namespace: &str) -> Res
 ///
 /// Returns `None` if the value doesn't need resolution (non-String or already qualified).
 pub fn resolve_enum_value(value: &Value, parts: &NamespacedEnumParts<'_>) -> Option<Value> {
-    let (type_name, ns, to_dsl) = parts;
+    let (type_name, ns, dsl_map) = parts;
     match value {
         Value::String(s) if !s.contains('.') => {
             // bare identifier: "Enabled" -> ns.TypeName.Enabled
-            let dsl_val = to_dsl.map_or_else(|| s.clone(), |f| f(s));
+            let dsl_val = dsl_map.dsl_for(s);
             Some(Value::String(format!("{}.{}.{}", ns, type_name, dsl_val)))
         }
         Value::String(s)
@@ -471,7 +471,7 @@ pub fn resolve_enum_value(value: &Value, parts: &NamespacedEnumParts<'_>) -> Opt
         {
             // TypeName.value: "VersioningStatus.Enabled" -> ns.TypeName.Enabled
             let member = s.split_once('.').unwrap().1;
-            let dsl_val = to_dsl.map_or_else(|| member.to_string(), |f| f(member));
+            let dsl_val = dsl_map.dsl_for(member);
             Some(Value::String(format!("{}.{}.{}", ns, type_name, dsl_val)))
         }
         _ => None,
@@ -490,7 +490,7 @@ pub fn normalize_state_enum_value(
     parts: &NamespacedEnumParts<'_>,
     string_enum_check: Option<&dyn Fn(&str) -> bool>,
 ) -> Option<Value> {
-    let (type_name, ns, to_dsl) = parts;
+    let (type_name, ns, dsl_map) = parts;
     if let Value::String(s) = value {
         // Skip values already in namespaced DSL format.
         // A value that contains '.' but is not already namespaced is a raw enum value
@@ -498,7 +498,7 @@ pub fn normalize_state_enum_value(
         let already_namespaced =
             s.contains('.') && !string_enum_check.is_some_and(|check| check(s));
         if !already_namespaced {
-            let dsl_val = to_dsl.map_or_else(|| s.clone(), |f| f(s));
+            let dsl_val = dsl_map.dsl_for(s);
             return Some(Value::String(format!("{}.{}.{}", ns, type_name, dsl_val)));
         }
     }
