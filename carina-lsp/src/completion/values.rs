@@ -516,6 +516,15 @@ impl CompletionProvider {
                 semantic_name: Some(name),
                 ..
             } if name == "Ipv6Cidr" => self.ipv6_cidr_completions(),
+            // Generic ARN snippet only for the bare `Arn` type. Specific
+            // ARN families (`IamRoleArn`, `IamPolicyArn`,
+            // `IamOidcProviderArn`, `KmsKeyArn`, …) already have shape
+            // constraints that the generic `arn:partition:service:…`
+            // template can't satisfy — surfacing it for those types is
+            // pure noise next to a properly-typed binding ref. Per-
+            // family snippets can be added as additional arms later if
+            // the per-type formats are useful enough to justify the
+            // surface. See #2621.
             AttributeType::Custom {
                 semantic_name: Some(name),
                 ..
@@ -952,6 +961,100 @@ impl CompletionProvider {
         items
     }
 
+    /// Module-call value-position completion entry point (#2621). The
+    /// `exports {}` value position deliberately does NOT funnel through
+    /// here — its existing two-layer surface (built-ins + binding refs)
+    /// is preserved untouched so this PR's scope stays bounded to
+    /// module-call value position.
+    ///
+    /// Layers, all driven by the same `AttributeType`:
+    ///
+    /// 1. **Structural / type-driven candidates** —
+    ///    [`Self::completions_for_type`] knows that `Bool` →
+    ///    `true`/`false`, `Cidr` → CIDR snippets, `Arn` → an ARN
+    ///    template, `StringEnum` → the enum members, etc. Lifts unions
+    ///    and unwraps lists/maps recursively.
+    /// 2. **Built-in function calls** whose return type is assignable
+    ///    to the target — `concat`, `join`, `format!`, … filtered by
+    ///    [`Self::builtin_function_completions_for_type`].
+    /// 3. **Existing-binding references** (`<binding>.<field>`) whose
+    ///    leaf attribute is assignable to the target —
+    ///    [`Self::resource_ref_completions_for_type`] for resource and
+    ///    module-call bindings, plus
+    ///    [`Self::upstream_state_ref_completions_for_type`] for
+    ///    `upstream_state` exports.
+    pub(super) fn value_completions_for_attribute_type(
+        &self,
+        attr_type: &AttributeType,
+        text: &str,
+        base_path: Option<&Path>,
+    ) -> Vec<CompletionItem> {
+        let mut items = self.completions_for_type(attr_type, None);
+        items.extend(Self::builtin_function_completions_for_type(attr_type));
+        items.extend(self.resource_ref_completions_for_type(attr_type, text, base_path));
+        items.extend(self.module_call_binding_ref_completions_for_type(attr_type, text, base_path));
+        items.extend(self.upstream_state_ref_completions_for_type(attr_type, text, base_path));
+        items
+    }
+
+    /// `<upstream_binding>.<exported_name>` references whose declared
+    /// `TypeExpr` is compatible with `target`. Mirrors
+    /// [`Self::resource_ref_completions_for_type`] but the source of
+    /// truth is the upstream project's `exports {}` block (read via
+    /// `resolve_upstream_exports_cached`) rather than a local schema.
+    /// Shared by every `value_completions_for_attribute_type` caller —
+    /// without this the consumer of an upstream `oidc_provider_arn`
+    /// wouldn't see `<upstream>.oidc_provider_arn` after `=` (#2621).
+    fn upstream_state_ref_completions_for_type(
+        &self,
+        target: &AttributeType,
+        text: &str,
+        base_path: Option<&Path>,
+    ) -> Vec<CompletionItem> {
+        let mut items: Vec<CompletionItem> = Vec::new();
+        let mut src_buf = String::new();
+        let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
+        let upstream_sources = super::collect_upstream_state_bindings(src);
+        let mut exports_cache: std::collections::HashMap<
+            String,
+            carina_core::upstream_exports::UpstreamExportEntries,
+        > = std::collections::HashMap::new();
+        for (binding, source) in &upstream_sources {
+            let exports = resolve_upstream_exports_cached(
+                binding,
+                source,
+                base_path,
+                &self.schemas,
+                &mut exports_cache,
+            );
+            for (export_name, entry) in exports {
+                let Some(export_type) = &entry.type_expr else {
+                    continue;
+                };
+                if !carina_core::validation::is_type_expr_compatible_with_schema(
+                    export_type,
+                    target,
+                ) {
+                    continue;
+                }
+                let full_ref = format!("{}.{}", binding, export_name);
+                items.push(CompletionItem {
+                    label: full_ref.clone(),
+                    kind: Some(CompletionItemKind::REFERENCE),
+                    detail: Some(format!(
+                        "export from upstream_state `{}` ({})",
+                        binding,
+                        self.format_type_expr(export_type)
+                    )),
+                    insert_text: Some(full_ref),
+                    ..Default::default()
+                });
+            }
+        }
+        items.sort_by(|a, b| a.label.cmp(&b.label));
+        items
+    }
+
     /// Find resource-ref paths (`<binding>.<attr>`) whose leaf attribute is
     /// assignable to `target` and return them as completion items. Uses a
     /// directory-scoped [`DslSource`] so exports in `exports.crn` can
@@ -986,6 +1089,64 @@ impl CompletionProvider {
                         binding_name,
                         attr.name,
                         attr.attr_type.type_name()
+                    )),
+                    insert_text: Some(full_ref),
+                    ..Default::default()
+                });
+            }
+        }
+        items.sort_by(|a, b| a.label.cmp(&b.label));
+        items
+    }
+
+    /// `<module_call_binding>.<exported_name>` references whose
+    /// declared `TypeExpr` is compatible with `target`. Walks every
+    /// `let X = <module> { ... }` in scope, loads the called module,
+    /// and emits an entry per type-compatible export. Only invoked
+    /// from the module-call value-position handler — the `exports {}`
+    /// value position keeps its pre-#2621 surface untouched. See #2621.
+    fn module_call_binding_ref_completions_for_type(
+        &self,
+        target: &AttributeType,
+        text: &str,
+        base_path: Option<&Path>,
+    ) -> Vec<CompletionItem> {
+        let mut items: Vec<CompletionItem> = Vec::new();
+        let mut src_buf = String::new();
+        let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
+        for (binding_name, rhs) in Self::extract_let_bindings(src) {
+            // Resource bindings are handled by
+            // `resource_ref_completions_for_type`; skip them so the
+            // two helpers don't double-emit.
+            if self.extract_resource_type(&rhs).is_some() {
+                continue;
+            }
+            let header = format!(
+                "let {} = {} {{",
+                binding_name,
+                rhs.trim_end_matches('{').trim()
+            );
+            let Some(module_name) = super::extract_let_module_call_name(header.trim()) else {
+                continue;
+            };
+            let Some(parsed) = self.load_called_module(&module_name, text, base_path) else {
+                continue;
+            };
+            for export in &parsed.export_params {
+                let Some(ref export_ty) = export.type_expr else {
+                    continue;
+                };
+                if !carina_core::validation::is_type_expr_compatible_with_schema(export_ty, target)
+                {
+                    continue;
+                }
+                let full_ref = format!("{}.{}", binding_name, export.name);
+                items.push(CompletionItem {
+                    label: full_ref.clone(),
+                    kind: Some(CompletionItemKind::REFERENCE),
+                    detail: Some(format!(
+                        "Reference to {}'s exported {} ({})",
+                        binding_name, export.name, export_ty,
                     )),
                     insert_text: Some(full_ref),
                     ..Default::default()

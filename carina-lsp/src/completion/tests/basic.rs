@@ -1899,3 +1899,491 @@ fn top_level_module_call_completion_with_sibling_use_decl() {
         "expected `github` module-call completion from sibling `let X = use {{...}}`, got: {labels:?}"
     );
 }
+
+/// Issue #2621: value-position completion inside a module call must
+/// surface candidates derived from the called module's `arguments {}`
+/// declaration. For closed-set string types (`'dev' | 'prod'`,
+/// introduced in #2611), the candidates are the literal members.
+#[test]
+fn module_call_value_completion_string_literal_union() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let provider = test_provider();
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let base_path = temp_dir.path();
+
+    let module_dir = base_path.join("usecases").join("registry-deploy");
+    fs::create_dir_all(&module_dir).expect("Failed to create module dir");
+    let module_main = r#"arguments {
+  environment: 'dev' | 'prod'
+}
+"#;
+    fs::write(module_dir.join("main.crn"), module_main).expect("Failed to write module");
+
+    // Consumer: `let rd = registry_deploy { environment = <CURSOR> }`.
+    let main_content = r#"let registry_deploy = use {
+  source = './usecases/registry-deploy'
+}
+
+let rd = registry_deploy {
+  environment =
+}
+"#;
+    let doc = create_document(main_content);
+
+    // Cursor sits one past the `= ` on line 5 (0-indexed).
+    let position = Position {
+        line: 5,
+        character: 16,
+    };
+    let completions = provider.complete(&doc, position, Some(base_path));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"'dev'"),
+        "expected 'dev' literal candidate after `environment = `, got: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"'prod'"),
+        "expected 'prod' literal candidate after `environment = `, got: {labels:?}"
+    );
+}
+
+/// Issue #2621: a module-call argument with `arguments {}` declared in
+/// `main.crn` (not `exports.crn`) must still expose its parameter names
+/// for completion. Mirrors the `usecases/<name>/main.crn` shape from
+/// the issue body.
+#[test]
+fn module_call_arg_name_completion_arguments_in_main_crn() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let provider = test_provider();
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let base_path = temp_dir.path();
+
+    let module_dir = base_path.join("usecases").join("registry-deploy");
+    fs::create_dir_all(&module_dir).expect("Failed to create module dir");
+    let module_main = r#"arguments {
+  oidc_provider_arn: IamOidcProviderArn
+  environment      : 'dev' | 'prod'
+}
+"#;
+    fs::write(module_dir.join("main.crn"), module_main).expect("Failed to write module");
+
+    let main_content = r#"let registry_deploy = use {
+  source = './usecases/registry-deploy'
+}
+
+let rd = registry_deploy {
+  o
+}
+"#;
+    let doc = create_document(main_content);
+
+    let position = Position {
+        line: 5,
+        character: 3,
+    };
+    let completions = provider.complete(&doc, position, Some(base_path));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"oidc_provider_arn"),
+        "expected `oidc_provider_arn` arg-name completion, got: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"environment"),
+        "expected `environment` arg-name completion, got: {labels:?}"
+    );
+}
+
+/// Issue #2621: value-position completion must work when the
+/// `let X = use { ... }` declaration lives in a sibling `.crn`, not the
+/// edited buffer. This is the real-infra shape (#2446-style cross-file
+/// resolution).
+#[test]
+fn module_call_value_completion_with_sibling_use_decl() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let provider = test_provider();
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let base_path = temp_dir.path();
+
+    let module_dir = base_path.join("usecases").join("registry-deploy");
+    fs::create_dir_all(&module_dir).expect("Failed to create module dir");
+    fs::write(
+        module_dir.join("main.crn"),
+        "arguments {\n  environment: 'dev' | 'prod'\n}\n",
+    )
+    .expect("Failed to write module");
+
+    // `let X = use { ... }` in a sibling file; consumer in the buffer.
+    fs::write(
+        base_path.join("imports.crn"),
+        "let registry_deploy = use {\n  source = './usecases/registry-deploy'\n}\n",
+    )
+    .expect("Failed to write imports");
+
+    let main_content = "let rd = registry_deploy {\n  environment =\n}\n";
+    let doc = create_document(main_content);
+    let position = Position {
+        line: 1,
+        character: 16,
+    };
+    let completions = provider.complete(&doc, position, Some(base_path));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"'dev'"),
+        "expected 'dev' literal candidate (sibling-`use` shape), got: {labels:?}"
+    );
+}
+
+/// Issue #2621: a specific ARN-family semantic type
+/// (e.g. `IamOidcProviderArn`) must NOT surface the generic
+/// `arn:partition:service:region:account:resource` snippet — its
+/// shape is too loose to satisfy the type's constraints, and a
+/// properly-typed binding ref (offered separately via the
+/// `<binding>.<field>` path) is the right candidate. The generic
+/// snippet stays available for the bare `Arn` type. See #2621
+/// (post-#2621-mvp tightening).
+#[test]
+fn module_call_value_completion_specific_arn_type_skips_generic_snippet() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let provider = test_provider();
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let base_path = temp_dir.path();
+
+    let module_dir = base_path.join("usecases").join("registry-deploy");
+    fs::create_dir_all(&module_dir).expect("Failed to create module dir");
+    fs::write(
+        module_dir.join("main.crn"),
+        "arguments {\n  oidc_provider_arn: IamOidcProviderArn\n}\n",
+    )
+    .expect("Failed to write module");
+
+    let main_content = r#"let registry_deploy = use {
+  source = './usecases/registry-deploy'
+}
+
+let rd = registry_deploy {
+  oidc_provider_arn =
+}
+"#;
+    let doc = create_document(main_content);
+    let position = Position {
+        line: 5,
+        character: 22,
+    };
+    let completions = provider.complete(&doc, position, Some(base_path));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        !labels
+            .iter()
+            .any(|l| l.starts_with("'arn:") && l.contains("partition")),
+        "specific ARN types must not surface the generic ARN-snippet template, \
+         got: {labels:?}"
+    );
+}
+
+/// Issue #2621: `arguments` typed `Bool` should offer `true` / `false`
+/// at the value position. Validates the generic dispatch works for
+/// non-ARN, non-literal types too.
+#[test]
+fn module_call_value_completion_bool_offers_true_false() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let provider = test_provider();
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let base_path = temp_dir.path();
+
+    let module_dir = base_path.join("modules").join("toggle");
+    fs::create_dir_all(&module_dir).expect("Failed to create module dir");
+    fs::write(
+        module_dir.join("main.crn"),
+        "arguments {\n  enabled: Bool\n}\n",
+    )
+    .expect("Failed to write module");
+
+    let main_content = r#"let toggle = use {
+  source = './modules/toggle'
+}
+
+let t = toggle {
+  enabled =
+}
+"#;
+    let doc = create_document(main_content);
+    let position = Position {
+        line: 5,
+        character: 12,
+    };
+    let completions = provider.complete(&doc, position, Some(base_path));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"true"),
+        "expected `true` candidate for Bool arg, got: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"false"),
+        "expected `false` candidate for Bool arg, got: {labels:?}"
+    );
+}
+
+/// Issue #2621: at the value position of a module-call argument the
+/// LSP must offer `<upstream_binding>.<exported_name>` candidates for
+/// every in-scope `upstream_state` binding whose published export's
+/// declared `TypeExpr` is compatible with the cursor's target type.
+/// Mirrors the real `infra/registry/dev/registry-deploy/` shape from
+/// the issue body: `let bootstrap = upstream_state {...}` lives in
+/// `backend.crn`, the consumer's module call lives in `main.crn`.
+#[test]
+fn module_call_value_completion_offers_upstream_state_export_ref() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let provider = test_provider();
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let base_path = temp_dir.path();
+
+    // Upstream project (`../bootstrap`): publishes `oidc_provider_arn`.
+    let upstream_dir = base_path.join("registry").join("dev").join("bootstrap");
+    fs::create_dir_all(&upstream_dir).expect("Failed to create upstream dir");
+    fs::write(
+        upstream_dir.join("main.crn"),
+        "arguments {\n  oidc_provider_arn: IamOidcProviderArn\n}\n\nexports {\n  oidc_provider_arn: IamOidcProviderArn = oidc_provider_arn\n}\n",
+    )
+    .expect("Failed to write upstream main.crn");
+
+    // Consumer module: receives `IamOidcProviderArn` argument.
+    let module_dir = base_path.join("usecases").join("registry-deploy");
+    fs::create_dir_all(&module_dir).expect("Failed to create module dir");
+    fs::write(
+        module_dir.join("main.crn"),
+        "arguments {\n  oidc_provider_arn: IamOidcProviderArn\n}\n",
+    )
+    .expect("Failed to write module");
+
+    // Caller: `let bootstrap = upstream_state {...}` in backend.crn,
+    // module call in main.crn.
+    let consumer_dir = base_path
+        .join("registry")
+        .join("dev")
+        .join("registry-deploy");
+    fs::create_dir_all(&consumer_dir).expect("Failed to create consumer dir");
+    fs::write(
+        consumer_dir.join("backend.crn"),
+        "let bootstrap = upstream_state {\n  source = '../bootstrap'\n}\n",
+    )
+    .expect("Failed to write backend.crn");
+    let main_content = r#"let registry_deploy = use {
+  source = '../../../usecases/registry-deploy'
+}
+
+let rd = registry_deploy {
+  oidc_provider_arn =
+}
+"#;
+    fs::write(consumer_dir.join("main.crn"), main_content).expect("Failed to write main.crn");
+
+    let doc = create_document(main_content);
+    let position = Position {
+        line: 5,
+        character: 22,
+    };
+    let completions = provider.complete(&doc, position, Some(consumer_dir.as_path()));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"bootstrap.oidc_provider_arn"),
+        "expected `bootstrap.oidc_provider_arn` upstream-state ref, got: {labels:?}"
+    );
+}
+
+/// Issue #2621: at the value position of a module-call argument the
+/// LSP must offer `<binding>.<exported_name>` candidates for any
+/// in-scope module-call binding whose `exports {}` declared a type
+/// assignable to the cursor's target type. This is the issue body's
+/// `bootstrap.oidc_provider_arn` shape, the common case for a
+/// `usecase` consumed by a downstream component.
+#[test]
+fn module_call_value_completion_offers_module_binding_export_ref() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let provider = test_provider();
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let base_path = temp_dir.path();
+
+    // Producer module: bootstrap exports an `oidc_provider_arn` of
+    // type `IamOidcProviderArn`.
+    let bootstrap_dir = base_path.join("usecases").join("bootstrap");
+    fs::create_dir_all(&bootstrap_dir).expect("Failed to create bootstrap dir");
+    // Bootstrap publishes the OIDC provider ARN. The export needs an
+    // assignable value at parse time (#2360 inference); a synthetic
+    // resource binding that "produces" the right type is the cheapest
+    // way to keep this fixture self-contained.
+    fs::write(
+        bootstrap_dir.join("main.crn"),
+        "arguments {\n  oidc_provider_arn: IamOidcProviderArn\n}\n\nexports {\n  oidc_provider_arn: IamOidcProviderArn = oidc_provider_arn\n}\n",
+    )
+    .expect("Failed to write bootstrap exports");
+
+    // Consumer module: receives an `IamOidcProviderArn` argument.
+    let deploy_dir = base_path.join("usecases").join("registry-deploy");
+    fs::create_dir_all(&deploy_dir).expect("Failed to create deploy dir");
+    fs::write(
+        deploy_dir.join("main.crn"),
+        "arguments {\n  oidc_provider_arn: IamOidcProviderArn\n}\n",
+    )
+    .expect("Failed to write deploy module");
+
+    // Caller: instantiates both, with the cursor at the value position
+    // for the deploy's `oidc_provider_arn` argument.
+    let main_content = r#"let bootstrap = use {
+  source = './usecases/bootstrap'
+}
+
+let registry_deploy = use {
+  source = './usecases/registry-deploy'
+}
+
+let bs = bootstrap {
+}
+
+let rd = registry_deploy {
+  oidc_provider_arn =
+}
+"#;
+    let doc = create_document(main_content);
+    let position = Position {
+        line: 12,
+        character: 22,
+    };
+    let completions = provider.complete(&doc, position, Some(base_path));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"bs.oidc_provider_arn"),
+        "expected `bs.oidc_provider_arn` binding-ref candidate, got: {labels:?}"
+    );
+}
+
+/// Issue #2621: a `String`-typed module-call argument routes through
+/// the shared value-completion entry point, so type-relevant built-in
+/// functions (`concat`, `join`, `lower`, `upper`, …) are offered even
+/// though `String` carries no specific values of its own.
+#[test]
+fn module_call_value_completion_string_offers_string_builtins() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let provider = test_provider();
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let base_path = temp_dir.path();
+
+    let module_dir = base_path.join("modules").join("notes");
+    fs::create_dir_all(&module_dir).expect("Failed to create module dir");
+    fs::write(
+        module_dir.join("main.crn"),
+        "arguments {\n  note: String\n}\n",
+    )
+    .expect("Failed to write module");
+
+    let main_content = r#"let notes = use {
+  source = './modules/notes'
+}
+
+let n = notes {
+  note =
+}
+"#;
+    let doc = create_document(main_content);
+    let position = Position {
+        line: 5,
+        character: 9,
+    };
+    let completions = provider.complete(&doc, position, Some(base_path));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    for expected in &["join", "lower", "upper", "trim"] {
+        assert!(
+            labels.contains(expected),
+            "expected `{expected}` builtin candidate for String arg, got: {labels:?}"
+        );
+    }
+}
+
+/// Issue #2621: negative paths must fall silent. A typo'd module name,
+/// typo'd argument name, or argument with a non-enumerable type
+/// produces no candidates instead of dumping built-in functions like
+/// `cidr_subnet`.
+#[test]
+fn module_call_value_completion_silent_on_unresolvable() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let provider = test_provider();
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let base_path = temp_dir.path();
+
+    let module_dir = base_path.join("usecases").join("registry-deploy");
+    fs::create_dir_all(&module_dir).expect("Failed to create module dir");
+    fs::write(
+        module_dir.join("main.crn"),
+        "arguments {\n  environment: 'dev' | 'prod'\n  freeform: String\n}\n",
+    )
+    .expect("Failed to write module");
+
+    // (a) Typo'd arg name `enviromnet` → no candidates.
+    let main_typo_arg = r#"let registry_deploy = use {
+  source = './usecases/registry-deploy'
+}
+
+let rd = registry_deploy {
+  enviromnet =
+}
+"#;
+    let doc = create_document(main_typo_arg);
+    let completions = provider.complete(
+        &doc,
+        Position {
+            line: 5,
+            character: 15,
+        },
+        Some(base_path),
+    );
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        !labels
+            .iter()
+            .any(|l| l.starts_with("cidr_") || *l == "concat"),
+        "typo'd arg should fall silent, not dump built-ins; got: {labels:?}"
+    );
+
+    // (b) `String`-typed arg → no specific values, but type-relevant
+    // built-in functions (e.g. `join`, `lower`, `upper`, `trim`) are
+    // surfaced via the shared value-completion entry point.
+    let main_string_arg = r#"let registry_deploy = use {
+  source = './usecases/registry-deploy'
+}
+
+let rd = registry_deploy {
+  freeform =
+}
+"#;
+    let doc = create_document(main_string_arg);
+    let completions = provider.complete(
+        &doc,
+        Position {
+            line: 5,
+            character: 13,
+        },
+        Some(base_path),
+    );
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"join"),
+        "String-typed arg should offer string-returning built-ins like `join`, got: {labels:?}"
+    );
+}
