@@ -22,7 +22,9 @@ use super::expressions::if_expr::parse_if_expr;
 use super::expressions::pipe::parse_coalesce_expr;
 use super::functions::parse_fn_def;
 use super::let_binding::parse_let_binding_extended;
-use super::resolve::{resolve_forward_references, resolve_resource_refs};
+use super::resolve::{
+    finalize_provider_configs, resolve_forward_references, resolve_resource_refs,
+};
 use crate::eval_value::EvalValue;
 use crate::resource::{Resource, Value};
 use indexmap::IndexMap;
@@ -332,5 +334,6 @@ pub(crate) fn parse_expression_eval(
 pub fn parse_and_resolve(input: &str) -> Result<ParsedFile, ParseError> {
     let mut parsed = parse(input, &ProviderContext::default())?;
     resolve_resource_refs(&mut parsed)?;
+    finalize_provider_configs(&mut parsed)?;
     Ok(parsed)
 }

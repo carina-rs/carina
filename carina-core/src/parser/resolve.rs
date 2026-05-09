@@ -231,6 +231,19 @@ pub fn resolve_resource_refs_with_config(
         }
     }
 
+    // Resolve references inside provider blocks' deferred attributes
+    // (#2717). Without this, `default_tags = some_binding.field` would
+    // remain a `Value::ResourceRef` after resolve and `finalize_provider_configs`
+    // would reject it as "must resolve to a map".
+    for provider in &mut parsed.providers {
+        let mut resolved: IndexMap<String, Value> = IndexMap::new();
+        for (key, expr) in &provider.unresolved_attributes {
+            let r = resolve_value_with_config(expr, &binding_map, &fn_ctx)?;
+            resolved.insert(key.clone(), r);
+        }
+        provider.unresolved_attributes = resolved;
+    }
+
     Ok(())
 }
 
@@ -519,4 +532,40 @@ fn resolve_function_calls_only(
         }
         _ => Ok(value.clone()),
     }
+}
+
+/// Drain `ProviderConfig.unresolved_attributes` and promote resolved
+/// well-known attributes into their typed fields. Run **after**
+/// [`resolve_resource_refs`] so deferred references have a chance to
+/// resolve to literals first.
+///
+/// Today only `default_tags` is handled; `source` / `version` /
+/// `revision` peel sites still use the legacy parse-time shape (#2757).
+///
+/// Errors when a resolved value has the wrong shape (e.g.
+/// `default_tags = "string"`).
+pub fn finalize_provider_configs(parsed: &mut ParsedFile) -> Result<(), ParseError> {
+    for provider in parsed.providers.iter_mut() {
+        if let Some(value) = provider.unresolved_attributes.shift_remove("default_tags") {
+            match value {
+                Value::Map(tags) => {
+                    provider.default_tags = tags;
+                }
+                other => {
+                    return Err(ParseError::InvalidExpression {
+                        line: 0,
+                        message: format!(
+                            "Provider '{}': default_tags must resolve to a map, got {other:?}",
+                            provider.name
+                        ),
+                    });
+                }
+            }
+        }
+        debug_assert!(
+            provider.unresolved_attributes.is_empty(),
+            "unresolved_attributes must be drained by finalize",
+        );
+    }
+    Ok(())
 }

@@ -2382,6 +2382,107 @@ fn provider_block_undefined_let_reference_flagged() {
 }
 
 #[test]
+fn finalize_provider_configs_promotes_resolved_default_tags() {
+    // After parse + resolve, a non-literal `default_tags = some_let.field`
+    // must end up resolved into the typed `default_tags` field, with
+    // `unresolved_attributes` drained.
+    let input = r#"
+        let shared = { region = "ap-northeast-1", env = "dev" }
+
+        provider awscc {
+          source       = "github.com/carina-rs/carina-provider-awscc"
+          revision     = "main"
+          default_tags = shared
+        }
+    "#;
+
+    // `let shared = { ... }` is inlined by the parser at parse time, so
+    // `default_tags = shared` reaches the literal-Map peel directly and
+    // `unresolved_attributes` stays empty in this single-file test. The
+    // genuine ResourceRef path (`default_tags = mod.tags`) needs a
+    // multi-file fixture and is covered by Task 5 (#2751).
+    let parsed = parse_and_resolve(input).unwrap();
+    let pc = &parsed.providers[0];
+
+    assert!(
+        pc.unresolved_attributes.is_empty(),
+        "finalize must drain unresolved_attributes; got: {:?}",
+        pc.unresolved_attributes
+    );
+    assert_eq!(
+        pc.default_tags.get("region"),
+        Some(&Value::String("ap-northeast-1".to_string())),
+        "resolved default_tags must contain the literal map's entries; got: {:?}",
+        pc.default_tags
+    );
+    assert_eq!(
+        pc.default_tags.get("env"),
+        Some(&Value::String("dev".to_string())),
+    );
+}
+
+#[test]
+fn finalize_provider_configs_resolves_resource_ref_default_tags() {
+    // The genuine target shape: `default_tags = binding.attr` where the
+    // attribute is itself a literal map. The deferred ResourceRef must be
+    // resolved by `resolve_resource_refs` before `finalize_provider_configs`
+    // promotes it.
+    let input = r#"
+        let cfg = aws.s3.Bucket {
+          name = "x"
+          tags = { Project = "carina-rs", Env = "dev" }
+        }
+
+        provider awscc {
+          source       = "github.com/carina-rs/carina-provider-awscc"
+          revision     = "main"
+          default_tags = cfg.tags
+        }
+    "#;
+
+    let parsed = parse_and_resolve(input).unwrap();
+    let pc = &parsed.providers[0];
+
+    assert!(
+        pc.unresolved_attributes.is_empty(),
+        "finalize must drain unresolved_attributes; got: {:?}",
+        pc.unresolved_attributes
+    );
+    assert_eq!(
+        pc.default_tags.get("Project"),
+        Some(&Value::String("carina-rs".to_string())),
+        "ResourceRef default_tags must resolve to the referenced map; got: {:?}",
+        pc.default_tags
+    );
+    assert_eq!(
+        pc.default_tags.get("Env"),
+        Some(&Value::String("dev".to_string())),
+    );
+}
+
+#[test]
+fn finalize_provider_configs_rejects_non_map_default_tags() {
+    // `default_tags = "not a map"` must surface as a typed error after
+    // finalize, instead of silently producing an empty map.
+    let input = r#"
+        let bad = "not a map"
+
+        provider awscc {
+          source       = "github.com/carina-rs/carina-provider-awscc"
+          revision     = "main"
+          default_tags = bad
+        }
+    "#;
+
+    let err = parse_and_resolve(input).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("default_tags"),
+        "error must mention default_tags; got: {msg}"
+    );
+}
+
+#[test]
 fn provider_config_carries_unresolved_attributes_field() {
     use crate::parser::ast::ProviderConfig;
     use indexmap::IndexMap;
