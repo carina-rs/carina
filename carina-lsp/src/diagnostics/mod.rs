@@ -147,6 +147,17 @@ impl DiagnosticEngine {
             diagnostics.extend(self.check_for_iterable_bindings(doc, merged, current_file_name));
         }
 
+        // Provider-attribute finalize diagnostic (#2717 / #2753): if a
+        // non-literal `default_tags` (or future deferred attribute) does
+        // not resolve to the expected shape, surface that error as a
+        // diagnostic so editors flag it the same way `carina validate`
+        // does.
+        if let Some(base) = base_path
+            && let Some(err) = self.finalize_provider_diagnostic(doc, current_file_name, base)
+        {
+            diagnostics.push(parse_error_to_diagnostic(&err));
+        }
+
         // `known_bindings` for the text-scan undefined-reference check.
         // When the merged parse succeeds, `BindingNameSet::from_parsed`
         // yields every binding declared anywhere in the directory. When
