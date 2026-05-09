@@ -3766,3 +3766,148 @@ let role = test.nested.resource {
         labels
     );
 }
+
+// =====================================================================
+// Value-position bare-identifier completion for `let` bindings (#2642)
+//
+// At a top-level value position inside a resource block (`attr = ▉`),
+// `let X = ...` bindings declared earlier in the same file (or in a
+// sibling `.crn`) must appear as bare-identifier candidates. Before
+// this fix, only `arguments {}` declarations were surfaced; let
+// bindings only reached the popup as `<binding>.<attr>` REFERENCE
+// candidates and only when the target attribute's `Custom` semantic
+// type happened to match a binding-attr's semantic type.
+// =====================================================================
+
+#[test]
+fn top_level_value_position_offers_let_bindings() {
+    // Same-file `let helper = ...` should appear as a bare candidate
+    // when the cursor is inside another resource's `attr = ▉`. The
+    // current binding (`role`) is excluded — referencing it from
+    // inside its own body would be circular.
+    let provider = test_provider_single_attr();
+    let text = "\
+let helper = test.foo.bar {
+  attr = \"hello\"
+}
+
+let role = test.foo.bar {
+  attr =
+}
+";
+    let doc = create_document(text);
+    let position = Position {
+        line: 5,
+        character: "  attr = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"helper"),
+        "expected sibling `let` binding `helper` at value position. Got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.contains(&"role"),
+        "current binding `role` must not appear inside its own body. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn top_level_value_position_offers_let_binding_in_anonymous_resource() {
+    // Anonymous resource (no enclosing `let`): every let binding still
+    // shows because there's no `current_binding` to filter on.
+    let provider = test_provider_single_attr();
+    let text = "\
+let helper = test.foo.bar {
+  attr = \"hello\"
+}
+
+test.foo.bar {
+  attr =
+}
+";
+    let doc = create_document(text);
+    let position = Position {
+        line: 5,
+        character: "  attr = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"helper"),
+        "expected `helper` even without enclosing `let`. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn top_level_value_position_emits_bare_binding_alongside_reference() {
+    // When the target attribute carries a `Custom` semantic type that
+    // matches a binding-attr's semantic type, the existing REFERENCE
+    // pass emits `<binding>.<attr>` (e.g. `vpc.vpc_id`). The new pass
+    // adds the bare binding name (`vpc`) alongside it. Both should
+    // appear — the user might want to type `vpc` then `.` to descend,
+    // or pick the dotted form directly.
+    let provider = test_provider_with_vpc_and_security_group();
+    let text = "\
+let vpc = awscc.ec2.Vpc {
+  cidr_block = \"10.0.0.0/16\"
+}
+
+awscc.ec2.SecurityGroup {
+  vpc_id =
+}
+";
+    let doc = create_document(text);
+    let position = Position {
+        line: 5,
+        character: "  vpc_id = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"vpc"),
+        "expected bare `vpc` (let binding) at vpc_id value position. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"vpc.vpc_id"),
+        "expected REFERENCE `vpc.vpc_id` (Custom-type match) at vpc_id value position. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn top_level_value_position_offers_let_binding_from_sibling_file() {
+    // Cross-file: a `let` binding declared in a sibling `.crn` file
+    // must still surface — the directory-scoped invariant. Mirrors
+    // the real `infra/.../<dir>/main.crn` + `<dir>/helpers.crn` shape.
+    let provider = test_provider_single_attr();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().to_path_buf();
+    std::fs::write(
+        base.join("helpers.crn"),
+        "let helper = test.foo.bar {\n  attr = \"hello\"\n}\n",
+    )
+    .unwrap();
+    let main = "\
+let role = test.foo.bar {
+  attr =
+}
+";
+    std::fs::write(base.join("main.crn"), main).unwrap();
+    let doc = create_document(main);
+    let position = Position {
+        line: 1,
+        character: "  attr = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, Some(&base));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"helper"),
+        "expected sibling-file `let` binding `helper` at value position. Got: {:?}",
+        labels
+    );
+}

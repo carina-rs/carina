@@ -261,18 +261,17 @@ impl CompletionProvider {
             }
         }
 
-        // Add argument parameter references (lexically scoped — direct name access).
-        // The shared `src` surfaces `arguments { ... }` even when split into
-        // a dedicated `arguments.crn`.
-        for (name, type_hint) in self.extract_argument_parameters(src) {
-            completions.push(CompletionItem {
-                label: name.clone(),
-                kind: Some(CompletionItemKind::VARIABLE),
-                detail: Some(format!("argument: {}", type_hint)),
-                insert_text: Some(name),
-                ..Default::default()
-            });
-        }
+        // Bare-identifier candidates: `let` bindings declared in this
+        // directory plus `arguments {}` parameters. Without the `let`
+        // half, a binding could only reach the popup as a REFERENCE
+        // (`<binding>.<attr>`), and only when the target attr's
+        // `Custom` semantic type happened to match a binding-attr's —
+        // a too-narrow filter that hid the most common intra-file
+        // reference style. See #2642.
+        completions.extend(self.in_scope_binding_completions_with_src(
+            src,
+            InScopeBindingMode::ValuePosition { current_binding },
+        ));
 
         // Add for-loop binding names in scope, filtered by inferred element
         // type where possible. When the iterable is an `upstream_state`
@@ -642,6 +641,21 @@ impl CompletionProvider {
         base_path: Option<&Path>,
         mode: InScopeBindingMode<'_>,
     ) -> Vec<CompletionItem> {
+        let mut src_buf = String::new();
+        let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
+        self.in_scope_binding_completions_with_src(src, mode)
+    }
+
+    /// Same as [`in_scope_binding_completions`] but reuses an
+    /// already-built [`DslSource`]. Hot-path callers (e.g.
+    /// [`value_completions_for_attr`]) build `src` once for several
+    /// passes; passing it in avoids re-reading every sibling `.crn`
+    /// file per keystroke.
+    pub(super) fn in_scope_binding_completions_with_src(
+        &self,
+        src: DslSource<'_>,
+        mode: InScopeBindingMode<'_>,
+    ) -> Vec<CompletionItem> {
         let current_binding = match &mode {
             InScopeBindingMode::ValuePosition { current_binding } => *current_binding,
             InScopeBindingMode::PartialReplace { .. } => None,
@@ -677,8 +691,6 @@ impl CompletionProvider {
             items.push(item);
         };
 
-        let mut src_buf = String::new();
-        let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
         for (name, rhs) in Self::extract_let_bindings(src) {
             let detail = if rhs.starts_with("upstream_state") {
                 "upstream_state binding"
