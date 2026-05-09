@@ -128,19 +128,25 @@ impl S3Backend {
         Ok(self.read_lock_with_etag().await?.map(|(lock, _)| lock))
     }
 
+    /// Serialize `value` as pretty JSON with a trailing newline, ready
+    /// to upload as the body of an S3 PutObject. Matches the
+    /// trailing-newline convention used by the local backend's
+    /// `carina.state.json` (#2721) and `carina-backend.lock` (#2583)
+    /// so POSIX tooling and "add final newline" editors agree on the
+    /// file shape regardless of which backend stores the artifact.
+    fn pretty_body_with_newline<T: serde::Serialize>(value: &T) -> BackendResult<Vec<u8>> {
+        let mut body = serde_json::to_vec_pretty(value)
+            .map_err(|e| BackendError::Serialization(e.to_string()))?;
+        body.push(b'\n');
+        Ok(body)
+    }
+
     fn lock_body(lock: &LockInfo) -> BackendResult<Vec<u8>> {
-        serde_json::to_vec_pretty(lock).map_err(|e| BackendError::Serialization(e.to_string()))
+        Self::pretty_body_with_newline(lock)
     }
 
     fn state_body(state: &StateFile) -> BackendResult<Vec<u8>> {
-        let mut body = serde_json::to_vec_pretty(state)
-            .map_err(|e| BackendError::Serialization(e.to_string()))?;
-        // Match the trailing-newline convention used by the local
-        // backend's carina.state.json so POSIX tooling and "add final
-        // newline" editors agree on the file shape regardless of
-        // which backend stores it.
-        body.push(b'\n');
-        Ok(body)
+        Self::pretty_body_with_newline(state)
     }
 
     async fn write_lock_if_absent(&self, lock: &LockInfo) -> BackendResult<bool> {
@@ -614,6 +620,21 @@ mod tests {
             }
             other => panic!("expected Configuration error, got: {other:?}"),
         }
+    }
+
+    // Pin the byte-level shape so the S3-stored lock body matches
+    // the trailing-newline convention used by the state body (#2754)
+    // and the local backend (#2721, #2583).
+    #[test]
+    fn lock_body_ends_with_trailing_newline() {
+        let lock = LockInfo::new("apply");
+        let bytes = S3Backend::lock_body(&lock).unwrap();
+        assert_eq!(
+            bytes.last().copied(),
+            Some(b'\n'),
+            "S3 lock body must end with a trailing newline; got {:?}",
+            bytes.last().map(|b| *b as char),
+        );
     }
 
     // Pin the byte-level shape so the S3-stored carina.state.json
