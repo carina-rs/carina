@@ -10,7 +10,7 @@ use carina_core::effect::Effect;
 use carina_core::parser::{ParsedFile, ProviderConfig};
 use carina_core::plan::Plan;
 use carina_core::provider::{BoxFuture, ProviderError, ProviderResult};
-use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
+use carina_core::resource::{Directives, Resource, ResourceId, State, Value};
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
 use carina_state::{BackendError, LockInfo, ResourceState, StateBackend, StateFile};
 
@@ -265,7 +265,7 @@ fn plan_file_serde_round_trip() {
     plan.add(Effect::Delete {
         id: ResourceId::with_provider("aws", "s3.Bucket", "old-bucket"),
         identifier: "old-bucket".to_string(),
-        lifecycle: LifecycleConfig::default(),
+        directives: Directives::default(),
         binding: None,
         dependencies: HashSet::new(),
     });
@@ -1258,14 +1258,14 @@ fn orphaned_state_resource_produces_delete_effect() {
         current_states.entry(id).or_insert(state);
     }
 
-    let lifecycles = state_file.build_lifecycles();
+    let directives_map = state_file.build_directives();
     let saved_attrs = state_file.build_saved_attrs();
     let prev_desired_keys = state_file.build_desired_keys();
 
     let plan = create_plan(
         &desired,
         &current_states,
-        &lifecycles,
+        &directives_map,
         &SchemaRegistry::new(),
         &saved_attrs,
         &prev_desired_keys,
@@ -1716,7 +1716,7 @@ async fn rename_failure_in_create_before_destroy_counts_as_failure() {
         id: id.clone(),
         from: Box::new(old_state.clone()),
         to: new_resource.clone(),
-        lifecycle: LifecycleConfig {
+        directives: Directives {
             create_before_destroy: true,
             ..Default::default()
         },
@@ -1824,7 +1824,7 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: vpc_unresolved.clone().with_binding("vpc"),
-        lifecycle: LifecycleConfig {
+        directives: Directives {
             create_before_destroy: true,
             ..Default::default()
         },
@@ -2169,14 +2169,14 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
         let _ = state;
     }
 
-    let lifecycles = state_file.build_lifecycles();
+    let directives_map = state_file.build_directives();
     let saved_attrs = state_file.build_saved_attrs();
     let prev_desired_keys = state_file.build_desired_keys();
 
     let plan = create_plan(
         &desired,
         &current_states,
-        &lifecycles,
+        &directives_map,
         &SchemaRegistry::new(),
         &saved_attrs,
         &prev_desired_keys,
@@ -2251,14 +2251,14 @@ fn refresh_false_uses_cached_state_from_state_file() {
         "Attributes should come from state file"
     );
 
-    let lifecycles = state_file.build_lifecycles();
+    let directives_map = state_file.build_directives();
     let saved_attrs = state_file.build_saved_attrs();
     let prev_desired_keys = state_file.build_desired_keys();
 
     let plan = create_plan(
         &desired,
         &current_states,
-        &lifecycles,
+        &directives_map,
         &SchemaRegistry::new(),
         &saved_attrs,
         &prev_desired_keys,
@@ -2297,14 +2297,14 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
         current_states.entry(id).or_insert(state);
     }
 
-    let lifecycles = state_file.build_lifecycles();
+    let directives_map = state_file.build_directives();
     let saved_attrs = state_file.build_saved_attrs();
     let prev_desired_keys = state_file.build_desired_keys();
 
     let plan = create_plan(
         &desired,
         &current_states,
-        &lifecycles,
+        &directives_map,
         &SchemaRegistry::new(),
         &saved_attrs,
         &prev_desired_keys,
@@ -2372,12 +2372,12 @@ fn refresh_false_without_state_file_treats_resources_as_new() {
 fn import_effect_preserves_resource_metadata_in_state() {
     // Regression test: the Effect::Import arm in build_state_after_apply used to
     // overwrite the ResourceState with a bare ResourceState::new(), stripping
-    // lifecycle, prefixes, desired_keys, binding, and dependency_bindings.
+    // directives, prefixes, desired_keys, binding, and dependency_bindings.
 
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc")
         .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()))
         .with_binding("my_vpc_binding");
-    resource.lifecycle.force_delete = true;
+    resource.directives.force_delete = true;
     resource
         .prefixes
         .insert("vpc_name".to_string(), "prod-".to_string());
@@ -2422,8 +2422,8 @@ fn import_effect_preserves_resource_metadata_in_state() {
 
     // Metadata must survive the import
     assert!(
-        saved_resource.lifecycle.force_delete,
-        "lifecycle.force_delete should be preserved after import"
+        saved_resource.directives.force_delete,
+        "directives.force_delete should be preserved after import"
     );
     assert_eq!(
         saved_resource.prefixes.get("vpc_name"),

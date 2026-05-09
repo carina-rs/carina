@@ -9,7 +9,7 @@ use carina_core::provider::{
     UpdatePatch as CoreUpdatePatch, UpdateRequest as CoreUpdateRequest,
 };
 use carina_core::resource::{
-    LifecycleConfig, Resource as CoreResource, ResourceId as CoreResourceId, State as CoreState,
+    Directives, Resource as CoreResource, ResourceId as CoreResourceId, State as CoreState,
     Value as CoreValue,
 };
 use carina_core::schema::{
@@ -301,9 +301,9 @@ pub fn wit_to_core_resource(resource: &wit::ResourceDef) -> CoreResource {
 
 // -- JSON passthrough functions for provider-specific types --
 
-/// Serialize LifecycleConfig to JSON string for the WIT boundary.
-pub fn lifecycle_to_json(lifecycle: &LifecycleConfig) -> String {
-    serde_json::to_string(lifecycle).unwrap_or_else(|_| "{}".to_string())
+/// Serialize Directives to JSON string for the WIT boundary.
+pub fn directives_to_json(directives: &Directives) -> String {
+    serde_json::to_string(directives).unwrap_or_else(|_| "{}".to_string())
 }
 
 // -- ProviderError --
@@ -408,16 +408,16 @@ pub fn core_to_wit_read_request(_request: &CoreReadRequest) -> wit::ReadRequest 
 /// [`CoreDeleteRequest`].
 pub fn core_to_wit_delete_request(request: &CoreDeleteRequest) -> wit::DeleteRequest {
     wit::DeleteRequest {
-        lifecycle: core_to_wit_lifecycle_config(&request.lifecycle),
+        directives: core_to_wit_directives(&request.directives),
     }
 }
 
-/// Convert a [`LifecycleConfig`] to a [`wit::LifecycleConfig`].
-pub fn core_to_wit_lifecycle_config(lifecycle: &LifecycleConfig) -> wit::LifecycleConfig {
-    wit::LifecycleConfig {
-        force_delete: lifecycle.force_delete,
-        create_before_destroy: lifecycle.create_before_destroy,
-        prevent_destroy: lifecycle.prevent_destroy,
+/// Convert a [`Directives`] to a [`wit::Directives`].
+pub fn core_to_wit_directives(directives: &Directives) -> wit::Directives {
+    wit::Directives {
+        force_delete: directives.force_delete,
+        create_before_destroy: directives.create_before_destroy,
+        prevent_destroy: directives.prevent_destroy,
     }
 }
 
@@ -1014,13 +1014,13 @@ mod tests {
     // -- JSON passthrough tests --
 
     #[test]
-    fn test_lifecycle_to_json() {
-        let lifecycle = LifecycleConfig {
+    fn test_directives_to_json() {
+        let directives = Directives {
             force_delete: true,
             create_before_destroy: false,
             prevent_destroy: false,
         };
-        let json = lifecycle_to_json(&lifecycle);
+        let json = directives_to_json(&directives);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["force_delete"], true);
         assert_eq!(parsed["create_before_destroy"], false);

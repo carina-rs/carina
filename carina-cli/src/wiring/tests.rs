@@ -142,7 +142,7 @@ fn test_resolve_enum_aliases_in_struct_field() {
 #[ignore = "requires provider binary for state normalization"]
 fn test_normalize_state_prevents_false_enum_diff() {
     use carina_core::differ::create_plan;
-    use carina_core::resource::LifecycleConfig;
+    use carina_core::resource::Directives;
 
     let ctx = WiringContext::new(vec![]);
 
@@ -166,7 +166,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
 
     // Without normalize_state, the differ would see a false diff
     let resources_without = vec![resource.clone()];
-    let lifecycles: HashMap<ResourceId, LifecycleConfig> = HashMap::new();
+    let directives_map: HashMap<ResourceId, Directives> = HashMap::new();
     let schemas = SchemaRegistry::new();
     let saved_attrs = HashMap::new();
     let prev_desired_keys = HashMap::new();
@@ -174,7 +174,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
     let plan_without = create_plan(
         &resources_without,
         &current_states,
-        &lifecycles,
+        &directives_map,
         &schemas,
         &saved_attrs,
         &prev_desired_keys,
@@ -191,7 +191,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
     let plan_with = create_plan(
         &resources_with,
         &current_states,
-        &lifecycles,
+        &directives_map,
         &schemas,
         &saved_attrs,
         &prev_desired_keys,
@@ -217,7 +217,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
 #[ignore = "requires provider binary for default tags merging"]
 fn test_merge_default_tags_prevents_false_diff() {
     use carina_core::differ::create_plan;
-    use carina_core::resource::LifecycleConfig;
+    use carina_core::resource::Directives;
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     // Build a minimal schema that has a "tags" attribute.
@@ -263,13 +263,13 @@ fn test_merge_default_tags_prevents_false_diff() {
     // but state has tags and prev_desired_keys says "tags" was previously desired.
     // The differ sees this as attribute removal → false Update diff.
     let resources_without = vec![resource.clone()];
-    let lifecycles: HashMap<ResourceId, LifecycleConfig> = HashMap::new();
+    let directives_map: HashMap<ResourceId, Directives> = HashMap::new();
     let saved_attrs = HashMap::new();
     let orphan_deps = HashMap::new();
     let plan_without = create_plan(
         &resources_without,
         &current_states,
-        &lifecycles,
+        &directives_map,
         &schemas,
         &saved_attrs,
         &prev_desired_keys,
@@ -297,7 +297,7 @@ fn test_merge_default_tags_prevents_false_diff() {
     let plan_with = create_plan(
         &resources_with,
         &current_states,
-        &lifecycles,
+        &directives_map,
         &schemas,
         &saved_attrs,
         &prev_desired_keys,

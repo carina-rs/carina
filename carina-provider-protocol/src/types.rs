@@ -157,12 +157,13 @@ pub struct UpdateRequest {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeleteRequest {
     #[serde(default)]
-    pub lifecycle: LifecycleConfig,
+    pub directives: Directives,
 }
 
-/// Lifecycle configuration for a resource.
+/// Carina-side directives for a resource. Mirrors `directives` in
+/// `wit/types.wit`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct LifecycleConfig {
+pub struct Directives {
     #[serde(default)]
     pub force_delete: bool,
     #[serde(default)]
@@ -178,7 +179,7 @@ pub struct Resource {
     pub id: ResourceId,
     pub attributes: HashMap<String, Value>,
     #[serde(default)]
-    pub lifecycle: LifecycleConfig,
+    pub directives: Directives,
 }
 
 /// Provider metadata returned by `provider_info`.

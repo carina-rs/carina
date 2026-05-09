@@ -722,8 +722,8 @@ fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode
             depth: 0,
             parent: None,
         },
-        Effect::Replace { id, lifecycle, .. } => {
-            let symbol = if lifecycle.create_before_destroy {
+        Effect::Replace { id, directives, .. } => {
+            let symbol = if directives.create_before_destroy {
                 "+/-".to_string()
             } else {
                 "-/+".to_string()

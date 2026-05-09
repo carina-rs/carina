@@ -67,14 +67,14 @@ pub(super) enum SingleEffectResult {
 
 /// Context for executing a Replace effect in the parallel path.
 ///
-/// Groups the resource data, lifecycle configuration, and execution metadata
+/// Groups the resource data, directives, and execution metadata
 /// that are passed to both CBD and DBD replace functions.
 pub(super) struct ReplaceContext<'a> {
     pub(super) effect: &'a Effect,
     pub(super) id: &'a ResourceId,
     pub(super) from: &'a State,
     pub(super) to: &'a Resource,
-    pub(super) lifecycle: &'a crate::resource::LifecycleConfig,
+    pub(super) directives: &'a crate::resource::Directives,
     pub(super) cascading_updates: &'a [crate::effect::CascadingUpdate],
     pub(super) temporary_name: Option<&'a crate::effect::TemporaryName>,
     pub(super) bindings: &'a ResolvedBindings,
@@ -93,7 +93,7 @@ pub(super) async fn execute_replace_parallel(
     ctx: &ReplaceContext<'_>,
     observer: &dyn ExecutionObserver,
 ) -> SingleEffectResult {
-    if ctx.lifecycle.create_before_destroy {
+    if ctx.directives.create_before_destroy {
         execute_cbd_replace_parallel(provider, ctx, observer).await
     } else {
         execute_dbd_replace_parallel(provider, ctx, observer).await
@@ -212,7 +212,7 @@ pub(super) async fn execute_cbd_replace_parallel(
                     ctx.id,
                     identifier,
                     DeleteRequest {
-                        lifecycle: ctx.lifecycle.clone(),
+                        directives: ctx.directives.clone(),
                     },
                 )
                 .await
@@ -361,7 +361,7 @@ pub(super) async fn execute_dbd_replace_parallel(
             ctx.id,
             identifier,
             DeleteRequest {
-                lifecycle: ctx.lifecycle.clone(),
+                directives: ctx.directives.clone(),
             },
         )
         .await

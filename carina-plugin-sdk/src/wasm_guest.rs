@@ -223,7 +223,7 @@ macro_rules! export_provider {
                 proto::Resource {
                     id: wit_to_proto_resource_id(&res.id),
                     attributes: wit_to_proto_value_map(&res.attributes),
-                    lifecycle: proto::LifecycleConfig::default(),
+                    directives: proto::Directives::default(),
                 }
             }
 
@@ -312,10 +312,10 @@ macro_rules! export_provider {
                 req: wit_types::DeleteRequest,
             ) -> proto::DeleteRequest {
                 proto::DeleteRequest {
-                    lifecycle: proto::LifecycleConfig {
-                        force_delete: req.lifecycle.force_delete,
-                        create_before_destroy: req.lifecycle.create_before_destroy,
-                        prevent_destroy: req.lifecycle.prevent_destroy,
+                    directives: proto::Directives {
+                        force_delete: req.directives.force_delete,
+                        create_before_destroy: req.directives.create_before_destroy,
+                        prevent_destroy: req.directives.prevent_destroy,
                     },
                 }
             }
@@ -694,7 +694,7 @@ macro_rules! export_provider {
                 proto::Resource {
                     id: wit_to_proto_resource_id(&res.id),
                     attributes: wit_to_proto_value_map(&res.attributes),
-                    lifecycle: proto::LifecycleConfig::default(),
+                    directives: proto::Directives::default(),
                 }
             }
 
@@ -785,10 +785,10 @@ macro_rules! export_provider {
                 req: wit_types::DeleteRequest,
             ) -> proto::DeleteRequest {
                 proto::DeleteRequest {
-                    lifecycle: proto::LifecycleConfig {
-                        force_delete: req.lifecycle.force_delete,
-                        create_before_destroy: req.lifecycle.create_before_destroy,
-                        prevent_destroy: req.lifecycle.prevent_destroy,
+                    directives: proto::Directives {
+                        force_delete: req.directives.force_delete,
+                        create_before_destroy: req.directives.create_before_destroy,
+                        prevent_destroy: req.directives.prevent_destroy,
                     },
                 }
             }

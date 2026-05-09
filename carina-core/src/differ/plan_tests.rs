@@ -11,7 +11,7 @@ fn create_before_destroy_generates_temporary_name_for_name_attribute() {
     let mut resource = Resource::new("s3.Bucket", "my-bucket")
         .with_attribute("bucket_name", Value::String("my-bucket".to_string()))
         .with_attribute("object_lock_enabled", Value::Bool(true));
-    resource.lifecycle.create_before_destroy = true;
+    resource.directives.create_before_destroy = true;
 
     let resources = vec![resource];
 
@@ -86,7 +86,7 @@ fn create_before_destroy_generates_temporary_name_with_can_rename() {
             Value::String("my-log-group".to_string()),
         )
         .with_attribute("kms_key_id", Value::String("new-key".to_string()));
-    resource.lifecycle.create_before_destroy = true;
+    resource.directives.create_before_destroy = true;
 
     let resources = vec![resource];
 
@@ -144,7 +144,7 @@ fn create_before_destroy_generates_temporary_name_with_can_rename() {
 fn no_temporary_name_without_create_before_destroy() {
     use crate::schema::{AttributeSchema, AttributeType};
 
-    // Default lifecycle (create_before_destroy = false)
+    // Default directives (create_before_destroy = false)
     let resources = vec![
         Resource::new("s3.Bucket", "my-bucket")
             .with_attribute("bucket_name", Value::String("my-bucket".to_string()))
@@ -203,7 +203,7 @@ fn no_temporary_name_when_name_prefix_is_used() {
     let mut resource = Resource::new("s3.Bucket", "my-bucket")
         .with_attribute("bucket_name", Value::String("my-app-abc12345".to_string()))
         .with_attribute("object_lock_enabled", Value::Bool(true));
-    resource.lifecycle.create_before_destroy = true;
+    resource.directives.create_before_destroy = true;
     // Simulate that name_prefix was used
     resource
         .prefixes
@@ -262,7 +262,7 @@ fn no_temporary_name_without_name_attribute_in_schema() {
 
     let mut resource = Resource::new("ec2.Vpc", "my-vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
-    resource.lifecycle.create_before_destroy = true;
+    resource.directives.create_before_destroy = true;
 
     let resources = vec![resource];
 
@@ -316,7 +316,7 @@ fn no_temporary_name_when_name_attribute_changes() {
     let mut resource = Resource::new("s3.Bucket", "my-bucket")
         .with_attribute("bucket_name", Value::String("new-bucket".to_string()))
         .with_attribute("object_lock_enabled", Value::Bool(true));
-    resource.lifecycle.create_before_destroy = true;
+    resource.directives.create_before_destroy = true;
 
     let resources = vec![resource];
 
@@ -693,11 +693,11 @@ fn prevent_destroy_blocks_delete_for_orphaned_resource() {
         State::existing(ResourceId::new("ec2.Vpc", "my-vpc"), attrs),
     );
 
-    // Lifecycle from state says prevent_destroy
-    let mut lifecycles = HashMap::new();
-    lifecycles.insert(
+    // Directives from state say prevent_destroy
+    let mut directives_map = HashMap::new();
+    directives_map.insert(
         ResourceId::new("ec2.Vpc", "my-vpc"),
-        LifecycleConfig {
+        Directives {
             prevent_destroy: true,
             ..Default::default()
         },
@@ -706,7 +706,7 @@ fn prevent_destroy_blocks_delete_for_orphaned_resource() {
     let plan = create_plan(
         &[], // no desired resources
         &current_states,
-        &lifecycles,
+        &directives_map,
         &SchemaRegistry::new(),
         &HashMap::new(),
         &HashMap::new(),
@@ -742,7 +742,7 @@ fn prevent_destroy_blocks_replace() {
     // (which would normally trigger a Replace)
     let mut resource = Resource::new("ec2.Vpc", "my-vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
-    resource.lifecycle.prevent_destroy = true;
+    resource.directives.prevent_destroy = true;
 
     let resources = vec![resource];
 
@@ -800,7 +800,7 @@ fn prevent_destroy_does_not_block_update() {
     // Updates don't destroy the resource, so they should be allowed
     let mut resource = Resource::new("s3.Bucket", "my-bucket")
         .with_attribute("versioning", Value::String("Enabled".to_string()));
-    resource.lifecycle.prevent_destroy = true;
+    resource.directives.prevent_destroy = true;
 
     let resources = vec![resource];
 
@@ -846,7 +846,7 @@ fn prevent_destroy_does_not_block_create() {
     // Creates don't destroy anything, so they should be allowed
     let mut resource = Resource::new("s3.Bucket", "my-bucket")
         .with_attribute("bucket", Value::String("my-bucket".to_string()));
-    resource.lifecycle.prevent_destroy = true;
+    resource.directives.prevent_destroy = true;
 
     let resources = vec![resource];
 
@@ -892,7 +892,7 @@ fn without_prevent_destroy_delete_works_normally() {
     let plan = create_plan(
         &[], // no desired resources
         &current_states,
-        &HashMap::new(), // no lifecycles (default = prevent_destroy: false)
+        &HashMap::new(), // no directives (default = prevent_destroy: false)
         &SchemaRegistry::new(),
         &HashMap::new(),
         &HashMap::new(),
@@ -934,17 +934,17 @@ fn prevent_destroy_collects_multiple_errors() {
         State::existing(ResourceId::new("ec2.Vpc", "vpc-2"), attrs2),
     );
 
-    let mut lifecycles = HashMap::new();
-    lifecycles.insert(
+    let mut directives_map = HashMap::new();
+    directives_map.insert(
         ResourceId::new("ec2.Vpc", "vpc-1"),
-        LifecycleConfig {
+        Directives {
             prevent_destroy: true,
             ..Default::default()
         },
     );
-    lifecycles.insert(
+    directives_map.insert(
         ResourceId::new("ec2.Vpc", "vpc-2"),
-        LifecycleConfig {
+        Directives {
             prevent_destroy: true,
             ..Default::default()
         },
@@ -953,7 +953,7 @@ fn prevent_destroy_collects_multiple_errors() {
     let plan = create_plan(
         &[],
         &current_states,
-        &lifecycles,
+        &directives_map,
         &SchemaRegistry::new(),
         &HashMap::new(),
         &HashMap::new(),

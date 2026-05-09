@@ -162,9 +162,9 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     resolve_enum_aliases_with_ctx(&wiring, &mut resources);
     resolve_enum_aliases_in_states(&wiring, &mut current_states);
 
-    let lifecycles = state_file
+    let directives_map = state_file
         .as_ref()
-        .map(|sf| sf.build_lifecycles())
+        .map(|sf| sf.build_directives())
         .unwrap_or_default();
 
     let mut saved_attrs = state_file
@@ -196,7 +196,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     let mut plan = create_plan(
         &resources,
         &current_states,
-        &lifecycles,
+        &directives_map,
         wiring.schemas(),
         &saved_attrs,
         &prev_desired_keys,

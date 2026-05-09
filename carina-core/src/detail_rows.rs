@@ -1010,7 +1010,7 @@ mod tests {
         let effect = Effect::Delete {
             id: id.clone(),
             identifier: "old-bucket".to_string(),
-            lifecycle: crate::resource::LifecycleConfig::default(),
+            directives: crate::resource::Directives::default(),
             binding: None,
             dependencies: HashSet::new(),
         };
@@ -1138,7 +1138,7 @@ mod tests {
         let effect = Effect::Delete {
             id: id.clone(),
             identifier: "old-bucket".to_string(),
-            lifecycle: crate::resource::LifecycleConfig::default(),
+            directives: crate::resource::Directives::default(),
             binding: None,
             dependencies: HashSet::new(),
         };
@@ -1181,7 +1181,7 @@ mod tests {
             id: ResourceId::new("ec2.Vpc", "my-vpc"),
             from: Box::new(from),
             to,
-            lifecycle: crate::resource::LifecycleConfig::default(),
+            directives: crate::resource::Directives::default(),
             changed_create_only: vec!["cidr_block".to_string()],
             cascading_updates: vec![],
             temporary_name: None,

@@ -139,35 +139,35 @@ fn state_serde_round_trip() {
 }
 
 #[test]
-fn lifecycle_config_serde_with_create_before_destroy() {
-    let config = LifecycleConfig {
+fn directives_serde_with_create_before_destroy() {
+    let config = Directives {
         create_before_destroy: true,
         ..Default::default()
     };
     let json = serde_json::to_string(&config).unwrap();
-    let deserialized: LifecycleConfig = serde_json::from_str(&json).unwrap();
+    let deserialized: Directives = serde_json::from_str(&json).unwrap();
     assert_eq!(config, deserialized);
     assert!(deserialized.create_before_destroy);
 }
 
 #[test]
-fn lifecycle_config_backward_compatible_deserialize() {
+fn directives_serde_default() {
     // Old JSON without all fields should deserialize with defaults
     let json = r#"{"create_before_destroy":true}"#;
-    let config: LifecycleConfig = serde_json::from_str(json).unwrap();
+    let config: Directives = serde_json::from_str(json).unwrap();
     assert!(config.create_before_destroy);
     assert!(!config.force_delete);
     assert!(!config.prevent_destroy);
 }
 
 #[test]
-fn lifecycle_config_with_force_delete() {
-    let config = LifecycleConfig {
+fn directives_with_force_delete() {
+    let config = Directives {
         force_delete: true,
         ..Default::default()
     };
     let json = serde_json::to_string(&config).unwrap();
-    let deserialized: LifecycleConfig = serde_json::from_str(&json).unwrap();
+    let deserialized: Directives = serde_json::from_str(&json).unwrap();
     assert!(deserialized.force_delete);
     assert!(!deserialized.create_before_destroy);
     assert!(!deserialized.prevent_destroy);

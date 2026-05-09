@@ -174,17 +174,17 @@ fn test_get_identifier_for_resource_returns_none() {
 }
 
 #[test]
-fn test_build_lifecycles() {
+fn test_build_directives() {
     use carina_core::resource::ResourceId;
 
     let mut state = StateFile::new();
     let mut rs = ResourceState::new("s3.Bucket", "my-bucket", "awscc");
-    rs.lifecycle.force_delete = true;
+    rs.directives.force_delete = true;
     state.upsert_resource(rs);
 
-    let lifecycles = state.build_lifecycles();
+    let directives_map = state.build_directives();
     let id = ResourceId::with_provider("awscc", "s3.Bucket", "my-bucket");
-    assert!(lifecycles.get(&id).unwrap().force_delete);
+    assert!(directives_map.get(&id).unwrap().force_delete);
 }
 
 #[test]
@@ -213,7 +213,7 @@ fn test_resource_state_serialization_with_binding_and_deps() {
         "provider": "aws",
         "attributes": {"region": "ap-northeast-1"},
         "protected": false,
-        "lifecycle": {},
+        "directives": {},
         "prefixes": {},
         "name_overrides": {},
         "desired_keys": [],
@@ -238,7 +238,7 @@ fn test_resource_state_deserialization_without_v3_fields() {
         "provider": "aws",
         "attributes": {"region": "ap-northeast-1"},
         "protected": false,
-        "lifecycle": {},
+        "directives": {},
         "prefixes": {},
         "name_overrides": {},
         "desired_keys": []
@@ -255,7 +255,7 @@ fn test_from_provider_state() {
     use carina_core::resource::{Resource, State as ProviderState, Value};
 
     let mut resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket");
-    resource.lifecycle.force_delete = true;
+    resource.directives.force_delete = true;
     resource
         .prefixes
         .insert("bucket_name".to_string(), "my-app-".to_string());
@@ -284,7 +284,7 @@ fn test_from_provider_state() {
         Some(&serde_json::json!("ap-northeast-1"))
     );
     assert!(rs.protected);
-    assert!(rs.lifecycle.force_delete);
+    assert!(rs.directives.force_delete);
     assert_eq!(rs.prefixes.get("bucket_name"), Some(&"my-app-".to_string()));
 }
 
@@ -378,23 +378,23 @@ fn test_multi_provider_resources_do_not_collide() {
 }
 
 #[test]
-fn test_build_lifecycles_provider_scoped() {
+fn test_build_directives_provider_scoped() {
     use carina_core::resource::ResourceId;
 
     let mut state = StateFile::new();
     let mut aws_rs = ResourceState::new("s3.Bucket", "main", "aws");
-    aws_rs.lifecycle.force_delete = true;
+    aws_rs.directives.force_delete = true;
     let awscc_rs = ResourceState::new("s3.Bucket", "main", "awscc");
 
     state.upsert_resource(aws_rs);
     state.upsert_resource(awscc_rs);
 
-    let lifecycles = state.build_lifecycles();
+    let directives_map = state.build_directives();
     let aws_id = ResourceId::with_provider("aws", "s3.Bucket", "main");
     let awscc_id = ResourceId::with_provider("awscc", "s3.Bucket", "main");
 
-    assert!(lifecycles.get(&aws_id).unwrap().force_delete);
-    assert!(!lifecycles.get(&awscc_id).unwrap().force_delete);
+    assert!(directives_map.get(&aws_id).unwrap().force_delete);
+    assert!(!directives_map.get(&awscc_id).unwrap().force_delete);
 }
 
 #[test]
@@ -1057,7 +1057,7 @@ fn build_remote_bindings_ignores_resource_bindings() {
             serde_json::Value::String("vpc-123".to_string()),
         )]),
         protected: false,
-        lifecycle: carina_core::resource::LifecycleConfig::default(),
+        directives: carina_core::resource::Directives::default(),
         prefixes: HashMap::new(),
         name_overrides: HashMap::new(),
         desired_keys: vec![],

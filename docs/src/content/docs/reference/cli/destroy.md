@@ -28,7 +28,7 @@ Refresh state from the cloud provider before computing the destroy plan. Default
 
 ### `--force`
 
-Destroy even resources that have `prevent_destroy = true` in their lifecycle block.
+Destroy even resources that have `prevent_destroy = true` in their `directives` block.
 
 ### `--reconfigure`
 

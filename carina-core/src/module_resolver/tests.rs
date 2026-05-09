@@ -13,7 +13,7 @@ use indexmap::IndexMap;
 
 use super::*;
 use crate::parser::{ArgumentParameter, ModuleCall, ParsedFile, ProviderContext, TypeExpr};
-use crate::resource::{LifecycleConfig, Resource, ResourceId, ResourceKind, Value};
+use crate::resource::{Directives, Resource, ResourceId, ResourceKind, Value};
 
 fn create_test_module() -> ParsedFile {
     ParsedFile {
@@ -34,7 +34,7 @@ fn create_test_module() -> ParsedFile {
                 attrs.into_iter().collect()
             },
             kind: ResourceKind::Managed,
-            lifecycle: LifecycleConfig::default(),
+            directives: Directives::default(),
             prefixes: HashMap::new(),
             binding: None,
             dependency_bindings: BTreeSet::new(),
@@ -126,7 +126,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
                 attrs
             },
             kind: ResourceKind::Managed,
-            lifecycle: LifecycleConfig::default(),
+            directives: Directives::default(),
             prefixes: HashMap::new(),
             binding: None,
             dependency_bindings: BTreeSet::new(),
@@ -249,7 +249,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                     attrs.into_iter().collect()
                 },
                 kind: ResourceKind::Managed,
-                lifecycle: LifecycleConfig::default(),
+                directives: Directives::default(),
                 prefixes: HashMap::new(),
                 binding: Some("vpc".to_string()),
                 dependency_bindings: BTreeSet::new(),
@@ -267,7 +267,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                     attrs.into_iter().collect()
                 },
                 kind: ResourceKind::Managed,
-                lifecycle: LifecycleConfig::default(),
+                directives: Directives::default(),
                 prefixes: HashMap::new(),
                 binding: Some("subnet".to_string()),
                 dependency_bindings: BTreeSet::new(),
@@ -396,7 +396,7 @@ fn create_module_with_attributes() -> ParsedFile {
                 attrs.into_iter().collect()
             },
             kind: ResourceKind::Managed,
-            lifecycle: LifecycleConfig::default(),
+            directives: Directives::default(),
             prefixes: HashMap::new(),
             binding: Some("sg".to_string()),
             dependency_bindings: BTreeSet::new(),
@@ -1201,7 +1201,7 @@ fn create_module_with_interpolation() -> ParsedFile {
                 attrs.into_iter().collect()
             },
             kind: ResourceKind::Managed,
-            lifecycle: LifecycleConfig::default(),
+            directives: Directives::default(),
             prefixes: HashMap::new(),
             binding: Some("vpc".to_string()),
             dependency_bindings: BTreeSet::new(),

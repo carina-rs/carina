@@ -9,7 +9,7 @@ use indexmap::IndexMap;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
+use crate::resource::{Directives, Resource, ResourceId, State, Value};
 use crate::schema::SchemaRegistry;
 
 /// Contextual metadata attached to every [`ProviderError`] variant.
@@ -235,8 +235,8 @@ pub struct UpdateRequest {
 /// Mirrors `delete-request` in `wit/types.wit`.
 #[derive(Debug, Clone, Default)]
 pub struct DeleteRequest {
-    /// Lifecycle policy for the resource.
-    pub lifecycle: LifecycleConfig,
+    /// Carina-side directives for the resource.
+    pub directives: Directives,
 }
 
 /// A structured description of the user's intended change to a resource.
@@ -413,7 +413,7 @@ pub trait Provider: Send + Sync {
     /// Delete an existing resource. `identifier` is the cloud-side
     /// internal ID (e.g. `vpc-xxx`).
     ///
-    /// `request.lifecycle` carries the resource's lifecycle policy
+    /// `request.directives` carries the resource's Carina-side directives
     /// (force-delete, create-before-destroy, prevent-destroy).
     fn delete(
         &self,

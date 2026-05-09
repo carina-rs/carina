@@ -224,7 +224,7 @@ local_binding = {
     kw_let ~ trivia+ ~ identifier ~ trivia* ~ equals ~ trivia* ~ expression
 }
 
-// Nested block: identifier { ... } (e.g., lifecycle { ... }, security_group_ingress { ... })
+// Nested block: identifier { ... } (e.g., directives { ... }, security_group_ingress { ... })
 nested_block = {
     identifier ~ trivia* ~ open_brace ~ block_content* ~ close_brace
 }

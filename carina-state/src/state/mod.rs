@@ -1,7 +1,7 @@
 //! State file structures for persisting infrastructure state
 
 use carina_core::deps::get_resource_dependencies;
-use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
+use carina_core::resource::{Directives, Resource, ResourceId, State, Value};
 use carina_core::value::{
     SecretHashContext, contains_secret, json_to_dsl_value, merge_secrets_into_provider_json,
     value_to_json,
@@ -165,14 +165,14 @@ impl StateFile {
         None
     }
 
-    /// Build a map of ResourceId -> LifecycleConfig from this state file.
-    pub fn build_lifecycles(&self) -> HashMap<ResourceId, LifecycleConfig> {
-        let mut lifecycles = HashMap::new();
+    /// Build a map of ResourceId -> Directives from this state file.
+    pub fn build_directives(&self) -> HashMap<ResourceId, Directives> {
+        let mut directives_map = HashMap::new();
         for rs in &self.resources {
             let id = ResourceId::with_provider(&rs.provider, &rs.resource_type, &rs.name);
-            lifecycles.insert(id, rs.lifecycle.clone());
+            directives_map.insert(id, rs.directives.clone());
         }
-        lifecycles
+        directives_map
     }
 
     /// Build a map of saved attributes, converting JSON values to DSL values.
@@ -442,9 +442,9 @@ pub struct ResourceState {
     /// Whether this resource is protected from deletion (e.g., state bucket)
     #[serde(default)]
     pub protected: bool,
-    /// Lifecycle configuration persisted from DSL
+    /// Carina-side directives persisted from the DSL `directives` block.
     #[serde(default)]
-    pub lifecycle: LifecycleConfig,
+    pub directives: Directives,
     /// Attribute prefixes used to generate names (e.g., {"bucket_name": "my-app-"})
     #[serde(default)]
     pub prefixes: HashMap<String, String>,
@@ -491,7 +491,7 @@ impl ResourceState {
             identifier: None,
             attributes: HashMap::new(),
             protected: false,
-            lifecycle: LifecycleConfig::default(),
+            directives: Directives::default(),
             prefixes: HashMap::new(),
             name_overrides: HashMap::new(),
             desired_keys: Vec::new(),
@@ -636,7 +636,7 @@ impl ResourceState {
             rs.protected = existing.protected;
             rs.name_overrides = existing.name_overrides.clone();
         }
-        rs.lifecycle = resource.lifecycle.clone();
+        rs.directives = resource.directives.clone();
         rs.prefixes = resource.prefixes.clone();
         // Record which attributes the user explicitly specified in their .crn file
         rs.desired_keys = resource

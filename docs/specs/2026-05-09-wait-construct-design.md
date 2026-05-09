@@ -25,7 +25,7 @@ The brainstorming surfaced and rejected six alternatives:
 |---|---|
 | **B**: Bake polling into `aws.acm.Certificate.create()` | Cyclic dependency — the validation DNS record needs `cert.domain_validation_options` (only known after `RequestCertificate`), so the cert cannot wait on the record before its own create returns. Same problem applies to **G** ("`Certificate` = `ISSUED` guarantee"). |
 | **A**: Per-provider `aws.acm.CertificateValidation` waiter resource (Terraform style) | Works, but multiplies into a class of `~Validation` / `~Ready` resources across services (RDS Available, Lambda Active, ...). Carries three runtime-escape hacks (no-op `delete()`, dummy state-row id, every attribute `ForceNew`) that violate the project's "type safety over runtime checks" rule. |
-| **C-2**: `lifecycle { wait_for = ... }` on the downstream resource | Spreads the wait responsibility across every consumer of the cert (Distribution, ALB Listener, ...), duplicating the predicate; also requires lifecycle-block expression evaluation to dereference *another* resource's attributes. |
+| **C-2**: `directives { wait_for = ... }` on the downstream resource | Spreads the wait responsibility across every consumer of the cert (Distribution, ALB Listener, ...), duplicating the predicate; also requires directives-block expression evaluation to dereference *another* resource's attributes. |
 | **H**: New `assert {...}` top-level statement | Conflates "must be true at point in time" with "wait until true", which are different operations. |
 | **I**: `cert.arn when cert.status == ISSUED` reference modifier | Cute but unsalvageable: the same cert may be referenced from multiple downstream resources, each of which needs the same wait — duplicating the `when` expression. |
 
@@ -191,7 +191,7 @@ A new first-class `Duration` type in carina-core (likely a thin wrapper around `
 
 Once introduced, `Duration` is naturally usable for:
 
-- Future `lifecycle { create_timeout = ..., delete_timeout = ... }` extensions
+- Future `directives { create_timeout = ..., delete_timeout = ... }` extensions
 - TTL-typed attributes (Route 53 record TTL, CloudWatch metric retention, etc.) — currently typed as `Int seconds`
 - Retry / backoff configuration on resources that need it
 

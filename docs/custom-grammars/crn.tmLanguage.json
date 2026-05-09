@@ -78,7 +78,7 @@
         },
         {
           "name": "keyword.declaration.crn",
-          "match": "\\b(let|fn|import|module|provider|backend|arguments|attributes|removed|moved|lifecycle)\\b"
+          "match": "\\b(let|fn|import|module|provider|backend|arguments|attributes|removed|moved|directives)\\b"
         },
         {
           "name": "storage.type.crn",

@@ -265,7 +265,7 @@ pub fn find_failed_dependent<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::{LifecycleConfig, Resource, ResourceId, Value};
+    use crate::resource::{Directives, Resource, ResourceId, Value};
 
     fn make_resource(binding: &str, deps: &[&str]) -> Resource {
         let mut r = Resource::new("test", binding);
@@ -419,7 +419,7 @@ mod tests {
         let effect = Effect::Delete {
             id: ResourceId::new("test", "a"),
             identifier: "id-123".to_string(),
-            lifecycle: LifecycleConfig::default(),
+            directives: Directives::default(),
             binding: None,
             dependencies: HashSet::new(),
         };

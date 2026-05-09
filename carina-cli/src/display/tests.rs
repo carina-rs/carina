@@ -2,7 +2,7 @@ use super::*;
 
 use carina_core::effect::{CascadingUpdate, Effect};
 use carina_core::plan::Plan;
-use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
+use carina_core::resource::{Directives, Resource, ResourceId, State, Value};
 
 fn make_resource(resource_type: &str, name: &str, binding: &str, deps: &[&str]) -> Resource {
     let mut r = Resource::new(resource_type, name);
@@ -737,7 +737,7 @@ fn test_cascading_update_shows_attribute_diffs() {
         id: ResourceId::new("ec2.Vpc", "vpc"),
         from: Box::new(vpc_from),
         to: vpc_to,
-        lifecycle: LifecycleConfig {
+        directives: Directives {
             create_before_destroy: true,
             ..Default::default()
         },
@@ -1074,7 +1074,7 @@ fn test_mixed_plan_tree_with_delete_effect() {
     let subnet_delete = Effect::Delete {
         id: ResourceId::new("ec2.Subnet", "subnet"),
         identifier: "subnet-12345".to_string(),
-        lifecycle: LifecycleConfig::default(),
+        directives: Directives::default(),
         binding: Some("subnet".to_string()),
         dependencies: HashSet::from(["vpc".to_string()]),
     };
@@ -1090,7 +1090,7 @@ fn test_mixed_plan_tree_with_delete_effect() {
         id: ResourceId::new("ec2.SecurityGroup", "sg"),
         from: Box::new(sg_from),
         to: sg_to,
-        lifecycle: LifecycleConfig::default(),
+        directives: Directives::default(),
         changed_create_only: vec!["ref_vpc".to_string()],
         cascading_updates: vec![],
         temporary_name: None,
@@ -1217,7 +1217,7 @@ fn format_effect_delete_uses_binding_name() {
     let effect = Effect::Delete {
         id: ResourceId::with_provider("awscc", "ec2.Vpc", "ec2_vpc_fb75c929"),
         identifier: "vpc-12345".to_string(),
-        lifecycle: LifecycleConfig::default(),
+        directives: Directives::default(),
         binding: Some("my_vpc".to_string()),
         dependencies: HashSet::new(),
     };
@@ -1229,7 +1229,7 @@ fn format_effect_delete_falls_back_to_id_name() {
     let effect = Effect::Delete {
         id: ResourceId::with_provider("awscc", "ec2.Vpc", "ec2_vpc_fb75c929"),
         identifier: "vpc-12345".to_string(),
-        lifecycle: LifecycleConfig::default(),
+        directives: Directives::default(),
         binding: None,
         dependencies: HashSet::new(),
     };
@@ -1282,7 +1282,7 @@ fn format_effect_replace_separates_type_and_name_with_space() {
             "awscc", "ec2.Vpc", "vpc",
         ))),
         to,
-        lifecycle: LifecycleConfig::default(),
+        directives: Directives::default(),
         changed_create_only: Vec::new(),
         cascading_updates: Vec::<CascadingUpdate>::new(),
         temporary_name: None,

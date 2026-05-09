@@ -112,21 +112,23 @@ Query existing resources without managing them:
 let caller = read aws.sts.CallerIdentity {}
 ```
 
-### Lifecycle blocks
+### Directives blocks
 
-Control resource behavior during updates and deletions:
+Control how Carina handles a resource during updates and deletions.
+The `directives` block carries Carina-side instructions — it is not a
+resource attribute, and the cloud provider never sees it:
 
 ```crn
 awscc.s3.Bucket {
   bucket_name = 'my-bucket'
 
-  lifecycle {
+  directives {
     force_delete = true
   }
 }
 ```
 
-Available lifecycle options:
+Available directives:
 
 | Option | Default | Effect |
 |--------|---------|--------|

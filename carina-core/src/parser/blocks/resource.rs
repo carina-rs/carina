@@ -6,7 +6,7 @@
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
 use crate::parser::Rule;
-use crate::parser::blocks::attributes::extract_lifecycle_config;
+use crate::parser::blocks::attributes::extract_directives;
 use crate::parser::context::{ParseContext, extract_key_string, first_inner, next_pair};
 use crate::parser::error::ParseError;
 use crate::parser::parse_expression;
@@ -46,8 +46,8 @@ pub(in crate::parser) fn parse_anonymous_resource(
     let mut attributes = attributes;
     attributes.insert("_type".to_string(), Value::String(namespaced_type.clone()));
 
-    // Extract lifecycle block from attributes (it's a meta-argument, not a real attribute)
-    let lifecycle = extract_lifecycle_config(&mut attributes);
+    // Extract directives block from attributes (it's a meta-argument, not a real attribute)
+    let directives = extract_directives(&mut attributes);
 
     let id = ResourceId::with_provider(provider, resource_type, resource_name);
 
@@ -55,7 +55,7 @@ pub(in crate::parser) fn parse_anonymous_resource(
         id,
         attributes: attributes.into_iter().collect(),
         kind: ResourceKind::Managed,
-        lifecycle,
+        directives,
         prefixes: HashMap::new(),
         binding: None,
         dependency_bindings: BTreeSet::new(),
@@ -205,8 +205,8 @@ pub(crate) fn parse_resource_expr(
     // All providers: use binding name as identifier.
     let resource_name = binding_name.to_string();
 
-    // Extract lifecycle block from attributes (it's a meta-argument, not a real attribute)
-    let lifecycle = extract_lifecycle_config(&mut attributes);
+    // Extract directives block from attributes (it's a meta-argument, not a real attribute)
+    let directives = extract_directives(&mut attributes);
 
     attributes.insert("_type".to_string(), Value::String(namespaced_type.clone()));
 
@@ -216,7 +216,7 @@ pub(crate) fn parse_resource_expr(
         id,
         attributes: attributes.into_iter().collect(),
         kind: ResourceKind::Managed,
-        lifecycle,
+        directives,
         prefixes: HashMap::new(),
         binding: Some(binding_name.to_string()),
         dependency_bindings: BTreeSet::new(),
@@ -254,8 +254,8 @@ pub(crate) fn parse_read_resource_expr(
     // All providers: use binding name as identifier.
     let resource_name = binding_name.to_string();
 
-    // Extract lifecycle block from attributes (it's a meta-argument, not a real attribute)
-    let lifecycle = extract_lifecycle_config(&mut attributes);
+    // Extract directives block from attributes (it's a meta-argument, not a real attribute)
+    let directives = extract_directives(&mut attributes);
 
     attributes.insert("_type".to_string(), Value::String(namespaced_type.clone()));
 
@@ -265,7 +265,7 @@ pub(crate) fn parse_read_resource_expr(
         id,
         attributes: attributes.into_iter().collect(),
         kind: ResourceKind::DataSource,
-        lifecycle,
+        directives,
         prefixes: HashMap::new(),
         binding: Some(binding_name.to_string()),
         dependency_bindings: BTreeSet::new(),

@@ -1061,9 +1061,13 @@ fn similarity_score(a: &Value, b: &Value) -> usize {
     }
 }
 
-/// Lifecycle configuration for a resource
+/// Carina-side directives for a resource.
+///
+/// These are instructions to Carina about how to handle the resource,
+/// not metadata about the resource itself. Mirrors the WIT
+/// `directives` record.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct LifecycleConfig {
+pub struct Directives {
     /// If true, force-delete the resource (e.g., non-empty S3 buckets)
     #[serde(default)]
     pub force_delete: bool,
@@ -1134,9 +1138,11 @@ pub struct Resource {
     /// Classification of this resource (managed, virtual, or data source)
     #[serde(default)]
     pub kind: ResourceKind,
-    /// Lifecycle meta-argument configuration
+    /// `directives` meta-argument block: Carina-side instructions for
+    /// how to handle this resource (force-delete, create-before-destroy,
+    /// prevent-destroy).
     #[serde(default)]
-    pub lifecycle: LifecycleConfig,
+    pub directives: Directives,
     /// Attribute prefixes: maps attribute name -> prefix string
     /// e.g., {"bucket_name": "my-app-"} from `bucket_name_prefix = "my-app-"`
     #[serde(default)]
@@ -1179,7 +1185,7 @@ impl Resource {
             id: ResourceId::new(resource_type, name),
             attributes: IndexMap::new(),
             kind: ResourceKind::Managed,
-            lifecycle: LifecycleConfig::default(),
+            directives: Directives::default(),
             prefixes: HashMap::new(),
             binding: None,
             dependency_bindings: BTreeSet::new(),
@@ -1197,7 +1203,7 @@ impl Resource {
             id: ResourceId::with_provider(provider, resource_type, name),
             attributes: IndexMap::new(),
             kind: ResourceKind::Managed,
-            lifecycle: LifecycleConfig::default(),
+            directives: Directives::default(),
             prefixes: HashMap::new(),
             binding: None,
             dependency_bindings: BTreeSet::new(),

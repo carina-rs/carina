@@ -19,7 +19,7 @@ use crate::effect::Effect;
 #[cfg(test)]
 use crate::plan::Plan;
 #[cfg(test)]
-use crate::resource::LifecycleConfig;
+use crate::resource::Directives;
 #[cfg(test)]
 use crate::schema::{AttributeType, SchemaRegistry};
 #[cfg(test)]

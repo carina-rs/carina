@@ -286,7 +286,7 @@ pub(super) async fn execute_effects_sequential(
                         id,
                         from,
                         to,
-                        lifecycle,
+                        directives,
                         cascading_updates,
                         temporary_name,
                         ..
@@ -306,7 +306,7 @@ pub(super) async fn execute_effects_sequential(
                                 id,
                                 from,
                                 to,
-                                lifecycle,
+                                directives,
                                 cascading_updates,
                                 temporary_name: temporary_name.as_ref(),
                                 bindings: &binding_snapshot,

@@ -799,7 +799,7 @@ pub(crate) async fn run_state_refresh_locked(
 /// Compare old state with fresh provider state for a single resource,
 /// display any changes, and update the state file accordingly.
 ///
-/// When `resource` is `Some`, lifecycle config, prefixes, and desired keys
+/// When `resource` is `Some`, directives, prefixes, and desired keys
 /// are preserved from it. When `None` (orphan resources), a minimal
 /// `Resource` is constructed from the id.
 ///

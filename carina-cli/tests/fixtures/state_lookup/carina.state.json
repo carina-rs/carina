@@ -15,7 +15,7 @@
         "vpc_id": "vpc-0123456789abcdef0"
       },
       "protected": false,
-      "lifecycle": {},
+      "directives": {},
       "prefixes": {},
       "name_overrides": {},
       "desired_keys": ["cidr_block", "enable_dns_support"],
@@ -35,7 +35,7 @@
         "tags": { "Name": "test-subnet" }
       },
       "protected": false,
-      "lifecycle": {},
+      "directives": {},
       "prefixes": {},
       "name_overrides": {},
       "desired_keys": ["vpc_id", "cidr_block", "availability_zone", "tags"],
@@ -52,7 +52,7 @@
         "route_table_id": "rtb-0123456789abcdef0"
       },
       "protected": false,
-      "lifecycle": {},
+      "directives": {},
       "prefixes": {},
       "name_overrides": {},
       "desired_keys": ["vpc_id"],

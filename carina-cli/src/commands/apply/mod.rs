@@ -970,15 +970,15 @@ async fn run_apply_locked(
         &parsed.providers,
     );
 
-    let lifecycles = state_file
+    let directives_map = state_file
         .as_ref()
-        .map(|sf| sf.build_lifecycles())
+        .map(|sf| sf.build_directives())
         .unwrap_or_default();
     let schemas = ctx.schemas();
     let mut plan = create_plan(
         &resources_for_plan,
         &current_states,
-        &lifecycles,
+        &directives_map,
         schemas,
         &saved_attrs,
         &prev_desired_keys,

@@ -287,8 +287,8 @@ async fn run_destroy_locked(
                 return false;
             }
 
-            // Check prevent_destroy lifecycle (unless --force)
-            if !force && r.lifecycle.prevent_destroy {
+            // Check prevent_destroy directive (unless --force)
+            if !force && r.directives.prevent_destroy {
                 prevent_destroy_resources.push(r);
                 return false;
             }
@@ -327,7 +327,7 @@ async fn run_destroy_locked(
         destroy_plan.add(Effect::Delete {
             id: resource.id.clone(),
             identifier,
-            lifecycle: resource.lifecycle.clone(),
+            directives: resource.directives.clone(),
             binding: resource.binding.clone(),
             dependencies,
         });
@@ -477,7 +477,7 @@ async fn run_destroy_locked(
             let effect = Effect::Delete {
                 id: resource.id.clone(),
                 identifier: identifier.clone(),
-                lifecycle: resource.lifecycle.clone(),
+                directives: resource.directives.clone(),
                 binding: resource.binding.clone(),
                 dependencies,
             };
@@ -680,7 +680,7 @@ async fn run_destroy_locked(
             // Spawn the deletion as a concurrent future
             let resource_id = resource.id.clone();
             let identifier = identifier.clone();
-            let lifecycle = resource.lifecycle.clone();
+            let directives = resource.directives.clone();
             let binding = binding.clone();
 
             let provider_ref = &provider;
@@ -691,7 +691,7 @@ async fn run_destroy_locked(
                         &resource_id,
                         &identifier,
                         carina_core::provider::DeleteRequest {
-                            lifecycle: lifecycle.clone(),
+                            directives: directives.clone(),
                         },
                     )
                     .await;

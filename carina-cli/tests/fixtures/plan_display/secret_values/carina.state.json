@@ -18,7 +18,7 @@
         }
       },
       "protected": false,
-      "lifecycle": {},
+      "directives": {},
       "prefixes": {},
       "name_overrides": {},
       "desired_keys": ["cidr_block", "tags"],
@@ -40,7 +40,7 @@
         }
       },
       "protected": false,
-      "lifecycle": {},
+      "directives": {},
       "prefixes": {},
       "name_overrides": {},
       "desired_keys": ["vpc_id", "cidr_block", "tags"],
