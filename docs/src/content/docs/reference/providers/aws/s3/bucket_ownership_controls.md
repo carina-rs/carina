@@ -17,7 +17,7 @@ The name of the Amazon S3 bucket whose OwnershipControls you want to set.
 
 ### `object_ownership`
 
-- **Type:** AttributeType::StringEnum { name: "ObjectOwnership".toString(), values: vec!["BucketOwnerEnforced".toString(), "BucketOwnerPreferred".toString(), "ObjectWriter".toString()], namespace: Some("aws.s3.BucketOwnershipControls".toString()), toDsl: None }
+- **Type:** AttributeType::StringEnum { name: "ObjectOwnership".toString(), values: vec!["BucketOwnerEnforced".toString(), "BucketOwnerPreferred".toString(), "ObjectWriter".toString()], namespace: Some("aws.s3.BucketOwnershipControls".toString()), dslAliases: vec![("BucketOwnerEnforced".toString(), "bucketOwnerEnforced".toString()), ("BucketOwnerPreferred".toString(), "bucketOwnerPreferred".toString()), ("ObjectWriter".toString(), "objectWriter".toString())] }
 - **Required:** No
 
 Object ownership setting: BucketOwnerEnforced, BucketOwnerPreferred, or ObjectWriter.
