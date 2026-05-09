@@ -404,12 +404,12 @@ Fixture content:
 `modules/standard-tags/main.crn`:
 ```crn
 arguments {
-  environment: string
-  component:   string
+  environment: String
+  component:   String
 }
 
-exports {
-  tags = {
+attributes {
+  tags: map(String) = {
     ManagedBy   = 'carina'
     Project     = 'carina-rs'
     Repository  = 'carina-rs/infra'

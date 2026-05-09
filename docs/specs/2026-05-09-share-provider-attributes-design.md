@@ -76,12 +76,12 @@ provider awscc {
 ```crn
 # infra/.../modules/standard-tags/main.crn
 arguments {
-  environment: string
-  component:   string
+  environment: String
+  component:   String
 }
 
-exports {
-  tags = {
+attributes {
+  tags: map(String) = {
     ManagedBy   = 'carina'
     Project     = 'carina-rs'
     Repository  = 'carina-rs/infra'
@@ -90,6 +90,23 @@ exports {
   }
 }
 ```
+
+The module exposes its tag map via the `attributes { ... }` block,
+not `exports { ... }`. The two surfaces are unrelated:
+
+- `attributes { ... }` declares a module's **return-value fields** —
+  the things a call-site binding (`let st = standard_tags { ... }`)
+  carries on `st.tags`. `module_resolver::expander` turns each entry
+  into a virtual-resource attribute at module-call time, so the value
+  is resolvable as soon as the module call is expanded.
+- `exports { ... }` declares **state values** that another
+  configuration directory can read via `upstream_state { source = '...' }`.
+  The exports are evaluated against the directory's *applied state*
+  (post-plan/apply), not against parse-time DSL values.
+
+A module's return value is `attributes`. `exports` is the
+state-export surface — using it for module return values does not
+work, because the call-site binding only sees `attributes` entries.
 
 ### Why Option 1, not Options 2/3
 
@@ -117,7 +134,10 @@ the grammar today:
   `collect_known_bindings_merged` (`carina-core/src/parser/resolve.rs:262`)
   already includes `parsed.uses[].alias` in the binding name set, so
   the `st` module name resolves.
-- Module `arguments { ... }` and `exports { ... }` blocks — existing.
+- Module `arguments { ... }` and `attributes { ... }` blocks —
+  existing. (`exports { ... }` is the state-export surface read by
+  `upstream_state { source }` and is unrelated to module-call return
+  values; the call-site binding carries `attributes` entries.)
 
 The only place that breaks is the parse-time extraction of `default_tags`
 in `parse_provider_block`.
