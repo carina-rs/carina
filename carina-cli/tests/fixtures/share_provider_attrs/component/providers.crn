@@ -1,0 +1,12 @@
+let st = use { source = '../modules/standard-tags' }
+
+let tags = st {
+  environment = 'dev'
+  component   = 'registry'
+}
+
+provider mock {
+  source       = 'github.com/carina-rs/carina-provider-mock'
+  version      = '~0.1.0'
+  default_tags = tags.tags
+}

@@ -179,12 +179,12 @@ pub fn load_configuration_with_config(
             return Err(e.to_string());
         }
 
-        // Promote any deferred provider attributes (e.g. non-literal
-        // `default_tags`) into their typed fields now that resolution
-        // is complete. See `finalize_provider_configs` (#2717).
-        if let Err(e) = parser::finalize_provider_configs(&mut merged) {
-            return Err(e.to_string());
-        }
+        // `finalize_provider_configs` is intentionally NOT called here.
+        // The merged result is still pre-module-expansion, so deferred
+        // `default_tags = mod.tags` shapes cannot be resolved yet. The
+        // CLI calls finalize after `module_resolver::resolve_modules_with_config`
+        // (see `carina-cli/src/commands/mod.rs`); LSP follows the same
+        // contract. See #2717.
 
         // Identifier-scope checks are accumulated rather than short-
         // circuited so `carina validate` can keep going and report every
@@ -287,12 +287,12 @@ pub fn parse_directory_with_overrides(
         return Err(e.to_string());
     }
 
-    // Promote any deferred provider attributes (e.g. non-literal
-    // `default_tags`) into their typed fields now that resolution
-    // is complete. See `finalize_provider_configs` (#2717).
-    if let Err(e) = parser::finalize_provider_configs(&mut merged) {
-        return Err(e.to_string());
-    }
+    // `finalize_provider_configs` is intentionally NOT called here. The
+    // merged result is pre-module-expansion; deferred provider
+    // attributes that reference module-call bindings cannot be resolved
+    // until `module_resolver::resolve_modules_with_config` runs.
+    // Consumers (CLI, LSP) call finalize themselves after expansion.
+    // See #2717.
 
     // Identifier-scope validation is left to callers. LSP needs the
     // ParsedFile even when a reference is unresolved, so it can surface

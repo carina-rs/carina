@@ -281,6 +281,25 @@ pub fn validate_and_resolve_errors_with_factories(
         return errors;
     }
 
+    // Module expansion produces virtual resources for module-call
+    // bindings (`carina-core/src/module_resolver/expander.rs`). Resolve
+    // deferred provider attributes that reference those bindings
+    // (`default_tags = mod.tags`), then finalize so the resolved values
+    // are promoted into the typed `default_tags` field. See #2717.
+    if let Err(e) =
+        carina_core::parser::resolve_provider_unresolved_attributes(parsed, &enriched_context)
+    {
+        errors.push(AppError::Config(format!(
+            "Provider attribute resolution error: {}",
+            e
+        )));
+        return errors;
+    }
+    if let Err(e) = carina_core::parser::finalize_provider_configs(parsed) {
+        errors.push(AppError::Config(format!("Finalize error: {}", e)));
+        return errors;
+    }
+
     // Resolve names (let bindings -> resource names) — must succeed
     // before per-resource schema checks can look up the renamed
     // attributes, so its failures gate the remaining pipeline.
