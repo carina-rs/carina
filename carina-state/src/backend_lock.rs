@@ -111,8 +111,12 @@ impl BackendLock {
     /// Persist this lock snapshot at the project root.
     pub fn save(&self, base_dir: &Path) -> BackendResult<()> {
         let path = Self::lock_path(base_dir);
-        let contents = serde_json::to_string_pretty(self)
+        let mut contents = serde_json::to_string_pretty(self)
             .map_err(|e| BackendError::Serialization(e.to_string()))?;
+        // Match the trailing-newline convention used by
+        // `carina-providers.lock` so POSIX tooling and "add final
+        // newline" editors agree on the file shape.
+        contents.push('\n');
         std::fs::write(&path, contents)
             .map_err(|e| BackendError::Io(format!("Failed to write {}: {}", path.display(), e)))?;
         Ok(())
@@ -220,6 +224,22 @@ mod tests {
         // Should be at root, not in .carina/
         assert!(tmp.path().join("carina-backend.lock").exists());
         assert!(!tmp.path().join(".carina/backend-lock.json").exists());
+    }
+
+    // Pin the byte-level shape so carina-backend.lock and
+    // carina-providers.lock stay consistent (both end with `\n`).
+    #[test]
+    fn lock_file_ends_with_trailing_newline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock = BackendLock::from_config(&make_config("b", "us-east-1")).unwrap();
+        lock.save(tmp.path()).unwrap();
+        let bytes = std::fs::read(tmp.path().join("carina-backend.lock")).unwrap();
+        assert_eq!(
+            bytes.last().copied(),
+            Some(b'\n'),
+            "carina-backend.lock must end with a trailing newline; got {:?}",
+            bytes.last().map(|b| *b as char),
+        );
     }
 
     #[test]
