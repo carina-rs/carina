@@ -132,6 +132,17 @@ impl S3Backend {
         serde_json::to_vec_pretty(lock).map_err(|e| BackendError::Serialization(e.to_string()))
     }
 
+    fn state_body(state: &StateFile) -> BackendResult<Vec<u8>> {
+        let mut body = serde_json::to_vec_pretty(state)
+            .map_err(|e| BackendError::Serialization(e.to_string()))?;
+        // Match the trailing-newline convention used by the local
+        // backend's carina.state.json so POSIX tooling and "add final
+        // newline" editors agree on the file shape regardless of
+        // which backend stores it.
+        body.push(b'\n');
+        Ok(body)
+    }
+
     async fn write_lock_if_absent(&self, lock: &LockInfo) -> BackendResult<bool> {
         self.write_lock(lock, Some("*"), None).await
     }
@@ -248,8 +259,7 @@ impl StateBackend for S3Backend {
     }
 
     async fn write_state(&self, state: &StateFile) -> BackendResult<()> {
-        let body = serde_json::to_vec_pretty(state)
-            .map_err(|e| BackendError::Serialization(e.to_string()))?;
+        let body = Self::state_body(state)?;
 
         let mut request = self
             .client
@@ -604,6 +614,22 @@ mod tests {
             }
             other => panic!("expected Configuration error, got: {other:?}"),
         }
+    }
+
+    // Pin the byte-level shape so the S3-stored carina.state.json
+    // body matches the trailing-newline convention used by the local
+    // backend (#2721).
+    #[test]
+    fn state_body_ends_with_trailing_newline() {
+        let mut state = StateFile::new();
+        state.increment_serial();
+        let bytes = S3Backend::state_body(&state).unwrap();
+        assert_eq!(
+            bytes.last().copied(),
+            Some(b'\n'),
+            "S3 state body must end with a trailing newline; got {:?}",
+            bytes.last().map(|b| *b as char),
+        );
     }
 
     #[test]
