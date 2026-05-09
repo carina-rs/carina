@@ -2325,6 +2325,41 @@ fn parse_block_comment_with_all_comment_styles() {
 }
 
 #[test]
+fn parse_provider_block_defers_non_literal_default_tags() {
+    // `tags.tags` is a ResourceRef into a module-call binding — the parser
+    // cannot inline-resolve it (the module hasn't been loaded yet), so the
+    // value must travel through the resolver pass. Without deferral, the
+    // legacy peel pattern dropped this silently into an empty default_tags.
+    let input = r#"
+        let st = use { source = "./modules/standard-tags" }
+
+        let tags = st {
+          environment = "dev"
+        }
+
+        provider awscc {
+          source       = "github.com/carina-rs/carina-provider-awscc"
+          revision     = "main"
+          default_tags = tags.tags
+        }
+    "#;
+
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let pc = &parsed.providers[0];
+
+    assert!(
+        pc.default_tags.is_empty(),
+        "default_tags must stay empty until the post-resolver finalize step \
+         resolves `tags.tags`"
+    );
+    assert!(
+        pc.unresolved_attributes.contains_key("default_tags"),
+        "non-literal default_tags must be deferred into unresolved_attributes, \
+         not dropped"
+    );
+}
+
+#[test]
 fn provider_config_carries_unresolved_attributes_field() {
     use crate::parser::ast::ProviderConfig;
     use indexmap::IndexMap;
