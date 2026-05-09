@@ -419,6 +419,11 @@ pub struct ProviderConfig {
     /// Mutually exclusive with `version`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
+    /// Non-literal well-known attributes (e.g. `default_tags = some_let.field`)
+    /// drained and validated by the post-resolver finalize step. Invariant:
+    /// empty after finalization. In-memory transit only — never serialized.
+    #[serde(skip)]
+    pub unresolved_attributes: IndexMap<String, Value>,
 }
 
 /// Backend configuration for state storage

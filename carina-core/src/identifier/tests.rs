@@ -206,6 +206,7 @@ fn test_reconcile_anonymous_id_partial_create_only_match() {
         source: None,
         version: None,
         revision: None,
+        unresolved_attributes: IndexMap::new(),
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -385,6 +386,7 @@ fn test_anonymous_resource_inside_module_keeps_instance_prefix() {
         source: None,
         version: None,
         revision: None,
+        unresolved_attributes: IndexMap::new(),
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
@@ -437,6 +439,7 @@ fn test_anonymous_resource_no_create_only_properties() {
         source: None,
         version: None,
         revision: None,
+        unresolved_attributes: IndexMap::new(),
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
@@ -470,6 +473,7 @@ fn test_anonymous_resource_no_create_only_deterministic() {
         source: None,
         version: None,
         revision: None,
+        unresolved_attributes: IndexMap::new(),
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
@@ -501,6 +505,7 @@ fn test_anonymous_resource_no_create_only_collision() {
         source: None,
         version: None,
         revision: None,
+        unresolved_attributes: IndexMap::new(),
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -541,6 +546,7 @@ fn test_identity_attribute_prevents_collision() {
         source: None,
         version: None,
         revision: None,
+        unresolved_attributes: IndexMap::new(),
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -663,6 +669,7 @@ fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
         source: None,
         version: None,
         revision: None,
+        unresolved_attributes: IndexMap::new(),
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
@@ -753,6 +760,7 @@ fn test_reconcile_anonymous_id_create_only_exists_but_none_set() {
         source: None,
         version: None,
         revision: None,
+        unresolved_attributes: IndexMap::new(),
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -934,6 +942,7 @@ fn test_reconcile_no_create_only_picks_closest_among_multiple_state_entries() {
         source: None,
         version: None,
         revision: None,
+        unresolved_attributes: IndexMap::new(),
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1029,6 +1038,7 @@ fn test_reconcile_no_create_only_same_id_in_state_no_change() {
         source: None,
         version: None,
         revision: None,
+        unresolved_attributes: IndexMap::new(),
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1085,6 +1095,7 @@ fn test_compute_anonymous_id_uses_simhash_for_no_create_only() {
         source: None,
         version: None,
         revision: None,
+        unresolved_attributes: IndexMap::new(),
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1139,6 +1150,7 @@ fn test_compute_anonymous_id_simhash_vs_create_only_hash_independent() {
         source: None,
         version: None,
         revision: None,
+        unresolved_attributes: IndexMap::new(),
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1224,6 +1236,7 @@ fn test_compute_anonymous_id_stable_with_prefixed_create_only_attribute() {
         source: None,
         version: None,
         revision: None,
+        unresolved_attributes: IndexMap::new(),
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1266,6 +1279,7 @@ fn test_compute_anonymous_id_different_prefix_produces_different_id() {
         source: None,
         version: None,
         revision: None,
+        unresolved_attributes: IndexMap::new(),
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1445,6 +1459,7 @@ fn test_reconcile_eip_tag_update_with_unset_create_only_props() {
         source: None,
         version: None,
         revision: None,
+        unresolved_attributes: IndexMap::new(),
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
@@ -2017,6 +2032,7 @@ fn anonymous_identifier_includes_provider_prefix() {
         source: None,
         version: None,
         revision: None,
+        unresolved_attributes: IndexMap::new(),
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -2049,6 +2065,7 @@ fn anonymous_identifier_provider_prefix_for_aws_provider() {
         source: None,
         version: None,
         revision: None,
+        unresolved_attributes: IndexMap::new(),
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -2080,6 +2097,7 @@ fn reconcile_simhash_match_keeps_new_format_identifier_and_emits_rename() {
         source: None,
         version: None,
         revision: None,
+        unresolved_attributes: IndexMap::new(),
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
