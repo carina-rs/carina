@@ -429,7 +429,36 @@ pub fn is_type_expr_compatible_with_schema(
                     _ => break,
                 }
             }
-            is_plain_string_or_string_union(attr_type)
+            if is_plain_string_or_string_union(attr_type) {
+                return true;
+            }
+            // Issue #2663: a `Simple(name)` value is unambiguously
+            // string-shaped at runtime, so it can flow into a `Union`
+            // receiver as long as one member is plain `String` and
+            // every other member is shape-disjoint from a string —
+            // i.e. `List`/`Map`/`Struct`. The runtime dispatch on
+            // shape sends the value to the String branch with no
+            // ambiguity. Mixing in another scalar member (e.g.
+            // `Union<String, Int>`) keeps falling through here, so
+            // the existing `Simple → Union<String, Int>` rejection
+            // (`type_compat_simple_rejected_by_mixed_string_int_union_receiver`)
+            // is preserved.
+            if let AttributeType::Union(members) = attr_type {
+                let has_plain_string = members.iter().any(|m| matches!(m, AttributeType::String));
+                let others_shape_disjoint = members.iter().all(|m| {
+                    matches!(
+                        m,
+                        AttributeType::String
+                            | AttributeType::List { .. }
+                            | AttributeType::Map { .. }
+                            | AttributeType::Struct { .. }
+                    )
+                });
+                if has_plain_string && others_shape_disjoint {
+                    return true;
+                }
+            }
+            false
         }
         TypeExpr::List(inner) => match attr_type {
             AttributeType::List {

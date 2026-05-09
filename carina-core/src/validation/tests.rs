@@ -1764,6 +1764,127 @@ fn type_compat_simple_subtypes_into_plain_string() {
     ));
 }
 
+// Issue #2663: a semantic-ARN refinement (`IamOidcProviderArn`) flowed
+// into a `Union<Struct(Principal), String>` receiver — the canonical
+// shape for IAM-style policy `principal` slots — was rejected because
+// the existing `Union<plain String>` rule required *every* member to
+// be a plain String. The Struct member made the union fall through to
+// the catch-all reject. The Simple value is unambiguously string-shaped
+// at runtime, and the Struct member only accepts map-shaped values, so
+// the two members are shape-disjoint and the assignment is safe.
+#[test]
+fn type_compat_simple_into_union_struct_or_string() {
+    use crate::schema::StructField;
+    let principal_union = AttributeType::Union(vec![
+        AttributeType::Struct {
+            name: "IamPolicyPrincipal".to_string(),
+            fields: vec![StructField::new("federated", AttributeType::String)],
+        },
+        AttributeType::String,
+    ]);
+    // Issue #2663 enumerates the full set of ARN refinements that
+    // should reach the principal slot; pin each one against the same
+    // receiver so the table is the spec.
+    for name in [
+        "arn",
+        "iam_role_arn",
+        "iam_policy_arn",
+        "iam_oidc_provider_arn",
+        "kms_key_arn",
+    ] {
+        assert!(
+            is_type_expr_compatible_with_schema(
+                &TypeExpr::Simple(name.to_string()),
+                &principal_union,
+            ),
+            "Simple({name}) should be assignable to Union<Struct, String>"
+        );
+    }
+}
+
+// Guards the boundary the new rule must not cross: if any non-String
+// member of the union is *also* scalar-shaped, the union receiver can
+// reinterpret the value down a non-string branch, which is the unsafe
+// case the original `Union<String, Int>` test pinned. A union mixing
+// Struct, String, and Int must still reject `Simple(name)` because the
+// Int branch competes for primitive values.
+#[test]
+fn type_compat_simple_rejected_when_union_has_other_scalar() {
+    use crate::schema::StructField;
+    let mixed = AttributeType::Union(vec![
+        AttributeType::Struct {
+            name: "Principal".to_string(),
+            fields: vec![StructField::new("federated", AttributeType::String)],
+        },
+        AttributeType::String,
+        AttributeType::Int,
+    ]);
+    assert!(!is_type_expr_compatible_with_schema(
+        &TypeExpr::Simple("iam_oidc_provider_arn".to_string()),
+        &mixed,
+    ));
+}
+
+// A union without any plain-String member cannot accept a Simple value:
+// even a List<String> member shapes its values as a list, not a string.
+#[test]
+fn type_compat_simple_rejected_when_union_has_no_plain_string() {
+    use crate::schema::StructField;
+    let no_string = AttributeType::Union(vec![
+        AttributeType::Struct {
+            name: "Principal".to_string(),
+            fields: vec![StructField::new("federated", AttributeType::String)],
+        },
+        AttributeType::List {
+            inner: Box::new(AttributeType::String),
+            ordered: true,
+        },
+    ]);
+    assert!(!is_type_expr_compatible_with_schema(
+        &TypeExpr::Simple("iam_oidc_provider_arn".to_string()),
+        &no_string,
+    ));
+}
+
+// `Custom` and `StringEnum` are deliberately excluded from the new
+// Union allow-list: both are string-shaped at runtime, so a `Simple`
+// value sharing a union with one of them is ambiguous about which
+// branch the consumer treats as the route. The Custom-chain walk
+// above already handles the *specific* "Simple subtypes of this
+// Custom" case at the top of the arm; the union escape hatch is for
+// shape-disjoint members only. If these arms are ever folded into the
+// allow-list, this test will fail and force a re-think.
+#[test]
+fn type_compat_simple_rejected_when_union_has_string_shaped_peer() {
+    let arn = AttributeType::Custom {
+        semantic_name: Some("Arn".to_string()),
+        base: Box::new(AttributeType::String),
+        pattern: None,
+        length: None,
+        validate: noop_validator(),
+        namespace: None,
+        to_dsl: None,
+    };
+    let with_custom = AttributeType::Union(vec![AttributeType::String, arn]);
+    assert!(!is_type_expr_compatible_with_schema(
+        &TypeExpr::Simple("iam_oidc_provider_arn".to_string()),
+        &with_custom,
+    ));
+    let with_enum = AttributeType::Union(vec![
+        AttributeType::String,
+        AttributeType::StringEnum {
+            name: "Status".to_string(),
+            values: vec!["enabled".to_string(), "disabled".to_string()],
+            namespace: None,
+            to_dsl: None,
+        },
+    ]);
+    assert!(!is_type_expr_compatible_with_schema(
+        &TypeExpr::Simple("iam_oidc_provider_arn".to_string()),
+        &with_enum,
+    ));
+}
+
 #[test]
 fn validate_export_param_ref_types_map_accepts_compatible_types() {
     use crate::parser::InferredExportParam;

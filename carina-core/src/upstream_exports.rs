@@ -1960,6 +1960,51 @@ mod tests {
         assert!(errs[0].location.contains("for"));
     }
 
+    // Issue #2663: a semantic-ARN refinement (e.g. `IamOidcProviderArn`)
+    // declared on an upstream export must be assignable to a
+    // `Union<Struct(Principal), String>` receiver — the canonical IAM
+    // policy `principal` slot. Before the fix, the Struct member made
+    // the union fall through to the catch-all reject so the arn was
+    // refused at the very position it was designed for.
+    #[test]
+    fn type_check_accepts_arn_refinement_into_principal_union() {
+        use crate::schema::{AttributeType, StructField};
+        let parsed = parse_project_with_provider(
+            r#"
+                let bootstrap = upstream_state { source = "../bootstrap" }
+                test.r.res {
+                    name = { federated = bootstrap.oidc_provider_arn }
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "bootstrap",
+            &[(
+                "oidc_provider_arn",
+                TypeExpr::Simple("iam_oidc_provider_arn".to_string()),
+            )],
+        )]);
+        // Mirrors the canonical IAM `principal` slot shape:
+        // `Union<Struct(IamPolicyPrincipal), String>`. The map walker
+        // hits the Union catch-all and walks each value against the
+        // whole union, so the leaf `Simple(iam_oidc_provider_arn)`
+        // must be assignable to the union receiver directly.
+        let principal_union = AttributeType::Union(vec![
+            AttributeType::Struct {
+                name: "IamPolicyPrincipal".to_string(),
+                fields: vec![StructField::new("federated", AttributeType::String)],
+            },
+            AttributeType::String,
+        ]);
+        let schemas = schema_with_attr("name", principal_union);
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        assert!(
+            errs.is_empty(),
+            "IamOidcProviderArn must be assignable into Union<Struct, String>, got: {errs:?}"
+        );
+    }
+
     #[test]
     fn type_check_accepts_custom_type_chain() {
         // Consumer attribute is `Custom { name: "KmsKeyArn", base: Arn }`;
