@@ -712,14 +712,16 @@ fn check_resource_ref_at_position(
     if crate::validation::is_type_expr_compatible_with_schema(&narrowed, expected) {
         return;
     }
-    // Narrowed-string-shape vs string-receiver: a `Simple("aws_account_id")`
-    // (or any other string-compatible scalar identity) can sit in any
-    // string-compatible position. The strict compat check rejects this
-    // direction (it walks the receiver's `Custom` chain looking for the
-    // exact identity; `String` carries no chain), but the runtime
-    // value is a string, so the position is satisfiable. The reverse
-    // direction (`String → Custom{Specific}`) stays strict via
-    // `attr_type_demands_specific_custom`. #2475.
+    // String-shaped value into a string-compatible receiver. The
+    // strict compat check above accepts `Simple(name) → String` /
+    // `Union<plain Strings>` directly via subtyping (#2643), so this
+    // fallback only handles the receivers it doesn't yet cover —
+    // `Custom { semantic_name: None }`-shaped wrappers and
+    // `StringEnum` receivers — and the non-`Simple` string-shaped
+    // values (e.g. `SchemaType` / scalar `String` literal) the
+    // strict path also doesn't recognise. The reverse direction
+    // (`String → Custom { semantic_name: Some(_) }`) stays strict
+    // via `attr_type_demands_specific_custom`. #2475 / #2643.
     if narrowed.is_string_shaped() && crate::validation::is_string_compatible_type(expected) {
         return;
     }

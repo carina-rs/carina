@@ -33,6 +33,7 @@ pub use resolve::{
     check_identifier_scope, collect_known_bindings_merged, resolve_resource_refs,
     resolve_resource_refs_with_config,
 };
+pub use types::parse_type_expr_str;
 pub(crate) use util::{eval_type_name, value_type_name};
 pub use util::{pascal_to_snake, snake_to_pascal};
 
