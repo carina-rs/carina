@@ -330,6 +330,14 @@ fn accumulate_undefined_reference_errors(
             check(value);
         }
     }
+    for provider in &parsed.providers {
+        for value in provider.attributes.values() {
+            check(value);
+        }
+        for value in provider.unresolved_attributes.values() {
+            check(value);
+        }
+    }
 }
 
 fn accumulate_deferred_iterable_errors(
