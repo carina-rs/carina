@@ -96,24 +96,24 @@ Shorthand formats: `cloud_watch_logs` or `LogDestinationType.cloud_watch_logs`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `NetworkInterface` | `aws.ec2.FlowLog.ResourceType.NetworkInterface` |
-| `RegionalNatGateway` | `aws.ec2.FlowLog.ResourceType.RegionalNatGateway` |
-| `Subnet` | `aws.ec2.FlowLog.ResourceType.Subnet` |
-| `TransitGateway` | `aws.ec2.FlowLog.ResourceType.TransitGateway` |
-| `TransitGatewayAttachment` | `aws.ec2.FlowLog.ResourceType.TransitGatewayAttachment` |
-| `VPC` | `aws.ec2.FlowLog.ResourceType.VPC` |
+| `NetworkInterface` | `aws.ec2.FlowLog.ResourceType.network_interface` |
+| `RegionalNatGateway` | `aws.ec2.FlowLog.ResourceType.regional_nat_gateway` |
+| `Subnet` | `aws.ec2.FlowLog.ResourceType.subnet` |
+| `TransitGateway` | `aws.ec2.FlowLog.ResourceType.transit_gateway` |
+| `TransitGatewayAttachment` | `aws.ec2.FlowLog.ResourceType.transit_gateway_attachment` |
+| `VPC` | `aws.ec2.FlowLog.ResourceType.vpc` |
 
-Shorthand formats: `NetworkInterface` or `ResourceType.NetworkInterface`
+Shorthand formats: `network_interface` or `ResourceType.network_interface`
 
 ### traffic_type (TrafficType)
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ACCEPT` | `aws.ec2.FlowLog.TrafficType.ACCEPT` |
-| `ALL` | `aws.ec2.FlowLog.TrafficType.ALL` |
-| `REJECT` | `aws.ec2.FlowLog.TrafficType.REJECT` |
+| `ACCEPT` | `aws.ec2.FlowLog.TrafficType.accept` |
+| `ALL` | `aws.ec2.FlowLog.TrafficType.all` |
+| `REJECT` | `aws.ec2.FlowLog.TrafficType.reject` |
 
-Shorthand formats: `ACCEPT` or `TrafficType.ACCEPT`
+Shorthand formats: `accept` or `TrafficType.accept`
 
 ## Attribute Reference
 

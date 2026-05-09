@@ -51,29 +51,29 @@ The tags for the resource.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ALLOW` | `aws.organizations.Account.IamUserAccessToBilling.ALLOW` |
-| `DENY` | `aws.organizations.Account.IamUserAccessToBilling.DENY` |
+| `ALLOW` | `aws.organizations.Account.IamUserAccessToBilling.allow` |
+| `DENY` | `aws.organizations.Account.IamUserAccessToBilling.deny` |
 
-Shorthand formats: `ALLOW` or `IamUserAccessToBilling.ALLOW`
+Shorthand formats: `allow` or `IamUserAccessToBilling.allow`
 
 ### joined_method (JoinedMethod)
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `CREATED` | `aws.organizations.Account.JoinedMethod.CREATED` |
-| `INVITED` | `aws.organizations.Account.JoinedMethod.INVITED` |
+| `CREATED` | `aws.organizations.Account.JoinedMethod.created` |
+| `INVITED` | `aws.organizations.Account.JoinedMethod.invited` |
 
-Shorthand formats: `CREATED` or `JoinedMethod.CREATED`
+Shorthand formats: `created` or `JoinedMethod.created`
 
 ### status (Status)
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ACTIVE` | `aws.organizations.Account.Status.ACTIVE` |
-| `PENDING_CLOSURE` | `aws.organizations.Account.Status.PENDING_CLOSURE` |
-| `SUSPENDED` | `aws.organizations.Account.Status.SUSPENDED` |
+| `ACTIVE` | `aws.organizations.Account.Status.active` |
+| `PENDING_CLOSURE` | `aws.organizations.Account.Status.pending_closure` |
+| `SUSPENDED` | `aws.organizations.Account.Status.suspended` |
 
-Shorthand formats: `ACTIVE` or `Status.ACTIVE`
+Shorthand formats: `active` or `Status.active`
 
 ## Attribute Reference
 

@@ -65,9 +65,9 @@ The tags for the resource.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `DELIVERY` | `aws.logs.LogGroup.LogGroupClass.DELIVERY` |
-| `INFREQUENT_ACCESS` | `aws.logs.LogGroup.LogGroupClass.INFREQUENT_ACCESS` |
-| `STANDARD` | `aws.logs.LogGroup.LogGroupClass.STANDARD` |
+| `DELIVERY` | `aws.logs.LogGroup.LogGroupClass.delivery` |
+| `INFREQUENT_ACCESS` | `aws.logs.LogGroup.LogGroupClass.infrequent_access` |
+| `STANDARD` | `aws.logs.LogGroup.LogGroupClass.standard` |
 
-Shorthand formats: `DELIVERY` or `LogGroupClass.DELIVERY`
+Shorthand formats: `delivery` or `LogGroupClass.delivery`
 

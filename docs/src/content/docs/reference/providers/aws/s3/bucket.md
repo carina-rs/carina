@@ -19,7 +19,7 @@ let bucket = aws.s3.Bucket {
 
 aws.s3.BucketVersioning {
   bucket = bucket.bucket
-  status = aws.s3.BucketVersioning.VersioningStatus.Enabled
+  status = aws.s3.BucketVersioning.VersioningStatus.enabled
 }
 ```
 
