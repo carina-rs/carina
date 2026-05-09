@@ -835,3 +835,43 @@ fn value_range_locates_value_separated_by_tabs() {
     assert_eq!(range.start.character, value_start);
     assert_eq!(range.end.character, value_end);
 }
+
+/// Issue #2623 regression: the closed-set string types from #2611
+/// (`'dev' | 'prod'`) must not surface a parser-level "expected
+/// type_expr" diagnostic in the LSP. The grammar accepts the shape;
+/// LSP and CLI share that grammar, so this test pins the no-error
+/// behavior so a future grammar refactor can't silently break it.
+#[test]
+fn arguments_literal_union_type_does_not_surface_parser_error() {
+    let engine = test_engine();
+    let doc = create_document(
+        "arguments {\n  oidc_provider_arn: IamOidcProviderArn\n  environment      : 'dev' | 'prod'\n}\n",
+    );
+    let diagnostics = engine.analyze(&doc, None);
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|d| d.message.contains("expected type_expr")),
+        "literal-union argument type must not produce `expected type_expr`; got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+/// Issue #2623 regression: a single-literal annotation
+/// (`'dev'` alone) is the degenerate case of the same grammar
+/// production. Pinning it separately so a future tightening of the
+/// `type_expr_atom` rule doesn't accidentally re-introduce a
+/// "expected type_expr" diagnostic on this shape.
+#[test]
+fn arguments_single_string_literal_type_does_not_surface_parser_error() {
+    let engine = test_engine();
+    let doc = create_document("arguments {\n  environment: 'dev'\n}\n");
+    let diagnostics = engine.analyze(&doc, None);
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|d| d.message.contains("expected type_expr")),
+        "single-literal argument type must not produce `expected type_expr`; got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
