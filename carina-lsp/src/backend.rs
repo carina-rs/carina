@@ -971,6 +971,7 @@ mod tests {
             source: Some("github.com/carina-rs/stub".into()),
             version: None,
             revision: None,
+            unresolved_attributes: IndexMap::new(),
             attributes,
             default_tags: IndexMap::new(),
         };
@@ -1003,6 +1004,7 @@ mod tests {
             source: None,
             version: None,
             revision: None,
+            unresolved_attributes: IndexMap::new(),
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
         };
@@ -1031,6 +1033,7 @@ mod reload_skip_tests {
             source: source.map(String::from),
             version: None,
             revision: None,
+            unresolved_attributes: IndexMap::new(),
         }
     }
 

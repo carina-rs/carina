@@ -566,6 +566,7 @@ mod tests {
             default_tags: IndexMap::new(),
             version: None,
             revision: None,
+            unresolved_attributes: IndexMap::new(),
         });
 
         let base_dir = std::path::Path::new("/tmp/nonexistent-carina-test");
@@ -598,6 +599,7 @@ mod tests {
             default_tags: IndexMap::new(),
             version: None,
             revision: None,
+            unresolved_attributes: IndexMap::new(),
         });
 
         let base_dir = std::path::Path::new("/tmp/nonexistent-carina-test");

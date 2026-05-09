@@ -1034,6 +1034,7 @@ mod tests {
             revision: revision.map(|r| r.into()),
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
+            unresolved_attributes: IndexMap::new(),
         }
     }
 
@@ -1381,6 +1382,7 @@ sha256 = "abc"
             source: Some(source.clone()),
             version: None,
             revision: None,
+            unresolved_attributes: IndexMap::new(),
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
         }];
@@ -1406,6 +1408,7 @@ sha256 = "abc"
             source: Some("file:///nonexistent/path.wasm".into()),
             version: None,
             revision: None,
+            unresolved_attributes: IndexMap::new(),
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
         }];
@@ -1503,6 +1506,7 @@ sha256 = "abc"
                 carina_core::version_constraint::VersionConstraint::parse(constraint).unwrap(),
             ),
             revision: None,
+            unresolved_attributes: IndexMap::new(),
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
         }
@@ -1674,6 +1678,7 @@ sha256 = "abc"
             source: Some("file:///tmp/provider.wasm".into()),
             version: None,
             revision: None,
+            unresolved_attributes: IndexMap::new(),
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
         };

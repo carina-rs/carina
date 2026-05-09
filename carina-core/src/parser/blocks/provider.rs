@@ -91,6 +91,7 @@ pub(in crate::parser) fn parse_provider_block(
         source,
         version,
         revision,
+        unresolved_attributes: IndexMap::new(),
     })
 }
 

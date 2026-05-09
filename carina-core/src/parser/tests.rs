@@ -2325,6 +2325,23 @@ fn parse_block_comment_with_all_comment_styles() {
 }
 
 #[test]
+fn provider_config_carries_unresolved_attributes_field() {
+    use crate::parser::ast::ProviderConfig;
+    use indexmap::IndexMap;
+
+    let pc = ProviderConfig {
+        name: "awscc".to_string(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+    };
+    assert!(pc.unresolved_attributes.is_empty());
+}
+
+#[test]
 fn parse_provider_block_with_default_tags() {
     let input = r#"
         provider awscc {
