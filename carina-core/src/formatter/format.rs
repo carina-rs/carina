@@ -859,6 +859,135 @@ mod tests {
         );
     }
 
+    // Regression for #2641: untyped `attributes {}` entries should align
+    // their `=` columns the same way resource attribute lists already do.
+    #[test]
+    fn issue_2641_attributes_block_aligns_equals_for_untyped_entries() {
+        let input = "attributes {\n  role_arn = role.arn\n  role_name = role.role_name\n}\n";
+        let config = FormatConfig {
+            align_attributes: true,
+            ..Default::default()
+        };
+        let result = format(input, &config).unwrap();
+
+        let lines: Vec<&str> = result.lines().collect();
+        let arn_eq = lines
+            .iter()
+            .find(|l| l.contains("role_arn"))
+            .unwrap()
+            .find('=');
+        let name_eq = lines
+            .iter()
+            .find(|l| l.contains("role_name"))
+            .unwrap()
+            .find('=');
+
+        assert_eq!(
+            arn_eq, name_eq,
+            "`=` columns must line up in `attributes {{}}` block. Got:\n{}",
+            result
+        );
+
+        // Idempotence
+        let second = format(&result, &config).unwrap();
+        assert_eq!(result, second, "format must be idempotent");
+    }
+
+    // Same alignment guarantee for `exports {}`, which shares the
+    // formatter path with `attributes {}` (NodeKind::ExportsBlock /
+    // ExportsParam).
+    #[test]
+    fn issue_2641_exports_block_aligns_equals_for_untyped_entries() {
+        let input = "exports {\n  role_arn = role.arn\n  role_name = role.role_name\n}\n";
+        let config = FormatConfig {
+            align_attributes: true,
+            ..Default::default()
+        };
+        let result = format(input, &config).unwrap();
+
+        let lines: Vec<&str> = result.lines().collect();
+        let arn_eq = lines
+            .iter()
+            .find(|l| l.contains("role_arn"))
+            .unwrap()
+            .find('=');
+        let name_eq = lines
+            .iter()
+            .find(|l| l.contains("role_name"))
+            .unwrap()
+            .find('=');
+
+        assert_eq!(
+            arn_eq, name_eq,
+            "`=` columns must line up in `exports {{}}` block. Got:\n{}",
+            result
+        );
+
+        let second = format(&result, &config).unwrap();
+        assert_eq!(result, second, "format must be idempotent");
+    }
+
+    // Degenerate shapes for the new alignment path: zero and one
+    // untyped entries. The guard's `align_to > 0` and `key_len <
+    // align_to` checks must skip padding so neither shape crashes or
+    // grows phantom whitespace.
+    #[test]
+    fn issue_2641_attributes_block_degenerate_shapes() {
+        let config = FormatConfig {
+            align_attributes: true,
+            ..Default::default()
+        };
+
+        // Empty block
+        let empty = format("attributes {\n}\n", &config).unwrap();
+        assert_eq!(format(&empty, &config).unwrap(), empty);
+
+        // Single entry — no peer to align to, padding must be skipped.
+        let single = format("attributes {\n  only_one = thing.value\n}\n", &config).unwrap();
+        assert!(
+            single.contains("only_one = thing.value"),
+            "single-entry block should not gain phantom padding. Got:\n{}",
+            single
+        );
+        assert_eq!(format(&single, &config).unwrap(), single);
+    }
+
+    // Mixed typed/untyped block: the new `!wrote_colon` guard in
+    // `format_attributes_param` only adds padding when no `:` was
+    // emitted, so typed entries still align at `:` (existing behavior)
+    // while untyped entries align at `=` against the same `align_to`
+    // (the longest key in the whole block).
+    #[test]
+    fn issue_2641_attributes_block_mixed_typed_and_untyped() {
+        let input = "attributes {\n  vpc_id: awscc.ec2.VpcId = vpc.vpc_id\n  security_group = sg.id\n  role_arn = role.arn\n}\n";
+        let config = FormatConfig {
+            align_attributes: true,
+            ..Default::default()
+        };
+        let result = format(input, &config).unwrap();
+
+        let lines: Vec<&str> = result.lines().collect();
+        let sg_eq = lines
+            .iter()
+            .find(|l| l.contains("security_group"))
+            .unwrap()
+            .find('=');
+        let role_eq = lines
+            .iter()
+            .find(|l| l.contains("role_arn"))
+            .unwrap()
+            .find('=');
+
+        assert_eq!(
+            sg_eq, role_eq,
+            "untyped `=` columns must line up across mixed block. Got:\n{}",
+            result
+        );
+
+        let second = format(&result, &config).unwrap();
+        assert_eq!(result, second, "format must be idempotent");
+    }
+
     #[test]
     fn test_format_index_access() {
         let input = "let x = items[0].name\n";

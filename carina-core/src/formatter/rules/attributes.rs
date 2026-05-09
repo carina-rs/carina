@@ -335,6 +335,13 @@ impl Formatter {
                         self.write(": ");
                         wrote_colon = true;
                     } else if token.text == "=" && !wrote_equals {
+                        // Untyped form (no `:` seen): pad before `=` so
+                        // entries' `=` columns line up. Typed form has
+                        // already aligned at `:`, so no extra padding here.
+                        if !wrote_colon && align_to > 0 && key_len < align_to {
+                            let padding = align_to - key_len;
+                            self.write(&" ".repeat(padding));
+                        }
                         self.write(" = ");
                         wrote_equals = true;
                     } else if wrote_colon && !wrote_equals {
