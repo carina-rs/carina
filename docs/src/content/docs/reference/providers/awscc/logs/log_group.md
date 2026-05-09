@@ -99,11 +99,11 @@ An array of key-value pairs to apply to the log group. For more information, see
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `STANDARD` | `awscc.logs.LogGroup.LogGroupClass.STANDARD` |
-| `INFREQUENT_ACCESS` | `awscc.logs.LogGroup.LogGroupClass.INFREQUENT_ACCESS` |
-| `DELIVERY` | `awscc.logs.LogGroup.LogGroupClass.DELIVERY` |
+| `STANDARD` | `awscc.logs.LogGroup.LogGroupClass.standard` |
+| `INFREQUENT_ACCESS` | `awscc.logs.LogGroup.LogGroupClass.infrequent_access` |
+| `DELIVERY` | `awscc.logs.LogGroup.LogGroupClass.delivery` |
 
-Shorthand formats: `STANDARD` or `LogGroupClass.STANDARD`
+Shorthand formats: `standard` or `LogGroupClass.standard`
 
 ## Attribute Reference
 

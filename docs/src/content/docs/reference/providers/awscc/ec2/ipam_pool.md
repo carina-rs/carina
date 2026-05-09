@@ -160,10 +160,10 @@ An array of key-value pairs to apply to this resource.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `IPv4` | `awscc.ec2.IpamPool.AddressFamily.IPv4` |
-| `IPv6` | `awscc.ec2.IpamPool.AddressFamily.IPv6` |
+| `IPv4` | `awscc.ec2.IpamPool.AddressFamily.ipv4` |
+| `IPv6` | `awscc.ec2.IpamPool.AddressFamily.ipv6` |
 
-Shorthand formats: `IPv4` or `AddressFamily.IPv4`
+Shorthand formats: `ipv4` or `AddressFamily.ipv4`
 
 ### aws_service (AwsService)
 

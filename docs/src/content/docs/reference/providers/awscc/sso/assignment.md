@@ -64,16 +64,16 @@ The type of resource to be provisioned to, only aws account now
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `USER` | `awscc.sso.Assignment.PrincipalType.USER` |
-| `GROUP` | `awscc.sso.Assignment.PrincipalType.GROUP` |
+| `USER` | `awscc.sso.Assignment.PrincipalType.user` |
+| `GROUP` | `awscc.sso.Assignment.PrincipalType.group` |
 
-Shorthand formats: `USER` or `PrincipalType.USER`
+Shorthand formats: `user` or `PrincipalType.user`
 
 ### target_type (TargetType)
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `AWS_ACCOUNT` | `awscc.sso.Assignment.TargetType.AWS_ACCOUNT` |
+| `AWS_ACCOUNT` | `awscc.sso.Assignment.TargetType.aws_account` |
 
-Shorthand formats: `AWS_ACCOUNT` or `TargetType.AWS_ACCOUNT`
+Shorthand formats: `aws_account` or `TargetType.aws_account`
 
