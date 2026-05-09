@@ -4166,3 +4166,107 @@ attributes {
         labels
     );
 }
+
+// =====================================================================
+// `attributes { }` block value-position completion (#2644)
+//
+// Inside an `attributes { name = ▉ }` block the right-hand side is a
+// value expression — the popup must surface in-scope identifiers
+// (arguments, `let` bindings) just like inside any other resource
+// block. The reporter saw an empty popup pre-#2649; the
+// schema-unknown fallback in `value_completions_for_attr` no longer
+// suppresses the in-scope pass after PR #2649. Lock the behavior
+// here so a future tightening can't silently regress to the empty
+// popup the original report described.
+// =====================================================================
+
+#[test]
+fn attributes_block_value_position_offers_arguments() {
+    let provider = test_provider_with_vpc_and_security_group();
+    let text = "\
+arguments {
+  oidc_provider_arn: String
+  environment: String
+}
+
+attributes {
+  role_arn =
+}
+";
+    let doc = create_document(text);
+    let position = Position {
+        line: 6,
+        character: "  role_arn = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"oidc_provider_arn"),
+        "argument `oidc_provider_arn` must appear at attributes-block value position. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"environment"),
+        "argument `environment` must appear at attributes-block value position. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn attributes_block_value_position_offers_let_bindings() {
+    let provider = test_provider_with_vpc_and_security_group();
+    let text = "\
+let vpc = awscc.ec2.Vpc {
+  cidr_block = \"10.0.0.0/16\"
+}
+
+attributes {
+  vpc_arn =
+}
+";
+    let doc = create_document(text);
+    let position = Position {
+        line: 5,
+        character: "  vpc_arn = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"vpc"),
+        "let binding `vpc` must appear at attributes-block value position. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn attributes_block_value_position_offers_arguments_from_sibling_file() {
+    // Directory-scoped invariant: `arguments` declared in a sibling
+    // `.crn` (the `arguments.crn` + `main.crn` shape) must still
+    // surface at an attributes-block cursor in `main.crn`.
+    let provider = test_provider_with_vpc_and_security_group();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().to_path_buf();
+    std::fs::write(
+        base.join("arguments.crn"),
+        "arguments {\n  oidc_provider_arn: String\n}\n",
+    )
+    .unwrap();
+    let main = "\
+attributes {
+  role_arn =
+}
+";
+    std::fs::write(base.join("main.crn"), main).unwrap();
+    let doc = create_document(main);
+    let position = Position {
+        line: 1,
+        character: "  role_arn = ".chars().count() as u32,
+    };
+    let completions = provider.complete(&doc, position, Some(&base));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"oidc_provider_arn"),
+        "sibling-file `arguments` must reach an attributes-block value position. Got: {:?}",
+        labels
+    );
+}
