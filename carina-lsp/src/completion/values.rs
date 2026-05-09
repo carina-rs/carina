@@ -956,15 +956,18 @@ impl CompletionProvider {
             annotation
         };
 
-        self.value_completions_for_attribute_type(&effective, text, base_path)
+        let mut items = Self::builtin_function_completions_for_type(&effective);
+        items.extend(self.resource_ref_completions_for_type(&effective, text, base_path));
+        items
     }
 
-    /// Single entry point for "given a value-position attribute type,
-    /// what should we offer the user?" — shared by the `exports {}`
-    /// value position (#2043) and the module-call value position
-    /// (#2621).
+    /// Module-call value-position completion entry point (#2621). The
+    /// `exports {}` value position deliberately does NOT funnel through
+    /// here — its existing two-layer surface (built-ins + binding refs)
+    /// is preserved untouched so this PR's scope stays bounded to
+    /// module-call value position.
     ///
-    /// Three layers, all driven by the same `AttributeType`:
+    /// Layers, all driven by the same `AttributeType`:
     ///
     /// 1. **Structural / type-driven candidates** —
     ///    [`Self::completions_for_type`] knows that `Bool` →
@@ -976,10 +979,10 @@ impl CompletionProvider {
     ///    [`Self::builtin_function_completions_for_type`].
     /// 3. **Existing-binding references** (`<binding>.<field>`) whose
     ///    leaf attribute is assignable to the target —
-    ///    [`Self::resource_ref_completions_for_type`].
-    ///
-    /// Adding new value-completion call sites should funnel through
-    /// here so the three layers stay in sync.
+    ///    [`Self::resource_ref_completions_for_type`] for resource and
+    ///    module-call bindings, plus
+    ///    [`Self::upstream_state_ref_completions_for_type`] for
+    ///    `upstream_state` exports.
     pub(super) fn value_completions_for_attribute_type(
         &self,
         attr_type: &AttributeType,
@@ -989,6 +992,7 @@ impl CompletionProvider {
         let mut items = self.completions_for_type(attr_type, None);
         items.extend(Self::builtin_function_completions_for_type(attr_type));
         items.extend(self.resource_ref_completions_for_type(attr_type, text, base_path));
+        items.extend(self.module_call_binding_ref_completions_for_type(attr_type, text, base_path));
         items.extend(self.upstream_state_ref_completions_for_type(attr_type, text, base_path));
         items
     }
@@ -1065,42 +1069,58 @@ impl CompletionProvider {
         let mut items: Vec<CompletionItem> = Vec::new();
         let mut src_buf = String::new();
         let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
-
-        // Walk every `let` binding once; classify each by RHS shape so
-        // resource bindings (provider-schema-driven) and module-call
-        // bindings (export-driven) both contribute candidates. Without
-        // the module-call path the consumer of e.g. a `bootstrap`
-        // usecase wouldn't see `bootstrap.<exported_name>` after `=`.
-        for (binding_name, rhs) in Self::extract_let_bindings(src) {
-            // Resource binding: schema-driven, every attr considered.
-            if let Some(resource_type) = self.extract_resource_type(&rhs)
-                && let Some(schema) = self.lookup_schema(&resource_type)
-            {
-                for attr in schema.attributes.values() {
-                    if !attr.attr_type.is_assignable_to(target) {
-                        continue;
-                    }
-                    let full_ref = format!("{}.{}", binding_name, attr.name);
-                    items.push(CompletionItem {
-                        label: full_ref.clone(),
-                        kind: Some(CompletionItemKind::REFERENCE),
-                        detail: Some(format!(
-                            "Reference to {}'s {} ({})",
-                            binding_name,
-                            attr.name,
-                            attr.attr_type.type_name()
-                        )),
-                        insert_text: Some(full_ref),
-                        ..Default::default()
-                    });
-                }
+        for (binding_name, resource_type) in self.extract_resource_bindings(src) {
+            if resource_type.is_empty() {
                 continue;
             }
-            // Module-call binding: walk the called module's
-            // `export_params` and surface each typed export whose
-            // declared `TypeExpr` is compatible with `target`. This is
-            // the path the issue body's `bootstrap.oidc_provider_arn`
-            // shape goes through (#2621).
+            let Some(schema) = self.lookup_schema(&resource_type) else {
+                continue;
+            };
+            for attr in schema.attributes.values() {
+                if !attr.attr_type.is_assignable_to(target) {
+                    continue;
+                }
+                let full_ref = format!("{}.{}", binding_name, attr.name);
+                items.push(CompletionItem {
+                    label: full_ref.clone(),
+                    kind: Some(CompletionItemKind::REFERENCE),
+                    detail: Some(format!(
+                        "Reference to {}'s {} ({})",
+                        binding_name,
+                        attr.name,
+                        attr.attr_type.type_name()
+                    )),
+                    insert_text: Some(full_ref),
+                    ..Default::default()
+                });
+            }
+        }
+        items.sort_by(|a, b| a.label.cmp(&b.label));
+        items
+    }
+
+    /// `<module_call_binding>.<exported_name>` references whose
+    /// declared `TypeExpr` is compatible with `target`. Walks every
+    /// `let X = <module> { ... }` in scope, loads the called module,
+    /// and emits an entry per type-compatible export. Only invoked
+    /// from the module-call value-position handler — the `exports {}`
+    /// value position keeps its pre-#2621 surface untouched. See #2621.
+    fn module_call_binding_ref_completions_for_type(
+        &self,
+        target: &AttributeType,
+        text: &str,
+        base_path: Option<&Path>,
+    ) -> Vec<CompletionItem> {
+        let mut items: Vec<CompletionItem> = Vec::new();
+        let mut src_buf = String::new();
+        let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
+        for (binding_name, rhs) in Self::extract_let_bindings(src) {
+            // Resource bindings are handled by
+            // `resource_ref_completions_for_type`; skip them so the
+            // two helpers don't double-emit.
+            if self.extract_resource_type(&rhs).is_some() {
+                continue;
+            }
             let header = format!(
                 "let {} = {} {{",
                 binding_name,
