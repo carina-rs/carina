@@ -128,25 +128,14 @@ impl S3Backend {
         Ok(self.read_lock_with_etag().await?.map(|(lock, _)| lock))
     }
 
-    /// Serialize `value` as pretty JSON with a trailing newline, ready
-    /// to upload as the body of an S3 PutObject. Matches the
-    /// trailing-newline convention used by the local backend's
-    /// `carina.state.json` (#2721) and `carina-backend.lock` (#2583)
-    /// so POSIX tooling and "add final newline" editors agree on the
-    /// file shape regardless of which backend stores the artifact.
-    fn pretty_body_with_newline<T: serde::Serialize>(value: &T) -> BackendResult<Vec<u8>> {
-        let mut body = serde_json::to_vec_pretty(value)
-            .map_err(|e| BackendError::Serialization(e.to_string()))?;
-        body.push(b'\n');
-        Ok(body)
-    }
-
     fn lock_body(lock: &LockInfo) -> BackendResult<Vec<u8>> {
-        Self::pretty_body_with_newline(lock)
+        carina_core::utils::pretty_with_newline_bytes(lock)
+            .map_err(|e| BackendError::Serialization(e.to_string()))
     }
 
     fn state_body(state: &StateFile) -> BackendResult<Vec<u8>> {
-        Self::pretty_body_with_newline(state)
+        carina_core::utils::pretty_with_newline_bytes(state)
+            .map_err(|e| BackendError::Serialization(e.to_string()))
     }
 
     async fn write_lock_if_absent(&self, lock: &LockInfo) -> BackendResult<bool> {

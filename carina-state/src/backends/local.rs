@@ -242,14 +242,9 @@ impl StateBackend for LocalBackend {
     }
 
     async fn write_state(&self, state: &StateFile) -> BackendResult<()> {
-        let mut content = serde_json::to_string_pretty(state).map_err(|e| {
+        let content = carina_core::utils::pretty_with_newline(state).map_err(|e| {
             BackendError::Serialization(format!("Failed to serialize state: {}", e))
         })?;
-        // Match the trailing-newline convention used by
-        // carina-backend.lock and carina-providers.lock so POSIX
-        // tooling and "add final newline" editors agree on the
-        // file shape.
-        content.push('\n');
 
         // Write to a temp file in the same directory, then rename atomically
         let tmp_path = self.state_path.with_extension("json.tmp");

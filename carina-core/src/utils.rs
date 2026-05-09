@@ -615,6 +615,29 @@ pub fn is_identifier_safe(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Serialize `value` as pretty JSON terminated with `\n`. Matches the
+/// trailing-newline convention enforced across all durable JSON
+/// artifacts Carina writes (#2583, #2721, #2722, #2754, #2758, #2759)
+/// so POSIX tooling and "add final newline" editors agree on the file
+/// shape regardless of the writer.
+///
+/// Each caller maps the returned `serde_json::Error` to its local
+/// error type as before; the helper does no error wrapping itself.
+pub fn pretty_with_newline<T: serde::Serialize>(value: &T) -> serde_json::Result<String> {
+    let mut s = serde_json::to_string_pretty(value)?;
+    s.push('\n');
+    Ok(s)
+}
+
+/// Byte-oriented variant of [`pretty_with_newline`] for callers (e.g.
+/// the S3 backend's `PutObject`) that consume `Vec<u8>` directly and
+/// want to avoid an intermediate `String`.
+pub fn pretty_with_newline_bytes<T: serde::Serialize>(value: &T) -> serde_json::Result<Vec<u8>> {
+    let mut v = serde_json::to_vec_pretty(value)?;
+    v.push(b'\n');
+    Ok(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1285,5 +1308,38 @@ mod tests {
             canonicalize_map_key_address("explicit-name-with-hyphens"),
             "explicit-name-with-hyphens"
         );
+    }
+
+    #[test]
+    fn pretty_with_newline_appends_single_trailing_newline() {
+        let value = serde_json::json!({"a": 1});
+        let s = pretty_with_newline(&value).unwrap();
+        assert!(s.ends_with("}\n"), "expected `...}}\\n`, got: {s:?}");
+        // Exactly one newline, not two.
+        assert!(!s.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn pretty_with_newline_bytes_appends_single_trailing_newline() {
+        let value = serde_json::json!({"a": 1});
+        let v = pretty_with_newline_bytes(&value).unwrap();
+        assert_eq!(v.last().copied(), Some(b'\n'));
+        let len = v.len();
+        // Last char is `\n`, second-to-last is `}` — not a double newline.
+        assert_eq!(v.get(len - 2).copied(), Some(b'}'));
+    }
+
+    #[test]
+    fn pretty_with_newline_propagates_serialize_error() {
+        // serde_json refuses non-string keys in maps because the JSON
+        // spec only allows string keys. A `BTreeMap<Vec<i32>, _>` key
+        // would serialize to a JSON array, so the serializer fails.
+        // The helper must surface that error, not swallow it.
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(vec![1, 2], "x");
+        let err = pretty_with_newline(&map).unwrap_err();
+        // The exact message is serde_json's; we only assert that a
+        // serialization failure surfaces as an Err.
+        assert!(!err.to_string().is_empty());
     }
 }
