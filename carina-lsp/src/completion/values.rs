@@ -516,10 +516,16 @@ impl CompletionProvider {
                 semantic_name: Some(name),
                 ..
             } if name == "Ipv6Cidr" => self.ipv6_cidr_completions(),
+            // Generic ARN snippet for `Arn` and every IAM/KMS/etc.
+            // ARN family that ends in `Arn` (e.g. `IamRoleArn`,
+            // `IamPolicyArn`, `IamOidcProviderArn`, `KmsKeyArn`). Per-
+            // family templates can be added later as additional arms;
+            // until then the generic ARN snippet is strictly better
+            // than a silent dropdown. See #2621.
             AttributeType::Custom {
                 semantic_name: Some(name),
                 ..
-            } if name == "Arn" => self.arn_completions(),
+            } if name == "Arn" || name.ends_with("Arn") => self.arn_completions(),
             AttributeType::Custom {
                 semantic_name: Some(name),
                 namespace,

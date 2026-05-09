@@ -2039,6 +2039,95 @@ fn module_call_value_completion_with_sibling_use_decl() {
     );
 }
 
+/// Issue #2621: value-position completion for ARN-family semantic
+/// types (e.g. `IamOidcProviderArn`) must surface the generic ARN
+/// snippet. Lifts `TypeExpr::Simple("iam_oidc_provider_arn")` to
+/// `AttributeType::Custom { semantic_name: "IamOidcProviderArn", .. }`
+/// and reuses the schema-level dispatcher; the `*Arn` suffix
+/// heuristic in `completions_for_type` then routes to `arn_completions`.
+#[test]
+fn module_call_value_completion_arn_semantic_type() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let provider = test_provider();
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let base_path = temp_dir.path();
+
+    let module_dir = base_path.join("usecases").join("registry-deploy");
+    fs::create_dir_all(&module_dir).expect("Failed to create module dir");
+    fs::write(
+        module_dir.join("main.crn"),
+        "arguments {\n  oidc_provider_arn: IamOidcProviderArn\n}\n",
+    )
+    .expect("Failed to write module");
+
+    let main_content = r#"let registry_deploy = use {
+  source = './usecases/registry-deploy'
+}
+
+let rd = registry_deploy {
+  oidc_provider_arn =
+}
+"#;
+    let doc = create_document(main_content);
+    let position = Position {
+        line: 5,
+        character: 22,
+    };
+    let completions = provider.complete(&doc, position, Some(base_path));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.iter().any(|l| l.contains("arn:")),
+        "expected ARN snippet candidate for IamOidcProviderArn, got: {labels:?}"
+    );
+}
+
+/// Issue #2621: `arguments` typed `Bool` should offer `true` / `false`
+/// at the value position. Validates the generic dispatch works for
+/// non-ARN, non-literal types too.
+#[test]
+fn module_call_value_completion_bool_offers_true_false() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let provider = test_provider();
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let base_path = temp_dir.path();
+
+    let module_dir = base_path.join("modules").join("toggle");
+    fs::create_dir_all(&module_dir).expect("Failed to create module dir");
+    fs::write(
+        module_dir.join("main.crn"),
+        "arguments {\n  enabled: Bool\n}\n",
+    )
+    .expect("Failed to write module");
+
+    let main_content = r#"let toggle = use {
+  source = './modules/toggle'
+}
+
+let t = toggle {
+  enabled =
+}
+"#;
+    let doc = create_document(main_content);
+    let position = Position {
+        line: 5,
+        character: 12,
+    };
+    let completions = provider.complete(&doc, position, Some(base_path));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"true"),
+        "expected `true` candidate for Bool arg, got: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"false"),
+        "expected `false` candidate for Bool arg, got: {labels:?}"
+    );
+}
+
 /// Issue #2621: negative paths must fall silent. A typo'd module name,
 /// typo'd argument name, or argument with a non-enumerable type
 /// produces no candidates instead of dumping built-in functions like

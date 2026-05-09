@@ -390,10 +390,23 @@ impl CompletionProvider {
 
     /// Value-position completion inside a module call. Resolves the
     /// called module's `arguments {}` declaration, looks up `arg_name`'s
-    /// type, and emits candidates derived from that type. Today this
-    /// covers string-literal unions (#2611, e.g. `'dev' | 'prod'`) and
-    /// single string literals; richer types fall silent rather than dump
-    /// generic built-ins. See #2621.
+    /// type, and emits candidates derived from that type.
+    ///
+    /// Two paths:
+    ///
+    /// - For closed-set string types (#2611) the candidate set lives in
+    ///   the syntax tree itself (`'dev' | 'prod'` → two literal items),
+    ///   so we emit those directly without round-tripping through the
+    ///   schema-level `AttributeType`.
+    /// - For named custom types (`IamOidcProviderArn`, `Cidr`,
+    ///   `AwsAccountId`, …) we lift the [`parser::TypeExpr`] into a
+    ///   minimal [`AttributeType::Custom`] and let
+    ///   [`Self::completions_for_type`] dispatch — same path the
+    ///   `exports {}` value position uses, so adding a new named type
+    ///   automatically gains a completion entry once it is wired into
+    ///   `completions_for_type`'s match.
+    ///
+    /// See #2621.
     pub(super) fn module_call_arg_value_completions(
         &self,
         module_name: &str,
@@ -407,7 +420,16 @@ impl CompletionProvider {
         let Some(arg) = parsed.arguments.iter().find(|a| a.name == arg_name) else {
             return Vec::new();
         };
-        completions_from_type_expr(&arg.type_expr)
+        // Literal-set fast path: candidates are syntactic.
+        let literal_items = literal_completions_from_type_expr(&arg.type_expr);
+        if !literal_items.is_empty() {
+            return literal_items;
+        }
+        // Type-driven fast path: lift to AttributeType and delegate.
+        if let Some(attr_type) = type_expr_to_attribute_type(&arg.type_expr) {
+            return self.completions_for_type(&attr_type, None);
+        }
+        Vec::new()
     }
 
     pub(super) fn format_type_expr(&self, type_expr: &parser::TypeExpr) -> String {
@@ -893,18 +915,15 @@ pub(super) fn extract_for_bindings_in_scope(
         .collect()
 }
 
-/// Derive value-position completion candidates from a [`parser::TypeExpr`].
+/// Closed-set string types (#2611) carry their candidate values
+/// inline in the syntax tree:
 ///
-/// Today this covers closed-set string types (#2611) — the only carina
-/// type whose membership is fully enumerable from the syntax tree alone:
+/// - [`parser::TypeExpr::StringLiteral`] → one literal candidate.
+/// - [`parser::TypeExpr::Union`] of `StringLiteral`s → one per member.
 ///
-/// - [`parser::TypeExpr::StringLiteral`] → one candidate, the literal.
-/// - [`parser::TypeExpr::Union`] of literals → one candidate per literal.
-///
-/// Any other shape returns an empty list. Adding richer types here
-/// (e.g. `Bool` → `true`/`false`) is a natural extension but out of
-/// scope for the original #2621 fix.
-fn completions_from_type_expr(type_expr: &parser::TypeExpr) -> Vec<CompletionItem> {
+/// Returns the empty `Vec` for anything else; the caller falls through
+/// to the schema-level dispatcher.
+fn literal_completions_from_type_expr(type_expr: &parser::TypeExpr) -> Vec<CompletionItem> {
     fn literal_item(value: &str) -> CompletionItem {
         let label = format!("'{value}'");
         CompletionItem {
@@ -925,6 +944,66 @@ fn completions_from_type_expr(type_expr: &parser::TypeExpr) -> Vec<CompletionIte
             })
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+/// Lift a [`parser::TypeExpr`] from `arguments { ... }` into a
+/// schema-level [`carina_core::schema::AttributeType`] so the existing
+/// type-driven completion dispatcher (`completions_for_type`) can be
+/// reused without forking a parallel implementation.
+///
+/// `Simple(name)` (snake_case) is reified as
+/// `AttributeType::Custom { semantic_name: <PascalCase>, base: String,
+/// .. }` — same shape `parse_exports_type_text` produces for `exports`
+/// annotations. The other arms cover the structural cases the
+/// dispatcher recurses through. Returns `None` for shapes that have no
+/// useful default (e.g. resource refs, `<unknown>`).
+fn type_expr_to_attribute_type(
+    type_expr: &parser::TypeExpr,
+) -> Option<carina_core::schema::AttributeType> {
+    use carina_core::schema::{AttributeType, legacy_validator};
+    fn noop(_: &carina_core::resource::Value) -> Result<(), String> {
+        Ok(())
+    }
+    match type_expr {
+        parser::TypeExpr::String => Some(AttributeType::String),
+        parser::TypeExpr::Bool => Some(AttributeType::Bool),
+        parser::TypeExpr::Int => Some(AttributeType::Int),
+        parser::TypeExpr::Float => Some(AttributeType::Float),
+        parser::TypeExpr::Simple(name) => Some(AttributeType::Custom {
+            semantic_name: Some(parser::snake_to_pascal(name)),
+            base: Box::new(AttributeType::String),
+            pattern: None,
+            length: None,
+            validate: legacy_validator(noop),
+            namespace: None,
+            to_dsl: None,
+        }),
+        parser::TypeExpr::List(inner) => {
+            type_expr_to_attribute_type(inner).map(AttributeType::list)
+        }
+        parser::TypeExpr::Map(inner) => {
+            type_expr_to_attribute_type(inner).map(|inner_ty| AttributeType::Map {
+                key: Box::new(AttributeType::String),
+                value: Box::new(inner_ty),
+            })
+        }
+        parser::TypeExpr::Union(members) => {
+            let lifted: Vec<AttributeType> = members
+                .iter()
+                .filter_map(type_expr_to_attribute_type)
+                .collect();
+            if lifted.is_empty() {
+                None
+            } else {
+                Some(AttributeType::Union(lifted))
+            }
+        }
+        parser::TypeExpr::StringLiteral(_)
+        | parser::TypeExpr::Ref(_)
+        | parser::TypeExpr::SchemaType { .. }
+        | parser::TypeExpr::Struct { .. }
+        | parser::TypeExpr::Unknown => None,
     }
 }
 
