@@ -218,6 +218,19 @@ pub fn validate_depends_on_with_ctx<E>(parsed: &carina_core::parser::File<E>) ->
     errors
 }
 
+/// Surface `wait <target> { ... }` diagnostics as `AppError::Validation`.
+/// Shared with the LSP via the underlying
+/// `carina_core::validation::wait::validate_wait_bindings` pass.
+pub fn validate_wait_bindings_with_ctx<E>(
+    ctx: &WiringContext,
+    parsed: &carina_core::parser::File<E>,
+) -> Vec<AppError> {
+    carina_core::validation::wait::validate_wait_bindings(parsed, ctx.schemas())
+        .into_iter()
+        .map(|d| AppError::Validation(d.message))
+        .collect()
+}
+
 pub fn validate_resource_ref_types_with_ctx<E>(
     ctx: &WiringContext,
     parsed: &carina_core::parser::File<E>,

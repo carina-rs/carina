@@ -347,6 +347,22 @@ impl SemanticTokensProvider {
                     tokens.push((name_pos as u32, name.len() as u32, 8)); // FUNCTION
                 }
             }
+        } else if trimmed.starts_with("wait ")
+            && let Some(wait_start) = line.find("wait ")
+        {
+            // `wait <target> { ... }` — paint the target binding name as
+            // VARIABLE (same role as a let binding's name) so editor
+            // semantics show it's a reference to a known binding.
+            let after_wait = &line[wait_start + 5..];
+            let leading_spaces = after_wait.len() - after_wait.trim_start().len();
+            let after_wait_trimmed = after_wait.trim_start();
+            if let Some(name_end) = after_wait_trimmed.find([' ', '{']) {
+                let name = &after_wait_trimmed[..name_end];
+                if !name.is_empty() {
+                    let name_pos = wait_start + 5 + leading_spaces;
+                    tokens.push((name_pos as u32, name.len() as u32, 2)); // VARIABLE
+                }
+            }
         }
 
         // Nested block names: "identifier {" without "=" (e.g., "security_group_ingress {")
@@ -368,6 +384,8 @@ impl SemanticTokensProvider {
             && !trimmed.starts_with("removed{")
             && !trimmed.starts_with("moved ")
             && !trimmed.starts_with("moved{")
+            && !trimmed.starts_with("wait ")
+            && !trimmed.starts_with("wait{")
             && !trimmed.starts_with("for ")
             && !trimmed.starts_with("if ")
             && !trimmed.contains('=')

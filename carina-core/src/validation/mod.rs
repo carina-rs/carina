@@ -1,6 +1,7 @@
 //! Validation utilities for resources and modules
 
 pub mod depends_on;
+pub mod wait;
 
 use std::collections::{HashMap, HashSet};
 

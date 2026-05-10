@@ -29,6 +29,7 @@ use crate::wiring::{
     validate_depends_on_with_ctx, validate_module_attribute_param_types, validate_module_calls,
     validate_no_empty_interpolations, validate_provider_region_with_ctx,
     validate_resource_ref_types_with_ctx, validate_resources_with_ctx,
+    validate_wait_bindings_with_ctx,
 };
 
 /// Detect whether the `backend` block in the current configuration has
@@ -317,6 +318,7 @@ pub fn validate_and_resolve_errors_with_factories(
 
         errors.extend(validate_resources_with_ctx(&ctx, parsed, &enriched_context));
         errors.extend(validate_depends_on_with_ctx(parsed));
+        errors.extend(validate_wait_bindings_with_ctx(&ctx, parsed));
         let mut argument_names: HashSet<String> =
             parsed.arguments.iter().map(|a| a.name.clone()).collect();
         // Upstream state bindings are resolved at plan time, skip type validation

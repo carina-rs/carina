@@ -836,6 +836,43 @@ fn top_level_completion_suggests_upstream_state() {
 }
 
 #[test]
+fn top_level_completion_suggests_wait() {
+    let provider = test_provider();
+    let completions = provider.top_level_completions(
+        Position {
+            line: 0,
+            character: 0,
+        },
+        "",
+        None,
+    );
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"wait"),
+        "Top-level completions should include 'wait'. Got: {:?}",
+        labels
+    );
+    let wait_item = completions
+        .iter()
+        .find(|c| c.label == "wait")
+        .expect("wait completion item");
+    let insert = wait_item
+        .insert_text
+        .as_ref()
+        .expect("wait completion has insert_text");
+    assert!(
+        insert.contains("wait ${"),
+        "wait snippet should include the keyword + target placeholder, got: {:?}",
+        insert
+    );
+    assert!(
+        insert.contains("until"),
+        "wait snippet should scaffold the `until` attribute, got: {:?}",
+        insert
+    );
+}
+
+#[test]
 fn upstream_state_block_completes_source_attribute() {
     let provider = test_provider();
     let doc = create_document(

@@ -3743,3 +3743,70 @@ provider awscc {
         diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
     );
 }
+
+#[test]
+fn lsp_flags_wait_unknown_target() {
+    let engine = test_engine_with_wait_target();
+    let src = r#"
+let cert = aws.acm.Certificate {
+    domain_name = "example.com"
+    status = "PENDING"
+}
+let waited = wait nonexistent {
+    until = nonexistent.status == "ISSUED"
+}
+"#;
+    let doc = create_document(src);
+    let diags = engine.analyze(&doc, None);
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.message.contains("nonexistent") && d.message.contains("not a known")),
+        "LSP must surface unknown wait target; got: {:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn lsp_flags_wait_unknown_attribute() {
+    let engine = test_engine_with_wait_target();
+    let src = r#"
+let cert = aws.acm.Certificate {
+    domain_name = "example.com"
+    status = "PENDING"
+}
+let waited = wait cert {
+    until = cert.statu == "ISSUED"
+}
+"#;
+    let doc = create_document(src);
+    let diags = engine.analyze(&doc, None);
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.message.contains("statu") && d.message.contains("unknown attribute")),
+        "LSP must surface unknown wait until attribute; got: {:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn lsp_accepts_valid_wait_block() {
+    let engine = test_engine_with_wait_target();
+    let src = r#"
+let cert = aws.acm.Certificate {
+    domain_name = "example.com"
+    status = "PENDING"
+}
+let waited = wait cert {
+    until = cert.status == "ISSUED"
+}
+"#;
+    let doc = create_document(src);
+    let diags = engine.analyze(&doc, None);
+    assert!(
+        !diags.iter().any(|d| d.message.contains("wait")),
+        "valid wait block should produce no wait-specific diagnostics; got: {:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+    );
+}

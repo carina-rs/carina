@@ -2000,6 +2000,75 @@ impl DiagnosticEngine {
             })
             .collect()
     }
+
+    /// Lint `wait <target> { ... }` declarations by delegating to the
+    /// shared `carina_core::validation::wait` pass. The diagnostics
+    /// produced here use the same wording as `carina validate`; the
+    /// LSP just adds source anchors via `wait_target_anchor` /
+    /// `wait_until_attr_anchor`.
+    pub(super) fn check_wait_bindings(
+        &self,
+        doc: &Document,
+        parsed: &ParsedFile,
+    ) -> Vec<Diagnostic> {
+        let diags = carina_core::validation::wait::validate_wait_bindings(parsed, &self.schemas);
+        if diags.is_empty() {
+            return Vec::new();
+        }
+        let text = doc.text();
+        diags
+            .into_iter()
+            .map(|d| {
+                let (line, col, end_col) = match d.attribute.as_deref() {
+                    Some(attr) => wait_until_attr_anchor(&text, &d.binding_name, &d.target, attr),
+                    None => wait_target_anchor(&text, &d.binding_name, &d.target),
+                };
+                carina_diagnostic(line, col, end_col, DiagnosticSeverity::ERROR, d.message)
+            })
+            .collect()
+    }
+}
+
+/// Find the source anchor for a wait diagnostic. Returns
+/// `(line, col, end_col)` for the target identifier inside the
+/// `wait <target>` line, falling back to the wait keyword's column when
+/// the target can't be found verbatim.
+fn wait_target_anchor(text: &str, binding: &str, target: &str) -> (u32, u32, u32) {
+    let lines: Vec<&str> = text.lines().collect();
+    // Find `let <binding> =` to scope the forward scan.
+    let start = find_binding_line(&lines, binding).unwrap_or(0);
+    for (i, line) in lines.iter().enumerate().skip(start) {
+        if !line.contains("wait ") {
+            continue;
+        }
+        if let Some((col, end_col)) = find_word_on_line(line, target) {
+            return (i as u32, col, end_col);
+        }
+        // Fall back to the `wait` keyword span.
+        if let Some((col, end_col)) = find_word_on_line(line, "wait") {
+            return (i as u32, col, end_col);
+        }
+    }
+    (0, 0, 0)
+}
+
+/// Find the source anchor for an `until = <target>.<attr> ...`
+/// attribute reference inside a wait block.
+fn wait_until_attr_anchor(text: &str, binding: &str, target: &str, attr: &str) -> (u32, u32, u32) {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = find_binding_line(&lines, binding).unwrap_or(0);
+    let dotted = format!("{}.{}", target, attr);
+    for (i, line) in lines.iter().enumerate().skip(start) {
+        if !line.contains("until") {
+            continue;
+        }
+        if let Some(byte_pos) = line.find(&dotted) {
+            let col = line[..byte_pos].chars().count() as u32;
+            let end_col = col + dotted.chars().count() as u32;
+            return (i as u32, col, end_col);
+        }
+    }
+    wait_target_anchor(text, binding, target)
 }
 
 /// Resolve the source anchor for a depends_on diagnostic.

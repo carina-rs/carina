@@ -151,8 +151,10 @@ impl DiagnosticEngine {
         // resolve; fall back to the buffer-only parse otherwise.
         if let Some(parsed) = merged.as_ref() {
             diagnostics.extend(self.check_depends_on(doc, parsed));
+            diagnostics.extend(self.check_wait_bindings(doc, parsed));
         } else if let Some(parsed) = doc.parsed() {
             diagnostics.extend(self.check_depends_on(doc, parsed));
+            diagnostics.extend(self.check_wait_bindings(doc, parsed));
         }
 
         // Provider-attribute finalize diagnostic (#2717 / #2753): if a
