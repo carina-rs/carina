@@ -1006,6 +1006,26 @@ pub fn is_list_of_maps(value: &Value) -> bool {
     }
 }
 
+/// Extract a `Vec<String>` from a `Value::StringList` or a `Value::List`
+/// whose every element is `Value::String`. Returns `None` for other
+/// shapes. Empty lists return `Some(vec![])` so callers can distinguish
+/// "empty string list" from "not a string list" — needed by #2943's
+/// diff path so a list shrinking to empty still routes through
+/// per-element `-` lines instead of the inline `[a, b] → []` form.
+pub fn as_string_list(value: &Value) -> Option<Vec<String>> {
+    match value {
+        Value::StringList(items) => Some(items.clone()),
+        Value::List(items) => items
+            .iter()
+            .map(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => None,
+    }
+}
+
 /// Whether `value` renders to a vertical block whose final line sits at
 /// the element's key column, leaving a sibling key visually attached
 /// to the last element. A blank line should follow such a value before

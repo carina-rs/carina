@@ -1022,6 +1022,31 @@ fn snapshot_list_diff_modified_with_unchanged() {
     insta::assert_snapshot!(output);
 }
 
+/// #2943: a List<String> field inside a list-of-maps modified element
+/// that grew by trailing entries must render multi-line with `+` lines
+/// for added entries, not as a single inline `field: [a, b, ...] →
+/// [a, b, ..., c, d]` overflow line.
+#[test]
+fn snapshot_list_diff_string_list_grew() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("list_diff_string_list_grew");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+    ));
+    assert!(
+        !output.lines().any(|l| l.len() > 200),
+        "string-list diff inside a list-of-maps modified element should not render inline; got: {}",
+        output
+    );
+    insta::assert_snapshot!(output);
+}
+
 // #2881 follow-on: exercises the modified-with-nested branch where the
 // only changed field is a nested Map (`config`). Locks in the
 // `~ { ... }` block-style layout: nested map diff first, then

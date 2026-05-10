@@ -139,6 +139,46 @@ pub fn compute_map_diff(
     }
 }
 
+/// Diff result for two `Vec<String>` slices, partitioned by value
+/// membership. `unchanged` follows new-list order; `added` and
+/// `removed` preserve their source order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StringListDiff {
+    pub unchanged: Vec<String>,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+/// Diff two `&[String]` slices into `unchanged` / `added` / `removed`.
+/// Set semantics: equality is by value, not position, and duplicate
+/// elements are conflated.
+pub fn compute_string_list_diff(old: &[String], new: &[String]) -> StringListDiff {
+    use std::collections::HashSet;
+    let old_set: HashSet<&str> = old.iter().map(String::as_str).collect();
+    let new_set: HashSet<&str> = new.iter().map(String::as_str).collect();
+
+    let mut unchanged = Vec::new();
+    let mut added = Vec::new();
+    for s in new {
+        if old_set.contains(s.as_str()) {
+            unchanged.push(s.clone());
+        } else {
+            added.push(s.clone());
+        }
+    }
+    let mut removed = Vec::new();
+    for s in old {
+        if !new_set.contains(s.as_str()) {
+            removed.push(s.clone());
+        }
+    }
+    StringListDiff {
+        unchanged,
+        added,
+        removed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

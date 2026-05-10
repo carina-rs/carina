@@ -7,6 +7,50 @@ use carina_core::detail_rows::{
 use carina_core::value::{PrettyLayout, format_value_pretty, needs_trailing_separator};
 use ratatui::prelude::*;
 
+/// Render string-list diff entries (#2943) into TUI lines. Mirrors
+/// `carina-cli::display::render_string_list_diff_entries` — including
+/// the trailing-summary placement.
+pub(super) fn render_string_list_diff_entries(
+    lines: &mut Vec<Line>,
+    unchanged: &[String],
+    added: &[String],
+    removed: &[String],
+) {
+    for s in removed {
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(
+                "- ",
+                Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::CROSSED_OUT),
+            ),
+            Span::styled(
+                format!("\"{}\"", s),
+                Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::CROSSED_OUT),
+            ),
+        ]));
+    }
+    for s in added {
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled("+ ", Style::default().fg(Color::Green)),
+            Span::styled(format!("\"{}\"", s), Style::default().fg(Color::Green)),
+        ]));
+    }
+    if !unchanged.is_empty() {
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(
+                hidden_unchanged_summary(unchanged.len(), "element"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+}
+
 /// Render map diff entries into TUI lines.
 pub(super) fn render_map_diff_entries(lines: &mut Vec<Line>, entries: &[MapDiffEntryIR]) {
     for entry in entries {
@@ -138,6 +182,22 @@ pub(super) fn render_list_of_maps_diff(
                     lines.push(Line::from(std::mem::take(&mut spans)));
                     let mut nested_lines = Vec::new();
                     render_map_diff_entries(&mut nested_lines, entries);
+                    for line in nested_lines {
+                        let mut indented = vec![Span::raw("      ")];
+                        indented.extend(line.spans);
+                        lines.push(Line::from(indented));
+                    }
+                }
+                ListOfMapsDiffField::StringListChanged {
+                    key,
+                    unchanged,
+                    added,
+                    removed,
+                } => {
+                    spans.push(Span::raw(format!("{}: ", key)));
+                    lines.push(Line::from(std::mem::take(&mut spans)));
+                    let mut nested_lines = Vec::new();
+                    render_string_list_diff_entries(&mut nested_lines, unchanged, added, removed);
                     for line in nested_lines {
                         let mut indented = vec![Span::raw("      ")];
                         indented.extend(line.spans);

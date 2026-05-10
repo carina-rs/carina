@@ -1,0 +1,58 @@
+{
+  "version": 6,
+  "serial": 1,
+  "lineage": "test-lineage-list-diff-string-list-grew",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "iam.RolePolicy",
+      "name": "policy",
+      "provider": "awscc",
+      "identifier": "test-role|test-inline",
+      "attributes": {
+        "policy_name": "test-inline",
+        "role_name": "test-role",
+        "statement": [
+          {
+            "sid": "AllowRoute53Read",
+            "effect": "Allow",
+            "action": [
+              "route53:CreateHostedZone",
+              "route53:DeleteHostedZone",
+              "route53:GetHostedZone",
+              "route53:ListHostedZones",
+              "route53:ListHostedZonesByName",
+              "route53:UpdateHostedZoneComment",
+              "route53:ChangeTagsForResource",
+              "route53:ListTagsForResource",
+              "route53:ChangeResourceRecordSets",
+              "route53:ListResourceRecordSets",
+              "route53:GetChange"
+            ],
+            "resource": "*"
+          }
+        ]
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "policy",
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "policy_name": {
+            "kind": "leaf"
+          },
+          "role_name": {
+            "kind": "leaf"
+          },
+          "statement": {
+            "kind": "leaf"
+          }
+        }
+      }
+    }
+  ]
+}

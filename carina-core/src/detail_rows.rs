@@ -71,6 +71,13 @@ pub enum DetailRow {
         added: Vec<ListOfMapsDiffItem>,
         removed: Vec<ListOfMapsDiffItem>,
     },
+    /// Per-element `List<String>` diff for Update effects (#2943).
+    StringListDiff {
+        key: String,
+        unchanged: Vec<String>,
+        added: Vec<String>,
+        removed: Vec<String>,
+    },
     /// An attribute that was removed (for Update effects)
     Removed { key: String, old: String },
     /// An attribute with a schema default value (for Create effects in Full mode)
@@ -103,6 +110,13 @@ pub enum DetailRow {
     ReplaceMapDiff {
         key: String,
         entries: Vec<MapDiffEntryIR>,
+    },
+    /// Per-element `List<String>` diff that forces replacement (#2943).
+    ReplaceStringListDiff {
+        key: String,
+        unchanged: Vec<String>,
+        added: Vec<String>,
+        removed: Vec<String>,
     },
     /// Temporary name note for create-before-destroy replacement
     TemporaryNameNote {
@@ -267,6 +281,14 @@ pub enum ListOfMapsDiffField {
     NestedMapChanged {
         key: String,
         entries: Vec<MapDiffEntryIR>,
+    },
+    /// Per-element `List<String>` field diff inside a modified
+    /// list-of-maps element (#2943).
+    StringListChanged {
+        key: String,
+        unchanged: Vec<String>,
+        added: Vec<String>,
+        removed: Vec<String>,
     },
 }
 
@@ -552,6 +574,13 @@ fn build_update_rows(
                 Some(row) => rows.push(row),
                 None => effectively_unchanged += 1,
             }
+        } else if let Some(diff) = compute_string_list_change(old_value, new_value) {
+            rows.push(DetailRow::StringListDiff {
+                key: key.to_string(),
+                unchanged: diff.unchanged,
+                added: diff.added,
+                removed: diff.removed,
+            });
         } else {
             let old_str = old_value
                 .map(|v| format_value_with_key(v, Some(key)))
@@ -653,6 +682,13 @@ fn build_replace_rows(
             rows.push(DetailRow::ReplaceMapDiff {
                 key: key.to_string(),
                 entries,
+            });
+        } else if let Some(diff) = compute_string_list_change(old_value, new_value) {
+            rows.push(DetailRow::ReplaceStringListDiff {
+                key: key.to_string(),
+                unchanged: diff.unchanged,
+                added: diff.added,
+                removed: diff.removed,
             });
         } else {
             let old_str = old_value
@@ -1031,6 +1067,13 @@ fn compute_list_of_maps_diff_parts(
                         key: k.to_string(),
                         entries: nested,
                     });
+                } else if let Some(diff) = compute_string_list_change(old_val, &new_map[k]) {
+                    fields.push(ListOfMapsDiffField::StringListChanged {
+                        key: k.to_string(),
+                        unchanged: diff.unchanged,
+                        added: diff.added,
+                        removed: diff.removed,
+                    });
                 } else {
                     let old_v = old_val
                         .map(format_value)
@@ -1130,6 +1173,30 @@ fn collect_added_removed_items(indices: &[usize], items: &[Value]) -> Vec<ListOf
 /// scalar stays visible.
 fn should_render_as_map_diff(old_value: Option<&Value>, new_value: &Value) -> bool {
     matches!(new_value, Value::Map(_)) && matches!(old_value, None | Some(Value::Map(_)))
+}
+
+/// Compute a string-list diff for a single attribute (#2943).
+///
+/// Returns `Some(diff)` when `new_value` is a string-list shape,
+/// `old_value` is either absent or also a string-list shape, and the
+/// diff has at least one added or removed element. Returns `None`
+/// otherwise — the caller falls through to the inline `Changed` form
+/// so a type mismatch (e.g. string → list) keeps the prior scalar
+/// visible.
+fn compute_string_list_change(
+    old_value: Option<&Value>,
+    new_value: &Value,
+) -> Option<crate::diff_helpers::StringListDiff> {
+    let new_list = crate::value::as_string_list(new_value)?;
+    let old_list = match old_value {
+        Some(ov) => crate::value::as_string_list(ov)?,
+        None => Vec::new(),
+    };
+    let diff = crate::diff_helpers::compute_string_list_diff(&old_list, &new_list);
+    if diff.added.is_empty() && diff.removed.is_empty() {
+        return None;
+    }
+    Some(diff)
 }
 
 /// Check whether a Value references the given binding name.
