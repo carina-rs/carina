@@ -36,5 +36,5 @@ jobs:
           external_repository: carina-rs/carina-rs.github.io
           publish_branch: main
           publish_dir: ./site/dist
-          personal_token: ${{ secrets.DOCS_DEPLOY_TOKEN }}
+          personal_token: ${{ secrets.SITE_DEPLOY_TOKEN }}
           cname: carina-rs.dev
