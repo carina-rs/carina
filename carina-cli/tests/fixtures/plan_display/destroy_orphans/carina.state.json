@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 6,
   "serial": 1,
   "lineage": "test-lineage-destroy-orphans",
   "carina_version": "0.1.0",
@@ -14,15 +14,33 @@
         "enable_dns_support": true,
         "enable_dns_hostnames": true,
         "vpc_id": "vpc-0123456789abcdef0",
-        "tags": { "Name": "test-vpc" }
+        "tags": {
+          "Name": "test-vpc"
+        }
       },
       "protected": false,
       "directives": {},
       "prefixes": {},
       "name_overrides": {},
-      "desired_keys": ["cidr_block", "enable_dns_support", "enable_dns_hostnames", "tags"],
       "binding": "my_vpc",
-      "dependency_bindings": []
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "cidr_block": {
+            "kind": "leaf"
+          },
+          "enable_dns_support": {
+            "kind": "leaf"
+          },
+          "enable_dns_hostnames": {
+            "kind": "leaf"
+          },
+          "tags": {
+            "kind": "leaf"
+          }
+        }
+      }
     },
     {
       "resource_type": "ec2.Subnet",
@@ -34,15 +52,35 @@
         "cidr_block": "10.0.1.0/24",
         "availability_zone": "ap-northeast-1a",
         "subnet_id": "subnet-0123456789abcdef0",
-        "tags": { "Name": "test-subnet" }
+        "tags": {
+          "Name": "test-subnet"
+        }
       },
       "protected": false,
       "directives": {},
       "prefixes": {},
       "name_overrides": {},
-      "desired_keys": ["vpc_id", "cidr_block", "availability_zone", "tags"],
       "binding": "my_subnet",
-      "dependency_bindings": ["my_vpc"]
+      "dependency_bindings": [
+        "my_vpc"
+      ],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "vpc_id": {
+            "kind": "leaf"
+          },
+          "cidr_block": {
+            "kind": "leaf"
+          },
+          "availability_zone": {
+            "kind": "leaf"
+          },
+          "tags": {
+            "kind": "leaf"
+          }
+        }
+      }
     }
   ]
 }

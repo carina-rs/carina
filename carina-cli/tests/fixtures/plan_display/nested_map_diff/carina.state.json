@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 6,
   "serial": 1,
   "lineage": "test-lineage-nested-map-diff",
   "carina_version": "0.1.0",
@@ -23,9 +23,19 @@
       "directives": {},
       "prefixes": {},
       "name_overrides": {},
-      "desired_keys": ["cidr_block", "config"],
       "binding": "vpc",
-      "dependency_bindings": []
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "cidr_block": {
+            "kind": "leaf"
+          },
+          "config": {
+            "kind": "leaf"
+          }
+        }
+      }
     }
   ]
 }

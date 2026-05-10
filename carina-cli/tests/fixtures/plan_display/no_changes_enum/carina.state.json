@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 6,
   "serial": 1,
   "lineage": "test-lineage-no-changes-enum",
   "carina_version": "0.1.0",
@@ -13,15 +13,30 @@
         "cidr_block": "10.0.0.0/16",
         "instance_tenancy": "default",
         "vpc_id": "vpc-0123456789abcdef0",
-        "tags": { "Name": "test-vpc" }
+        "tags": {
+          "Name": "test-vpc"
+        }
       },
       "protected": false,
       "directives": {},
       "prefixes": {},
       "name_overrides": {},
-      "desired_keys": ["cidr_block", "instance_tenancy", "tags"],
       "binding": "vpc",
-      "dependency_bindings": []
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "cidr_block": {
+            "kind": "leaf"
+          },
+          "instance_tenancy": {
+            "kind": "leaf"
+          },
+          "tags": {
+            "kind": "leaf"
+          }
+        }
+      }
     },
     {
       "resource_type": "ec2.Subnet",
@@ -33,15 +48,35 @@
         "cidr_block": "10.0.1.0/24",
         "availability_zone": "ap-northeast-1a",
         "subnet_id": "subnet-0123456789abcdef0",
-        "tags": { "Name": "test-subnet" }
+        "tags": {
+          "Name": "test-subnet"
+        }
       },
       "protected": false,
       "directives": {},
       "prefixes": {},
       "name_overrides": {},
-      "desired_keys": ["vpc_id", "cidr_block", "availability_zone", "tags"],
       "binding": "ec2_subnet_f5269366",
-      "dependency_bindings": ["vpc"]
+      "dependency_bindings": [
+        "vpc"
+      ],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "vpc_id": {
+            "kind": "leaf"
+          },
+          "cidr_block": {
+            "kind": "leaf"
+          },
+          "availability_zone": {
+            "kind": "leaf"
+          },
+          "tags": {
+            "kind": "leaf"
+          }
+        }
+      }
     }
   ]
 }
