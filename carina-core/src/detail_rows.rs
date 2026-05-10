@@ -64,8 +64,8 @@ pub enum DetailRow {
         key: String,
         unchanged: Vec<String>,
         modified: Vec<ListOfMapsDiffModified>,
-        added: Vec<String>,
-        removed: Vec<String>,
+        added: Vec<ListOfMapsDiffItem>,
+        removed: Vec<ListOfMapsDiffItem>,
     },
     /// An attribute that was removed (for Update effects)
     Removed { key: String, old: String },
@@ -92,8 +92,8 @@ pub enum DetailRow {
         key: String,
         unchanged: Vec<String>,
         modified: Vec<ListOfMapsDiffModified>,
-        added: Vec<String>,
-        removed: Vec<String>,
+        added: Vec<ListOfMapsDiffItem>,
+        removed: Vec<ListOfMapsDiffItem>,
     },
     /// A map diff that forces replacement
     ReplaceMapDiff {
@@ -157,9 +157,32 @@ pub enum MapDiffEntryIR {
     NestedListOfMapsDiff {
         key: String,
         modified: Vec<ListOfMapsDiffModified>,
-        added: Vec<String>,
-        removed: Vec<String>,
+        added: Vec<ListOfMapsDiffItem>,
+        removed: Vec<ListOfMapsDiffItem>,
     },
+}
+
+/// A wholly added or removed item in a list-of-maps diff (#2877).
+///
+/// Fields carry the raw `Value` rather than a pre-stringified form so the
+/// renderer can supply the actual indent column when calling
+/// `format_value_pretty`. Pre-stringifying at build time would force
+/// nested complex values (long string lists, nested maps) onto a single
+/// line because a `String` carries no indentation context — that was
+/// exactly the bug fixed in #2877.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListOfMapsDiffItem {
+    /// Map fields in the order they should be rendered (alphabetical).
+    pub fields: Vec<(String, Value)>,
+}
+
+/// Whether a `ListOfMapsDiffItem` is a wholly-added or wholly-removed
+/// element. Lives in `carina-core` so both the CLI and TUI renderers can
+/// share the discriminant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListOfMapsDiffItemKind {
+    Added,
+    Removed,
 }
 
 /// A modified item in a list-of-maps diff
@@ -737,8 +760,8 @@ fn compute_list_of_maps_diff_parts(
 ) -> (
     Vec<String>,
     Vec<ListOfMapsDiffModified>,
-    Vec<String>,
-    Vec<String>,
+    Vec<ListOfMapsDiffItem>,
+    Vec<ListOfMapsDiffItem>,
 ) {
     let new_items = match new_value {
         Value::List(items) => items,
@@ -876,33 +899,33 @@ fn compute_list_of_maps_diff_parts(
         }
     }
 
-    let mut added = Vec::new();
-    for &ni in &added_indices {
-        if let Value::Map(map) = &new_items[ni] {
-            let mut keys: Vec<_> = map.keys().collect();
-            keys.sort();
-            let fields: Vec<String> = keys
-                .iter()
-                .map(|k| format!("{}: {}", k, format_value(&map[*k])))
-                .collect();
-            added.push(format!("{{{}}}", fields.join(", ")));
-        }
-    }
-
-    let mut removed = Vec::new();
-    for &oi in &removed_indices {
-        if let Value::Map(map) = &old_items[oi] {
-            let mut keys: Vec<_> = map.keys().collect();
-            keys.sort();
-            let fields: Vec<String> = keys
-                .iter()
-                .map(|k| format!("{}: {}", k, format_value(&map[*k])))
-                .collect();
-            removed.push(format!("{{{}}}", fields.join(", ")));
-        }
-    }
+    let added = collect_added_removed_items(&added_indices, new_items);
+    let removed = collect_added_removed_items(&removed_indices, old_items);
 
     (unchanged, modified, added, removed)
+}
+
+/// Build alphabetically-sorted `ListOfMapsDiffItem`s from a list of map
+/// indices into `items`. Non-map entries at the listed indices are silently
+/// skipped — only `Value::Map` items contribute fields. This is what the
+/// renderer consumes for the added/removed slots of a list-of-maps diff.
+fn collect_added_removed_items(indices: &[usize], items: &[Value]) -> Vec<ListOfMapsDiffItem> {
+    indices
+        .iter()
+        .filter_map(|&i| {
+            if let Value::Map(map) = &items[i] {
+                let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+                let fields = entries
+                    .into_iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                Some(ListOfMapsDiffItem { fields })
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Check if both old and new values are `Value::Map`.

@@ -1,0 +1,40 @@
+# Update plan that adds a struct element to a list-of-maps attribute
+# (issue #2877). The first statement is unchanged from state; the second
+# is a freshly added struct that contains a long list of strings — the
+# kind of element that previously rendered collapsed onto a single very
+# wide line.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let policy = awscc.iam.RolePolicy {
+  policy_name = 'test-inline'
+  role_name   = 'test-role'
+  statement = [
+    {
+      sid      = 'AllowS3Read'
+      effect   = 'Allow'
+      action   = 's3:GetObject'
+      resource = 'arn:aws:s3:::example/*'
+    },
+    {
+      sid    = 'CloudControl'
+      effect = 'Allow'
+      action = [
+        'cloudformation:CancelResourceRequest',
+        'cloudformation:CreateResource',
+        'cloudformation:DeleteResource',
+        'cloudformation:GetResource',
+        'cloudformation:GetResourceRequestStatus',
+        'cloudformation:ListResources',
+        'cloudformation:UpdateResource',
+      ]
+      resource = ['*']
+    },
+  ]
+}
+
+exports {
+  policy_name = policy.policy_name
+}

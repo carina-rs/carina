@@ -4,7 +4,8 @@ use std::fmt::Write;
 use colored::Colorize;
 
 use carina_core::detail_rows::{
-    DetailRow, ListOfMapsDiffField, ListOfMapsDiffModified, MapDiffEntryIR, build_detail_rows,
+    DetailRow, ListOfMapsDiffField, ListOfMapsDiffItem, ListOfMapsDiffItemKind,
+    ListOfMapsDiffModified, MapDiffEntryIR, build_detail_rows,
 };
 #[cfg(test)]
 use carina_core::diff_helpers::compute_map_diff;
@@ -1329,8 +1330,8 @@ fn render_list_of_maps_diff(
     out: &mut String,
     unchanged: &[String],
     modified: &[ListOfMapsDiffModified],
-    added: &[String],
-    removed: &[String],
+    added: &[ListOfMapsDiffItem],
+    removed: &[ListOfMapsDiffItem],
     attr_prefix: &str,
 ) {
     for item in unchanged {
@@ -1381,18 +1382,61 @@ fn render_list_of_maps_diff(
         }
     }
     for item in added {
-        writeln!(out, "{}  {} {}", attr_prefix, "+".green().bold(), item).unwrap();
+        render_added_removed_block(out, item, attr_prefix, ListOfMapsDiffItemKind::Added);
     }
     for item in removed {
-        writeln!(
-            out,
-            "{}  {} {}",
-            attr_prefix,
-            "-".red().bold().strikethrough(),
-            item.red().strikethrough()
-        )
-        .unwrap();
+        render_added_removed_block(out, item, attr_prefix, ListOfMapsDiffItemKind::Removed);
     }
+}
+
+/// Render a wholly added or removed list-of-maps element as a multi-line
+/// block (#2877). Mirrors the modified-with-nested layout
+/// (`~ {\n  key: value\n  ...\n}`) so all three diff markers (`+`, `-`,
+/// `~`) share the same visual shape.
+///
+/// Each field's value is laid out via `format_value_pretty` so nested
+/// long lists / maps wrap to multiple indented lines instead of dumping
+/// inline. The pre-fix path stringified the whole element with
+/// `format_value` and emitted it on one line (`+ {action: [...], ...}`),
+/// which produced unreadable ~500-column lines for IAM policy statements.
+fn render_added_removed_block(
+    out: &mut String,
+    item: &ListOfMapsDiffItem,
+    attr_prefix: &str,
+    kind: ListOfMapsDiffItemKind,
+) {
+    let marker = match kind {
+        ListOfMapsDiffItemKind::Added => "+".green().bold().to_string(),
+        ListOfMapsDiffItemKind::Removed => "-".red().bold().strikethrough().to_string(),
+    };
+    writeln!(out, "{}  {} {{", attr_prefix, marker).unwrap();
+    // Fields render at `attr_prefix.cols + 6`: 2 leading spaces, "+ {" is 3
+    // chars, then 1 more for the inner `  ` padding before the key — same
+    // column the modified-with-nested branch above uses for its
+    // `Unchanged` arm at `{attr_prefix}      `.
+    let field_indent_cols = attr_prefix.chars().count() + 6;
+    let field_indent = " ".repeat(field_indent_cols);
+    let mut prev_needs_separator = false;
+    for (key, value) in &item.fields {
+        // Mirror `format_map_vertical` / `MapExpanded`: a multi-element
+        // list-of-maps child needs a blank line before the next sibling
+        // key so the boundary stays visible (#2555).
+        if prev_needs_separator {
+            writeln!(out).unwrap();
+        }
+        prev_needs_separator = carina_core::value::needs_trailing_separator(value);
+        let layout = carina_core::value::PrettyLayout {
+            parent_indent_cols: field_indent_cols,
+            key,
+        };
+        let pretty = format_value_pretty(value, layout);
+        let cv = match kind {
+            ListOfMapsDiffItemKind::Added => colored_value(&pretty, false),
+            ListOfMapsDiffItemKind::Removed => pretty.red().strikethrough().to_string(),
+        };
+        writeln!(out, "{}{}: {}", field_indent, key, cv).unwrap();
+    }
+    writeln!(out, "{}    }}", attr_prefix).unwrap();
 }
 
 /// Render modified fields from structured IR into colored output.

@@ -1,0 +1,26 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  ~ awscc.iam.RolePolicy policy
+      statement:
+          {action: "s3:GetObject", effect: "Allow", resource: "arn:aws:s3:::example/*", sid: "AllowS3Read"}
+        - {
+            action: [
+              "cloudformation:CancelResourceRequest",
+              "cloudformation:CreateResource",
+              "cloudformation:DeleteResource",
+              "cloudformation:GetResource",
+              "cloudformation:GetResourceRequestStatus",
+              "cloudformation:ListResources",
+              "cloudformation:UpdateResource",
+            ]
+            effect: "Allow"
+            resource: ["*"]
+            sid: "CloudControl"
+          }
+      # (2 unchanged attributes hidden)
+
+Plan: 0 to add, 1 to change, 0 to destroy.
