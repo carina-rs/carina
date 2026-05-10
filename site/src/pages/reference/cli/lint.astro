@@ -1,0 +1,13 @@
+---
+import Doc from '../../../layouts/Doc.astro';
+import { Content, getHeadings, frontmatter } from '../../../content/reference/cli/lint.md';
+
+const headings = getHeadings();
+---
+<Doc
+  title={frontmatter.title ?? 'carina lint'}
+  description={frontmatter.description}
+  headings={headings}
+>
+  <Content />
+</Doc>
