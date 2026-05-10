@@ -15,6 +15,53 @@ use crate::parser::{
 use crate::resource::{AccessPath, Subscript, Value};
 use indexmap::IndexMap;
 
+/// Decode a duration literal (`75min`, `1h`, `30s`) into integer
+/// seconds.
+///
+/// The pest grammar guarantees `<digits><unit>`; this helper performs
+/// the post-parse decode and shares the implementation between the
+/// value-position parser ([`parse_primary_eval`]'s `Rule::duration_literal`
+/// arm) and the validate-expression parser
+/// (`expressions::validate_expr`). On overflow it surfaces a typed
+/// parse error rather than silently truncating, since the grammar
+/// accepts arbitrary digit runs.
+pub(crate) fn parse_duration_secs(src: &str, line: usize) -> Result<u64, ParseError> {
+    let unit_start = src
+        .find(|c: char| !c.is_ascii_digit())
+        .expect("grammar guarantees a non-digit unit suffix");
+    let n: u64 = src[..unit_start]
+        .parse()
+        .map_err(|e| ParseError::InvalidExpression {
+            line,
+            message: format!("invalid duration integer in {src:?}: {e}"),
+        })?;
+    let multiplier: u64 = match &src[unit_start..] {
+        "s" | "sec" | "second" | "seconds" => 1,
+        "m" | "min" | "minute" | "minutes" => 60,
+        "h" | "hr" | "hour" | "hours" => 3600,
+        // Reachable only if a future grammar change adds a unit family
+        // (e.g. `day` / `week`) without updating this match. Surface as
+        // a typed parse error rather than a panic so the binary stays
+        // up while the developer fills in the multiplier.
+        other => {
+            return Err(ParseError::InvalidExpression {
+                line,
+                message: format!("duration unit {other:?} is not supported by this build"),
+            });
+        }
+    };
+    n.checked_mul(multiplier)
+        .ok_or_else(|| ParseError::InvalidExpression {
+            line,
+            message: format!("duration {src} overflows u64 seconds"),
+        })
+}
+
+pub(crate) fn parse_duration_literal(src: &str, line: usize) -> Result<Value, ParseError> {
+    let secs = parse_duration_secs(src, line)?;
+    Ok(Value::Duration(std::time::Duration::from_secs(secs)))
+}
+
 /// Convert an index-expression value into a `Subscript`. Only
 /// non-negative integer and string keys are legal subscripts; anything
 /// else is a parse error. Negative integers are rejected here rather
@@ -225,6 +272,11 @@ pub(crate) fn parse_primary_eval(
                     message: format!("integer literal out of range: {e}"),
                 })?;
             Ok(EvalValue::from_value(Value::Int(n)))
+        }
+        Rule::duration_literal => {
+            let line = inner.line_col().0;
+            let value = parse_duration_literal(inner.as_str(), line)?;
+            Ok(EvalValue::from_value(value))
         }
         Rule::string => parse_string_value(inner, ctx).map(EvalValue::from_value),
         Rule::function_call => {

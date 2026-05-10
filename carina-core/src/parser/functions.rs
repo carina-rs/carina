@@ -270,6 +270,7 @@ fn check_fn_arg_type(
         TypeExpr::Int => matches!(value, Value::Int(_)),
         TypeExpr::Float => matches!(value, Value::Float(_)),
         TypeExpr::Bool => matches!(value, Value::Bool(_)),
+        TypeExpr::Duration => matches!(value, Value::Duration(_)),
         TypeExpr::List(_) => matches!(value, Value::List(_)),
         TypeExpr::Map(_) => matches!(value, Value::Map(_)),
         // Simple types (cidr, ipv4_address, arn, etc.) are string subtypes at runtime
@@ -385,6 +386,7 @@ fn check_fn_return_type(
         TypeExpr::Int => matches!(value, Value::Int(_)),
         TypeExpr::Float => matches!(value, Value::Float(_)),
         TypeExpr::Bool => matches!(value, Value::Bool(_)),
+        TypeExpr::Duration => matches!(value, Value::Duration(_)),
         TypeExpr::List(_) => matches!(value, Value::List(_)),
         TypeExpr::Map(_) => matches!(value, Value::Map(_)),
         // Simple types (cidr, ipv4_address, arn, etc.) — validate the value

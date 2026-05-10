@@ -402,6 +402,7 @@ pub fn is_type_expr_compatible_with_schema(
         TypeExpr::Bool => matches!(attr_type, AttributeType::Bool),
         TypeExpr::Int => matches!(attr_type, AttributeType::Int),
         TypeExpr::Float => matches!(attr_type, AttributeType::Float),
+        TypeExpr::Duration => matches!(attr_type, AttributeType::Duration),
         TypeExpr::Simple(name) => {
             // Two compatibility directions both succeed:
             //

@@ -258,6 +258,7 @@ fn is_type_default(value: &Value, attr_type: Option<&AttributeType>) -> bool {
         (Value::Bool(false), Some(AttributeType::Bool) | None) => true,
         (Value::Int(0), Some(AttributeType::Int)) => true,
         (Value::Float(f), Some(AttributeType::Float)) if *f == 0.0 => true,
+        (Value::Duration(d), Some(AttributeType::Duration)) if d.is_zero() => true,
         (Value::String(s), Some(AttributeType::String)) if s.is_empty() => true,
         (Value::String(s), Some(AttributeType::StringEnum { .. })) if s.is_empty() => true,
         (Value::List(l), Some(AttributeType::List { .. })) if l.is_empty() => true,

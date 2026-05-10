@@ -16,6 +16,7 @@ pub(super) fn format_value_for_error(value: &Value) -> String {
         Value::Int(n) => n.to_string(),
         Value::Float(f) => f.to_string(),
         Value::Bool(b) => b.to_string(),
+        Value::Duration(d) => crate::value::render_duration(*d),
         Value::List(items) => format!("[...] (length {})", items.len()),
         Value::Map(map) => format!("{{...}} (length {})", map.len()),
         _ => format!("{:?}", value),
@@ -45,6 +46,12 @@ enum ValidateValue {
     Bool(bool),
     Int(i64),
     Float(f64),
+    /// Duration carried as `std::time::Duration`. Compared via its
+    /// native `PartialOrd` (total-ordered by elapsed time) — see the
+    /// matching arm in `compare_validate_values`. Cross-type comparison
+    /// against `Int` / `Float` is not supported; users who want to
+    /// compare a Duration to a number convert at the call site.
+    Duration(std::time::Duration),
     String(String),
 }
 
@@ -58,6 +65,7 @@ fn eval_validate(
         ValidateExpr::Bool(b) => Ok(ValidateValue::Bool(*b)),
         ValidateExpr::Int(n) => Ok(ValidateValue::Int(*n)),
         ValidateExpr::Float(f) => Ok(ValidateValue::Float(*f)),
+        ValidateExpr::Duration(d) => Ok(ValidateValue::Duration(*d)),
         ValidateExpr::String(s) => Ok(ValidateValue::String(s.clone())),
         ValidateExpr::Null => {
             Err("null is not supported in per-argument validation expressions".to_string())
@@ -68,6 +76,7 @@ fn eval_validate(
                     Value::Int(n) => Ok(ValidateValue::Int(*n)),
                     Value::Float(f) => Ok(ValidateValue::Float(*f)),
                     Value::Bool(b) => Ok(ValidateValue::Bool(*b)),
+                    Value::Duration(d) => Ok(ValidateValue::Duration(*d)),
                     Value::String(s) => Ok(ValidateValue::String(s.clone())),
                     other => Err(format!(
                         "unsupported value type for validation: {:?}",
@@ -183,6 +192,16 @@ fn compare_validate_values(
             CompareOp::Ne => a != b,
             _ => return Err("booleans only support == and != comparisons".to_string()),
         }),
+        // Durations compare by total seconds — same ordering semantic as
+        // `std::time::Duration`'s `PartialOrd`.
+        (ValidateValue::Duration(a), ValidateValue::Duration(b)) => Ok(match op {
+            CompareOp::Gte => a >= b,
+            CompareOp::Lte => a <= b,
+            CompareOp::Gt => a > b,
+            CompareOp::Lt => a < b,
+            CompareOp::Eq => a == b,
+            CompareOp::Ne => a != b,
+        }),
         _ => Err(format!("cannot compare {:?} with {:?}", left, right)),
     }
 }
@@ -253,6 +272,7 @@ enum RequireValue {
     Bool(bool),
     Int(i64),
     Float(f64),
+    Duration(std::time::Duration),
     String(String),
     Null,
 }
@@ -266,6 +286,7 @@ fn eval_require(
         ValidateExpr::Bool(b) => Ok(RequireValue::Bool(*b)),
         ValidateExpr::Int(n) => Ok(RequireValue::Int(*n)),
         ValidateExpr::Float(f) => Ok(RequireValue::Float(*f)),
+        ValidateExpr::Duration(d) => Ok(RequireValue::Duration(*d)),
         ValidateExpr::String(s) => Ok(RequireValue::String(s.clone())),
         ValidateExpr::Null => Ok(RequireValue::Null),
         ValidateExpr::Var(name) => {
@@ -274,6 +295,7 @@ fn eval_require(
                     Value::Int(n) => Ok(RequireValue::Int(*n)),
                     Value::Float(f) => Ok(RequireValue::Float(*f)),
                     Value::Bool(b) => Ok(RequireValue::Bool(*b)),
+                    Value::Duration(d) => Ok(RequireValue::Duration(*d)),
                     Value::String(s) => Ok(RequireValue::String(s.clone())),
                     other => Err(format!(
                         "unsupported value type for require expression: {:?}",
@@ -397,6 +419,16 @@ fn compare_require_values(
             CompareOp::Eq => a == b,
             CompareOp::Ne => a != b,
             _ => return Err("booleans only support == and != comparisons".to_string()),
+        }),
+        // Durations compare by total seconds — same ordering semantic as
+        // `std::time::Duration`'s `PartialOrd`.
+        (RequireValue::Duration(a), RequireValue::Duration(b)) => Ok(match op {
+            CompareOp::Gte => a >= b,
+            CompareOp::Lte => a <= b,
+            CompareOp::Gt => a > b,
+            CompareOp::Lt => a < b,
+            CompareOp::Eq => a == b,
+            CompareOp::Ne => a != b,
         }),
         _ => Err(format!("cannot compare {:?} with {:?}", left, right)),
     }

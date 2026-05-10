@@ -67,6 +67,7 @@ fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
             | Value::Int(_)
             | Value::Float(_)
             | Value::Bool(_)
+            | Value::Duration(_)
             | Value::StringList(_)
             | Value::Unknown(_) => {}
         }

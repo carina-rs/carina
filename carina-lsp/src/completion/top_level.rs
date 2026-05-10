@@ -441,6 +441,7 @@ impl CompletionProvider {
             parser::TypeExpr::Bool => "bool".to_string(),
             parser::TypeExpr::Int => "int".to_string(),
             parser::TypeExpr::Float => "float".to_string(),
+            parser::TypeExpr::Duration => "duration".to_string(),
             parser::TypeExpr::Simple(name) => name.clone(),
             parser::TypeExpr::List(inner) => format!("list({})", self.format_type_expr(inner)),
             parser::TypeExpr::Map(inner) => format!("map({})", self.format_type_expr(inner)),
@@ -973,6 +974,7 @@ fn type_expr_to_attribute_type(
         parser::TypeExpr::Bool => Some(AttributeType::Bool),
         parser::TypeExpr::Int => Some(AttributeType::Int),
         parser::TypeExpr::Float => Some(AttributeType::Float),
+        parser::TypeExpr::Duration => Some(AttributeType::Duration),
         parser::TypeExpr::Simple(name) => Some(AttributeType::Custom {
             semantic_name: Some(parser::snake_to_pascal(name)),
             base: Box::new(AttributeType::String),

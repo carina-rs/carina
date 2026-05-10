@@ -120,6 +120,13 @@ pub(super) fn check_type_match(
                 TypeCheckResult::Mismatch
             }
         }
+        TypeExpr::Duration => {
+            if matches!(value, Value::Duration(_)) {
+                TypeCheckResult::Ok
+            } else {
+                TypeCheckResult::Mismatch
+            }
+        }
         TypeExpr::List(inner) => {
             if let Value::List(items) = value {
                 for item in items {
@@ -236,7 +243,8 @@ fn type_expr_compatible(expected: &TypeExpr, actual: &TypeExpr) -> TypeCheckResu
         (a, b) if is_string_shaped(a) && is_string_shaped(b) => TypeCheckResult::Ok,
         (TypeExpr::Int, TypeExpr::Int)
         | (TypeExpr::Float, TypeExpr::Float)
-        | (TypeExpr::Bool, TypeExpr::Bool) => TypeCheckResult::Ok,
+        | (TypeExpr::Bool, TypeExpr::Bool)
+        | (TypeExpr::Duration, TypeExpr::Duration) => TypeCheckResult::Ok,
         (TypeExpr::List(e), TypeExpr::List(a)) => type_expr_compatible(e, a),
         (TypeExpr::Map(e), TypeExpr::Map(a)) => type_expr_compatible(e, a),
         (TypeExpr::Struct { fields: ef }, TypeExpr::Struct { fields: af }) => {

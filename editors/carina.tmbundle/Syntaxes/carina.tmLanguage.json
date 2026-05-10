@@ -177,6 +177,10 @@
     "numbers": {
       "patterns": [
         {
+          "name": "constant.numeric.duration.carina",
+          "match": "\\b[0-9]+(seconds|second|sec|s|minutes|minute|min|m|hours|hour|hr|h)\\b"
+        },
+        {
           "name": "constant.numeric.carina",
           "match": "\\b[0-9]+\\b"
         }

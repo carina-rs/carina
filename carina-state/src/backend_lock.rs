@@ -162,6 +162,7 @@ fn value_to_json(
         Value::String(s) => Ok(serde_json::Value::String(s.clone())),
         Value::Bool(b) => Ok(serde_json::Value::Bool(*b)),
         Value::Int(i) => Ok(serde_json::Value::Number((*i).into())),
+        Value::Duration(d) => Ok(serde_json::Value::Number((d.as_secs() as i64).into())),
         Value::Unknown(reason) => Err(SerializationError::UnknownNotAllowed {
             reason: reason.clone(),
             context: SerializationContext::BackendLock,

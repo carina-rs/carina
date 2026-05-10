@@ -294,6 +294,7 @@ fn infer_type_from_value_with_visiting(
         Value::Int(_) => Ok(TypeExpr::Int),
         Value::Float(_) => Ok(TypeExpr::Float),
         Value::Bool(_) => Ok(TypeExpr::Bool),
+        Value::Duration(_) => Ok(TypeExpr::Duration),
         Value::Interpolation(_) => Ok(TypeExpr::String),
         Value::Secret(_) => Ok(TypeExpr::String),
         Value::List(items) => infer_collection(items, bindings, schemas, visiting, TypeExpr::List),
@@ -542,6 +543,7 @@ fn attribute_type_to_type_expr(attr_type: &AttributeType) -> TypeExpr {
         AttributeType::Int => TypeExpr::Int,
         AttributeType::Float => TypeExpr::Float,
         AttributeType::Bool => TypeExpr::Bool,
+        AttributeType::Duration => TypeExpr::Duration,
         AttributeType::Custom {
             semantic_name: Some(name),
             ..

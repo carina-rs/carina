@@ -673,6 +673,7 @@ fn walk_value_against_type(
         | Value::Int(_)
         | Value::Float(_)
         | Value::Bool(_)
+        | Value::Duration(_)
         | Value::StringList(_)
         | Value::Unknown(_) => {}
         // `BindingRef` carries no attribute, so there is nothing to

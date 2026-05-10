@@ -217,6 +217,7 @@ pub fn value_to_json_with_context(
     match value {
         Value::String(s) => Ok(serde_json::Value::String(s.clone())),
         Value::Int(n) => Ok(serde_json::Value::Number((*n).into())),
+        Value::Duration(d) => Ok(serde_json::Value::Number((d.as_secs() as i64).into())),
         Value::Float(f) => {
             let num =
                 serde_json::Number::from_f64(*f).ok_or(SerializationError::NonFiniteFloat {
@@ -396,6 +397,33 @@ impl FormatSink for WidthCounter {
     }
 }
 
+/// Render a `Duration` to its canonical surface form.
+///
+/// Picks the largest unit that divides the duration cleanly:
+/// `3600s` → `1h`, `60s` → `1min`, anything else → `Ns`. The original
+/// authoring unit is not preserved (`Value::Duration` carries only a
+/// `std::time::Duration`), so this is a deterministic re-rendering
+/// rule — not a faithful round-trip.
+///
+/// Used by every value-tree consumer: plan display, hover, deferred-
+/// for / export display, builtin-error messages, and `Display for
+/// Value`. The source-text formatter (`carina fmt`) currently passes
+/// duration literals through verbatim — see #2966 for the planned
+/// fmt-side normalisation that will make `2700s` rewrite to `45min`.
+pub fn render_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs == 0 {
+        return "0s".into();
+    }
+    if secs.is_multiple_of(3600) {
+        return format!("{}h", secs / 3600);
+    }
+    if secs.is_multiple_of(60) {
+        return format!("{}min", secs / 60);
+    }
+    format!("{secs}s")
+}
+
 /// Render `value` into `sink` using the same code path that produces
 /// the public `format_value_with_key` output. The single source of
 /// truth for plan-display value formatting; sinks downstream of this
@@ -425,6 +453,7 @@ pub(crate) fn format_value_into<S: FormatSink>(
             sink.write_str("\"")
         }
         Value::Int(n) => sink.write_str(&n.to_string()),
+        Value::Duration(d) => sink.write_str(&render_duration(*d)),
         Value::Float(f) => {
             let s = f.to_string();
             sink.write_str(&s)?;
@@ -1250,6 +1279,44 @@ pub fn canonicalize_states_with_schemas(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_duration_picks_largest_clean_unit() {
+        use std::time::Duration;
+        assert_eq!(render_duration(Duration::from_secs(0)), "0s");
+        assert_eq!(render_duration(Duration::from_secs(30)), "30s");
+        assert_eq!(render_duration(Duration::from_secs(60)), "1min");
+        assert_eq!(render_duration(Duration::from_secs(90)), "90s");
+        assert_eq!(render_duration(Duration::from_secs(2700)), "45min");
+        assert_eq!(render_duration(Duration::from_secs(3600)), "1h");
+        assert_eq!(render_duration(Duration::from_secs(4500)), "75min");
+        assert_eq!(render_duration(Duration::from_secs(7200)), "2h");
+        // No day/week unit — values past 24h render in hours.
+        assert_eq!(render_duration(Duration::from_secs(86400)), "24h");
+        // Large prime-ish second count keeps the seconds form.
+        assert_eq!(render_duration(Duration::from_secs(90061)), "90061s");
+    }
+
+    #[test]
+    fn value_to_json_duration_emits_integer_seconds() {
+        let v = Value::Duration(std::time::Duration::from_secs(4500));
+        let j = value_to_json_with_context(&v, None).unwrap();
+        assert_eq!(j, serde_json::json!(4500));
+    }
+
+    #[test]
+    fn value_duration_round_trips_serde() {
+        // Confirms the `#[serde(with = "duration_secs")]` adapter on
+        // `Value::Duration` emits and reads back integer seconds, not
+        // the default `{secs, nanos}` shape.
+        let v = Value::Duration(std::time::Duration::from_secs(4500));
+        let json = serde_json::to_string(&v).unwrap();
+        let back: Value = serde_json::from_str(&json).unwrap();
+        match back {
+            Value::Duration(d) => assert_eq!(d, std::time::Duration::from_secs(4500)),
+            other => panic!("expected Value::Duration, got {other:?}"),
+        }
+    }
 
     #[test]
     fn render_unknown_upstream_ref() {

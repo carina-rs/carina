@@ -183,6 +183,8 @@ Duration values serialise to JSON as integer seconds:
 
 Schema knows the attribute is typed `Duration`; deserialisation reads the integer and reconstructs `Value::Duration(Duration::from_secs(n))`. Without the schema (e.g. an attribute on a stale resource type) the value remains `Value::Int` and downstream typing is reasserted at the next plan.
 
+> **Follow-up:** the schema-aware re-typing on the inbound state-load path is **not implemented in the Duration MVP** (carina#2962). Today every state-file integer reads back as `Value::Int(_)`, regardless of whether the schema attribute is `Duration`. The asymmetry is contained — no `AttributeType::Duration` reaches a real state file in the MVP because the only consumer (`wait { timeout = ... }`) does not persist. Re-typing lands in carina#2965 once a provider attribute migrates to `AttributeType::Duration` and creates a live consumer.
+
 Rationale: the state file is read by tooling (other plan/apply invocations, `carina state` subcommands) and by humans only as a last resort. Storing `4500` is unambiguous, easy to compute on, and round-trips losslessly through serde without a custom deserialiser path. The "`75min` was the source form" information lives in the .crn file, not the state file.
 
 State v3's existing schema versioning is sufficient — Duration deserialisation does not need a state version bump because it only adds an interpretation rule for an integer that already deserialises correctly.
@@ -207,6 +209,8 @@ Two host-side conversion points handle the marshaling:
 
 - **Outbound** (`core_to_wit_value` in `carina-plugin-host/src/host_value.rs`): `Value::Duration(d) → wit::Value::IntVal(d.as_secs() as i64)`. Negative results impossible because `Value::Duration` cannot hold a negative duration.
 - **Inbound** (`wit_to_core_value` in the same file): WIT does not annotate which integers are durations. The host queries the schema for the destination attribute's type; if it's `AttributeType::Duration`, the inbound `int-val(n)` is reconstructed as `Value::Duration(Duration::from_secs(n as u64))`. Otherwise it's an `Value::Int(n)`.
+
+> **Follow-up:** the WIT-inbound schema-aware re-typing is **not implemented in the Duration MVP** (carina#2962). Today every `IntVal` reads back as `Value::Int(_)`, regardless of the destination schema's type. Same asymmetry rationale as the state-file path above: the only Duration consumer in the MVP is host-side and never crosses the WIT boundary. Re-typing lands alongside carina#2965 once a provider attribute migrates to `AttributeType::Duration`.
 
 Rationale (decided during brainstorming):
 
@@ -243,9 +247,9 @@ The Duration type is "done" for MVP when:
 
 1. `let foo = wait cert { timeout = 75min }` parses without error and produces an `AttributeType::Duration`-valued attribute carrying `Value::Duration(Duration::from_secs(4500))`.
 2. Assigning `30` (Int), `"30s"` (String), or `30.0` (Float) to a Duration-typed attribute is a parse-or-validation error with a clear message.
-3. `carina fmt` round-trips `75min` → `75min`, `5m` → `5min`, `2700s` → `45min` (canonical form), and `1h` → `1h`.
+3. `carina fmt` round-trips `75min` → `75min`, `5m` → `5min`, `2700s` → `45min` (canonical form), and `1h` → `1h`. **Deferred to carina#2966** in the MVP — the source-text formatter currently passes duration literals through verbatim; canonical-form rewriting fires on the value-tree consumers (Display, plan display, hover, exports) but not yet on `carina fmt`'s output.
 4. State JSON serialises Duration as integer seconds (`{ "timeout": 4500 }`).
-5. Plan display renders Duration in canonical form (`> cert_issued (until ..., timeout 75min)`).
+5. Plan display renders Duration in canonical form via `Display for Value::Duration` → `render_duration`. A dedicated end-to-end snapshot fixture under `carina-cli/tests/fixtures/plan_display/duration/` is **deferred** — the rendering path is unit-tested through `format_value_into` and through the per-feature display/hover/error tests added by Round 1 / Round 4 reviews.
 6. WIT-bound providers (mock provider's `set_attribute("ttl", Value::Duration(...))`) see the value as `int-val(secs)` and the schema's typing reflects it.
 7. LSP shows a type-mismatch diagnostic when a Duration attribute receives an Int.
 8. TextMate highlights duration literals consistently in both VS Code and TextMate bundle grammars.

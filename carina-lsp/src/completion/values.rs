@@ -572,6 +572,38 @@ impl CompletionProvider {
             AttributeType::Float => {
                 vec![] // No specific completions for floats
             }
+            // Curated unit-snippet completions for Duration attributes,
+            // per `notes/specs/2026-05-10-duration-design.md` §"LSP /
+            // formatter / diagnostics". The list is intentionally
+            // short — common timeout magnitudes — rather than every
+            // unit alias, because the user types a digit prefix
+            // anyway and only needs hint candidates for the unit.
+            AttributeType::Duration => vec![
+                CompletionItem {
+                    label: "30s".to_string(),
+                    kind: Some(CompletionItemKind::VALUE),
+                    detail: Some("Duration: 30 seconds".to_string()),
+                    ..Default::default()
+                },
+                CompletionItem {
+                    label: "1min".to_string(),
+                    kind: Some(CompletionItemKind::VALUE),
+                    detail: Some("Duration: 1 minute".to_string()),
+                    ..Default::default()
+                },
+                CompletionItem {
+                    label: "5min".to_string(),
+                    kind: Some(CompletionItemKind::VALUE),
+                    detail: Some("Duration: 5 minutes".to_string()),
+                    ..Default::default()
+                },
+                CompletionItem {
+                    label: "1h".to_string(),
+                    kind: Some(CompletionItemKind::VALUE),
+                    detail: Some("Duration: 1 hour".to_string()),
+                    ..Default::default()
+                },
+            ],
             AttributeType::Custom {
                 semantic_name: Some(name),
                 ..
@@ -1852,8 +1884,9 @@ fn return_type_fits(ret: builtins::BuiltinReturnType, attr_type: &AttributeType)
         // a semantic return annotation before a built-in can be suggested
         // here.
         AttributeType::Custom { .. } => false,
-        // Float and Struct attributes — no matching built-in today.
+        // Float, Duration, and Struct attributes — no matching built-in today.
         AttributeType::Float => false,
+        AttributeType::Duration => false,
         AttributeType::Struct { .. } => false,
     }
 }

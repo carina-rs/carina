@@ -97,6 +97,7 @@ fn parse_type_expr_atom(
                 "Bool" => Ok(TypeExpr::Bool),
                 "Int" => Ok(TypeExpr::Int),
                 "Float" => Ok(TypeExpr::Float),
+                "Duration" => Ok(TypeExpr::Duration),
                 // Phase C: the transition window for snake_case primitives
                 // and custom types has closed. The parser accepts only
                 // PascalCase type names (naming-conventions design D1).
@@ -217,6 +218,10 @@ mod tests {
         assert!(matches!(
             parse_type_expr_str("String", &ctx),
             Some(TypeExpr::String)
+        ));
+        assert!(matches!(
+            parse_type_expr_str("Duration", &ctx),
+            Some(TypeExpr::Duration)
         ));
     }
 

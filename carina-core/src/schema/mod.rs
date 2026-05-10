@@ -152,6 +152,7 @@ fn walk_custom_lookup(
         | AttributeType::Int
         | AttributeType::Float
         | AttributeType::Bool
+        | AttributeType::Duration
         | AttributeType::StringEnum { .. } => {}
     }
 }
@@ -264,6 +265,10 @@ pub enum AttributeType {
     Float,
     /// Boolean
     Bool,
+    /// Time duration. Values use the `<integer><unit>` literal
+    /// (`75min`, `1h`, `30s`); internally a `std::time::Duration`.
+    /// Serialised as integer seconds at every value-tree boundary.
+    Duration,
     /// String enum with optional namespace-aware DSL syntax support.
     ///
     /// `dsl_aliases` is a list of `(api, dsl)` pairs that map a canonical
@@ -338,6 +343,7 @@ impl fmt::Debug for AttributeType {
             AttributeType::Int => f.write_str("Int"),
             AttributeType::Float => f.write_str("Float"),
             AttributeType::Bool => f.write_str("Bool"),
+            AttributeType::Duration => f.write_str("Duration"),
             AttributeType::StringEnum {
                 name,
                 values,
@@ -564,7 +570,8 @@ impl AttributeType {
             AttributeType::String
             | AttributeType::Int
             | AttributeType::Float
-            | AttributeType::Bool => self.validate_primitive(value),
+            | AttributeType::Bool
+            | AttributeType::Duration => self.validate_primitive(value),
         }
     }
 
@@ -740,6 +747,7 @@ impl AttributeType {
             }),
             (AttributeType::Float, Value::Int(_)) => Ok(()), // integers are valid numbers
             (AttributeType::Bool, Value::Bool(_)) => Ok(()),
+            (AttributeType::Duration, Value::Duration(_)) => Ok(()),
             _ => Err(TypeError::TypeMismatch {
                 expected: self.type_name(),
                 got: value.type_name(),
@@ -1056,6 +1064,7 @@ impl AttributeType {
             AttributeType::Int => "Int".to_string(),
             AttributeType::Float => "Float".to_string(),
             AttributeType::Bool => "Bool".to_string(),
+            AttributeType::Duration => "Duration".to_string(),
             AttributeType::StringEnum { name, .. } => name.clone(),
             AttributeType::Custom {
                 semantic_name,
@@ -1700,6 +1709,7 @@ impl Value {
             Value::Int(_) => "Int".to_string(),
             Value::Float(_) => "Float".to_string(),
             Value::Bool(_) => "Bool".to_string(),
+            Value::Duration(_) => "Duration".to_string(),
             Value::List(_) => "List".to_string(),
             Value::StringList(_) => "StringList".to_string(),
             Value::Map(_) => "Map".to_string(),
