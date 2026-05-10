@@ -26,10 +26,19 @@ pub enum Severity {
 }
 
 /// A single depends_on diagnostic.
+///
+/// `binding_name` and `dep_name` carry structured location hints so
+/// the LSP can resolve a per-element span without re-parsing the
+/// validation message text. Both are populated when the diagnostic
+/// pertains to a specific binding (`directives.depends_on on '<name>'`)
+/// and / or element (`binding '<name>'`); cycle errors and other
+/// whole-graph diagnostics leave them `None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependsOnDiagnostic {
     pub severity: Severity,
     pub message: String,
+    pub binding_name: Option<String>,
+    pub dep_name: Option<String>,
 }
 
 impl DependsOnDiagnostic {
@@ -37,6 +46,8 @@ impl DependsOnDiagnostic {
         Self {
             severity: Severity::Error,
             message: msg.into(),
+            binding_name: None,
+            dep_name: None,
         }
     }
 
@@ -44,7 +55,21 @@ impl DependsOnDiagnostic {
         Self {
             severity: Severity::Warning,
             message: msg.into(),
+            binding_name: None,
+            dep_name: None,
         }
+    }
+
+    #[allow(dead_code)]
+    fn at_binding(mut self, binding: &str) -> Self {
+        self.binding_name = Some(binding.to_string());
+        self
+    }
+
+    fn at_element(mut self, binding: &str, dep: &str) -> Self {
+        self.binding_name = Some(binding.to_string());
+        self.dep_name = Some(dep.to_string());
+        self
     }
 }
 
@@ -98,55 +123,73 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
         for dep_name in &resource.directives.depends_on {
             if !seen.insert(dep_name.as_str()) {
                 if duplicate_warned.insert(dep_name.as_str()) {
-                    diags.push(DependsOnDiagnostic::warning(format!(
-                        "directives.depends_on on '{}': binding '{}' is listed multiple times",
-                        self_name, dep_name
-                    )));
+                    diags.push(
+                        DependsOnDiagnostic::warning(format!(
+                            "directives.depends_on on '{}': binding '{}' is listed multiple times",
+                            self_name, dep_name
+                        ))
+                        .at_element(self_name, dep_name),
+                    );
                 }
                 continue;
             }
 
             if dep_name == self_name {
-                diags.push(DependsOnDiagnostic::error(format!(
-                    "directives.depends_on on '{}': self-reference is not allowed \
-                     (binding '{}' depends on itself)",
-                    self_name, dep_name
-                )));
+                diags.push(
+                    DependsOnDiagnostic::error(format!(
+                        "directives.depends_on on '{}': self-reference is not allowed \
+                         (binding '{}' depends on itself)",
+                        self_name, dep_name
+                    ))
+                    .at_element(self_name, dep_name),
+                );
                 continue;
             }
 
             if upstream_names.contains(dep_name.as_str()) {
-                diags.push(DependsOnDiagnostic::error(format!(
-                    "directives.depends_on on '{}': upstream_state binding '{}' \
-                     is not a valid depends_on target",
-                    self_name, dep_name
-                )));
+                diags.push(
+                    DependsOnDiagnostic::error(format!(
+                        "directives.depends_on on '{}': upstream_state binding '{}' \
+                         is not a valid depends_on target",
+                        self_name, dep_name
+                    ))
+                    .at_element(self_name, dep_name),
+                );
                 continue;
             }
 
             let Some(target) = bindings_by_name.get(dep_name.as_str()) else {
-                diags.push(DependsOnDiagnostic::error(format!(
-                    "directives.depends_on on '{}': binding '{}' is not declared in this scope",
-                    self_name, dep_name
-                )));
+                diags.push(
+                    DependsOnDiagnostic::error(format!(
+                        "directives.depends_on on '{}': binding '{}' is not declared in this scope",
+                        self_name, dep_name
+                    ))
+                    .at_element(self_name, dep_name),
+                );
                 continue;
             };
 
             if matches!(target.kind, ResourceKind::DataSource) {
-                diags.push(DependsOnDiagnostic::error(format!(
-                    "directives.depends_on on '{}': data sources cannot be \
-                     depends_on targets (binding '{}')",
-                    self_name, dep_name
-                )));
+                diags.push(
+                    DependsOnDiagnostic::error(format!(
+                        "directives.depends_on on '{}': data sources cannot be \
+                         depends_on targets (binding '{}')",
+                        self_name, dep_name
+                    ))
+                    .at_element(self_name, dep_name),
+                );
                 continue;
             }
 
             if value_ref_deps.contains(dep_name.as_str()) {
-                diags.push(DependsOnDiagnostic::warning(format!(
-                    "directives.depends_on on '{}': edge to '{}' is redundant; \
-                     '{}' is already referenced by value",
-                    self_name, dep_name, dep_name
-                )));
+                diags.push(
+                    DependsOnDiagnostic::warning(format!(
+                        "directives.depends_on on '{}': edge to '{}' is redundant; \
+                         '{}' is already referenced by value",
+                        self_name, dep_name, dep_name
+                    ))
+                    .at_element(self_name, dep_name),
+                );
             }
         }
     }

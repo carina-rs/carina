@@ -1976,9 +1976,10 @@ impl DiagnosticEngine {
     }
 
     /// Mirror `validate_depends_on` errors/warnings in the editor.
-    /// Diagnostics anchor at the first `depends_on` token in the buffer
-    /// — per-element spans need pest spans plumbed through the
-    /// validation pass and are deferred.
+    /// Per-diagnostic anchoring uses the structured `binding_name` /
+    /// `dep_name` hints carried by `DependsOnDiagnostic` (#2874) to
+    /// resolve a precise span. Falls back to whole-buffer scan only
+    /// for diagnostics that have no hints (e.g. cycle errors).
     pub(super) fn check_depends_on(&self, doc: &Document, parsed: &ParsedFile) -> Vec<Diagnostic> {
         use carina_core::validation::depends_on::{Severity, validate_depends_on};
         let diags = validate_depends_on(parsed);
@@ -1986,7 +1987,6 @@ impl DiagnosticEngine {
             return Vec::new();
         }
         let text = doc.text();
-        let (line, col, end_col) = find_first_depends_on(&text).unwrap_or((0, 0, 0));
         diags
             .into_iter()
             .map(|d| {
@@ -1994,38 +1994,164 @@ impl DiagnosticEngine {
                     Severity::Error => DiagnosticSeverity::ERROR,
                     Severity::Warning => DiagnosticSeverity::WARNING,
                 };
+                let (line, col, end_col) =
+                    anchor_for_diagnostic(&text, d.binding_name.as_deref(), d.dep_name.as_deref());
                 carina_diagnostic(line, col, end_col, severity, d.message)
             })
             .collect()
     }
 }
 
-/// Locate the first `depends_on` token in the buffer for diagnostic
-/// anchoring. Skips comment lines and verifies the match isn't a
-/// substring of a longer identifier (e.g., `depends_on_role`).
-/// Returns `(line, start_col, end_col)` in character columns.
-fn find_first_depends_on(text: &str) -> Option<(u32, u32, u32)> {
-    for (line_idx, line) in text.lines().enumerate() {
-        if line.trim_start().starts_with('#') {
-            continue;
-        }
-        let mut search_from = 0;
-        while let Some(rel) = line[search_from..].find("depends_on") {
-            let byte_col = search_from + rel;
-            let after = byte_col + "depends_on".len();
-            let prev_ok = byte_col == 0
-                || !line.as_bytes()[byte_col - 1].is_ascii_alphanumeric()
-                    && line.as_bytes()[byte_col - 1] != b'_';
-            let next_ok = after == line.len()
-                || !line.as_bytes()[after].is_ascii_alphanumeric()
-                    && line.as_bytes()[after] != b'_';
-            if prev_ok && next_ok {
-                let prefix = &line[..byte_col];
-                let col = prefix.chars().count() as u32;
-                return Some((line_idx as u32, col, col + "depends_on".len() as u32));
-            }
-            search_from = after;
+/// Resolve the source anchor for a depends_on diagnostic.
+///
+/// Strategy:
+/// 1. Find the `let <binding_name> =` line for the offending binding
+///    (or the resource's opening line if unbound).
+/// 2. From there, scan forward for the `directives` block.
+/// 3. If `dep_name` is given, find the matching identifier inside
+///    the `depends_on = [...]` list. Otherwise anchor at `depends_on`.
+/// 4. Fall back to first-`depends_on` whole-buffer scan when the
+///    diagnostic carries no hints (cycle errors), or `(0, 0, 0)` if
+///    even that fails.
+fn anchor_for_diagnostic(
+    text: &str,
+    binding_name: Option<&str>,
+    dep_name: Option<&str>,
+) -> (u32, u32, u32) {
+    let lines: Vec<&str> = text.lines().collect();
+
+    let binding_line = binding_name.and_then(|b| find_binding_line(&lines, b));
+    let search_start = binding_line.unwrap_or(0);
+
+    let directives_line = find_token_after(&lines, search_start, "directives");
+    let depends_on_line = directives_line
+        .and_then(|d| find_token_after(&lines, d, "depends_on"))
+        .or_else(|| find_token_after(&lines, search_start, "depends_on"))
+        .or_else(|| find_token_after(&lines, 0, "depends_on"));
+
+    let Some(dep_on_idx) = depends_on_line else {
+        return (0, 0, 0);
+    };
+
+    if let Some(dep) = dep_name
+        && let Some((line_idx, col, end_col)) =
+            find_word_in_lines(&lines, dep_on_idx, dep_on_idx + 5, dep)
+    {
+        return (line_idx, col, end_col);
+    }
+
+    if let Some((col, end_col)) = find_word_on_line(lines[dep_on_idx], "depends_on") {
+        return (dep_on_idx as u32, col, end_col);
+    }
+    (dep_on_idx as u32, 0, 0)
+}
+
+/// Find the line index of `let <binding_name> = ...`.
+fn find_binding_line(lines: &[&str], binding: &str) -> Option<usize> {
+    let needle = format!("let {} ", binding);
+    let needle_eq = format!("let {}=", binding);
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(&needle) || trimmed.starts_with(&needle_eq) {
+            return Some(i);
         }
     }
     None
+}
+
+/// Find the line index >= `from` containing `token` as a whole word.
+fn find_token_after(lines: &[&str], from: usize, token: &str) -> Option<usize> {
+    for (offset, line) in lines.iter().enumerate().skip(from) {
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        if find_word_on_line(line, token).is_some() {
+            return Some(offset);
+        }
+    }
+    None
+}
+
+/// Find a whole-word `token` somewhere in any of `lines[from..to.min(end)]`.
+fn find_word_in_lines(
+    lines: &[&str],
+    from: usize,
+    to: usize,
+    token: &str,
+) -> Option<(u32, u32, u32)> {
+    let end = to.min(lines.len());
+    for (offset, line) in lines.iter().enumerate().take(end).skip(from) {
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        if let Some((col, end_col)) = find_word_on_line(line, token) {
+            return Some((offset as u32, col, end_col));
+        }
+    }
+    None
+}
+
+/// Find a whole-word `token` on a single line (character-column).
+fn find_word_on_line(line: &str, token: &str) -> Option<(u32, u32)> {
+    let mut search_from = 0;
+    while let Some(rel) = line[search_from..].find(token) {
+        let byte_col = search_from + rel;
+        let after = byte_col + token.len();
+        let prev_ok = byte_col == 0
+            || !line.as_bytes()[byte_col - 1].is_ascii_alphanumeric()
+                && line.as_bytes()[byte_col - 1] != b'_';
+        let next_ok = after == line.len()
+            || !line.as_bytes()[after].is_ascii_alphanumeric() && line.as_bytes()[after] != b'_';
+        if prev_ok && next_ok {
+            let prefix = &line[..byte_col];
+            let col = prefix.chars().count() as u32;
+            return Some((col, col + token.chars().count() as u32));
+        }
+        search_from = after;
+    }
+    None
+}
+
+#[cfg(test)]
+mod depends_on_anchor_tests {
+    use super::*;
+
+    #[test]
+    fn anchor_for_diagnostic_finds_specific_element_by_dep_name() {
+        let text = "let role = aws.iam.Role { role_name = \"r\" }\nlet bucket = aws.s3.Bucket {\n  bucket_name = \"x\"\n  directives {\n    depends_on = [role, kms]\n  }\n}\n";
+        let (line, col, end_col) = anchor_for_diagnostic(text, Some("bucket"), Some("kms"));
+        assert_eq!(line, 4, "should anchor on the depends_on list line");
+        let line_text = text.lines().nth(4).unwrap();
+        let kms_col = line_text.find("kms").unwrap() as u32;
+        assert_eq!(col, kms_col, "should point at start of `kms`");
+        assert_eq!(end_col, kms_col + 3);
+    }
+
+    #[test]
+    fn anchor_for_diagnostic_distinguishes_two_resources() {
+        let text = "let role = aws.iam.Role { role_name = \"r\" }\nlet bucket1 = aws.s3.Bucket {\n  bucket_name = \"x1\"\n  directives { depends_on = [bad1] }\n}\nlet bucket2 = aws.s3.Bucket {\n  bucket_name = \"x2\"\n  directives { depends_on = [bad2] }\n}\n";
+        let a = anchor_for_diagnostic(text, Some("bucket1"), Some("bad1"));
+        let b = anchor_for_diagnostic(text, Some("bucket2"), Some("bad2"));
+        assert_ne!(
+            a.0, b.0,
+            "two resources must anchor on different lines: {a:?} {b:?}"
+        );
+        assert_eq!(a.0, 3, "bucket1 anchor on line 3");
+        assert_eq!(b.0, 7, "bucket2 anchor on line 7");
+    }
+
+    #[test]
+    fn anchor_for_diagnostic_falls_back_when_no_hints() {
+        let text = "let bucket = aws.s3.Bucket {\n  directives { depends_on = [role] }\n}\n";
+        let (line, _, _) = anchor_for_diagnostic(text, None, None);
+        assert_eq!(line, 1, "fallback should land on the depends_on line");
+    }
+
+    #[test]
+    fn find_word_on_line_word_boundary() {
+        let line = "let depends_on_role = something";
+        assert!(find_word_on_line(line, "depends_on").is_none());
+        let line2 = "    depends_on = [role]";
+        assert!(find_word_on_line(line2, "depends_on").is_some());
+    }
 }
