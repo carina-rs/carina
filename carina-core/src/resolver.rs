@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use indexmap::IndexMap;
 
 use crate::binding_index::ResolvedBindings;
-use crate::deps::get_resource_dependencies;
 use crate::resource::{
     InterpolationPart, Resource, ResourceId, State, Value, contains_resource_ref,
 };
@@ -67,7 +66,7 @@ fn resolve_refs_inner(
     // This metadata is used by plan tree building to recover parent-child
     // relationships (see build_plan_tree in display.rs and app.rs).
     for resource in resources.iter_mut() {
-        let deps = get_resource_dependencies(resource);
+        let deps = crate::deps::get_resource_value_ref_dependencies(resource);
         if !deps.is_empty() {
             resource.dependency_bindings = deps.into_iter().collect();
         }

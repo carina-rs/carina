@@ -1,5 +1,7 @@
 //! Validation utilities for resources and modules
 
+pub mod depends_on;
+
 use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
@@ -754,6 +756,9 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
             collect_resource_refs(value, &mut referenced);
             collect_dot_notation_refs(value, &mut referenced);
         }
+        for dep in &resource.directives.depends_on {
+            referenced.insert(dep.clone());
+        }
     }
     for call in &parsed.module_calls {
         for value in call.arguments.values() {
@@ -794,7 +799,7 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
 }
 
 /// Recursively collect all `ResourceRef` binding names from a value tree.
-fn collect_resource_refs(value: &Value, refs: &mut HashSet<String>) {
+pub(crate) fn collect_resource_refs(value: &Value, refs: &mut HashSet<String>) {
     match value {
         Value::ResourceRef { path } => {
             refs.insert(path.binding().to_string());
@@ -818,7 +823,7 @@ fn collect_resource_refs(value: &Value, refs: &mut HashSet<String>) {
 /// When files are parsed independently, cross-file references like `vpc.vpc_id`
 /// become `String("vpc.vpc_id")` instead of `ResourceRef`. This function extracts
 /// the first component as a potential binding name.
-fn collect_dot_notation_refs(value: &Value, refs: &mut HashSet<String>) {
+pub(crate) fn collect_dot_notation_refs(value: &Value, refs: &mut HashSet<String>) {
     match value {
         Value::String(s) if s.contains('.') && !s.contains(' ') && !s.starts_with('/') => {
             if let Some(binding) = s.split('.').next()

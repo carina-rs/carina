@@ -46,6 +46,24 @@ fn build_plan_and_states_from_fixture(
     (fp.plan, fp.current_states, fp.schemas, fp.moved_origins)
 }
 
+/// Plan-display gate for `directives.depends_on` (#2823). The bucket
+/// declares an explicit ordering edge to `role` with no value
+/// reference; the snapshot pins how the plan tree renders that edge.
+#[test]
+fn snapshot_depends_on() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("depends_on");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+    ));
+    insta::assert_snapshot!(output);
+}
+
 #[test]
 fn snapshot_all_create() {
     let (plan, schemas, _moved) = build_plan_from_fixture("all_create");

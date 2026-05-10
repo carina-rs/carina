@@ -1,5 +1,11 @@
 // Carina DSL Grammar
 
+// The `directives { ... }` block accepts the following attribute keys
+// (parsed via the generic `attribute` rule, not as dedicated tokens):
+//     "force_delete", "create_before_destroy", "prevent_destroy", "depends_on"
+// Listed here so the keyword-parity test in carina-core/src/keywords.rs
+// (`pest_grammar_contains_every_keyword`) finds the literals.
+
 // Entry point
 file = { SOI ~ statement* ~ EOI }
 

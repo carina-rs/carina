@@ -38,6 +38,7 @@ pub const KEYWORDS: &[(&str, KeywordKind)] = &[
     ("for", KeywordKind::Control),
     ("if", KeywordKind::Control),
     ("in", KeywordKind::Control),
+    ("depends_on", KeywordKind::Other),
     ("import", KeywordKind::Other),
     ("read", KeywordKind::Other),
     ("require", KeywordKind::Other),
@@ -94,6 +95,11 @@ mod tests {
         assert!(is_keyword("upstream_state"));
         assert!(!is_keyword("not_a_keyword"));
         assert!(!is_keyword(""));
+    }
+
+    #[test]
+    fn depends_on_is_a_keyword() {
+        assert!(is_keyword("depends_on"));
     }
 
     #[test]

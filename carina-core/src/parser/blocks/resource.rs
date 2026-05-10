@@ -47,7 +47,7 @@ pub(in crate::parser) fn parse_anonymous_resource(
     attributes.insert("_type".to_string(), Value::String(namespaced_type.clone()));
 
     // Extract directives block from attributes (it's a meta-argument, not a real attribute)
-    let directives = extract_directives(&mut attributes);
+    let directives = extract_directives(&mut attributes)?;
 
     let id = ResourceId::with_provider(provider, resource_type, resource_name);
 
@@ -129,7 +129,9 @@ pub(in crate::parser) fn parse_block_contents_with_quoted(
                         let block_name = next_pair(&mut block_inner, "block name", "nested block")?
                             .as_str()
                             .to_string();
-
+                        if block_name == "directives" {
+                            check_directives_depends_on_elements(block_inner.clone())?;
+                        }
                         // Recursively parse nested block contents (supports arbitrary depth)
                         let block_attrs = parse_block_contents(block_inner, &local_ctx)?;
 
@@ -206,7 +208,7 @@ pub(crate) fn parse_resource_expr(
     let resource_name = binding_name.to_string();
 
     // Extract directives block from attributes (it's a meta-argument, not a real attribute)
-    let directives = extract_directives(&mut attributes);
+    let directives = extract_directives(&mut attributes)?;
 
     attributes.insert("_type".to_string(), Value::String(namespaced_type.clone()));
 
@@ -255,7 +257,7 @@ pub(crate) fn parse_read_resource_expr(
     let resource_name = binding_name.to_string();
 
     // Extract directives block from attributes (it's a meta-argument, not a real attribute)
-    let directives = extract_directives(&mut attributes);
+    let directives = extract_directives(&mut attributes)?;
 
     attributes.insert("_type".to_string(), Value::String(namespaced_type.clone()));
 
@@ -272,4 +274,57 @@ pub(crate) fn parse_read_resource_expr(
         module_source: None,
         quoted_string_attrs,
     })
+}
+
+/// Walk the contents of a `directives { ... }` block at the pest layer and
+/// reject any `depends_on = [...]` element that is a string literal — bare
+/// binding identifiers and string literals collapse to the same `Value`
+/// later, so this is the only place we can tell `[role]` from `["role"]`.
+fn check_directives_depends_on_elements(
+    directives_inner: pest::iterators::Pairs<Rule>,
+) -> Result<(), ParseError> {
+    for content_pair in directives_inner {
+        let attr = match content_pair.as_rule() {
+            Rule::block_content => {
+                first_inner(content_pair, "block content item", "block content")?
+            }
+            Rule::attribute => content_pair,
+            _ => continue,
+        };
+        if attr.as_rule() != Rule::attribute {
+            continue;
+        }
+        let mut attr_inner = attr.into_inner();
+        let key_pair = next_pair(&mut attr_inner, "attribute name", "directives attribute")?;
+        if key_pair.as_str() != "depends_on" {
+            continue;
+        }
+        let value_pair = next_pair(&mut attr_inner, "attribute value", "directives attribute")?;
+        let primary = match crate::parser::util::unwrap_to_primary(value_pair) {
+            Some(p) => p,
+            None => continue,
+        };
+        let inner = match primary.into_inner().next() {
+            Some(p) => p,
+            None => continue,
+        };
+        if inner.as_rule() != Rule::list {
+            return Err(ParseError::InvalidExpression {
+                line: 0,
+                message: "directives.depends_on: must be a list of binding identifiers".to_string(),
+            });
+        }
+        for elem in inner.into_inner() {
+            if expression_is_plain_string_literal(elem) {
+                return Err(ParseError::InvalidExpression {
+                    line: 0,
+                    message: "directives.depends_on: list elements must be \
+                              binding identifiers, not string literals (e.g., \
+                              `[role, key]`, not `[\"role\"]`)"
+                        .to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
 }

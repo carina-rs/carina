@@ -1,0 +1,19 @@
+# Plan-display fixture exercising directives.depends_on (#2823).
+# The anonymous bucket declares an explicit ordering edge to `role`
+# even though no value reference connects them. `role` stays a let
+# binding so depends_on has something to name; the bucket is anonymous
+# (no let) per the "no unused let bindings in fixtures" rule.
+
+provider aws {
+    region = "us-east-1"
+}
+
+let role = aws.iam.Role {
+    role_name                   = "my-role"
+    assume_role_policy_document = "{}"
+}
+
+aws.s3.Bucket {
+    bucket_name = "my-bucket"
+    directives { depends_on = [role] }
+}

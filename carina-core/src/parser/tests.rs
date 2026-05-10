@@ -8639,3 +8639,162 @@ arguments {
         ])
     );
 }
+
+#[test]
+fn extract_directives_reads_depends_on_list() {
+    let src = r#"
+        let role = aws.iam.Role {
+            role_name = "r"
+            assume_role_policy_document = "{}"
+        }
+        let key = aws.kms.Key {
+            description = "k"
+        }
+        let bucket = aws.s3.Bucket {
+            bucket_name = "x"
+            directives {
+                depends_on = [role, key]
+            }
+        }
+    "#;
+    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let bucket = parsed
+        .resources
+        .iter()
+        .find(|r| r.id.name.as_str() == "bucket")
+        .expect("bucket binding");
+    assert_eq!(
+        bucket.directives.depends_on,
+        vec!["role".to_string(), "key".to_string()]
+    );
+}
+
+#[test]
+fn parser_resolve_unions_directives_depends_on_into_dependency_bindings() {
+    let src = r#"
+        let role = aws.iam.Role {
+            role_name = "r"
+            assume_role_policy_document = "{}"
+        }
+        let bucket = aws.s3.Bucket {
+            bucket_name = "b"
+            directives { depends_on = [role] }
+        }
+    "#;
+    let parsed = parse_and_resolve(src).expect("parse_and_resolve should succeed");
+    let bucket = parsed
+        .resources
+        .iter()
+        .find(|r| r.id.name.as_str() == "bucket")
+        .expect("bucket binding");
+    let deps = crate::deps::get_resource_dependencies(bucket);
+    assert!(
+        deps.contains("role"),
+        "get_resource_dependencies should include 'role' from directives.depends_on; got {:?}",
+        deps
+    );
+}
+
+#[test]
+fn extract_directives_rejects_string_literal_in_depends_on() {
+    let src = r#"
+        let bucket = aws.s3.Bucket {
+            bucket_name = "x"
+            directives { depends_on = ["role"] }
+        }
+    "#;
+    let result = parse(src, &ProviderContext::default());
+    assert!(
+        result.is_err(),
+        "expected parse error for string-literal element in depends_on"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("binding identifier"),
+        "error should mention binding identifiers, got: {}",
+        err
+    );
+}
+
+#[test]
+fn extract_directives_accepts_empty_depends_on_list() {
+    // `depends_on = []` is a legal no-op — the parser must accept it
+    // and produce an empty Vec, not error or panic on the empty pair.
+    let src = r#"
+        let bucket = aws.s3.Bucket {
+            bucket_name = "x"
+            directives { depends_on = [] }
+        }
+    "#;
+    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let bucket = parsed
+        .resources
+        .iter()
+        .find(|r| r.id.name.as_str() == "bucket")
+        .expect("bucket binding");
+    assert!(
+        bucket.directives.depends_on.is_empty(),
+        "empty depends_on list should produce an empty Vec, got {:?}",
+        bucket.directives.depends_on
+    );
+}
+
+#[test]
+fn extract_directives_depends_on_in_for_loop_resource() {
+    // `for` bodies are deferred resources — confirm `directives` flows
+    // through expansion so each instance has the depends_on edge.
+    let src = r#"
+        provider test {
+            source = 'x/y'
+            version = '0.1'
+            region = 'ap-northeast-1'
+        }
+        let role = test.r.res {
+            name = "role"
+        }
+        let orgs = upstream_state {
+            source = "../organizations"
+        }
+        for account_id in orgs.accounts {
+            test.r.res {
+                name = account_id
+                directives { depends_on = [role] }
+            }
+        }
+    "#;
+    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let template = &parsed
+        .deferred_for_expressions
+        .first()
+        .expect("for expression present")
+        .template_resource;
+    assert_eq!(
+        template.directives.depends_on,
+        vec!["role".to_string()],
+        "for-body resource template should carry directives.depends_on"
+    );
+}
+
+#[test]
+fn extract_directives_rejects_string_literal_in_anonymous_resource_depends_on() {
+    // Same shape as the let-binding case above, but via an anonymous
+    // resource — confirms `check_directives_depends_on_elements` runs
+    // for both code paths through `parse_block_contents_with_quoted`.
+    let src = r#"
+        aws.s3.Bucket {
+            bucket_name = "x"
+            directives { depends_on = ["role"] }
+        }
+    "#;
+    let result = parse(src, &ProviderContext::default());
+    assert!(
+        result.is_err(),
+        "expected parse error for string-literal element in anonymous resource"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("binding identifier"),
+        "error should mention binding identifiers, got: {}",
+        err
+    );
+}

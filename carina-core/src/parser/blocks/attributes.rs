@@ -241,7 +241,7 @@ pub(in crate::parser) fn parse_exports_block(
 /// `Directives`.
 pub(in crate::parser) fn extract_directives(
     attributes: &mut IndexMap<String, Value>,
-) -> Directives {
+) -> Result<Directives, ParseError> {
     if let Some(Value::List(blocks)) = attributes.shift_remove("directives") {
         // Take the first directives block (there should only be one)
         if let Some(Value::Map(map)) = blocks.into_iter().next() {
@@ -249,12 +249,78 @@ pub(in crate::parser) fn extract_directives(
             let create_before_destroy =
                 matches!(map.get("create_before_destroy"), Some(Value::Bool(true)));
             let prevent_destroy = matches!(map.get("prevent_destroy"), Some(Value::Bool(true)));
-            return Directives {
+            let depends_on = match map.get("depends_on") {
+                None => Vec::new(),
+                Some(Value::List(items)) => {
+                    let mut names = Vec::with_capacity(items.len());
+                    for item in items {
+                        match item {
+                            Value::ResourceRef { path } => {
+                                // `a.b` and longer paths are rejected: only bare
+                                // binding identifiers are accepted in MVP. Bare
+                                // identifiers parse as `Value::String` (see
+                                // primary.rs `Rule::variable_ref` with no access
+                                // chain), so a `ResourceRef` here means the user
+                                // wrote `binding.attr`.
+                                if path.attribute().is_empty() && path.field_path().is_empty() {
+                                    names.push(path.binding().to_string());
+                                } else {
+                                    return Err(ParseError::InvalidExpression {
+                                        line: 0,
+                                        message: format!(
+                                            "directives.depends_on: list elements must be \
+                                             bare binding identifiers, not attribute \
+                                             selectors (got `{}`)",
+                                            path.binding()
+                                        ),
+                                    });
+                                }
+                            }
+                            Value::String(name) => {
+                                // Bindings resolve to the indirection marker
+                                // `${name}` (see
+                                // `parse_primary_with_resource_or_module`);
+                                // strip it. Quoted strings are rejected
+                                // upstream by
+                                // `check_directives_depends_on_elements`.
+                                let bare = name
+                                    .strip_prefix("${")
+                                    .and_then(|s| s.strip_suffix('}'))
+                                    .unwrap_or(name.as_str());
+                                names.push(bare.to_string());
+                            }
+                            other => {
+                                return Err(ParseError::InvalidExpression {
+                                    line: 0,
+                                    message: format!(
+                                        "directives.depends_on: list elements must be \
+                                         binding identifiers, got {:?}",
+                                        other
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    names
+                }
+                Some(other) => {
+                    return Err(ParseError::InvalidExpression {
+                        line: 0,
+                        message: format!(
+                            "directives.depends_on: must be a list of binding identifiers, \
+                             got {:?}",
+                            other
+                        ),
+                    });
+                }
+            };
+            return Ok(Directives {
                 force_delete,
                 create_before_destroy,
                 prevent_destroy,
-            };
+                depends_on,
+            });
         }
     }
-    Directives::default()
+    Ok(Directives::default())
 }

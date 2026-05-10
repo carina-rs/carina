@@ -1,0 +1,4 @@
+let bucket = aws.s3.Bucket {
+    bucket_name = "my-bucket"
+    directives { depends_on = [role] }
+}

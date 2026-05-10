@@ -147,6 +147,14 @@ impl DiagnosticEngine {
             diagnostics.extend(self.check_for_iterable_bindings(doc, merged, current_file_name));
         }
 
+        // Prefer the directory-merged parse so cross-file binding refs
+        // resolve; fall back to the buffer-only parse otherwise.
+        if let Some(parsed) = merged.as_ref() {
+            diagnostics.extend(self.check_depends_on(doc, parsed));
+        } else if let Some(parsed) = doc.parsed() {
+            diagnostics.extend(self.check_depends_on(doc, parsed));
+        }
+
         // Provider-attribute finalize diagnostic (#2717 / #2753): if a
         // non-literal `default_tags` (or future deferred attribute) does
         // not resolve to the expected shape, surface that error as a

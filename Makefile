@@ -48,6 +48,8 @@ plan-explicit:
 	$(PLAN_FIXTURE) explicit --detail explicit
 plan-default-tags:
 	$(PLAN_FIXTURE) default_tags
+plan-depends-on:
+	$(PLAN_FIXTURE) depends_on
 plan-secret-values:
 	$(PLAN_FIXTURE) secret_values
 plan-moved-with-changes:
