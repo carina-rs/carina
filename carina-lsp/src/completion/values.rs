@@ -623,6 +623,125 @@ impl CompletionProvider {
         }
     }
 
+    /// Attribute-name candidates for `directives { | }` (#2873). The
+    /// four directives — `force_delete`, `create_before_destroy`,
+    /// `prevent_destroy`, `depends_on` — exhaustively. Order is
+    /// alphabetical to match `KEYWORDS` ordering in `keywords.rs`.
+    pub(super) fn directives_block_completions(&self) -> Vec<CompletionItem> {
+        let trigger_suggest = Command {
+            title: "Trigger Suggest".to_string(),
+            command: "editor.action.triggerSuggest".to_string(),
+            arguments: None,
+        };
+        vec![
+            CompletionItem {
+                label: "create_before_destroy".to_string(),
+                kind: Some(CompletionItemKind::PROPERTY),
+                detail: Some(
+                    "Create the replacement before destroying the old resource".to_string(),
+                ),
+                insert_text: Some("create_before_destroy = ".to_string()),
+                command: Some(trigger_suggest.clone()),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "depends_on".to_string(),
+                kind: Some(CompletionItemKind::PROPERTY),
+                detail: Some("Explicit ordering edges to sibling let bindings".to_string()),
+                insert_text: Some("depends_on = [$0]".to_string()),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                command: Some(trigger_suggest.clone()),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "force_delete".to_string(),
+                kind: Some(CompletionItemKind::PROPERTY),
+                detail: Some("Force-delete the resource (e.g., non-empty S3 buckets)".to_string()),
+                insert_text: Some("force_delete = ".to_string()),
+                command: Some(trigger_suggest.clone()),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "prevent_destroy".to_string(),
+                kind: Some(CompletionItemKind::PROPERTY),
+                detail: Some("Block any plan that would destroy this resource".to_string()),
+                insert_text: Some("prevent_destroy = ".to_string()),
+                command: Some(trigger_suggest),
+                ..Default::default()
+            },
+        ]
+    }
+
+    /// Element candidates for `directives { depends_on = [|] }`
+    /// (#2873). Suggests every in-scope `let` binding that names a
+    /// resource (managed) or module call. Excludes:
+    ///   - data source bindings (rejected by `validate_depends_on`)
+    ///   - upstream_state bindings (rejected by `validate_depends_on`)
+    ///   - the enclosing binding (self-reference is an error)
+    ///   - names already present in the list before the cursor
+    pub(super) fn directives_depends_on_completions(
+        &self,
+        text: &str,
+        current_binding: Option<&str>,
+        position: Position,
+        base_path: Option<&Path>,
+    ) -> Vec<CompletionItem> {
+        let already_present = self.depends_on_elements_before_cursor(text, position);
+
+        let mut src_buf = String::new();
+        let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
+        let raw = self.in_scope_binding_completions_with_src(
+            src,
+            InScopeBindingMode::ValuePosition { current_binding },
+        );
+
+        // `in_scope_binding_completions_with_src` returns every in-scope
+        // binding (resources, modules, upstream_state, arguments). For
+        // depends_on we drop upstream_state via the `detail` text — the
+        // helper sets `detail = "upstream_state binding"` for those.
+        // Same for arguments (not let-bound resources).
+        raw.into_iter()
+            .filter(|item| {
+                let detail = item.detail.as_deref().unwrap_or("");
+                if detail.contains("upstream_state") || detail.contains("argument") {
+                    return false;
+                }
+                !already_present.contains(&item.label)
+            })
+            .collect()
+    }
+
+    /// Parse `depends_on = [<elements...><cursor>` from `text`,
+    /// returning bare identifier names already typed before the
+    /// cursor. Used to suppress duplicates in
+    /// `directives_depends_on_completions`.
+    fn depends_on_elements_before_cursor(
+        &self,
+        text: &str,
+        position: Position,
+    ) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        let lines: Vec<&str> = text.lines().collect();
+        let line_idx = position.line as usize;
+        if line_idx >= lines.len() {
+            return out;
+        }
+        let line = lines[line_idx];
+        let col = position.character as usize;
+        let prefix_chars: String = line.chars().take(col).collect();
+        let Some(open) = prefix_chars.rfind('[') else {
+            return out;
+        };
+        let inner = &prefix_chars[open + 1..];
+        for raw in inner.split(',') {
+            let name = raw.trim();
+            if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                out.insert(name.to_string());
+            }
+        }
+        out
+    }
+
     pub(super) fn provider_block_completions(&self) -> Vec<CompletionItem> {
         let trigger_suggest = Command {
             title: "Trigger Suggest".to_string(),
