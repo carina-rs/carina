@@ -88,7 +88,7 @@
         "entity.name.type.resource",
         "entity.name.type.resource.crn"
       ],
-      "settings": { "foreground": "#f1f5f9" }
+      "settings": { "foreground": "#fef9c3" }
     },
     {
       "scope": [
@@ -96,7 +96,7 @@
         "variable.other",
         "variable.other.crn"
       ],
-      "settings": { "foreground": "#f1f5f9" }
+      "settings": { "foreground": "#cbd5e1" }
     },
 
     {
