@@ -8,6 +8,7 @@
 //! See `docs/specs/2026-05-10-explicit-fields-design.md`.
 
 use crate::resource::{Resource, Value};
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -107,6 +108,58 @@ pub fn merge(a: ExplicitFields, b: ExplicitFields) -> ExplicitFields {
         // Mismatched shapes shouldn't occur for well-typed inputs;
         // prefer the structural variant on the left.
         (a, _) => a,
+    }
+}
+
+/// Strip from `value` everything not listed in `explicit`. Used to
+/// remove server-side defaults from the actual-state side before
+/// diffing.
+///
+/// Idempotent: `project(project(v, e), e) == project(v, e)`.
+///
+/// Shape-mismatch fallback: when `value` and `explicit` disagree on
+/// shape (e.g. `Value::String` paired with `ExplicitFields::Struct`),
+/// the value is returned unchanged. This is a conservative choice —
+/// better to over-show a value once than to silently hide real data.
+pub fn project(value: Value, explicit: &ExplicitFields) -> Value {
+    match (value, explicit) {
+        // user wrote whole leaf: keep entire current value
+        (v, ExplicitFields::Leaf) => v,
+        (Value::Map(fields), ExplicitFields::Struct { children }) => {
+            let projected: IndexMap<String, Value> = fields
+                .into_iter()
+                .filter_map(|(k, v)| children.get(&k).map(|sub| (k, project(v, sub))))
+                .collect();
+            Value::Map(projected)
+        }
+        (Value::List(items), ExplicitFields::List { element }) => Value::List(
+            items
+                .into_iter()
+                .map(|item| project(item, element))
+                .collect(),
+        ),
+        // shape mismatch (state inconsistent or schema drift): keep
+        // value as-is to avoid hiding real data
+        (v, _) => v,
+    }
+}
+
+/// Apply `project` to every entry of a top-level attribute map. The
+/// outer `explicit` is expected to be `ExplicitFields::Struct` (the
+/// shape `build_from_resource` produces); other variants pass through
+/// conservatively.
+pub fn project_attributes(
+    attrs: HashMap<String, Value>,
+    explicit: &ExplicitFields,
+) -> HashMap<String, Value> {
+    match explicit {
+        ExplicitFields::Struct { children } => attrs
+            .into_iter()
+            .filter_map(|(k, v)| children.get(&k).map(|sub| (k, project(v, sub))))
+            .collect(),
+        // Top-level being Leaf or List shouldn't occur for a
+        // resource's full attribute set; pass through conservatively.
+        _ => attrs,
     }
 }
 
@@ -230,6 +283,105 @@ mod tests {
             children: HashMap::from([("a".into(), ExplicitFields::Leaf)]),
         };
         assert!(matches!(merge(a, b), ExplicitFields::Struct { .. }));
+    }
+
+    #[test]
+    fn project_struct_drops_unauthored_field() {
+        let mut fields = IndexMap::new();
+        fields.insert("authored".into(), Value::String("keep".into()));
+        fields.insert("server_default".into(), Value::String("drop".into()));
+        let value = Value::Map(fields);
+        let explicit = ExplicitFields::Struct {
+            children: HashMap::from([("authored".into(), ExplicitFields::Leaf)]),
+        };
+        let Value::Map(projected) = project(value, &explicit) else {
+            panic!("expected Map");
+        };
+        assert_eq!(projected.len(), 1);
+        assert!(projected.contains_key("authored"));
+        assert!(!projected.contains_key("server_default"));
+    }
+
+    #[test]
+    fn project_leaf_keeps_whole_value() {
+        let mut fields = IndexMap::new();
+        fields.insert("any".into(), Value::Int(1));
+        let value = Value::Map(fields);
+        let result = project(value.clone(), &ExplicitFields::Leaf);
+        assert_eq!(result, value);
+    }
+
+    #[test]
+    fn project_is_idempotent() {
+        let mut fields = IndexMap::new();
+        fields.insert("a".into(), Value::Int(1));
+        fields.insert("b".into(), Value::Int(2));
+        let value = Value::Map(fields);
+        let explicit = ExplicitFields::Struct {
+            children: HashMap::from([("a".into(), ExplicitFields::Leaf)]),
+        };
+        let once = project(value, &explicit);
+        let twice = project(once.clone(), &explicit);
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn project_list_recurses_into_each_element() {
+        let mut e1 = IndexMap::new();
+        e1.insert("authored".into(), Value::Int(1));
+        e1.insert("server".into(), Value::Int(2));
+        let mut e2 = IndexMap::new();
+        e2.insert("authored".into(), Value::Int(3));
+        e2.insert("server".into(), Value::Int(4));
+        let value = Value::List(vec![Value::Map(e1), Value::Map(e2)]);
+        let explicit = ExplicitFields::List {
+            element: Box::new(ExplicitFields::Struct {
+                children: HashMap::from([("authored".into(), ExplicitFields::Leaf)]),
+            }),
+        };
+        let Value::List(items) = project(value, &explicit) else {
+            panic!("expected List");
+        };
+        assert_eq!(items.len(), 2);
+        for item in &items {
+            let Value::Map(fields) = item else {
+                panic!("expected Map element");
+            };
+            assert_eq!(fields.len(), 1);
+            assert!(fields.contains_key("authored"));
+        }
+    }
+
+    #[test]
+    fn project_mismatched_shape_keeps_value() {
+        // Authoring says Struct, value is a String — keep value as-is.
+        let value = Value::String("oops".into());
+        let explicit = ExplicitFields::Struct {
+            children: HashMap::new(),
+        };
+        let result = project(value.clone(), &explicit);
+        assert_eq!(result, value);
+    }
+
+    #[test]
+    fn project_attributes_drops_top_level_unauthored() {
+        let attrs = HashMap::from([
+            ("a".to_string(), Value::Int(1)),
+            ("server_only".to_string(), Value::Int(99)),
+        ]);
+        let explicit = ExplicitFields::Struct {
+            children: HashMap::from([("a".into(), ExplicitFields::Leaf)]),
+        };
+        let result = project_attributes(attrs, &explicit);
+        assert_eq!(result.len(), 1);
+        assert!(result.contains_key("a"));
+    }
+
+    #[test]
+    fn project_attributes_passes_through_when_explicit_is_leaf() {
+        let attrs = HashMap::from([("a".to_string(), Value::Int(1))]);
+        let result = project_attributes(attrs.clone(), &ExplicitFields::Leaf);
+        assert_eq!(result, attrs);
     }
 
     #[test]
