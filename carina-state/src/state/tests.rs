@@ -547,9 +547,9 @@ fn test_build_orphan_dependencies() {
 }
 
 #[test]
-fn test_state_file_version_is_v5() {
+fn test_state_file_version_is_v6() {
     let state = StateFile::new();
-    assert_eq!(state.version, 5);
+    assert_eq!(state.version, 6);
 }
 
 #[test]
@@ -1060,7 +1060,7 @@ fn build_remote_bindings_ignores_resource_bindings() {
         directives: carina_core::resource::Directives::default(),
         prefixes: HashMap::new(),
         name_overrides: HashMap::new(),
-        desired_keys: vec![],
+        explicit: ExplicitFields::default(),
         binding: Some("vpc".to_string()),
         dependency_bindings: BTreeSet::new(),
         write_only_attributes: vec![],
@@ -1139,4 +1139,90 @@ fn from_provider_state_rejects_resource_ref_in_provider_attributes() {
         err.contains("unresolved reference") && err.contains("net.vpc.vpc_id"),
         "expected UnresolvedResourceRef diagnostic in error, got: {err}"
     );
+}
+
+#[test]
+fn v5_state_read_converts_desired_keys_to_explicit_leaves() {
+    // A v5 state file carries a `"desired_keys": ["..."]` array.
+    // Reading it under v6 must (a) bump the version to 6 and
+    // (b) lift each top-level key to a `Leaf` child of the root
+    // `ExplicitFields::Struct`.
+    let v5 = r#"{
+        "version": 5,
+        "serial": 0,
+        "lineage": "test-lineage",
+        "carina_version": "0.4.0",
+        "resources": [{
+            "resource_type": "s3.Bucket",
+            "name": "my-bucket",
+            "provider": "aws",
+            "identifier": null,
+            "attributes": {"region": "ap-northeast-1"},
+            "protected": false,
+            "directives": {},
+            "prefixes": {},
+            "name_overrides": {},
+            "desired_keys": ["region", "tags"],
+            "binding": null,
+            "dependency_bindings": []
+        }]
+    }"#;
+
+    let state = check_and_migrate(v5).expect("migration must succeed");
+    assert_eq!(state.version, StateFile::CURRENT_VERSION);
+    assert_eq!(state.resources.len(), 1);
+
+    let ExplicitFields::Struct { children } = &state.resources[0].explicit else {
+        panic!(
+            "v5 desired_keys should lift to ExplicitFields::Struct, got: {:?}",
+            state.resources[0].explicit
+        );
+    };
+    assert_eq!(children.len(), 2);
+    assert!(matches!(children["region"], ExplicitFields::Leaf));
+    assert!(matches!(children["tags"], ExplicitFields::Leaf));
+}
+
+#[test]
+fn v6_state_writes_and_reads_full_explicit_tree() {
+    // A v6 state file with a nested `explicit` tree round-trips
+    // through serde without loss.
+    let mut state = StateFile::new();
+    let mut rs = ResourceState::new("s3.Bucket", "my-bucket", "aws");
+    rs.explicit = ExplicitFields::Struct {
+        children: HashMap::from([(
+            "lifecycle_configuration".into(),
+            ExplicitFields::Struct {
+                children: HashMap::from([(
+                    "rules".into(),
+                    ExplicitFields::List {
+                        element: Box::new(ExplicitFields::Struct {
+                            children: HashMap::from([("id".into(), ExplicitFields::Leaf)]),
+                        }),
+                    },
+                )]),
+            },
+        )]),
+    };
+    state.upsert_resource(rs);
+
+    let json = serde_json::to_string(&state).expect("serialize");
+    let back = check_and_migrate(&json).expect("read");
+    assert_eq!(back.version, 6);
+    assert_eq!(back.resources[0].explicit, state.resources[0].explicit);
+}
+
+#[test]
+fn build_explicit_yields_per_resource_trees() {
+    let mut state = StateFile::new();
+    let mut rs = ResourceState::new("s3.Bucket", "my-bucket", "aws");
+    rs.explicit = ExplicitFields::Struct {
+        children: HashMap::from([("region".into(), ExplicitFields::Leaf)]),
+    };
+    state.upsert_resource(rs);
+
+    let map = state.build_explicit();
+    let id = ResourceId::with_provider("aws", "s3.Bucket", "my-bucket");
+    assert!(map.contains_key(&id));
+    assert!(matches!(map[&id], ExplicitFields::Struct { .. }));
 }

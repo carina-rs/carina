@@ -176,11 +176,17 @@ fn build_state_after_apply_preserves_block_name_attribute() {
         "state should contain 'policies' attribute (carried over from desired)"
     );
 
-    // Verify desired_keys includes "policies" (canonical name, not "policy")
+    // Verify explicit tree includes "policies" (canonical name, not "policy")
+    let carina_core::explicit::ExplicitFields::Struct {
+        children: explicit_children,
+    } = &saved.explicit
+    else {
+        panic!("saved.explicit must be Struct, got: {:?}", saved.explicit);
+    };
     assert!(
-        saved.desired_keys.contains(&"policies".to_string()),
-        "desired_keys should contain 'policies': {:?}",
-        saved.desired_keys
+        explicit_children.contains_key("policies"),
+        "explicit children should contain 'policies': {:?}",
+        explicit_children.keys().collect::<Vec<_>>()
     );
 
     // Now simulate second plan: build_saved_attrs should return the policies
@@ -379,11 +385,18 @@ fn block_name_attribute_state_roundtrip() {
         saved_rs.attributes.contains_key("operating_regions"),
         "state should contain 'operating_regions'"
     );
+    let carina_core::explicit::ExplicitFields::Struct {
+        children: explicit_children,
+    } = &saved_rs.explicit
+    else {
+        panic!(
+            "saved_rs.explicit must be Struct, got: {:?}",
+            saved_rs.explicit
+        );
+    };
     assert!(
-        saved_rs
-            .desired_keys
-            .contains(&"operating_regions".to_string()),
-        "desired_keys should contain 'operating_regions'"
+        explicit_children.contains_key("operating_regions"),
+        "explicit children should contain 'operating_regions'"
     );
 
     // Verify roundtrip through saved_attrs
