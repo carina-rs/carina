@@ -442,10 +442,12 @@ fn build_update_rows(
     keys.sort();
 
     // Attributes where `semantically_equal` reported a diff but the
-    // per-shape builder produced no display rows (e.g. list-of-maps
-    // whose only diff was an upstream-injected key dropped by the IR,
-    // #2886). Counted into the trailing unchanged-attributes summary
-    // so the final tally still adds up.
+    // per-shape builder produced no display rows. Two shapes today:
+    // list-of-maps whose only diff was an upstream-injected key the IR
+    // dropped (#2886), and Map whose only entries were empty nested
+    // sections recursively suppressed (#2910). Counted into the
+    // trailing unchanged-attributes summary so the final tally still
+    // adds up.
     let mut effectively_unchanged: usize = 0;
 
     for key in keys {
@@ -465,7 +467,10 @@ fn build_update_rows(
                 None => effectively_unchanged += 1,
             }
         } else if is_both_maps(old_value, new_value) {
-            rows.push(build_map_diff_row(key, old_value, new_value, detail));
+            match build_map_diff_row(key, old_value, new_value, detail) {
+                Some(row) => rows.push(row),
+                None => effectively_unchanged += 1,
+            }
         } else {
             let old_str = old_value
                 .map(|v| format_value_with_key(v, Some(key)))
@@ -680,17 +685,24 @@ fn build_delete_rows(
     rows
 }
 
+/// Returns `None` when `compute_map_diff_entries` filters every entry
+/// (#2910), so the caller can fold the attribute into the trailing
+/// `# (n unchanged attributes hidden)` count — same shape as
+/// `build_list_of_maps_diff_row` (#2886).
 fn build_map_diff_row(
     key: &str,
     old_value: Option<&Value>,
     new_value: &Value,
     detail: DetailLevel,
-) -> DetailRow {
+) -> Option<DetailRow> {
     let entries = compute_map_diff_entries(old_value, new_value, detail);
-    DetailRow::MapDiff {
+    if entries.is_empty() {
+        return None;
+    }
+    Some(DetailRow::MapDiff {
         key: key.to_string(),
         entries,
-    }
+    })
 }
 
 fn compute_map_diff_entries(
@@ -727,6 +739,11 @@ fn compute_map_diff_entries(
                 // If both old and new are maps, recursively diff
                 if matches!(&e.old_value, Value::Map(_)) && matches!(&e.new_value, Value::Map(_)) {
                     let nested = compute_map_diff_entries(Some(&e.old_value), &e.new_value, detail);
+                    // #2910: drop the parent header when every nested
+                    // entry was suppressed (recursive case of #2886).
+                    if nested.is_empty() {
+                        continue;
+                    }
                     entries.push(MapDiffEntryIR::NestedMapDiff {
                         key: e.key.clone(),
                         entries: nested,
@@ -735,6 +752,12 @@ fn compute_map_diff_entries(
                     // List-of-maps: compute per-item field-level diffs
                     let (_, modified, added, removed) =
                         compute_list_of_maps_diff_parts(Some(&e.old_value), &e.new_value, detail);
+                    // #2910: drop the parent header when every paired
+                    // element was dropped per #2886 and there are no
+                    // wholly-added / wholly-removed elements either.
+                    if modified.is_empty() && added.is_empty() && removed.is_empty() {
+                        continue;
+                    }
                     entries.push(MapDiffEntryIR::NestedListOfMapsDiff {
                         key: e.key.clone(),
                         modified,

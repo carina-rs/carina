@@ -1,0 +1,36 @@
+{
+  "version": 3,
+  "serial": 1,
+  "lineage": "test-lineage-nested-list-of-maps-all-dropped",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "ec2.Vpc",
+      "name": "vpc",
+      "provider": "awscc",
+      "identifier": "vpc-0123456789abcdef0",
+      "attributes": {
+        "cidr_block": "10.0.0.0/16",
+        "vpc_id": "vpc-0123456789abcdef0",
+        "config": {
+          "settings": {
+            "rules": [
+              {
+                "name": "allow-internal",
+                "action": "allow",
+                "provider_default_field": "an-extra-key-the-provider-injected-not-in-desired"
+              }
+            ]
+          }
+        }
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "desired_keys": ["cidr_block", "config"],
+      "binding": "vpc",
+      "dependency_bindings": []
+    }
+  ]
+}
