@@ -268,6 +268,7 @@ fn plan_file_serde_round_trip() {
         directives: Directives::default(),
         binding: None,
         dependencies: HashSet::new(),
+        explicit_dependencies: std::collections::HashSet::new(),
     });
 
     let sorted_resources = vec![

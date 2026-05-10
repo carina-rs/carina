@@ -265,6 +265,7 @@ async fn test_simple_delete() {
         directives: Directives::default(),
         binding: None,
         dependencies: HashSet::new(),
+        explicit_dependencies: std::collections::HashSet::new(),
     });
 
     provider.push_delete(Ok(()));
@@ -1033,6 +1034,7 @@ fn test_build_dependency_levels_respects_delete_dependencies() {
         directives: Directives::default(),
         binding: Some("vpc".to_string()),
         dependencies: HashSet::new(), // vpc has no deps
+        explicit_dependencies: HashSet::new(),
     });
     plan.add(Effect::Delete {
         id: ResourceId::new("ec2.Subnet", "my-subnet"),
@@ -1040,6 +1042,7 @@ fn test_build_dependency_levels_respects_delete_dependencies() {
         directives: Directives::default(),
         binding: Some("subnet".to_string()),
         dependencies: HashSet::from(["vpc".to_string()]), // subnet depends on vpc
+        explicit_dependencies: HashSet::new(),
     });
 
     let levels = build_dependency_levels(plan.effects(), &HashMap::new());
@@ -1157,6 +1160,7 @@ fn test_build_dependency_map_respects_delete_dependencies() {
         directives: Directives::default(),
         binding: Some("vpc".to_string()),
         dependencies: HashSet::new(),
+        explicit_dependencies: std::collections::HashSet::new(),
     });
     plan.add(Effect::Delete {
         id: ResourceId::new("ec2.Subnet", "my-subnet"),
@@ -1164,6 +1168,7 @@ fn test_build_dependency_map_respects_delete_dependencies() {
         directives: Directives::default(),
         binding: Some("subnet".to_string()),
         dependencies: HashSet::from(["vpc".to_string()]),
+        explicit_dependencies: std::collections::HashSet::new(),
     });
 
     let deps = build_dependency_map(plan.effects(), &HashMap::new());
@@ -1386,6 +1391,7 @@ async fn test_delete_waits_for_replace_cbd_of_dependent() {
         directives: Default::default(),
         binding: Some("tgw_a".to_string()),
         dependencies: tgw_a_deps,
+        explicit_dependencies: std::collections::HashSet::new(),
     });
 
     // attachment: Replace (CBD) — from depends on tgw_a
@@ -1475,6 +1481,7 @@ async fn test_delete_waits_for_replace_cbd_even_when_delete_binding_is_none() {
         directives: Default::default(),
         binding: None,
         dependencies: tgw_a_deps,
+        explicit_dependencies: std::collections::HashSet::new(),
     });
 
     // attachment: Replace (CBD)

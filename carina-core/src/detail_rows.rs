@@ -1393,6 +1393,7 @@ mod tests {
             directives: crate::resource::Directives::default(),
             binding: None,
             dependencies: HashSet::new(),
+            explicit_dependencies: std::collections::HashSet::new(),
         };
         let mut delete_attrs: HashMap<ResourceId, HashMap<String, Value>> = HashMap::new();
         delete_attrs.insert(
@@ -1521,6 +1522,7 @@ mod tests {
             directives: crate::resource::Directives::default(),
             binding: None,
             dependencies: HashSet::new(),
+            explicit_dependencies: std::collections::HashSet::new(),
         };
         let mut tags = IndexMap::new();
         tags.insert("Name".to_string(), Value::String("test".to_string()));

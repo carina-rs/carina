@@ -474,6 +474,7 @@ mod tests {
             directives: Directives::default(),
             binding: None,
             dependencies: HashSet::new(),
+            explicit_dependencies: std::collections::HashSet::new(),
         };
 
         let mut failed = HashSet::new();

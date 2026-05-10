@@ -324,12 +324,14 @@ async fn run_destroy_locked(
             .and_then(|s| s.identifier.clone())
             .unwrap_or_default();
         let dependencies = get_resource_dependencies(resource);
+        let explicit_dependencies = resource.directives.depends_on.iter().cloned().collect();
         destroy_plan.add(Effect::Delete {
             id: resource.id.clone(),
             identifier,
             directives: resource.directives.clone(),
             binding: resource.binding.clone(),
             dependencies,
+            explicit_dependencies,
         });
     }
 
@@ -474,12 +476,14 @@ async fn run_destroy_locked(
                 .and_then(|s| s.identifier.clone())
                 .unwrap_or_default();
             let dependencies = get_resource_dependencies(resource);
+            let explicit_dependencies = resource.directives.depends_on.iter().cloned().collect();
             let effect = Effect::Delete {
                 id: resource.id.clone(),
                 identifier: identifier.clone(),
                 directives: resource.directives.clone(),
                 binding: resource.binding.clone(),
                 dependencies,
+                explicit_dependencies,
             };
             let binding = resource.binding.clone().unwrap_or_else(|| {
                 format!("{}:{}", resource.id.resource_type, resource.id.name_str())
