@@ -188,15 +188,21 @@ pub enum ListOfMapsDiffItemKind {
 /// A modified item in a list-of-maps diff
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListOfMapsDiffModified {
-    /// Ordered list of fields, each either unchanged or changed
+    /// Ordered list of fields. Only changed / nested-changed fields are
+    /// retained — unchanged fields are filtered out at IR build time
+    /// (#2881) and surfaced as a summary count in `hidden_unchanged_count`.
     pub fields: Vec<ListOfMapsDiffField>,
+    /// Number of unchanged fields filtered out of `fields`. Set to a
+    /// non-zero value only when the build is in `DetailLevel::Full`,
+    /// matching the top-level `# (n unchanged attributes hidden)`
+    /// convention. Zero in `Explicit` / `NamesOnly`. Renderers should
+    /// emit a `# (n unchanged fields hidden)` line when this is > 0.
+    pub hidden_unchanged_count: usize,
 }
 
 /// A single field in a modified list-of-maps item
 #[derive(Debug, Clone, PartialEq)]
 pub enum ListOfMapsDiffField {
-    /// Field value is unchanged
-    Unchanged { key: String, value: String },
     /// Field value changed
     Changed {
         key: String,
@@ -444,9 +450,11 @@ fn build_update_rows(
         }
 
         if is_list_of_maps(new_value) {
-            rows.push(build_list_of_maps_diff_row(key, old_value, new_value));
+            rows.push(build_list_of_maps_diff_row(
+                key, old_value, new_value, detail,
+            ));
         } else if is_both_maps(old_value, new_value) {
-            rows.push(build_map_diff_row(key, old_value, new_value));
+            rows.push(build_map_diff_row(key, old_value, new_value, detail));
         } else {
             let old_str = old_value
                 .map(|v| format_value_with_key(v, Some(key)))
@@ -530,7 +538,7 @@ fn build_replace_rows(
             });
         } else if is_list_of_maps(new_value) {
             let (unchanged, modified, added, removed) =
-                compute_list_of_maps_diff_parts(old_value, new_value);
+                compute_list_of_maps_diff_parts(old_value, new_value, detail);
             rows.push(DetailRow::ReplaceListOfMapsDiff {
                 key: key.to_string(),
                 unchanged,
@@ -539,7 +547,7 @@ fn build_replace_rows(
                 removed,
             });
         } else if is_both_maps(old_value, new_value) {
-            let entries = compute_map_diff_entries(old_value, new_value);
+            let entries = compute_map_diff_entries(old_value, new_value, detail);
             rows.push(DetailRow::ReplaceMapDiff {
                 key: key.to_string(),
                 entries,
@@ -660,15 +668,24 @@ fn build_delete_rows(
     rows
 }
 
-fn build_map_diff_row(key: &str, old_value: Option<&Value>, new_value: &Value) -> DetailRow {
-    let entries = compute_map_diff_entries(old_value, new_value);
+fn build_map_diff_row(
+    key: &str,
+    old_value: Option<&Value>,
+    new_value: &Value,
+    detail: DetailLevel,
+) -> DetailRow {
+    let entries = compute_map_diff_entries(old_value, new_value, detail);
     DetailRow::MapDiff {
         key: key.to_string(),
         entries,
     }
 }
 
-fn compute_map_diff_entries(old_value: Option<&Value>, new_value: &Value) -> Vec<MapDiffEntryIR> {
+fn compute_map_diff_entries(
+    old_value: Option<&Value>,
+    new_value: &Value,
+    detail: DetailLevel,
+) -> Vec<MapDiffEntryIR> {
     let new_map = match new_value {
         Value::Map(m) => m,
         _ => return Vec::new(),
@@ -697,7 +714,7 @@ fn compute_map_diff_entries(old_value: Option<&Value>, new_value: &Value) -> Vec
             crate::diff_helpers::MapDiffItem::Changed(e) => {
                 // If both old and new are maps, recursively diff
                 if matches!(&e.old_value, Value::Map(_)) && matches!(&e.new_value, Value::Map(_)) {
-                    let nested = compute_map_diff_entries(Some(&e.old_value), &e.new_value);
+                    let nested = compute_map_diff_entries(Some(&e.old_value), &e.new_value, detail);
                     entries.push(MapDiffEntryIR::NestedMapDiff {
                         key: e.key.clone(),
                         entries: nested,
@@ -705,7 +722,7 @@ fn compute_map_diff_entries(old_value: Option<&Value>, new_value: &Value) -> Vec
                 } else if is_list_of_maps(&e.new_value) {
                     // List-of-maps: compute per-item field-level diffs
                     let (_, modified, added, removed) =
-                        compute_list_of_maps_diff_parts(Some(&e.old_value), &e.new_value);
+                        compute_list_of_maps_diff_parts(Some(&e.old_value), &e.new_value, detail);
                     entries.push(MapDiffEntryIR::NestedListOfMapsDiff {
                         key: e.key.clone(),
                         modified,
@@ -742,9 +759,10 @@ fn build_list_of_maps_diff_row(
     key: &str,
     old_value: Option<&Value>,
     new_value: &Value,
+    detail: DetailLevel,
 ) -> DetailRow {
     let (unchanged, modified, added, removed) =
-        compute_list_of_maps_diff_parts(old_value, new_value);
+        compute_list_of_maps_diff_parts(old_value, new_value, detail);
     DetailRow::ListOfMapsDiff {
         key: key.to_string(),
         unchanged,
@@ -757,6 +775,7 @@ fn build_list_of_maps_diff_row(
 fn compute_list_of_maps_diff_parts(
     old_value: Option<&Value>,
     new_value: &Value,
+    detail: DetailLevel,
 ) -> (
     Vec<String>,
     Vec<ListOfMapsDiffModified>,
@@ -858,44 +877,49 @@ fn compute_list_of_maps_diff_parts(
         if let (Value::Map(old_map), Value::Map(new_map)) = (&old_items[oi], &new_items[ni]) {
             let mut keys: Vec<_> = new_map.keys().collect();
             keys.sort();
-            let fields: Vec<ListOfMapsDiffField> = keys
-                .iter()
-                .map(|k| {
-                    let new_v = format_value(&new_map[*k]);
-                    let field_same = old_map
-                        .get(*k)
-                        .map(|ov| ov.semantically_equal(&new_map[*k]))
-                        .unwrap_or(false);
-                    if !field_same {
-                        let old_val = old_map.get(*k);
-                        // If both old and new are maps, show recursive diff
-                        if matches!(old_val, Some(Value::Map(_)))
-                            && matches!(&new_map[*k], Value::Map(_))
-                        {
-                            let nested = compute_map_diff_entries(old_val, &new_map[*k]);
-                            ListOfMapsDiffField::NestedMapChanged {
-                                key: k.to_string(),
-                                entries: nested,
-                            }
-                        } else {
-                            let old_v = old_val
-                                .map(format_value)
-                                .unwrap_or_else(|| "(none)".to_string());
-                            ListOfMapsDiffField::Changed {
-                                key: k.to_string(),
-                                old: old_v,
-                                new: new_v,
-                            }
-                        }
-                    } else {
-                        ListOfMapsDiffField::Unchanged {
-                            key: k.to_string(),
-                            value: new_v,
-                        }
-                    }
-                })
-                .collect();
-            modified.push(ListOfMapsDiffModified { fields });
+            let mut fields: Vec<ListOfMapsDiffField> = Vec::new();
+            let mut unchanged_count: usize = 0;
+            for k in keys {
+                let field_same = old_map
+                    .get(k)
+                    .map(|ov| ov.semantically_equal(&new_map[k]))
+                    .unwrap_or(false);
+                if field_same {
+                    // #2881: drop unchanged fields from the IR; renderers
+                    // surface them as `# (n unchanged fields hidden)`,
+                    // mirroring the top-level `HiddenUnchanged` row.
+                    unchanged_count += 1;
+                    continue;
+                }
+                let old_val = old_map.get(k);
+                if matches!(old_val, Some(Value::Map(_))) && matches!(&new_map[k], Value::Map(_)) {
+                    let nested = compute_map_diff_entries(old_val, &new_map[k], detail);
+                    fields.push(ListOfMapsDiffField::NestedMapChanged {
+                        key: k.to_string(),
+                        entries: nested,
+                    });
+                } else {
+                    let old_v = old_val
+                        .map(format_value)
+                        .unwrap_or_else(|| "(none)".to_string());
+                    fields.push(ListOfMapsDiffField::Changed {
+                        key: k.to_string(),
+                        old: old_v,
+                        new: format_value(&new_map[k]),
+                    });
+                }
+            }
+            // Only surface the count in Full mode — Explicit / NamesOnly
+            // never emit hidden-counts at the top level either.
+            let hidden_unchanged_count = if detail == DetailLevel::Full {
+                unchanged_count
+            } else {
+                0
+            };
+            modified.push(ListOfMapsDiffModified {
+                fields,
+                hidden_unchanged_count,
+            });
         }
     }
 
@@ -903,6 +927,33 @@ fn compute_list_of_maps_diff_parts(
     let removed = collect_added_removed_items(&removed_indices, old_items);
 
     (unchanged, modified, added, removed)
+}
+
+/// Format a `# (n unchanged <noun> hidden)` summary for use under both
+/// the top-level `DetailRow::HiddenUnchanged` row (noun = "attribute")
+/// and the per-element list-of-maps unchanged-fields summary
+/// (noun = "field"). Pluralizes in English (singular / `<noun>s`).
+/// Defined here so CLI and TUI renderers share one source of truth and
+/// don't drift in punctuation or wording.
+///
+/// ```
+/// use carina_core::detail_rows::hidden_unchanged_summary;
+/// assert_eq!(
+///     hidden_unchanged_summary(1, "attribute"),
+///     "# (1 unchanged attribute hidden)"
+/// );
+/// assert_eq!(
+///     hidden_unchanged_summary(3, "field"),
+///     "# (3 unchanged fields hidden)"
+/// );
+/// ```
+pub fn hidden_unchanged_summary(count: usize, noun_singular: &str) -> String {
+    let noun = if count == 1 {
+        noun_singular.to_string()
+    } else {
+        format!("{}s", noun_singular)
+    };
+    format!("# ({} unchanged {} hidden)", count, noun)
 }
 
 /// Build alphabetically-sorted `ListOfMapsDiffItem`s from a list of map

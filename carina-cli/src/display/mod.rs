@@ -5,7 +5,7 @@ use colored::Colorize;
 
 use carina_core::detail_rows::{
     DetailRow, ListOfMapsDiffField, ListOfMapsDiffItem, ListOfMapsDiffItemKind,
-    ListOfMapsDiffModified, MapDiffEntryIR, build_detail_rows,
+    ListOfMapsDiffModified, MapDiffEntryIR, build_detail_rows, hidden_unchanged_summary,
 };
 #[cfg(test)]
 use carina_core::diff_helpers::compute_map_diff;
@@ -1159,16 +1159,11 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
             .unwrap();
         }
         DetailRow::HiddenUnchanged { count } => {
-            let noun = if *count == 1 {
-                "attribute"
-            } else {
-                "attributes"
-            };
             writeln!(
                 out,
                 "{}{}",
                 attr_prefix,
-                format!("# ({} unchanged {} hidden)", count, noun).dimmed()
+                hidden_unchanged_summary(*count, "attribute").dimmed()
             )
             .unwrap();
         }
@@ -1346,9 +1341,6 @@ fn render_list_of_maps_diff(
             writeln!(out, "{}  {} {{", attr_prefix, "~".yellow().bold()).unwrap();
             for field in &item.fields {
                 match field {
-                    ListOfMapsDiffField::Unchanged { key, value } => {
-                        writeln!(out, "{}      {}: {}", attr_prefix, key, value).unwrap();
-                    }
                     ListOfMapsDiffField::Changed { key, old, new } => {
                         writeln!(
                             out,
@@ -1368,15 +1360,44 @@ fn render_list_of_maps_diff(
                     }
                 }
             }
+            // #2881: surface the number of unchanged sibling fields
+            // (only set in Full mode by `compute_list_of_maps_diff_parts`).
+            // Mirrors the top-level `# (n unchanged attributes hidden)` row.
+            if item.hidden_unchanged_count > 0 {
+                writeln!(
+                    out,
+                    "{}      {}",
+                    attr_prefix,
+                    hidden_unchanged_summary(item.hidden_unchanged_count, "field").dimmed()
+                )
+                .unwrap();
+            }
             writeln!(out, "{}    }}", attr_prefix).unwrap();
         } else {
             let rendered_fields = render_modified_fields(&item.fields);
+            // Append the hidden-fields count after the changed field list
+            // so the summary stays inside the `~ { ... }` block. A paired
+            // modified item always has at least one changed field by
+            // construction (Phase 1 absorbs all-equal pairs as unchanged
+            // before pairing runs), so `rendered_fields` is never empty.
+            debug_assert!(
+                !rendered_fields.is_empty(),
+                "paired modified item must have at least one changed field"
+            );
+            let summary = if item.hidden_unchanged_count > 0 {
+                let s = hidden_unchanged_summary(item.hidden_unchanged_count, "field")
+                    .dimmed()
+                    .to_string();
+                format!("{}, {}", rendered_fields, s)
+            } else {
+                rendered_fields
+            };
             writeln!(
                 out,
                 "{}  {} {{{}}}",
                 attr_prefix,
                 "~".yellow().bold(),
-                rendered_fields
+                summary
             )
             .unwrap();
         }
@@ -1444,9 +1465,6 @@ fn render_modified_fields(fields: &[ListOfMapsDiffField]) -> String {
     let mut result_parts = Vec::new();
     for field in fields {
         match field {
-            ListOfMapsDiffField::Unchanged { key, value } => {
-                result_parts.push(format!("{}: {}", key, value));
-            }
             ListOfMapsDiffField::Changed { key, old, new } => {
                 result_parts.push(format!(
                     "{}: {} → {}",

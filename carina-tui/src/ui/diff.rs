@@ -2,7 +2,7 @@
 
 use carina_core::detail_rows::{
     ListOfMapsDiffField, ListOfMapsDiffItem, ListOfMapsDiffItemKind, ListOfMapsDiffModified,
-    MapDiffEntryIR,
+    MapDiffEntryIR, hidden_unchanged_summary,
 };
 use carina_core::value::{PrettyLayout, format_value_pretty, needs_trailing_separator};
 use ratatui::prelude::*;
@@ -119,14 +119,13 @@ pub(super) fn render_list_of_maps_diff(
     }
     for m in modified {
         let mut spans = vec![Span::raw("    {")];
-        for (i, field) in m.fields.iter().enumerate() {
-            if i > 0 {
+        let mut emitted = 0usize;
+        for field in &m.fields {
+            if emitted > 0 {
                 spans.push(Span::raw(", "));
             }
+            emitted += 1;
             match field {
-                ListOfMapsDiffField::Unchanged { key, value } => {
-                    spans.push(Span::raw(format!("{}: {}", key, value)));
-                }
                 ListOfMapsDiffField::Changed { key, old, new } => {
                     spans.push(Span::raw(format!("{}: ", key)));
                     spans.push(Span::styled(
@@ -152,8 +151,37 @@ pub(super) fn render_list_of_maps_diff(
                 }
             }
         }
-        spans.push(Span::raw("}"));
-        lines.push(Line::from(spans));
+        // #2881: surface unchanged-fields summary inside the brace block.
+        // When `spans` is empty here, the previous field was a
+        // `NestedMapChanged` whose recursion flushed the inline buffer
+        // (`std::mem::take` at the arm above). Emit the summary on its
+        // own indented line in that case so we don't produce a stray
+        // `, # (... hidden)}` with no opening `{`.
+        if m.hidden_unchanged_count > 0 {
+            let summary = hidden_unchanged_summary(m.hidden_unchanged_count, "field");
+            // Use the same dim style other TUI paths use for the
+            // sibling top-level `# (n unchanged attributes hidden)`
+            // row (`detail.rs::dim_style`) so both render identically.
+            let dim = Style::default().fg(Color::DarkGray);
+            if spans.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::raw("      "),
+                    Span::styled(summary, dim),
+                ]));
+            } else {
+                if emitted > 0 {
+                    spans.push(Span::raw(", "));
+                }
+                spans.push(Span::styled(summary, dim));
+            }
+        }
+        if !spans.is_empty() {
+            spans.push(Span::raw("}"));
+            lines.push(Line::from(spans));
+        } else {
+            // Closing brace on its own line aligned with the opening.
+            lines.push(Line::from(Span::raw("    }")));
+        }
     }
     for item in added {
         push_added_removed_block(lines, item, ListOfMapsDiffItemKind::Added);

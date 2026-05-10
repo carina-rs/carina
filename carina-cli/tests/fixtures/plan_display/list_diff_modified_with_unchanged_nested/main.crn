@@ -1,0 +1,30 @@
+# Update plan that modifies a list-of-maps element where the changed
+# field is a nested Map (`config`) and several flat fields stay unchanged.
+# Exercises the modified-with-nested branch in the renderer (CLI block-
+# style `~ { ... }` with the closing brace on its own line, plus the
+# `# (n unchanged fields hidden)` summary attached to that block).
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let policy = awscc.iam.RolePolicy {
+  policy_name = 'test-inline'
+  role_name   = 'test-role'
+  statement = [
+    {
+      sid    = 'AllowS3Read'
+      effect = 'Allow'
+      action = 's3:GetObject'
+      resource = 'arn:aws:s3:::example/*'
+      config = {
+        log_level = 'debug'
+        retention_days = '90'
+      }
+    },
+  ]
+}
+
+exports {
+  policy_name = policy.policy_name
+}

@@ -20,6 +20,10 @@ plan-list-diff-added-struct:
 	$(PLAN_FIXTURE) list_diff_added_struct
 plan-list-diff-removed-struct:
 	$(PLAN_FIXTURE) list_diff_removed_struct
+plan-list-diff-modified-with-unchanged:
+	$(PLAN_FIXTURE) list_diff_modified_with_unchanged
+plan-list-diff-modified-with-unchanged-nested:
+	$(PLAN_FIXTURE) list_diff_modified_with_unchanged_nested
 plan-enum-display:
 	$(PLAN_FIXTURE) enum_display
 plan-no-changes-enum:
@@ -81,6 +85,10 @@ plan-fixtures:
 	@$(MAKE) plan-list-diff-added-struct
 	@echo "---"
 	@$(MAKE) plan-list-diff-removed-struct
+	@echo "---"
+	@$(MAKE) plan-list-diff-modified-with-unchanged
+	@echo "---"
+	@$(MAKE) plan-list-diff-modified-with-unchanged-nested
 	@echo ""
 	@echo "=== enum_display ==="
 	@$(MAKE) plan-enum-display
@@ -183,6 +191,8 @@ plan-module-anonymous-resource:
 	$(PLAN_FIXTURE) module_anonymous_resource
 .PHONY: plan-all-create plan-no-changes plan-no-changes-enum plan-mixed plan-delete plan-compact \
         plan-map-diff plan-list-diff-added-struct plan-list-diff-removed-struct \
+        plan-list-diff-modified-with-unchanged \
+        plan-list-diff-modified-with-unchanged-nested \
         plan-enum-display plan-destroy-full plan-destroy-orphans plan-read-only-attrs \
         plan-default-values plan-explicit plan-default-tags \
         plan-state-blocks plan-secret-values plan-moved-with-changes plan-moved-prev-keys plan-moved-pure \
