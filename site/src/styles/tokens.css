@@ -371,4 +371,5 @@ a:hover { color: var(--accent-high); }
   --feature-card-body:       var(--fg3);
   --feature-card-icon-bg:    var(--bg-panel);
   --feature-card-icon-color: var(--accent);
+
 }
