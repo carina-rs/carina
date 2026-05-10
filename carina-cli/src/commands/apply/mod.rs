@@ -280,10 +280,13 @@ pub(crate) async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), 
         schemas: input.schemas,
     })?;
 
-    // Resolve exports and persist to state
-    if !input.export_params.is_empty() {
-        let exports = resolve_exports(input.export_params, input.sorted_resources, &state)?;
-        state.exports = exports;
+    // `Some([])` is meaningful: the user removed the `exports {}` block,
+    // so stale entries the previous apply persisted must be cleared
+    // (#2932). `None` preserves `state.exports` because the caller has
+    // no source-side view of which exports the user intends — see the
+    // `FinalizeApplyInput::export_params` doc-comment.
+    if let Some(params) = input.export_params {
+        state.exports = resolve_exports(params, input.sorted_resources, &state)?;
     }
 
     if let Some(lock) = input.lock {
@@ -1151,7 +1154,7 @@ async fn run_apply_locked(
         backend,
         lock,
         schemas,
-        export_params: &parsed.export_params,
+        export_params: Some(&parsed.export_params),
     })
     .await?;
 
@@ -1461,7 +1464,11 @@ async fn run_apply_from_plan_locked(
         backend,
         lock,
         schemas: ctx.schemas(),
-        export_params: &[],
+        // Saved plan files do not persist `export_params` today, so
+        // pass `None` to preserve `state.exports` rather than wipe it.
+        // Source-driven `carina apply` reconciles exports from the
+        // `.crn` directly (#2932).
+        export_params: None,
     })
     .await?;
 
