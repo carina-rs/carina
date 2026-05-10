@@ -547,7 +547,7 @@ fn build_update_rows(
                 Some(row) => rows.push(row),
                 None => effectively_unchanged += 1,
             }
-        } else if is_both_maps(old_value, new_value) {
+        } else if should_render_as_map_diff(old_value, new_value) {
             match build_map_diff_row(key, old_value, new_value, detail) {
                 Some(row) => rows.push(row),
                 None => effectively_unchanged += 1,
@@ -648,7 +648,7 @@ fn build_replace_rows(
                 added,
                 removed,
             });
-        } else if is_both_maps(old_value, new_value) {
+        } else if should_render_as_map_diff(old_value, new_value) {
             let entries = compute_map_diff_entries(old_value, new_value, detail);
             rows.push(DetailRow::ReplaceMapDiff {
                 key: key.to_string(),
@@ -1122,9 +1122,14 @@ fn collect_added_removed_items(indices: &[usize], items: &[Value]) -> Vec<ListOf
         .collect()
 }
 
-/// Check if both old and new values are `Value::Map`.
-fn is_both_maps(old_value: Option<&Value>, new_value: &Value) -> bool {
-    matches!((old_value, new_value), (Some(Value::Map(_)), Value::Map(_)))
+/// Check whether the diff at this attribute should render via the
+/// per-key `MapDiff` walk. True when `new_value` is a `Value::Map` and
+/// `old_value` is either absent (attribute being added — #2936) or
+/// itself a `Value::Map`. A non-Map old value (type mismatch, e.g.
+/// string → map) keeps the inline `prev → next` form so the prior
+/// scalar stays visible.
+fn should_render_as_map_diff(old_value: Option<&Value>, new_value: &Value) -> bool {
+    matches!(new_value, Value::Map(_)) && matches!(old_value, None | Some(Value::Map(_)))
 }
 
 /// Check whether a Value references the given binding name.
