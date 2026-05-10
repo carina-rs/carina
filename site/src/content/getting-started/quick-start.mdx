@@ -1,0 +1,93 @@
+---
+title: Quick Start
+description: Create your first infrastructure resource with Carina in five minutes.
+---
+import Stepper from '../../components/Stepper.astro';
+import Step from '../../components/Step.astro';
+
+This guide walks you through creating an AWS VPC using Carina.
+
+<Stepper>
+  <Step number={1} eyebrow="Step 1 · Author" title="Write a <code>.crn</code> file">
+
+  Create a directory for your project and add a `main.crn` file:
+
+  ```bash
+  mkdir my-infra && cd my-infra
+  ```
+
+  ```crn
+  // main.crn
+  provider awscc {
+    source  = 'github.com/carina-rs/carina-provider-awscc'
+    version = '0.5.0'
+    region  = awscc.Region.ap_northeast_1
+  }
+
+  awscc.ec2.Vpc {
+    cidr_block = '10.0.0.0/16'
+
+    tags = {
+      Name = 'my-first-vpc'
+    }
+  }
+  ```
+
+  Carina downloads the WASM provider plugin from the release matching `version` (or use `revision = 'main'` to track the latest commit). The plugin is cached under `.carina/providers/`.
+
+  </Step>
+
+  <Step number={2} eyebrow="Step 2 · Validate" title="Validate">
+
+  Check that the syntax and schema are correct:
+
+  ```bash
+  carina validate
+  ```
+
+  This parses the `.crn` files in the current directory and reports any errors. No AWS credentials are needed.
+
+  </Step>
+
+  <Step number={3} eyebrow="Step 3 · Plan" title="Plan">
+
+  Preview what Carina will create:
+
+  ```bash
+  carina plan
+  ```
+
+  The plan output shows each resource and the action Carina will take (Create, Update, Delete, or Replace).
+
+  </Step>
+
+  <Step number={4} eyebrow="Step 4 · Apply" title="Apply">
+
+  Create the resources:
+
+  ```bash
+  carina apply
+  ```
+
+  Carina executes the plan and records the result in `carina.state.json`. This state file tracks which resources Carina manages and their current attributes.
+
+  </Step>
+
+  <Step number={5} eyebrow="Step 5 · Destroy" title="Destroy">
+
+  Tear down all managed resources:
+
+  ```bash
+  carina destroy
+  ```
+
+  This deletes every resource recorded in the state file.
+
+  </Step>
+</Stepper>
+
+## Next steps
+
+- [Core Concepts](/getting-started/core-concepts/) -- understand effects, providers, and the DSL
+- [Writing Resources](/guides/writing-resources/) -- learn `let` bindings, nested blocks, and data sources
+- [State Management](/guides/state-management/) -- configure S3 backends and import existing resources
