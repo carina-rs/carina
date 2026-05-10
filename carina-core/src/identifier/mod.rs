@@ -209,6 +209,9 @@ fn deterministic_value_string(value: &Value) -> String {
                 UnknownReason::UpstreamRef { path } => {
                     format!("Unknown(UpstreamRef({}))", path.to_dot_string())
                 }
+                UnknownReason::UpstreamBareRef { binding } => {
+                    format!("Unknown(UpstreamBareRef({}))", binding)
+                }
                 UnknownReason::ForKey => "Unknown(ForKey)".to_string(),
                 UnknownReason::ForIndex => "Unknown(ForIndex)".to_string(),
                 UnknownReason::ForValue => "Unknown(ForValue)".to_string(),

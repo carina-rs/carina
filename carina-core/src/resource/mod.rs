@@ -475,6 +475,16 @@ pub enum UnknownReason {
     /// Holds the original `AccessPath` so display retains subscripts and
     /// chained field access (`network.accounts[0]`, `vpc.tags["Name"]`).
     UpstreamRef { path: AccessPath },
+    /// Plan-time reference into an `upstream_state` binding written
+    /// without an attribute selector — `let v = bootstrap` (since the
+    /// type-split in #2856 lowers a bare identifier to
+    /// `Value::BindingRef`). Renders as
+    /// `(known after upstream apply: <binding>)`. Parallel to
+    /// `UpstreamRef`; kept as a distinct variant so the type system
+    /// carries the "no attribute" condition rather than a runtime
+    /// `path.attribute().is_empty()` check inside `UpstreamRef`. See
+    /// #2876.
+    UpstreamBareRef { binding: String },
     /// Map-binding key in a deferred for-expression
     /// (`for (k, _) in iterable`). Substituted with the actual key when
     /// the iterable is later resolved.
@@ -876,6 +886,7 @@ impl Value {
                     // the `ResourceRef` arm above) — no per-call String
                     // allocation.
                     UnknownReason::UpstreamRef { path } => path.hash(hasher),
+                    UnknownReason::UpstreamBareRef { binding } => binding.hash(hasher),
                     // `For{Key,Index,Value}` and `EmptyInterpolation`
                     // carry no payload; the discriminant alone already
                     // distinguishes them.
