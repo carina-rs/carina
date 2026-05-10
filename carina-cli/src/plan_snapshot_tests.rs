@@ -60,6 +60,7 @@ fn snapshot_depends_on() {
         &HashMap::new(),
         &[],
         &[],
+        None,
     ));
     insta::assert_snapshot!(output);
 }

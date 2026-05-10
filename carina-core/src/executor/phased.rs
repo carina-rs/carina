@@ -28,8 +28,8 @@ pub(super) fn has_interdependent_replaces(effects: &[Effect]) -> bool {
 
     for effect in effects {
         if let Effect::Replace { to, .. } = effect {
-            for dep in &to.dependency_bindings {
-                if replace_bindings.contains(dep) {
+            for dep in get_resource_dependencies(to) {
+                if replace_bindings.contains(&dep) {
                     return true;
                 }
             }
@@ -69,15 +69,16 @@ pub(super) fn topological_sort_replaces(
         }
     }
 
-    // Build adjacency: for each replace effect, find which other replace effects it depends on
+    // Build adjacency: for each replace effect, find which other replace effects it depends on.
+    // Use the unioned `get_resource_dependencies` so explicit
+    // `directives.depends_on` edges participate alongside value refs (#2875).
     let mut deps: HashMap<usize, Vec<usize>> = HashMap::new();
     for &idx in &replace_indices {
         let effect = &effects[idx];
         if let Effect::Replace { to, .. } = effect {
-            let dep_indices: Vec<usize> = to
-                .dependency_bindings
+            let dep_indices: Vec<usize> = get_resource_dependencies(to)
                 .iter()
-                .filter(|b| replace_bindings.contains(*b))
+                .filter(|b| replace_bindings.contains(b.as_str()))
                 .filter_map(|b| binding_to_idx.get(b))
                 .copied()
                 .collect();
@@ -1353,6 +1354,62 @@ mod tests {
             deps_of[&1].contains(&0),
             "caller must depend on Role through two virtual layers (outer → outer.inner → outer.inner.role); got: {:?}",
             deps_of[&1],
+        );
+    }
+
+    /// #2875: Replace topological sort must respect explicit
+    /// `directives.depends_on` edges, not only `dependency_bindings`
+    /// (which is value-ref-only post-#2823).
+    #[test]
+    fn topological_sort_replaces_respects_depends_on() {
+        use crate::resource::{Directives, State};
+
+        let mut role = Resource::with_provider("test", "iam.Role", "role");
+        role.binding = Some("role".to_string());
+        let mut bucket = Resource::with_provider("test", "s3.Bucket", "bucket");
+        bucket.binding = Some("bucket".to_string());
+        bucket.directives = Directives {
+            depends_on: vec!["role".to_string()],
+            ..Directives::default()
+        };
+
+        let role_state = State::not_found(role.id.clone());
+        let bucket_state = State::not_found(bucket.id.clone());
+
+        let role_replace = Effect::Replace {
+            id: role.id.clone(),
+            from: Box::new(role_state),
+            to: role.clone(),
+            directives: Directives::default(),
+            changed_create_only: vec!["role_name".to_string()],
+            cascading_updates: vec![],
+            temporary_name: None,
+            cascade_ref_hints: vec![],
+        };
+        let bucket_replace = Effect::Replace {
+            id: bucket.id.clone(),
+            from: Box::new(bucket_state),
+            to: bucket.clone(),
+            directives: Directives::default(),
+            changed_create_only: vec!["bucket_name".to_string()],
+            cascading_updates: vec![],
+            temporary_name: None,
+            cascade_ref_hints: vec![],
+        };
+
+        let effects = vec![bucket_replace, role_replace];
+        let replace_bindings = collect_replace_bindings(&effects);
+        assert!(
+            has_interdependent_replaces(&effects),
+            "depends_on-only edge between two Replaces should count as interdependent"
+        );
+        let sorted = topological_sort_replaces(&effects, &replace_bindings);
+        let role_pos = sorted.iter().position(|&i| i == 1).unwrap();
+        let bucket_pos = sorted.iter().position(|&i| i == 0).unwrap();
+        assert!(
+            role_pos < bucket_pos,
+            "role Replace must come before bucket Replace; sorted={:?}",
+            sorted
         );
     }
 }

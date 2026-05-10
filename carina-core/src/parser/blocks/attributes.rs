@@ -255,33 +255,30 @@ pub(in crate::parser) fn extract_directives(
                     let mut names = Vec::with_capacity(items.len());
                     for item in items {
                         match item {
+                            Value::BindingRef { binding } => {
+                                // Bare binding identifier — the canonical
+                                // shape after #2847.
+                                names.push(binding.clone());
+                            }
                             Value::ResourceRef { path } => {
-                                // `a.b` and longer paths are rejected: only bare
-                                // binding identifiers are accepted in MVP. Bare
-                                // identifiers parse as `Value::String` (see
-                                // primary.rs `Rule::variable_ref` with no access
-                                // chain), so a `ResourceRef` here means the user
-                                // wrote `binding.attr`.
-                                if path.attribute().is_empty() && path.field_path().is_empty() {
-                                    names.push(path.binding().to_string());
-                                } else {
-                                    return Err(ParseError::InvalidExpression {
-                                        line: 0,
-                                        message: format!(
-                                            "directives.depends_on: list elements must be \
-                                             bare binding identifiers, not attribute \
-                                             selectors (got `{}`)",
-                                            path.binding()
-                                        ),
-                                    });
-                                }
+                                // `binding.attr` — attribute selectors are
+                                // rejected in MVP (only bare bindings allowed).
+                                return Err(ParseError::InvalidExpression {
+                                    line: 0,
+                                    message: format!(
+                                        "directives.depends_on: list elements must be \
+                                         bare binding identifiers, not attribute \
+                                         selectors (got `{}`)",
+                                        path.binding()
+                                    ),
+                                });
                             }
                             Value::String(name) => {
-                                // Bindings resolve to the indirection marker
-                                // `${name}` (see
-                                // `parse_primary_with_resource_or_module`);
-                                // strip it. Quoted strings are rejected
-                                // upstream by
+                                // Pre-#2847 path: bindings resolved through the
+                                // `${name}` indirection marker. Strip it for
+                                // backwards-compat with any code path that
+                                // still produces this shape. Quoted strings
+                                // are rejected upstream by
                                 // `check_directives_depends_on_elements`.
                                 let bare = name
                                     .strip_prefix("${")
