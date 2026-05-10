@@ -1930,7 +1930,7 @@ pub struct OperationConfig {
 /// Classification of a resource schema: managed (full CRUD lifecycle) vs
 /// data source (read-only lookup of existing infrastructure).
 ///
-/// See `docs/specs/2026-05-02-resource-vs-data-source-design.md` (Decision 1-1).
+/// See `notes/specs/2026-05-02-resource-vs-data-source-design.md` (Decision 1-1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaKind {
     Managed,
@@ -2872,7 +2872,7 @@ fn validate_ipv6_group(group: &str, addr: &str) -> Result<(), String> {
 /// a type like `aws.s3.Bucket` can be used both for new-resource creation
 /// and for `read`-keyword lookup of existing infrastructure.
 ///
-/// See `docs/specs/2026-05-02-resource-vs-data-source-design.md` (Decision 1-2).
+/// See `notes/specs/2026-05-02-resource-vs-data-source-design.md` (Decision 1-2).
 #[derive(Debug, Clone, Default)]
 pub struct SchemaRegistry {
     managed: HashMap<(String, String), ResourceSchema>,

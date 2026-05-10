@@ -44,7 +44,7 @@ assert_scope() {
     assert_array_equals "$expected_clippy" "${clippy_scope[@]-}"
 }
 
-assert_scope $'README.md\nAGENTS.md\ndocs/book.toml' "skip" "" ""
+assert_scope $'README.md\nAGENTS.md\nsite/package.json' "skip" "" ""
 assert_scope "Cargo.toml" "workspace" "--all" "--all-targets --all-features"
 assert_scope "scripts/pre-commit" "workspace" "--all" "--all-targets --all-features"
 assert_scope "carina-cli/src/main.rs" "crate" "-p carina-cli" "-p carina-cli --all-targets --all-features"

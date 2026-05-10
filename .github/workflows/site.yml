@@ -1,11 +1,11 @@
-name: Deploy Docs
+name: Deploy Site
 
 on:
   push:
     branches: [main]
     paths:
-      - "docs/**"
-      - ".github/workflows/docs.yml"
+      - "site/**"
+      - ".github/workflows/site.yml"
   workflow_dispatch:
 
 concurrency:
@@ -24,17 +24,17 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
-        working-directory: docs
+        working-directory: site
 
-      - name: Build docs
+      - name: Build site
         run: npm run build
-        working-directory: docs
+        working-directory: site
 
       - name: Deploy to carina-rs.github.io
         uses: peaceiris/actions-gh-pages@v4
         with:
           external_repository: carina-rs/carina-rs.github.io
           publish_branch: main
-          publish_dir: ./docs/dist
+          publish_dir: ./site/dist
           personal_token: ${{ secrets.DOCS_DEPLOY_TOKEN }}
           cname: carina-rs.dev

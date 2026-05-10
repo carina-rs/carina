@@ -23,11 +23,11 @@
 #      on carina-core; running its tests alone is insufficient).
 #   3. Otherwise, collect the leading `carina-*/` segment from each
 #      changed file. If any changed file is outside a workspace crate
-#      AND outside the "ignore" set (docs/CI/scripts/infra), emit
+#      AND outside the "ignore" set (site/notes/CI/scripts/infra), emit
 #      `--workspace` to be safe.
 #   4. Files in the ignore set (CLAUDE.md, .github/**, scripts/**,
-#      docs/**, infra/**, README.md, .gitignore, *.md at root) do not
-#      trigger any test crates on their own.
+#      site/**, notes/**, infra/**, README.md, .gitignore, *.md at root) do
+#      not trigger any test crates on their own.
 
 set -euo pipefail
 
@@ -99,7 +99,7 @@ is_ignorable() {
     local f="$1"
     case "$f" in
         CLAUDE.md|README.md|.gitignore|.gitmodules) return 0 ;;
-        .github/*|scripts/*|docs/*|infra/*|examples/*) return 0 ;;
+        .github/*|scripts/*|site/*|notes/*|infra/*|examples/*) return 0 ;;
         *.md) return 0 ;;  # other top-level docs
     esac
     return 1
@@ -135,7 +135,7 @@ for f in "${files[@]}"; do
         continue
     fi
 
-    # Ignorable docs/CI/script change?
+    # Ignorable site/notes/CI/script change?
     if is_ignorable "$f"; then
         continue
     fi

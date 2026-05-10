@@ -19,113 +19,107 @@ pub fn embedded_docs() -> Vec<EmbeddedDoc> {
         EmbeddedDoc {
             name: "getting-started/installation",
             title: "Installation",
-            content: include_str!("../../../docs/src/content/docs/getting-started/installation.md"),
+            content: include_str!("../../../site/src/content/getting-started/installation.md"),
         },
         EmbeddedDoc {
             name: "getting-started/quick-start",
             title: "Quick Start",
-            content: include_str!("../../../docs/src/content/docs/getting-started/quick-start.md"),
+            content: include_str!("../../../site/src/content/getting-started/quick-start.mdx"),
         },
         EmbeddedDoc {
             name: "getting-started/core-concepts",
             title: "Core Concepts",
-            content: include_str!(
-                "../../../docs/src/content/docs/getting-started/core-concepts.md"
-            ),
+            content: include_str!("../../../site/src/content/getting-started/core-concepts.md"),
         },
         EmbeddedDoc {
             name: "guides/writing-resources",
             title: "Writing Resources",
-            content: include_str!("../../../docs/src/content/docs/guides/writing-resources.md"),
+            content: include_str!("../../../site/src/content/guides/writing-resources.md"),
         },
         EmbeddedDoc {
             name: "guides/using-modules",
             title: "Using Modules",
-            content: include_str!("../../../docs/src/content/docs/guides/using-modules.md"),
+            content: include_str!("../../../site/src/content/guides/using-modules.md"),
         },
         EmbeddedDoc {
             name: "guides/state-management",
             title: "State Management",
-            content: include_str!("../../../docs/src/content/docs/guides/state-management.md"),
+            content: include_str!("../../../site/src/content/guides/state-management.md"),
         },
         EmbeddedDoc {
             name: "guides/functions",
             title: "Functions",
-            content: include_str!("../../../docs/src/content/docs/guides/functions.md"),
+            content: include_str!("../../../site/src/content/guides/functions.md"),
         },
         EmbeddedDoc {
             name: "guides/for-if-expressions",
             title: "For/If Expressions",
-            content: include_str!("../../../docs/src/content/docs/guides/for-if-expressions.md"),
+            content: include_str!("../../../site/src/content/guides/for-if-expressions.md"),
         },
         EmbeddedDoc {
             name: "guides/lsp-setup",
             title: "LSP Setup",
-            content: include_str!("../../../docs/src/content/docs/guides/lsp-setup.md"),
+            content: include_str!("../../../site/src/content/guides/lsp-setup.md"),
         },
         EmbeddedDoc {
             name: "reference/dsl/syntax",
             title: "DSL Syntax",
-            content: include_str!("../../../docs/src/content/docs/reference/dsl/syntax.md"),
+            content: include_str!("../../../site/src/content/reference/dsl/syntax.md"),
         },
         EmbeddedDoc {
             name: "reference/dsl/types-and-values",
             title: "Types and Values",
-            content: include_str!(
-                "../../../docs/src/content/docs/reference/dsl/types-and-values.md"
-            ),
+            content: include_str!("../../../site/src/content/reference/dsl/types-and-values.md"),
         },
         EmbeddedDoc {
             name: "reference/dsl/expressions",
             title: "Expressions",
-            content: include_str!("../../../docs/src/content/docs/reference/dsl/expressions.md"),
+            content: include_str!("../../../site/src/content/reference/dsl/expressions.md"),
         },
         EmbeddedDoc {
             name: "reference/dsl/modules",
             title: "Modules Reference",
-            content: include_str!("../../../docs/src/content/docs/reference/dsl/modules.md"),
+            content: include_str!("../../../site/src/content/reference/dsl/modules.md"),
         },
         EmbeddedDoc {
             name: "reference/dsl/built-in-functions",
             title: "Built-in Functions",
-            content: include_str!(
-                "../../../docs/src/content/docs/reference/dsl/built-in-functions.md"
-            ),
+            content: include_str!("../../../site/src/content/reference/dsl/built-in-functions.md"),
         },
         EmbeddedDoc {
             name: "reference/cli/validate",
             title: "CLI: validate",
-            content: include_str!("../../../docs/src/content/docs/reference/cli/validate.md"),
+            content: include_str!("../../../site/src/content/reference/cli/validate.md"),
         },
         EmbeddedDoc {
             name: "reference/cli/plan",
             title: "CLI: plan",
-            content: include_str!("../../../docs/src/content/docs/reference/cli/plan.md"),
+            content: include_str!("../../../site/src/content/reference/cli/plan.md"),
         },
         EmbeddedDoc {
             name: "reference/cli/apply",
             title: "CLI: apply",
-            content: include_str!("../../../docs/src/content/docs/reference/cli/apply.md"),
+            content: include_str!("../../../site/src/content/reference/cli/apply.md"),
         },
         EmbeddedDoc {
             name: "reference/cli/state",
             title: "CLI: state",
-            content: include_str!("../../../docs/src/content/docs/reference/cli/state.md"),
+            content: include_str!("../../../site/src/content/reference/cli/state.md"),
         },
         EmbeddedDoc {
             name: "reference/cli/module-info",
             title: "CLI: module info",
-            content: include_str!("../../../docs/src/content/docs/reference/cli/module-info.md"),
+            content: include_str!("../../../site/src/content/reference/cli/module-info.md"),
         },
         EmbeddedDoc {
             name: "reference/cli/docs",
             title: "CLI: docs",
-            content: include_str!("../../../docs/src/content/docs/reference/cli/docs.md"),
+            content: include_str!("../../../site/src/content/reference/cli/docs.md"),
         },
         EmbeddedDoc {
             name: "reference/cli/skills",
             title: "CLI: skills",
-            content: include_str!("../../../docs/src/content/docs/reference/cli/skills.md"),
+            content: include_str!("../../../site/src/content/reference/cli/skills.md"),
         },
     ]
 }

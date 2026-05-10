@@ -489,7 +489,7 @@ impl ExportParamLike for InferredExportParam {
 /// where `type_expr` is `Option<TypeExpr>`; the loader runs
 /// `apply_inference` and yields `File<InferredExportParam>` where every
 /// export's `type_expr` is bare. Every other field is identical between
-/// phases. See `docs/specs/2026-05-03-typeexpr-stage2-design.md`.
+/// phases. See `notes/specs/2026-05-03-typeexpr-stage2-design.md`.
 #[derive(Debug, Clone)]
 pub struct File<E> {
     pub providers: Vec<ProviderConfig>,
@@ -563,7 +563,7 @@ impl<E> File<E> {
     /// Per-attribute checkers (type, enum, required, ref validity, etc.)
     /// should prefer this over `self.resources.iter()` so they stay in sync
     /// with for-body code. See
-    /// `docs/specs/2026-04-19-unify-resource-walk-design.md` for the
+    /// `notes/specs/2026-04-19-unify-resource-walk-design.md` for the
     /// rationale.
     pub fn iter_all_resources(&self) -> impl Iterator<Item = (ResourceContext<'_>, &Resource)> {
         self.resources

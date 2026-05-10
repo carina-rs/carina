@@ -29,9 +29,9 @@ Thumbs.db
 .env
 .env.local
 
-docs/dist/
-docs/node_modules/
-docs/.astro/
+site/dist/
+site/node_modules/
+site/.astro/
 
 # Superpowers brainstorm sessions
 .superpowers/
