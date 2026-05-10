@@ -1145,10 +1145,15 @@ async fn run_apply_locked(
     // Execute remove and move effects (state-only, logged for user feedback)
     execute_state_only_effects(&plan, &mut result);
 
+    // Use `resources_for_plan` (post-default_tags merge, post-canonicalize)
+    // for state writeback so the per-resource `explicit` tree includes
+    // provider-level default tags. Otherwise the next plan projects the
+    // tags out of `current` and surfaces a spurious `tags: (none) → ...`
+    // diff (refs awscc#206).
     finalize_apply(FinalizeApplyInput {
         result: &result,
         state_file,
-        sorted_resources: &sorted_resources,
+        sorted_resources: &resources_for_plan,
         current_states: &current_states,
         plan: &plan,
         backend,
