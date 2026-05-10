@@ -164,6 +164,7 @@ pub(crate) fn dsl_value_to_json(
         Value::Bool(b) => Ok(Some(serde_json::Value::Bool(*b))),
         Value::Int(i) => Ok(Some(serde_json::Value::Number((*i).into()))),
         Value::Float(f) => Ok(serde_json::Number::from_f64(*f).map(serde_json::Value::Number)),
+        Value::Duration(d) => Ok(Some(serde_json::Value::Number((d.as_secs() as i64).into()))),
         Value::List(items) => {
             // `Result::transpose` flips `Result<Option<T>, E>` to
             // `Option<Result<T, E>>`, so `filter_map` drops the

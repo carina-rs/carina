@@ -252,6 +252,15 @@ impl<'a> CstBuilder<'a> {
             Rule::string => Some(CstChild::Token(Token::new(pair.as_str().to_string(), span))),
             Rule::float => Some(CstChild::Token(Token::new(pair.as_str().to_string(), span))),
             Rule::number => Some(CstChild::Token(Token::new(pair.as_str().to_string(), span))),
+            // Round-trip the literal verbatim — `<integer><unit>` is a
+            // single atomic token. The formatter does not normalise to
+            // canonical form here; that lives in `value::render_duration`,
+            // which is only reached by the value-tree formatter, not the
+            // source-text formatter.
+            Rule::duration_literal => {
+                Some(CstChild::Token(Token::new(pair.as_str().to_string(), span)))
+            }
+            Rule::duration_unit => None,
             Rule::boolean => Some(CstChild::Token(Token::new(pair.as_str().to_string(), span))),
             Rule::inner_string
             | Rule::char

@@ -120,6 +120,13 @@ pub(super) fn check_type_match(
                 TypeCheckResult::Mismatch
             }
         }
+        TypeExpr::Duration => {
+            if matches!(value, Value::Duration(_)) {
+                TypeCheckResult::Ok
+            } else {
+                TypeCheckResult::Mismatch
+            }
+        }
         TypeExpr::List(inner) => {
             if let Value::List(items) = value {
                 for item in items {

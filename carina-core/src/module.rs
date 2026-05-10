@@ -135,6 +135,7 @@ fn format_value(value: &Value) -> String {
             }
         }
         Value::Bool(b) => b.to_string(),
+        Value::Duration(d) => crate::value::render_duration(*d),
         Value::List(items) => {
             if items.is_empty() {
                 "[]".to_string()

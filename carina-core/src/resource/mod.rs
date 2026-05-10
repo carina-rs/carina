@@ -378,6 +378,29 @@ impl std::fmt::Display for AccessPath {
     }
 }
 
+/// Serde adapter that maps `std::time::Duration` ↔ integer seconds.
+///
+/// Without this, the default `Duration` serde impl emits
+/// `{ "secs": N, "nanos": N }`, but the project's design decision is to
+/// store durations as a plain integer at every JSON boundary
+/// (state file, plan file, WIT plugin contract — see
+/// `notes/specs/2026-05-10-duration-design.md`). The variant carries
+/// `#[serde(with = "duration_secs")]` so this module is used uniformly
+/// on serialise and deserialise.
+mod duration_secs {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u64(d.as_secs())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        let secs = u64::deserialize(d)?;
+        Ok(Duration::from_secs(secs))
+    }
+}
+
 /// Attribute value of a resource
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Value {
@@ -385,6 +408,16 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Bool(bool),
+    /// Time duration carried as `std::time::Duration`.
+    ///
+    /// Constructed from a `<integer><unit>` literal in DSL source
+    /// (`75min`, `1h`, `30s`); the original unit is not preserved —
+    /// `Display` and `carina fmt` re-render via the canonical-form
+    /// rule documented in `notes/specs/2026-05-10-duration-design.md`.
+    /// Serialises to JSON as integer seconds at every value-tree
+    /// boundary (state file, plan file, WIT plugin contract).
+    #[serde(with = "duration_secs")]
+    Duration(std::time::Duration),
     List(Vec<Value>),
     /// Canonical form for fields whose schema type is
     /// `Union(vec![String, list(String)])` — the IAM-style
@@ -728,6 +761,7 @@ impl Value {
             | Value::Int(_)
             | Value::Float(_)
             | Value::Bool(_)
+            | Value::Duration(_)
             | Value::StringList(_) => {}
             // `BindingRef` carries no attribute, so attribute-walking
             // visitors have nothing to do. Callers that *do* care about
@@ -801,6 +835,7 @@ impl Value {
                 f.to_bits().hash(hasher);
             }
             Value::Bool(b) => b.hash(hasher),
+            Value::Duration(d) => d.as_secs().hash(hasher),
             Value::List(items) => {
                 // For list hashing, use an order-independent combination (wrapping sum)
                 // so that lists with same elements in different order hash the same.

@@ -160,6 +160,7 @@ fn deterministic_value_string(value: &Value) -> String {
         Value::Int(i) => format!("Int({})", i),
         Value::Float(f) => format!("Float({})", f),
         Value::Bool(b) => format!("Bool({})", b),
+        Value::Duration(d) => format!("Duration({})", d.as_secs()),
         Value::List(items) => {
             let parts: Vec<String> = items.iter().map(deterministic_value_string).collect();
             format!("List([{}])", parts.join(", "))

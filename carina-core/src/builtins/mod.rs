@@ -416,6 +416,7 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::Int(_) => "Int",
         Value::Float(_) => "Float",
         Value::Bool(_) => "Bool",
+        Value::Duration(_) => "Duration",
         Value::List(_) => "List",
         Value::StringList(_) => "StringList",
         Value::Map(_) => "Map",

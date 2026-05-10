@@ -126,6 +126,11 @@ pub(crate) fn parse_validate_expr(
                 })?;
             Ok(ValidateExpr::Int(n))
         }
+        Rule::duration_literal => {
+            let line = pair.line_col().0;
+            let secs = super::primary::parse_duration_secs(pair.as_str(), line)?;
+            Ok(ValidateExpr::Duration(std::time::Duration::from_secs(secs)))
+        }
         Rule::string => {
             // Simple string parsing (no interpolation support in validate expressions)
             let raw = pair.as_str();

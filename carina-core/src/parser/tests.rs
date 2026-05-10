@@ -8717,6 +8717,73 @@ fn extract_directives_rejects_string_literal_in_depends_on() {
 }
 
 #[test]
+fn parse_duration_literal_minutes() {
+    let parsed = parse_and_resolve("let t = 75min").expect("parse should succeed");
+    let v = parsed.variables.get("t").expect("t binding present");
+    match v {
+        Value::Duration(d) => assert_eq!(*d, std::time::Duration::from_secs(75 * 60)),
+        other => panic!("expected Value::Duration, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_duration_literal_all_units() {
+    use std::time::Duration;
+    let cases: &[(&str, Duration)] = &[
+        ("30s", Duration::from_secs(30)),
+        ("30sec", Duration::from_secs(30)),
+        ("30second", Duration::from_secs(30)),
+        ("30seconds", Duration::from_secs(30)),
+        ("5m", Duration::from_secs(5 * 60)),
+        ("5min", Duration::from_secs(5 * 60)),
+        ("5minute", Duration::from_secs(5 * 60)),
+        ("5minutes", Duration::from_secs(5 * 60)),
+        ("1h", Duration::from_secs(3600)),
+        ("1hr", Duration::from_secs(3600)),
+        ("1hour", Duration::from_secs(3600)),
+        ("1hours", Duration::from_secs(3600)),
+    ];
+    for (src, expected) in cases {
+        let input = format!("let t = {}", src);
+        let parsed =
+            parse_and_resolve(&input).unwrap_or_else(|e| panic!("parse failed for {src}: {e}"));
+        let v = parsed.variables.get("t").expect("t binding present");
+        match v {
+            Value::Duration(d) => assert_eq!(d, expected, "case {src}"),
+            other => panic!("case {src}: expected Value::Duration, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn parse_bare_number_still_parses_as_int() {
+    // Regression: an integer literal without a unit suffix must still
+    // be Value::Int, not interpreted as a malformed duration.
+    let parsed = parse_and_resolve("let n = 30").expect("parse should succeed");
+    let v = parsed.variables.get("n").expect("n binding present");
+    match v {
+        Value::Int(30) => {}
+        other => panic!("expected Value::Int(30), got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_duration_rejects_internal_whitespace() {
+    // `30 min` must NOT parse as a duration. Either the parse fails,
+    // or the value is something other than `Value::Duration` (most
+    // likely `Value::Int(30)` followed by a parse error from `min`).
+    let result = parse_and_resolve("let t = 30 min");
+    if let Ok(parsed) = result
+        && let Some(v) = parsed.variables.get("t")
+    {
+        assert!(
+            !matches!(v, Value::Duration(_)),
+            "`30 min` must not parse as a Duration, got {v:?}"
+        );
+    }
+}
+
+#[test]
 fn extract_directives_accepts_empty_depends_on_list() {
     // `depends_on = []` is a legal no-op — the parser must accept it
     // and produce an empty Vec, not error or panic on the empty pair.

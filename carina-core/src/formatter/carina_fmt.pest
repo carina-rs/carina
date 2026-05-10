@@ -102,6 +102,7 @@ validate_primary = {
   | null_literal
   | boolean
   | float
+  | duration_literal
   | number
   | string
   | variable_ref
@@ -294,6 +295,7 @@ primary = {
   | namespaced_id
   | boolean
   | float
+  | duration_literal
   | number
   | string
   | variable_ref
@@ -371,6 +373,18 @@ index_access = { open_bracket ~ trivia* ~ expression ~ trivia* ~ close_bracket }
 boolean = { "true" | "false" }
 float = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
 number = @{ "-"? ~ ASCII_DIGIT+ }
+
+// Mirrors `parser/carina.pest::duration_literal`. Atomic so the digit
+// run and the unit suffix are matched as a single token; the formatter
+// re-emits the literal verbatim (round-trip preservation of source
+// units is up to the formatter — see
+// `notes/specs/2026-05-10-duration-design.md`).
+duration_literal = @{ ASCII_DIGIT+ ~ duration_unit ~ !ASCII_ALPHANUMERIC }
+duration_unit = @{
+      "seconds" | "second" | "sec" | "s"
+    | "minutes" | "minute" | "min" | "m"
+    | "hours"   | "hour"   | "hr"  | "h"
+}
 string = ${ single_quoted_string | double_quoted_string }
 double_quoted_string = ${ "\"" ~ inner_string ~ "\"" }
 inner_string = @{ char* }

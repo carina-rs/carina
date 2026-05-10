@@ -1852,8 +1852,9 @@ fn return_type_fits(ret: builtins::BuiltinReturnType, attr_type: &AttributeType)
         // a semantic return annotation before a built-in can be suggested
         // here.
         AttributeType::Custom { .. } => false,
-        // Float and Struct attributes — no matching built-in today.
+        // Float, Duration, and Struct attributes — no matching built-in today.
         AttributeType::Float => false,
+        AttributeType::Duration => false,
         AttributeType::Struct { .. } => false,
     }
 }

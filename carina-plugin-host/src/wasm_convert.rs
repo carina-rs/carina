@@ -51,6 +51,13 @@ pub fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, SerializationError
         CoreValue::Int(i) => Ok(wit::Value::IntVal(*i)),
         CoreValue::Float(f) => Ok(wit::Value::FloatVal(*f)),
         CoreValue::Bool(b) => Ok(wit::Value::BoolVal(*b)),
+        // Duration crosses the WIT boundary as integer seconds — see
+        // `notes/specs/2026-05-10-duration-design.md` for the rationale
+        // (no `duration-val` variant; existing `aws`/`awscc` plugins
+        // need no rebuild). Inbound reconstruction lives in
+        // `wit_to_core_value` and consults the schema to decide whether
+        // an `IntVal` reads back as `Value::Int` or `Value::Duration`.
+        CoreValue::Duration(d) => Ok(wit::Value::IntVal(d.as_secs() as i64)),
         CoreValue::List(items) => {
             let json_items: Result<Vec<serde_json::Value>, _> =
                 items.iter().map(core_value_to_json).collect();
@@ -156,6 +163,7 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null)),
         CoreValue::Bool(b) => Ok(serde_json::Value::Bool(*b)),
+        CoreValue::Duration(d) => Ok(serde_json::Value::Number((d.as_secs() as i64).into())),
         CoreValue::List(items) => {
             let arr: Result<Vec<_>, _> = items.iter().map(core_value_to_json).collect();
             Ok(serde_json::Value::Array(arr?))

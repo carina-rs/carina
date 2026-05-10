@@ -16,6 +16,7 @@ pub(crate) fn is_static_value(value: &Value) -> bool {
         | Value::Int(_)
         | Value::Float(_)
         | Value::Bool(_)
+        | Value::Duration(_)
         | Value::StringList(_) => true,
         Value::List(items) => items.iter().all(is_static_value),
         Value::Map(map) => map.values().all(is_static_value),

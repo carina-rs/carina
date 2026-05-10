@@ -67,6 +67,7 @@ validate_primary = {
   | null_literal
   | boolean
   | float
+  | duration_literal
   | number
   | string
   | variable_ref
@@ -243,6 +244,7 @@ primary = {
   | namespaced_id
   | boolean
   | float
+  | duration_literal
   | number
   | string
   | variable_ref
@@ -303,6 +305,29 @@ index_access = { "[" ~ expression ~ "]" }
 boolean = { "true" | "false" }
 float = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
 number = @{ "-"? ~ ASCII_DIGIT+ }
+
+// Duration literal: <integer><unit> with no internal whitespace.
+//
+// Atomic so that the digit run and the unit suffix are matched as a
+// single token; without `@{ ... }` pest's WHITESPACE auto-insertion
+// would let `30 min` parse, which the issue#2824 spec forbids.
+//
+// Unit alternatives are ordered longest-first within each magnitude
+// (e.g. `seconds` before `second` before `sec` before `s`) because
+// pest's `|` is ordered choice — without longest-first, `30sec` would
+// match as `30 + s + "ec"` and surface as a parse error on the
+// trailing `ec`.
+//
+// The `!ASCII_ALPHANUMERIC` lookahead guards against partial-match
+// false positives like `30sx` or `5minutex` (a string that happens
+// to start with a duration literal). Without it `30sx` would parse
+// as `30s` + a stray `x`, hiding a typo.
+duration_literal = @{ ASCII_DIGIT+ ~ duration_unit ~ !ASCII_ALPHANUMERIC }
+duration_unit = @{
+      "seconds" | "second" | "sec" | "s"
+    | "minutes" | "minute" | "min" | "m"
+    | "hours"   | "hour"   | "hr"  | "h"
+}
 string = ${ single_quoted_string | double_quoted_string }
 double_quoted_string = ${ "\"" ~ string_part* ~ "\"" }
 string_part = ${ interpolation | string_literal }

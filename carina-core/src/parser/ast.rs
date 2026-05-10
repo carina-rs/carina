@@ -100,6 +100,9 @@ pub enum TypeExpr {
     Bool,
     Int,
     Float,
+    /// Time duration. Surface form: `<integer><unit>` literal (`75min`,
+    /// `1h`, `30s`); internal form: `Value::Duration(std::time::Duration)`.
+    Duration,
     /// Schema type identified by name (e.g., "ipv4_cidr", "ipv4_address", "arn")
     Simple(std::string::String),
     List(Box<TypeExpr>),
@@ -186,6 +189,7 @@ impl std::fmt::Display for TypeExpr {
             TypeExpr::Bool => write!(f, "Bool"),
             TypeExpr::Int => write!(f, "Int"),
             TypeExpr::Float => write!(f, "Float"),
+            TypeExpr::Duration => write!(f, "Duration"),
             TypeExpr::Simple(name) => write!(f, "{}", snake_to_pascal(name)),
             TypeExpr::List(inner) => write!(f, "list({})", inner),
             TypeExpr::Map(inner) => write!(f, "map({})", inner),
@@ -254,6 +258,8 @@ pub enum ValidateExpr {
     Int(i64),
     /// Float literal
     Float(f64),
+    /// Duration literal (`75min`, `1h`, `30s`).
+    Duration(std::time::Duration),
     /// String literal
     String(String),
     /// Variable reference (argument name)
