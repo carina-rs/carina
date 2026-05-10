@@ -211,31 +211,6 @@ impl StateFile {
         result
     }
 
-    /// Backwards-compatible shim that flattens the per-resource
-    /// `ExplicitFields` tree to a sorted list of its top-level keys
-    /// — the shape callers used before the v6 schema change.
-    ///
-    /// Retained only so the differ entry points (which still take
-    /// `prev_desired_keys: Option<&[String]>`) keep compiling while
-    /// the differ-side rewrite (#2899 / #2900) lands. Once those land,
-    /// this method is deleted in #2901.
-    pub fn build_desired_keys(&self) -> HashMap<ResourceId, Vec<String>> {
-        let mut result = HashMap::new();
-        for rs in &self.resources {
-            let ExplicitFields::Struct { children } = &rs.explicit else {
-                continue;
-            };
-            if children.is_empty() {
-                continue;
-            }
-            let mut keys: Vec<String> = children.keys().cloned().collect();
-            keys.sort();
-            let id = ResourceId::with_provider(&rs.provider, &rs.resource_type, &rs.name);
-            result.insert(id, keys);
-        }
-        result
-    }
-
     /// Build a `State` for a resource from the state file data.
     /// Returns a non-existing state if the resource is not found in the state file.
     pub fn build_state_for_resource(&self, resource: &Resource) -> State {

@@ -169,7 +169,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
     let directives_map: HashMap<ResourceId, Directives> = HashMap::new();
     let schemas = SchemaRegistry::new();
     let saved_attrs = HashMap::new();
-    let prev_desired_keys = HashMap::new();
+    let prev_explicit = HashMap::new();
     let orphan_deps = HashMap::new();
     let plan_without = create_plan(
         &resources_without,
@@ -177,7 +177,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
         &directives_map,
         &schemas,
         &saved_attrs,
-        &prev_desired_keys,
+        &prev_explicit,
         &orphan_deps,
     );
     assert!(
@@ -194,7 +194,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
         &directives_map,
         &schemas,
         &saved_attrs,
-        &prev_desired_keys,
+        &prev_explicit,
         &orphan_deps,
     );
     assert!(
@@ -254,13 +254,22 @@ fn test_merge_default_tags_prevents_false_diff() {
         m
     };
 
-    // Simulate prev_desired_keys from a previous apply that included "tags"
+    // Simulate prev_explicit from a previous apply that included "tags"
     // (because merge_default_tags was called correctly in the plan path).
-    let mut prev_desired_keys = HashMap::new();
-    prev_desired_keys.insert(resource.id.clone(), vec!["tags".to_string()]);
+    let mut prev_explicit: HashMap<ResourceId, carina_core::explicit::ExplicitFields> =
+        HashMap::new();
+    prev_explicit.insert(
+        resource.id.clone(),
+        carina_core::explicit::ExplicitFields::Struct {
+            children: std::collections::HashMap::from([(
+                "tags".to_string(),
+                carina_core::explicit::ExplicitFields::Leaf,
+            )]),
+        },
+    );
 
     // Without merge_default_tags, the desired resource has no tags,
-    // but state has tags and prev_desired_keys says "tags" was previously desired.
+    // but state has tags and prev_explicit says "tags" was previously desired.
     // The differ sees this as attribute removal → false Update diff.
     let resources_without = vec![resource.clone()];
     let directives_map: HashMap<ResourceId, Directives> = HashMap::new();
@@ -272,7 +281,7 @@ fn test_merge_default_tags_prevents_false_diff() {
         &directives_map,
         &schemas,
         &saved_attrs,
-        &prev_desired_keys,
+        &prev_explicit,
         &orphan_deps,
     );
     assert!(
@@ -300,7 +309,7 @@ fn test_merge_default_tags_prevents_false_diff() {
         &directives_map,
         &schemas,
         &saved_attrs,
-        &prev_desired_keys,
+        &prev_explicit,
         &orphan_deps,
     );
     assert!(

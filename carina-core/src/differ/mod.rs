@@ -55,15 +55,18 @@ impl Diff {
 /// Compare desired state with current state to compute a Diff.
 /// If `saved` is provided, unmanaged nested fields from the saved state are merged
 /// into desired before comparison, preventing false diffs when AWS returns extra fields.
-/// If `prev_desired_keys` is provided, attributes that were previously in the user's
-/// desired state but are now absent are detected as removals.
+/// If `prev_explicit` is provided, the actual-state side is projected through
+/// the authoring tree before comparison so server-side default fields the
+/// user never wrote do not surface as diffs (refs awscc#206). The same
+/// tree drives explicit-removal detection for attributes the user
+/// previously wrote but no longer mentions.
 /// If `schema` is provided, type-aware comparison is used (e.g., Int/Float coercion,
 /// case-insensitive enum matching).
 pub fn diff(
     desired: &Resource,
     current: &State,
     saved: Option<&HashMap<String, Value>>,
-    prev_desired_keys: Option<&[String]>,
+    prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
 ) -> Diff {
     if !current.exists {
@@ -74,7 +77,7 @@ pub fn diff(
         &desired.resolved_attributes(),
         &current.attributes,
         saved,
-        prev_desired_keys,
+        prev_explicit,
         schema,
         Some(&desired.id),
     );

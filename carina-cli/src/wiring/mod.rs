@@ -339,14 +339,14 @@ fn identity_attributes_for_provider(ctx: &WiringContext, name: &str) -> Vec<Stri
 ///
 /// Mirrors `materialize_moved_states` but for synthetic rename pairs produced
 /// by `identifier::detect_anonymous_to_named_renames`. Transfers state,
-/// `prev_desired_keys`, and `saved_attrs` from the old anonymous name to the
+/// `prev_explicit`, and `saved_attrs` from the old anonymous name to the
 /// new binding name so the differ sees the resource under its new identity.
 pub fn apply_anonymous_to_named_renames(
     ctx: &WiringContext,
     resources: &[Resource],
     providers: &[ProviderConfig],
     current_states: &mut HashMap<ResourceId, State>,
-    prev_desired_keys: &mut HashMap<ResourceId, Vec<String>>,
+    prev_explicit: &mut HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     saved_attrs: &mut HashMap<ResourceId, HashMap<String, Value>>,
     state_file: &Option<StateFile>,
 ) -> Vec<(ResourceId, ResourceId)> {
@@ -395,8 +395,8 @@ pub fn apply_anonymous_to_named_renames(
             state.id = to.clone();
             current_states.insert(to.clone(), state);
         }
-        if let Some(keys) = prev_desired_keys.remove(from) {
-            prev_desired_keys.insert(to.clone(), keys);
+        if let Some(keys) = prev_explicit.remove(from) {
+            prev_explicit.insert(to.clone(), keys);
         }
         if let Some(attrs) = saved_attrs.remove(from) {
             saved_attrs.insert(to.clone(), attrs);
@@ -455,7 +455,7 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
 ///
 /// For each `(old_name, new_name)` pair, find the matching `ResourceState`
 /// in `state_file.resources` and overwrite its `name` field. Downstream maps
-/// (`build_saved_attrs`, `build_desired_keys`, `build_directives`) then key
+/// (`build_saved_attrs`, `build_explicit`, `build_directives`) then key
 /// off the new name, so the differ sees the resource under its updated
 /// identifier instead of an orphan-delete + create pair.
 pub fn apply_provider_prefix_renames(renames: &[(String, String)], state_file: &mut StateFile) {
@@ -1072,9 +1072,9 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
         .as_ref()
         .map(|sf| sf.build_saved_attrs())
         .unwrap_or_default();
-    let mut prev_desired_keys = state_file
+    let mut prev_explicit = state_file
         .as_ref()
-        .map(|sf| sf.build_desired_keys())
+        .map(|sf| sf.build_explicit())
         .unwrap_or_default();
     // `moved_pairs` accumulates explicit `moved` block transfers and
     // detected anonymous → let-bound renames. Populated inside the
@@ -1202,7 +1202,7 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
         // an orthogonal edge case that pre-dates this fix.
         moved_pairs.extend(materialize_moved_states(
             &mut current_states,
-            &mut prev_desired_keys,
+            &mut prev_explicit,
             &mut saved_attrs,
             &parsed.state_blocks,
             state_file,
@@ -1212,7 +1212,7 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
             &sorted_resources,
             &parsed.providers,
             &mut current_states,
-            &mut prev_desired_keys,
+            &mut prev_explicit,
             &mut saved_attrs,
             state_file,
         ));
@@ -1270,7 +1270,7 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
             provider.hydrate_read_state(&mut current_states, &saved_attrs);
             moved_pairs.extend(materialize_moved_states(
                 &mut current_states,
-                &mut prev_desired_keys,
+                &mut prev_explicit,
                 &mut saved_attrs,
                 &parsed.state_blocks,
                 state_file,
@@ -1280,7 +1280,7 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
                 &sorted_resources,
                 &parsed.providers,
                 &mut current_states,
-                &mut prev_desired_keys,
+                &mut prev_explicit,
                 &mut saved_attrs,
                 state_file,
             ));
@@ -1338,7 +1338,7 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
         &directives_map,
         ctx.schemas(),
         &saved_attrs,
-        &prev_desired_keys,
+        &prev_explicit,
         &orphan_dependencies,
     );
 
@@ -1370,20 +1370,20 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
     })
 }
 
-/// Pre-process moved blocks by transferring state, `prev_desired_keys`, and
+/// Pre-process moved blocks by transferring state, `prev_explicit`, and
 /// `saved_attrs` from the old resource name to the new name.
 ///
 /// This must be called BEFORE `create_plan()` so the differ sees the moved
 /// resource's state under its new name and can produce Update/Replace effects
 /// if attributes differ between state and desired. Transferring
-/// `prev_desired_keys` ensures attribute removals are detected; transferring
+/// `prev_explicit` ensures attribute removals are detected; transferring
 /// `saved_attrs` ensures hydrated attributes are found under the new name.
 ///
 /// Returns a list of active Move pairs (from, to) where the `from` resource
 /// existed in state. Callers use this to add Move effects to the plan.
 pub fn materialize_moved_states(
     current_states: &mut HashMap<ResourceId, State>,
-    prev_desired_keys: &mut HashMap<ResourceId, Vec<String>>,
+    prev_explicit: &mut HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     saved_attrs: &mut HashMap<ResourceId, HashMap<String, Value>>,
     state_blocks: &[StateBlock],
     state_file: &Option<StateFile>,
@@ -1404,10 +1404,10 @@ pub fn materialize_moved_states(
                     current_states.insert(to.clone(), state);
                 }
 
-                // Transfer prev_desired_keys so the differ detects attribute
+                // Transfer prev_explicit so the differ detects attribute
                 // removals under the new resource name.
-                if let Some(keys) = prev_desired_keys.remove(from) {
-                    prev_desired_keys.insert(to.clone(), keys);
+                if let Some(keys) = prev_explicit.remove(from) {
+                    prev_explicit.insert(to.clone(), keys);
                 }
 
                 // Transfer saved_attrs so create_plan can look up saved

@@ -279,14 +279,25 @@ fn block_name_attribute_no_diff_when_hydrated() {
     // Saved attrs: same as current (from previous apply)
     let saved: HashMap<String, Value> = current.attributes.clone();
 
-    // Previous desired keys: what was in the resource on first apply
-    let prev_desired_keys = vec!["policies".to_string(), "role_name".to_string()];
+    // Previous explicit tree: what the user wrote on first apply
+    let prev_explicit = carina_core::explicit::ExplicitFields::Struct {
+        children: std::collections::HashMap::from([
+            (
+                "policies".to_string(),
+                carina_core::explicit::ExplicitFields::Leaf,
+            ),
+            (
+                "role_name".to_string(),
+                carina_core::explicit::ExplicitFields::Leaf,
+            ),
+        ]),
+    };
 
     let d = diff(
         &resource,
         &current,
         Some(&saved),
-        Some(&prev_desired_keys),
+        Some(&prev_explicit),
         Some(&schema),
     );
 

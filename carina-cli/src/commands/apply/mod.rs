@@ -787,9 +787,9 @@ async fn run_apply_locked(
         .as_ref()
         .map(|sf| sf.build_saved_attrs())
         .unwrap_or_default();
-    let mut prev_desired_keys = state_file
+    let mut prev_explicit = state_file
         .as_ref()
-        .map(|sf| sf.build_desired_keys())
+        .map(|sf| sf.build_explicit())
         .unwrap_or_default();
 
     // Read states for all resources using identifier from state
@@ -896,7 +896,7 @@ async fn run_apply_locked(
     let moved_pairs = {
         let mut pairs = crate::wiring::materialize_moved_states(
             &mut current_states,
-            &mut prev_desired_keys,
+            &mut prev_explicit,
             &mut saved_attrs,
             &parsed.state_blocks,
             &state_file,
@@ -906,7 +906,7 @@ async fn run_apply_locked(
             &sorted_resources,
             &parsed.providers,
             &mut current_states,
-            &mut prev_desired_keys,
+            &mut prev_explicit,
             &mut saved_attrs,
             &state_file,
         ));
@@ -981,7 +981,7 @@ async fn run_apply_locked(
         &directives_map,
         schemas,
         &saved_attrs,
-        &prev_desired_keys,
+        &prev_explicit,
         &orphan_dependencies,
     );
 

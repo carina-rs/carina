@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use indexmap::IndexMap;
 
+use crate::explicit::{self, ExplicitFields};
 use crate::resource::{ResourceId, Value, merge_with_saved};
 use crate::schema::{AttributeType, ResourceSchema};
 use crate::value::{SECRET_PREFIX, SecretHashContext, argon2id_hash, value_to_json_with_context};
@@ -314,9 +315,18 @@ fn secret_matches_state(
 /// Find changed attributes between desired and current state.
 /// If `saved` is provided, each desired value is merged with the saved value
 /// before comparison, filling in unmanaged nested fields.
-/// If `prev_desired_keys` is provided, attributes that were previously in the user's
-/// desired state but are now absent from desired (while still present in current)
-/// are detected as removals.
+/// If `prev_explicit` is provided, the actual-state side is **projected**
+/// through its tree before comparison so server-side default fields the
+/// user never wrote do not surface as diffs (refs awscc#206). The
+/// projection is applied per-attribute: each `current[key]` is folded
+/// against the matching `prev_explicit` child shape via
+/// `crate::explicit::project`. Top-level keys absent from
+/// `prev_explicit.children` are treated as the user never having
+/// authored them and excluded from the comparison entirely (so their
+/// presence in `current` does not surface a removal).
+/// `prev_explicit` also drives the explicit-removal detection at the
+/// end of this function: the same set of top-level keys is used to
+/// flag attributes the user *previously* wrote but no longer mentions.
 /// If `schema` is provided, type-aware comparison is used for each attribute.
 /// If `resource_id` is provided, it is used to build context-specific salt for
 /// secret hash comparison.
@@ -324,11 +334,22 @@ pub(super) fn find_changed_attributes(
     desired: &HashMap<String, Value>,
     current: &HashMap<String, Value>,
     saved: Option<&HashMap<String, Value>>,
-    prev_desired_keys: Option<&[String]>,
+    prev_explicit: Option<&ExplicitFields>,
     schema: Option<&ResourceSchema>,
     resource_id: Option<&ResourceId>,
 ) -> Vec<String> {
     let mut changed = Vec::new();
+
+    // Project `current` through `prev_explicit` so server-side defaults
+    // the user never authored disappear before any comparison runs.
+    // The projection is idempotent and shape-preserving for keys the
+    // user did author. When `prev_explicit` is absent (e.g. first-plan,
+    // no saved state) we fall back to the unprojected map — there is
+    // no authoring information to consult yet.
+    let projected_current = match prev_explicit {
+        Some(e) => explicit::project_attributes(current.clone(), e),
+        None => current.clone(),
+    };
 
     for (key, desired_value) in desired {
         // Skip internal attributes (starting with _)
@@ -341,7 +362,7 @@ pub(super) fn find_changed_attributes(
         // absence from state is expected and should not trigger a diff.
         if schema
             .and_then(|s| s.attributes.get(key))
-            .is_some_and(|attr| attr.write_only && !current.contains_key(key))
+            .is_some_and(|attr| attr.write_only && !projected_current.contains_key(key))
         {
             continue;
         }
@@ -357,14 +378,14 @@ pub(super) fn find_changed_attributes(
         let is_equal = match saved.and_then(|s| s.get(key)) {
             Some(saved_value) => {
                 let effective_desired = merge_with_saved(desired_value, saved_value);
-                current
+                projected_current
                     .get(key)
                     .map(|cv| {
                         type_aware_equal(cv, &effective_desired, attr_type, secret_ctx.as_ref())
                     })
                     .unwrap_or(false)
             }
-            None => current
+            None => projected_current
                 .get(key)
                 .map(|cv| type_aware_equal(cv, desired_value, attr_type, secret_ctx.as_ref()))
                 .unwrap_or(false),
@@ -376,18 +397,19 @@ pub(super) fn find_changed_attributes(
     }
 
     // Detect attributes removed from desired but still present in current.
-    // Only flag attributes that were previously in the user's desired state
-    // (from the state file's desired_keys). This prevents false removals for
-    // computed/provider-returned attributes the user never specified.
-    if let Some(prev_keys) = prev_desired_keys {
-        for key in prev_keys {
+    // Only flag attributes that were previously in the user's desired
+    // state (top-level children of `prev_explicit`'s root `Struct`).
+    // This prevents false removals for computed/provider-returned
+    // attributes the user never specified.
+    if let Some(ExplicitFields::Struct { children }) = prev_explicit {
+        for key in children.keys() {
             if key.starts_with('_') {
                 continue;
             }
             if desired.contains_key(key) {
                 continue;
             }
-            if current.contains_key(key) {
+            if projected_current.contains_key(key) {
                 changed.push(key.clone());
             }
         }
