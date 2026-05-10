@@ -8768,6 +8768,43 @@ fn parse_bare_number_still_parses_as_int() {
 }
 
 #[test]
+fn parse_duration_inside_list_and_map() {
+    // Spec §"Position in the value grammar" says Duration can appear
+    // wherever any other primitive value can. Confirm the literal
+    // wires through `expression` for both `list` and `map` shapes,
+    // not just top-level attribute position.
+    let parsed = parse_and_resolve(
+        r#"
+            let xs = [30s, 1min, 1h]
+            let m = { a = 5min, b = 30s }
+        "#,
+    )
+    .expect("list/map of Duration must parse");
+    match parsed.variables.get("xs") {
+        Some(Value::List(items)) => {
+            let secs: Vec<u64> = items
+                .iter()
+                .map(|v| match v {
+                    Value::Duration(d) => d.as_secs(),
+                    other => panic!("list element was not Duration: {other:?}"),
+                })
+                .collect();
+            assert_eq!(secs, vec![30, 60, 3600]);
+        }
+        other => panic!("expected list of Duration, got {other:?}"),
+    }
+    match parsed.variables.get("m") {
+        Some(Value::Map(map)) => {
+            let a = map.get("a").expect("entry `a` present");
+            let b = map.get("b").expect("entry `b` present");
+            assert!(matches!(a, Value::Duration(d) if d.as_secs() == 300));
+            assert!(matches!(b, Value::Duration(d) if d.as_secs() == 30));
+        }
+        other => panic!("expected map of Duration, got {other:?}"),
+    }
+}
+
+#[test]
 fn parse_duration_rejects_internal_whitespace() {
     // `30 min` must NOT parse as a duration. Either the parse fails,
     // or the value is something other than `Value::Duration` (most

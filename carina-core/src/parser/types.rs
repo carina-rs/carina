@@ -219,6 +219,10 @@ mod tests {
             parse_type_expr_str("String", &ctx),
             Some(TypeExpr::String)
         ));
+        assert!(matches!(
+            parse_type_expr_str("Duration", &ctx),
+            Some(TypeExpr::Duration)
+        ));
     }
 
     #[test]
