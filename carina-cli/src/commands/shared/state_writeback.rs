@@ -70,7 +70,15 @@ pub(crate) struct FinalizeApplyInput<'a> {
     pub backend: &'a dyn StateBackend,
     pub lock: Option<&'a LockInfo>,
     pub schemas: &'a SchemaRegistry,
-    pub export_params: &'a [carina_core::parser::InferredExportParam],
+    /// `Some(params)` rebuilds `state.exports` from the source
+    /// configuration's `exports {}` block — empty `params` clears the
+    /// map (#2932). `None` preserves the existing `state.exports` and
+    /// is used by `apply --plan` because saved plan files do not
+    /// persist `export_params` today; with `None` the apply path
+    /// neither resolves nor wipes them, leaving the prior values
+    /// intact for the next source-driven `carina apply` to
+    /// reconcile.
+    pub export_params: Option<&'a [carina_core::parser::InferredExportParam]>,
 }
 
 /// Resolve export expressions using bindings built from applied state.

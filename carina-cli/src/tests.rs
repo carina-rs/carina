@@ -1397,7 +1397,7 @@ async fn lock_released_on_write_state_failure() {
         backend: &backend,
         lock: Some(&lock),
         schemas: &SchemaRegistry::new(),
-        export_params: &[],
+        export_params: Some(&[]),
     })
     .await;
 
@@ -1530,7 +1530,7 @@ async fn finalize_apply_uses_write_state_locked() {
         backend: &backend,
         lock: Some(&lock),
         schemas: &SchemaRegistry::new(),
-        export_params: &[],
+        export_params: Some(&[]),
     })
     .await;
 
@@ -2078,7 +2078,7 @@ async fn finalize_apply_without_lock_uses_write_state() {
         backend: &backend,
         lock: None, // No lock
         schemas: &SchemaRegistry::new(),
-        export_params: &[],
+        export_params: Some(&[]),
     })
     .await;
 
@@ -2786,5 +2786,123 @@ async fn persist_exports_only_writes_state_with_new_exports() {
     assert_eq!(
         state.exports.get("account_id"),
         Some(&serde_json::json!("123456789012"))
+    );
+}
+
+/// Regression test for #2932: when the user removes the entire
+/// `exports {}` block (so `parsed.export_params` is empty) but the
+/// plan has resource changes, `finalize_apply` must still drop
+/// stale entries from `state.exports`. Previously a guard
+/// `if !input.export_params.is_empty()` skipped the assignment,
+/// so subsequent plans kept re-emitting the same `- exports`
+/// removal lines and the state never converged.
+#[tokio::test]
+async fn finalize_apply_clears_state_exports_when_params_empty() {
+    let captured = Arc::new(Mutex::new(None));
+    let backend = CapturingBackend {
+        captured: captured.clone(),
+    };
+    let lock = LockInfo::new("apply");
+
+    // Pre-existing state with exports left over from a previous
+    // apply whose `exports {}` block has since been removed.
+    let mut state_in = StateFile::new();
+    state_in.exports.insert(
+        "zone_id".to_string(),
+        serde_json::json!("Z0788351HTU0H3UKV38I"),
+    );
+    state_in.exports.insert(
+        "nameservers".to_string(),
+        serde_json::json!(["ns-1572.awsdns-04.co.uk"]),
+    );
+
+    let result = ApplyResult {
+        success_count: 0,
+        failure_count: 0,
+        skip_count: 0,
+        applied_states: HashMap::new(),
+        permanent_name_overrides: HashMap::new(),
+        successfully_deleted: HashSet::new(),
+        current_states: HashMap::new(),
+        failed_refreshes: HashSet::new(),
+    };
+
+    let op_result = finalize_apply(FinalizeApplyInput {
+        result: &result,
+        state_file: Some(state_in),
+        sorted_resources: &[],
+        current_states: &HashMap::new(),
+        plan: &Plan::new(),
+        backend: &backend,
+        lock: Some(&lock),
+        schemas: &SchemaRegistry::new(),
+        export_params: Some(&[]),
+    })
+    .await;
+
+    assert!(op_result.is_ok(), "finalize_apply failed: {:?}", op_result);
+
+    let written = captured.lock().unwrap();
+    let state = written.as_ref().expect("state should be written");
+    assert!(
+        state.exports.is_empty(),
+        "stale exports must be cleared when export_params is empty, got: {:?}",
+        state.exports
+    );
+}
+
+/// `apply --plan plan.json` does not parse the source `.crn`, so it
+/// has no `export_params` to feed `finalize_apply` and passes `None`
+/// instead. In that case `state.exports` must be **preserved** — the
+/// previous source-driven apply already populated them, and clearing
+/// here would silently drop the user's exports on every apply-from-plan
+/// (regression of the #2932 fix). The next source-driven `carina
+/// apply` reconciles them.
+#[tokio::test]
+async fn finalize_apply_preserves_state_exports_when_params_none() {
+    let captured = Arc::new(Mutex::new(None));
+    let backend = CapturingBackend {
+        captured: captured.clone(),
+    };
+    let lock = LockInfo::new("apply");
+
+    let mut state_in = StateFile::new();
+    state_in
+        .exports
+        .insert("vpc_id".to_string(), serde_json::json!("vpc-0abc123"));
+
+    let result = ApplyResult {
+        success_count: 0,
+        failure_count: 0,
+        skip_count: 0,
+        applied_states: HashMap::new(),
+        permanent_name_overrides: HashMap::new(),
+        successfully_deleted: HashSet::new(),
+        current_states: HashMap::new(),
+        failed_refreshes: HashSet::new(),
+    };
+
+    let op_result = finalize_apply(FinalizeApplyInput {
+        result: &result,
+        state_file: Some(state_in),
+        sorted_resources: &[],
+        current_states: &HashMap::new(),
+        plan: &Plan::new(),
+        backend: &backend,
+        lock: Some(&lock),
+        schemas: &SchemaRegistry::new(),
+        export_params: None,
+    })
+    .await;
+
+    assert!(op_result.is_ok(), "finalize_apply failed: {:?}", op_result);
+
+    let written = captured.lock().unwrap();
+    let state = written.as_ref().expect("state should be written");
+    assert_eq!(
+        state.exports.get("vpc_id"),
+        Some(&serde_json::json!("vpc-0abc123")),
+        "state.exports must survive apply-from-plan (export_params: None), got: {:?}",
+        state.exports
     );
 }
