@@ -1374,30 +1374,30 @@ fn render_list_of_maps_diff(
             }
             writeln!(out, "{}    }}", attr_prefix).unwrap();
         } else {
+            // `fields` may be empty when state carries an extra
+            // (provider-injected) key not in desired — every desired
+            // key compares equal, so all are absorbed into
+            // `hidden_unchanged_count`. Build the summary as a list so
+            // the comma separator only appears between non-empty
+            // pieces (#2886).
+            let mut parts: Vec<String> = Vec::with_capacity(2);
             let rendered_fields = render_modified_fields(&item.fields);
-            // Append the hidden-fields count after the changed field list
-            // so the summary stays inside the `~ { ... }` block. A paired
-            // modified item always has at least one changed field by
-            // construction (Phase 1 absorbs all-equal pairs as unchanged
-            // before pairing runs), so `rendered_fields` is never empty.
-            debug_assert!(
-                !rendered_fields.is_empty(),
-                "paired modified item must have at least one changed field"
-            );
-            let summary = if item.hidden_unchanged_count > 0 {
-                let s = hidden_unchanged_summary(item.hidden_unchanged_count, "field")
-                    .dimmed()
-                    .to_string();
-                format!("{}, {}", rendered_fields, s)
-            } else {
-                rendered_fields
-            };
+            if !rendered_fields.is_empty() {
+                parts.push(rendered_fields);
+            }
+            if item.hidden_unchanged_count > 0 {
+                parts.push(
+                    hidden_unchanged_summary(item.hidden_unchanged_count, "field")
+                        .dimmed()
+                        .to_string(),
+                );
+            }
             writeln!(
                 out,
                 "{}  {} {{{}}}",
                 attr_prefix,
                 "~".yellow().bold(),
-                summary
+                parts.join(", ")
             )
             .unwrap();
         }

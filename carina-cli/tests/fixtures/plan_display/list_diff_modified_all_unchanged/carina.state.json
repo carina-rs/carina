@@ -1,0 +1,34 @@
+{
+  "version": 3,
+  "serial": 1,
+  "lineage": "test-lineage-list-diff-modified-all-unchanged",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "iam.RolePolicy",
+      "name": "policy",
+      "provider": "awscc",
+      "identifier": "test-role|test-inline",
+      "attributes": {
+        "policy_name": "test-inline",
+        "role_name": "test-role",
+        "statement": [
+          {
+            "sid": "AllowS3Read",
+            "effect": "Allow",
+            "action": "s3:GetObject",
+            "resource": "arn:aws:s3:::example/*",
+            "spurious_provider_field": "ignored"
+          }
+        ]
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "desired_keys": ["policy_name", "role_name", "statement"],
+      "binding": "policy",
+      "dependency_bindings": []
+    }
+  ]
+}

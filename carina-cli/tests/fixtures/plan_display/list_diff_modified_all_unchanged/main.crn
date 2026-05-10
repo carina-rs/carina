@@ -1,0 +1,29 @@
+# #2886: a list-of-maps element where every key from the desired side
+# matches the state byte-for-byte, but state carries an *extra* key not
+# present in desired. The element is paired (Phase 2 picks it as the
+# best-similarity match), then Phase 3 iterates desired keys — all
+# `field_same` — so `fields` ends up empty while `hidden_unchanged_count`
+# captures every shared key. Pre-fix the renderer emitted
+# `~ {, # (N unchanged fields hidden)}` with a leading comma; post-fix
+# the comma is elided and only the summary remains inside the braces.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let policy = awscc.iam.RolePolicy {
+  policy_name = 'test-inline-renamed'
+  role_name   = 'test-role'
+  statement = [
+    {
+      sid    = 'AllowS3Read'
+      effect = 'Allow'
+      action = 's3:GetObject'
+      resource = 'arn:aws:s3:::example/*'
+    },
+  ]
+}
+
+exports {
+  policy_name = policy.policy_name
+}

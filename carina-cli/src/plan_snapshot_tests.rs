@@ -1001,6 +1001,39 @@ fn snapshot_list_diff_modified_with_unchanged_nested() {
     insta::assert_snapshot!(output);
 }
 
+// #2886: a list-of-maps element where state carries an extra
+// (provider-injected) field that desired does not, so Phase 1's
+// `maps_semantically_equal` rejects the pair (lengths differ) and Phase 2
+// pairs them by similarity. Every desired key matches state, so the
+// per-element renderer ends up with `fields = []` and
+// `hidden_unchanged_count > 0`. Pre-fix that produced a leading comma:
+// `~ {, # (N unchanged fields hidden)}`. Post-fix the comma is elided
+// and the summary stands alone inside the braces.
+#[test]
+fn snapshot_list_diff_modified_all_unchanged() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("list_diff_modified_all_unchanged");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+    ));
+    assert!(
+        !output.contains("{,"),
+        "all-unchanged element must not render a leading comma; got: {}",
+        output
+    );
+    assert!(
+        output.contains("unchanged field"),
+        "expected `# (n unchanged fields hidden)` summary in Full mode; got: {}",
+        output
+    );
+    insta::assert_snapshot!(output);
+}
+
 // Mirror of the added-struct test for the removed path.
 #[test]
 fn snapshot_list_diff_removed_struct() {
