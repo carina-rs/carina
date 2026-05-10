@@ -6,7 +6,7 @@
 use super::CarinaParser;
 use super::ProviderContext;
 use super::Rule;
-use super::ast::{ParsedFile, UpstreamState};
+use super::ast::{ParsedFile, UpstreamState, WaitBinding};
 use super::blocks::attributes::{
     parse_arguments_block, parse_attributes_block, parse_exports_block,
 };
@@ -93,6 +93,7 @@ pub fn parse_with_seeded_bindings(
     let mut backend = None;
     let mut state_blocks = Vec::new();
     let mut upstream_states: Vec<UpstreamState> = Vec::new();
+    let mut wait_bindings: Vec<WaitBinding> = Vec::new();
     let mut requires = Vec::new();
     let mut anon_for_counter = 0usize;
     let mut anon_if_counter = 0usize;
@@ -219,6 +220,7 @@ pub fn parse_with_seeded_bindings(
                                 }
                                 let is_discard = name == "_";
                                 let is_upstream_state = ctx.upstream_states.contains_key(&name);
+                                let is_wait_binding = ctx.wait_bindings.contains_key(&name);
                                 if !is_discard {
                                     // A seeded placeholder (from a sibling-file
                                     // declaration during the directory-aware
@@ -237,15 +239,16 @@ pub fn parse_with_seeded_bindings(
                                     if shadows_seed {
                                         ctx.unmark_seeded(&name);
                                     }
-                                    if is_upstream_state {
-                                        // upstream_state lets do not bind a
-                                        // user-facing value; legacy semantics
-                                        // is "no entry in `variables`". When a
-                                        // seed pre-installed a placeholder
-                                        // under this name, drop it so the
-                                        // ParsedFile we hand back doesn't
-                                        // leak the seeded `ResourceRef` into
-                                        // downstream walkers (#2817).
+                                    if is_upstream_state || is_wait_binding {
+                                        // upstream_state and wait lets do not bind a
+                                        // user-facing value; the binding name
+                                        // resolves through `resource_bindings`
+                                        // as a forward reference. When a seed
+                                        // pre-installed a placeholder under
+                                        // this name, drop it so the ParsedFile
+                                        // we hand back doesn't leak the seeded
+                                        // `ResourceRef` into downstream walkers
+                                        // (#2817).
                                         if shadows_seed {
                                             ctx.variables.shift_remove(&name);
                                         }
@@ -282,6 +285,16 @@ pub fn parse_with_seeded_bindings(
                                     let placeholder = Resource::new("_upstream_state", &name);
                                     ctx.set_resource_binding(name.clone(), placeholder);
                                     upstream_states.push(ctx.upstream_states[&name].clone());
+                                }
+                                let is_wait = ctx.wait_bindings.contains_key(&name);
+                                if is_wait && !is_discard {
+                                    // Register a placeholder resource binding so that
+                                    // `<wait-binding>.<attr>` parses as `ResourceRef`.
+                                    // Downstream resolution (Phase 4 of #2825) treats
+                                    // it as passthrough of the target's snapshot.
+                                    let placeholder = Resource::new("_wait", &name);
+                                    ctx.set_resource_binding(name.clone(), placeholder);
+                                    wait_bindings.push(ctx.wait_bindings[&name].clone());
                                 }
                                 if let Some(use_stmt) = maybe_import {
                                     ctx.imported_modules
@@ -354,6 +367,7 @@ pub fn parse_with_seeded_bindings(
         state_blocks,
         user_functions: ctx.user_functions,
         upstream_states,
+        wait_bindings,
         requires,
         structural_bindings: ctx.structural_bindings,
         warnings: ctx.warnings,

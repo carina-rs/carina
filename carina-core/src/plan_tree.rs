@@ -72,6 +72,19 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
                 effect_deps.insert(idx, HashSet::new());
                 continue;
             }
+            Effect::Wait {
+                binding, target_id, ..
+            } => {
+                // The wait depends on its target binding so the tree
+                // shows the wait as a child of the resource it gates.
+                let mut deps = HashSet::new();
+                deps.insert(target_id.name_str().to_string());
+                binding_to_effect.insert(binding.clone(), idx);
+                effect_bindings.insert(idx, binding.clone());
+                effect_types.insert(idx, "wait".to_string());
+                effect_deps.insert(idx, deps);
+                continue;
+            }
         };
 
         if let Some(r) = resource {

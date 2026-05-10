@@ -465,6 +465,39 @@ pub struct UpstreamState {
     pub source: std::path::PathBuf,
 }
 
+/// A `wait <target> { ... }` declaration captured during parse.
+///
+/// Carries the parsed surface form of the `until` predicate so later
+/// phases (differ → executor) can both type-check / lower the predicate
+/// (via `until_ast`) and echo the user-authored expression in plan
+/// display (via `until_raw`). `timeout_secs` is normalised to seconds
+/// because `Duration` from carina#2824 already canonicalises that way.
+///
+/// See `notes/specs/2026-05-09-wait-construct-design.md`.
+#[derive(Debug, Clone)]
+pub struct WaitBinding {
+    /// The wait's binding name (e.g. `cert_issued`).
+    pub binding: String,
+    /// Identifier of the target resource binding (e.g. `cert`).
+    pub target: String,
+    /// Surface form of the `until` expression as the user wrote it
+    /// (e.g. `"cert.status == aws.acm.Certificate.Status.Issued"`).
+    pub until_raw: String,
+    /// Parsed `until` predicate. Reuses `validate_expr` so later phases
+    /// can lower to `WaitPredicate` once the supported predicate shape
+    /// (MVP: `<target>.<attr> == <value>`) is enforced.
+    pub until_ast: ValidateExpr,
+    /// Optional user override of the wait timeout, in whole seconds. When
+    /// `None` the differ falls back to the target schema's default.
+    pub timeout_secs: Option<u64>,
+    /// Additional ordering edges declared via `depends_on = [...]`. The
+    /// ordering machinery itself is shared with the per-resource
+    /// `directives.depends_on` (carina#2823).
+    pub depends_on: Vec<String>,
+    /// Source line of the `wait` keyword. Used by diagnostics.
+    pub line: usize,
+}
+
 /// An export parameter as seen post-inference (#2360 stage 2).
 ///
 /// `type_expr` is bare `TypeExpr` because every export carries a
@@ -520,6 +553,8 @@ pub struct File<E> {
     pub user_functions: HashMap<String, UserFunction>,
     /// Upstream state references (read-only views of other Carina configurations)
     pub upstream_states: Vec<UpstreamState>,
+    /// `wait` bindings declared via `let <name> = wait <target> { ... }`.
+    pub wait_bindings: Vec<WaitBinding>,
     /// Require blocks (cross-argument constraints)
     pub requires: Vec<RequireBlock>,
     /// Binding names that are structurally required (if/for/read expressions)
@@ -553,6 +588,7 @@ impl<E> Default for File<E> {
             state_blocks: Vec::new(),
             user_functions: HashMap::new(),
             upstream_states: Vec::new(),
+            wait_bindings: Vec::new(),
             requires: Vec::new(),
             structural_bindings: HashSet::new(),
             warnings: Vec::new(),

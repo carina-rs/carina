@@ -632,6 +632,7 @@ pub fn apply_inference(
             state_blocks: parsed.state_blocks,
             user_functions: parsed.user_functions,
             upstream_states: parsed.upstream_states,
+            wait_bindings: parsed.wait_bindings,
             requires: parsed.requires,
             structural_bindings: parsed.structural_bindings,
             warnings: parsed.warnings,

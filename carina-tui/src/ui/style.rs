@@ -83,5 +83,6 @@ pub(super) fn effect_style(kind: EffectKind) -> Style {
         EffectKind::Replace => Style::default().fg(Color::Yellow),
         EffectKind::Delete => Style::default().fg(Color::Red),
         EffectKind::Read => Style::default().fg(Color::Cyan),
+        EffectKind::Wait => Style::default().fg(Color::Magenta),
     }
 }

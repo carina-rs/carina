@@ -197,6 +197,7 @@ impl Plan {
                 Effect::Import { .. } => summary.import += 1,
                 Effect::Remove { .. } => summary.remove += 1,
                 Effect::Move { .. } => summary.moved += 1,
+                Effect::Wait { .. } => summary.wait += 1,
             }
         }
         summary
@@ -213,6 +214,7 @@ pub struct PlanSummary {
     pub import: usize,
     pub remove: usize,
     pub moved: usize,
+    pub wait: usize,
 }
 
 impl std::fmt::Display for PlanSummary {
@@ -235,6 +237,9 @@ impl std::fmt::Display for PlanSummary {
         }
         if self.moved > 0 {
             parts.push(format!("{} to move", self.moved));
+        }
+        if self.wait > 0 {
+            parts.push(format!("{} to wait", self.wait));
         }
         write!(f, "Plan: {}", parts.join(", "))
     }
@@ -275,7 +280,8 @@ impl ModularPlan {
                 Effect::Delete { .. }
                 | Effect::Import { .. }
                 | Effect::Remove { .. }
-                | Effect::Move { .. } => ModuleSource::Root,
+                | Effect::Move { .. }
+                | Effect::Wait { .. } => ModuleSource::Root,
             };
             modular.effect_sources.insert(idx, source);
         }
@@ -392,6 +398,11 @@ fn format_effect_brief(effect: &Effect) -> String {
         Effect::Import { id, identifier } => format!("<- {} (import: {})", id, identifier),
         Effect::Remove { id } => format!("x {}", id),
         Effect::Move { from, to } => format!("-> {} (from: {})", to, from),
+        Effect::Wait {
+            binding,
+            until_surface,
+            ..
+        } => format!("> {} (until {})", binding, until_surface),
     }
 }
 
@@ -405,6 +416,55 @@ mod tests {
         let plan = Plan::new();
         assert!(plan.is_empty());
         assert_eq!(plan.mutation_count(), 0);
+    }
+
+    #[test]
+    fn format_effect_brief_renders_wait() {
+        use crate::resource::{ResourceId, Value};
+        use crate::wait::predicate::{AttrPath, WaitPredicate};
+        use std::time::Duration;
+
+        let e = Effect::Wait {
+            binding: "cert_issued".to_string(),
+            target_id: ResourceId::new("acm.Certificate", "cert"),
+            target_identifier: None,
+            until: WaitPredicate::Equals {
+                attr: AttrPath::single("status"),
+                value: Value::String("ISSUED".to_string()),
+            },
+            until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
+            timeout: Duration::from_secs(75 * 60),
+            interval: Duration::from_secs(5),
+        };
+        assert_eq!(
+            format_effect_brief(&e),
+            "> cert_issued (until cert.status == aws.acm.Certificate.Status.Issued)"
+        );
+    }
+
+    #[test]
+    fn plan_summary_counts_wait() {
+        use crate::resource::{ResourceId, Value};
+        use crate::wait::predicate::{AttrPath, WaitPredicate};
+        use std::time::Duration;
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(Resource::new("acm.Certificate", "cert")));
+        plan.add(Effect::Wait {
+            binding: "cert_issued".to_string(),
+            target_id: ResourceId::new("acm.Certificate", "cert"),
+            target_identifier: None,
+            until: WaitPredicate::Equals {
+                attr: AttrPath::single("status"),
+                value: Value::String("ISSUED".to_string()),
+            },
+            until_surface: "cert.status == ISSUED".to_string(),
+            timeout: Duration::from_secs(60),
+            interval: Duration::from_secs(5),
+        });
+        let summary = plan.summary();
+        assert_eq!(summary.create, 1);
+        assert_eq!(summary.wait, 1);
     }
 
     #[test]

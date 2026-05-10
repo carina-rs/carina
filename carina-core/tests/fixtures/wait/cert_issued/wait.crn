@@ -1,0 +1,5 @@
+let cert_issued = wait cert {
+    until      = cert.status == aws.acm.Certificate.Status.Issued
+    depends_on = [validation_record]
+    timeout    = 75min
+}

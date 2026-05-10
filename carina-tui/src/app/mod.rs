@@ -43,6 +43,7 @@ pub enum EffectKind {
     Update,
     Replace,
     Delete,
+    Wait,
 }
 
 /// Which panel currently has focus
@@ -635,7 +636,8 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
             Effect::Delete { .. }
             | Effect::Import { .. }
             | Effect::Remove { .. }
-            | Effect::Move { .. } => None,
+            | Effect::Move { .. }
+            | Effect::Wait { .. } => None,
         };
 
         if let Some(r) = resource {
@@ -662,7 +664,8 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
                         Effect::Delete { .. }
                         | Effect::Import { .. }
                         | Effect::Remove { .. }
-                        | Effect::Move { .. } => None,
+                        | Effect::Move { .. }
+                        | Effect::Wait { .. } => None,
                     };
                     p_resource.and_then(|pr| pr.binding.clone())
                 });
@@ -792,6 +795,21 @@ fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode
             name_part: to.name_str().to_string(),
             symbol: "->".to_string(),
             kind: EffectKind::Update,
+            detail_rows,
+            children: Vec::new(),
+            depth: 0,
+            parent: None,
+        },
+        Effect::Wait {
+            binding,
+            until_surface,
+            ..
+        } => TreeNode {
+            effect_label: format!("{} (until {})", binding, until_surface),
+            resource_type: "wait".to_string(),
+            name_part: binding.clone(),
+            symbol: ">".to_string(),
+            kind: EffectKind::Wait,
             detail_rows,
             children: Vec::new(),
             depth: 0,

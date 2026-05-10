@@ -30,7 +30,7 @@
       "patterns": [
         {
           "name": "storage.type.carina",
-          "match": "\\b(let|fn)\\b"
+          "match": "\\b(let|fn|wait)\\b"
         },
         {
           "name": "keyword.declaration.carina",
@@ -42,7 +42,7 @@
         },
         {
           "name": "keyword.other.carina",
-          "match": "\\b(depends_on|use|import|require|read)\\b"
+          "match": "\\b(depends_on|use|import|require|read|until)\\b"
         },
         {
           "name": "constant.language.null.carina",
