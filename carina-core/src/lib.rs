@@ -12,6 +12,7 @@ pub mod differ;
 pub mod effect;
 pub(crate) mod eval_value;
 pub mod executor;
+pub mod explicit;
 pub mod formatter;
 pub mod heredoc;
 pub mod identifier;
