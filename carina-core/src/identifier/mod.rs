@@ -180,6 +180,9 @@ fn deterministic_value_string(value: &Value) -> String {
         Value::ResourceRef { path } => {
             format!("ResourceRef({})", path.to_dot_string())
         }
+        Value::BindingRef { binding } => {
+            format!("BindingRef({})", binding)
+        }
         Value::Interpolation(parts) => {
             use crate::resource::InterpolationPart;
             let strs: Vec<String> = parts

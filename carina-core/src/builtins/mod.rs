@@ -420,6 +420,7 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::StringList(_) => "StringList",
         Value::Map(_) => "Map",
         Value::ResourceRef { .. } => "ResourceRef",
+        Value::BindingRef { .. } => "BindingRef",
         Value::Interpolation(_) => "Interpolation",
         Value::FunctionCall { .. } => "FunctionCall",
         Value::Secret(_) => "Secret",

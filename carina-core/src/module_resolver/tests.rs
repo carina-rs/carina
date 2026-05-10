@@ -25,7 +25,9 @@ fn create_test_module() -> ParsedFile {
                 attrs.insert("name".to_string(), Value::String("sg".to_string()));
                 attrs.insert(
                     "vpc_id".to_string(),
-                    Value::resource_ref("vpc_id".to_string(), String::new(), vec![]),
+                    Value::BindingRef {
+                        binding: "vpc_id".to_string(),
+                    },
                 );
                 attrs.insert(
                     "_type".to_string(),
@@ -79,7 +81,9 @@ fn test_substitute_arguments() {
     inputs.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
 
     // Argument params are lexically scoped: binding_name is the param name itself
-    let value = Value::resource_ref("vpc_id".to_string(), String::new(), vec![]);
+    let value = Value::BindingRef {
+        binding: "vpc_id".to_string(),
+    };
     let result = substitute_arguments(&value, &inputs);
 
     assert_eq!(result, Value::String("vpc-123".to_string()));
@@ -91,7 +95,9 @@ fn test_substitute_arguments_nested() {
     inputs.insert("port".to_string(), Value::Int(8080));
 
     let value = Value::List(vec![
-        Value::resource_ref("port".to_string(), String::new(), vec![]),
+        Value::BindingRef {
+            binding: "port".to_string(),
+        },
         Value::Int(443),
     ]);
     let result = substitute_arguments(&value, &inputs);
@@ -244,7 +250,9 @@ fn create_module_with_intra_refs() -> ParsedFile {
                     let mut attrs = HashMap::new();
                     attrs.insert(
                         "cidr_block".to_string(),
-                        Value::resource_ref("cidr".to_string(), String::new(), vec![]),
+                        Value::BindingRef {
+                            binding: "cidr".to_string(),
+                        },
                     );
                     attrs.into_iter().collect()
                 },
@@ -1088,11 +1096,9 @@ fn test_substitute_arguments_interpolation() {
     // Interpolation like "prefix-${env_name}-suffix" where env_name is a module argument
     let value = Value::Interpolation(vec![
         InterpolationPart::Literal("prefix-".to_string()),
-        InterpolationPart::Expr(Value::resource_ref(
-            "env_name".to_string(),
-            String::new(),
-            vec![],
-        )),
+        InterpolationPart::Expr(Value::BindingRef {
+            binding: "env_name".to_string(),
+        }),
         InterpolationPart::Literal("-suffix".to_string()),
     ]);
     let result = substitute_arguments(&value, &inputs);
@@ -1149,7 +1155,9 @@ fn test_substitute_arguments_function_call() {
     let value = Value::FunctionCall {
         name: "cidr_subnet".to_string(),
         args: vec![
-            Value::resource_ref("cidr".to_string(), String::new(), vec![]),
+            Value::BindingRef {
+                binding: "cidr".to_string(),
+            },
             Value::Int(8),
             Value::Int(0),
         ],
@@ -1181,22 +1189,24 @@ fn create_module_with_interpolation() -> ParsedFile {
                 let mut attrs = HashMap::new();
                 attrs.insert(
                     "cidr_block".to_string(),
-                    Value::resource_ref("cidr_block".to_string(), String::new(), vec![]),
+                    Value::BindingRef {
+                        binding: "cidr_block".to_string(),
+                    },
                 );
                 attrs.insert(
                     "name".to_string(),
                     Value::Interpolation(vec![
                         InterpolationPart::Literal("test-".to_string()),
-                        InterpolationPart::Expr(Value::resource_ref(
-                            "env_name".to_string(),
-                            String::new(),
-                            vec![],
-                        )),
+                        InterpolationPart::Expr(Value::BindingRef {
+                            binding: "env_name".to_string(),
+                        }),
                     ]),
                 );
                 attrs.insert(
                     "env".to_string(),
-                    Value::resource_ref("env_name".to_string(), String::new(), vec![]),
+                    Value::BindingRef {
+                        binding: "env_name".to_string(),
+                    },
                 );
                 attrs.into_iter().collect()
             },
@@ -2738,19 +2748,19 @@ m {}
 
     let role_name = role_attr(&parsed, "role_name");
     match role_name {
-        Value::ResourceRef { path } => {
-            // The cycle leaves both `a` and `b` as ResourceRef; which one
-            // surfaces as `role_name` depends on substitute_arguments's
-            // walk order. Either is fine — the contract is that the
-            // loop terminates without panicking and produces a
-            // structured ref the scope check can flag.
+        // The cycle leaves both `a` and `b` as bare-binding refs; which
+        // one surfaces as `role_name` depends on substitute_arguments's
+        // walk order. Either is fine — the contract is that the loop
+        // terminates without panicking and produces a structured ref
+        // the scope check can flag. Since #2847 these bare refs are
+        // `BindingRef`, not `ResourceRef` with empty attribute.
+        Value::BindingRef { binding } => {
             assert!(
-                path.binding() == "a" || path.binding() == "b",
-                "expected cyclic ref to point at `a` or `b`, got: {:?}",
-                path.binding()
+                binding == "a" || binding == "b",
+                "expected cyclic ref to point at `a` or `b`, got: {binding:?}"
             );
         }
-        other => panic!("expected unresolved ResourceRef from cycle; got {other:?}"),
+        other => panic!("expected unresolved BindingRef from cycle; got {other:?}"),
     }
 }
 

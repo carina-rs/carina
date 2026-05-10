@@ -675,6 +675,11 @@ fn walk_value_against_type(
         | Value::Bool(_)
         | Value::StringList(_)
         | Value::Unknown(_) => {}
+        // `BindingRef` carries no attribute, so there is nothing to
+        // type-check at a "field reference" position. The same applies
+        // to all other walkers in this module: a bare-binding seed
+        // cannot stand in for an attribute reference. (#2847)
+        Value::BindingRef { .. } => {}
     }
 }
 
@@ -1693,6 +1698,50 @@ mod tests {
         assert_eq!(errs.len(), 1, "got: {errs:?}");
         assert_eq!(errs[0].field, "acc");
         assert!(errs[0].location.contains("let"));
+    }
+
+    #[test]
+    fn upstream_state_sibling_reference_no_empty_export_error() {
+        // Regression: #2847. `bootstrap` declared in `backend.crn`,
+        // referenced from `main.crn`. Pre-fix the seeded placeholder
+        // surfaced as a `ResourceRef { attribute: "" }` and tripped the
+        // walker into emitting `does not export ``.`. Type-split makes
+        // the offending shape unrepresentable: a sibling-only seed is a
+        // `Value::BindingRef`, which has no attribute slot for the
+        // walker to read, so the empty-field diagnostic class is
+        // statically eliminated.
+        let tmp = tempfile::tempdir().unwrap();
+        write_crn(
+            tmp.path(),
+            "backend.crn",
+            r#"
+            let bootstrap = upstream_state { source = "../bootstrap" }
+            "#,
+        );
+        write_crn(
+            tmp.path(),
+            "main.crn",
+            r#"
+            let arn = bootstrap.oidc_provider_arn
+            "#,
+        );
+        let parsed = parse_directory(tmp.path(), &ctx()).expect("parse_directory");
+        // Whitebox: the bare-binding seed surfaces as `BindingRef`,
+        // not `ResourceRef`. The type itself proves the seeded shape
+        // can no longer impersonate an attribute reference.
+        let bootstrap_var = parsed.variables.get("bootstrap");
+        assert!(
+            matches!(bootstrap_var, Some(Value::BindingRef { .. }) | None),
+            "sibling-only `bootstrap` must be either absent or a \
+             BindingRef, got: {bootstrap_var:?}"
+        );
+        let exports = mk_exports(&[("bootstrap", &["oidc_provider_arn"])]);
+        let errs = check_upstream_state_field_references(&parsed, &exports);
+        assert!(
+            errs.is_empty(),
+            "consumer-only sibling reference must not synthesize an \
+             empty-field error, got: {errs:?}"
+        );
     }
 
     #[test]

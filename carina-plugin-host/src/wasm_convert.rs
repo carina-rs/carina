@@ -88,6 +88,10 @@ pub fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, SerializationError
             path: path.to_dot_string(),
             context: SerializationContext::WasmBoundary,
         }),
+        CoreValue::BindingRef { binding } => Err(SerializationError::UnresolvedResourceRef {
+            path: binding.clone(),
+            context: SerializationContext::WasmBoundary,
+        }),
         CoreValue::Interpolation(_) => Err(SerializationError::UnresolvedInterpolation {
             context: SerializationContext::WasmBoundary,
         }),
@@ -175,6 +179,10 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
         }),
         CoreValue::ResourceRef { path } => Err(SerializationError::UnresolvedResourceRef {
             path: path.to_dot_string(),
+            context: SerializationContext::WasmBoundary,
+        }),
+        CoreValue::BindingRef { binding } => Err(SerializationError::UnresolvedResourceRef {
+            path: binding.clone(),
             context: SerializationContext::WasmBoundary,
         }),
         CoreValue::Interpolation(_) => Err(SerializationError::UnresolvedInterpolation {

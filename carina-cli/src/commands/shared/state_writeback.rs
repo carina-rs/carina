@@ -189,6 +189,10 @@ pub(crate) fn dsl_value_to_json(
             path: path.to_dot_string(),
             context: ctx,
         }),
+        Value::BindingRef { binding } => Err(SerializationError::UnresolvedResourceRef {
+            path: binding.clone(),
+            context: ctx,
+        }),
         Value::Interpolation(_) => {
             Err(SerializationError::UnresolvedInterpolation { context: ctx })
         }

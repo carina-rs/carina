@@ -244,6 +244,15 @@ pub fn value_to_json_with_context(
             path: path.to_dot_string(),
             context: ctx,
         }),
+        Value::BindingRef { binding } => Err(SerializationError::UnresolvedResourceRef {
+            // A bare-binding reference is by construction never a
+            // resolved value — it must be substituted by the resolver
+            // pass before reaching any serialization boundary. Report
+            // through the same channel as `ResourceRef` so the same
+            // diagnostic path covers both producer kinds.
+            path: binding.clone(),
+            context: ctx,
+        }),
         Value::Interpolation(_) => {
             Err(SerializationError::UnresolvedInterpolation { context: ctx })
         }
@@ -459,6 +468,7 @@ pub(crate) fn format_value_into<S: FormatSink>(
             sink.write_str("}")
         }
         Value::ResourceRef { path } => sink.write_str(&path.to_dot_string()),
+        Value::BindingRef { binding } => sink.write_str(binding),
         Value::Interpolation(parts) => {
             sink.write_str("\"")?;
             for part in parts {

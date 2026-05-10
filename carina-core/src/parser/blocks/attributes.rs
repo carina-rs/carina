@@ -131,11 +131,20 @@ pub(in crate::parser) fn parse_arguments_block(
 
 /// Register an argument name as a lexical binding so subsequent expressions
 /// (later argument defaults, resource bodies, etc.) resolve it as a
-/// `ResourceRef` placeholder rather than a literal string. Without this
+/// `BindingRef` placeholder rather than a literal string. Without this
 /// incremental registration, `${other_arg}` inside a default would have no
 /// in-scope binding and degrade to the literal string `"other_arg"` (#2393).
+///
+/// `BindingRef` (not `ResourceRef`) is correct here: an `arguments {}`
+/// declaration introduces a name without an attribute. When a later
+/// expression writes `other_arg.attr`, the parser composes a fresh
+/// `ResourceRef`. Storing the placeholder as `ResourceRef` with an
+/// empty `attribute` would be a type-level lie — the same shape that
+/// produced the empty-field diagnostic in #2847.
 fn register_argument_binding(ctx: &mut ParseContext, name: &str) {
-    let placeholder_ref = Value::resource_ref(name.to_string(), String::new(), vec![]);
+    let placeholder_ref = Value::BindingRef {
+        binding: name.to_string(),
+    };
     ctx.set_variable(name.to_string(), placeholder_ref);
     let placeholder = Resource::new("_argument", name);
     ctx.set_resource_binding(name.to_string(), placeholder);

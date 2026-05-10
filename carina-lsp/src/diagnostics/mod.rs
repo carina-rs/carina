@@ -607,9 +607,16 @@ impl DiagnosticEngine {
                                         .err()
                                         .map(|e| e.with_attribute(attr_name).to_string())
                                 }
-                                // Validate Union static values (non-ResourceRef)
+                                // Validate Union static values (non-ResourceRef, non-BindingRef).
+                                // Ref-shaped values are unresolved at this
+                                // checkpoint and must not be type-checked
+                                // against Union members here — see #2847
+                                // for the bare-binding (`BindingRef`) form.
                                 (carina_core::schema::AttributeType::Union(_), value)
-                                    if !matches!(value, Value::ResourceRef { .. }) =>
+                                    if !matches!(
+                                        value,
+                                        Value::ResourceRef { .. } | Value::BindingRef { .. }
+                                    ) =>
                                 {
                                     attr_schema
                                         .attr_type

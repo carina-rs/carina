@@ -376,13 +376,17 @@ pub(crate) fn parse_primary_eval(
                     // construction (the post-field bucket only fills
                     // after a field). Pre-field subscripts have already
                     // been folded into binding_name above.
+                    //
+                    // No attribute selector → emit `BindingRef`. The
+                    // legacy "ResourceRef with empty attribute" shape
+                    // was the source of the empty-field diagnostic in
+                    // #2847; the new variant makes that representation
+                    // unrepresentable.
                     match ctx.get_variable(&binding_name) {
                         Some(val) => Ok(val.clone()),
-                        None => Ok(EvalValue::from_value(Value::resource_ref(
-                            binding_name,
-                            String::new(),
-                            vec![],
-                        ))),
+                        None => Ok(EvalValue::from_value(Value::BindingRef {
+                            binding: binding_name,
+                        })),
                     }
                 } else {
                     let attribute_name = field_names.remove(0);

@@ -163,12 +163,9 @@ fn format_value(value: &Value) -> String {
             }
         }
         Value::ResourceRef { path } => {
-            if path.attribute().is_empty() {
-                path.binding().to_string()
-            } else {
-                format!("{}.{}", path.binding(), path.attribute())
-            }
+            format!("{}.{}", path.binding(), path.attribute())
         }
+        Value::BindingRef { binding } => binding.clone(),
         Value::Interpolation(parts) => {
             use crate::resource::InterpolationPart;
             let inner: String = parts
@@ -456,6 +453,22 @@ impl RootConfigSignature {
                         target: path.binding().to_string(),
                         target_type,
                         attribute: path.attribute().to_string(),
+                        used_in: attr_key.to_string(),
+                    },
+                );
+            }
+            // Bare-binding refs (e.g. `vpc_id` standing alone, since
+            // #2847) are dependencies just like attribute refs; the
+            // displayed `attribute` slot stays empty so
+            // `format_dep_detail` renders `target (via used_in)`.
+            Value::BindingRef { binding } => {
+                let target_type = binding_types.get(binding).cloned();
+                graph.add_edge(
+                    from.to_string(),
+                    TypedDependency {
+                        target: binding.clone(),
+                        target_type,
+                        attribute: String::new(),
                         used_in: attr_key.to_string(),
                     },
                 );
@@ -874,6 +887,29 @@ impl ModuleSignature {
                         target: binding_name.to_string(),
                         target_type,
                         attribute: path.attribute().to_string(),
+                        used_in: attr_key.to_string(),
+                    },
+                );
+            }
+            // Bare-binding refs (`vpc_id = vpc` referencing argument
+            // `vpc`, since #2847) — same dependency edge, empty
+            // attribute slot.
+            Value::BindingRef { binding } => {
+                let target_type = if let Some(arg_type) = argument_types.get(binding) {
+                    if let TypeExpr::Ref(p) = arg_type {
+                        Some(p.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    binding_types.get(binding).cloned()
+                };
+                graph.add_edge(
+                    from.to_string(),
+                    TypedDependency {
+                        target: binding.clone(),
+                        target_type,
+                        attribute: String::new(),
                         used_in: attr_key.to_string(),
                     },
                 );

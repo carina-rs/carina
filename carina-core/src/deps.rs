@@ -32,11 +32,43 @@ pub fn get_resource_dependencies(resource: &Resource) -> HashSet<String> {
     deps
 }
 
-/// Recursively collect resource reference dependencies from a value
+/// Recursively collect resource reference dependencies from a value.
+///
+/// Both attribute references (`vpc.vpc_id`) and bare-binding refs
+/// (`vpc_id` standing alone) record the same dependency edge: the
+/// resource depends on the named binding. The two parse to different
+/// `Value` variants since #2847 (`ResourceRef` vs. `BindingRef`), so
+/// the walker visits both forms here.
 fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
-    value.visit_refs(&mut |path| {
-        deps.insert(path.binding().to_string());
-    });
+    fn walk(value: &Value, deps: &mut HashSet<String>) {
+        match value {
+            Value::ResourceRef { path } => {
+                deps.insert(path.binding().to_string());
+            }
+            Value::BindingRef { binding } => {
+                deps.insert(binding.clone());
+            }
+            Value::List(items) => items.iter().for_each(|v| walk(v, deps)),
+            Value::Map(map) => map.values().for_each(|v| walk(v, deps)),
+            Value::Interpolation(parts) => {
+                use crate::resource::InterpolationPart;
+                for part in parts {
+                    if let InterpolationPart::Expr(v) = part {
+                        walk(v, deps);
+                    }
+                }
+            }
+            Value::FunctionCall { args, .. } => args.iter().for_each(|v| walk(v, deps)),
+            Value::Secret(inner) => walk(inner, deps),
+            Value::String(_)
+            | Value::Int(_)
+            | Value::Float(_)
+            | Value::Bool(_)
+            | Value::StringList(_)
+            | Value::Unknown(_) => {}
+        }
+    }
+    walk(value, deps);
 }
 
 /// Sort resources topologically based on dependencies.
