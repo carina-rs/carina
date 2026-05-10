@@ -418,6 +418,7 @@ mod tests {
             directives: crate::resource::Directives::default(),
             binding: None,
             dependencies: std::collections::HashSet::new(),
+            explicit_dependencies: std::collections::HashSet::new(),
         });
 
         let summary = plan.summary();
@@ -572,6 +573,7 @@ mod tests {
             directives: crate::resource::Directives::default(),
             binding: None,
             dependencies: std::collections::HashSet::new(),
+            explicit_dependencies: std::collections::HashSet::new(),
         });
 
         let json = serde_json::to_string(&plan).unwrap();

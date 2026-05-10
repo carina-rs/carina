@@ -720,12 +720,14 @@ pub fn redact_secrets_in_effect(
             directives,
             binding,
             dependencies,
+            explicit_dependencies,
         } => Effect::Delete {
             id: id.clone(),
             identifier: identifier.clone(),
             directives: directives.clone(),
             binding: binding.clone(),
             dependencies: dependencies.clone(),
+            explicit_dependencies: explicit_dependencies.clone(),
         },
         Effect::Import { id, identifier } => Effect::Import {
             id: id.clone(),

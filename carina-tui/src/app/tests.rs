@@ -20,6 +20,7 @@ fn app_from_plan_with_effects() {
         directives: Directives::default(),
         binding: None,
         dependencies: HashSet::new(),
+        explicit_dependencies: std::collections::HashSet::new(),
     });
 
     let app = App::new(&plan, &SchemaRegistry::new());

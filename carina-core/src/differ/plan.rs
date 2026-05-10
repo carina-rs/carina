@@ -298,12 +298,15 @@ pub fn create_plan(
                 let directives = resource.directives.clone();
                 let binding = resource.binding.clone();
                 let dependencies = get_resource_dependencies(resource);
+                let explicit_dependencies =
+                    resource.directives.depends_on.iter().cloned().collect();
                 plan.add(Effect::Delete {
                     id,
                     identifier,
                     directives,
                     binding,
                     dependencies,
+                    explicit_dependencies,
                 });
             }
         }
@@ -356,6 +359,11 @@ pub fn create_plan(
                 directives,
                 binding,
                 dependencies,
+                // Orphan deletes have no source `directives.depends_on`;
+                // the resource is gone from desired state. Carrying an
+                // empty set here is correct and serde-stable for
+                // pre-#2871 state files.
+                explicit_dependencies: std::collections::HashSet::new(),
             });
         }
     }

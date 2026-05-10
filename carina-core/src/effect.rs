@@ -88,9 +88,18 @@ pub enum Effect {
         /// The binding name of the deleted resource (for plan tree display)
         #[serde(default)]
         binding: Option<String>,
-        /// Binding names this resource depended on (for plan tree display)
+        /// Binding names this resource depended on (for plan tree display).
+        /// Includes both value-reference and explicit `directives.depends_on`
+        /// edges — the union the executor needs for ordering.
         #[serde(default)]
         dependencies: HashSet<String>,
+        /// Subset of `dependencies` that came from
+        /// `directives { depends_on = [...] }` rather than value
+        /// references. Captured at Delete construction time because the
+        /// originating Resource is gone by the time the executor runs
+        /// (#2871). Empty for legacy state files.
+        #[serde(default)]
+        explicit_dependencies: HashSet<String>,
     },
 
     /// Import an existing resource into state (via provider read)
@@ -180,6 +189,33 @@ impl Effect {
         }
         self.resource().and_then(|r| r.binding.clone())
     }
+
+    /// Returns the binding names this effect depends on **via explicit
+    /// `directives { depends_on = [...] }` declarations**, as a snapshot
+    /// (cloned).
+    ///
+    /// For variants carrying a `Resource` (Create, Update, Replace,
+    /// Read), the answer is derived live from
+    /// `resource.directives.depends_on`. For Delete the answer comes
+    /// from a stored `explicit_dependencies` set captured by the differ
+    /// at construction time, because the originating Resource is gone
+    /// by the time the executor runs (#2871).
+    ///
+    /// State-only effects (Import, Remove, Move) return an empty set —
+    /// they are scheduling primitives, not resource-state operations.
+    pub fn explicit_dependencies(&self) -> HashSet<String> {
+        if let Some(res) = self.resource() {
+            return res.directives.depends_on.iter().cloned().collect();
+        }
+        if let Effect::Delete {
+            explicit_dependencies,
+            ..
+        } = self
+        {
+            return explicit_dependencies.clone();
+        }
+        HashSet::new()
+    }
 }
 
 #[cfg(test)]
@@ -224,6 +260,7 @@ mod tests {
             directives: Directives::default(),
             binding: None,
             dependencies: HashSet::new(),
+            explicit_dependencies: std::collections::HashSet::new(),
         };
         assert!(effect.resource().is_none());
     }
@@ -290,6 +327,7 @@ mod tests {
                 directives: Directives::default(),
                 binding: None,
                 dependencies: HashSet::new(),
+                explicit_dependencies: std::collections::HashSet::new(),
             },
         ];
 
@@ -297,6 +335,82 @@ mod tests {
             let json = serde_json::to_string(&effect).unwrap();
             let deserialized: Effect = serde_json::from_str(&json).unwrap();
             assert_eq!(effect, deserialized, "Round-trip failed for {:?}", effect);
+        }
+    }
+
+    #[test]
+    fn explicit_dependencies_derived_from_resource_directives() {
+        use crate::resource::Directives;
+        let mut bucket = Resource::new("s3.Bucket", "b");
+        bucket.directives = Directives {
+            depends_on: vec!["role".to_string(), "kms".to_string()],
+            ..Directives::default()
+        };
+        let create = Effect::Create(bucket.clone());
+        let got = create.explicit_dependencies();
+        assert!(got.contains("role") && got.contains("kms"), "got {:?}", got);
+    }
+
+    #[test]
+    fn explicit_dependencies_for_delete_uses_stored_set() {
+        let effect = Effect::Delete {
+            id: ResourceId::new("s3.Bucket", "b"),
+            identifier: "x".to_string(),
+            directives: Directives::default(),
+            binding: Some("bucket".to_string()),
+            dependencies: HashSet::from(["role".to_string(), "kms".to_string()]),
+            explicit_dependencies: HashSet::from(["role".to_string()]),
+        };
+        let got = effect.explicit_dependencies();
+        assert!(got.contains("role"));
+        assert!(!got.contains("kms"), "kms is value-ref-only; got {:?}", got);
+    }
+
+    #[test]
+    fn explicit_dependencies_empty_for_state_only_effects() {
+        let imp = Effect::Import {
+            id: ResourceId::new("s3.Bucket", "b"),
+            identifier: "x".to_string(),
+        };
+        let rem = Effect::Remove {
+            id: ResourceId::new("s3.Bucket", "b"),
+        };
+        let mov = Effect::Move {
+            from: ResourceId::new("s3.Bucket", "old"),
+            to: ResourceId::new("s3.Bucket", "new"),
+        };
+        for e in [imp, rem, mov] {
+            assert!(
+                e.explicit_dependencies().is_empty(),
+                "expected empty for state-only, got {:?}",
+                e.explicit_dependencies()
+            );
+        }
+    }
+
+    #[test]
+    fn delete_legacy_state_without_explicit_deps_deserialises_to_empty() {
+        // Pre-#2871 state files have no `explicit_dependencies` field.
+        // `#[serde(default)]` must populate it as an empty HashSet so
+        // round-tripping legacy state never fails.
+        let legacy = serde_json::json!({
+            "Delete": {
+                "id": {"provider": "aws", "resource_type": "s3.Bucket", "name": "b"},
+                "identifier": "x",
+                "directives": {},
+                "binding": null,
+                "dependencies": ["role"],
+            }
+        });
+        let effect: Effect = serde_json::from_value(legacy).unwrap();
+        if let Effect::Delete {
+            explicit_dependencies,
+            ..
+        } = &effect
+        {
+            assert!(explicit_dependencies.is_empty());
+        } else {
+            panic!("expected Delete, got {:?}", effect);
         }
     }
 }

@@ -1082,6 +1082,7 @@ fn test_mixed_plan_tree_with_delete_effect() {
         directives: Directives::default(),
         binding: Some("subnet".to_string()),
         dependencies: HashSet::from(["vpc".to_string()]),
+        explicit_dependencies: std::collections::HashSet::new(),
     };
 
     let mut plan = Plan::new();
@@ -1225,6 +1226,7 @@ fn format_effect_delete_uses_binding_name() {
         directives: Directives::default(),
         binding: Some("my_vpc".to_string()),
         dependencies: HashSet::new(),
+        explicit_dependencies: std::collections::HashSet::new(),
     };
     assert_eq!(format_effect(&effect), "Delete awscc.ec2.Vpc my_vpc");
 }
@@ -1237,6 +1239,7 @@ fn format_effect_delete_falls_back_to_id_name() {
         directives: Directives::default(),
         binding: None,
         dependencies: HashSet::new(),
+        explicit_dependencies: std::collections::HashSet::new(),
     };
     assert_eq!(
         format_effect(&effect),

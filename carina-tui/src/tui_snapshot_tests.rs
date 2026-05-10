@@ -111,6 +111,7 @@ fn build_mixed_operations_plan() -> Plan {
         directives: Directives::default(),
         binding: Some("old_subnet".to_string()),
         dependencies: HashSet::new(),
+        explicit_dependencies: std::collections::HashSet::new(),
     });
     plan
 }
