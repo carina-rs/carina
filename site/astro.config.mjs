@@ -10,12 +10,19 @@ const crnGrammar = JSON.parse(
   ),
 );
 
+const carinaDark = JSON.parse(
+  readFileSync(
+    fileURLToPath(new URL('./src/grammars/carina-dark.theme.json', import.meta.url)),
+    'utf-8',
+  ),
+);
+
 export default defineConfig({
   site: 'https://carina-rs.dev',
   integrations: [mdx()],
   markdown: {
     shikiConfig: {
-      theme: 'css-variables',
+      theme: carinaDark,
       langs: [crnGrammar],
     },
   },

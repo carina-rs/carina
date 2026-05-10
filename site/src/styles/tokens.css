@@ -372,19 +372,4 @@ a:hover { color: var(--accent-high); }
   --feature-card-icon-bg:    var(--bg-panel);
   --feature-card-icon-color: var(--accent);
 
-  /* ----- Shiki css-variables theme (Astro 4 namespace) -----
-     Astro emits inline `style="color: var(--astro-code-token-*)"` against
-     these slots; map each stock token to a --code-* alias so the dark
-     palette stays in sync with the rest of the design system. */
-  --astro-code-color-text:               var(--code-id);
-  --astro-code-color-background:         var(--code-block-bg);
-  --astro-code-token-keyword:            var(--code-keyword);
-  --astro-code-token-string:             var(--code-string);
-  --astro-code-token-string-expression:  var(--code-string);
-  --astro-code-token-constant:           var(--code-bool);
-  --astro-code-token-parameter:          var(--code-id);
-  --astro-code-token-function:           var(--code-id);
-  --astro-code-token-punctuation:        var(--code-muted);
-  --astro-code-token-link:               var(--code-attr);
-  --astro-code-token-comment:            var(--code-muted);
 }
