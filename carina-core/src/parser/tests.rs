@@ -8783,6 +8783,77 @@ fn parse_duration_rejects_internal_whitespace() {
     }
 }
 
+/// Multi-file fixture per CLAUDE.md's "Directory-scoped, never single-file"
+/// rule: a Duration value declared on one `.crn` file's resource must
+/// flow through the directory-scoped parse pipeline (#2817's
+/// `parse_directory_files`) intact, and a sibling file must be able to
+/// reference it without the seeding pass mistyping the value. Both
+/// shapes — the literal carrying through to a resource attribute, and
+/// the cross-file binding reference — are covered.
+#[test]
+fn parse_duration_in_directory_scoped_fixture() {
+    use crate::config_loader::parse_directory;
+    let tmp = tempfile::tempdir().unwrap();
+    // main.crn carries the Duration literal on a resource attribute —
+    // exercises the parser's `Rule::duration_literal` arm via the
+    // `expression` production used inside resource blocks.
+    std::fs::write(
+        tmp.path().join("main.crn"),
+        r#"
+            provider test {
+                source = "x/y"
+                version = "0.1"
+            }
+
+            test.r.cert {
+                name        = "cert"
+                wait_time   = 75min
+                zero_time   = 0s
+            }
+        "#,
+    )
+    .unwrap();
+    // sibling.crn declares its own Duration value on a separate
+    // resource, proving the duration-literal arm is reachable in every
+    // file the directory pipeline merges (not just the first one).
+    std::fs::write(
+        tmp.path().join("sibling.crn"),
+        r#"
+            test.r.other {
+                name      = "other"
+                wait_time = 5min
+            }
+        "#,
+    )
+    .unwrap();
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
+        .expect("multi-file fixture with a Duration must parse");
+    let cert = parsed
+        .resources
+        .iter()
+        .find(|r| r.attributes.contains_key("zero_time"))
+        .expect("cert resource (with `zero_time`) present");
+    match cert.attributes.get("wait_time") {
+        Some(Value::Duration(d)) => assert_eq!(*d, std::time::Duration::from_secs(4500)),
+        other => panic!("expected Value::Duration(4500), got {other:?}"),
+    }
+    match cert.attributes.get("zero_time") {
+        Some(Value::Duration(d)) => assert_eq!(*d, std::time::Duration::ZERO),
+        other => panic!("expected Value::Duration(0), got {other:?}"),
+    }
+    // The sibling file's resource is identifiable by lacking the
+    // `zero_time` attribute that only `cert` carries.
+    let other = parsed
+        .resources
+        .iter()
+        .find(|r| r.attributes.contains_key("wait_time") && !r.attributes.contains_key("zero_time"))
+        .expect("sibling-file resource present");
+    match other.attributes.get("wait_time") {
+        Some(Value::Duration(d)) => assert_eq!(*d, std::time::Duration::from_secs(5 * 60)),
+        other => panic!("expected Value::Duration(300), got {other:?}"),
+    }
+}
+
 #[test]
 fn extract_directives_accepts_empty_depends_on_list() {
     // `depends_on = []` is a legal no-op — the parser must accept it

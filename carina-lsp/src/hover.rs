@@ -54,6 +54,7 @@ fn format_value_for_hover(value: &Value) -> String {
         Value::Int(n) => n.to_string(),
         Value::Float(f) => f.to_string(),
         Value::Bool(b) => b.to_string(),
+        Value::Duration(d) => carina_core::value::render_duration(*d),
         Value::List(_) | Value::StringList(_) => "[...]".to_string(),
         Value::Map(_) => "{...}".to_string(),
         _ => format!("{:?}", value),

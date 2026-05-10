@@ -560,6 +560,7 @@ impl PartialEq for Value {
             (Value::Int(a), Value::Int(b)) => a == b,
             (Value::Float(a), Value::Float(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Duration(a), Value::Duration(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::StringList(a), Value::StringList(b)) => a == b,
             (Value::Map(a), Value::Map(b)) => a == b,

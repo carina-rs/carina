@@ -70,6 +70,7 @@ fn format_deferred_value(value: &Value) -> String {
         Value::Int(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
         Value::Bool(b) => b.to_string(),
+        Value::Duration(d) => carina_core::value::render_duration(*d),
         Value::ResourceRef { path } => path.to_dot_string().to_string(),
         Value::List(items) => {
             let formatted: Vec<String> = items.iter().map(format_deferred_value).collect();
@@ -97,6 +98,7 @@ fn format_export_value(value: &Value) -> String {
         Value::Int(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
         Value::Bool(b) => b.to_string(),
+        Value::Duration(d) => carina_core::value::render_duration(*d),
         Value::ResourceRef { path } => path.to_dot_string().to_string(),
         Value::List(items) => {
             let formatted: Vec<String> = items.iter().map(format_export_value).collect();

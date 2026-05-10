@@ -45,9 +45,11 @@ enum ValidateValue {
     Bool(bool),
     Int(i64),
     Float(f64),
-    /// Duration is treated as a numeric value during validation —
-    /// stored as integer seconds so the existing `Compare` numeric
-    /// path can compare two durations or a duration and an int.
+    /// Duration carried as `std::time::Duration`. Compared via its
+    /// native `PartialOrd` (total-ordered by elapsed time) — see the
+    /// matching arm in `compare_validate_values`. Cross-type comparison
+    /// against `Int` / `Float` is not supported; users who want to
+    /// compare a Duration to a number convert at the call site.
     Duration(std::time::Duration),
     String(String),
 }
