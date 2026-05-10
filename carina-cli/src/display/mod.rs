@@ -1135,6 +1135,15 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
             writeln!(out, "{}{}:", attr_prefix, key).unwrap();
             render_map_diff_entries(out, entries.as_slice(), attr_prefix);
         }
+        DetailRow::StringListDiff {
+            key,
+            unchanged,
+            added,
+            removed,
+        } => {
+            writeln!(out, "{}{}:", attr_prefix, key).unwrap();
+            render_string_list_diff_entries(out, unchanged, added, removed, attr_prefix);
+        }
         DetailRow::ListOfMapsDiff {
             key,
             unchanged,
@@ -1225,6 +1234,16 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
             let suffix = format!(" {}", "(forces replacement)".magenta());
             writeln!(out, "{}{}:{}", attr_prefix, key, suffix).unwrap();
             render_map_diff_entries(out, entries, attr_prefix);
+        }
+        DetailRow::ReplaceStringListDiff {
+            key,
+            unchanged,
+            added,
+            removed,
+        } => {
+            let suffix = format!(" {}", "(forces replacement)".magenta());
+            writeln!(out, "{}{}:{}", attr_prefix, key, suffix).unwrap();
+            render_string_list_diff_entries(out, unchanged, added, removed, attr_prefix);
         }
         DetailRow::TemporaryNameNote {
             can_rename,
@@ -1341,6 +1360,49 @@ fn render_map_diff_entries(out: &mut String, entries: &[MapDiffEntryIR], attr_pr
     }
 }
 
+/// Render a string-list diff (#2943) with ANSI colors. The
+/// `# (n unchanged elements hidden)` summary trails the diff lines to
+/// match the placement of `# (n unchanged fields hidden)` in
+/// `render_list_of_maps_diff` and `# (n unchanged attributes hidden)`
+/// at the top level.
+fn render_string_list_diff_entries(
+    out: &mut String,
+    unchanged: &[String],
+    added: &[String],
+    removed: &[String],
+    attr_prefix: &str,
+) {
+    for s in removed {
+        writeln!(
+            out,
+            "{}  {} \"{}\"",
+            attr_prefix,
+            "-".red().strikethrough(),
+            s.red().strikethrough()
+        )
+        .unwrap();
+    }
+    for s in added {
+        writeln!(
+            out,
+            "{}  {} {}",
+            attr_prefix,
+            "+".green(),
+            format!("\"{}\"", s).green()
+        )
+        .unwrap();
+    }
+    if !unchanged.is_empty() {
+        writeln!(
+            out,
+            "{}  {}",
+            attr_prefix,
+            hidden_unchanged_summary(unchanged.len(), "element").dimmed()
+        )
+        .unwrap();
+    }
+}
+
 /// Render a list-of-maps diff with ANSI colors.
 fn render_list_of_maps_diff(
     out: &mut String,
@@ -1354,11 +1416,18 @@ fn render_list_of_maps_diff(
         writeln!(out, "{}    {}", attr_prefix, item).unwrap();
     }
     for item in modified {
-        let has_nested = item
-            .fields
-            .iter()
-            .any(|f| matches!(f, ListOfMapsDiffField::NestedMapChanged { .. }));
-        if has_nested {
+        // `StringListChanged` (#2943) forces the block layout for the
+        // same reason `NestedMapChanged` (#2881) does: its rendering
+        // spans multiple lines and cannot fit inside the inline
+        // `~ {field: value, ...}` summary.
+        let has_block_field = item.fields.iter().any(|f| {
+            matches!(
+                f,
+                ListOfMapsDiffField::NestedMapChanged { .. }
+                    | ListOfMapsDiffField::StringListChanged { .. }
+            )
+        });
+        if has_block_field {
             writeln!(out, "{}  {} {{", attr_prefix, "~".yellow().bold()).unwrap();
             for field in item.fields.iter() {
                 match field {
@@ -1378,6 +1447,22 @@ fn render_list_of_maps_diff(
                         writeln!(out, "{}      {}:", attr_prefix, key).unwrap();
                         let nested_prefix = format!("{}      ", attr_prefix);
                         render_map_diff_entries(out, entries, &nested_prefix);
+                    }
+                    ListOfMapsDiffField::StringListChanged {
+                        key,
+                        unchanged,
+                        added,
+                        removed,
+                    } => {
+                        writeln!(out, "{}      {}:", attr_prefix, key).unwrap();
+                        let nested_prefix = format!("{}      ", attr_prefix);
+                        render_string_list_diff_entries(
+                            out,
+                            unchanged,
+                            added,
+                            removed,
+                            &nested_prefix,
+                        );
                     }
                 }
             }
@@ -1490,6 +1575,13 @@ fn render_modified_fields(fields: &[ListOfMapsDiffField]) -> String {
             }
             ListOfMapsDiffField::NestedMapChanged { key, .. } => {
                 result_parts.push(format!("{}: (nested changes)", key));
+            }
+            ListOfMapsDiffField::StringListChanged { .. } => {
+                // `has_block_field` in `render_list_of_maps_diff` keeps
+                // `StringListChanged` out of the inline summary path.
+                unreachable!(
+                    "StringListChanged should be handled by the block layout, not the inline summary"
+                );
             }
         }
     }

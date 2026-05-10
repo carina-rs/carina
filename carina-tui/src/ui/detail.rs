@@ -6,7 +6,9 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{App, FocusedPanel};
 
-use super::diff::{render_list_of_maps_diff, render_map_diff_entries};
+use super::diff::{
+    render_list_of_maps_diff, render_map_diff_entries, render_string_list_diff_entries,
+};
 use super::style::effect_style;
 use super::value_view::{value_spans, value_spans_dimmed};
 
@@ -185,6 +187,19 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
             lines.push(first_line);
             render_map_diff_entries(lines, entries.as_slice());
         }
+        DetailRow::StringListDiff {
+            key,
+            unchanged,
+            added,
+            removed,
+        } => {
+            let mut first_line = Line::from(Span::raw(format!("  {}:", key)));
+            if is_selected {
+                first_line = first_line.style(Style::default().bg(Color::DarkGray));
+            }
+            lines.push(first_line);
+            render_string_list_diff_entries(lines, unchanged, added, removed);
+        }
         DetailRow::ListOfMapsDiff {
             key,
             unchanged,
@@ -294,6 +309,19 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
             }
             lines.push(first_line);
             render_map_diff_entries(lines, entries);
+        }
+        DetailRow::ReplaceStringListDiff {
+            key,
+            unchanged,
+            added,
+            removed,
+        } => {
+            let mut first_line = Line::from(Span::raw(format!("  {}:", key)));
+            if is_selected {
+                first_line = first_line.style(Style::default().bg(Color::DarkGray));
+            }
+            lines.push(first_line);
+            render_string_list_diff_entries(lines, unchanged, added, removed);
         }
         DetailRow::TemporaryNameNote {
             can_rename,

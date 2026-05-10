@@ -1,0 +1,41 @@
+# Update plan: a List<String> field inside a list-of-maps modified
+# element grew by two trailing entries (issue #2943). Pre-fix, the
+# entire `action: [old1, ..., oldN] → [old1, ..., oldN, new1, new2]`
+# pair rendered on one inline line, overflowing the terminal for
+# realistic IAM action lists. Post-fix, the diff is laid out
+# multi-line with `+` lines for added entries.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let policy = awscc.iam.RolePolicy {
+  policy_name = 'test-inline'
+  role_name   = 'test-role'
+  statement = [
+    {
+      sid    = 'AllowRoute53Read'
+      effect = 'Allow'
+      action = [
+        'route53:CreateHostedZone',
+        'route53:DeleteHostedZone',
+        'route53:GetHostedZone',
+        'route53:ListHostedZones',
+        'route53:ListHostedZonesByName',
+        'route53:UpdateHostedZoneComment',
+        'route53:ChangeTagsForResource',
+        'route53:ListTagsForResource',
+        'route53:ChangeResourceRecordSets',
+        'route53:ListResourceRecordSets',
+        'route53:GetChange',
+        'route53:ListQueryLoggingConfigs',
+        'route53:GetQueryLoggingConfig',
+      ]
+      resource = '*'
+    },
+  ]
+}
+
+exports {
+  policy_name = policy.policy_name
+}
