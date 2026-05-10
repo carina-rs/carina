@@ -1272,6 +1272,7 @@ fn orphaned_state_resource_produces_delete_effect() {
         &saved_attrs,
         &prev_explicit,
         &HashMap::new(),
+        &[],
     );
 
     // The plan should contain a Delete effect for "removed-bucket"
@@ -2183,6 +2184,7 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
         &saved_attrs,
         &prev_explicit,
         &HashMap::new(),
+        &[],
     );
 
     let delete_effects: Vec<_> = plan
@@ -2265,6 +2267,7 @@ fn refresh_false_uses_cached_state_from_state_file() {
         &saved_attrs,
         &prev_explicit,
         &HashMap::new(),
+        &[],
     );
 
     // No changes expected since desired matches cached state
@@ -2311,6 +2314,7 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
         &saved_attrs,
         &prev_explicit,
         &HashMap::new(),
+        &[],
     );
 
     // With refresh=false, orphaned resources are assumed to still exist,
@@ -2355,6 +2359,7 @@ fn refresh_false_without_state_file_treats_resources_as_new() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &[],
     );
 
     let create_effects: Vec<_> = plan

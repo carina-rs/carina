@@ -1360,6 +1360,7 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
         &saved_attrs,
         &prev_explicit,
         &orphan_dependencies,
+        &parsed.wait_bindings,
     );
 
     // Populate cascading updates for Replace effects with create_before_destroy.

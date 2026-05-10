@@ -413,6 +413,8 @@ fn make_schema(resource_type: &str, attrs: Vec<(&str, AttributeType)>) -> Resour
         force_replace: false,
         operation_config: None,
         exclusive_required: Vec::new(),
+        default_wait_timeout: None,
+        default_wait_interval: None,
     }
 }
 

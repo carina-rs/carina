@@ -1,0 +1,26 @@
+# Plan-display fixture exercising the `wait` construct (carina#2825).
+# `cert_issued` blocks downstream resources until ACM marks the cert
+# ISSUED; the snapshot pins how plan tree renders the wait line.
+
+provider aws {
+    region = "us-east-1"
+}
+
+let cert = aws.acm.Certificate {
+    domain_name       = "registry.example.com"
+    validation_method = "DNS"
+}
+
+let validation_record = aws.route53.RecordSet {
+    hosted_zone_id   = "Z123"
+    name             = "_acme.registry.example.com"
+    type             = "CNAME"
+    ttl              = 60
+    resource_records = ["validation.example.com"]
+}
+
+let cert_issued = wait cert {
+    until      = cert.status == aws.acm.Certificate.Status.Issued
+    depends_on = [validation_record]
+    timeout    = 75min
+}

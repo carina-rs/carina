@@ -465,12 +465,32 @@ pub struct UpstreamState {
     pub source: std::path::PathBuf,
 }
 
+/// Typed `until` predicate captured at parse time. MVP supports the
+/// `<binding>.<attr-path> == <value>` shape; future operators
+/// (`!=`, `&&`/`||`, comparisons, `in`) will grow new variants here
+/// without breaking existing fields.
+///
+/// `lhs_segments` is the dotted path under the target binding —
+/// `[target, attr]` for `cert.status`, `[target, parent, attr]` for
+/// `cert.renewal_summary.renewal_status`. Always non-empty and the
+/// first segment is the target binding name (enforced by the parser).
+///
+/// `rhs` is the literal value to compare against, captured as a
+/// `Value` so namespaced enums (`aws.acm.Certificate.Status.Issued`),
+/// string literals, integers, booleans, and durations all flow into
+/// the same predicate type.
+#[derive(Debug, Clone)]
+pub struct UntilPredicateAst {
+    pub lhs_segments: Vec<String>,
+    pub rhs: crate::resource::Value,
+}
+
 /// A `wait <target> { ... }` declaration captured during parse.
 ///
-/// Carries the parsed surface form of the `until` predicate so later
-/// phases (differ → executor) can both type-check / lower the predicate
-/// (via `until_ast`) and echo the user-authored expression in plan
-/// display (via `until_raw`). `timeout_secs` is normalised to seconds
+/// Carries the parsed surface form of the `until` predicate so plan
+/// display can echo the user-authored expression verbatim, plus the
+/// structured `until_predicate` for the differ / executor to lower
+/// into `WaitPredicate`. `timeout_secs` is normalised to seconds
 /// because `Duration` from carina#2824 already canonicalises that way.
 ///
 /// See `notes/specs/2026-05-09-wait-construct-design.md`.
@@ -483,10 +503,8 @@ pub struct WaitBinding {
     /// Surface form of the `until` expression as the user wrote it
     /// (e.g. `"cert.status == aws.acm.Certificate.Status.Issued"`).
     pub until_raw: String,
-    /// Parsed `until` predicate. Reuses `validate_expr` so later phases
-    /// can lower to `WaitPredicate` once the supported predicate shape
-    /// (MVP: `<target>.<attr> == <value>`) is enforced.
-    pub until_ast: ValidateExpr,
+    /// Structured predicate for the differ / executor to consume.
+    pub until_predicate: UntilPredicateAst,
     /// Optional user override of the wait timeout, in whole seconds. When
     /// `None` the differ falls back to the target schema's default.
     pub timeout_secs: Option<u64>,

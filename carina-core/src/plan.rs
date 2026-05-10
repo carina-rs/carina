@@ -435,6 +435,7 @@ mod tests {
             until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
             timeout: Duration::from_secs(75 * 60),
             interval: Duration::from_secs(5),
+            explicit_dependencies: std::collections::HashSet::new(),
         };
         assert_eq!(
             format_effect_brief(&e),
@@ -461,6 +462,7 @@ mod tests {
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: Duration::from_secs(60),
             interval: Duration::from_secs(5),
+            explicit_dependencies: std::collections::HashSet::new(),
         });
         let summary = plan.summary();
         assert_eq!(summary.create, 1);

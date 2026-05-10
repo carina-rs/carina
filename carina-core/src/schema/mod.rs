@@ -1976,7 +1976,27 @@ pub struct ResourceSchema {
     /// (a function pointer), this is plain data and survives the WASM plugin
     /// boundary.
     pub exclusive_required: Vec<Vec<String>>,
+    /// Default total timeout for `wait <target> { ... }` polling against
+    /// this resource type. `None` falls back to
+    /// [`WAIT_DEFAULT_TIMEOUT`].
+    pub default_wait_timeout: Option<std::time::Duration>,
+    /// Default poll cadence between `read()` calls for `wait <target>`
+    /// against this resource type. `None` falls back to
+    /// [`WAIT_DEFAULT_INTERVAL`].
+    pub default_wait_interval: Option<std::time::Duration>,
 }
+
+/// Fallback total timeout when neither the user nor the resource schema
+/// declares one. Conservative — real provider workloads should declare
+/// their own (e.g. ACM Certificate at 75min, EC2 Instance Running at
+/// 5min). Used by the differ when emitting `Effect::Wait`.
+pub const WAIT_DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Fallback poll cadence when the resource schema declares none. The
+/// executor pauses for this between `read()` calls. AWS API rate limits
+/// drive the lower bound; 5 seconds is the same default Terraform uses
+/// for `aws_acm_certificate_validation`.
+pub const WAIT_DEFAULT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl ResourceSchema {
     pub fn new(resource_type: impl Into<String>) -> Self {
@@ -1990,7 +2010,21 @@ impl ResourceSchema {
             force_replace: false,
             operation_config: None,
             exclusive_required: Vec::new(),
+            default_wait_timeout: None,
+            default_wait_interval: None,
         }
+    }
+
+    /// Set the schema-declared default total timeout for `wait` polling.
+    pub fn with_default_wait_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.default_wait_timeout = Some(timeout);
+        self
+    }
+
+    /// Set the schema-declared default poll interval for `wait` polling.
+    pub fn with_default_wait_interval(mut self, interval: std::time::Duration) -> Self {
+        self.default_wait_interval = Some(interval);
+        self
     }
 
     pub fn attribute(mut self, schema: AttributeSchema) -> Self {

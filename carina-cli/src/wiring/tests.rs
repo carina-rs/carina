@@ -179,6 +179,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
         &saved_attrs,
         &prev_explicit,
         &orphan_deps,
+        &[],
     );
     assert!(
         !plan_without.is_empty(),
@@ -196,6 +197,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
         &saved_attrs,
         &prev_explicit,
         &orphan_deps,
+        &[],
     );
     assert!(
         plan_with.is_empty(),
@@ -283,6 +285,7 @@ fn test_merge_default_tags_prevents_false_diff() {
         &saved_attrs,
         &prev_explicit,
         &orphan_deps,
+        &[],
     );
     assert!(
         !plan_without.is_empty(),
@@ -311,6 +314,7 @@ fn test_merge_default_tags_prevents_false_diff() {
         &saved_attrs,
         &prev_explicit,
         &orphan_deps,
+        &[],
     );
     assert!(
         plan_with.is_empty(),

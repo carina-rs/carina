@@ -9,7 +9,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use crate::deps::find_failed_dependency;
 use crate::effect::Effect;
 use crate::provider::Provider;
-use crate::resource::{Resource, ResourceId, State};
+use crate::resource::{Resource, ResourceId, State, Value};
 
 use super::basic::{
     ExecutionState, count_actionable_effects, execute_basic_effect, process_basic_result,
@@ -93,6 +93,35 @@ pub(super) fn build_dependency_map(
     }
     for (parent_idx, child_idx) in reverse_deps {
         deps_of.entry(parent_idx).or_default().insert(child_idx);
+    }
+
+    // Wait dependencies: each `Effect::Wait` depends on the effect that
+    // produces its target (Create / Update / Replace on `target_id`) so
+    // the wait does not start polling before the target has been
+    // created. Explicit `depends_on = [...]` entries from the wait
+    // block layer on top.
+    for (idx, effect) in effects.iter().enumerate() {
+        if let Effect::Wait { target_id, .. } = effect {
+            // Edge from the wait to its target's binding-effect (if
+            // present in the plan). The target may already exist (no
+            // Create effect in this plan) — then the wait is free to
+            // start immediately, which is what we want for refresh-only
+            // applies.
+            if let Some(target_binding) = lookup_idx(target_id.name_str()) {
+                deps_of.entry(idx).or_default().insert(target_binding);
+            }
+            // Honour `depends_on = [...]` declared in the wait block.
+            for dep_binding in effect.explicit_dependencies() {
+                if let Some(dep_idx) = lookup_idx(&dep_binding) {
+                    deps_of.entry(idx).or_default().insert(dep_idx);
+                }
+            }
+            // Defensive: ensure the wait has an entry even when it has
+            // no resolved deps (an isolated wait still needs to appear
+            // in deps_of so the scheduler's `&deps_of[&idx]` lookup
+            // doesn't panic).
+            deps_of.entry(idx).or_default();
+        }
     }
 
     deps_of
@@ -323,11 +352,61 @@ pub(super) async fn execute_effects_sequential(
                     Effect::Import { .. } | Effect::Remove { .. } | Effect::Move { .. } => {
                         SingleEffectResult::ReadNoOp
                     }
-                    // Wait effects are dispatched by a follow-up PR (Phase 4
-                    // of carina#2825). Until then, treat them as a planner
-                    // no-op so existing tests stay green; they will not be
-                    // produced by the differ in this PR.
-                    Effect::Wait { .. } => SingleEffectResult::ReadNoOp,
+                    Effect::Wait {
+                        binding,
+                        target_id,
+                        target_identifier,
+                        until,
+                        timeout,
+                        interval,
+                        ..
+                    } => {
+                        let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                        let started = Instant::now();
+                        observer.on_event(&ExecutionEvent::EffectStarted { effect });
+                        let progress = ProgressInfo {
+                            completed: c,
+                            total,
+                        };
+                        match super::wait::execute_wait_effect(
+                            provider,
+                            target_id,
+                            target_identifier.as_deref(),
+                            until,
+                            *timeout,
+                            *interval,
+                        )
+                        .await
+                        {
+                            Ok(state) => {
+                                observer.on_event(&ExecutionEvent::EffectSucceeded {
+                                    effect,
+                                    state: Some(&state),
+                                    duration: started.elapsed(),
+                                    progress,
+                                });
+                                SingleEffectResult::Wait {
+                                    success: true,
+                                    binding: binding.clone(),
+                                    target_state: Some(state),
+                                }
+                            }
+                            Err(e) => {
+                                let err_msg = e.to_string();
+                                observer.on_event(&ExecutionEvent::EffectFailed {
+                                    effect,
+                                    error: &err_msg,
+                                    duration: started.elapsed(),
+                                    progress,
+                                });
+                                SingleEffectResult::Wait {
+                                    success: false,
+                                    binding: binding.clone(),
+                                    target_state: None,
+                                }
+                            }
+                        }
+                    }
                 };
                 (idx, result)
             });
@@ -408,6 +487,37 @@ pub(super) async fn execute_effects_sequential(
                 }
             }
             SingleEffectResult::ReadNoOp => {}
+            SingleEffectResult::Wait {
+                success,
+                binding,
+                target_state,
+            } => {
+                if success {
+                    success_count += 1;
+                    if let Some(state) = target_state {
+                        // Register the captured target snapshot under the
+                        // wait's *synthetic* ResourceId so the downstream
+                        // resolution layer can deref `<binding>.<attr>` —
+                        // and under the binding name in `bindings` so
+                        // resolve_refs sees the same attribute map. Wait
+                        // effects do not persist to the state file
+                        // (handled by `state_writeback_should_skip`).
+                        let synthetic = ResourceId::new("__wait", &binding);
+                        let attrs: HashMap<String, Value> = state
+                            .attributes
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
+                        input
+                            .bindings
+                            .record_applied(Some(&binding), &attrs, &state);
+                        applied_states.insert(synthetic, state);
+                    }
+                } else {
+                    failure_count += 1;
+                    failed_bindings.insert(binding);
+                }
+            }
         }
     }
 

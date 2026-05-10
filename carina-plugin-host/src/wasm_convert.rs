@@ -553,6 +553,12 @@ fn proto_schema_to_core(s: &proto::ResourceSchema) -> CoreResourceSchema {
             }
         }),
         exclusive_required: s.exclusive_required.clone(),
+        // Wait defaults are not (yet) carried across the WASM plugin
+        // boundary — providers fall back to the carina-core constants
+        // (`WAIT_DEFAULT_TIMEOUT` / `WAIT_DEFAULT_INTERVAL`) until the
+        // protocol gains explicit fields. See carina-rs/carina#2825.
+        default_wait_timeout: None,
+        default_wait_interval: None,
     }
 }
 

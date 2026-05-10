@@ -60,6 +60,7 @@ fn create_before_destroy_generates_temporary_name_for_name_attribute() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &[],
     );
 
     assert_eq!(plan.effects().len(), 1);
@@ -139,6 +140,7 @@ fn create_before_destroy_generates_temporary_name_with_can_rename() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &[],
     );
 
     assert_eq!(plan.effects().len(), 1);
@@ -196,6 +198,7 @@ fn no_temporary_name_without_create_before_destroy() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &[],
     );
 
     assert_eq!(plan.effects().len(), 1);
@@ -256,6 +259,7 @@ fn no_temporary_name_when_name_prefix_is_used() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &[],
     );
 
     assert_eq!(plan.effects().len(), 1);
@@ -307,6 +311,7 @@ fn no_temporary_name_without_name_attribute_in_schema() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &[],
     );
 
     assert_eq!(plan.effects().len(), 1);
@@ -365,6 +370,7 @@ fn no_temporary_name_when_name_attribute_changes() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &[],
     );
 
     assert_eq!(plan.effects().len(), 1);
@@ -620,6 +626,7 @@ fn create_plan_detects_attribute_removal() {
         &HashMap::new(),
         &prev_explicit,
         &HashMap::new(),
+        &[],
     );
 
     assert_eq!(plan.effects().len(), 1);
@@ -685,6 +692,7 @@ fn create_plan_filters_non_removable_attribute_removal() {
         &HashMap::new(),
         &prev_explicit,
         &HashMap::new(),
+        &[],
     );
 
     assert_eq!(plan.effects().len(), 1);
@@ -750,6 +758,7 @@ fn create_plan_skips_update_when_only_non_removable_removal() {
         &HashMap::new(),
         &prev_explicit,
         &HashMap::new(),
+        &[],
     );
 
     assert!(
@@ -821,6 +830,7 @@ fn prevent_destroy_blocks_delete_for_orphaned_resource() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &[],
     );
 
     // Should have NO delete effects
@@ -882,6 +892,7 @@ fn prevent_destroy_blocks_replace() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &[],
     );
 
     // Should have NO replace effects
@@ -933,6 +944,7 @@ fn prevent_destroy_does_not_block_update() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &[],
     );
 
     // Should generate an Update effect (not blocked)
@@ -968,6 +980,7 @@ fn prevent_destroy_does_not_block_create() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &[],
     );
 
     // Should generate a Create effect (not blocked)
@@ -1007,6 +1020,7 @@ fn without_prevent_destroy_delete_works_normally() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &[],
     );
 
     // Should generate a Delete effect
@@ -1068,6 +1082,7 @@ fn prevent_destroy_collects_multiple_errors() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &[],
     );
 
     assert!(plan.effects().is_empty());
@@ -1104,6 +1119,7 @@ fn virtual_resources_are_skipped_in_plan() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &[],
     );
 
     // Only the real resource should generate an effect (Create)
@@ -1111,5 +1127,168 @@ fn virtual_resources_are_skipped_in_plan() {
     assert_eq!(
         plan.effects()[0].resource_id(),
         &ResourceId::new("ec2.SecurityGroup", "sg")
+    );
+}
+
+#[test]
+fn wait_binding_lowers_to_wait_effect() {
+    use crate::effect::Effect;
+    use crate::parser::{UntilPredicateAst, WaitBinding};
+    use crate::wait::predicate::{AttrPath, WaitPredicate};
+
+    let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
+    let resources = vec![cert];
+
+    let wait = WaitBinding {
+        binding: "cert_issued".to_string(),
+        target: "cert".to_string(),
+        until_raw: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
+        until_predicate: UntilPredicateAst {
+            lhs_segments: vec!["cert".to_string(), "status".to_string()],
+            rhs: Value::String("aws.acm.Certificate.Status.Issued".to_string()),
+        },
+        timeout_secs: Some(75 * 60),
+        depends_on: vec![],
+        line: 1,
+    };
+
+    let plan = create_plan(
+        &resources,
+        &HashMap::new(),
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &[wait],
+    );
+
+    let wait_effect = plan
+        .effects()
+        .iter()
+        .find(|e| matches!(e, Effect::Wait { .. }))
+        .expect("expected Wait effect");
+    let Effect::Wait {
+        binding,
+        target_id,
+        until,
+        until_surface,
+        timeout,
+        ..
+    } = wait_effect
+    else {
+        unreachable!();
+    };
+    assert_eq!(binding, "cert_issued");
+    assert_eq!(target_id.name.as_str(), "cert");
+    assert_eq!(target_id.resource_type, "acm.Certificate");
+    assert_eq!(
+        until,
+        &WaitPredicate::Equals {
+            attr: AttrPath {
+                segments: vec!["status".to_string()],
+            },
+            value: Value::String("aws.acm.Certificate.Status.Issued".to_string()),
+        }
+    );
+    assert_eq!(*timeout, std::time::Duration::from_secs(75 * 60));
+    assert_eq!(
+        until_surface,
+        "cert.status == aws.acm.Certificate.Status.Issued"
+    );
+}
+
+#[test]
+fn wait_uses_schema_default_timeout_when_omitted() {
+    use crate::effect::Effect;
+    use crate::parser::{UntilPredicateAst, WaitBinding};
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
+    let resources = vec![cert];
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("acm.Certificate")
+            .attribute(AttributeSchema::new("status", AttributeType::String))
+            .with_default_wait_timeout(std::time::Duration::from_secs(99))
+            .with_default_wait_interval(std::time::Duration::from_secs(7)),
+    );
+
+    let wait = WaitBinding {
+        binding: "cert_issued".to_string(),
+        target: "cert".to_string(),
+        until_raw: "cert.status == ISSUED".to_string(),
+        until_predicate: UntilPredicateAst {
+            lhs_segments: vec!["cert".to_string(), "status".to_string()],
+            rhs: Value::String("ISSUED".to_string()),
+        },
+        timeout_secs: None,
+        depends_on: vec![],
+        line: 1,
+    };
+
+    let plan = create_plan(
+        &resources,
+        &HashMap::new(),
+        &HashMap::new(),
+        &schemas,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &[wait],
+    );
+    let Effect::Wait {
+        timeout, interval, ..
+    } = plan
+        .effects()
+        .iter()
+        .find(|e| matches!(e, Effect::Wait { .. }))
+        .expect("expected Wait effect")
+    else {
+        unreachable!();
+    };
+    assert_eq!(*timeout, std::time::Duration::from_secs(99));
+    assert_eq!(*interval, std::time::Duration::from_secs(7));
+}
+
+#[test]
+fn wait_with_unknown_target_emits_plan_error() {
+    use crate::parser::{UntilPredicateAst, WaitBinding};
+
+    let resources: Vec<Resource> = vec![];
+
+    let wait = WaitBinding {
+        binding: "cert_issued".to_string(),
+        target: "nonexistent".to_string(),
+        until_raw: "nonexistent.status == ISSUED".to_string(),
+        until_predicate: UntilPredicateAst {
+            lhs_segments: vec!["nonexistent".to_string(), "status".to_string()],
+            rhs: Value::String("ISSUED".to_string()),
+        },
+        timeout_secs: None,
+        depends_on: vec![],
+        line: 1,
+    };
+
+    let plan = create_plan(
+        &resources,
+        &HashMap::new(),
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &[wait],
+    );
+    assert!(
+        !plan.errors().is_empty(),
+        "missing-target wait should surface a plan error"
+    );
+    assert!(
+        plan.errors()[0].message.contains("nonexistent"),
+        "error message should mention the missing target, got: {}",
+        plan.errors()[0].message
     );
 }

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use carina_core::config_loader::parse_directory;
 use carina_core::parser::ProviderContext;
+use carina_core::resource::Value;
 
 #[test]
 fn wait_resolves_target_and_depends_on_across_sibling_files() {
@@ -36,6 +37,11 @@ fn wait_resolves_target_and_depends_on_across_sibling_files() {
     );
     assert_eq!(wait.timeout_secs, Some(75 * 60));
     assert_eq!(wait.depends_on, vec!["validation_record"]);
+    assert_eq!(wait.until_predicate.lhs_segments, vec!["cert", "status"]);
+    assert_eq!(
+        wait.until_predicate.rhs,
+        Value::String("aws.acm.Certificate.Status.Issued".to_string())
+    );
 
     // Sanity: the target binding really lives in a sibling file.
     let cert = parsed
