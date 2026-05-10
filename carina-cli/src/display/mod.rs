@@ -1114,7 +1114,7 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
         }
         DetailRow::MapDiff { key, entries } => {
             writeln!(out, "{}{}:", attr_prefix, key).unwrap();
-            render_map_diff_entries(out, entries, attr_prefix);
+            render_map_diff_entries(out, entries.as_slice(), attr_prefix);
         }
         DetailRow::ListOfMapsDiff {
             key,
@@ -1304,17 +1304,19 @@ fn render_map_diff_entries(out: &mut String, entries: &[MapDiffEntryIR], attr_pr
             MapDiffEntryIR::NestedMapDiff { key, entries } => {
                 writeln!(out, "{}    {}:", attr_prefix, key).unwrap();
                 let nested_prefix = format!("{}    ", attr_prefix);
-                render_map_diff_entries(out, entries, &nested_prefix);
+                render_map_diff_entries(out, entries.as_slice(), &nested_prefix);
             }
-            MapDiffEntryIR::NestedListOfMapsDiff {
-                key,
-                modified,
-                added,
-                removed,
-            } => {
+            MapDiffEntryIR::NestedListOfMapsDiff { key, block } => {
                 writeln!(out, "{}    {}:", attr_prefix, key).unwrap();
                 let nested_prefix = format!("{}    ", attr_prefix);
-                render_list_of_maps_diff(out, &[], modified, added, removed, &nested_prefix);
+                render_list_of_maps_diff(
+                    out,
+                    block.unchanged(),
+                    block.modified(),
+                    block.added(),
+                    block.removed(),
+                    &nested_prefix,
+                );
             }
         }
     }

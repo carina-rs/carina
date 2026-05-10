@@ -55,10 +55,13 @@ pub enum DetailRow {
         old: String,
         new: String,
     },
-    /// A map attribute with key-level diffs (for Update effects)
+    /// A map attribute with key-level diffs (for Update effects).
+    /// `entries` is `NonEmptyVec`: a Map with no displayable entries
+    /// is dropped at the IR builder (#2910), not rendered as an empty
+    /// header.
     MapDiff {
         key: String,
-        entries: Vec<MapDiffEntryIR>,
+        entries: NonEmptyVec<MapDiffEntryIR>,
     },
     /// A list-of-maps diff (for Update effects)
     ListOfMapsDiff {
@@ -149,18 +152,66 @@ pub enum MapDiffEntryIR {
     },
     /// Nested map diff: when both old and new values are maps,
     /// recursively compute key-level diffs instead of showing as one-liner.
+    /// `entries` is `NonEmptyVec` so renderers do not need to defend
+    /// against an empty container header (#2910).
     NestedMapDiff {
         key: String,
-        entries: Vec<MapDiffEntryIR>,
+        entries: NonEmptyVec<MapDiffEntryIR>,
     },
     /// Nested list-of-maps diff: when both old and new values are lists of maps,
-    /// show per-item field-level diffs instead of one-liner.
+    /// show per-item field-level diffs instead of one-liner. `block`'s
+    /// constructor enforces "at least one of unchanged/modified/added/removed
+    /// is non-empty" (#2910).
     NestedListOfMapsDiff {
         key: String,
+        block: NonEmptyListOfMapsBlock,
+    },
+}
+
+/// A list-of-maps diff bundle whose constructor refuses the
+/// "everything empty" shape (#2910). The IR builder converts via
+/// [`NonEmptyListOfMapsBlock::from_parts`] and only pushes the parent
+/// row when conversion succeeds, so renderers never see a section
+/// header with nothing under it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NonEmptyListOfMapsBlock {
+    unchanged: Vec<String>,
+    modified: Vec<ListOfMapsDiffModified>,
+    added: Vec<ListOfMapsDiffItem>,
+    removed: Vec<ListOfMapsDiffItem>,
+}
+
+impl NonEmptyListOfMapsBlock {
+    pub fn from_parts(
+        unchanged: Vec<String>,
         modified: Vec<ListOfMapsDiffModified>,
         added: Vec<ListOfMapsDiffItem>,
         removed: Vec<ListOfMapsDiffItem>,
-    },
+    ) -> Option<Self> {
+        if unchanged.is_empty() && modified.is_empty() && added.is_empty() && removed.is_empty() {
+            None
+        } else {
+            Some(Self {
+                unchanged,
+                modified,
+                added,
+                removed,
+            })
+        }
+    }
+
+    pub fn unchanged(&self) -> &[String] {
+        &self.unchanged
+    }
+    pub fn modified(&self) -> &[ListOfMapsDiffModified] {
+        &self.modified
+    }
+    pub fn added(&self) -> &[ListOfMapsDiffItem] {
+        &self.added
+    }
+    pub fn removed(&self) -> &[ListOfMapsDiffItem] {
+        &self.removed
+    }
 }
 
 /// A wholly added or removed item in a list-of-maps diff (#2877).
@@ -695,10 +746,7 @@ fn build_map_diff_row(
     new_value: &Value,
     detail: DetailLevel,
 ) -> Option<DetailRow> {
-    let entries = compute_map_diff_entries(old_value, new_value, detail);
-    if entries.is_empty() {
-        return None;
-    }
+    let entries = NonEmptyVec::from_vec(compute_map_diff_entries(old_value, new_value, detail))?;
     Some(DetailRow::MapDiff {
         key: key.to_string(),
         entries,
@@ -739,31 +787,32 @@ fn compute_map_diff_entries(
                 // If both old and new are maps, recursively diff
                 if matches!(&e.old_value, Value::Map(_)) && matches!(&e.new_value, Value::Map(_)) {
                     let nested = compute_map_diff_entries(Some(&e.old_value), &e.new_value, detail);
-                    // #2910: drop the parent header when every nested
-                    // entry was suppressed (recursive case of #2886).
-                    if nested.is_empty() {
-                        continue;
+                    // #2910: `from_vec` returns None for the all-empty
+                    // recursive case (every grandchild was itself
+                    // suppressed). Skip pushing so the parent header
+                    // never renders empty.
+                    if let Some(entries_nev) = NonEmptyVec::from_vec(nested) {
+                        entries.push(MapDiffEntryIR::NestedMapDiff {
+                            key: e.key.clone(),
+                            entries: entries_nev,
+                        });
                     }
-                    entries.push(MapDiffEntryIR::NestedMapDiff {
-                        key: e.key.clone(),
-                        entries: nested,
-                    });
                 } else if is_list_of_maps(&e.new_value) {
                     // List-of-maps: compute per-item field-level diffs
                     let (_, modified, added, removed) =
                         compute_list_of_maps_diff_parts(Some(&e.old_value), &e.new_value, detail);
-                    // #2910: drop the parent header when every paired
-                    // element was dropped per #2886 and there are no
-                    // wholly-added / wholly-removed elements either.
-                    if modified.is_empty() && added.is_empty() && removed.is_empty() {
-                        continue;
+                    // #2910: `from_parts` returns None when every
+                    // paired element was dropped per #2886 and there
+                    // are no wholly-added / wholly-removed elements
+                    // either.
+                    if let Some(block) =
+                        NonEmptyListOfMapsBlock::from_parts(Vec::new(), modified, added, removed)
+                    {
+                        entries.push(MapDiffEntryIR::NestedListOfMapsDiff {
+                            key: e.key.clone(),
+                            block,
+                        });
                     }
-                    entries.push(MapDiffEntryIR::NestedListOfMapsDiff {
-                        key: e.key.clone(),
-                        modified,
-                        added,
-                        removed,
-                    });
                 } else {
                     entries.push(MapDiffEntryIR::Changed {
                         key: e.key.clone(),
@@ -1054,6 +1103,27 @@ mod tests {
     use super::*;
     use crate::resource::{Resource, ResourceId, State};
     use std::collections::HashSet;
+
+    #[test]
+    fn non_empty_list_of_maps_block_rejects_all_empty() {
+        assert!(
+            NonEmptyListOfMapsBlock::from_parts(Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn non_empty_list_of_maps_block_accepts_any_non_empty_section() {
+        let block = NonEmptyListOfMapsBlock::from_parts(
+            vec!["{ k: v }".to_string()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("non-empty unchanged section is valid");
+        assert_eq!(block.unchanged().len(), 1);
+        assert!(block.modified().is_empty());
+    }
 
     #[test]
     fn test_names_only_returns_empty() {
