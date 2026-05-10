@@ -1,15 +1,84 @@
 ---
-// TODO Step 2+: navigation tree from astro.config or a dedicated config file.
----
+const sections = [
+  {
+    label: 'Getting Started',
+    items: [
+      { label: 'Installation',  href: '/getting-started/installation/' },
+      { label: 'Quick Start',   href: '/getting-started/quick-start/' },
+      { label: 'Core Concepts', href: '/getting-started/core-concepts/' },
+    ],
+  },
+  // TODO Step 3+: Guides, Reference, Providers
+];
 
+const currentPath = Astro.url.pathname;
+---
 <aside class="sidebar">
-  <!-- sidebar items go here in Step 2 -->
+  {sections.map(section => (
+    <div class="sidebar-section">
+      <h3 class="sidebar-section-title">{section.label}</h3>
+      <ul class="sidebar-list">
+        {section.items.map(item => (
+          <li>
+            <a
+              href={item.href}
+              class:list={['sidebar-link', { active: currentPath === item.href }]}
+              aria-current={currentPath === item.href ? 'page' : undefined}
+            >
+              {item.label}
+            </a>
+          </li>
+        ))}
+      </ul>
+    </div>
+  ))}
 </aside>
 
 <style>
   .sidebar {
-    padding: var(--space-6) var(--space-4);
-    border-right: 1px solid var(--border);
+    padding: var(--space-2) 0;
     background: var(--sidebar-bg);
+  }
+
+  .sidebar-section + .sidebar-section { margin-top: var(--space-6); }
+
+  .sidebar-section-title {
+    font-family: var(--font-sans);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--sidebar-group-head-color);
+    margin: 0 0 var(--space-3);
+  }
+
+  .sidebar-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+
+  .sidebar-link {
+    display: block;
+    padding: var(--space-2) var(--space-3);
+    border-left: 2px solid transparent;
+    color: var(--sidebar-link-color);
+    text-decoration: none;
+    font-size: var(--text-sm);
+    line-height: 1.4;
+    transition: color 0.15s ease, background-color 0.15s ease;
+  }
+
+  .sidebar-link:hover {
+    color: var(--sidebar-link-hover-color);
+  }
+
+  .sidebar-link.active {
+    color: var(--sidebar-link-active-color);
+    background: var(--sidebar-link-active-bg);
+    border-left-color: var(--sidebar-link-active-border);
   }
 </style>

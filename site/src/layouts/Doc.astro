@@ -1,0 +1,139 @@
+---
+import BaseLayout from '../components/BaseLayout.astro';
+import Sidebar from '../components/Sidebar.astro';
+import TOC from '../components/TOC.astro';
+
+interface Heading { depth: number; slug: string; text: string; }
+interface Props {
+  title: string;
+  description?: string;
+  headings?: Heading[];
+}
+
+const { title, description, headings = [] } = Astro.props;
+---
+<BaseLayout title={title} description={description} showSidebar={false}>
+  <div class="doc-grid">
+    <Sidebar />
+    <article class="doc-main">
+      <header class="doc-header">
+        <h1>{title}</h1>
+        {description && <p class="doc-lede">{description}</p>}
+      </header>
+      <div class="doc-body">
+        <slot />
+      </div>
+    </article>
+    <TOC headings={headings} />
+  </div>
+</BaseLayout>
+
+<style>
+  .doc-grid {
+    display: grid;
+    grid-template-columns: 16rem minmax(0, 1fr) 14rem;
+    gap: var(--space-8);
+    max-width: 80rem;
+    margin: 0 auto;
+    padding: var(--space-8) var(--space-6);
+  }
+
+  .doc-main { min-width: 0; }
+
+  .doc-header { margin-bottom: var(--space-8); }
+
+  .doc-header h1 {
+    font-family: var(--font-display);
+    font-size: var(--text-4xl);
+    color: var(--page-title-color);
+    margin: 0 0 var(--space-3);
+  }
+
+  .doc-lede {
+    font-size: var(--text-lg);
+    color: var(--fg3);
+    margin: 0;
+  }
+
+  .doc-body {
+    color: var(--page-body-color);
+    line-height: var(--lh-body);
+  }
+
+  .doc-body :global(h2) {
+    margin-top: var(--space-8);
+    margin-bottom: var(--space-4);
+    scroll-margin-top: var(--space-8);
+  }
+
+  .doc-body :global(h3) {
+    margin-top: var(--space-6);
+    margin-bottom: var(--space-3);
+    scroll-margin-top: var(--space-8);
+  }
+
+  .doc-body :global(p) { margin: 0 0 var(--space-4); }
+
+  .doc-body :global(ul),
+  .doc-body :global(ol) {
+    margin: 0 0 var(--space-4);
+    padding-left: var(--space-6);
+  }
+
+  .doc-body :global(li) { margin: var(--space-1) 0; }
+
+  .doc-body :global(pre) {
+    background: var(--code-block-bg);
+    border: 1px solid var(--code-block-border);
+    border-radius: var(--radius);
+    padding: var(--space-4);
+    overflow-x: auto;
+    margin: var(--space-4) 0;
+  }
+
+  .doc-body :global(code) {
+    background: var(--code-inline-bg);
+    color: var(--code-inline-color);
+    padding: 0.1em 0.35em;
+    border-radius: var(--radius-sm);
+    font-size: 0.9em;
+  }
+
+  .doc-body :global(pre code) {
+    background: transparent;
+    padding: 0;
+    color: var(--code-block-text);
+  }
+
+  .doc-body :global(table) {
+    border-collapse: collapse;
+    margin: var(--space-4) 0;
+    width: 100%;
+    font-size: var(--text-sm);
+  }
+
+  .doc-body :global(th),
+  .doc-body :global(td) {
+    border: 1px solid var(--border);
+    padding: var(--space-2) var(--space-3);
+    text-align: left;
+  }
+
+  .doc-body :global(th) {
+    background: var(--bg-raise);
+    color: var(--fg1);
+    font-weight: 600;
+  }
+
+  /* 1024px 以下: TOC 落とす */
+  @media (max-width: 64rem) {
+    .doc-grid { grid-template-columns: 14rem minmax(0, 1fr); }
+    .doc-grid > :global(.toc) { display: none; }
+  }
+
+  /* 768px 以下: サイドバーも落とす */
+  @media (max-width: 48rem) {
+    .doc-grid { grid-template-columns: 1fr; }
+    .doc-grid > :global(.sidebar) { display: none; }
+  }
+</style>

@@ -1,0 +1,40 @@
+---
+interface Props {
+  type?: 'note' | 'tip' | 'warn' | 'success';
+  title?: string;
+}
+
+const { type = 'note', title } = Astro.props;
+const defaultTitles = { note: 'Note', tip: 'Tip', warn: 'Warning', success: 'Success' };
+const heading = title ?? defaultTitles[type];
+---
+<aside class:list={['aside', `aside-${type}`]} role="note">
+  <p class="aside-title">{heading}</p>
+  <div class="aside-body"><slot /></div>
+</aside>
+
+<style>
+  .aside {
+    border-left: 3px solid var(--aside-accent);
+    background: var(--aside-bg);
+    padding: var(--space-4) var(--space-5);
+    border-radius: 0 var(--radius) var(--radius) 0;
+    margin: var(--space-6) 0;
+  }
+  .aside-tip     { background: var(--aside-tip-bg);     border-left-color: var(--aside-tip-accent); }
+  .aside-warn    { background: var(--aside-warn-bg);    border-left-color: var(--aside-warn-accent); }
+  .aside-success { background: var(--aside-success-bg); border-left-color: var(--aside-success-accent); }
+
+  .aside-title {
+    font-weight: 600;
+    color: var(--aside-title-color);
+    margin: 0 0 var(--space-2);
+  }
+
+  .aside-body {
+    color: var(--aside-body-color);
+    line-height: var(--lh-body);
+  }
+
+  .aside-body :global(:last-child) { margin-bottom: 0; }
+</style>
