@@ -1029,20 +1029,30 @@ impl DiagnosticEngine {
 
         for attr_param in &parsed.attribute_params {
             if let Some(value) = &attr_param.value {
-                // Check for undefined binding references
-                if let Value::ResourceRef { path } = value
-                    && !defined_bindings.contains(path.binding())
+                // Check for undefined binding references — both shapes
+                // (`Value::ResourceRef` for `name.attr`, `Value::BindingRef`
+                // for bare `name`, since #2847).
+                let undefined_binding = match value {
+                    Value::ResourceRef { path } if !defined_bindings.contains(path.binding()) => {
+                        Some(path.binding().to_string())
+                    }
+                    Value::BindingRef { binding } if !defined_bindings.contains(binding) => {
+                        Some(binding.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(undefined) = undefined_binding
                     && let Some((line, col)) =
                         self.find_attributes_value_position(doc, &attr_param.name)
                 {
                     diagnostics.push(carina_diagnostic(
                         line,
                         col,
-                        col + path.binding().len() as u32,
+                        col + undefined.len() as u32,
                         DiagnosticSeverity::ERROR,
                         format!(
                             "Undefined resource '{}' in attributes '{}'. Define it with 'let {} = ...'",
-                            path.binding(), attr_param.name, path.binding()
+                            undefined, attr_param.name, undefined
                         ),
                     ));
                 }
@@ -1212,6 +1222,11 @@ impl DiagnosticEngine {
                 )
             }
             (_, Value::ResourceRef { .. }) => None,
+            // Bare-binding ref (#2847): no attribute selector means we
+            // cannot localize the type at this checkpoint without a
+            // separate let/argument lookup. Skip rather than false-flag
+            // — same policy as the `ResourceRef` fallthrough above.
+            (_, Value::BindingRef { .. }) => None,
             // List: recurse into elements
             (TypeExpr::List(inner), Value::List(items)) => {
                 for (i, item) in items.iter().enumerate() {

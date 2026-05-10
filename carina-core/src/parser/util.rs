@@ -57,6 +57,7 @@ pub(crate) fn value_type_name(value: &Value) -> &'static str {
         Value::StringList(_) => "list",
         Value::Map(_) => "map",
         Value::ResourceRef { .. } => "resource reference",
+        Value::BindingRef { .. } => "binding reference",
         Value::Interpolation(_) => "string",
         Value::FunctionCall { .. } => "function call",
         Value::Secret(_) => "secret",

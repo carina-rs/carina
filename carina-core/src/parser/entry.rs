@@ -366,11 +366,22 @@ pub fn parse_with_seeded_bindings(
 /// the same `ctx.get_variable` / `ctx.is_resource_binding` paths that
 /// locally-declared `let` / `arguments` names use after parsing.
 ///
+/// Each seed is installed as a [`Value::BindingRef`] — a bare-binding
+/// reference with no attribute slot. This is intentional: a seed
+/// represents "a name exists in scope; we know nothing more about it".
+/// When a downstream expression accesses `name.attr`, the parser
+/// composes a fresh [`Value::ResourceRef`] with the real attribute
+/// instead of mutating the seed. Storing the seed as `ResourceRef`
+/// with an empty `attribute` field would be a type-level lie and
+/// previously surfaced as the empty-field diagnostic in #2847.
+///
 /// Empty seed list is a no-op — single-file callers (the legacy
 /// `parse(input, config)` wrapper, parser tests) pay no cost.
 fn seed_bindings(ctx: &mut ParseContext<'_>, seeds: &[&str]) {
     for &name in seeds {
-        let placeholder_ref = Value::resource_ref(name.to_string(), String::new(), vec![]);
+        let placeholder_ref = Value::BindingRef {
+            binding: name.to_string(),
+        };
         ctx.set_variable(name.to_string(), placeholder_ref);
         let placeholder = Resource::new("_seeded", name);
         ctx.set_resource_binding(name.to_string(), placeholder);

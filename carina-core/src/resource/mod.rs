@@ -255,24 +255,46 @@ pub struct AccessPath {
 
 impl AccessPath {
     /// Create an `AccessPath` referring to a top-level attribute of a binding.
+    ///
+    /// `attribute` must be non-empty. A bare-binding reference (no
+    /// `.attr`) is represented by [`Value::BindingRef`], not by an
+    /// `AccessPath` with an empty attribute.
     pub fn new(binding: impl Into<String>, attribute: impl Into<String>) -> Self {
+        let binding = binding.into();
+        let attribute = attribute.into();
+        assert!(
+            !attribute.is_empty(),
+            "AccessPath::new with empty attribute for binding {:?}; \
+             use Value::BindingRef instead (#2847)",
+            binding
+        );
         Self {
-            binding: binding.into(),
-            attribute: attribute.into(),
+            binding,
+            attribute,
             field_path: Vec::new(),
             subscripts: Vec::new(),
         }
     }
 
     /// Create an `AccessPath` with a nested field path (e.g., `web.network.vpc_id`).
+    ///
+    /// `attribute` must be non-empty. See [`AccessPath::new`].
     pub fn with_fields(
         binding: impl Into<String>,
         attribute: impl Into<String>,
         field_path: Vec<String>,
     ) -> Self {
+        let binding = binding.into();
+        let attribute = attribute.into();
+        assert!(
+            !attribute.is_empty(),
+            "AccessPath::with_fields with empty attribute for binding {:?}; \
+             use Value::BindingRef instead (#2847)",
+            binding
+        );
         Self {
-            binding: binding.into(),
-            attribute: attribute.into(),
+            binding,
+            attribute,
             field_path,
             subscripts: Vec::new(),
         }
@@ -281,15 +303,25 @@ impl AccessPath {
     /// Create an `AccessPath` with both a field chain and trailing
     /// `[index]` subscripts. Used by the parser when source contains
     /// `binding.field[idx]` or `binding.field.subfield[idx]…`.
+    ///
+    /// `attribute` must be non-empty. See [`AccessPath::new`].
     pub fn with_fields_and_subscripts(
         binding: impl Into<String>,
         attribute: impl Into<String>,
         field_path: Vec<String>,
         subscripts: Vec<Subscript>,
     ) -> Self {
+        let binding = binding.into();
+        let attribute = attribute.into();
+        assert!(
+            !attribute.is_empty(),
+            "AccessPath::with_fields_and_subscripts with empty attribute for binding {:?}; \
+             use Value::BindingRef instead (#2847)",
+            binding
+        );
         Self {
-            binding: binding.into(),
-            attribute: attribute.into(),
+            binding,
+            attribute,
             field_path,
             subscripts,
         }
@@ -375,8 +407,32 @@ pub enum Value {
     /// - segment 0: binding name (e.g., "vpc")
     /// - segment 1: attribute name (e.g., "vpc_id")
     /// - segments 2+: nested field path
+    ///
+    /// `AccessPath` carries a non-empty `attribute`; the type system
+    /// guarantees this — see [`AccessPath`]. A reference to a binding
+    /// without any attribute access (`bootstrap` standalone, the
+    /// directory-aware Pass-2 seed for sibling-defined names) is
+    /// represented as [`Value::BindingRef`] instead.
     ResourceRef {
         path: AccessPath,
+    },
+    /// Reference to a binding without an attribute selector.
+    ///
+    /// Two producer sites:
+    /// - [`crate::parser::parse_with_seeded_bindings`] seeds every
+    ///   sibling-defined name (#2817) so in-file expressions resolve
+    ///   `name.attr` correctly; the seed itself carries no attribute.
+    /// - The parser's `variable_ref` rule emits `BindingRef` for a bare
+    ///   `let arn = bootstrap` (no `.attr` chain).
+    ///
+    /// `BindingRef` is invisible to attribute-walking code paths
+    /// (`visit_refs`, `check_upstream_state_field_references`, etc.) by
+    /// construction: there is no `attribute` slot for them to read. This
+    /// makes the empty-field diagnostic class (#2847) unrepresentable —
+    /// a sibling-only seed cannot synthesize a fake attribute reference
+    /// because the type carries none.
+    BindingRef {
+        binding: String,
     },
     /// String interpolation: `"prefix-${expr}-suffix"`
     /// Parts are evaluated and concatenated into a final String.
@@ -465,6 +521,7 @@ impl PartialEq for Value {
             (Value::StringList(a), Value::StringList(b)) => a == b,
             (Value::Map(a), Value::Map(b)) => a == b,
             (Value::ResourceRef { path: a }, Value::ResourceRef { path: b }) => a == b,
+            (Value::BindingRef { binding: a }, Value::BindingRef { binding: b }) => a == b,
             (Value::Interpolation(a), Value::Interpolation(b)) => a == b,
             (
                 Value::FunctionCall { name: an, args: aa },
@@ -592,8 +649,10 @@ impl Value {
 
     /// Create a `ResourceRef` from binding name, attribute name, and optional field path.
     ///
-    /// This is the primary constructor for `ResourceRef` values, replacing direct
-    /// struct literal construction.
+    /// `attribute_name` must be non-empty. A bare-binding reference (no
+    /// `.attr`) is a [`Value::BindingRef`], not a `ResourceRef` with an
+    /// empty attribute — see #2847 for the regression that motivated
+    /// the type-level split.
     pub fn resource_ref(
         binding_name: impl Into<String>,
         attribute_name: impl Into<String>,
@@ -660,6 +719,11 @@ impl Value {
             | Value::Float(_)
             | Value::Bool(_)
             | Value::StringList(_) => {}
+            // `BindingRef` carries no attribute, so attribute-walking
+            // visitors have nothing to do. Callers that *do* care about
+            // bare-binding references walk them explicitly via
+            // `visit_binding_refs`.
+            Value::BindingRef { .. } => {}
             // `Value::Unknown` is what a previously-unresolved
             // `ResourceRef` was *replaced with* by `stamp_unresolved_upstream`.
             // It carries an `AccessPath` for display, but it is no longer
@@ -766,6 +830,9 @@ impl Value {
             }
             Value::ResourceRef { path } => {
                 path.hash(hasher);
+            }
+            Value::BindingRef { binding } => {
+                binding.hash(hasher);
             }
             Value::Interpolation(parts) => {
                 parts.len().hash(hasher);

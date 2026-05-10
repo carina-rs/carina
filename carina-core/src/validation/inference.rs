@@ -310,6 +310,12 @@ fn infer_type_from_value_with_visiting(
             schemas,
             visiting,
         ),
+        // `BindingRef` is a bare-binding placeholder with no attribute
+        // and therefore no inferable position. Inference treats it as
+        // "type unknown until accessed" — same shape as `Unknown(_)`.
+        Value::BindingRef { .. } => Err(InferenceError::UnknownType {
+            reason: "bare binding reference has no attribute to infer".to_string(),
+        }),
         Value::FunctionCall { name, .. } => infer_function_call(name),
         Value::Unknown(_) => Err(InferenceError::UnknownType {
             reason: "value not yet known at plan time (unresolved upstream)".to_string(),

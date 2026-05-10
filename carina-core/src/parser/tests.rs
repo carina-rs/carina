@@ -580,11 +580,9 @@ fn parse_directory_module() {
     let sg = &result.resources[0];
     assert_eq!(
         sg.get_attr("vpc_id"),
-        Some(&Value::resource_ref(
-            "vpc_id".to_string(),
-            String::new(),
-            vec![]
-        ))
+        Some(&Value::BindingRef {
+            binding: "vpc_id".to_string(),
+        })
     );
 }
 

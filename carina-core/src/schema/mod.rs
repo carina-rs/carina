@@ -1706,6 +1706,7 @@ impl Value {
             Value::ResourceRef { path } => {
                 format!("ResourceRef({})", path.to_dot_string())
             }
+            Value::BindingRef { binding } => format!("BindingRef({})", binding),
             Value::Interpolation(_) => "Interpolation".to_string(),
             Value::FunctionCall { name, .. } => format!("FunctionCall({})", name),
             Value::Secret(_) => "Secret".to_string(),

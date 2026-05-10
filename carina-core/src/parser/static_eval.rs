@@ -20,7 +20,10 @@ pub(crate) fn is_static_value(value: &Value) -> bool {
         Value::List(items) => items.iter().all(is_static_value),
         Value::Map(map) => map.values().all(is_static_value),
         Value::FunctionCall { args, .. } => args.iter().all(is_static_value),
-        Value::ResourceRef { .. } | Value::Interpolation(_) | Value::Unknown(_) => false,
+        Value::ResourceRef { .. }
+        | Value::BindingRef { .. }
+        | Value::Interpolation(_)
+        | Value::Unknown(_) => false,
         Value::Secret(inner) => is_static_value(inner),
     }
 }

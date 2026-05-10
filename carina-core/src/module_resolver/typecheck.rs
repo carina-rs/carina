@@ -41,26 +41,24 @@ pub(super) enum TypeCheckResult {
     ValidationError(String),
 }
 
-/// If `value` is a bare reference to a binding in `enclosing_args`
-/// (no attribute / field path / subscripts), return that arg's declared
-/// type. Bare-binding refs are how the parser represents arguments-block
-/// names that propagate into nested module calls (#2549).
+/// If `value` is a bare reference to a binding in `enclosing_args`,
+/// return that arg's declared type. Bare-binding refs are how the
+/// parser represents arguments-block names that propagate into nested
+/// module calls (#2549).
+///
+/// `Value::BindingRef` is the canonical representation since #2847;
+/// the type system guarantees no attribute/field/subscript can hide
+/// inside it.
 fn enclosing_arg_type<'a>(
     value: &Value,
     enclosing_args: Option<&'a [ArgumentParameter]>,
 ) -> Option<&'a TypeExpr> {
-    let Value::ResourceRef { path } = value else {
+    let Value::BindingRef { binding } = value else {
         return None;
     };
-    if !path.attribute().is_empty()
-        || !path.field_path().is_empty()
-        || !path.subscripts().is_empty()
-    {
-        return None;
-    }
     enclosing_args?
         .iter()
-        .find(|a| a.name == path.binding())
+        .find(|a| a.name == binding.as_str())
         .map(|a| &a.type_expr)
 }
 
@@ -80,7 +78,17 @@ pub(super) fn check_type_match(
 
     match type_expr {
         // Deferred-resolution values: type unknown at this checkpoint.
-        _ if matches!(value, Value::FunctionCall { .. } | Value::Unknown(_)) => TypeCheckResult::Ok,
+        // `BindingRef` falls through here only when it is not an
+        // enclosing-arg ref (the early return above handles that case);
+        // those leftover bare refs are unresolved sibling/forward refs
+        // and behave like `Unknown` for typecheck purposes.
+        _ if matches!(
+            value,
+            Value::FunctionCall { .. } | Value::Unknown(_) | Value::BindingRef { .. }
+        ) =>
+        {
+            TypeCheckResult::Ok
+        }
         TypeExpr::String => {
             if matches!(
                 value,

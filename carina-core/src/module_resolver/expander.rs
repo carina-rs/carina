@@ -280,11 +280,17 @@ impl ModuleResolver<'_> {
 
 /// Substitute arguments references with actual values.
 ///
-/// Argument parameter names are registered as lexical bindings in the parser,
-/// so they appear as `ResourceRef { binding_name: "<param_name>", attribute_name: ... }`.
-/// We match when `binding_name` is one of the argument keys.
+/// Argument parameter names are registered as lexical bindings in the
+/// parser. A bare-name reference (`source_arn`) parses as
+/// [`Value::BindingRef`]; an attribute access (`source_arn.field`)
+/// parses as [`Value::ResourceRef`]. Both forms can target an argument
+/// parameter, so substitution covers both.
 pub(super) fn substitute_arguments(value: &Value, arguments: &HashMap<String, Value>) -> Value {
     match value {
+        Value::BindingRef { binding } if arguments.contains_key(binding) => arguments
+            .get(binding)
+            .cloned()
+            .unwrap_or_else(|| value.clone()),
         Value::ResourceRef { path } if arguments.contains_key(path.binding()) => arguments
             .get(path.binding())
             .cloned()
@@ -334,6 +340,11 @@ pub(super) fn rewrite_intra_module_refs(
     intra_module_bindings: &HashSet<String>,
 ) -> Value {
     match value {
+        Value::BindingRef { binding } if intra_module_bindings.contains(binding) => {
+            Value::BindingRef {
+                binding: format!("{}.{}", instance_prefix, binding),
+            }
+        }
         Value::ResourceRef { path } if intra_module_bindings.contains(path.binding()) => {
             Value::ResourceRef {
                 path: crate::resource::AccessPath::with_fields_and_subscripts(
