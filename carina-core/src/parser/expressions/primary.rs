@@ -39,7 +39,16 @@ pub(crate) fn parse_duration_secs(src: &str, line: usize) -> Result<u64, ParseEr
         "s" | "sec" | "second" | "seconds" => 1,
         "m" | "min" | "minute" | "minutes" => 60,
         "h" | "hr" | "hour" | "hours" => 3600,
-        other => unreachable!("grammar restricts the unit suffix to s/m/h families, got {other:?}"),
+        // Reachable only if a future grammar change adds a unit family
+        // (e.g. `day` / `week`) without updating this match. Surface as
+        // a typed parse error rather than a panic so the binary stays
+        // up while the developer fills in the multiplier.
+        other => {
+            return Err(ParseError::InvalidExpression {
+                line,
+                message: format!("duration unit {other:?} is not supported by this build"),
+            });
+        }
     };
     n.checked_mul(multiplier)
         .ok_or_else(|| ParseError::InvalidExpression {

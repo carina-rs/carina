@@ -54,9 +54,17 @@ pub fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, SerializationError
         // Duration crosses the WIT boundary as integer seconds — see
         // `notes/specs/2026-05-10-duration-design.md` for the rationale
         // (no `duration-val` variant; existing `aws`/`awscc` plugins
-        // need no rebuild). Inbound reconstruction lives in
-        // `wit_to_core_value` and consults the schema to decide whether
-        // an `IntVal` reads back as `Value::Int` or `Value::Duration`.
+        // need no rebuild). The inbound `wit_to_core_value` path is
+        // intentionally one-way for now: every `IntVal` reads back as
+        // `Value::Int`, regardless of whether the destination schema
+        // attribute is typed `Duration`. Re-typing on the inbound side
+        // (so a Duration-typed schema attribute reconstructs as
+        // `Value::Duration`) is a deferred follow-up — without it, a
+        // post-apply state diff for a Duration attribute will surface
+        // as `Duration(75min) → Int(4500)` until the schema-aware
+        // re-typing lands. For MVP every consumer of Duration is
+        // host-side (`wait { timeout = ... }`), so the asymmetry is
+        // contained to the not-yet-existent provider-side use case.
         CoreValue::Duration(d) => Ok(wit::Value::IntVal(d.as_secs() as i64)),
         CoreValue::List(items) => {
             let json_items: Result<Vec<serde_json::Value>, _> =
