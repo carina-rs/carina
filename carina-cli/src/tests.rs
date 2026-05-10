@@ -2430,11 +2430,18 @@ fn import_effect_preserves_resource_metadata_in_state() {
         Some(&"prod-".to_string()),
         "prefixes should be preserved after import"
     );
+    let carina_core::explicit::ExplicitFields::Struct {
+        children: explicit_children,
+    } = &saved_resource.explicit
+    else {
+        panic!(
+            "saved_resource.explicit must be Struct, got: {:?}",
+            saved_resource.explicit
+        );
+    };
     assert!(
-        saved_resource
-            .desired_keys
-            .contains(&"cidr_block".to_string()),
-        "desired_keys should be preserved after import"
+        explicit_children.contains_key("cidr_block"),
+        "explicit children should be preserved after import"
     );
     assert_eq!(
         saved_resource.binding,

@@ -60,7 +60,12 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
 
     let mut state_file: Option<StateFile> = if state_path.exists() {
         let json = std::fs::read_to_string(&state_path).unwrap();
-        Some(serde_json::from_str(&json).unwrap())
+        // Go through check_and_migrate so v5 fixtures (with the legacy
+        // `desired_keys` array) are lifted into v6 `explicit` trees on
+        // load. Direct `serde_json::from_str` would silently drop the
+        // legacy field and leave `explicit` empty, breaking the
+        // moved_prev_keys snapshot test.
+        Some(check_and_migrate(&json).unwrap())
     } else {
         None
     };

@@ -1,6 +1,7 @@
 //! State file structures for persisting infrastructure state
 
 use carina_core::deps::get_resource_dependencies;
+use carina_core::explicit::{self, ExplicitFields};
 use carina_core::resource::{Directives, Resource, ResourceId, State, Value};
 use carina_core::value::{
     SecretHashContext, contains_secret, json_to_dsl_value, merge_secrets_into_provider_json,
@@ -35,7 +36,12 @@ impl StateFile {
     /// v3: Added binding and dependency_bindings fields to ResourceState
     /// v4: Instance path addressing (dot notation instead of underscore prefix)
     /// v5: Added exports field for remote_state output
-    pub const CURRENT_VERSION: u32 = 5;
+    /// v6: Replaced flat `desired_keys: Vec<String>` with recursive
+    ///     `explicit: ExplicitFields` (refs awscc#206). Reads of v5
+    ///     state lift each top-level key to a `Leaf` child of the
+    ///     root `Struct`; the next plan/apply rebuilds a full tree
+    ///     from the resource's authored `Value`.
+    pub const CURRENT_VERSION: u32 = 6;
 
     /// Create a new empty state file
     pub fn new() -> Self {
@@ -190,14 +196,42 @@ impl StateFile {
         result
     }
 
-    /// Build a map of desired attribute keys (user-specified in .crn) from this state file.
+    /// Build a map of `ExplicitFields` trees (one per resource) recording
+    /// which fields the user explicitly wrote in their `.crn`. The differ
+    /// uses these trees both to detect attribute removals and to project
+    /// the actual-state side before computing diffs (refs awscc#206).
+    pub fn build_explicit(&self) -> HashMap<ResourceId, ExplicitFields> {
+        let mut result = HashMap::new();
+        for rs in &self.resources {
+            if !is_empty_explicit(&rs.explicit) {
+                let id = ResourceId::with_provider(&rs.provider, &rs.resource_type, &rs.name);
+                result.insert(id, rs.explicit.clone());
+            }
+        }
+        result
+    }
+
+    /// Backwards-compatible shim that flattens the per-resource
+    /// `ExplicitFields` tree to a sorted list of its top-level keys
+    /// — the shape callers used before the v6 schema change.
+    ///
+    /// Retained only so the differ entry points (which still take
+    /// `prev_desired_keys: Option<&[String]>`) keep compiling while
+    /// the differ-side rewrite (#2899 / #2900) lands. Once those land,
+    /// this method is deleted in #2901.
     pub fn build_desired_keys(&self) -> HashMap<ResourceId, Vec<String>> {
         let mut result = HashMap::new();
         for rs in &self.resources {
-            if !rs.desired_keys.is_empty() {
-                let id = ResourceId::with_provider(&rs.provider, &rs.resource_type, &rs.name);
-                result.insert(id, rs.desired_keys.clone());
+            let ExplicitFields::Struct { children } = &rs.explicit else {
+                continue;
+            };
+            if children.is_empty() {
+                continue;
             }
+            let mut keys: Vec<String> = children.keys().cloned().collect();
+            keys.sort();
+            let id = ResourceId::with_provider(&rs.provider, &rs.resource_type, &rs.name);
+            result.insert(id, keys);
         }
         result
     }
@@ -402,6 +436,16 @@ pub fn check_and_migrate(content: &str) -> Result<StateFile, BackendError> {
                     v, e
                 ))
             })?;
+            // v5 → v6: lift the flat `desired_keys: Vec<String>` field
+            // (already discarded by serde because the v6 struct no longer
+            // declares it) back from the source JSON, and use it to
+            // construct a top-level `ExplicitFields::Struct` whose
+            // children are all `Leaf`. Mirrors the design's "first plan
+            // after upgrade still surfaces nested-field spurious diffs;
+            // first apply rebuilds the full tree" behavior.
+            if v <= 5 {
+                migrate_v5_desired_keys_to_explicit(content, &mut state)?;
+            }
             state.version = StateFile::CURRENT_VERSION;
             state
         }
@@ -452,11 +496,19 @@ pub struct ResourceState {
     /// Maps attribute name to the permanent temporary name (e.g., {"role_name": "my-role-abc123"}).
     #[serde(default)]
     pub name_overrides: HashMap<String, String>,
-    /// Attribute keys that were explicitly specified by the user in the .crn file.
-    /// Used to detect attribute removal: if a key was in desired_keys but is now absent
-    /// from the desired state, it means the user intentionally removed it.
-    #[serde(default)]
-    pub desired_keys: Vec<String>,
+    /// Tree of fields the user explicitly wrote in their `.crn` for
+    /// this resource. Used by the differ both to detect attribute
+    /// removals and to project actual-state through the authoring
+    /// shape so server-side default fields the user never wrote stop
+    /// appearing as spurious removals (refs awscc#206).
+    ///
+    /// Replaces the flat `desired_keys: Vec<String>` (state ≤ v5);
+    /// the v5 reader lifts each top-level key to a `Leaf` child of
+    /// the root `Struct`. The next plan/apply rebuilds a full tree
+    /// from the resource's authored `Value` via
+    /// `carina_core::explicit::build_from_resource`.
+    #[serde(default, skip_serializing_if = "is_empty_explicit")]
+    pub explicit: ExplicitFields,
     /// The binding name for this resource (from `let` bindings in DSL).
     /// Stored so orphan Delete effects can have tree structure.
     #[serde(default)]
@@ -494,7 +546,7 @@ impl ResourceState {
             directives: Directives::default(),
             prefixes: HashMap::new(),
             name_overrides: HashMap::new(),
-            desired_keys: Vec::new(),
+            explicit: ExplicitFields::default(),
             binding: None,
             dependency_bindings: BTreeSet::new(),
             write_only_attributes: Vec::new(),
@@ -638,14 +690,10 @@ impl ResourceState {
         }
         rs.directives = resource.directives.clone();
         rs.prefixes = resource.prefixes.clone();
-        // Record which attributes the user explicitly specified in their .crn file
-        rs.desired_keys = resource
-            .attributes
-            .keys()
-            .filter(|k| !k.starts_with('_'))
-            .cloned()
-            .collect();
-        rs.desired_keys.sort();
+        // Record the structural shape the user wrote in their .crn,
+        // so the differ can project actual-state through it and skip
+        // server-side defaults the user never authored (refs awscc#206).
+        rs.explicit = explicit::build_from_resource(resource);
         // Store binding name for tree structure in orphan Delete effects
         rs.binding = resource.binding.clone();
         // Store dependency bindings for tree structure in orphan Delete effects.
@@ -656,6 +704,64 @@ impl ResourceState {
         }
         Ok(rs)
     }
+}
+
+/// Returns true if the `ExplicitFields` is the default (`Leaf`) — used
+/// as a `skip_serializing_if` predicate so resources that have not yet
+/// been touched by `from_provider_state` (or that legitimately have no
+/// authored attributes) don't emit a verbose `"explicit": {"kind": "leaf"}`
+/// line.
+fn is_empty_explicit(e: &ExplicitFields) -> bool {
+    matches!(e, ExplicitFields::Leaf)
+}
+
+/// v5 → v6: state files written under v5 carry a `"desired_keys"`
+/// array per resource (flat list of top-level user-authored keys).
+/// v6's `ResourceState` no longer has that field, so serde silently
+/// discards it during the initial deserialization. This helper
+/// re-reads the source JSON to recover those arrays and lifts each
+/// entry into a `Leaf` child of the v6 `explicit: ExplicitFields::Struct`
+/// tree.
+///
+/// Resources are matched by `(provider, resource_type, name)` because
+/// state files use that triple as the canonical identity.
+fn migrate_v5_desired_keys_to_explicit(
+    content: &str,
+    state: &mut StateFile,
+) -> Result<(), BackendError> {
+    let raw: serde_json::Value = serde_json::from_str(content).map_err(|e| {
+        BackendError::InvalidState(format!(
+            "Failed to re-parse state file for v5 desired_keys recovery: {}",
+            e
+        ))
+    })?;
+    let Some(raw_resources) = raw.get("resources").and_then(|v| v.as_array()) else {
+        return Ok(());
+    };
+    for raw_rs in raw_resources {
+        let provider = raw_rs.get("provider").and_then(|v| v.as_str());
+        let resource_type = raw_rs.get("resource_type").and_then(|v| v.as_str());
+        let name = raw_rs.get("name").and_then(|v| v.as_str());
+        let Some(((provider, resource_type), name)) = provider.zip(resource_type).zip(name) else {
+            continue;
+        };
+        let Some(keys) = raw_rs.get("desired_keys").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let children: std::collections::HashMap<String, ExplicitFields> = keys
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| (s.to_string(), ExplicitFields::Leaf)))
+            .collect();
+        if children.is_empty() {
+            continue;
+        }
+        if let Some(rs) = state.resources.iter_mut().find(|rs| {
+            rs.provider == provider && rs.resource_type == resource_type && rs.name == name
+        }) {
+            rs.explicit = ExplicitFields::Struct { children };
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
