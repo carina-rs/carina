@@ -10,8 +10,6 @@ const COLORS = {
   fg4: '#64748b',         // --fg4 / --slate-500
   accent: '#fbbf24',      // --accent / --gold-400 (--hero-divider-gold)
   cyan: '#0891b2',        // --cyan-600 (--hero-divider-cyan)
-  haloOuter: 'transparent',
-  haloInner: 'rgba(8, 145, 178, 0.18)', // approx --hero-halo
 };
 
 // Minimal React-element factory (satori only needs { type, props }).
@@ -40,6 +38,13 @@ function horizonLine(color: string, top: number): Node {
 }
 
 function halo(): Node {
+  // Why both stops are spelled out:
+  //   - The outer stop is `--bg` (#020617) at zero alpha, not `transparent`.
+  //     `transparent` resolves to `rgba(0,0,0,0)`, so satori interpolates
+  //     through black and produces a muddy mid-band against the navy bg.
+  //   - Explicit `0%` / `100%` anchors the cyan stop at the geometric
+  //     center; without it satori can render the first ~3% as the next
+  //     color, leaving a dark pinprick at the center.
   return el('div', {
     style: {
       position: 'absolute',
@@ -47,7 +52,11 @@ function halo(): Node {
       top: 200,
       width: 480,
       height: 360,
-      background: `radial-gradient(closest-side, ${COLORS.haloInner}, ${COLORS.haloOuter})`,
+      background:
+        'radial-gradient(closest-side, ' +
+        'rgba(8, 145, 178, 0.22) 0%, ' +
+        'rgba(2, 6, 23, 0) 100%' +
+        ')',
     },
   });
 }
