@@ -1,0 +1,33 @@
+# #2910: Map attribute whose only "diff" is a nested list-of-maps
+# whose every paired element is dropped per #2886. Pre-fix the
+# rendered tree showed dangling `bucket_encryption:` /
+# `server_side_encryption_configuration:` headers with nothing under
+# them. Post-fix the IR drops the empty sections recursively and the
+# headers vanish; the attribute is absorbed into the trailing
+# unchanged-attributes count.
+#
+# `cidr_block` is renamed to force an Update; `config.settings.rules`
+# is the list-of-maps where every desired key matches state but state
+# carries an extra `provider_default_field` (mimics awscc#206).
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.Vpc {
+  cidr_block = '10.1.0.0/16'
+  config = {
+    settings = {
+      rules = [
+        {
+          name   = 'allow-internal'
+          action = 'allow'
+        },
+      ]
+    }
+  }
+}
+
+exports {
+  vpc_id = vpc.vpc_id
+}

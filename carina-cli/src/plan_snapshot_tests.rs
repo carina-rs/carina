@@ -1021,6 +1021,27 @@ fn snapshot_list_diff_paired_all_unchanged_dropped() {
     insta::assert_snapshot!(output);
 }
 
+// #2910: a Map attribute whose only "diff" is a nested list-of-maps
+// where every paired element is dropped (per #2886). Pre-fix the tree
+// rendered dangling section headers (`config:`, `settings:`, `rules:`)
+// with nothing under them. Post-fix the IR drops the empty sections
+// recursively and the parent Map row is absorbed into the trailing
+// unchanged-attributes count.
+#[test]
+fn snapshot_nested_list_of_maps_all_dropped() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("nested_list_of_maps_all_dropped");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+    ));
+    insta::assert_snapshot!(output);
+}
+
 // Mirror of the added-struct test for the removed path.
 #[test]
 fn snapshot_list_diff_removed_struct() {

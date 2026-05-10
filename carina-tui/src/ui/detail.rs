@@ -183,7 +183,7 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
                 first_line = first_line.style(Style::default().bg(Color::DarkGray));
             }
             lines.push(first_line);
-            render_map_diff_entries(lines, entries);
+            render_map_diff_entries(lines, entries.as_slice());
         }
         DetailRow::ListOfMapsDiff {
             key,
