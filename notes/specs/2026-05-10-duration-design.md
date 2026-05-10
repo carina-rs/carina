@@ -247,9 +247,9 @@ The Duration type is "done" for MVP when:
 
 1. `let foo = wait cert { timeout = 75min }` parses without error and produces an `AttributeType::Duration`-valued attribute carrying `Value::Duration(Duration::from_secs(4500))`.
 2. Assigning `30` (Int), `"30s"` (String), or `30.0` (Float) to a Duration-typed attribute is a parse-or-validation error with a clear message.
-3. `carina fmt` round-trips `75min` → `75min`, `5m` → `5min`, `2700s` → `45min` (canonical form), and `1h` → `1h`.
+3. `carina fmt` round-trips `75min` → `75min`, `5m` → `5min`, `2700s` → `45min` (canonical form), and `1h` → `1h`. **Deferred to carina#2966** in the MVP — the source-text formatter currently passes duration literals through verbatim; canonical-form rewriting fires on the value-tree consumers (Display, plan display, hover, exports) but not yet on `carina fmt`'s output.
 4. State JSON serialises Duration as integer seconds (`{ "timeout": 4500 }`).
-5. Plan display renders Duration in canonical form (`> cert_issued (until ..., timeout 75min)`).
+5. Plan display renders Duration in canonical form via `Display for Value::Duration` → `render_duration`. A dedicated end-to-end snapshot fixture under `carina-cli/tests/fixtures/plan_display/duration/` is **deferred** — the rendering path is unit-tested through `format_value_into` and through the per-feature display/hover/error tests added by Round 1 / Round 4 reviews.
 6. WIT-bound providers (mock provider's `set_attribute("ttl", Value::Duration(...))`) see the value as `int-val(secs)` and the schema's typing reflects it.
 7. LSP shows a type-mismatch diagnostic when a Duration attribute receives an Int.
 8. TextMate highlights duration literals consistently in both VS Code and TextMate bundle grammars.
