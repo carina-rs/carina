@@ -10,6 +10,7 @@ use indexmap::IndexMap;
 
 use crate::diff_helpers::{compute_map_diff, compute_unchanged_count};
 use crate::effect::Effect;
+use crate::non_empty::NonEmptyVec;
 use crate::resource::{ResourceId, Value};
 use crate::schema::SchemaRegistry;
 use crate::value::{format_value, format_value_with_key, is_list_of_maps, map_similarity};
@@ -185,13 +186,15 @@ pub enum ListOfMapsDiffItemKind {
     Removed,
 }
 
-/// A modified item in a list-of-maps diff
+/// A modified item in a list-of-maps diff.
+///
+/// `fields` is `NonEmptyVec`: an item with zero changed fields is by
+/// definition unchanged and the IR builder drops it (#2886) rather
+/// than synthesize a `~ {}` row. Renderers therefore do not need to
+/// guard against an empty `fields` shape.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListOfMapsDiffModified {
-    /// Ordered list of fields. Only changed / nested-changed fields are
-    /// retained — unchanged fields are filtered out at IR build time
-    /// (#2881) and surfaced as a summary count in `hidden_unchanged_count`.
-    pub fields: Vec<ListOfMapsDiffField>,
+    pub fields: NonEmptyVec<ListOfMapsDiffField>,
     /// Number of unchanged fields filtered out of `fields`. Set to a
     /// non-zero value only when the build is in `DetailLevel::Full`,
     /// matching the top-level `# (n unchanged attributes hidden)`
@@ -438,6 +441,13 @@ fn build_update_rows(
         .collect();
     keys.sort();
 
+    // Attributes where `semantically_equal` reported a diff but the
+    // per-shape builder produced no display rows (e.g. list-of-maps
+    // whose only diff was an upstream-injected key dropped by the IR,
+    // #2886). Counted into the trailing unchanged-attributes summary
+    // so the final tally still adds up.
+    let mut effectively_unchanged: usize = 0;
+
     for key in keys {
         let new_value = &to.attributes[key];
         let old_value = from.attributes.get(key);
@@ -450,9 +460,10 @@ fn build_update_rows(
         }
 
         if is_list_of_maps(new_value) {
-            rows.push(build_list_of_maps_diff_row(
-                key, old_value, new_value, detail,
-            ));
+            match build_list_of_maps_diff_row(key, old_value, new_value, detail) {
+                Some(row) => rows.push(row),
+                None => effectively_unchanged += 1,
+            }
         } else if is_both_maps(old_value, new_value) {
             rows.push(build_map_diff_row(key, old_value, new_value, detail));
         } else {
@@ -485,7 +496,8 @@ fn build_update_rows(
     // In Full mode, show count of unchanged attributes hidden
     if detail == DetailLevel::Full {
         let unchanged_count =
-            compute_unchanged_count(&from.attributes, &to.resolved_attributes(), None);
+            compute_unchanged_count(&from.attributes, &to.resolved_attributes(), None)
+                + effectively_unchanged;
         if unchanged_count > 0 {
             rows.push(DetailRow::HiddenUnchanged {
                 count: unchanged_count,
@@ -755,21 +767,30 @@ fn compute_map_diff_entries(
     entries
 }
 
+/// Build the per-attribute list-of-maps diff row, returning `None` when
+/// every section of the diff is empty. The empty result occurs when the
+/// only "difference" was an upstream-injected key that the IR builder
+/// dropped (#2886) — semantically the attribute has no diff to show, so
+/// the caller should treat it as effectively unchanged and let it roll
+/// into the top-level `# (n unchanged attributes hidden)` summary.
 fn build_list_of_maps_diff_row(
     key: &str,
     old_value: Option<&Value>,
     new_value: &Value,
     detail: DetailLevel,
-) -> DetailRow {
+) -> Option<DetailRow> {
     let (unchanged, modified, added, removed) =
         compute_list_of_maps_diff_parts(old_value, new_value, detail);
-    DetailRow::ListOfMapsDiff {
+    if unchanged.is_empty() && modified.is_empty() && added.is_empty() && removed.is_empty() {
+        return None;
+    }
+    Some(DetailRow::ListOfMapsDiff {
         key: key.to_string(),
         unchanged,
         modified,
         added,
         removed,
-    }
+    })
 }
 
 fn compute_list_of_maps_diff_parts(
@@ -909,6 +930,16 @@ fn compute_list_of_maps_diff_parts(
                     });
                 }
             }
+            // #2886: a paired item whose every desired key matched
+            // state (`fields` empty) is semantically unchanged. Drop
+            // it from the modified list rather than synthesizing a
+            // `~ {}` row that would mislead the reader. The driver of
+            // this case is upstream provider drift — state carrying a
+            // key not in desired forces Phase 1 to reject the pair on
+            // length mismatch, but Phase 2 still pairs by similarity.
+            let Some(fields) = NonEmptyVec::from_vec(fields) else {
+                continue;
+            };
             // Only surface the count in Full mode — Explicit / NamesOnly
             // never emit hidden-counts at the top level either.
             let hidden_unchanged_count = if detail == DetailLevel::Full {

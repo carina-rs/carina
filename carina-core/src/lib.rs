@@ -19,6 +19,7 @@ pub mod keywords;
 pub mod lint;
 pub mod module;
 pub mod module_resolver;
+pub(crate) mod non_empty;
 pub mod parser;
 pub mod plan;
 pub mod plan_tree;

@@ -24,6 +24,8 @@ plan-list-diff-modified-with-unchanged:
 	$(PLAN_FIXTURE) list_diff_modified_with_unchanged
 plan-list-diff-modified-with-unchanged-nested:
 	$(PLAN_FIXTURE) list_diff_modified_with_unchanged_nested
+plan-list-diff-paired-all-unchanged-dropped:
+	$(PLAN_FIXTURE) list_diff_paired_all_unchanged_dropped
 plan-enum-display:
 	$(PLAN_FIXTURE) enum_display
 plan-no-changes-enum:
@@ -89,6 +91,8 @@ plan-fixtures:
 	@$(MAKE) plan-list-diff-modified-with-unchanged
 	@echo "---"
 	@$(MAKE) plan-list-diff-modified-with-unchanged-nested
+	@echo "---"
+	@$(MAKE) plan-list-diff-paired-all-unchanged-dropped
 	@echo ""
 	@echo "=== enum_display ==="
 	@$(MAKE) plan-enum-display

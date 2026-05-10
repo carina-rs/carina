@@ -1339,7 +1339,7 @@ fn render_list_of_maps_diff(
             .any(|f| matches!(f, ListOfMapsDiffField::NestedMapChanged { .. }));
         if has_nested {
             writeln!(out, "{}  {} {{", attr_prefix, "~".yellow().bold()).unwrap();
-            for field in &item.fields {
+            for field in item.fields.iter() {
                 match field {
                     ListOfMapsDiffField::Changed { key, old, new } => {
                         writeln!(
@@ -1374,16 +1374,10 @@ fn render_list_of_maps_diff(
             }
             writeln!(out, "{}    }}", attr_prefix).unwrap();
         } else {
-            let rendered_fields = render_modified_fields(&item.fields);
-            // Append the hidden-fields count after the changed field list
-            // so the summary stays inside the `~ { ... }` block. A paired
-            // modified item always has at least one changed field by
-            // construction (Phase 1 absorbs all-equal pairs as unchanged
-            // before pairing runs), so `rendered_fields` is never empty.
-            debug_assert!(
-                !rendered_fields.is_empty(),
-                "paired modified item must have at least one changed field"
-            );
+            // `item.fields` is `NonEmptyVec`, so the changed-field
+            // string is statically non-empty — no need to guard the
+            // separator (#2886).
+            let rendered_fields = render_modified_fields(item.fields.as_slice());
             let summary = if item.hidden_unchanged_count > 0 {
                 let s = hidden_unchanged_summary(item.hidden_unchanged_count, "field")
                     .dimmed()
