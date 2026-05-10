@@ -8,7 +8,18 @@ const sections = [
       { label: 'Core Concepts', href: '/getting-started/core-concepts/' },
     ],
   },
-  // TODO Step 3+: Guides, Reference, Providers
+  {
+    label: 'Guides',
+    items: [
+      { label: 'Writing Resources',  href: '/guides/writing-resources/' },
+      { label: 'Using Modules',      href: '/guides/using-modules/' },
+      { label: 'State Management',   href: '/guides/state-management/' },
+      { label: 'For/If Expressions', href: '/guides/for-if-expressions/' },
+      { label: 'Functions',          href: '/guides/functions/' },
+      { label: 'LSP Setup',          href: '/guides/lsp-setup/' },
+    ],
+  },
+  // TODO Step 5+: Reference, Providers
 ];
 
 const currentPath = Astro.url.pathname;
