@@ -1,17 +1,15 @@
 #!/usr/bin/env bash
 # Fail if any hand-written markdown file under this repo ships a ```crn``` block
 # using the pre-naming-conventions spellings (snake_case primitives or snake_case
-# custom types in type position). Provider reference docs under
-# docs/src/content/docs/reference/providers/ are codegen output and are
-# excluded here; they move when the provider repo regenerates them.
+# custom types in type position). Internal notes under notes/ (plans, specs,
+# audits, etc.) are historical artifacts and excluded.
 set -euo pipefail
 
 offenders=()
 
 while IFS= read -r f; do
   case "$f" in
-    docs/src/content/docs/reference/providers/*) continue ;;
-    docs/handoff/*) continue ;;
+    notes/*) continue ;;
   esac
 
   awk '

@@ -5,7 +5,7 @@
 //! through this tree before computing diffs so server-side default
 //! fields the user never authored stop appearing as spurious removals.
 //!
-//! See `docs/specs/2026-05-10-explicit-fields-design.md`.
+//! See `notes/specs/2026-05-10-explicit-fields-design.md`.
 
 use crate::resource::{Resource, Value};
 use indexmap::IndexMap;

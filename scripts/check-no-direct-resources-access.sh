@@ -7,7 +7,7 @@
 # with `// allow: direct — <reason>` on the same line, where <reason> is
 # one of the phrasings below.
 #
-# See docs/specs/2026-04-19-unify-resource-walk-design.md for rationale.
+# See notes/specs/2026-04-19-unify-resource-walk-design.md for rationale.
 
 set -euo pipefail
 

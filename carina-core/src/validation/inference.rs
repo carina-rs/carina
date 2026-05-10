@@ -8,7 +8,7 @@
 //! on the side). The loader runs this once per directory load so
 //! downstream consumers (CLI validate, LSP diagnostics, LSP
 //! completion) see a definitive type per export instead of having to
-//! re-derive it. See `docs/specs/2026-05-03-typeexpr-stage2-design.md`.
+//! re-derive it. See `notes/specs/2026-05-03-typeexpr-stage2-design.md`.
 //!
 //! Inference rules:
 //!

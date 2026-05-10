@@ -18,8 +18,7 @@ npm run preview  # serves the built dist/
 Markdown code fences are highlighted by Astro's built-in Shiki, wired
 in `astro.config.mjs`:
 
-- Custom `crn` grammar — `src/grammars/crn.tmLanguage.json` (verbatim
-  copy from `docs/custom-grammars/`).
+- Custom `crn` grammar — `src/grammars/crn.tmLanguage.json`.
 - Custom dark theme — `src/grammars/carina-dark.theme.json`. Hex
   values mirror the resolved `--code-*` tokens in
   `src/styles/tokens.css`; if the design system shifts a `--code-*`
