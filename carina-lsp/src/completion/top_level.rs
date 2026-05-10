@@ -67,6 +67,11 @@ impl CompletionProvider {
         } else {
             "let ${1:binding} = upstream_state {\n    source = '${2:../other-project}'\n}"
         };
+        let wait_snippet = if after_let_binding {
+            "wait ${1:target} {\n    until = ${1:target}.${2:status} == ${3:value}\n}"
+        } else {
+            "let ${1:waited} = wait ${2:target} {\n    until = ${2:target}.${3:status} == ${4:value}\n}"
+        };
 
         let mut completions = vec![
             CompletionItem {
@@ -179,6 +184,16 @@ impl CompletionProvider {
                 insert_text: Some("require ${1:condition}, \"${2:error message}\"".to_string()),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Cross-argument constraint".to_string()),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "wait".to_string(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                insert_text: Some(wait_snippet.to_string()),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                detail: Some(
+                    "Block downstream resources until target reaches a condition".to_string(),
+                ),
                 ..Default::default()
             },
         ];

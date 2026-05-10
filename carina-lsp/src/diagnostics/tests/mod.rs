@@ -59,6 +59,18 @@ pub(super) fn test_engine_with_nested_structs() -> DiagnosticEngine {
     )
 }
 
+/// Engine carrying a managed `aws.acm.Certificate` schema with `status`
+/// attribute — the canonical target for `wait` diagnostics tests.
+pub(super) fn test_engine_with_wait_target() -> DiagnosticEngine {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    let schema = ResourceSchema::new("acm.Certificate")
+        .attribute(AttributeSchema::new("domain_name", AttributeType::String))
+        .attribute(AttributeSchema::new("status", AttributeType::String));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("aws", schema);
+    DiagnosticEngine::new(Arc::new(schemas), vec!["aws".to_string()], Arc::new(vec![]))
+}
+
 pub(super) fn test_engine_with_enum_attr() -> DiagnosticEngine {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
