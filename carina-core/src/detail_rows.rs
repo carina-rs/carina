@@ -527,7 +527,13 @@ fn build_update_rows(
 
     for key in keys {
         let new_value = &to.attributes[key];
-        let old_value = from.attributes.get(key);
+        // Look up `old_value` from the projected map so MapDiff /
+        // ListOfMapsDiff rows don't surface server-side default leaves
+        // the user never authored (refs awscc#206). The same value the
+        // unchanged-count computation below uses, kept consistent so a
+        // field that's "unchanged after projection" is also "unchanged
+        // for display".
+        let old_value = from_attrs_projected.get(key);
         let is_same = old_value
             .map(|ov| ov.semantically_equal(new_value))
             .unwrap_or(false);
@@ -558,14 +564,16 @@ fn build_update_rows(
         }
     }
 
-    // Show removed attributes (in changed_attributes but not in to)
+    // Show removed attributes (in changed_attributes but not in to).
+    // Use the projected map so we don't surface unauthored leaves as
+    // removals (refs awscc#206).
     let mut removed_keys: Vec<_> = changed_attributes
         .iter()
         .filter(|k| !to.attributes.contains_key(k.as_str()))
         .collect();
     removed_keys.sort();
     for key in removed_keys {
-        if let Some(old_value) = from.attributes.get(key.as_str()) {
+        if let Some(old_value) = from_attrs_projected.get(key.as_str()) {
             rows.push(DetailRow::Removed {
                 key: key.to_string(),
                 old: format_value_with_key(old_value, Some(key)),
