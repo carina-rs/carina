@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 6,
   "serial": 1,
   "lineage": "test-lineage-list-diff-removed-struct",
   "carina_version": "0.1.0",
@@ -31,7 +31,9 @@
               "cloudformation:ListResources",
               "cloudformation:UpdateResource"
             ],
-            "resource": ["*"]
+            "resource": [
+              "*"
+            ]
           }
         ]
       },
@@ -39,9 +41,22 @@
       "directives": {},
       "prefixes": {},
       "name_overrides": {},
-      "desired_keys": ["policy_name", "role_name", "statement"],
       "binding": "policy",
-      "dependency_bindings": []
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "policy_name": {
+            "kind": "leaf"
+          },
+          "role_name": {
+            "kind": "leaf"
+          },
+          "statement": {
+            "kind": "leaf"
+          }
+        }
+      }
     }
   ]
 }

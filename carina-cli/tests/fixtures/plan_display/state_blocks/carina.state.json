@@ -1,5 +1,5 @@
 {
-  "version": 4,
+  "version": 6,
   "serial": 1,
   "lineage": "test-state-blocks",
   "carina_version": "0.1.0",
@@ -15,12 +15,17 @@
         "cidr_block": "10.0.1.0/24"
       },
       "protected": false,
-      "directives": { "force_delete": false, "create_before_destroy": false },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false
+      },
       "prefixes": {},
       "name_overrides": {},
-      "desired_keys": [],
       "binding": "legacy_subnet",
-      "dependency_bindings": []
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "leaf"
+      }
     },
     {
       "resource_type": "ec2.SecurityGroup",
@@ -32,12 +37,17 @@
         "group_description": "Old security group"
       },
       "protected": false,
-      "directives": { "force_delete": false, "create_before_destroy": false },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false
+      },
       "prefixes": {},
       "name_overrides": {},
-      "desired_keys": [],
       "binding": "old_sg",
-      "dependency_bindings": []
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "leaf"
+      }
     }
   ]
 }

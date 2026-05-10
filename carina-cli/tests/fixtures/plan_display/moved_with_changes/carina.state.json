@@ -1,5 +1,5 @@
 {
-  "version": 4,
+  "version": 6,
   "serial": 1,
   "lineage": "test-moved-with-changes",
   "carina_version": "0.1.0",
@@ -14,12 +14,22 @@
         "cidr_block": "10.0.0.0/16"
       },
       "protected": false,
-      "directives": { "force_delete": false, "create_before_destroy": false },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false
+      },
       "prefixes": {},
       "name_overrides": {},
-      "desired_keys": ["cidr_block"],
       "binding": "old_vpc",
-      "dependency_bindings": []
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "cidr_block": {
+            "kind": "leaf"
+          }
+        }
+      }
     }
   ]
 }

@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 6,
   "serial": 1,
   "lineage": "test-lineage-secret",
   "carina_version": "0.1.0",
@@ -21,9 +21,19 @@
       "directives": {},
       "prefixes": {},
       "name_overrides": {},
-      "desired_keys": ["cidr_block", "tags"],
       "binding": null,
-      "dependency_bindings": []
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "cidr_block": {
+            "kind": "leaf"
+          },
+          "tags": {
+            "kind": "leaf"
+          }
+        }
+      }
     },
     {
       "resource_type": "ec2.Subnet",
@@ -43,9 +53,22 @@
       "directives": {},
       "prefixes": {},
       "name_overrides": {},
-      "desired_keys": ["vpc_id", "cidr_block", "tags"],
       "binding": null,
-      "dependency_bindings": []
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "vpc_id": {
+            "kind": "leaf"
+          },
+          "cidr_block": {
+            "kind": "leaf"
+          },
+          "tags": {
+            "kind": "leaf"
+          }
+        }
+      }
     }
   ]
 }
