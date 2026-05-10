@@ -168,6 +168,14 @@ impl CompletionProvider {
                 current_binding.as_deref(),
                 base_path,
             ),
+            CompletionContext::InsideDirectivesBlock => self.directives_block_completions(),
+            CompletionContext::InsideDirectivesDependsOnList { current_binding } => self
+                .directives_depends_on_completions(
+                    &text,
+                    current_binding.as_deref(),
+                    position,
+                    base_path,
+                ),
             CompletionContext::InsideProviderBlock { .. } => self.provider_block_completions(),
             CompletionContext::AfterProviderRegion { provider_name } => {
                 self.region_completions_for_provider(&provider_name)
@@ -444,6 +452,30 @@ impl CompletionProvider {
                 if !after_colon.contains('=') && !after_colon.contains('{') {
                     return CompletionContext::InTypePosition;
                 }
+            }
+        }
+
+        // `directives { ... }` is the meta-arg block, not a struct
+        // attribute — short-circuit before the struct router runs (#2873).
+        if !nested_block_names.is_empty()
+            && nested_block_names.last().map(String::as_str) == Some("directives")
+            && brace_depth >= 2
+        {
+            // Cursor inside `depends_on = [...]` → list-element completion.
+            if let Some(after_eq) = prefix.split('=').next_back()
+                && let Some(open) = after_eq.rfind('[')
+                && !after_eq[open..].contains(']')
+            {
+                let attr_name = self.extract_attr_name(&prefix);
+                if attr_name == "depends_on" {
+                    return CompletionContext::InsideDirectivesDependsOnList {
+                        current_binding: current_binding.clone(),
+                    };
+                }
+            }
+            // Cursor at attribute-name position inside `directives { | }`.
+            if !prefix.contains('=') || prefix.trim_end().ends_with('{') {
+                return CompletionContext::InsideDirectivesBlock;
             }
         }
 
@@ -850,6 +882,16 @@ enum CompletionContext {
         provider_name: String,
     },
     InTypePosition,
+    /// Cursor is at attribute-name position inside `directives { | }`
+    /// (#2873). Suggests the four directive keys: `force_delete`,
+    /// `create_before_destroy`, `prevent_destroy`, `depends_on`.
+    InsideDirectivesBlock,
+    /// Cursor is inside `directives { depends_on = [|] }` (#2873).
+    /// Suggests sibling resource / wait / module bindings, excluding
+    /// the enclosing binding name and any names already in the list.
+    InsideDirectivesDependsOnList {
+        current_binding: Option<String>,
+    },
     InsideImportPath {
         partial_path: String,
     },

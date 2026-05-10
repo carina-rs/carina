@@ -2393,3 +2393,83 @@ let rd = registry_deploy {
         "String-typed arg should offer string-returning built-ins like `join`, got: {labels:?}"
     );
 }
+
+#[test]
+fn directives_block_completion_includes_all_four_keys() {
+    let provider = test_provider_single_attr();
+    let doc = create_document("test.foo.bar {\n  attr = \"x\"\n  directives {\n    \n  }\n}\n");
+    // Cursor inside directives block, line 3, char 4
+    let completions = provider.complete(
+        &doc,
+        Position {
+            line: 3,
+            character: 4,
+        },
+        None,
+    );
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    for key in [
+        "force_delete",
+        "create_before_destroy",
+        "prevent_destroy",
+        "depends_on",
+    ] {
+        assert!(
+            labels.contains(&key),
+            "directives block completion missing `{key}`; got {labels:?}"
+        );
+    }
+}
+
+#[test]
+fn directives_depends_on_completion_lists_resource_bindings() {
+    let provider = test_provider_single_attr();
+    let doc = create_document(
+        "let role = test.foo.bar {\n  attr = \"r\"\n}\nlet bucket = test.foo.bar {\n  attr = \"x\"\n  directives {\n    depends_on = []\n  }\n}\n",
+    );
+    // Cursor between `[` and `]` on line 6, char 18
+    let completions = provider.complete(
+        &doc,
+        Position {
+            line: 6,
+            character: 18,
+        },
+        None,
+    );
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"role"),
+        "depends_on list completion missing `role`; got {labels:?}"
+    );
+    // self-reference suppression
+    assert!(
+        !labels.contains(&"bucket"),
+        "depends_on list completion must not include enclosing binding `bucket`; got {labels:?}"
+    );
+}
+
+#[test]
+fn directives_depends_on_completion_excludes_already_listed_names() {
+    let provider = test_provider_single_attr();
+    let doc = create_document(
+        "let role = test.foo.bar {\n  attr = \"r\"\n}\nlet kms = test.foo.bar {\n  attr = \"k\"\n}\nlet bucket = test.foo.bar {\n  attr = \"x\"\n  directives {\n    depends_on = [role, ]\n  }\n}\n",
+    );
+    // Cursor right after the comma+space inside the list
+    let completions = provider.complete(
+        &doc,
+        Position {
+            line: 9,
+            character: 24,
+        },
+        None,
+    );
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        !labels.contains(&"role"),
+        "already-listed `role` must not be re-suggested; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"kms"),
+        "kms binding should still be suggested; got {labels:?}"
+    );
+}
