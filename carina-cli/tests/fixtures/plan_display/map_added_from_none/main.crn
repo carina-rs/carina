@@ -1,0 +1,24 @@
+# Update plan: Map<String, String> attribute (tags) added from `(none)`
+# (issue #2936). State has no `tags`; desired has a multi-key map.
+# Expected rendering: per-key `+ key: "value"` lines, not a single
+# inline `tags: (none) → {...}` line.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.Vpc {
+  cidr_block = '10.0.0.0/16'
+
+  tags = {
+    Component   = 'registry'
+    Environment = 'dev'
+    ManagedBy   = 'carina'
+    Project     = 'carina-rs'
+    Repository  = 'carina-rs/infra'
+  }
+}
+
+exports {
+  cidr_block = vpc.cidr_block
+}

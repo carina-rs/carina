@@ -265,6 +265,25 @@ fn snapshot_map_key_diff() {
     insta::assert_snapshot!(output);
 }
 
+/// #2936: a Map<String, String> attribute that goes from absent in
+/// state to a multi-key value must render as per-key `+ key: "value"`
+/// lines, not as a single inline `tags: (none) → {...}` line.
+#[test]
+fn snapshot_map_added_from_none() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("map_added_from_none");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+    ));
+    insta::assert_snapshot!(output);
+}
+
 #[test]
 fn snapshot_enum_display() {
     let (plan, schemas, _moved) = build_plan_from_fixture("enum_display");

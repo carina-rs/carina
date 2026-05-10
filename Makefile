@@ -14,6 +14,8 @@ plan-compact:
 	$(PLAN_FIXTURE) compact --detail none
 plan-map-diff:
 	$(PLAN_FIXTURE) map_key_diff
+plan-map-added-from-none:
+	$(PLAN_FIXTURE) map_added_from_none
 plan-nested-map-diff:
 	$(PLAN_FIXTURE) nested_map_diff
 plan-list-diff-added-struct:
@@ -82,6 +84,8 @@ plan-fixtures:
 	@echo ""
 	@echo "=== map_key_diff ==="
 	@$(MAKE) plan-map-diff
+	@echo "---"
+	@$(MAKE) plan-map-added-from-none
 	@echo ""
 	@echo "=== nested_map_diff ==="
 	@$(MAKE) plan-nested-map-diff

@@ -32,9 +32,9 @@ expression: output
 ┌ Details ─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │~ ec2.Vpc new_vpc                                                                                                     │
 │                                                                                                                      │
-│  tags: (none) -> {Name: "updated"}                                                                                   │
+│  tags:                                                                                                               │
+│    + Name: "updated"                                                                                                 │
 │  # (1 unchanged attribute hidden)                                                                                    │
-│                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
