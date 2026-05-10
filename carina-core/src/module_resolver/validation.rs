@@ -16,6 +16,7 @@ pub(super) fn format_value_for_error(value: &Value) -> String {
         Value::Int(n) => n.to_string(),
         Value::Float(f) => f.to_string(),
         Value::Bool(b) => b.to_string(),
+        Value::Duration(d) => crate::value::render_duration(*d),
         Value::List(items) => format!("[...] (length {})", items.len()),
         Value::Map(map) => format!("{{...}} (length {})", map.len()),
         _ => format!("{:?}", value),
