@@ -183,6 +183,8 @@ Duration values serialise to JSON as integer seconds:
 
 Schema knows the attribute is typed `Duration`; deserialisation reads the integer and reconstructs `Value::Duration(Duration::from_secs(n))`. Without the schema (e.g. an attribute on a stale resource type) the value remains `Value::Int` and downstream typing is reasserted at the next plan.
 
+> **Follow-up:** the schema-aware re-typing on the inbound state-load path is **not implemented in the Duration MVP** (carina#2962). Today every state-file integer reads back as `Value::Int(_)`, regardless of whether the schema attribute is `Duration`. The asymmetry is contained — no `AttributeType::Duration` reaches a real state file in the MVP because the only consumer (`wait { timeout = ... }`) does not persist. Re-typing lands in carina#2965 once a provider attribute migrates to `AttributeType::Duration` and creates a live consumer.
+
 Rationale: the state file is read by tooling (other plan/apply invocations, `carina state` subcommands) and by humans only as a last resort. Storing `4500` is unambiguous, easy to compute on, and round-trips losslessly through serde without a custom deserialiser path. The "`75min` was the source form" information lives in the .crn file, not the state file.
 
 State v3's existing schema versioning is sufficient — Duration deserialisation does not need a state version bump because it only adds an interpretation rule for an integer that already deserialises correctly.
@@ -207,6 +209,8 @@ Two host-side conversion points handle the marshaling:
 
 - **Outbound** (`core_to_wit_value` in `carina-plugin-host/src/host_value.rs`): `Value::Duration(d) → wit::Value::IntVal(d.as_secs() as i64)`. Negative results impossible because `Value::Duration` cannot hold a negative duration.
 - **Inbound** (`wit_to_core_value` in the same file): WIT does not annotate which integers are durations. The host queries the schema for the destination attribute's type; if it's `AttributeType::Duration`, the inbound `int-val(n)` is reconstructed as `Value::Duration(Duration::from_secs(n as u64))`. Otherwise it's an `Value::Int(n)`.
+
+> **Follow-up:** the WIT-inbound schema-aware re-typing is **not implemented in the Duration MVP** (carina#2962). Today every `IntVal` reads back as `Value::Int(_)`, regardless of the destination schema's type. Same asymmetry rationale as the state-file path above: the only Duration consumer in the MVP is host-side and never crosses the WIT boundary. Re-typing lands alongside carina#2965 once a provider attribute migrates to `AttributeType::Duration`.
 
 Rationale (decided during brainstorming):
 

@@ -50,6 +50,7 @@ pub(crate) fn builtin_join(args: &[Value]) -> Result<Value, String> {
             Value::Int(n) => n.to_string(),
             Value::Float(f) => f.to_string(),
             Value::Bool(b) => b.to_string(),
+            Value::Duration(d) => crate::value::render_duration(*d),
             other => format!("{:?}", other),
         })
         .collect::<Vec<_>>()

@@ -1471,3 +1471,24 @@ fn colored_value_preserves_vertical_map_layout() {
         "vertical map layout must be preserved verbatim, got: {result:?}",
     );
 }
+
+#[test]
+fn format_export_value_duration_renders_canonical() {
+    // Regression: simplify + Round 1 added the Value::Duration arm so
+    // exports of a Duration attribute don't fall through to the
+    // wildcard "(known after apply)" placeholder. Pin the canonical
+    // form here so a future refactor cannot silently regress to either
+    // the wildcard or the {:?} Debug shape.
+    let v = Value::Duration(std::time::Duration::from_secs(60));
+    assert_eq!(format_export_value(&v), "1min");
+}
+
+#[test]
+fn format_deferred_value_duration_renders_canonical() {
+    // Same shape as format_export_value but on the deferred-for path.
+    let v = Value::Duration(std::time::Duration::from_secs(60));
+    let result = format_deferred_value(&v);
+    // The deferred path may inject ANSI dimming for Unknown variants,
+    // but a resolved Duration must render verbatim.
+    assert_eq!(result, "1min");
+}

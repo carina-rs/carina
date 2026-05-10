@@ -403,9 +403,13 @@ impl FormatSink for WidthCounter {
 /// `3600s` → `1h`, `60s` → `1min`, anything else → `Ns`. The original
 /// authoring unit is not preserved (`Value::Duration` carries only a
 /// `std::time::Duration`), so this is a deterministic re-rendering
-/// rule — not a faithful round-trip. `carina fmt` therefore rewrites
-/// `2700s` to `45min`, by design (`feedback_no_backward_compat` plus
-/// the design doc's "canonical form" section).
+/// rule — not a faithful round-trip.
+///
+/// Used by every value-tree consumer: plan display, hover, deferred-
+/// for / export display, builtin-error messages, and `Display for
+/// Value`. The source-text formatter (`carina fmt`) currently passes
+/// duration literals through verbatim — see #2966 for the planned
+/// fmt-side normalisation that will make `2700s` rewrite to `45min`.
 pub fn render_duration(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     if secs == 0 {
@@ -1287,6 +1291,10 @@ mod tests {
         assert_eq!(render_duration(Duration::from_secs(3600)), "1h");
         assert_eq!(render_duration(Duration::from_secs(4500)), "75min");
         assert_eq!(render_duration(Duration::from_secs(7200)), "2h");
+        // No day/week unit — values past 24h render in hours.
+        assert_eq!(render_duration(Duration::from_secs(86400)), "24h");
+        // Large prime-ish second count keeps the seconds form.
+        assert_eq!(render_duration(Duration::from_secs(90061)), "90061s");
     }
 
     #[test]

@@ -803,6 +803,19 @@ mod tests {
     use carina_core::parser::ProviderContext;
     use carina_core::schema::{AttributeSchema, AttributeType};
 
+    #[test]
+    fn format_value_for_hover_renders_duration_as_canonical_form() {
+        // Regression: Round 1 added the Value::Duration arm so editor
+        // hover doesn't show the {:?} fall-through
+        // `Duration { secs: 60, nanos: 0 }`. Pin the canonical surface
+        // form here.
+        use carina_core::resource::Value;
+        let v = Value::Duration(std::time::Duration::from_secs(60));
+        assert_eq!(format_value_for_hover(&v), "1min");
+        let v = Value::Duration(std::time::Duration::from_secs(4500));
+        assert_eq!(format_value_for_hover(&v), "75min");
+    }
+
     fn create_hover_provider_with_description(
         resource_type: &str,
         description: &str,

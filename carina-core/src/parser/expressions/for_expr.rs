@@ -368,6 +368,7 @@ pub(crate) fn parse_for_expr(
                 Value::Int(i) => format!("int {}", i),
                 Value::Float(f) => format!("float {}", f),
                 Value::Bool(b) => format!("bool {}", b),
+                Value::Duration(d) => format!("duration {}", crate::value::render_duration(*d)),
                 Value::ResourceRef { path } => {
                     format!("unresolved reference {}", path.to_dot_string())
                 }
