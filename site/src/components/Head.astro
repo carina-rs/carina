@@ -6,6 +6,14 @@ interface Props {
 
 const { title, description } = Astro.props;
 const fullTitle = title === 'Carina' ? 'Carina' : `${title} | Carina`;
+
+// Build the OG image URL from the current page's pathname.
+// Pathnames look like "/", "/getting-started/installation/", etc.
+// The OG endpoint is /og/<slug>.png where <slug> matches the page slug
+// used by content/<slug>.md(x). For "/" we emit /og/index.png.
+const path = Astro.url.pathname.replace(/^\/|\/$/g, '');
+const ogPath = path ? `/og/${path}.png` : '/og/index.png';
+const ogUrl = new URL(ogPath, Astro.site ?? Astro.url).toString();
 ---
 <head>
   <meta charset="utf-8" />
@@ -16,10 +24,12 @@ const fullTitle = title === 'Carina' ? 'Carina' : `${title} | Carina`;
   <meta property="og:title" content={fullTitle} />
   <meta property="og:description" content={description} />
   <meta property="og:type" content="website" />
+  <meta property="og:image" content={ogUrl} />
 
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="twitter:title" content={fullTitle} />
   <meta name="twitter:description" content={description} />
+  <meta name="twitter:image" content={ogUrl} />
 
   <link rel="icon" type="image/png" href="/favicon.png" />
 </head>
