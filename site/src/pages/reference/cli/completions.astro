@@ -1,0 +1,13 @@
+---
+import Doc from '../../../layouts/Doc.astro';
+import { Content, getHeadings, frontmatter } from '../../../content/reference/cli/completions.md';
+
+const headings = getHeadings();
+---
+<Doc
+  title={frontmatter.title ?? 'carina completions'}
+  description={frontmatter.description}
+  headings={headings}
+>
+  <Content />
+</Doc>
