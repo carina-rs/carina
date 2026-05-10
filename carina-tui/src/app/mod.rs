@@ -686,7 +686,7 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
 }
 
 fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode {
-    let detail_rows = build_detail_rows(effect, schemas, DetailLevel::Full, None);
+    let detail_rows = build_detail_rows(effect, schemas, DetailLevel::Full, None, None);
 
     match effect {
         Effect::Read { resource } => TreeNode {

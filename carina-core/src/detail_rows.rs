@@ -291,11 +291,18 @@ pub struct CascadingUpdateAttr {
 /// This function encapsulates ALL the logic for deciding what detail rows to
 /// show for a given effect. The caller only needs to render each `DetailRow`
 /// with appropriate formatting (colors, prefixes, etc.).
+///
+/// `prev_explicit` is the per-resource user-authoring tree the differ used.
+/// When provided, the actual-state side (`from.attributes`) is projected
+/// through it before unchanged-attribute counting so server-side default
+/// fields the user never wrote do not inflate the
+/// `# (n unchanged attributes hidden)` summary in Full mode (refs awscc#206).
 pub fn build_detail_rows(
     effect: &Effect,
     registry: Option<&SchemaRegistry>,
     detail: DetailLevel,
     delete_attributes: Option<&HashMap<ResourceId, HashMap<String, Value>>>,
+    prev_explicit: Option<&HashMap<ResourceId, crate::explicit::ExplicitFields>>,
 ) -> Vec<DetailRow> {
     if detail == DetailLevel::NamesOnly {
         return Vec::new();
@@ -308,7 +315,10 @@ pub fn build_detail_rows(
             to,
             changed_attributes,
             ..
-        } => build_update_rows(from, to, changed_attributes, detail),
+        } => {
+            let explicit = prev_explicit.and_then(|map| map.get(&to.id));
+            build_update_rows(from, to, changed_attributes, detail, explicit)
+        }
         Effect::Replace {
             from,
             to,
@@ -317,15 +327,19 @@ pub fn build_detail_rows(
             temporary_name,
             cascade_ref_hints,
             ..
-        } => build_replace_rows(
-            from,
-            to,
-            changed_create_only,
-            cascading_updates,
-            temporary_name,
-            cascade_ref_hints,
-            detail,
-        ),
+        } => {
+            let explicit = prev_explicit.and_then(|map| map.get(&to.id));
+            build_replace_rows(
+                from,
+                to,
+                changed_create_only,
+                cascading_updates,
+                temporary_name,
+                cascade_ref_hints,
+                detail,
+                explicit,
+            )
+        }
         Effect::Delete { id, .. } => build_delete_rows(id, delete_attributes),
         Effect::Read { resource } => build_create_rows(resource, registry, detail),
         Effect::Import { identifier, .. } => {
@@ -482,8 +496,18 @@ fn build_update_rows(
     to: &crate::resource::Resource,
     changed_attributes: &[String],
     detail: DetailLevel,
+    explicit: Option<&crate::explicit::ExplicitFields>,
 ) -> Vec<DetailRow> {
     let mut rows = Vec::new();
+
+    // Project `from.attributes` through the user-authoring tree so
+    // server-side default fields the user never wrote don't inflate
+    // the unchanged-count summary (refs awscc#206). Idempotent and a
+    // no-op when `explicit` is None.
+    let from_attrs_projected: HashMap<String, Value> = match explicit {
+        Some(e) => crate::explicit::project_attributes(from.attributes.clone(), e),
+        None => from.attributes.clone(),
+    };
 
     let mut keys: Vec<_> = to
         .attributes
@@ -552,7 +576,7 @@ fn build_update_rows(
     // In Full mode, show count of unchanged attributes hidden
     if detail == DetailLevel::Full {
         let unchanged_count =
-            compute_unchanged_count(&from.attributes, &to.resolved_attributes(), None)
+            compute_unchanged_count(&from_attrs_projected, &to.resolved_attributes(), None)
                 + effectively_unchanged;
         if unchanged_count > 0 {
             rows.push(DetailRow::HiddenUnchanged {
@@ -564,6 +588,7 @@ fn build_update_rows(
     rows
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_replace_rows(
     from: &crate::resource::State,
     to: &crate::resource::Resource,
@@ -572,6 +597,7 @@ fn build_replace_rows(
     temporary_name: &Option<crate::effect::TemporaryName>,
     cascade_ref_hints: &[(String, String)],
     detail: DetailLevel,
+    explicit: Option<&crate::explicit::ExplicitFields>,
 ) -> Vec<DetailRow> {
     let mut rows = Vec::new();
 
@@ -642,11 +668,17 @@ fn build_replace_rows(
         });
     }
 
-    // In Full mode, show count of unchanged attributes hidden
+    // In Full mode, show count of unchanged attributes hidden.
+    // Project `from.attributes` so server-side defaults don't inflate
+    // the count (refs awscc#206).
     if detail == DetailLevel::Full {
+        let from_attrs_projected: HashMap<String, Value> = match explicit {
+            Some(e) => crate::explicit::project_attributes(from.attributes.clone(), e),
+            None => from.attributes.clone(),
+        };
         let changed_set: HashSet<&str> = changed_create_only.iter().map(|s| s.as_str()).collect();
         let unchanged_count = compute_unchanged_count(
-            &from.attributes,
+            &from_attrs_projected,
             &to.resolved_attributes(),
             Some(&changed_set),
         );
@@ -1129,7 +1161,7 @@ mod tests {
     fn test_names_only_returns_empty() {
         let resource = Resource::new("s3.Bucket", "my-bucket");
         let effect = Effect::Create(resource);
-        let rows = build_detail_rows(&effect, None, DetailLevel::NamesOnly, None);
+        let rows = build_detail_rows(&effect, None, DetailLevel::NamesOnly, None, None);
         assert!(rows.is_empty());
     }
 
@@ -1139,7 +1171,7 @@ mod tests {
             .with_attribute("bucket", Value::String("my-bucket".to_string()))
             .with_attribute("region", Value::String("us-east-1".to_string()));
         let effect = Effect::Create(resource);
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None);
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
         assert_eq!(rows.len(), 2);
         assert!(matches!(&rows[0], DetailRow::Attribute { key, .. } if key == "bucket"));
         assert!(matches!(&rows[1], DetailRow::Attribute { key, .. } if key == "region"));
@@ -1164,7 +1196,7 @@ mod tests {
             to,
             changed_attributes: vec!["versioning".to_string()],
         };
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None);
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
         assert_eq!(rows.len(), 1);
         assert!(matches!(&rows[0], DetailRow::Changed { key, old, new }
             if key == "versioning" && old == "\"Disabled\"" && new == "\"Enabled\""));
@@ -1195,11 +1227,81 @@ mod tests {
             to,
             changed_attributes: vec!["versioning".to_string()],
         };
-        let rows = build_detail_rows(&effect, None, DetailLevel::Full, None);
+        let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, None);
         // 1 changed + 1 hidden unchanged (2 unchanged attrs)
         assert_eq!(rows.len(), 2);
         assert!(matches!(&rows[0], DetailRow::Changed { .. }));
         assert!(matches!(&rows[1], DetailRow::HiddenUnchanged { count: 2 }));
+    }
+
+    #[test]
+    fn unchanged_count_excludes_server_only_field() {
+        // `from.attributes` has authored + server_only, both unchanged
+        // against `to`. Without prev_explicit, both contribute to the
+        // hidden-unchanged count. With prev_explicit listing only
+        // "authored", the projection drops server_only before counting,
+        // shrinking the count from 2 to 1 — the awscc#206 effect.
+        use crate::explicit::ExplicitFields;
+
+        let from = State::existing(
+            ResourceId::new("s3.Bucket", "my-bucket"),
+            [
+                ("authored".to_string(), Value::String("a".to_string())),
+                ("server_only".to_string(), Value::String("s".to_string())),
+                (
+                    "trigger_diff".to_string(),
+                    Value::String("old-value".to_string()),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let to = Resource::new("s3.Bucket", "my-bucket")
+            .with_attribute("authored", Value::String("a".to_string()))
+            .with_attribute("server_only", Value::String("s".to_string()))
+            .with_attribute("trigger_diff", Value::String("new-value".to_string()));
+        let effect = Effect::Update {
+            id: ResourceId::new("s3.Bucket", "my-bucket"),
+            from: Box::new(from),
+            to,
+            changed_attributes: vec!["trigger_diff".to_string()],
+        };
+
+        // Without prev_explicit: both authored and server_only contribute
+        // to the unchanged count.
+        let rows_no_explicit = build_detail_rows(&effect, None, DetailLevel::Full, None, None);
+        let no_explicit_count = rows_no_explicit.iter().find_map(|r| match r {
+            DetailRow::HiddenUnchanged { count } => Some(*count),
+            _ => None,
+        });
+        assert_eq!(
+            no_explicit_count,
+            Some(2),
+            "Without prev_explicit, both authored and server_only contribute to unchanged count"
+        );
+
+        // With prev_explicit listing only "authored": server_only is
+        // projected out, leaving only "authored" as the unchanged tally.
+        let mut explicit_map = HashMap::new();
+        explicit_map.insert(
+            ResourceId::new("s3.Bucket", "my-bucket"),
+            ExplicitFields::Struct {
+                children: HashMap::from([
+                    ("authored".to_string(), ExplicitFields::Leaf),
+                    ("trigger_diff".to_string(), ExplicitFields::Leaf),
+                ]),
+            },
+        );
+        let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, Some(&explicit_map));
+        let projected_count = rows.iter().find_map(|r| match r {
+            DetailRow::HiddenUnchanged { count } => Some(*count),
+            _ => None,
+        });
+        assert_eq!(
+            projected_count,
+            Some(1),
+            "With prev_explicit, server_only should not contribute to unchanged count"
+        );
     }
 
     #[test]
@@ -1222,7 +1324,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let rows = build_detail_rows(&effect, None, DetailLevel::Full, Some(&delete_attrs));
+        let rows = build_detail_rows(&effect, None, DetailLevel::Full, Some(&delete_attrs), None);
         assert_eq!(rows.len(), 1);
         assert!(matches!(&rows[0], DetailRow::Attribute { key, .. } if key == "bucket"));
     }
@@ -1249,7 +1351,7 @@ mod tests {
             to,
             changed_attributes: vec!["removed_attr".to_string()],
         };
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None);
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
         assert_eq!(rows.len(), 1);
         assert!(matches!(&rows[0], DetailRow::Removed { key, .. } if key == "removed_attr"));
     }
@@ -1262,7 +1364,7 @@ mod tests {
         let resource =
             Resource::new("s3.Bucket", "my-bucket").with_attribute("tags", Value::Map(tags));
         let effect = Effect::Create(resource);
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None);
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
         assert_eq!(rows.len(), 1);
         match &rows[0] {
             DetailRow::MapExpanded { key, entries } => {
@@ -1304,7 +1406,7 @@ mod tests {
         let resource = Resource::new("iam.RolePolicy", "test")
             .with_attribute("policy_document", Value::Map(policy));
         let effect = Effect::Create(resource);
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None);
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
         let entries = rows
             .iter()
             .find_map(|r| match r {
@@ -1349,7 +1451,7 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        let rows = build_detail_rows(&effect, None, DetailLevel::Full, Some(&delete_attrs));
+        let rows = build_detail_rows(&effect, None, DetailLevel::Full, Some(&delete_attrs), None);
         assert_eq!(rows.len(), 1);
         match &rows[0] {
             DetailRow::MapExpanded { key, entries } => {
@@ -1385,7 +1487,7 @@ mod tests {
             temporary_name: None,
             cascade_ref_hints: vec![],
         };
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None);
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
         assert_eq!(rows.len(), 1);
         assert!(matches!(&rows[0], DetailRow::ReplaceChanged { key, .. } if key == "cidr_block"));
     }
@@ -1434,7 +1536,7 @@ mod tests {
         let resource = Resource::new("iam.RolePolicy", "test")
             .with_attribute("statement", Value::List(vec![Value::Map(entry)]));
         let effect = Effect::Create(resource);
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None);
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
 
         let pretty_value = rows.iter().find_map(|row| match row {
             DetailRow::PrettyAttribute { key, value } if key == "statement" => Some(value),
@@ -1455,7 +1557,7 @@ mod tests {
         let resource = Resource::new("iam.Role", "test")
             .with_attribute("role_name", Value::String("foo".to_string()));
         let effect = Effect::Create(resource);
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None);
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
         assert!(
             rows.iter().any(|row| matches!(
                 row,
@@ -1477,7 +1579,7 @@ mod tests {
             ]),
         );
         let effect = Effect::Create(resource);
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None);
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
 
         let pretty = rows.iter().find_map(|row| match row {
             DetailRow::PrettyAttribute { key, value } if key == "managed_policy_arns" => {
@@ -1503,7 +1605,7 @@ mod tests {
         let resource =
             Resource::new("iam.Role", "test").with_attribute("tags", Value::List(vec![]));
         let effect = Effect::Create(resource);
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None);
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
         assert!(
             rows.iter().any(|row| matches!(
                 row,
