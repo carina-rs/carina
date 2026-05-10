@@ -1,6 +1,6 @@
 //! Detail-pane drawing and per-row rendering.
 
-use carina_core::detail_rows::DetailRow;
+use carina_core::detail_rows::{DetailRow, hidden_unchanged_summary};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
@@ -235,13 +235,8 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
             lines.push(line);
         }
         DetailRow::HiddenUnchanged { count } => {
-            let noun = if *count == 1 {
-                "attribute"
-            } else {
-                "attributes"
-            };
             let mut line = Line::from(Span::styled(
-                format!("  # ({} unchanged {} hidden)", count, noun),
+                format!("  {}", hidden_unchanged_summary(*count, "attribute")),
                 dim_style,
             ));
             if is_selected {

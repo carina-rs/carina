@@ -1,0 +1,34 @@
+# Update plan that modifies *one* field of a list-of-maps element while
+# leaving its other fields unchanged (issue #2881). Pre-fix, every
+# unchanged sibling field rendered next to the changed one — including
+# a long `action` list that pre-stringified into one ~250-column line.
+# Post-fix, only the `~ effect:` line shows, plus a summary
+# `# (3 unchanged fields hidden)` row in Full mode.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let policy = awscc.iam.RolePolicy {
+  policy_name = 'test-inline'
+  role_name   = 'test-role'
+  statement = [
+    {
+      sid    = 'AllowS3Read'
+      effect = 'Deny'
+      action = [
+        's3:GetObject',
+        's3:GetObjectTagging',
+        's3:GetObjectVersion',
+        's3:GetObjectVersionTagging',
+        's3:ListBucket',
+        's3:ListBucketVersions',
+      ]
+      resource = 'arn:aws:s3:::example/*'
+    },
+  ]
+}
+
+exports {
+  policy_name = policy.policy_name
+}

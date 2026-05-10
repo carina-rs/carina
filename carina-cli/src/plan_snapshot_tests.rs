@@ -936,6 +936,71 @@ fn snapshot_list_diff_added_struct() {
     insta::assert_snapshot!(output);
 }
 
+// #2881 acceptance: when a list-of-maps element is modified (paired with
+// an old element by similarity), unchanged fields inside the `~ { ... }`
+// block should be hidden behind a single `# (n unchanged fields hidden)`
+// summary in Full mode — mirroring the top-level
+// `# (n unchanged attributes hidden)` convention. Pre-fix every sibling
+// field rendered next to the changed one, including a long
+// `action: [...]` list that produced a wide one-line dump.
+#[test]
+fn snapshot_list_diff_modified_with_unchanged() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("list_diff_modified_with_unchanged");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+    ));
+    assert!(
+        !output.lines().any(|l| l.len() > 200),
+        "modified list-element block should not render a wide unchanged-field line; got: {}",
+        output
+    );
+    assert!(
+        output.contains("unchanged field"),
+        "expected `# (n unchanged fields hidden)` summary in Full mode; got: {}",
+        output
+    );
+    insta::assert_snapshot!(output);
+}
+
+// #2881 follow-on: exercises the modified-with-nested branch where the
+// only changed field is a nested Map (`config`). Locks in the
+// `~ { ... }` block-style layout: nested map diff first, then
+// `# (n unchanged fields hidden)` summary inside the block, then the
+// closing `}` on its own line. This is the round-1-review edge case
+// where the inline-spans buffer gets flushed mid-iteration by the
+// `NestedMapChanged` arm.
+#[test]
+fn snapshot_list_diff_modified_with_unchanged_nested() {
+    let (plan, schemas, _moved) =
+        build_plan_from_fixture("list_diff_modified_with_unchanged_nested");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+    ));
+    assert!(
+        !output.lines().any(|l| l.len() > 200),
+        "modified list-element block should not render a wide unchanged-field line; got: {}",
+        output
+    );
+    assert!(
+        output.contains("unchanged field"),
+        "expected `# (n unchanged fields hidden)` summary in Full mode; got: {}",
+        output
+    );
+    insta::assert_snapshot!(output);
+}
+
 // Mirror of the added-struct test for the removed path.
 #[test]
 fn snapshot_list_diff_removed_struct() {

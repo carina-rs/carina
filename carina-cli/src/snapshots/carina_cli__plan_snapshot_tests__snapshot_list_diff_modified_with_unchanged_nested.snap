@@ -1,0 +1,17 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  ~ awscc.iam.RolePolicy policy
+      statement:
+        ~ {
+            config:
+              ~ log_level: "info" → "debug"
+              ~ retention_days: "30" → "90"
+            # (4 unchanged fields hidden)
+          }
+      # (2 unchanged attributes hidden)
+
+Plan: 0 to add, 1 to change, 0 to destroy.
