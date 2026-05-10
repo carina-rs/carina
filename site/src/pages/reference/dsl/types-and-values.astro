@@ -1,0 +1,13 @@
+---
+import Doc from '../../../layouts/Doc.astro';
+import { Content, getHeadings, frontmatter } from '../../../content/reference/dsl/types-and-values.md';
+
+const headings = getHeadings();
+---
+<Doc
+  title={frontmatter.title ?? 'Types & Values'}
+  description={frontmatter.description}
+  headings={headings}
+>
+  <Content />
+</Doc>
