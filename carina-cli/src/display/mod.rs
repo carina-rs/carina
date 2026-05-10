@@ -392,6 +392,10 @@ struct TreeRenderContext<'a> {
     delete_attributes: Option<&'a HashMap<ResourceId, HashMap<String, Value>>>,
     schemas: Option<&'a SchemaRegistry>,
     moved_origins: &'a HashMap<ResourceId, ResourceId>,
+    /// Per-resource user-authoring trees, used by `build_detail_rows`
+    /// to project the actual-state side before unchanged-attribute
+    /// counting (refs awscc#206).
+    prev_explicit: Option<&'a HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
     /// ResourceIds that are targets of Update or Replace effects.
     /// Used to skip Move line display when the move is already shown via annotation.
     update_or_replace_targets: HashSet<ResourceId>,
@@ -653,6 +657,7 @@ impl<'a> TreeRenderContext<'a> {
                 self.schemas,
                 self.detail.to_core(),
                 self.delete_attributes,
+                self.prev_explicit,
             );
 
             if !detail_rows.is_empty() {
@@ -776,6 +781,7 @@ fn format_plan_tree(
         delete_attributes,
         schemas,
         moved_origins,
+        prev_explicit: None,
         update_or_replace_targets,
     };
 
