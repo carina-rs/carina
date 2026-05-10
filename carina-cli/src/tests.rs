@@ -1260,7 +1260,7 @@ fn orphaned_state_resource_produces_delete_effect() {
 
     let directives_map = state_file.build_directives();
     let saved_attrs = state_file.build_saved_attrs();
-    let prev_desired_keys = state_file.build_desired_keys();
+    let prev_explicit = state_file.build_explicit();
 
     let plan = create_plan(
         &desired,
@@ -1268,7 +1268,7 @@ fn orphaned_state_resource_produces_delete_effect() {
         &directives_map,
         &SchemaRegistry::new(),
         &saved_attrs,
-        &prev_desired_keys,
+        &prev_explicit,
         &HashMap::new(),
     );
 
@@ -2171,7 +2171,7 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
 
     let directives_map = state_file.build_directives();
     let saved_attrs = state_file.build_saved_attrs();
-    let prev_desired_keys = state_file.build_desired_keys();
+    let prev_explicit = state_file.build_explicit();
 
     let plan = create_plan(
         &desired,
@@ -2179,7 +2179,7 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
         &directives_map,
         &SchemaRegistry::new(),
         &saved_attrs,
-        &prev_desired_keys,
+        &prev_explicit,
         &HashMap::new(),
     );
 
@@ -2253,7 +2253,7 @@ fn refresh_false_uses_cached_state_from_state_file() {
 
     let directives_map = state_file.build_directives();
     let saved_attrs = state_file.build_saved_attrs();
-    let prev_desired_keys = state_file.build_desired_keys();
+    let prev_explicit = state_file.build_explicit();
 
     let plan = create_plan(
         &desired,
@@ -2261,7 +2261,7 @@ fn refresh_false_uses_cached_state_from_state_file() {
         &directives_map,
         &SchemaRegistry::new(),
         &saved_attrs,
-        &prev_desired_keys,
+        &prev_explicit,
         &HashMap::new(),
     );
 
@@ -2299,7 +2299,7 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
 
     let directives_map = state_file.build_directives();
     let saved_attrs = state_file.build_saved_attrs();
-    let prev_desired_keys = state_file.build_desired_keys();
+    let prev_explicit = state_file.build_explicit();
 
     let plan = create_plan(
         &desired,
@@ -2307,7 +2307,7 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
         &directives_map,
         &SchemaRegistry::new(),
         &saved_attrs,
-        &prev_desired_keys,
+        &prev_explicit,
         &HashMap::new(),
     );
 

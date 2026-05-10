@@ -131,17 +131,19 @@ fn generate_temporary_name(
 /// This is used to merge unmanaged nested fields into desired values before comparison,
 /// preventing false diffs when AWS returns extra fields not specified in the .crn file.
 ///
-/// The `prev_desired_keys` map provides the attribute keys that the user explicitly
-/// specified in their .crn file during the last apply. This is used to detect
-/// attribute removal: if a key was previously in the user's desired state but is
-/// now absent, it means the user intentionally removed it.
+/// The `prev_explicit` map provides the per-resource authoring tree that
+/// the user wrote in their `.crn` during the last apply. The differ uses
+/// it both to project the actual-state side (hiding server-side defaults
+/// the user never wrote, refs awscc#206) and to detect attribute
+/// removals: if a top-level key was previously in the user's desired
+/// state but is now absent, it means the user intentionally removed it.
 pub fn create_plan(
     desired: &[Resource],
     current_states: &HashMap<ResourceId, State>,
     directives_map: &HashMap<ResourceId, Directives>,
     registry: &SchemaRegistry,
     saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
-    prev_desired_keys: &HashMap<ResourceId, Vec<String>>,
+    prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     orphan_dependencies: &HashMap<ResourceId, BTreeSet<String>>,
 ) -> Plan {
     let mut plan = Plan::new();
@@ -169,7 +171,7 @@ pub fn create_plan(
             .unwrap_or_else(|| State::not_found(resource.id.clone()));
 
         let saved = saved_attrs.get(&resource.id);
-        let prev_keys = prev_desired_keys.get(&resource.id);
+        let prev_explicit_for_resource = prev_explicit.get(&resource.id);
         let schema = registry.get(
             &resource.id.provider,
             &resource.id.resource_type,
@@ -179,7 +181,7 @@ pub fn create_plan(
             resource,
             &current,
             saved,
-            prev_keys.map(|v| v.as_slice()),
+            prev_explicit_for_resource,
             schema,
         );
 

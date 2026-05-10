@@ -2,7 +2,21 @@ use super::*;
 
 use indexmap::IndexMap;
 
+use crate::explicit::ExplicitFields;
 use crate::resource::ResourceKind;
+
+/// Build an `ExplicitFields::Struct` whose children are all `Leaf` —
+/// the shape `state v5 → v6` reads produce, and a convenient way to
+/// express "user previously authored these top-level keys" in tests
+/// that pre-date the nested authoring tree.
+fn explicit_top_level(keys: &[&str]) -> ExplicitFields {
+    ExplicitFields::Struct {
+        children: keys
+            .iter()
+            .map(|k| ((*k).to_string(), ExplicitFields::Leaf))
+            .collect(),
+    }
+}
 
 #[test]
 fn create_before_destroy_generates_temporary_name_for_name_attribute() {
@@ -386,9 +400,9 @@ fn diff_detects_attribute_removal_with_prev_desired_keys() {
     let current = State::existing(ResourceId::new("s3.Bucket", "test"), current_attrs);
 
     // Previous desired state had both "region" and "tags"
-    let prev_keys = vec!["region".to_string(), "tags".to_string()];
+    let prev_explicit = explicit_top_level(&["region", "tags"]);
 
-    let result = diff(&desired, &current, None, Some(&prev_keys), None);
+    let result = diff(&desired, &current, None, Some(&prev_explicit), None);
     match result {
         Diff::Update {
             changed_attributes, ..
@@ -421,9 +435,9 @@ fn diff_ignores_attributes_not_in_prev_desired_keys() {
     let current = State::existing(ResourceId::new("s3.Bucket", "test"), current_attrs);
 
     // User previously only specified "region", not "arn"
-    let prev_keys = vec!["region".to_string()];
+    let prev_explicit = explicit_top_level(&["region"]);
 
-    let result = diff(&desired, &current, None, Some(&prev_keys), None);
+    let result = diff(&desired, &current, None, Some(&prev_explicit), None);
     match result {
         Diff::Update {
             changed_attributes, ..
@@ -438,6 +452,102 @@ fn diff_ignores_attributes_not_in_prev_desired_keys() {
             );
         }
         _ => panic!("Expected Update, got {:?}", result),
+    }
+}
+
+#[test]
+fn server_default_struct_field_does_not_appear_in_diff() {
+    // The user wrote `lifecycle_configuration { rules: [...] }` but did
+    // NOT write `transition_default_minimum_object_size`. AWS returns
+    // the latter in `current` as a server-side default. The differ must
+    // project current through `prev_explicit` and skip the server-only
+    // leaf — no `lifecycle_configuration` change should be reported.
+    use indexmap::IndexMap;
+
+    let mut desired_lc = IndexMap::new();
+    desired_lc.insert(
+        "rules".to_string(),
+        Value::List(vec![{
+            let mut rule = IndexMap::new();
+            rule.insert("id".to_string(), Value::String("expire".to_string()));
+            Value::Map(rule)
+        }]),
+    );
+    let desired = Resource::new("s3.Bucket", "test")
+        .with_attribute("lifecycle_configuration", Value::Map(desired_lc.clone()));
+
+    let mut current_lc = desired_lc;
+    current_lc.insert(
+        "transition_default_minimum_object_size".to_string(),
+        Value::String("all_storage_classes_128K".to_string()),
+    );
+    let mut current_attrs = HashMap::new();
+    current_attrs.insert(
+        "lifecycle_configuration".to_string(),
+        Value::Map(current_lc),
+    );
+    let current = State::existing(ResourceId::new("s3.Bucket", "test"), current_attrs);
+
+    // prev_explicit reflects what the user wrote: lifecycle_configuration > rules
+    let prev_explicit = ExplicitFields::Struct {
+        children: std::collections::HashMap::from([(
+            "lifecycle_configuration".to_string(),
+            ExplicitFields::Struct {
+                children: std::collections::HashMap::from([(
+                    "rules".to_string(),
+                    ExplicitFields::List {
+                        element: Box::new(ExplicitFields::Struct {
+                            children: std::collections::HashMap::from([(
+                                "id".to_string(),
+                                ExplicitFields::Leaf,
+                            )]),
+                        }),
+                    },
+                )]),
+            },
+        )]),
+    };
+
+    let result = diff(&desired, &current, None, Some(&prev_explicit), None);
+    assert!(
+        matches!(result, Diff::NoChange(_)),
+        "Server-side default struct leaf must not surface in diff, got: {:?}",
+        result
+    );
+}
+
+#[test]
+fn explicit_top_level_removal_still_detected() {
+    // Regression guard: removing the *whole* attribute (top-level key
+    // gone from desired but still authored in prev_explicit) must
+    // still produce an Update. This is the existing "explicit unset"
+    // mechanism; the projection logic must not regress it.
+    let desired = Resource::new("s3.Bucket", "test");
+
+    let mut current_attrs = HashMap::new();
+    current_attrs.insert(
+        "tags".to_string(),
+        Value::Map(IndexMap::from([(
+            "Env".to_string(),
+            Value::String("prod".to_string()),
+        )])),
+    );
+    let current = State::existing(ResourceId::new("s3.Bucket", "test"), current_attrs);
+
+    let prev_explicit = explicit_top_level(&["tags"]);
+    let result = diff(&desired, &current, None, Some(&prev_explicit), None);
+
+    match result {
+        Diff::Update {
+            changed_attributes, ..
+        } => {
+            assert!(
+                changed_attributes.contains(&"tags".to_string()),
+                "Removed top-level attr must still produce Update, got: {:?}",
+                changed_attributes
+            );
+        }
+        _ => panic!("Expected Update for explicit-unset, got {:?}", result),
     }
 }
 
@@ -496,10 +606,10 @@ fn create_plan_detects_attribute_removal() {
         State::existing(ResourceId::new("s3.Bucket", "test"), attrs),
     );
 
-    let mut prev_desired_keys = HashMap::new();
-    prev_desired_keys.insert(
+    let mut prev_explicit = HashMap::new();
+    prev_explicit.insert(
         ResourceId::new("s3.Bucket", "test"),
-        vec!["region".to_string(), "tags".to_string()],
+        explicit_top_level(&["region", "tags"]),
     );
 
     let plan = create_plan(
@@ -508,7 +618,7 @@ fn create_plan_detects_attribute_removal() {
         &HashMap::new(),
         &SchemaRegistry::new(),
         &HashMap::new(),
-        &prev_desired_keys,
+        &prev_explicit,
         &HashMap::new(),
     );
 
@@ -548,10 +658,10 @@ fn create_plan_filters_non_removable_attribute_removal() {
         State::existing(ResourceId::new("s3.Bucket", "test"), attrs),
     );
 
-    let mut prev_desired_keys = HashMap::new();
-    prev_desired_keys.insert(
+    let mut prev_explicit = HashMap::new();
+    prev_explicit.insert(
         ResourceId::new("s3.Bucket", "test"),
-        vec!["region".to_string(), "tags".to_string()],
+        explicit_top_level(&["region", "tags"]),
     );
 
     // Schema: tags is auto-removable (optional, not create-only),
@@ -573,7 +683,7 @@ fn create_plan_filters_non_removable_attribute_removal() {
         &HashMap::new(),
         &schemas,
         &HashMap::new(),
-        &prev_desired_keys,
+        &prev_explicit,
         &HashMap::new(),
     );
 
@@ -617,10 +727,10 @@ fn create_plan_skips_update_when_only_non_removable_removal() {
         State::existing(ResourceId::new("s3.Bucket", "test"), attrs),
     );
 
-    let mut prev_desired_keys = HashMap::new();
-    prev_desired_keys.insert(
+    let mut prev_explicit = HashMap::new();
+    prev_explicit.insert(
         ResourceId::new("s3.Bucket", "test"),
-        vec!["bucket".to_string(), "region".to_string()],
+        explicit_top_level(&["bucket", "region"]),
     );
 
     // Schema: region is explicitly non-removable, bucket is required
@@ -638,7 +748,7 @@ fn create_plan_skips_update_when_only_non_removable_removal() {
         &HashMap::new(),
         &schemas,
         &HashMap::new(),
-        &prev_desired_keys,
+        &prev_explicit,
         &HashMap::new(),
     );
 
@@ -666,9 +776,9 @@ fn diff_skips_internal_attributes_in_removal_detection() {
     );
     let current = State::existing(ResourceId::new("s3.Bucket", "test"), current_attrs);
 
-    let prev_keys = vec!["region".to_string(), "_internal".to_string()];
+    let prev_explicit = explicit_top_level(&["region", "_internal"]);
 
-    let result = diff(&desired, &current, None, Some(&prev_keys), None);
+    let result = diff(&desired, &current, None, Some(&prev_explicit), None);
     assert!(
         matches!(result, Diff::NoChange(_)),
         "Should skip internal attributes starting with '_', got {:?}",

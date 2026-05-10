@@ -177,9 +177,9 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         .map(|sf| sf.build_saved_attrs())
         .unwrap_or_default();
 
-    let mut prev_desired_keys = state_file
+    let mut prev_explicit = state_file
         .as_ref()
-        .map(|sf| sf.build_desired_keys())
+        .map(|sf| sf.build_explicit())
         .unwrap_or_default();
 
     let orphan_dependencies = if let Some(sf) = state_file.as_ref() {
@@ -192,7 +192,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
 
     let moved_pairs = crate::wiring::materialize_moved_states(
         &mut current_states,
-        &mut prev_desired_keys,
+        &mut prev_explicit,
         &mut saved_attrs,
         &parsed.state_blocks,
         &state_file,
@@ -204,7 +204,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &directives_map,
         wiring.schemas(),
         &saved_attrs,
-        &prev_desired_keys,
+        &prev_explicit,
         &orphan_dependencies,
     );
 
