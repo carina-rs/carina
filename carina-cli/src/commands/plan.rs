@@ -375,6 +375,7 @@ pub async fn run_plan(
             &ctx.moved_origins,
             &export_changes,
             &parsed.deferred_for_expressions,
+            Some(&ctx.prev_explicit),
         );
     }
 

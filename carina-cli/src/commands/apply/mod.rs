@@ -1038,6 +1038,7 @@ async fn run_apply_locked(
             &HashMap::new(),
             &export_changes,
             &parsed.deferred_for_expressions,
+            None,
         );
 
         let stdin = tokio::io::BufReader::new(tokio::io::stdin());
@@ -1106,6 +1107,7 @@ async fn run_apply_locked(
         &moved_origins,
         &export_changes,
         &parsed.deferred_for_expressions,
+        Some(&prev_explicit),
     );
 
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
@@ -1396,6 +1398,7 @@ async fn run_apply_from_plan_locked(
         &HashMap::new(),
         &[],
         &[],
+        None,
     );
 
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());

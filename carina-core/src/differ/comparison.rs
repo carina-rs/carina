@@ -346,10 +346,19 @@ pub(super) fn find_changed_attributes(
     // user did author. When `prev_explicit` is absent (e.g. first-plan,
     // no saved state) we fall back to the unprojected map — there is
     // no authoring information to consult yet.
+    //
+    // `saved` undergoes the same projection so the saved-merge fallback
+    // doesn't smuggle server-only fields back into `effective_desired`
+    // (refs awscc#206).
     let projected_current = match prev_explicit {
         Some(e) => explicit::project_attributes(current.clone(), e),
         None => current.clone(),
     };
+    let projected_saved = match (saved, prev_explicit) {
+        (Some(s), Some(e)) => Some(explicit::project_attributes(s.clone(), e)),
+        _ => None,
+    };
+    let saved = projected_saved.as_ref().or(saved);
 
     for (key, desired_value) in desired {
         // Skip internal attributes (starting with _)

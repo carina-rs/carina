@@ -45,6 +45,10 @@ pub struct PlanContext {
     /// cascade re-resolution. Empty when the configuration declares no
     /// `upstream_state` blocks.
     pub upstream_snapshot: HashMap<String, HashMap<String, carina_core::resource::Value>>,
+    /// Per-resource user-authoring trees lifted from the saved state.
+    /// Forwarded to the display layer so server-side default fields the
+    /// user never wrote do not surface in plan output (refs awscc#206).
+    pub prev_explicit: HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
 }
 
 /// Cached provider factories and schemas, constructed once per CLI invocation.
@@ -1367,6 +1371,7 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
         current_states,
         moved_origins,
         upstream_snapshot: remote_bindings.clone(),
+        prev_explicit,
     })
 }
 

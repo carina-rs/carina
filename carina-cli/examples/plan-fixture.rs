@@ -111,6 +111,7 @@ fn main() -> ExitCode {
             &fp.moved_origins,
             &[],
             &fp.deferred_for_expressions,
+            Some(&fp.prev_explicit),
         );
     }
 

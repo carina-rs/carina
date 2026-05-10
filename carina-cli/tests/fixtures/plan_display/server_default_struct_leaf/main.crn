@@ -1,0 +1,23 @@
+# server_default_struct_leaf — refs awscc#206
+#
+# Reproduces the awscc.s3.Bucket scenario in which a server-side
+# default leaf (e.g. transition_default_minimum_object_size) appears
+# inside a user-authored Struct attribute. The user wrote only
+# `tags = { Env = 'prod' }`; the saved state's actual current value
+# carries an additional `Name` leaf the user never authored.
+#
+# Expected plan output: no `- Name: ...` line for the unauthored
+# leaf, no Update effect — the projection through ExplicitFields
+# strips the server-default leaf before diffing.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.ec2.Vpc {
+  cidr_block = '10.0.0.0/16'
+
+  tags = {
+    Env = 'prod'
+  }
+}
