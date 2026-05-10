@@ -1,0 +1,44 @@
+{
+  "version": 6,
+  "serial": 1,
+  "lineage": "test-lineage-server-default-struct-leaf",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "ec2.Vpc",
+      "name": "",
+      "provider": "awscc",
+      "identifier": "vpc-0000000000000abcd",
+      "attributes": {
+        "cidr_block": "10.0.0.0/16",
+        "vpc_id": "vpc-0000000000000abcd",
+        "tags": {
+          "Env": "prod",
+          "Name": "auto-generated-by-server"
+        }
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": null,
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "cidr_block": {
+            "kind": "leaf"
+          },
+          "tags": {
+            "kind": "struct",
+            "children": {
+              "Env": {
+                "kind": "leaf"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

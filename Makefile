@@ -197,6 +197,8 @@ plan-provider-prefix:
 	$(PLAN_FIXTURE) provider_prefix
 plan-module-anonymous-resource:
 	$(PLAN_FIXTURE) module_anonymous_resource
+plan-server-default-struct-leaf:
+	$(PLAN_FIXTURE) server_default_struct_leaf
 .PHONY: plan-all-create plan-no-changes plan-no-changes-enum plan-mixed plan-delete plan-compact \
         plan-map-diff plan-list-diff-added-struct plan-list-diff-removed-struct \
         plan-list-diff-modified-with-unchanged \
@@ -209,7 +211,7 @@ plan-module-anonymous-resource:
         plan-deferred-for plan-exports plan-exports-multifile plan-policy-pretty \
         plan-policy-pretty-nested plan-policy-pretty-dynamic-key-list \
         plan-pretty-long-string-list plan-pretty-short-string-list plan-provider-prefix \
-        plan-module-anonymous-resource \
+        plan-module-anonymous-resource plan-server-default-struct-leaf \
         plan-map-diff-tui plan-all-create-tui plan-mixed-tui plan-delete-tui \
         plan-moved-with-changes-tui plan-moved-pure-tui plan-fixtures
 

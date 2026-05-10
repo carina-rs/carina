@@ -34,6 +34,11 @@ pub struct FixturePlan {
     pub moved_origins: HashMap<ResourceId, ResourceId>,
     pub deferred_for_expressions: Vec<carina_core::parser::DeferredForExpression>,
     pub export_params: Vec<carina_core::parser::InferredExportParam>,
+    /// Per-resource user-authoring trees lifted from the fixture's
+    /// `carina.state.json`. Forwarded to `format_plan` so server-side
+    /// default fields the user never wrote do not surface in plan
+    /// output (refs awscc#206).
+    pub prev_explicit: HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
 }
 
 /// Build a plan from a fixture directory name (e.g. "all_create"). Resolves
@@ -235,6 +240,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         moved_origins,
         deferred_for_expressions: parsed.deferred_for_expressions,
         export_params: parsed.export_params,
+        prev_explicit,
     }
 }
 

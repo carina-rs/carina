@@ -198,6 +198,7 @@ fn format_export_change(change: &crate::commands::plan::ExportChange) -> String 
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn print_plan(
     plan: &Plan,
     detail: DetailLevel,
@@ -206,6 +207,7 @@ pub fn print_plan(
     moved_origins: &HashMap<ResourceId, ResourceId>,
     export_changes: &[crate::commands::plan::ExportChange],
     deferred_for_expressions: &[carina_core::parser::DeferredForExpression],
+    prev_explicit: Option<&HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
 ) {
     print!(
         "{}",
@@ -217,6 +219,7 @@ pub fn print_plan(
             moved_origins,
             export_changes,
             deferred_for_expressions,
+            prev_explicit,
         )
     );
 }
@@ -225,6 +228,12 @@ pub fn print_plan(
 ///
 /// This is the core formatting logic used by `print_plan`. Returning a `String`
 /// enables snapshot testing and other programmatic uses of the plan output.
+///
+/// When `prev_explicit` is provided, the actual-state side of each effect
+/// is projected through the per-resource authoring tree before
+/// unchanged-attribute counting (refs awscc#206), so server-side default
+/// fields the user never wrote do not inflate the plan output.
+#[allow(clippy::too_many_arguments)]
 pub fn format_plan(
     plan: &Plan,
     detail: DetailLevel,
@@ -233,6 +242,7 @@ pub fn format_plan(
     moved_origins: &HashMap<ResourceId, ResourceId>,
     export_changes: &[crate::commands::plan::ExportChange],
     deferred_for_expressions: &[carina_core::parser::DeferredForExpression],
+    prev_explicit: Option<&HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
 ) -> String {
     let mut out = String::new();
 
@@ -260,6 +270,7 @@ pub fn format_plan(
         attrs,
         schemas,
         moved_origins,
+        prev_explicit,
     ));
 
     // Show deferred for-expressions
@@ -374,6 +385,7 @@ pub fn format_destroy_plan(
         Some(delete_attributes),
         None,
         &HashMap::new(),
+        None,
     ));
 
     out
@@ -749,12 +761,13 @@ impl<'a> TreeRenderContext<'a> {
 ///
 /// `delete_attributes` optionally provides current state attributes for Delete
 /// effects, allowing the display to show what will be deleted.
-fn format_plan_tree(
+fn format_plan_tree<'a>(
     plan: &Plan,
     detail: DetailLevel,
-    delete_attributes: Option<&HashMap<ResourceId, HashMap<String, Value>>>,
-    schemas: Option<&SchemaRegistry>,
-    moved_origins: &HashMap<ResourceId, ResourceId>,
+    delete_attributes: Option<&'a HashMap<ResourceId, HashMap<String, Value>>>,
+    schemas: Option<&'a SchemaRegistry>,
+    moved_origins: &'a HashMap<ResourceId, ResourceId>,
+    prev_explicit: Option<&'a HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
 ) -> String {
     // Build dependency graph from effects
     let graph = build_dependency_graph(plan);
@@ -781,7 +794,7 @@ fn format_plan_tree(
         delete_attributes,
         schemas,
         moved_origins,
-        prev_explicit: None,
+        prev_explicit,
         update_or_replace_targets,
     };
 
