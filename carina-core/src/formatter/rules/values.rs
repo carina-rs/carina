@@ -204,7 +204,14 @@ impl Formatter {
         // stays single-line *unless* it contains a line comment, in
         // which case it is promoted to multi-line — a line comment
         // intrinsically ends its line and cannot live inline.
-        let items = collect_list_items(node);
+        let mut items = collect_list_items(node);
+        // #2872: `directives { depends_on = [...] }` sorts elements
+        // alphabetically on emission. Sort is order-insensitive in
+        // semantics, so this is purely cosmetic — but produces
+        // stable diffs across edits.
+        if self.in_directives_depends_on() {
+            sort_depends_on_items(&mut items);
+        }
         let multiline = list_is_multiline(node) || any_line_comment(&items);
 
         self.write("[");
@@ -266,6 +273,48 @@ impl Formatter {
         }
     }
 
+    fn in_directives_depends_on(&self) -> bool {
+        self.block_stack.last().map(String::as_str) == Some("directives")
+            && self.attr_stack.last().map(String::as_str) == Some("depends_on")
+    }
+}
+
+/// Identifier text of a `depends_on` list element, used as the sort
+/// key. Returns `None` for shapes the formatter shouldn't touch
+/// (block-bodied expressions, malformed CST). Bare identifiers parse
+/// as a single token, so the common case is straightforward; comments
+/// attached to elements travel with them via `ListItem`.
+fn list_element_sort_key<'a>(element: &ListElement<'a>) -> Option<String> {
+    match element {
+        ListElement::Token(t) => Some((*t).to_string()),
+        ListElement::Node(n) => element_node_first_token(n),
+    }
+}
+
+fn element_node_first_token(node: &CstNode) -> Option<String> {
+    for child in &node.children {
+        match child {
+            CstChild::Token(tok) if !tok.text.trim().is_empty() => return Some(tok.text.clone()),
+            CstChild::Node(n) => {
+                if let Some(t) = element_node_first_token(n) {
+                    return Some(t);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn sort_depends_on_items<'a>(items: &mut [ListItem<'a>]) {
+    items.sort_by(|a, b| {
+        let ka = list_element_sort_key(&a.element).unwrap_or_default();
+        let kb = list_element_sort_key(&b.element).unwrap_or_default();
+        ka.cmp(&kb)
+    });
+}
+
+impl Formatter {
     pub(in crate::formatter) fn format_map(&mut self, node: &CstNode) {
         self.write("{");
 

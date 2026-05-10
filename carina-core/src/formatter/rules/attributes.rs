@@ -370,15 +370,20 @@ impl Formatter {
         self.write_indent();
 
         // Find and write block name (identifier)
+        let mut block_name: Option<String> = None;
         for child in &node.children {
             if let CstChild::Token(token) = child
                 && self.is_identifier(&token.text)
             {
                 self.write_token(&token.text);
+                block_name = Some(token.text.clone());
                 break;
             }
         }
 
+        if let Some(ref n) = block_name {
+            self.block_stack.push(n.clone());
+        }
         if self.block_has_content(node) {
             self.write(" {");
             self.write_newline();
@@ -391,6 +396,9 @@ impl Formatter {
             self.write("}");
         } else {
             self.write(" {}");
+        }
+        if block_name.is_some() {
+            self.block_stack.pop();
         }
         self.write_newline();
     }
@@ -813,6 +821,7 @@ impl Formatter {
         let mut key_len: usize;
         let mut wrote_key = false;
         let mut wrote_equals = false;
+        let mut pushed_key = false;
 
         for child in &node.children {
             match child {
@@ -821,6 +830,8 @@ impl Formatter {
                         key_len = token.text.len();
                         self.write_token(&token.text);
                         wrote_key = true;
+                        self.attr_stack.push(token.text.clone());
+                        pushed_key = true;
 
                         // Add padding for alignment
                         if align_to > 0 && key_len < align_to {
@@ -841,6 +852,10 @@ impl Formatter {
                 }
                 CstChild::Trivia(_) => {}
             }
+        }
+
+        if pushed_key {
+            self.attr_stack.pop();
         }
 
         // Write inline comment if present

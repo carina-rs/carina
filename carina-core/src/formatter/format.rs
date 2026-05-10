@@ -71,6 +71,17 @@ pub(in crate::formatter) struct Formatter {
     pub(in crate::formatter) output: String,
     pub(in crate::formatter) current_indent: usize,
     pub(in crate::formatter) block_names: std::collections::HashMap<String, String>,
+    /// Stack of currently-open nested-block names. Top-of-stack is the
+    /// immediate enclosing block (e.g. `"directives"`). Pushed in
+    /// `format_nested_block`, popped after the body is emitted. Drives
+    /// context-sensitive normalisation like alphabetical sort of
+    /// `directives.depends_on` (#2872).
+    pub(in crate::formatter) block_stack: Vec<String>,
+    /// Stack of currently-open attribute keys. Top-of-stack is the
+    /// attribute whose value is currently being formatted. Used by
+    /// `format_list` to detect "this list is the value of `depends_on`
+    /// inside `directives`" without parent pointers in the CST.
+    pub(in crate::formatter) attr_stack: Vec<String>,
 }
 
 impl Formatter {
@@ -80,6 +91,8 @@ impl Formatter {
             output: String::new(),
             current_indent: 0,
             block_names: std::collections::HashMap::new(),
+            block_stack: Vec::new(),
+            attr_stack: Vec::new(),
         }
     }
 
@@ -92,6 +105,8 @@ impl Formatter {
             output: String::new(),
             current_indent: 0,
             block_names,
+            block_stack: Vec::new(),
+            attr_stack: Vec::new(),
         }
     }
 
@@ -2137,5 +2152,37 @@ aws.s3.Bucket {
         let first = format(input, &config).unwrap();
         let second = format(&first, &config).unwrap();
         assert_eq!(first, second, "list with comments fmt must be idempotent");
+    }
+
+    #[test]
+    fn fmt_sorts_directives_depends_on_alphabetically() {
+        let input = "let bucket = aws.s3.Bucket {\n  bucket_name = 'x'\n  directives {\n    depends_on = [zebra, apple, mango]\n  }\n}\n";
+        let result = format(input, &FormatConfig::default()).unwrap();
+        assert!(
+            result.contains("depends_on = [apple, mango, zebra]"),
+            "expected alphabetical order, got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn fmt_does_not_sort_other_lists() {
+        // Lists outside `directives.depends_on` must NOT be reordered.
+        let input = "aws.s3.Bucket {\n  bucket_name = 'x'\n  policies = [zebra, apple, mango]\n}\n";
+        let result = format(input, &FormatConfig::default()).unwrap();
+        assert!(
+            result.contains("[zebra, apple, mango]"),
+            "non-depends_on list must keep source order, got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn fmt_depends_on_sort_is_idempotent() {
+        let input = "let bucket = aws.s3.Bucket {\n  bucket_name = 'x'\n  directives {\n    depends_on = [zebra, apple, mango]\n  }\n}\n";
+        let config = FormatConfig::default();
+        let first = format(input, &config).unwrap();
+        let second = format(&first, &config).unwrap();
+        assert_eq!(first, second, "depends_on sort must be idempotent");
     }
 }

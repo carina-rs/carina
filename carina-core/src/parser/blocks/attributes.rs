@@ -274,11 +274,8 @@ pub(in crate::parser) fn extract_directives(
                                 });
                             }
                             Value::String(name) => {
-                                // Pre-#2847 path: bindings resolved through the
-                                // `${name}` indirection marker. Strip it for
-                                // backwards-compat with any code path that
-                                // still produces this shape. Quoted strings
-                                // are rejected upstream by
+                                // Pre-#2847 indirection marker `${name}`.
+                                // Quoted strings are rejected upstream in
                                 // `check_directives_depends_on_elements`.
                                 let bare = name
                                     .strip_prefix("${")
