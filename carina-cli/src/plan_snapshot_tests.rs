@@ -1001,6 +1001,26 @@ fn snapshot_list_diff_modified_with_unchanged_nested() {
     insta::assert_snapshot!(output);
 }
 
+// #2886: paired list-of-maps elements whose only "diff" was an
+// upstream-injected key dropped by the IR are absorbed into the
+// trailing `# (n unchanged attributes hidden)` summary. Snapshot
+// pins the resulting per-resource block (no `statement:` row, count
+// includes the absorbed attribute).
+#[test]
+fn snapshot_list_diff_paired_all_unchanged_dropped() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("list_diff_paired_all_unchanged_dropped");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+    ));
+    insta::assert_snapshot!(output);
+}
+
 // Mirror of the added-struct test for the removed path.
 #[test]
 fn snapshot_list_diff_removed_struct() {

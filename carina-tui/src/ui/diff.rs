@@ -120,7 +120,7 @@ pub(super) fn render_list_of_maps_diff(
     for m in modified {
         let mut spans = vec![Span::raw("    {")];
         let mut emitted = 0usize;
-        for field in &m.fields {
+        for field in m.fields.iter() {
             if emitted > 0 {
                 spans.push(Span::raw(", "));
             }

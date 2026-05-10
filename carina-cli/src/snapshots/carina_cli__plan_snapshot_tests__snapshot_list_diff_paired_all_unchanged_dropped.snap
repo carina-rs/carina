@@ -1,0 +1,11 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  ~ awscc.iam.RolePolicy policy
+      policy_name: "test-inline" → "test-inline-renamed"
+      # (2 unchanged attributes hidden)
+
+Plan: 0 to add, 1 to change, 0 to destroy.
