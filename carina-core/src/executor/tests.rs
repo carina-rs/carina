@@ -1521,3 +1521,147 @@ async fn test_delete_waits_for_replace_cbd_even_when_delete_binding_is_none() {
     // tgw_a delete MUST still come after attachment replace, even though binding is None
     assert_eq!(calls[3], ("delete".to_string(), tgw_a_id.to_string()));
 }
+
+#[tokio::test]
+async fn test_wait_effect_polls_then_unblocks_downstream() {
+    use crate::wait::predicate::{AttrPath, WaitPredicate};
+
+    let provider = MockProvider::new();
+
+    // Plan: Create cert → Wait cert_issued (target = cert) → Create dist
+    let cert = make_resource("cert", &[]);
+    let cert_id = cert.id.clone();
+    let mut dist = make_resource("dist", &[]);
+    // `dist` references the wait binding so the scheduler links it.
+    dist.set_attr(
+        "ref_cert_issued".to_string(),
+        Value::resource_ref("cert_issued".to_string(), "arn".to_string(), vec![]),
+    );
+    dist.dependency_bindings = ["cert_issued".to_string()].into_iter().collect();
+    let dist_id = dist.id.clone();
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(cert));
+    plan.add(Effect::Wait {
+        binding: "cert_issued".to_string(),
+        target_id: cert_id.clone(),
+        target_identifier: None,
+        until: WaitPredicate::Equals {
+            attr: AttrPath::single("status"),
+            value: Value::String("ISSUED".to_string()),
+        },
+        until_surface: "cert.status == ISSUED".to_string(),
+        timeout: std::time::Duration::from_secs(60),
+        interval: std::time::Duration::from_millis(1),
+        explicit_dependencies: std::collections::HashSet::new(),
+    });
+    plan.add(Effect::Create(dist));
+
+    // create cert → state with status PENDING (the Create result; the
+    // wait polls via read for ISSUED).
+    let mut create_attrs = HashMap::new();
+    create_attrs.insert(
+        "status".to_string(),
+        Value::String("PENDING_VALIDATION".to_string()),
+    );
+    provider.push_create(Ok(
+        State::existing(cert_id.clone(), create_attrs).with_identifier("acm-cert-id")
+    ));
+    // wait reads: PENDING → PENDING → ISSUED
+    let mut pending = HashMap::new();
+    pending.insert(
+        "status".to_string(),
+        Value::String("PENDING_VALIDATION".to_string()),
+    );
+    let mut issued = HashMap::new();
+    issued.insert("status".to_string(), Value::String("ISSUED".to_string()));
+    issued.insert(
+        "arn".to_string(),
+        Value::String("arn:aws:acm:...".to_string()),
+    );
+    provider.push_read(Ok(State::existing(cert_id.clone(), pending.clone())));
+    provider.push_read(Ok(State::existing(cert_id.clone(), pending)));
+    provider.push_read(Ok(State::existing(cert_id.clone(), issued)));
+    // create dist → succeeds
+    provider.push_create(Ok(ok_state(&dist_id)));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+    };
+
+    let observer = MockObserver::new();
+    let result = execute_plan(&provider, input, &observer).await;
+
+    assert_eq!(
+        result.success_count,
+        3,
+        "expected 3 successful effects (cert create + wait + dist create), got {} (events: {:?})",
+        result.success_count,
+        observer.events()
+    );
+    assert_eq!(result.failure_count, 0);
+
+    let calls = provider.calls();
+    assert_eq!(calls[0], ("create".to_string(), cert_id.to_string()));
+    // Three reads from the wait polling loop.
+    assert_eq!(calls[1], ("read".to_string(), cert_id.to_string()));
+    assert_eq!(calls[2], ("read".to_string(), cert_id.to_string()));
+    assert_eq!(calls[3], ("read".to_string(), cert_id.to_string()));
+    // dist create must follow the wait.
+    assert_eq!(calls[4], ("create".to_string(), dist_id.to_string()));
+}
+
+#[tokio::test]
+async fn test_wait_state_writeback_skips_synthetic_wait_id() {
+    use crate::wait::predicate::{AttrPath, WaitPredicate};
+
+    let provider = MockProvider::new();
+    let cert = make_resource("cert", &[]);
+    let cert_id = cert.id.clone();
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(cert));
+    plan.add(Effect::Wait {
+        binding: "cert_issued".to_string(),
+        target_id: cert_id.clone(),
+        target_identifier: None,
+        until: WaitPredicate::Equals {
+            attr: AttrPath::single("status"),
+            value: Value::String("ISSUED".to_string()),
+        },
+        until_surface: "cert.status == ISSUED".to_string(),
+        timeout: std::time::Duration::from_secs(60),
+        interval: std::time::Duration::from_millis(1),
+        explicit_dependencies: std::collections::HashSet::new(),
+    });
+
+    let mut issued = HashMap::new();
+    issued.insert("status".to_string(), Value::String("ISSUED".to_string()));
+    provider.push_create(Ok(
+        State::existing(cert_id.clone(), issued.clone()).with_identifier("acm-cert-id")
+    ));
+    provider.push_read(Ok(State::existing(cert_id.clone(), issued)));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+    };
+
+    let observer = MockObserver::new();
+    let result = execute_plan(&provider, input, &observer).await;
+    assert_eq!(result.success_count, 2);
+    // The wait's captured State is keyed under a synthetic `__wait`
+    // ResourceId. This is what guarantees state writeback never sees
+    // it as a real resource — `sorted_resources` (the writeback input)
+    // does not contain `__wait` IDs.
+    let synthetic = ResourceId::new("__wait", "cert_issued");
+    assert!(
+        result.applied_states.contains_key(&synthetic),
+        "wait should register its captured State under the __wait synthetic id"
+    );
+}

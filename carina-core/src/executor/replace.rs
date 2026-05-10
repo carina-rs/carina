@@ -63,6 +63,15 @@ pub(super) enum SingleEffectResult {
         permanent_overrides: Option<(ResourceId, HashMap<String, String>)>,
     },
     ReadNoOp,
+    /// `Effect::Wait` execution outcome. On success carries the
+    /// captured target state so the parallel scheduler can register it
+    /// under the wait binding for downstream resolution. On failure
+    /// carries the wait binding so dependents can be marked failed.
+    Wait {
+        success: bool,
+        binding: String,
+        target_state: Option<State>,
+    },
 }
 
 /// Context for executing a Replace effect in the parallel path.

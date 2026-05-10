@@ -20,8 +20,8 @@ pub use ast::{
     ArgumentParameter, AttributeParameter, BackendConfig, DeferredForExpression, ExportParamLike,
     ExportParameter, File, FnParam, InferredExportParam, InferredFile, ModuleCall,
     ParsedExportParam, ParsedFile, ProviderConfig, RequireBlock, ResourceContext, ResourceTypePath,
-    StateBlock, TypeExpr, UpstreamState, UseStatement, UserFunction, UserFunctionBody,
-    ValidateExpr, ValidationBlock, WaitBinding,
+    StateBlock, TypeExpr, UntilPredicateAst, UpstreamState, UseStatement, UserFunction,
+    UserFunctionBody, ValidateExpr, ValidationBlock, WaitBinding,
 };
 pub use config::{DecryptorFn, ProviderContext, ValidatorFn};
 pub(crate) use entry::parse_with_seeded_bindings;

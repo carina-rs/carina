@@ -5,9 +5,13 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use crate::deps::get_resource_dependencies;
 use crate::effect::{CascadingUpdate, Effect, TemporaryName};
 use crate::identifier::generate_random_suffix;
+use crate::parser::WaitBinding;
 use crate::plan::{Plan, PlanError};
 use crate::resource::{Directives, Resource, ResourceId, ResourceKind, State, Value};
-use crate::schema::{ResourceSchema, SchemaKind, SchemaRegistry};
+use crate::schema::{
+    ResourceSchema, SchemaKind, SchemaRegistry, WAIT_DEFAULT_INTERVAL, WAIT_DEFAULT_TIMEOUT,
+};
+use crate::wait::predicate::{AttrPath, WaitPredicate};
 
 use super::{Diff, diff};
 
@@ -137,6 +141,7 @@ fn generate_temporary_name(
 /// the user never wrote, refs awscc#206) and to detect attribute
 /// removals: if a top-level key was previously in the user's desired
 /// state but is now absent, it means the user intentionally removed it.
+#[allow(clippy::too_many_arguments)]
 pub fn create_plan(
     desired: &[Resource],
     current_states: &HashMap<ResourceId, State>,
@@ -145,6 +150,7 @@ pub fn create_plan(
     saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     orphan_dependencies: &HashMap<ResourceId, BTreeSet<String>>,
+    wait_bindings: &[WaitBinding],
 ) -> Plan {
     let mut plan = Plan::new();
 
@@ -366,6 +372,68 @@ pub fn create_plan(
                 explicit_dependencies: std::collections::HashSet::new(),
             });
         }
+    }
+
+    // Lower each `wait` declaration into an `Effect::Wait`.
+    //
+    // Target resolution: the parser has already pinned the target name;
+    // here we look it up in `desired` (the live resource set after
+    // forward-ref resolution) to recover the resolved `ResourceId`. If
+    // the target is missing — typo, scoped-out binding, etc. — the
+    // wait is skipped with a plan-level error so downstream resources
+    // referencing the wait binding still fail loudly.
+    for wb in wait_bindings {
+        let resolved = desired
+            .iter()
+            .find(|r| r.binding.as_deref() == Some(wb.target.as_str()))
+            .or_else(|| desired.iter().find(|r| r.id.name.as_str() == wb.target));
+        let Some(target_resource) = resolved else {
+            plan.add_error(PlanError {
+                resource_id: ResourceId::new("__wait", &wb.binding),
+                message: format!(
+                    "wait `{}`: target binding `{}` is not a known resource",
+                    wb.binding, wb.target
+                ),
+            });
+            continue;
+        };
+        // `lhs_segments` is guaranteed non-empty and the first segment
+        // equals `wb.target` (enforced by `parse_wait_expr`). The
+        // predicate attribute path is therefore `lhs_segments[1..]`.
+        let attr = AttrPath {
+            segments: wb.until_predicate.lhs_segments[1..].to_vec(),
+        };
+        let until = WaitPredicate::Equals {
+            attr,
+            value: wb.until_predicate.rhs.clone(),
+        };
+        let target_id = target_resource.id.clone();
+        let target_identifier = current_states
+            .get(&target_id)
+            .and_then(|s| s.identifier.clone());
+        let schema = registry.get(
+            &target_id.provider,
+            &target_id.resource_type,
+            SchemaKind::Managed,
+        );
+        let schema_timeout = schema.and_then(|s| s.default_wait_timeout);
+        let schema_interval = schema.and_then(|s| s.default_wait_interval);
+        let timeout = wb
+            .timeout_secs
+            .map(std::time::Duration::from_secs)
+            .or(schema_timeout)
+            .unwrap_or(WAIT_DEFAULT_TIMEOUT);
+        let interval = schema_interval.unwrap_or(WAIT_DEFAULT_INTERVAL);
+        plan.add(Effect::Wait {
+            binding: wb.binding.clone(),
+            target_id,
+            target_identifier,
+            until,
+            until_surface: wb.until_raw.clone(),
+            timeout,
+            interval,
+            explicit_dependencies: wb.depends_on.iter().cloned().collect(),
+        });
     }
 
     plan

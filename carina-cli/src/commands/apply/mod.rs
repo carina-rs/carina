@@ -986,6 +986,7 @@ async fn run_apply_locked(
         &saved_attrs,
         &prev_explicit,
         &orphan_dependencies,
+        &parsed.wait_bindings,
     );
 
     // Populate cascading updates for create_before_destroy Replace effects.

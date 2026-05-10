@@ -73,6 +73,7 @@ fn create_plan_from_resources() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &[],
     );
 
     assert_eq!(plan.effects().len(), 2);
@@ -98,6 +99,7 @@ fn create_plan_with_read_only_resource() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &[],
     );
 
     // Should have 2 effects: Read for data source, Create for new bucket
@@ -178,6 +180,7 @@ fn create_plan_detects_orphaned_resources_for_deletion() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &[],
     );
 
     // Should have 1 effect: Delete for orphaned-bucket
@@ -224,6 +227,7 @@ fn read_only_resource_always_generates_read_effect() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &[],
     );
 
     // Should still have Read effect, not NoChange
@@ -292,6 +296,7 @@ fn replace_when_create_only_attr_changed() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &[],
     );
 
     assert_eq!(plan.effects().len(), 1);
@@ -342,6 +347,7 @@ fn normal_update_when_non_create_only_attr_changed() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &[],
     );
 
     assert_eq!(plan.effects().len(), 1);
@@ -403,6 +409,7 @@ fn replace_when_schema_force_replace() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &[],
     );
 
     assert_eq!(plan.effects().len(), 1);
@@ -454,6 +461,7 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &[],
     );
 
     assert_eq!(plan.effects().len(), 1);
@@ -504,6 +512,7 @@ fn replace_carries_create_before_destroy_directives() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &[],
     );
 
     assert_eq!(plan.effects().len(), 1);
@@ -598,6 +607,7 @@ fn replace_with_provider_prefixed_schema_key() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &[],
     );
 
     assert_eq!(plan.effects().len(), 1);
@@ -866,6 +876,7 @@ fn orphan_delete_preserves_binding_and_dependencies() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &[],
     );
 
     let delete_effects: Vec<_> = plan

@@ -15,6 +15,7 @@ mod basic;
 mod parallel;
 mod phased;
 mod replace;
+pub(crate) mod wait;
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;

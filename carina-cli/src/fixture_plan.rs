@@ -211,6 +211,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &saved_attrs,
         &prev_explicit,
         &orphan_dependencies,
+        &parsed.wait_bindings,
     );
 
     cascade_dependent_updates(

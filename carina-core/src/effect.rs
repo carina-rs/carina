@@ -158,6 +158,13 @@ pub enum Effect {
         /// schema's default; not user-visible in MVP.
         #[serde(with = "crate::resource::duration_secs")]
         interval: std::time::Duration,
+        /// Additional bindings the wait must wait for before polling,
+        /// declared via `depends_on = [...]` in the wait block. The
+        /// scheduler treats these like `directives.depends_on` on a
+        /// resource — extra ordering edges that aren't expressed via
+        /// value references.
+        #[serde(default)]
+        explicit_dependencies: HashSet<String>,
     },
 }
 
@@ -250,6 +257,13 @@ impl Effect {
             return res.directives.depends_on.iter().cloned().collect();
         }
         if let Effect::Delete {
+            explicit_dependencies,
+            ..
+        } = self
+        {
+            return explicit_dependencies.clone();
+        }
+        if let Effect::Wait {
             explicit_dependencies,
             ..
         } = self
@@ -473,6 +487,7 @@ mod tests {
             until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
             timeout: Duration::from_secs(75 * 60),
             interval: Duration::from_secs(5),
+            explicit_dependencies: std::collections::HashSet::new(),
         };
     }
 
@@ -493,6 +508,7 @@ mod tests {
             until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
             timeout: Duration::from_secs(60),
             interval: Duration::from_secs(5),
+            explicit_dependencies: std::collections::HashSet::new(),
         };
         assert_eq!(e.binding_name(), Some("cert_issued".to_string()));
     }
@@ -514,6 +530,7 @@ mod tests {
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: Duration::from_secs(60),
             interval: Duration::from_secs(5),
+            explicit_dependencies: std::collections::HashSet::new(),
         };
         assert!(!e.is_mutating());
         assert_eq!(e.kind(), "wait");
@@ -536,6 +553,7 @@ mod tests {
             until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
             timeout: Duration::from_secs(4500),
             interval: Duration::from_secs(5),
+            explicit_dependencies: std::collections::HashSet::new(),
         };
         let json = serde_json::to_string(&original).expect("serialize");
         // Duration must round-trip as plain integer seconds (matches the

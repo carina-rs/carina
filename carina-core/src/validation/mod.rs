@@ -786,6 +786,16 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
             collect_dot_notation_refs(value, &mut referenced);
         }
     }
+    // Each `wait <target> { ... }` declaration references its target
+    // and every binding in `depends_on = [...]`. The until predicate's
+    // LHS is rooted at the target (enforced by parser), so the target
+    // covers the LHS path too.
+    for wb in &parsed.wait_bindings {
+        referenced.insert(wb.target.clone());
+        for dep in &wb.depends_on {
+            referenced.insert(dep.clone());
+        }
+    }
 
     // Return unused binding names, skipping structurally-required bindings
     // (if/for/read expressions) and for-generated indexed bindings (e.g., vpcs[0])

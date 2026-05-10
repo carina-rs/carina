@@ -50,6 +50,8 @@ plan-default-tags:
 	$(PLAN_FIXTURE) default_tags
 plan-depends-on:
 	$(PLAN_FIXTURE) depends_on
+plan-wait-cert:
+	$(PLAN_FIXTURE) wait_cert
 plan-secret-values:
 	$(PLAN_FIXTURE) secret_values
 plan-moved-with-changes:

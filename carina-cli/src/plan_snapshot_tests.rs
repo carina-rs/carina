@@ -65,6 +65,31 @@ fn snapshot_depends_on() {
     insta::assert_snapshot!(output);
 }
 
+/// Plan-display gate for the `wait` construct (carina#2825). The
+/// fixture wires ACM Certificate → Route53 validation record → wait
+/// (blocking on `cert.status == ISSUED`). The snapshot pins:
+/// - the `> cert_issued (until cert.status == aws.acm.Certificate.Status.Issued)`
+///   line format (one-character marker `>`, predicate surface form
+///   echoed verbatim from the user source),
+/// - that wait effects are placed in the tree as children of their
+///   target (`cert`) — the tree shape is wired in
+///   `plan_tree::build_dependency_graph`.
+#[test]
+fn snapshot_wait_cert() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("wait_cert");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+    ));
+    insta::assert_snapshot!(output);
+}
+
 #[test]
 fn snapshot_all_create() {
     let (plan, schemas, _moved) = build_plan_from_fixture("all_create");
