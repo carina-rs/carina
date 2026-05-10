@@ -115,6 +115,9 @@ fn stamp_unresolved_upstream(
         Value::ResourceRef { path } if upstream_binding_names.contains(path.binding()) => {
             Value::Unknown(crate::resource::UnknownReason::UpstreamRef { path })
         }
+        Value::BindingRef { binding } if upstream_binding_names.contains(binding.as_str()) => {
+            Value::Unknown(crate::resource::UnknownReason::UpstreamBareRef { binding })
+        }
         Value::List(items) => Value::List(
             items
                 .into_iter()
@@ -1575,6 +1578,85 @@ mod tests {
             resources[0].get_attr("vpc_id"),
             Some(Value::ResourceRef { .. })
         ));
+    }
+
+    /// Bare-binding refs into an upstream_state binding must also be
+    /// stamped — `let v = bootstrap` (no `.attr`) parses as
+    /// `Value::BindingRef { binding: "bootstrap" }` since #2856.
+    /// Without a dedicated arm in `stamp_unresolved_upstream`, the
+    /// `BindingRef` would slip past the marker and surface in plan
+    /// display as a plain identifier instead of the
+    /// `(known after upstream apply: bootstrap)` form. #2876.
+    #[test]
+    fn test_resolve_refs_for_plan_stamps_bare_upstream_binding_ref() {
+        use crate::resource::UnknownReason;
+        let mut resources = vec![make_resource(
+            "consumer",
+            None,
+            vec![(
+                "raw",
+                Value::BindingRef {
+                    binding: "bootstrap".to_string(),
+                },
+            )],
+        )];
+        let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        remote_bindings.insert("bootstrap".to_string(), HashMap::new());
+
+        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings).unwrap();
+
+        match resources[0].get_attr("raw") {
+            Some(Value::Unknown(UnknownReason::UpstreamBareRef { binding })) => {
+                assert_eq!(binding, "bootstrap");
+            }
+            other => panic!("expected Value::Unknown(UpstreamBareRef), got {:?}", other),
+        }
+    }
+
+    /// Bare upstream refs nested inside a `List` must reach the
+    /// stamping arm via the existing recursion. Locks in the recursive
+    /// contract symmetrically with the `UpstreamRef`-inside-list test
+    /// above. #2876.
+    #[test]
+    fn test_resolve_refs_for_plan_stamps_bare_upstream_inside_list() {
+        use crate::resource::UnknownReason;
+        let mut resources = vec![make_resource(
+            "consumer",
+            None,
+            vec![(
+                "raws",
+                Value::List(vec![
+                    Value::BindingRef {
+                        binding: "bootstrap".to_string(),
+                    },
+                    Value::BindingRef {
+                        binding: "secondary".to_string(),
+                    },
+                ]),
+            )],
+        )];
+        let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        remote_bindings.insert("bootstrap".to_string(), HashMap::new());
+        remote_bindings.insert("secondary".to_string(), HashMap::new());
+
+        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings).unwrap();
+
+        match resources[0].get_attr("raws") {
+            Some(Value::List(items)) => {
+                assert_eq!(items.len(), 2);
+                let bindings: Vec<&str> = items
+                    .iter()
+                    .map(|v| match v {
+                        Value::Unknown(UnknownReason::UpstreamBareRef { binding }) => {
+                            binding.as_str()
+                        }
+                        other => panic!("expected UpstreamBareRef, got {:?}", other),
+                    })
+                    .collect();
+                assert_eq!(bindings, vec!["bootstrap", "secondary"]);
+            }
+            other => panic!("expected List, got {:?}", other),
+        }
     }
 
     /// Refs to non-upstream bindings must not be marked, so existing

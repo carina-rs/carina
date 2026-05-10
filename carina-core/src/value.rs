@@ -107,6 +107,9 @@ impl std::fmt::Display for UnknownReason {
             UnknownReason::UpstreamRef { path } => {
                 write!(f, "upstream value {}", path.to_dot_string())
             }
+            UnknownReason::UpstreamBareRef { binding } => {
+                write!(f, "upstream value {}", binding)
+            }
             UnknownReason::ForKey => write!(f, "deferred for-binding key"),
             UnknownReason::ForIndex => write!(f, "deferred for-binding index"),
             UnknownReason::ForValue => write!(f, "deferred for-binding value"),
@@ -120,6 +123,9 @@ pub fn render_unknown(reason: &UnknownReason) -> String {
     match reason {
         UnknownReason::UpstreamRef { path } => {
             format!("(known after upstream apply: {})", path.to_dot_string())
+        }
+        UnknownReason::UpstreamBareRef { binding } => {
+            format!("(known after upstream apply: {})", binding)
         }
         UnknownReason::ForKey => "(known after upstream apply: key)".to_string(),
         UnknownReason::ForIndex => "(known after upstream apply: index)".to_string(),
