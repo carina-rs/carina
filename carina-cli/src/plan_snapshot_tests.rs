@@ -911,6 +911,52 @@ fn snapshot_nested_map_diff() {
     insta::assert_snapshot!(output);
 }
 
+// #2877 acceptance: a struct element added to a list-of-maps attribute
+// must render with one field per line (multi-line `+ { ... }` block),
+// not as an inline single-line dump. The pre-fix path collapsed the
+// added element to a `+ {action: [...], effect: "...", ...}` line that
+// blew past 500 columns for IAM policy statements.
+#[test]
+fn snapshot_list_diff_added_struct() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("list_diff_added_struct");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+    ));
+    assert!(
+        !output.lines().any(|l| l.len() > 200),
+        "added struct element should not render as a single very wide line; got: {}",
+        output
+    );
+    insta::assert_snapshot!(output);
+}
+
+// Mirror of the added-struct test for the removed path.
+#[test]
+fn snapshot_list_diff_removed_struct() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("list_diff_removed_struct");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+    ));
+    assert!(
+        !output.lines().any(|l| l.len() > 200),
+        "removed struct element should not render as a single very wide line; got: {}",
+        output
+    );
+    insta::assert_snapshot!(output);
+}
+
 #[test]
 fn snapshot_deferred_for() {
     let fp = build_plan_from_fixture_name("deferred_for");

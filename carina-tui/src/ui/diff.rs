@@ -1,6 +1,10 @@
 //! Map and list-of-maps diff rendering.
 
-use carina_core::detail_rows::{ListOfMapsDiffField, ListOfMapsDiffModified, MapDiffEntryIR};
+use carina_core::detail_rows::{
+    ListOfMapsDiffField, ListOfMapsDiffItem, ListOfMapsDiffItemKind, ListOfMapsDiffModified,
+    MapDiffEntryIR,
+};
+use carina_core::value::{PrettyLayout, format_value_pretty, needs_trailing_separator};
 use ratatui::prelude::*;
 
 /// Render map diff entries into TUI lines.
@@ -98,8 +102,8 @@ pub(super) fn render_list_of_maps_diff(
     key: &str,
     unchanged: &[String],
     modified: &[ListOfMapsDiffModified],
-    added: &[String],
-    removed: &[String],
+    added: &[ListOfMapsDiffItem],
+    removed: &[ListOfMapsDiffItem],
     is_selected: bool,
 ) {
     let mut first_line = Line::from(Span::raw(format!("  {}: [", key)));
@@ -152,18 +156,67 @@ pub(super) fn render_list_of_maps_diff(
         lines.push(Line::from(spans));
     }
     for item in added {
-        lines.push(Line::from(Span::styled(
-            format!("    {}", item),
-            Style::default().fg(Color::Green),
-        )));
+        push_added_removed_block(lines, item, ListOfMapsDiffItemKind::Added);
     }
     for item in removed {
-        lines.push(Line::from(Span::styled(
-            format!("    {}", item),
-            Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::CROSSED_OUT),
-        )));
+        push_added_removed_block(lines, item, ListOfMapsDiffItemKind::Removed);
     }
     lines.push(Line::from(Span::raw("  ]")));
+}
+
+/// Render a wholly added or removed list-of-maps element as a multi-line
+/// `+ {` / `- {` block (#2877). Mirrors the CLI display in
+/// `carina-cli/src/display/mod.rs::render_added_removed_block`. Each
+/// field's value goes through `format_value_pretty` so nested long lists
+/// or maps wrap to multiple indented lines instead of dumping inline.
+fn push_added_removed_block(
+    lines: &mut Vec<Line>,
+    item: &ListOfMapsDiffItem,
+    kind: ListOfMapsDiffItemKind,
+) {
+    let (marker, color, modifier) = match kind {
+        ListOfMapsDiffItemKind::Added => ("+", Color::Green, Modifier::empty()),
+        ListOfMapsDiffItemKind::Removed => ("-", Color::Red, Modifier::CROSSED_OUT),
+    };
+    let style = Style::default().fg(color).add_modifier(modifier);
+
+    lines.push(Line::from(vec![
+        Span::raw("    "),
+        Span::styled(format!("{} {{", marker), style),
+    ]));
+
+    // Constant indent — nesting (e.g. `NestedListOfMapsDiff`) is handled by
+    // the outer wrapper that prepends `"    "` to every line, shifting first-
+    // line key and continuation indent together. So we don't need to thread a
+    // dynamic prefix through here the way the CLI side does.
+    let field_indent_cols = 6;
+    let field_indent = " ".repeat(field_indent_cols);
+    let mut prev_needs_separator = false;
+    for (key, value) in &item.fields {
+        // Mirror `format_map_vertical`: insert a blank line before the
+        // next sibling key when the previous value was a multi-element
+        // list-of-maps so the boundary stays visible (#2555).
+        if prev_needs_separator {
+            lines.push(Line::from(Span::raw("")));
+        }
+        prev_needs_separator = needs_trailing_separator(value);
+        let layout = PrettyLayout {
+            parent_indent_cols: field_indent_cols,
+            key,
+        };
+        let pretty = format_value_pretty(value, layout);
+        for (i, vline) in pretty.split('\n').enumerate() {
+            let line = if i == 0 {
+                format!("{}{}: {}", field_indent, key, vline)
+            } else {
+                vline.to_string()
+            };
+            lines.push(Line::from(Span::styled(line, style)));
+        }
+    }
+
+    lines.push(Line::from(vec![
+        Span::raw("    "),
+        Span::styled("}".to_string(), style),
+    ]));
 }
