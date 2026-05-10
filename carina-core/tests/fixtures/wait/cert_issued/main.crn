@@ -1,0 +1,12 @@
+let cert = aws.acm.Certificate {
+    domain_name       = "registry.example.com"
+    validation_method = "DNS"
+}
+
+let validation_record = aws.route53.RecordSet {
+    hosted_zone_id   = "Z123"
+    name             = "_acme.registry.example.com"
+    type             = "CNAME"
+    ttl              = 60
+    resource_records = ["validation.example.com"]
+}

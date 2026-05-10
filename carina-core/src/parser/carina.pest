@@ -19,6 +19,19 @@ require_statement = { "require" ~ validate_expr ~ "," ~ string }
 // Used as the RHS of a `let` binding: `let orgs = upstream_state { source = "../organizations" }`.
 upstream_state_expr = { "upstream_state" ~ "{" ~ attribute* ~ "}" }
 
+// Wait expression: `wait <target> { until = ..., depends_on = [...], timeout = ... }`
+// Synchronisation construct: blocks downstream resources until target reaches the
+// condition declared by `until`. See notes/specs/2026-05-09-wait-construct-design.md.
+//
+// `until` reuses `validate_expr` so the parser short-cuts to a known production;
+// semantic narrowing to `<target>.<attr> == <value>` happens post-parse in the
+// differ (see lower_until_to_predicate, follow-up phase).
+wait_expr = { "wait" ~ identifier ~ "{" ~ wait_attr* ~ "}" }
+wait_attr = { wait_until_attr | wait_timeout_attr | wait_depends_on_attr }
+wait_until_attr = { "until" ~ "=" ~ validate_expr }
+wait_timeout_attr = { "timeout" ~ "=" ~ duration_literal }
+wait_depends_on_attr = { "depends_on" ~ "=" ~ "[" ~ (identifier ~ ("," ~ identifier)*)? ~ ","? ~ "]" }
+
 // User-defined function: fn name(params) { body }
 fn_def = { "fn" ~ identifier ~ "(" ~ fn_params? ~ ")" ~ (":" ~ type_expr)? ~ "{" ~ fn_body ~ "}" }
 fn_params = { fn_param ~ ("," ~ fn_param)* }
@@ -232,6 +245,7 @@ function_call = { identifier ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
 // positions the evaluator cannot handle (issue #2233).
 primary = {
     read_resource_expr   // Must come before resource_expr for "read aws..." parsing
+  | wait_expr            // Must come before module_call so "wait <target> { ... }" is not parsed as a module call
   | upstream_state_expr  // Must come before module_call so "upstream_state { ... }" is not parsed as a module call
   | resource_expr
   | for_expr             // Must come before module_call so "for" is not parsed as module name

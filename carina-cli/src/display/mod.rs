@@ -445,6 +445,7 @@ impl<'a> TreeRenderContext<'a> {
             Effect::Import { .. } => "<-".cyan().bold(),
             Effect::Remove { .. } => "x".red().bold(),
             Effect::Move { .. } => "->".yellow().bold(),
+            Effect::Wait { .. } => ">".magenta().bold(),
         };
 
         // Build the tree connector (shown before child resources)
@@ -651,6 +652,22 @@ impl<'a> TreeRenderContext<'a> {
                 )
                 .unwrap();
             }
+            Effect::Wait {
+                binding,
+                until_surface,
+                ..
+            } => {
+                writeln!(
+                    self.out,
+                    "{}{}{} {} {}",
+                    base_indent,
+                    connector,
+                    colored_symbol,
+                    binding.magenta().bold(),
+                    format!("(until {})", until_surface).dimmed()
+                )
+                .unwrap();
+            }
         }
 
         // --- Detail rows (attributes) ---
@@ -696,7 +713,8 @@ impl<'a> TreeRenderContext<'a> {
                     Effect::Delete { .. }
                     | Effect::Import { .. }
                     | Effect::Remove { .. }
-                    | Effect::Move { .. } => None,
+                    | Effect::Move { .. }
+                    | Effect::Wait { .. } => None,
                 };
                 resource.and_then(|r| r.binding.clone())
             }
@@ -1629,6 +1647,13 @@ pub fn format_effect(effect: &Effect) -> String {
         }
         Effect::Move { from, to } => {
             format!("Move {} -> {}", from.human(), to.human())
+        }
+        Effect::Wait {
+            binding,
+            until_surface,
+            ..
+        } => {
+            format!("Wait {} (until {})", binding, until_surface)
         }
     }
 }

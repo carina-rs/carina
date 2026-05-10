@@ -693,6 +693,7 @@ fn test_find_state_bucket_resource_matching_type() {
         state_blocks: vec![],
         user_functions: HashMap::new(),
         upstream_states: vec![],
+        wait_bindings: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
         warnings: vec![],

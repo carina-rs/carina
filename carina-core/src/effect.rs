@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 use crate::resource::{Directives, Resource, ResourceId, State};
+use crate::wait::predicate::WaitPredicate;
 
 /// Temporary name used during create-before-destroy replacement.
 ///
@@ -123,6 +124,41 @@ pub enum Effect {
         /// New resource address
         to: ResourceId,
     },
+
+    /// Wait for `target` to satisfy `until` by polling `read()`.
+    ///
+    /// Emitted by the differ for a `let <binding> = wait <target> { ... }`
+    /// declaration. The executor (not the provider) drives the polling
+    /// loop on top of the existing `Provider::read` trait method, so
+    /// providers — including WASM plugins — need no contract change.
+    ///
+    /// Wait effects do **not** persist to `carina.state.json`; they are
+    /// re-evaluated on every plan/apply. See
+    /// `notes/specs/2026-05-09-wait-construct-design.md` §State file.
+    Wait {
+        /// The wait's binding name (e.g. `"cert_issued"`).
+        binding: String,
+        /// Resolved id of the target resource (`wait cert { ... }` →
+        /// `cert`'s `ResourceId`).
+        target_id: ResourceId,
+        /// Cloud provider identifier of the target, when already known.
+        target_identifier: Option<String>,
+        /// Typed predicate evaluated against each `read()` snapshot.
+        until: WaitPredicate,
+        /// Surface form of the `until` expression as the user wrote it
+        /// (e.g. `"cert.status == aws.acm.Certificate.Status.Issued"`).
+        /// Carried so plan-display never re-stringifies the parsed AST —
+        /// same pattern as `Effect::Replace::cascade_ref_hints`.
+        until_surface: String,
+        /// Hard cap on total wait time. Resolved by the differ from the
+        /// user-provided override or the target schema's default.
+        #[serde(with = "crate::resource::duration_secs")]
+        timeout: std::time::Duration,
+        /// Poll cadence between `read()` calls. Resolved from the target
+        /// schema's default; not user-visible in MVP.
+        #[serde(with = "crate::resource::duration_secs")]
+        interval: std::time::Duration,
+    },
 }
 
 impl Effect {
@@ -137,12 +173,13 @@ impl Effect {
             Effect::Import { .. } => "import",
             Effect::Remove { .. } => "remove",
             Effect::Move { .. } => "move",
+            Effect::Wait { .. } => "wait",
         }
     }
 
     /// Returns whether this Effect causes a mutation
     pub fn is_mutating(&self) -> bool {
-        !matches!(self, Effect::Read { .. })
+        !matches!(self, Effect::Read { .. } | Effect::Wait { .. })
     }
 
     /// Returns whether this is a state-only operation (import/remove/move)
@@ -164,11 +201,12 @@ impl Effect {
             Effect::Import { id, .. } => id,
             Effect::Remove { id, .. } => id,
             Effect::Move { to, .. } => to,
+            Effect::Wait { target_id, .. } => target_id,
         }
     }
 
     /// Returns a reference to the resource for this effect, if it has one.
-    /// Delete, Import, Remove, and Move effects have no resource.
+    /// Delete, Import, Remove, Move, and Wait effects have no resource.
     pub fn resource(&self) -> Option<&Resource> {
         match self {
             Effect::Create(resource) => Some(resource),
@@ -178,7 +216,8 @@ impl Effect {
             Effect::Delete { .. }
             | Effect::Import { .. }
             | Effect::Remove { .. }
-            | Effect::Move { .. } => None,
+            | Effect::Move { .. }
+            | Effect::Wait { .. } => None,
         }
     }
 
@@ -186,6 +225,9 @@ impl Effect {
     pub fn binding_name(&self) -> Option<String> {
         if let Effect::Delete { binding, .. } = self {
             return binding.clone();
+        }
+        if let Effect::Wait { binding, .. } = self {
+            return Some(binding.clone());
         }
         self.resource().and_then(|r| r.binding.clone())
     }
@@ -412,5 +454,98 @@ mod tests {
         } else {
             panic!("expected Delete, got {:?}", effect);
         }
+    }
+
+    #[test]
+    fn wait_variant_constructs() {
+        use crate::resource::Value;
+        use crate::wait::predicate::{AttrPath, WaitPredicate};
+        use std::time::Duration;
+
+        let _ = Effect::Wait {
+            binding: "cert_issued".to_string(),
+            target_id: ResourceId::new("acm.Certificate", "cert"),
+            target_identifier: None,
+            until: WaitPredicate::Equals {
+                attr: AttrPath::single("status"),
+                value: Value::String("ISSUED".to_string()),
+            },
+            until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
+            timeout: Duration::from_secs(75 * 60),
+            interval: Duration::from_secs(5),
+        };
+    }
+
+    #[test]
+    fn wait_binding_name_returns_wait_binding() {
+        use crate::resource::Value;
+        use crate::wait::predicate::{AttrPath, WaitPredicate};
+        use std::time::Duration;
+
+        let e = Effect::Wait {
+            binding: "cert_issued".to_string(),
+            target_id: ResourceId::new("acm.Certificate", "cert"),
+            target_identifier: None,
+            until: WaitPredicate::Equals {
+                attr: AttrPath::single("status"),
+                value: Value::String("ISSUED".to_string()),
+            },
+            until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
+            timeout: Duration::from_secs(60),
+            interval: Duration::from_secs(5),
+        };
+        assert_eq!(e.binding_name(), Some("cert_issued".to_string()));
+    }
+
+    #[test]
+    fn wait_is_not_mutating() {
+        use crate::resource::Value;
+        use crate::wait::predicate::{AttrPath, WaitPredicate};
+        use std::time::Duration;
+
+        let e = Effect::Wait {
+            binding: "cert_issued".to_string(),
+            target_id: ResourceId::new("acm.Certificate", "cert"),
+            target_identifier: None,
+            until: WaitPredicate::Equals {
+                attr: AttrPath::single("status"),
+                value: Value::String("ISSUED".to_string()),
+            },
+            until_surface: "cert.status == ISSUED".to_string(),
+            timeout: Duration::from_secs(60),
+            interval: Duration::from_secs(5),
+        };
+        assert!(!e.is_mutating());
+        assert_eq!(e.kind(), "wait");
+    }
+
+    #[test]
+    fn wait_serde_round_trip() {
+        use crate::resource::Value;
+        use crate::wait::predicate::{AttrPath, WaitPredicate};
+        use std::time::Duration;
+
+        let original = Effect::Wait {
+            binding: "cert_issued".to_string(),
+            target_id: ResourceId::new("acm.Certificate", "cert"),
+            target_identifier: None,
+            until: WaitPredicate::Equals {
+                attr: AttrPath::single("status"),
+                value: Value::String("ISSUED".to_string()),
+            },
+            until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
+            timeout: Duration::from_secs(4500),
+            interval: Duration::from_secs(5),
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        // Duration must round-trip as plain integer seconds (matches the
+        // project's "no { secs, nanos }" rule from #2824).
+        assert!(
+            json.contains("\"timeout\":4500"),
+            "expected `\"timeout\":4500` in JSON, got: {}",
+            json
+        );
+        let decoded: Effect = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, original);
     }
 }

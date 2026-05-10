@@ -12,3 +12,4 @@ pub(super) mod pipe;
 pub(super) mod primary;
 pub(super) mod string_literal;
 pub(super) mod validate_expr;
+pub(super) mod wait_expr;

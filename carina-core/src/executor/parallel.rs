@@ -323,6 +323,11 @@ pub(super) async fn execute_effects_sequential(
                     Effect::Import { .. } | Effect::Remove { .. } | Effect::Move { .. } => {
                         SingleEffectResult::ReadNoOp
                     }
+                    // Wait effects are dispatched by a follow-up PR (Phase 4
+                    // of carina#2825). Until then, treat them as a planner
+                    // no-op so existing tests stay green; they will not be
+                    // produced by the differ in this PR.
+                    Effect::Wait { .. } => SingleEffectResult::ReadNoOp,
                 };
                 (idx, result)
             });

@@ -25,6 +25,7 @@ pub enum KeywordKind {
 pub const KEYWORDS: &[(&str, KeywordKind)] = &[
     ("fn", KeywordKind::Storage),
     ("let", KeywordKind::Storage),
+    ("wait", KeywordKind::Storage),
     ("arguments", KeywordKind::Declaration),
     ("attributes", KeywordKind::Declaration),
     ("backend", KeywordKind::Declaration),
@@ -42,6 +43,7 @@ pub const KEYWORDS: &[(&str, KeywordKind)] = &[
     ("import", KeywordKind::Other),
     ("read", KeywordKind::Other),
     ("require", KeywordKind::Other),
+    ("until", KeywordKind::Other),
     ("use", KeywordKind::Other),
     ("null", KeywordKind::NullLiteral),
 ];
@@ -105,8 +107,22 @@ mod tests {
     #[test]
     fn by_kind_partitions_correctly() {
         let storage: Vec<&str> = by_kind(KeywordKind::Storage).collect();
-        assert_eq!(storage, vec!["fn", "let"]);
+        assert_eq!(storage, vec!["fn", "let", "wait"]);
         let null: Vec<&str> = by_kind(KeywordKind::NullLiteral).collect();
         assert_eq!(null, vec!["null"]);
+    }
+
+    #[test]
+    fn wait_is_a_storage_keyword() {
+        assert!(is_keyword("wait"));
+        let storage: Vec<&str> = by_kind(KeywordKind::Storage).collect();
+        assert!(storage.contains(&"wait"));
+    }
+
+    #[test]
+    fn until_is_an_other_keyword() {
+        assert!(is_keyword("until"));
+        let other: Vec<&str> = by_kind(KeywordKind::Other).collect();
+        assert!(other.contains(&"until"));
     }
 }

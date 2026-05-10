@@ -68,6 +68,7 @@ fn create_test_module() -> ParsedFile {
         state_blocks: vec![],
         user_functions: HashMap::new(),
         upstream_states: vec![],
+        wait_bindings: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
         warnings: vec![],
@@ -149,6 +150,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
         state_blocks: vec![],
         user_functions: HashMap::new(),
         upstream_states: vec![],
+        wait_bindings: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
         warnings: vec![],
@@ -299,6 +301,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
         state_blocks: vec![],
         user_functions: HashMap::new(),
         upstream_states: vec![],
+        wait_bindings: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
         warnings: vec![],
@@ -429,6 +432,7 @@ fn create_module_with_attributes() -> ParsedFile {
         state_blocks: vec![],
         user_functions: HashMap::new(),
         upstream_states: vec![],
+        wait_bindings: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
         warnings: vec![],
@@ -1243,6 +1247,7 @@ fn create_module_with_interpolation() -> ParsedFile {
         state_blocks: vec![],
         user_functions: HashMap::new(),
         upstream_states: vec![],
+        wait_bindings: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
         warnings: vec![],
@@ -1559,6 +1564,7 @@ fn create_module_with_port_validation() -> ParsedFile {
         state_blocks: vec![],
         user_functions: HashMap::new(),
         upstream_states: vec![],
+        wait_bindings: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
         warnings: vec![],
@@ -1731,6 +1737,7 @@ fn test_argument_validation_no_message_uses_default() {
         state_blocks: vec![],
         user_functions: HashMap::new(),
         upstream_states: vec![],
+        wait_bindings: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
         warnings: vec![],
@@ -1796,6 +1803,7 @@ fn test_argument_validation_len_with_list() {
         state_blocks: vec![],
         user_functions: HashMap::new(),
         upstream_states: vec![],
+        wait_bindings: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
         warnings: vec![],
@@ -1876,6 +1884,7 @@ fn test_require_block_passes() {
         state_blocks: vec![],
         user_functions: HashMap::new(),
         upstream_states: vec![],
+        wait_bindings: vec![],
         requires: vec![RequireBlock {
             // !enable_https || cert_arn != null
             condition: ValidateExpr::Or(
@@ -1949,6 +1958,7 @@ fn test_require_block_fails_with_not_expr() {
         state_blocks: vec![],
         user_functions: HashMap::new(),
         upstream_states: vec![],
+        wait_bindings: vec![],
         requires: vec![RequireBlock {
             // !enable_https || has_cert
             condition: ValidateExpr::Or(
@@ -2013,6 +2023,7 @@ fn test_require_block_len_function() {
         state_blocks: vec![],
         user_functions: HashMap::new(),
         upstream_states: vec![],
+        wait_bindings: vec![],
         requires: vec![RequireBlock {
             // len(subnet_ids) >= 2
             condition: ValidateExpr::Compare {
@@ -2108,6 +2119,7 @@ fn test_require_block_multiple_constraints() {
         state_blocks: vec![],
         user_functions: HashMap::new(),
         upstream_states: vec![],
+        wait_bindings: vec![],
         requires: vec![RequireBlock {
             // min_size <= max_size
             condition: ValidateExpr::Compare {
@@ -3372,6 +3384,7 @@ fn create_module_with_environment_union() -> ParsedFile {
         state_blocks: vec![],
         user_functions: HashMap::new(),
         upstream_states: vec![],
+        wait_bindings: vec![],
         requires: vec![],
         structural_bindings: HashSet::new(),
         warnings: vec![],

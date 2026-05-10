@@ -17,6 +17,7 @@ fn empty_parsed() -> ParsedFile {
         state_blocks: Vec::new(),
         user_functions: HashMap::new(),
         upstream_states: Vec::new(),
+        wait_bindings: Vec::new(),
         requires: Vec::new(),
         structural_bindings: HashSet::new(),
         warnings: Vec::new(),

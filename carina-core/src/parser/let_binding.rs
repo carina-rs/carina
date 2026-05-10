@@ -16,6 +16,7 @@ use super::error::ParseError;
 use super::expressions::for_expr::parse_for_expr;
 use super::expressions::if_expr::parse_if_expr;
 use super::expressions::primary::parse_primary_eval;
+use super::expressions::wait_expr::parse_wait_expr;
 use super::parse_expression;
 use super::static_eval::is_static_value;
 use super::util::eval_type_name;
@@ -101,7 +102,8 @@ fn detect_structural_rhs(pair: &pest::iterators::Pair<Rule>) -> bool {
             Rule::if_expr
             | Rule::for_expr
             | Rule::read_resource_expr
-            | Rule::upstream_state_expr => Some(inner.as_rule()),
+            | Rule::upstream_state_expr
+            | Rule::wait_expr => Some(inner.as_rule()),
             Rule::pipe_expr | Rule::compose_expr | Rule::coalesce_expr | Rule::expression => {
                 find_inner_rule(&inner)
             }
@@ -111,7 +113,8 @@ fn detect_structural_rhs(pair: &pest::iterators::Pair<Rule>) -> bool {
                     Rule::if_expr
                     | Rule::for_expr
                     | Rule::read_resource_expr
-                    | Rule::upstream_state_expr => Some(primary_inner.as_rule()),
+                    | Rule::upstream_state_expr
+                    | Rule::wait_expr => Some(primary_inner.as_rule()),
                     _ => None,
                 }
             }
@@ -317,6 +320,24 @@ fn parse_primary_with_resource_or_module(
                 });
             }
             ctx.upstream_states.insert(us.binding.clone(), us);
+            let ref_value = Value::String(format!("${{{}}}", binding_name));
+            Ok((EvalValue::from_value(ref_value), vec![], vec![], None))
+        }
+        Rule::wait_expr => {
+            let (line, _) = inner.as_span().start_pos().line_col();
+            let wb = parse_wait_expr(inner, binding_name)?;
+            if ctx.wait_bindings.contains_key(&wb.binding) {
+                return Err(ParseError::DuplicateBinding {
+                    name: wb.binding,
+                    line,
+                });
+            }
+            ctx.wait_bindings.insert(wb.binding.clone(), wb);
+            // The wait binding's value is a forward reference to the
+            // captured target snapshot; downstream resolution treats
+            // `<wait-binding>.<attr>` as passthrough of `<target>.<attr>`.
+            // For now we mirror the upstream_state_expr pattern and emit
+            // a placeholder `${binding}` reference.
             let ref_value = Value::String(format!("${{{}}}", binding_name));
             Ok((EvalValue::from_value(ref_value), vec![], vec![], None))
         }

@@ -176,6 +176,12 @@ pub fn resolve_resource_refs_with_config(
         binding_map.entry(us.binding.clone()).or_default();
     }
 
+    // Register `wait` bindings the same way: downstream `<wait>.<attr>`
+    // refs are passthrough of the target's snapshot, resolved at apply time.
+    for wb in &parsed.wait_bindings {
+        binding_map.entry(wb.binding.clone()).or_default();
+    }
+
     // Build a `ParseContext` once, populated with the merged
     // directory's user functions so a `Value::FunctionCall` whose name
     // is a sibling-defined user-fn (visible only in the merged parse —
@@ -265,6 +271,7 @@ pub fn collect_known_bindings_merged(parsed: &ParsedFile) -> std::collections::H
             .filter_map(|c| c.binding_name.as_deref()),
     );
     known.extend(parsed.upstream_states.iter().map(|u| u.binding.as_str()));
+    known.extend(parsed.wait_bindings.iter().map(|w| w.binding.as_str()));
     known.extend(parsed.uses.iter().map(|i| i.alias.as_str()));
     known.extend(parsed.user_functions.keys().map(String::as_str));
     known.extend(parsed.variables.keys().map(String::as_str));
@@ -561,6 +568,9 @@ pub fn resolve_provider_unresolved_attributes<E>(
     }
     for us in &parsed.upstream_states {
         binding_map.entry(us.binding.clone()).or_default();
+    }
+    for wb in &parsed.wait_bindings {
+        binding_map.entry(wb.binding.clone()).or_default();
     }
     let mut fn_ctx = super::ParseContext::new(config);
     fn_ctx.user_functions = parsed.user_functions.clone();

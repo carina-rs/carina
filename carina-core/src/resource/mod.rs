@@ -387,7 +387,7 @@ impl std::fmt::Display for AccessPath {
 /// `notes/specs/2026-05-10-duration-design.md`). The variant carries
 /// `#[serde(with = "duration_secs")]` so this module is used uniformly
 /// on serialise and deserialise.
-mod duration_secs {
+pub(crate) mod duration_secs {
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
 

@@ -767,6 +767,10 @@ pub fn redact_secrets_in_effect(
             from: from.clone(),
             to: to.clone(),
         },
+        // Wait effects carry no secret-bearing fields — `until` is a
+        // typed predicate over scalar values, surface form is the
+        // user-authored source. Clone through unchanged.
+        Effect::Wait { .. } => effect.clone(),
     })
 }
 

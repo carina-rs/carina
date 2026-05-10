@@ -283,6 +283,7 @@ pub(crate) fn merge_parsed_file(target: &mut ParsedFile, source: ParsedFile) {
     target.state_blocks.extend(source.state_blocks);
     target.user_functions.extend(source.user_functions);
     target.upstream_states.extend(source.upstream_states);
+    target.wait_bindings.extend(source.wait_bindings);
     target.requires.extend(source.requires);
     target
         .structural_bindings

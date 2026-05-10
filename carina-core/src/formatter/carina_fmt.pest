@@ -270,6 +270,20 @@ upstream_state_expr = {
     kw_upstream_state ~ trivia* ~ open_brace ~ block_content* ~ close_brace
 }
 
+// Wait expression: wait <target> { until = ..., depends_on = [...], timeout = ... }
+// Mirrors carina.pest:wait_expr. The body is a sequence of `wait_attr`
+// terms; the formatter walks them with the same one-attribute-per-line
+// shape it uses for other key-value blocks.
+wait_expr = {
+    kw_wait ~ trivia+ ~ identifier ~ trivia* ~ open_brace ~ (trivia | wait_attr)* ~ close_brace
+}
+wait_attr = { wait_until_attr | wait_timeout_attr | wait_depends_on_attr }
+wait_until_attr = { kw_until ~ trivia* ~ equals ~ trivia* ~ validate_expr }
+wait_timeout_attr = { kw_timeout ~ trivia* ~ equals ~ trivia* ~ duration_literal }
+wait_depends_on_attr = {
+    kw_depends_on ~ trivia* ~ equals ~ trivia* ~ open_bracket ~ trivia* ~ (identifier ~ (trivia* ~ comma ~ trivia* ~ identifier)*)? ~ trivia* ~ comma? ~ trivia* ~ close_bracket
+}
+
 // Primary value
 // `use_expr` is intentionally NOT here — mirrors carina.pest. It is only
 // valid as the RHS of a let binding (see `let_binding`). Issue #2233.
@@ -284,6 +298,7 @@ upstream_state_expr = {
 // unambiguous.
 primary = {
     read_resource_expr
+  | wait_expr
   | upstream_state_expr
   | resource_expr
   | for_expr
@@ -437,3 +452,7 @@ kw_from = { "from" }
 kw_id = { "id" }
 kw_require = { "require" }
 kw_upstream_state = { "upstream_state" }
+kw_wait = { "wait" }
+kw_until = { "until" }
+kw_timeout = { "timeout" }
+kw_depends_on = { "depends_on" }

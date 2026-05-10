@@ -169,6 +169,17 @@ impl<'a> CstBuilder<'a> {
             Rule::upstream_state_expr => Some(CstChild::Node(
                 self.build_node(NodeKind::UpstreamStateExpr, pair),
             )),
+            Rule::wait_expr => Some(CstChild::Node(self.build_node(NodeKind::WaitExpr, pair))),
+            Rule::wait_attr => Some(CstChild::Node(self.build_node(NodeKind::WaitAttr, pair))),
+            Rule::wait_until_attr => Some(CstChild::Node(
+                self.build_node(NodeKind::WaitUntilAttr, pair),
+            )),
+            Rule::wait_timeout_attr => Some(CstChild::Node(
+                self.build_node(NodeKind::WaitTimeoutAttr, pair),
+            )),
+            Rule::wait_depends_on_attr => Some(CstChild::Node(
+                self.build_node(NodeKind::WaitDependsOnAttr, pair),
+            )),
             Rule::fn_def => Some(CstChild::Node(self.build_node(NodeKind::FnDef, pair))),
             Rule::fn_param => Some(CstChild::Node(self.build_node(NodeKind::FnParam, pair))),
             Rule::fn_local_let => Some(CstChild::Node(
@@ -325,6 +336,12 @@ impl<'a> CstBuilder<'a> {
                 "upstream_state".to_string(),
                 span,
             ))),
+            Rule::kw_wait => Some(CstChild::Token(Token::new("wait".to_string(), span))),
+            Rule::kw_until => Some(CstChild::Token(Token::new("until".to_string(), span))),
+            Rule::kw_timeout => Some(CstChild::Token(Token::new("timeout".to_string(), span))),
+            Rule::kw_depends_on => {
+                Some(CstChild::Token(Token::new("depends_on".to_string(), span)))
+            }
 
             // Validate expression rules - treat as opaque node preserving source text
             Rule::validate_expr => Some(CstChild::Node(
