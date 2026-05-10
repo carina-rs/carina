@@ -44,7 +44,9 @@ const { title, description, headings = [] } = Astro.props;
 
   .doc-header h1 {
     font-family: var(--font-display);
-    font-size: var(--text-4xl);
+    font-size: 3rem;
+    font-weight: 700;
+    letter-spacing: -0.01em;
     color: var(--page-title-color);
     margin: 0 0 var(--space-3);
   }
@@ -61,9 +63,24 @@ const { title, description, headings = [] } = Astro.props;
   }
 
   .doc-body :global(h2) {
-    margin-top: var(--space-8);
+    position: relative;
+    margin-top: 4rem;
+    padding-top: 1.25rem;
     margin-bottom: var(--space-4);
     scroll-margin-top: var(--space-8);
+    font-size: 1.55rem;
+    font-weight: 700;
+  }
+
+  .doc-body :global(h2::before) {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 3rem;
+    height: 1px;
+    background: var(--accent);
+    opacity: 0.55;
   }
 
   .doc-body :global(h3) {
