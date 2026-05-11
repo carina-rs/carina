@@ -1,7 +1,7 @@
 //! Shared utility functions for value normalization and conversion
 
 use crate::resource::{ConcreteValue, Value};
-use crate::schema::NamespacedEnumParts;
+use crate::schema::{AttributeType, NamespacedEnumParts};
 
 /// A namespaced DSL enum identifier, parsed once and reused.
 ///
@@ -483,6 +483,123 @@ pub fn resolve_enum_value(value: &Value, parts: &NamespacedEnumParts<'_>) -> Opt
                 ns, type_name, dsl_val
             ))))
         }
+        _ => None,
+    }
+}
+
+/// Resolve every enum value reachable from `value` through `attr_type` to
+/// its fully-qualified namespaced DSL format, descending into struct
+/// fields, list elements, and map values.
+///
+/// At each position the function asks the schema what type of value
+/// lives there. If the position is a `StringEnum` (or a `Custom` with a
+/// namespaced enum), [`resolve_enum_value`] runs on it. If the position
+/// is a `Struct`/`List`/`Map`, recursion continues into the children.
+/// All other types pass through unchanged.
+///
+/// Returns `Some(new_value)` when at least one nested value was
+/// rewritten, `None` when nothing changed (mirroring
+/// [`resolve_enum_value`]'s contract so callers can keep a "rewrite
+/// only on diff" pattern).
+///
+/// `Union` types are not recursed into — there is no way to tell which
+/// arm a runtime value belongs to without re-running the validator, and
+/// AWS schemas use `Union` only for shapes where each arm is itself a
+/// scalar (so there are no nested enums to find anyway).
+///
+/// # Examples
+///
+/// ```
+/// use carina_core::resource::{ConcreteValue, Value};
+/// use carina_core::schema::{AttributeType, StructField};
+/// use carina_core::utils::resolve_enum_value_recursive;
+/// use indexmap::IndexMap;
+///
+/// let status_enum = AttributeType::StringEnum {
+///     name: "VersioningStatus".to_string(),
+///     values: vec!["Enabled".to_string(), "Suspended".to_string()],
+///     namespace: Some("aws.s3.Bucket".to_string()),
+///     dsl_aliases: vec![],
+/// };
+/// let config = AttributeType::Struct {
+///     name: "VersioningConfiguration".to_string(),
+///     fields: vec![StructField::new("status", status_enum)],
+/// };
+///
+/// let mut inner = IndexMap::new();
+/// inner.insert("status".to_string(),
+///     Value::Concrete(ConcreteValue::String("Enabled".to_string())));
+/// let input = Value::Concrete(ConcreteValue::Map(inner));
+///
+/// let resolved = resolve_enum_value_recursive(&input, &config).unwrap();
+/// // Bare "Enabled" → fully-qualified DSL form.
+/// match resolved {
+///     Value::Concrete(ConcreteValue::Map(m)) => {
+///         match m.get("status").unwrap() {
+///             Value::Concrete(ConcreteValue::String(s)) => {
+///                 assert_eq!(s, "aws.s3.Bucket.VersioningStatus.Enabled");
+///             }
+///             _ => panic!("status should be String"),
+///         }
+///     }
+///     _ => panic!("result should be Map"),
+/// }
+/// ```
+pub fn resolve_enum_value_recursive(value: &Value, attr_type: &AttributeType) -> Option<Value> {
+    // First, try the leaf case: this position is itself an enum.
+    if let Some(parts) = attr_type.namespaced_enum_parts()
+        && let Some(resolved) = resolve_enum_value(value, &parts)
+    {
+        return Some(resolved);
+    }
+
+    match attr_type {
+        AttributeType::Struct { fields, .. } => {
+            let Value::Concrete(ConcreteValue::Map(map)) = value else {
+                return None;
+            };
+            let mut rewritten = map.clone();
+            let mut changed = false;
+            for field in fields {
+                if let Some(field_value) = map.get(&field.name)
+                    && let Some(new_field) =
+                        resolve_enum_value_recursive(field_value, &field.field_type)
+                {
+                    rewritten.insert(field.name.clone(), new_field);
+                    changed = true;
+                }
+            }
+            changed.then_some(Value::Concrete(ConcreteValue::Map(rewritten)))
+        }
+        AttributeType::List { inner, .. } => {
+            let Value::Concrete(ConcreteValue::List(items)) = value else {
+                return None;
+            };
+            let mut rewritten = items.clone();
+            let mut changed = false;
+            for (i, item) in items.iter().enumerate() {
+                if let Some(new_item) = resolve_enum_value_recursive(item, inner) {
+                    rewritten[i] = new_item;
+                    changed = true;
+                }
+            }
+            changed.then_some(Value::Concrete(ConcreteValue::List(rewritten)))
+        }
+        AttributeType::Map { value: inner, .. } => {
+            let Value::Concrete(ConcreteValue::Map(map)) = value else {
+                return None;
+            };
+            let mut rewritten = map.clone();
+            let mut changed = false;
+            for (k, v) in map {
+                if let Some(new_v) = resolve_enum_value_recursive(v, inner) {
+                    rewritten.insert(k.clone(), new_v);
+                    changed = true;
+                }
+            }
+            changed.then_some(Value::Concrete(ConcreteValue::Map(rewritten)))
+        }
+        // Scalars and Union: nothing to descend into.
         _ => None,
     }
 }
@@ -1361,5 +1478,255 @@ mod tests {
         // The exact message is serde_json's; we only assert that a
         // serialization failure surfaces as an Err.
         assert!(!err.to_string().is_empty());
+    }
+
+    mod resolve_enum_value_recursive {
+        use super::*;
+        use crate::schema::StructField;
+        use indexmap::IndexMap;
+
+        fn versioning_status() -> AttributeType {
+            AttributeType::StringEnum {
+                name: "VersioningStatus".to_string(),
+                values: vec!["Enabled".to_string(), "Suspended".to_string()],
+                namespace: Some("aws.s3.Bucket".to_string()),
+                dsl_aliases: vec![],
+            }
+        }
+
+        fn s(s: &str) -> Value {
+            Value::Concrete(ConcreteValue::String(s.to_string()))
+        }
+
+        #[test]
+        fn leaf_string_enum_resolves_bare_value() {
+            let resolved = resolve_enum_value_recursive(&s("Enabled"), &versioning_status());
+            assert_eq!(resolved, Some(s("aws.s3.Bucket.VersioningStatus.Enabled")));
+        }
+
+        #[test]
+        fn non_enum_scalar_passes_through() {
+            let resolved = resolve_enum_value_recursive(&s("hello"), &AttributeType::String);
+            assert_eq!(resolved, None);
+        }
+
+        #[test]
+        fn struct_with_enum_field_resolves_field() {
+            let config = AttributeType::Struct {
+                name: "VersioningConfiguration".to_string(),
+                fields: vec![StructField::new("status", versioning_status())],
+            };
+            let mut inner = IndexMap::new();
+            inner.insert("status".to_string(), s("Enabled"));
+            let input = Value::Concrete(ConcreteValue::Map(inner));
+
+            let resolved = resolve_enum_value_recursive(&input, &config).unwrap();
+            match resolved {
+                Value::Concrete(ConcreteValue::Map(m)) => {
+                    assert_eq!(
+                        m.get("status"),
+                        Some(&s("aws.s3.Bucket.VersioningStatus.Enabled"))
+                    );
+                }
+                _ => panic!("expected Map"),
+            }
+        }
+
+        #[test]
+        fn struct_with_no_enum_changes_returns_none() {
+            let config = AttributeType::Struct {
+                name: "Config".to_string(),
+                fields: vec![StructField::new("name", AttributeType::String)],
+            };
+            let mut inner = IndexMap::new();
+            inner.insert("name".to_string(), s("foo"));
+            let input = Value::Concrete(ConcreteValue::Map(inner));
+
+            assert_eq!(resolve_enum_value_recursive(&input, &config), None);
+        }
+
+        #[test]
+        fn list_of_enum_resolves_every_item() {
+            let list_t = AttributeType::List {
+                inner: Box::new(versioning_status()),
+                ordered: true,
+            };
+            let input = Value::Concrete(ConcreteValue::List(vec![s("Enabled"), s("Suspended")]));
+            let resolved = resolve_enum_value_recursive(&input, &list_t).unwrap();
+            match resolved {
+                Value::Concrete(ConcreteValue::List(items)) => {
+                    assert_eq!(items.len(), 2);
+                    assert_eq!(items[0], s("aws.s3.Bucket.VersioningStatus.Enabled"));
+                    assert_eq!(items[1], s("aws.s3.Bucket.VersioningStatus.Suspended"));
+                }
+                _ => panic!("expected List"),
+            }
+        }
+
+        #[test]
+        fn map_of_enum_resolves_every_value() {
+            let map_t = AttributeType::Map {
+                key: Box::new(AttributeType::String),
+                value: Box::new(versioning_status()),
+            };
+            let mut input_map = IndexMap::new();
+            input_map.insert("primary".to_string(), s("Enabled"));
+            input_map.insert("secondary".to_string(), s("Suspended"));
+            let input = Value::Concrete(ConcreteValue::Map(input_map));
+
+            let resolved = resolve_enum_value_recursive(&input, &map_t).unwrap();
+            match resolved {
+                Value::Concrete(ConcreteValue::Map(m)) => {
+                    assert_eq!(
+                        m.get("primary"),
+                        Some(&s("aws.s3.Bucket.VersioningStatus.Enabled"))
+                    );
+                    assert_eq!(
+                        m.get("secondary"),
+                        Some(&s("aws.s3.Bucket.VersioningStatus.Suspended"))
+                    );
+                }
+                _ => panic!("expected Map"),
+            }
+        }
+
+        #[test]
+        fn list_of_struct_with_enum_field_descends_into_each_item() {
+            // List<Struct{status: VersioningStatus}>
+            let item_t = AttributeType::Struct {
+                name: "Rule".to_string(),
+                fields: vec![StructField::new("status", versioning_status())],
+            };
+            let list_t = AttributeType::List {
+                inner: Box::new(item_t),
+                ordered: false,
+            };
+            let mut item1 = IndexMap::new();
+            item1.insert("status".to_string(), s("Enabled"));
+            let mut item2 = IndexMap::new();
+            item2.insert("status".to_string(), s("Suspended"));
+            let input = Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::Map(item1)),
+                Value::Concrete(ConcreteValue::Map(item2)),
+            ]));
+
+            let resolved = resolve_enum_value_recursive(&input, &list_t).unwrap();
+            let Value::Concrete(ConcreteValue::List(items)) = resolved else {
+                panic!("expected List");
+            };
+            for (item, expected) in items.iter().zip(
+                [
+                    "aws.s3.Bucket.VersioningStatus.Enabled",
+                    "aws.s3.Bucket.VersioningStatus.Suspended",
+                ]
+                .iter(),
+            ) {
+                let Value::Concrete(ConcreteValue::Map(m)) = item else {
+                    panic!("expected Map");
+                };
+                assert_eq!(m.get("status"), Some(&s(expected)));
+            }
+        }
+
+        #[test]
+        fn nested_struct_descends_recursively() {
+            // Struct{outer_field: Struct{status: VersioningStatus}}
+            let inner_t = AttributeType::Struct {
+                name: "Inner".to_string(),
+                fields: vec![StructField::new("status", versioning_status())],
+            };
+            let outer_t = AttributeType::Struct {
+                name: "Outer".to_string(),
+                fields: vec![StructField::new("inner", inner_t)],
+            };
+
+            let mut inner_map = IndexMap::new();
+            inner_map.insert("status".to_string(), s("Enabled"));
+            let mut outer_map = IndexMap::new();
+            outer_map.insert(
+                "inner".to_string(),
+                Value::Concrete(ConcreteValue::Map(inner_map)),
+            );
+            let input = Value::Concrete(ConcreteValue::Map(outer_map));
+
+            let resolved = resolve_enum_value_recursive(&input, &outer_t).unwrap();
+            let Value::Concrete(ConcreteValue::Map(om)) = resolved else {
+                panic!("expected Map");
+            };
+            let Some(Value::Concrete(ConcreteValue::Map(im))) = om.get("inner") else {
+                panic!("expected nested Map");
+            };
+            assert_eq!(
+                im.get("status"),
+                Some(&s("aws.s3.Bucket.VersioningStatus.Enabled"))
+            );
+        }
+
+        #[test]
+        fn already_qualified_value_is_unchanged() {
+            // Fully-qualified DSL form should pass through unchanged
+            // (resolve_enum_value's contract — we exercise it through
+            // the recursive entry point to confirm passthrough
+            // propagates to None at this level too).
+            let resolved = resolve_enum_value_recursive(
+                &s("aws.s3.Bucket.VersioningStatus.Enabled"),
+                &versioning_status(),
+            );
+            assert_eq!(resolved, None);
+        }
+
+        #[test]
+        fn dsl_alias_resolves_via_dsl_for() {
+            // Enum with a DSL alias: dsl_aliases maps API "Enabled" → DSL "enabled".
+            // resolve_enum_value calls dsl_for(api) to render the alias,
+            // so the resolved fully-qualified form uses the DSL spelling.
+            let aliased = AttributeType::StringEnum {
+                name: "VersioningStatus".to_string(),
+                values: vec!["Enabled".to_string()],
+                namespace: Some("aws.s3.Bucket".to_string()),
+                dsl_aliases: vec![("Enabled".to_string(), "enabled".to_string())],
+            };
+            let resolved = resolve_enum_value_recursive(&s("Enabled"), &aliased).unwrap();
+            assert_eq!(resolved, s("aws.s3.Bucket.VersioningStatus.enabled"));
+        }
+
+        #[test]
+        fn map_of_struct_with_enum_field_descends() {
+            // Map<String, Struct{status: VersioningStatus}>
+            let item_t = AttributeType::Struct {
+                name: "Rule".to_string(),
+                fields: vec![StructField::new("status", versioning_status())],
+            };
+            let map_t = AttributeType::Map {
+                key: Box::new(AttributeType::String),
+                value: Box::new(item_t),
+            };
+            let mut item = IndexMap::new();
+            item.insert("status".to_string(), s("Enabled"));
+            let mut input_map = IndexMap::new();
+            input_map.insert("a".to_string(), Value::Concrete(ConcreteValue::Map(item)));
+            let input = Value::Concrete(ConcreteValue::Map(input_map));
+
+            let resolved = resolve_enum_value_recursive(&input, &map_t).unwrap();
+            let Value::Concrete(ConcreteValue::Map(om)) = resolved else {
+                panic!("expected Map");
+            };
+            let Some(Value::Concrete(ConcreteValue::Map(im))) = om.get("a") else {
+                panic!("expected nested Map");
+            };
+            assert_eq!(
+                im.get("status"),
+                Some(&s("aws.s3.Bucket.VersioningStatus.Enabled"))
+            );
+        }
+
+        #[test]
+        fn union_is_not_recursed_into() {
+            // Union types are documented as not recursed; assert by
+            // construction that a Union wrapping an enum yields None
+            // even when the value would resolve for the enum directly.
+            let union_t = AttributeType::Union(vec![versioning_status(), AttributeType::String]);
+            assert_eq!(resolve_enum_value_recursive(&s("Enabled"), &union_t), None);
+        }
     }
 }
