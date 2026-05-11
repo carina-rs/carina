@@ -248,6 +248,34 @@ impl<'a> DslMap<'a> {
         }
     }
 
+    /// Translate a DSL spelling back to its API-canonical spelling.
+    /// Returns the input unchanged when no mapping applies.
+    ///
+    /// Mirror of [`dsl_for`]. Used by providers that have a DSL-spelled
+    /// enum value in hand and need the API-canonical form to feed into
+    /// an SDK builder. Without this, hand-written provider code that
+    /// extracts the trailing segment of a namespaced identifier passes
+    /// the DSL alias (e.g. `"enabled"`) straight to the SDK and the API
+    /// rejects it (e.g. S3 `MalformedXML`).
+    ///
+    /// The [`DslMap::Closure`] variant carries an API→DSL function only;
+    /// the inverse direction is not representable, so this method returns
+    /// the input as-is for that variant. Callers whose value space goes
+    /// through a `Closure` must reverse the mapping themselves.
+    ///
+    /// When two `(api, dsl)` entries share the same `dsl` spelling, the
+    /// first match wins. Codegen is expected to ensure DSL spellings are
+    /// unique within a single enum's alias table.
+    pub fn api_for(&self, dsl: &str) -> String {
+        match self {
+            DslMap::Aliases(map) => map
+                .iter()
+                .find_map(|(a, d)| (d == dsl).then(|| a.clone()))
+                .unwrap_or_else(|| dsl.to_string()),
+            DslMap::Closure(_) => dsl.to_string(),
+        }
+    }
+
     /// True when the mapping carries no DSL-side rewrites.
     pub fn is_empty(&self) -> bool {
         match self {
