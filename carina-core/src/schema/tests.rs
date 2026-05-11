@@ -857,6 +857,45 @@ fn validate_list_of_struct() {
 }
 
 #[test]
+fn validate_list_accepts_resource_ref() {
+    // A `ResourceRef` standing in for a whole list value (e.g.
+    // `resource_records = registry_dev.nameservers` where the upstream
+    // export is typed `list(string)`) must not be rejected by the
+    // schema-level `validate_list`. Type fitness against the upstream's
+    // declared export type is the upstream-aware checker's job; the
+    // schema layer should treat `ResourceRef` the same way it does for
+    // `String`/`Custom`/`Struct` positions — accept and defer. See
+    // issue #2954.
+    let list_type = AttributeType::list(AttributeType::String);
+    let value = Value::resource_ref(
+        "registry_dev".to_string(),
+        "nameservers".to_string(),
+        vec![],
+    );
+    assert!(
+        list_type.validate(&value).is_ok(),
+        "ResourceRef in List position must not produce an error"
+    );
+}
+
+#[test]
+fn validate_map_accepts_resource_ref() {
+    // Same shape as `validate_list_accepts_resource_ref`, on the map
+    // side: a whole-map `ResourceRef` (e.g. `tags = orgs.tag_map`) must
+    // be accepted by the schema-level `validate_map`. The upstream
+    // checker compares declared export type vs. the receiver.
+    let map_type = AttributeType::Map {
+        key: Box::new(AttributeType::String),
+        value: Box::new(AttributeType::String),
+    };
+    let value = Value::resource_ref("orgs".to_string(), "tag_map".to_string(), vec![]);
+    assert!(
+        map_type.validate(&value).is_ok(),
+        "ResourceRef in Map position must not produce an error"
+    );
+}
+
+#[test]
 fn struct_rejects_block_syntax_single_element() {
     // Block syntax produces Value::List([Value::Map(...)]) which should be rejected
     // for bare Struct attributes

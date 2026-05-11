@@ -894,6 +894,18 @@ impl AttributeType {
         let AttributeType::List { inner, .. } = self else {
             unreachable!("validate_list called on non-List");
         };
+        // A whole-list `ResourceRef` (e.g. `resource_records =
+        // upstream.nameservers` against a `list(string)` receiver) is
+        // a placeholder that resolves at apply time. The schema layer
+        // can't see the upstream's declared export type, so type
+        // fitness is checked separately by
+        // `check_upstream_state_field_types` (cross-directory) and
+        // `validate_resource_ref_types` (intra-directory). Accept the
+        // ref here, matching how `validate_primitive` already accepts
+        // a `ResourceRef` at a `String` position. Issue #2954.
+        if matches!(value, Value::ResourceRef { .. }) {
+            return Ok(());
+        }
         // `Value::StringList` is the canonicalized form for fields
         // typed as `Union[String, list(String)]` (see #2510). When
         // validated against a `list(String)` member of that Union, it
@@ -934,6 +946,12 @@ impl AttributeType {
         else {
             unreachable!("validate_map called on non-Map");
         };
+        // Whole-map `ResourceRef` mirrors the list case in
+        // `validate_list` — defer to the upstream-aware checker. See
+        // issue #2954.
+        if matches!(value, Value::ResourceRef { .. }) {
+            return Ok(());
+        }
         let Value::Map(map) = value else {
             return Err(TypeError::TypeMismatch {
                 expected: self.type_name(),
