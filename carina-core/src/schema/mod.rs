@@ -73,6 +73,59 @@ pub fn no_lookup() -> CustomTypeLookup<'static> {
     &|_name, _value| Ok(())
 }
 
+/// If `value` is a bare reference to a `let` binding (no access path,
+/// no attribute selector), return the binding name. Otherwise return
+/// `None`. Used by `AttributeType::validate` to detect the collision
+/// case from #2978: a StringEnum attribute receives a bare identifier
+/// that the parser already resolved as a binding reference rather than
+/// as the enum's DSL alias of the same spelling.
+fn bare_binding_name(value: &Value) -> Option<&str> {
+    match value {
+        Value::Deferred(DeferredValue::BindingRef { binding }) => Some(binding.as_str()),
+        _ => None,
+    }
+}
+
+/// True when `binding` matches a canonical enum value or a DSL alias
+/// of `(values, dsl_aliases)`. Drives the #2978 collision check.
+fn enum_alias_collides_with(
+    binding: &str,
+    values: &[String],
+    dsl_aliases: &[(String, String)],
+) -> bool {
+    if values.iter().any(|v| v == binding) {
+        return true;
+    }
+    dsl_aliases.iter().any(|(_api, dsl)| dsl == binding)
+}
+
+/// Build the user-facing error message for the #2978 collision case.
+fn enum_binding_collision_message(
+    binding: &str,
+    type_name: &str,
+    namespace: Option<&str>,
+    values: &[String],
+    dsl_aliases: &[(String, String)],
+) -> String {
+    // Prefer the DSL spelling if one exists for the colliding API value;
+    // that is the form the user almost certainly meant to write.
+    let dsl_spelling = dsl_aliases
+        .iter()
+        .find(|(_api, dsl)| dsl == binding)
+        .map(|(_api, dsl)| dsl.as_str())
+        .or_else(|| values.iter().find(|v| *v == binding).map(String::as_str))
+        .unwrap_or(binding);
+    let type_qualified = format!("{}.{}", type_name, dsl_spelling);
+    let fully_qualified = match namespace {
+        Some(ns) => format!("{}.{}.{}", ns, type_name, dsl_spelling),
+        None => type_qualified.clone(),
+    };
+    format!(
+        "bare identifier `{binding}` is shadowed by a `let` binding of the same name; \
+         to use the enum value, write `{type_qualified}`, `{fully_qualified}`, or `'{dsl_spelling}'`"
+    )
+}
+
 /// Walk an [`AttributeType`] and apply `lookup` to every `Custom` node
 /// reached. Pushes any returned error into `errors`, tagged with
 /// `attr_name` so it points back at the user-visible attribute. Used
@@ -571,6 +624,33 @@ impl AttributeType {
     /// independently re-projected. Lists may legitimately mix concrete
     /// and deferred elements (e.g. `[vpc.id, "literal"]`).
     pub fn validate(&self, value: &Value) -> Result<(), TypeError> {
+        // StringEnum attributes assigned a bare `BindingRef` are the
+        // shadowing collision case described in #2978: the user wrote a
+        // bare identifier that happens to be a `let` binding *and* is
+        // also a DSL alias for one of this enum's variants. Surface a
+        // pointed error so they can disambiguate (use `TypeName.value`,
+        // fully-qualified, or quoted string). Without this check the
+        // deferred value flows through validation unchecked and only
+        // surfaces later as a `${vpc}`-style error from the resolver.
+        if let AttributeType::StringEnum {
+            name,
+            values,
+            namespace,
+            dsl_aliases,
+        } = self
+            && let Some(binding) = bare_binding_name(value)
+            && enum_alias_collides_with(binding, values, dsl_aliases)
+        {
+            return Err(TypeError::ValidationFailed {
+                message: enum_binding_collision_message(
+                    binding,
+                    name,
+                    namespace.as_deref(),
+                    values,
+                    dsl_aliases,
+                ),
+            });
+        }
         let Some(concrete) = value.as_concrete() else {
             return Ok(());
         };
