@@ -12,7 +12,7 @@ use crate::parser::{
     ParseContext, ParseError, Rule, eval_type_name, evaluate_user_function, is_static_eval,
     is_static_value, next_pair, parse_expression,
 };
-use crate::resource::Value;
+use crate::resource::{DeferredValue, Value};
 
 pub(crate) fn parse_coalesce_expr(
     pair: pest::iterators::Pair<Rule>,
@@ -26,7 +26,7 @@ pub(crate) fn parse_coalesce_expr(
     if let Some(rhs_pair) = inner.next() {
         let default = parse_pipe_expr(rhs_pair, ctx)?;
         match &value {
-            EvalValue::User(Value::ResourceRef { .. }) => Ok(default),
+            EvalValue::User(Value::Deferred(DeferredValue::ResourceRef { .. })) => Ok(default),
             _ => Ok(value),
         }
     } else {
@@ -179,16 +179,16 @@ pub(crate) fn parse_pipe_expr(
                     message: format!("{}(): {}", func_name, e),
                 })?;
             } else {
-                value = EvalValue::from_value(Value::FunctionCall {
+                value = EvalValue::from_value(Value::Deferred(DeferredValue::FunctionCall {
                     name: func_name,
                     args,
-                });
+                }));
             }
         } else {
-            value = EvalValue::from_value(Value::FunctionCall {
+            value = EvalValue::from_value(Value::Deferred(DeferredValue::FunctionCall {
                 name: func_name,
                 args,
-            });
+            }));
         }
     }
 

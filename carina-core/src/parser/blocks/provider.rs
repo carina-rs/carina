@@ -9,7 +9,7 @@ use crate::parser::context::{ParseContext, next_pair};
 use crate::parser::error::ParseError;
 use crate::parser::expressions::validate_expr::parse_validate_expr;
 use crate::parser::parse_expression;
-use crate::resource::Value;
+use crate::resource::{ConcreteValue, Value};
 use crate::version_constraint::VersionConstraint;
 use indexmap::IndexMap;
 
@@ -44,7 +44,7 @@ pub(in crate::parser) fn parse_provider_block(
     // fall through to an empty map (#2717).
     let mut unresolved_attributes: IndexMap<String, Value> = IndexMap::new();
     let default_tags = match attributes.shift_remove("default_tags") {
-        Some(Value::Map(tags)) => tags,
+        Some(Value::Concrete(ConcreteValue::Map(tags))) => tags,
         Some(other) => {
             unresolved_attributes.insert("default_tags".to_string(), other);
             IndexMap::new()
@@ -53,14 +53,18 @@ pub(in crate::parser) fn parse_provider_block(
     };
 
     // Extract source from attributes if present
-    let source = if let Some(Value::String(s)) = attributes.shift_remove("source") {
+    let source = if let Some(Value::Concrete(ConcreteValue::String(s))) =
+        attributes.shift_remove("source")
+    {
         Some(s)
     } else {
         None
     };
 
     // Extract version from attributes if present
-    let version = if let Some(Value::String(v)) = attributes.shift_remove("version") {
+    let version = if let Some(Value::Concrete(ConcreteValue::String(v))) =
+        attributes.shift_remove("version")
+    {
         Some(VersionConstraint::parse(&v).map_err(|e| {
             pest::error::Error::new_from_pos(
                 pest::error::ErrorVariant::CustomError { message: e },
@@ -72,7 +76,9 @@ pub(in crate::parser) fn parse_provider_block(
     };
 
     // Extract revision from attributes if present
-    let revision = if let Some(Value::String(r)) = attributes.shift_remove("revision") {
+    let revision = if let Some(Value::Concrete(ConcreteValue::String(r))) =
+        attributes.shift_remove("revision")
+    {
         Some(r)
     } else {
         None

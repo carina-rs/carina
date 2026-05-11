@@ -10,7 +10,7 @@ use ratatui::backend::TestBackend;
 
 use carina_core::effect::Effect;
 use carina_core::plan::Plan;
-use carina_core::resource::{Directives, Resource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, Directives, Resource, ResourceId, State, Value};
 use carina_core::schema::SchemaRegistry;
 
 use crate::app::App;
@@ -48,7 +48,10 @@ fn build_all_create_plan() -> Plan {
     plan.add(Effect::Create(
         Resource::new("ec2.Vpc", "my-vpc")
             .with_binding("vpc")
-            .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string())),
+            .with_attribute(
+                "cidr_block",
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            ),
     ));
     plan.add(Effect::Create(
         Resource::new("ec2.RouteTable", "my-rt")
@@ -61,7 +64,10 @@ fn build_all_create_plan() -> Plan {
     plan.add(Effect::Create(
         Resource::new("ec2.Subnet", "my-subnet")
             .with_binding("subnet")
-            .with_attribute("cidr_block", Value::String("10.0.1.0/24".to_string()))
+            .with_attribute(
+                "cidr_block",
+                Value::Concrete(ConcreteValue::String("10.0.1.0/24".to_string())),
+            )
             .with_attribute(
                 "vpc_id",
                 Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
@@ -80,17 +86,26 @@ fn build_mixed_operations_plan() -> Plan {
             [
                 (
                     "cidr_block".to_string(),
-                    Value::String("10.0.0.0/16".to_string()),
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
                 ),
-                ("_binding".to_string(), Value::String("vpc".to_string())),
+                (
+                    "_binding".to_string(),
+                    Value::Concrete(ConcreteValue::String("vpc".to_string())),
+                ),
             ]
             .into_iter()
             .collect(),
         )),
         to: Resource::new("ec2.Vpc", "my-vpc")
             .with_binding("vpc")
-            .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()))
-            .with_attribute("enable_dns_support", Value::Bool(true)),
+            .with_attribute(
+                "cidr_block",
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            )
+            .with_attribute(
+                "enable_dns_support",
+                Value::Concrete(ConcreteValue::Bool(true)),
+            ),
         changed_attributes: vec!["enable_dns_support".to_string()],
     });
     plan.add(Effect::Create(
@@ -98,7 +113,7 @@ fn build_mixed_operations_plan() -> Plan {
             .with_binding("sg")
             .with_attribute(
                 "group_description",
-                Value::String("Web security group".to_string()),
+                Value::Concrete(ConcreteValue::String("Web security group".to_string())),
             )
             .with_attribute(
                 "vpc_id",
@@ -121,23 +136,35 @@ fn build_map_key_diff_plan() -> Plan {
     let mut plan = Plan::new();
 
     let old_tags: indexmap::IndexMap<String, Value> = [
-        ("Name".to_string(), Value::String("my-vpc".to_string())),
+        (
+            "Name".to_string(),
+            Value::Concrete(ConcreteValue::String("my-vpc".to_string())),
+        ),
         (
             "Environment".to_string(),
-            Value::String("staging".to_string()),
+            Value::Concrete(ConcreteValue::String("staging".to_string())),
         ),
-        ("OldTag".to_string(), Value::String("to-remove".to_string())),
+        (
+            "OldTag".to_string(),
+            Value::Concrete(ConcreteValue::String("to-remove".to_string())),
+        ),
     ]
     .into_iter()
     .collect();
 
     let new_tags: indexmap::IndexMap<String, Value> = [
-        ("Name".to_string(), Value::String("my-vpc".to_string())),
+        (
+            "Name".to_string(),
+            Value::Concrete(ConcreteValue::String("my-vpc".to_string())),
+        ),
         (
             "Environment".to_string(),
-            Value::String("production".to_string()),
+            Value::Concrete(ConcreteValue::String("production".to_string())),
         ),
-        ("NewTag".to_string(), Value::String("added".to_string())),
+        (
+            "NewTag".to_string(),
+            Value::Concrete(ConcreteValue::String("added".to_string())),
+        ),
     ]
     .into_iter()
     .collect();
@@ -147,20 +174,29 @@ fn build_map_key_diff_plan() -> Plan {
         from: Box::new(State::existing(
             ResourceId::new("ec2.Vpc", "my-vpc"),
             [
-                ("_binding".to_string(), Value::String("vpc".to_string())),
+                (
+                    "_binding".to_string(),
+                    Value::Concrete(ConcreteValue::String("vpc".to_string())),
+                ),
                 (
                     "cidr_block".to_string(),
-                    Value::String("10.0.0.0/16".to_string()),
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
                 ),
-                ("tags".to_string(), Value::Map(old_tags)),
+                (
+                    "tags".to_string(),
+                    Value::Concrete(ConcreteValue::Map(old_tags)),
+                ),
             ]
             .into_iter()
             .collect(),
         )),
         to: Resource::new("ec2.Vpc", "my-vpc")
             .with_binding("vpc")
-            .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()))
-            .with_attribute("tags", Value::Map(new_tags)),
+            .with_attribute(
+                "cidr_block",
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            )
+            .with_attribute("tags", Value::Concrete(ConcreteValue::Map(new_tags))),
         changed_attributes: vec!["tags".to_string()],
     });
     plan
@@ -201,7 +237,10 @@ fn snapshot_create_with_schema() {
     plan.add(Effect::Create(
         Resource::new("ec2.Vpc", "my-vpc")
             .with_binding("vpc")
-            .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string())),
+            .with_attribute(
+                "cidr_block",
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            ),
     ));
 
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
@@ -210,11 +249,11 @@ fn snapshot_create_with_schema() {
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String).required())
         .attribute(
             AttributeSchema::new("enable_dns_support", AttributeType::Bool)
-                .with_default(Value::Bool(true)),
+                .with_default(Value::Concrete(ConcreteValue::Bool(true))),
         )
         .attribute(
             AttributeSchema::new("enable_dns_hostnames", AttributeType::Bool)
-                .with_default(Value::Bool(false)),
+                .with_default(Value::Concrete(ConcreteValue::Bool(false))),
         )
         .attribute(AttributeSchema::new("vpc_id", AttributeType::String).read_only())
         .attribute(
@@ -312,29 +351,41 @@ fn build_moved_with_changes_plan() -> Plan {
             [
                 (
                     "cidr_block".to_string(),
-                    Value::String("10.0.0.0/16".to_string()),
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
                 ),
-                ("_binding".to_string(), Value::String("new_vpc".to_string())),
+                (
+                    "_binding".to_string(),
+                    Value::Concrete(ConcreteValue::String("new_vpc".to_string())),
+                ),
             ]
             .into_iter()
             .collect(),
         )),
         to: Resource::new("ec2.Vpc", "new_vpc")
             .with_binding("new_vpc")
-            .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()))
+            .with_attribute(
+                "cidr_block",
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            )
             .with_attribute(
                 "tags",
-                Value::Map(
-                    [("Name".to_string(), Value::String("updated".to_string()))]
-                        .into_iter()
-                        .collect(),
-                ),
+                Value::Concrete(ConcreteValue::Map(
+                    [(
+                        "Name".to_string(),
+                        Value::Concrete(ConcreteValue::String("updated".to_string())),
+                    )]
+                    .into_iter()
+                    .collect(),
+                )),
             ),
         changed_attributes: vec!["tags".to_string()],
     });
     plan.add(Effect::Create(
         Resource::new("ec2.Subnet", "my-subnet")
-            .with_attribute("cidr_block", Value::String("10.0.1.0/24".to_string()))
+            .with_attribute(
+                "cidr_block",
+                Value::Concrete(ConcreteValue::String("10.0.1.0/24".to_string())),
+            )
             .with_attribute(
                 "vpc_id",
                 Value::resource_ref("new_vpc".to_string(), "vpc_id".to_string(), vec![]),

@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::parser::ProviderConfig;
-use crate::resource::{Resource, ResourceId, Value};
+use crate::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, Value};
 use crate::schema::SchemaRegistry;
 use crate::validation::is_string_compatible_type;
 
@@ -44,7 +44,7 @@ pub fn resolve_attr_prefixes(
             .iter()
             .filter_map(|(key, value)| {
                 if let Some(base_attr) = key.strip_suffix("_prefix")
-                    && let Value::String(prefix_value) = value
+                    && let Value::Concrete(ConcreteValue::String(prefix_value)) = value
                     && let Some(attr_schema) = schema.attributes.get(base_attr)
                     && is_string_compatible_type(&attr_schema.attr_type)
                 {
@@ -84,7 +84,10 @@ pub fn resolve_attr_prefixes(
 
             // Generate temporary name
             let generated_name = format!("{}{}", prefix_value, generate_random_suffix());
-            resource.set_attr(base_attr, Value::String(generated_name));
+            resource.set_attr(
+                base_attr,
+                Value::Concrete(ConcreteValue::String(generated_name)),
+            );
         }
     }
 
@@ -135,10 +138,12 @@ pub fn reconcile_prefixed_names(
                 if let Some(state_prefix) = state_info.prefixes.get(attr_name)
                     && state_prefix == prefix
                 {
-                    state_info
-                        .attribute_values
-                        .get(attr_name)
-                        .map(|name_str| (attr_name.clone(), Value::String(name_str.clone())))
+                    state_info.attribute_values.get(attr_name).map(|name_str| {
+                        (
+                            attr_name.clone(),
+                            Value::Concrete(ConcreteValue::String(name_str.clone())),
+                        )
+                    })
                 } else {
                     None
                 }
@@ -156,20 +161,20 @@ pub fn reconcile_prefixed_names(
 /// so the output is consistent across runs (HashMap iteration order is random).
 fn deterministic_value_string(value: &Value) -> String {
     match value {
-        Value::String(s) => format!("String({:?})", s),
-        Value::Int(i) => format!("Int({})", i),
-        Value::Float(f) => format!("Float({})", f),
-        Value::Bool(b) => format!("Bool({})", b),
-        Value::Duration(d) => format!("Duration({})", d.as_secs()),
-        Value::List(items) => {
+        Value::Concrete(ConcreteValue::String(s)) => format!("String({:?})", s),
+        Value::Concrete(ConcreteValue::Int(i)) => format!("Int({})", i),
+        Value::Concrete(ConcreteValue::Float(f)) => format!("Float({})", f),
+        Value::Concrete(ConcreteValue::Bool(b)) => format!("Bool({})", b),
+        Value::Concrete(ConcreteValue::Duration(d)) => format!("Duration({})", d.as_secs()),
+        Value::Concrete(ConcreteValue::List(items)) => {
             let parts: Vec<String> = items.iter().map(deterministic_value_string).collect();
             format!("List([{}])", parts.join(", "))
         }
-        Value::StringList(items) => {
+        Value::Concrete(ConcreteValue::StringList(items)) => {
             let parts: Vec<String> = items.iter().map(|s| format!("{:?}", s)).collect();
             format!("StringList([{}])", parts.join(", "))
         }
-        Value::Map(map) => {
+        Value::Concrete(ConcreteValue::Map(map)) => {
             let mut entries: Vec<(&String, &Value)> = map.iter().collect();
             entries.sort_by_key(|(k, _)| *k);
             let parts: Vec<String> = entries
@@ -178,13 +183,13 @@ fn deterministic_value_string(value: &Value) -> String {
                 .collect();
             format!("Map({{{}}})", parts.join(", "))
         }
-        Value::ResourceRef { path } => {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
             format!("ResourceRef({})", path.to_dot_string())
         }
-        Value::BindingRef { binding } => {
+        Value::Deferred(DeferredValue::BindingRef { binding }) => {
             format!("BindingRef({})", binding)
         }
-        Value::Interpolation(parts) => {
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
             use crate::resource::InterpolationPart;
             let strs: Vec<String> = parts
                 .iter()
@@ -197,14 +202,14 @@ fn deterministic_value_string(value: &Value) -> String {
                 .collect();
             format!("Interpolation([{}])", strs.join(", "))
         }
-        Value::FunctionCall { name, args } => {
+        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
             let arg_strs: Vec<String> = args.iter().map(deterministic_value_string).collect();
             format!("FunctionCall({}({}))", name, arg_strs.join(", "))
         }
-        Value::Secret(inner) => {
+        Value::Deferred(DeferredValue::Secret(inner)) => {
             format!("Secret({})", deterministic_value_string(inner))
         }
-        Value::Unknown(reason) => {
+        Value::Deferred(DeferredValue::Unknown(reason)) => {
             use crate::resource::UnknownReason;
             match reason {
                 UnknownReason::UpstreamRef { path } => {
@@ -271,13 +276,13 @@ pub(crate) fn flatten_value_for_simhash(
     out: &mut std::collections::BTreeMap<String, String>,
 ) {
     match value {
-        Value::Map(map) => {
+        Value::Concrete(ConcreteValue::Map(map)) => {
             for (k, v) in map {
                 let key = format!("{}.{}", prefix, k);
                 flatten_value_for_simhash(&key, v, out);
             }
         }
-        Value::List(items) => {
+        Value::Concrete(ConcreteValue::List(items)) => {
             for (i, item) in items.iter().enumerate() {
                 let key = format!("{}[{}]", prefix, i);
                 flatten_value_for_simhash(&key, item, out);
@@ -597,7 +602,7 @@ pub fn reconcile_anonymous_identifiers(
         // Collect this resource's create-only values
         let mut resource_co_values: HashMap<&str, String> = HashMap::new();
         for attr_name in &create_only_attrs {
-            if let Some(Value::String(v)) = resource.get_attr(attr_name) {
+            if let Some(Value::Concrete(ConcreteValue::String(v))) = resource.get_attr(attr_name) {
                 resource_co_values.insert(attr_name, v.clone());
             }
         }
@@ -759,7 +764,7 @@ pub fn detect_anonymous_to_named_renames(
         let create_only_attrs = schema.create_only_attributes();
         let mut resource_co_values: HashMap<&str, String> = HashMap::new();
         for attr_name in &create_only_attrs {
-            if let Some(Value::String(v)) = resource.get_attr(attr_name) {
+            if let Some(Value::Concrete(ConcreteValue::String(v))) = resource.get_attr(attr_name) {
                 resource_co_values.insert(attr_name, v.clone());
             }
         }

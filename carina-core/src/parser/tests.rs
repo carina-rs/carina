@@ -1,5 +1,5 @@
 use super::*;
-use crate::resource::{InterpolationPart, Resource, Value};
+use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Resource, Value};
 use indexmap::IndexMap;
 use std::collections::HashMap;
 
@@ -27,7 +27,8 @@ fn parse_and_resolve_returns_value_only_no_closure() {
     // test is that the type contract holds: whatever shape this
     // is, downstream code does not have to consider closures.
     match joined {
-        Value::String(_) | Value::FunctionCall { .. } => {}
+        Value::Concrete(ConcreteValue::String(_))
+        | Value::Deferred(DeferredValue::FunctionCall { .. }) => {}
         other => panic!("unexpected variant for `joined`: {other:?}"),
     }
 }
@@ -72,7 +73,9 @@ fn iter_all_resources_yields_direct_then_deferred() {
     assert!(matches!(items[0].0, ResourceContext::Direct));
     assert_eq!(
         items[0].1.get_attr("name"),
-        Some(&Value::String("direct".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "direct".to_string()
+        )))
     );
 
     assert!(matches!(items[1].0, ResourceContext::Deferred(_)));
@@ -108,11 +111,15 @@ fn parse_resource_with_namespaced_type() {
     assert_eq!(resource.id.name_str(), "my_bucket"); // binding name becomes the resource ID
     assert_eq!(
         resource.get_attr("name"),
-        Some(&Value::String("my-bucket".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "my-bucket".to_string()
+        )))
     );
     assert_eq!(
         resource.get_attr("region"),
-        Some(&Value::String("aws.Region.ap_northeast_1".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "aws.Region.ap_northeast_1".to_string()
+        )))
     );
 }
 
@@ -149,7 +156,9 @@ fn parse_variable_and_resource() {
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("region"),
-        Some(&Value::String("aws.Region.ap_northeast_1".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "aws.Region.ap_northeast_1".to_string()
+        )))
     );
 }
 
@@ -183,11 +192,11 @@ fn parse_full_example() {
     assert_eq!(result.resources.len(), 2);
     assert_eq!(
         result.resources[0].get_attr("versioning"),
-        Some(&Value::Bool(true))
+        Some(&Value::Concrete(ConcreteValue::Bool(true)))
     );
     assert_eq!(
         result.resources[0].get_attr("expiration_days"),
-        Some(&Value::Int(90))
+        Some(&Value::Concrete(ConcreteValue::Int(90)))
     );
 }
 
@@ -203,10 +212,12 @@ fn function_call_is_parsed() {
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("name"),
-        Some(&Value::FunctionCall {
+        Some(&Value::Deferred(DeferredValue::FunctionCall {
             name: "env".to_string(),
-            args: vec![Value::String("SOME_VAR".to_string())],
-        })
+            args: vec![Value::Concrete(ConcreteValue::String(
+                "SOME_VAR".to_string()
+            ))],
+        }))
     );
 }
 
@@ -329,18 +340,22 @@ fn parse_and_resolve_resource_reference() {
     let policy = &result.resources[1];
     assert_eq!(
         policy.get_attr("bucket"),
-        Some(&Value::String("my-bucket".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "my-bucket".to_string()
+        )))
     );
     assert_eq!(
         policy.get_attr("bucket_region"),
-        Some(&Value::String("aws.Region.ap_northeast_1".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "aws.Region.ap_northeast_1".to_string()
+        )))
     );
 }
 
 #[test]
 fn parse_undefined_two_part_identifier_becomes_resource_ref() {
     // A 2-part dotted identifier whose head is not a known binding in
-    // this file lowers to `Value::ResourceRef`, not a literal string.
+    // this file lowers to `Value::Deferred(DeferredValue::ResourceRef)`, not a literal string.
     // Two reasons:
     //   - the head may legitimately live in a sibling `.crn` (the
     //     directory-scoped, multi-file shape), and
@@ -359,7 +374,7 @@ fn parse_undefined_two_part_identifier_becomes_resource_ref() {
     assert!(result.is_ok());
     let parsed = result.unwrap();
     match parsed.resources[0].get_attr("bucket") {
-        Some(Value::ResourceRef { path }) => {
+        Some(Value::Deferred(DeferredValue::ResourceRef { path })) => {
             assert_eq!(path.binding(), "nonexistent");
             assert_eq!(path.attribute(), "name");
             assert!(path.field_path().is_empty());
@@ -395,7 +410,9 @@ fn parse_bare_identifier_becomes_string() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.resources[0].get_attr("instance_tenancy"),
-        Some(&Value::String("dedicated".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "dedicated".to_string()
+        )))
     );
 }
 
@@ -412,7 +429,9 @@ fn resource_reference_preserves_namespaced_id() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.resources[0].get_attr("region"),
-        Some(&Value::String("aws.Region.ap_northeast_1".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "aws.Region.ap_northeast_1".to_string()
+        )))
     );
 }
 
@@ -429,9 +448,9 @@ fn namespaced_id_with_digit_segment() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.resources[0].get_attr("type"),
-        Some(&Value::String(
+        Some(&Value::Concrete(ConcreteValue::String(
             "awscc.ec2.vpn_gateway.Type.ipsec.1".to_string()
-        ))
+        )))
     );
 }
 
@@ -475,16 +494,19 @@ fn parse_nested_blocks_terraform_style() {
 
     // Check ingress is a list with 2 items
     let ingress = sg.get_attr("ingress").unwrap();
-    if let Value::List(items) = ingress {
+    if let Value::Concrete(ConcreteValue::List(items)) = ingress {
         assert_eq!(items.len(), 2);
 
         // Check first ingress rule
-        if let Value::Map(rule) = &items[0] {
+        if let Value::Concrete(ConcreteValue::Map(rule)) = &items[0] {
             assert_eq!(
                 rule.get("protocol"),
-                Some(&Value::String("tcp".to_string()))
+                Some(&Value::Concrete(ConcreteValue::String("tcp".to_string())))
             );
-            assert_eq!(rule.get("from_port"), Some(&Value::Int(80)));
+            assert_eq!(
+                rule.get("from_port"),
+                Some(&Value::Concrete(ConcreteValue::Int(80)))
+            );
         } else {
             panic!("Expected map for ingress rule");
         }
@@ -494,7 +516,7 @@ fn parse_nested_blocks_terraform_style() {
 
     // Check egress is a list with 1 item
     let egress = sg.get_attr("egress").unwrap();
-    if let Value::List(items) = egress {
+    if let Value::Concrete(ConcreteValue::List(items)) = egress {
         assert_eq!(items.len(), 1);
     } else {
         panic!("Expected list for egress");
@@ -520,17 +542,21 @@ fn parse_list_syntax() {
 
     let rt = &result.resources[0];
     let routes = rt.get_attr("routes").unwrap();
-    if let Value::List(items) = routes {
+    if let Value::Concrete(ConcreteValue::List(items)) = routes {
         assert_eq!(items.len(), 2);
 
-        if let Value::Map(route) = &items[0] {
+        if let Value::Concrete(ConcreteValue::Map(route)) = &items[0] {
             assert_eq!(
                 route.get("destination"),
-                Some(&Value::String("0.0.0.0/0".to_string()))
+                Some(&Value::Concrete(ConcreteValue::String(
+                    "0.0.0.0/0".to_string()
+                )))
             );
             assert_eq!(
                 route.get("gateway"),
-                Some(&Value::String("my-igw".to_string()))
+                Some(&Value::Concrete(ConcreteValue::String(
+                    "my-igw".to_string()
+                )))
             );
         } else {
             panic!("Expected map for route");
@@ -568,7 +594,10 @@ fn parse_directory_module() {
 
     assert_eq!(result.arguments[1].name, "enable_https");
     assert_eq!(result.arguments[1].type_expr, TypeExpr::Bool);
-    assert_eq!(result.arguments[1].default, Some(Value::Bool(true)));
+    assert_eq!(
+        result.arguments[1].default,
+        Some(Value::Concrete(ConcreteValue::Bool(true)))
+    );
 
     // Check attribute params
     assert_eq!(result.attribute_params.len(), 1);
@@ -580,9 +609,9 @@ fn parse_directory_module() {
     let sg = &result.resources[0];
     assert_eq!(
         sg.get_attr("vpc_id"),
-        Some(&Value::BindingRef {
+        Some(&Value::Deferred(DeferredValue::BindingRef {
             binding: "vpc_id".to_string(),
-        })
+        }))
     );
 }
 
@@ -1018,7 +1047,7 @@ fn parse_float_literal() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.resources[0].get_attr("weight"),
-        Some(&Value::Float(2.5))
+        Some(&Value::Concrete(ConcreteValue::Float(2.5)))
     );
 }
 
@@ -1034,7 +1063,7 @@ fn parse_negative_float_literal() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.resources[0].get_attr("offset"),
-        Some(&Value::Float(-0.5))
+        Some(&Value::Concrete(ConcreteValue::Float(-0.5)))
     );
 }
 
@@ -1083,20 +1112,29 @@ fn parse_backend_block() {
     assert_eq!(backend.backend_type, "s3");
     assert_eq!(
         backend.attributes.get("bucket"),
-        Some(&Value::String("my-carina-state".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "my-carina-state".to_string()
+        )))
     );
     assert_eq!(
         backend.attributes.get("key"),
-        Some(&Value::String("infra/prod/carina.crnstate".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "infra/prod/carina.crnstate".to_string()
+        )))
     );
     assert_eq!(
         backend.attributes.get("region"),
-        Some(&Value::String("aws.Region.ap_northeast_1".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "aws.Region.ap_northeast_1".to_string()
+        )))
     );
-    assert_eq!(backend.attributes.get("encrypt"), Some(&Value::Bool(true)));
+    assert_eq!(
+        backend.attributes.get("encrypt"),
+        Some(&Value::Concrete(ConcreteValue::Bool(true)))
+    );
     assert_eq!(
         backend.attributes.get("auto_create"),
-        Some(&Value::Bool(true))
+        Some(&Value::Concrete(ConcreteValue::Bool(true)))
     );
 
     // Check provider
@@ -1135,7 +1173,9 @@ fn parse_backend_block_with_resources() {
     assert_eq!(backend.backend_type, "s3");
     assert_eq!(
         backend.attributes.get("bucket"),
-        Some(&Value::String("my-state".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "my-state".to_string()
+        )))
     );
 
     assert_eq!(result.providers.len(), 1);
@@ -1377,23 +1417,27 @@ fn parse_block_syntax_inside_map() {
 
     let role = &result.resources[0];
     let doc = role.get_attr("assume_role_policy_document").unwrap();
-    if let Value::Map(map) = doc {
+    if let Value::Concrete(ConcreteValue::Map(map)) = doc {
         assert_eq!(
             map.get("version"),
-            Some(&Value::String("2012-10-17".to_string()))
+            Some(&Value::Concrete(ConcreteValue::String(
+                "2012-10-17".to_string()
+            )))
         );
         // statement block becomes a list with one element
         let statement = map.get("statement").unwrap();
-        if let Value::List(stmts) = statement {
+        if let Value::Concrete(ConcreteValue::List(stmts)) = statement {
             assert_eq!(stmts.len(), 1);
-            if let Value::Map(stmt) = &stmts[0] {
+            if let Value::Concrete(ConcreteValue::Map(stmt)) = &stmts[0] {
                 assert_eq!(
                     stmt.get("effect"),
-                    Some(&Value::String("Allow".to_string()))
+                    Some(&Value::Concrete(ConcreteValue::String("Allow".to_string())))
                 );
                 assert_eq!(
                     stmt.get("action"),
-                    Some(&Value::String("sts:AssumeRole".to_string()))
+                    Some(&Value::Concrete(ConcreteValue::String(
+                        "sts:AssumeRole".to_string()
+                    )))
                 );
             } else {
                 panic!("Expected map for statement");
@@ -1427,9 +1471,9 @@ fn parse_multiple_blocks_inside_map() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     let role = &result.resources[0];
     let doc = role.get_attr("policy_document").unwrap();
-    if let Value::Map(map) = doc {
+    if let Value::Concrete(ConcreteValue::Map(map)) = doc {
         let statement = map.get("statement").unwrap();
-        if let Value::List(stmts) = statement {
+        if let Value::Concrete(ConcreteValue::List(stmts)) = statement {
             assert_eq!(stmts.len(), 2);
         } else {
             panic!("Expected list for statement");
@@ -1460,9 +1504,9 @@ fn parse_list_syntax_inside_map_still_works() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     let role = &result.resources[0];
     let doc = role.get_attr("assume_role_policy_document").unwrap();
-    if let Value::Map(map) = doc {
+    if let Value::Concrete(ConcreteValue::Map(map)) = doc {
         let statement = map.get("statement").unwrap();
-        if let Value::List(stmts) = statement {
+        if let Value::Concrete(ConcreteValue::List(stmts)) = statement {
             assert_eq!(stmts.len(), 1);
         } else {
             panic!("Expected list for statement");
@@ -1489,16 +1533,16 @@ fn parse_deeply_nested_blocks() {
     let r = &result.resources[0];
 
     let outer = r.get_attr("outer").unwrap();
-    if let Value::List(outer_items) = outer {
+    if let Value::Concrete(ConcreteValue::List(outer_items)) = outer {
         assert_eq!(outer_items.len(), 1);
-        if let Value::Map(outer_map) = &outer_items[0] {
+        if let Value::Concrete(ConcreteValue::Map(outer_map)) = &outer_items[0] {
             let inner = outer_map.get("inner").unwrap();
-            if let Value::List(inner_items) = inner {
+            if let Value::Concrete(ConcreteValue::List(inner_items)) = inner {
                 assert_eq!(inner_items.len(), 1);
-                if let Value::Map(inner_map) = &inner_items[0] {
+                if let Value::Concrete(ConcreteValue::Map(inner_map)) = &inner_items[0] {
                     assert_eq!(
                         inner_map.get("leaf"),
-                        Some(&Value::String("value".to_string()))
+                        Some(&Value::Concrete(ConcreteValue::String("value".to_string())))
                     );
                 } else {
                     panic!("Expected map for inner block");
@@ -1532,12 +1576,15 @@ fn parse_nested_block_in_map() {
     let role = &result.resources[0];
 
     let doc = role.get_attr("policy_document").unwrap();
-    if let Value::Map(map) = doc {
+    if let Value::Concrete(ConcreteValue::Map(map)) = doc {
         let statement = map.get("statement").unwrap();
-        if let Value::List(items) = statement {
+        if let Value::Concrete(ConcreteValue::List(items)) = statement {
             assert_eq!(items.len(), 1);
-            if let Value::Map(s) = &items[0] {
-                assert_eq!(s.get("effect"), Some(&Value::String("Allow".to_string())));
+            if let Value::Concrete(ConcreteValue::Map(s)) = &items[0] {
+                assert_eq!(
+                    s.get("effect"),
+                    Some(&Value::Concrete(ConcreteValue::String("Allow".to_string())))
+                );
             } else {
                 panic!("Expected map for statement");
             }
@@ -1614,10 +1661,10 @@ fn pipe_operator_desugars_to_function_call() {
     // "hello" |> upper() desugars to upper("hello")
     assert_eq!(
         result.variables.get("x"),
-        Some(&Value::FunctionCall {
+        Some(&Value::Deferred(DeferredValue::FunctionCall {
             name: "upper".to_string(),
-            args: vec![Value::String("hello".to_string())],
-        })
+            args: vec![Value::Concrete(ConcreteValue::String("hello".to_string()))],
+        }))
     );
 }
 
@@ -1632,10 +1679,10 @@ fn pipe_operator_in_attribute_desugars() {
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("name"),
-        Some(&Value::FunctionCall {
+        Some(&Value::Deferred(DeferredValue::FunctionCall {
             name: "lower".to_string(),
-            args: vec![Value::String("test".to_string())],
-        })
+            args: vec![Value::Concrete(ConcreteValue::String("test".to_string()))],
+        }))
     );
 }
 
@@ -1651,17 +1698,17 @@ fn join_function_call_parsed() {
     // At parse time, function calls remain as FunctionCall values
     assert_eq!(
         result.resources[0].get_attr("name"),
-        Some(&Value::FunctionCall {
+        Some(&Value::Deferred(DeferredValue::FunctionCall {
             name: "join".to_string(),
             args: vec![
-                Value::String("-".to_string()),
-                Value::List(vec![
-                    Value::String("a".to_string()),
-                    Value::String("b".to_string()),
-                    Value::String("c".to_string()),
-                ]),
+                Value::Concrete(ConcreteValue::String("-".to_string())),
+                Value::Concrete(ConcreteValue::List(vec![
+                    Value::Concrete(ConcreteValue::String("a".to_string())),
+                    Value::Concrete(ConcreteValue::String("b".to_string())),
+                    Value::Concrete(ConcreteValue::String("c".to_string())),
+                ])),
             ],
-        })
+        }))
     );
 }
 
@@ -1677,17 +1724,17 @@ fn pipe_with_join_parsed() {
     // ["a", "b", "c"] |> join("-") desugars to join("-", ["a", "b", "c"])
     assert_eq!(
         result.resources[0].get_attr("name"),
-        Some(&Value::FunctionCall {
+        Some(&Value::Deferred(DeferredValue::FunctionCall {
             name: "join".to_string(),
             args: vec![
-                Value::String("-".to_string()),
-                Value::List(vec![
-                    Value::String("a".to_string()),
-                    Value::String("b".to_string()),
-                    Value::String("c".to_string()),
-                ]),
+                Value::Concrete(ConcreteValue::String("-".to_string())),
+                Value::Concrete(ConcreteValue::List(vec![
+                    Value::Concrete(ConcreteValue::String("a".to_string())),
+                    Value::Concrete(ConcreteValue::String("b".to_string())),
+                    Value::Concrete(ConcreteValue::String("c".to_string())),
+                ])),
             ],
-        })
+        }))
     );
 }
 
@@ -1702,19 +1749,19 @@ fn join_with_multiple_pipes() {
     // => upper(join("-", ["a", "b"]))
     assert_eq!(
         result.variables.get("x"),
-        Some(&Value::FunctionCall {
+        Some(&Value::Deferred(DeferredValue::FunctionCall {
             name: "upper".to_string(),
-            args: vec![Value::FunctionCall {
+            args: vec![Value::Deferred(DeferredValue::FunctionCall {
                 name: "join".to_string(),
                 args: vec![
-                    Value::String("-".to_string()),
-                    Value::List(vec![
+                    Value::Concrete(ConcreteValue::String("-".to_string())),
+                    Value::Concrete(ConcreteValue::List(vec![
                         Value::String("a".to_string()),
                         Value::String("b".to_string()),
-                    ]),
+                    ])),
                 ],
-            }],
-        })
+            })],
+        }))
     );
 }
 
@@ -1726,10 +1773,10 @@ fn function_call_with_no_args() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.variables.get("x"),
-        Some(&Value::FunctionCall {
+        Some(&Value::Deferred(DeferredValue::FunctionCall {
             name: "foo".to_string(),
             args: vec![],
-        })
+        }))
     );
 }
 
@@ -1744,7 +1791,9 @@ fn join_resolved_during_resource_ref_resolution() {
     resolve_resource_refs(&mut result).unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
-        Some(&Value::String("my-bucket-name".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "my-bucket-name".to_string()
+        )))
     );
 }
 
@@ -1759,7 +1808,9 @@ fn pipe_join_resolved_during_resource_ref_resolution() {
     resolve_resource_refs(&mut result).unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
-        Some(&Value::String("my-bucket".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "my-bucket".to_string()
+        )))
     );
 }
 
@@ -1792,7 +1843,7 @@ fn partial_application_join_with_pipe() {
     resolve_resource_refs(&mut result).unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
-        Some(&Value::String("a,b".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String("a,b".to_string())))
     );
 }
 
@@ -1806,7 +1857,7 @@ fn partial_application_closure_direct_call() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.variables.get("x"),
-        Some(&Value::String("a,b".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String("a,b".to_string())))
     );
 }
 
@@ -1822,7 +1873,7 @@ fn partial_application_chained_pipes() {
     resolve_resource_refs(&mut result).unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
-        Some(&Value::String("A,B".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String("A,B".to_string())))
     );
 }
 
@@ -1836,7 +1887,7 @@ fn partial_application_closure_pipe() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.variables.get("x"),
-        Some(&Value::String("a,b".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String("a,b".to_string())))
     );
 }
 
@@ -1861,7 +1912,9 @@ fn partial_application_replace() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.variables.get("x"),
-        Some(&Value::String("hello_world".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "hello_world".to_string()
+        )))
     );
 }
 
@@ -1877,7 +1930,9 @@ fn partial_application_in_resource_attribute() {
     resolve_resource_refs(&mut parsed).unwrap();
     assert_eq!(
         parsed.resources[0].get_attr("name"),
-        Some(&Value::String("my-bucket".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "my-bucket".to_string()
+        )))
     );
 }
 
@@ -1894,7 +1949,9 @@ fn partial_application_closure_in_resource_attribute() {
     resolve_resource_refs(&mut parsed).unwrap();
     assert_eq!(
         parsed.resources[0].get_attr("name"),
-        Some(&Value::String("my-bucket".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "my-bucket".to_string()
+        )))
     );
 }
 
@@ -1911,7 +1968,9 @@ fn partial_application_closure_direct_call_in_resource_attribute() {
     resolve_resource_refs(&mut parsed).unwrap();
     assert_eq!(
         parsed.resources[0].get_attr("name"),
-        Some(&Value::String("my-bucket".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "my-bucket".to_string()
+        )))
     );
 }
 
@@ -2012,8 +2071,8 @@ fn forward_reference_in_nested_value() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     let subnet = &result.resources[0];
     // Check nested reference in list > map
-    if let Some(Value::List(items)) = subnet.get_attr("tags") {
-        if let Some(Value::Map(map)) = items.first() {
+    if let Some(Value::Concrete(ConcreteValue::List(items))) = subnet.get_attr("tags") {
+        if let Some(Value::Concrete(ConcreteValue::Map(map))) = items.first() {
             assert_eq!(
                 map.get("vpc_ref"),
                 Some(&Value::resource_ref(
@@ -2219,7 +2278,9 @@ fn parse_slash_slash_comment_inline() {
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
-        Some(&Value::String("10.0.0.0/16".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "10.0.0.0/16".to_string()
+        )))
     );
 }
 
@@ -2238,7 +2299,9 @@ fn parse_mixed_comment_styles() {
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
-        Some(&Value::String("10.0.0.0/16".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "10.0.0.0/16".to_string()
+        )))
     );
 }
 
@@ -2302,7 +2365,9 @@ fn parse_block_comment_inline() {
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
-        Some(&Value::String("10.0.0.0/16".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "10.0.0.0/16".to_string()
+        )))
     );
 }
 
@@ -2360,7 +2425,7 @@ fn parse_provider_block_defers_non_literal_default_tags() {
 #[test]
 fn provider_block_undefined_let_reference_flagged() {
     // `nonexistent.tags` is a ResourceRef (bare identifiers without field
-    // access parse to Value::String per parser/expressions/primary.rs and
+    // access parse to Value::Concrete(ConcreteValue::String) per parser/expressions/primary.rs and
     // are intentionally not scope-checked). The `.tags` access is what
     // upgrades the value into a ResourceRef whose root must resolve.
     let input = r#"
@@ -2409,13 +2474,15 @@ fn finalize_provider_configs_promotes_resolved_default_tags() {
     );
     assert_eq!(
         pc.default_tags.get("region"),
-        Some(&Value::String("ap-northeast-1".to_string())),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "ap-northeast-1".to_string()
+        ))),
         "resolved default_tags must contain the literal map's entries; got: {:?}",
         pc.default_tags
     );
     assert_eq!(
         pc.default_tags.get("env"),
-        Some(&Value::String("dev".to_string())),
+        Some(&Value::Concrete(ConcreteValue::String("dev".to_string()))),
     );
 }
 
@@ -2448,13 +2515,15 @@ fn finalize_provider_configs_resolves_resource_ref_default_tags() {
     );
     assert_eq!(
         pc.default_tags.get("Project"),
-        Some(&Value::String("carina-rs".to_string())),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "carina-rs".to_string()
+        ))),
         "ResourceRef default_tags must resolve to the referenced map; got: {:?}",
         pc.default_tags
     );
     assert_eq!(
         pc.default_tags.get("Env"),
-        Some(&Value::String("dev".to_string())),
+        Some(&Value::Concrete(ConcreteValue::String("dev".to_string()))),
     );
 }
 
@@ -2518,15 +2587,21 @@ fn parse_provider_block_with_default_tags() {
     assert_eq!(result.providers[0].default_tags.len(), 3);
     assert_eq!(
         result.providers[0].default_tags.get("Environment"),
-        Some(&Value::String("production".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "production".to_string()
+        )))
     );
     assert_eq!(
         result.providers[0].default_tags.get("Team"),
-        Some(&Value::String("platform".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "platform".to_string()
+        )))
     );
     assert_eq!(
         result.providers[0].default_tags.get("ManagedBy"),
-        Some(&Value::String("carina".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "carina".to_string()
+        )))
     );
 }
 
@@ -2711,7 +2786,9 @@ fn parse_let_binding_module_call() {
     assert_eq!(call.binding_name, Some("web".to_string()));
     assert_eq!(
         call.arguments.get("vpc"),
-        Some(&Value::String("vpc-123".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "vpc-123".to_string()
+        )))
     );
 }
 
@@ -2757,7 +2834,9 @@ fn parse_string_interpolation_simple() {
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
-        Some(&Value::String("vpc-prod".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "vpc-prod".to_string()
+        )))
     );
 }
 
@@ -2775,7 +2854,9 @@ fn parse_string_interpolation_multiple_exprs() {
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
-        Some(&Value::String("vpc-prod-us-east-1".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "vpc-prod-us-east-1".to_string()
+        )))
     );
 }
 
@@ -2794,20 +2875,20 @@ fn parse_string_interpolation_with_resource_ref() {
     let subnet = &result.resources[1];
     assert_eq!(
         subnet.get_attr("name"),
-        Some(&Value::Interpolation(vec![
+        Some(&Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("subnet-".to_string()),
             InterpolationPart::Expr(Value::resource_ref(
                 "vpc".to_string(),
                 "vpc_id".to_string(),
                 vec![]
             )),
-        ]))
+        ])))
     );
 }
 
 #[test]
 fn parse_string_no_interpolation() {
-    // Strings without ${} should remain as plain Value::String
+    // Strings without ${} should remain as plain Value::Concrete(ConcreteValue::String)
     let input = r#"
         let vpc = aws.ec2.Vpc {
             name = "my-vpc"
@@ -2818,7 +2899,9 @@ fn parse_string_no_interpolation() {
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
-        Some(&Value::String("my-vpc".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "my-vpc".to_string()
+        )))
     );
 }
 
@@ -2835,7 +2918,9 @@ fn parse_string_dollar_without_brace() {
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
-        Some(&Value::String("price$100".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "price$100".to_string()
+        )))
     );
 }
 
@@ -2852,14 +2937,16 @@ fn parse_string_escaped_interpolation() {
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
-        Some(&Value::String("literal${expr}".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "literal${expr}".to_string()
+        )))
     );
 }
 
 #[test]
 fn parse_empty_interpolation_accepted_as_unknown() {
     // `${}` mid-edit must NOT abort parsing — instead it is stamped as
-    // `Value::Unknown(EmptyInterpolation)` so other diagnostics in the
+    // `Value::Deferred(DeferredValue::Unknown(EmptyInterpolation))` so other diagnostics in the
     // file (sibling let bindings, type mismatches, etc.) keep running.
     // See #2480 — pre-fix, this input rejected the entire AST with
     // `expected primary` and made every let binding appear undefined.
@@ -2874,20 +2961,23 @@ fn parse_empty_interpolation_accepted_as_unknown() {
     let bucket = &result.resources[0];
     let attr = bucket.get_attr("name").expect("name attr");
     let parts = match attr {
-        Value::Interpolation(parts) => parts,
-        other => panic!("expected Value::Interpolation, got {:?}", other),
+        Value::Deferred(DeferredValue::Interpolation(parts)) => parts,
+        other => panic!(
+            "expected Value::Deferred(DeferredValue::Interpolation), got {:?}",
+            other
+        ),
     };
     let has_empty = parts.iter().any(|p| {
         matches!(
             p,
-            crate::resource::InterpolationPart::Expr(Value::Unknown(
+            crate::resource::InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
                 crate::resource::UnknownReason::EmptyInterpolation
-            ))
+            )))
         )
     });
     assert!(
         has_empty,
-        "expected an InterpolationPart::Expr(Value::Unknown(EmptyInterpolation)) in the parsed parts; got {:?}",
+        "expected an InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(EmptyInterpolation))) in the parsed parts; got {:?}",
         parts
     );
 }
@@ -2908,15 +2998,18 @@ fn parse_whitespace_only_interpolation_accepted_as_unknown() {
     let bucket = &result.resources[0];
     let attr = bucket.get_attr("name").expect("name attr");
     let parts = match attr {
-        Value::Interpolation(parts) => parts,
-        other => panic!("expected Value::Interpolation, got {:?}", other),
+        Value::Deferred(DeferredValue::Interpolation(parts)) => parts,
+        other => panic!(
+            "expected Value::Deferred(DeferredValue::Interpolation), got {:?}",
+            other
+        ),
     };
     let has_empty = parts.iter().any(|p| {
         matches!(
             p,
-            crate::resource::InterpolationPart::Expr(Value::Unknown(
+            crate::resource::InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
                 crate::resource::UnknownReason::EmptyInterpolation
-            ))
+            )))
         )
     });
     assert!(
@@ -2966,7 +3059,9 @@ fn parse_string_interpolation_with_bool() {
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
-        Some(&Value::String("enabled-true".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "enabled-true".to_string()
+        )))
     );
 }
 
@@ -2982,7 +3077,9 @@ fn parse_string_interpolation_with_number() {
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
-        Some(&Value::String("port-8080".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "port-8080".to_string()
+        )))
     );
 }
 
@@ -3000,7 +3097,7 @@ fn parse_string_interpolation_only_expr() {
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("tag"),
-        Some(&Value::String("prod".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String("prod".to_string())))
     );
 }
 
@@ -3023,11 +3120,15 @@ fn parse_local_let_binding_in_resource_block() {
     // The local binding value should be resolved in subsequent attributes
     assert_eq!(
         subnet.get_attr("tag_name"),
-        Some(&Value::String("my-subnet".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "my-subnet".to_string()
+        )))
     );
     assert_eq!(
         subnet.get_attr("cidr_block"),
-        Some(&Value::String("10.0.1.0/24".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "10.0.1.0/24".to_string()
+        )))
     );
 }
 
@@ -3048,7 +3149,9 @@ fn parse_local_let_binding_with_interpolation() {
     // Local binding should resolve outer scope variable in interpolation.
     assert_eq!(
         subnet.get_attr("tag_name"),
-        Some(&Value::String("app-prod".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "app-prod".to_string()
+        )))
     );
 }
 
@@ -3069,7 +3172,9 @@ fn parse_local_let_binding_chain() {
     // Chained local bindings should resolve correctly.
     assert_eq!(
         subnet.get_attr("tag_name"),
-        Some(&Value::String("app-subnet".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "app-subnet".to_string()
+        )))
     );
 
     // Local bindings should NOT appear in attributes
@@ -3093,10 +3198,12 @@ fn parse_local_let_binding_with_function_call() {
     // Local binding used inside function call
     assert_eq!(
         subnet.get_attr("tag_name"),
-        Some(&Value::FunctionCall {
+        Some(&Value::Deferred(DeferredValue::FunctionCall {
             name: "upper".to_string(),
-            args: vec![Value::String("my-subnet".to_string())],
-        })
+            args: vec![Value::Concrete(ConcreteValue::String(
+                "my-subnet".to_string()
+            ))],
+        }))
     );
 }
 
@@ -3117,7 +3224,9 @@ fn parse_local_let_binding_in_anonymous_resource() {
     assert!(!subnet.attributes.contains_key("name"));
     assert_eq!(
         subnet.get_attr("tag_name"),
-        Some(&Value::String("my-subnet".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "my-subnet".to_string()
+        )))
     );
 }
 
@@ -3137,9 +3246,12 @@ fn parse_local_let_binding_in_nested_block() {
     let subnet = &result.resources[0];
 
     // Local binding should be visible in nested blocks
-    if let Some(Value::List(tags_list)) = subnet.get_attr("tags") {
-        if let Some(Value::Map(tags)) = tags_list.first() {
-            assert_eq!(tags.get("Name"), Some(&Value::String("prod".to_string())));
+    if let Some(Value::Concrete(ConcreteValue::List(tags_list))) = subnet.get_attr("tags") {
+        if let Some(Value::Concrete(ConcreteValue::Map(tags))) = tags_list.first() {
+            assert_eq!(
+                tags.get("Name"),
+                Some(&Value::Concrete(ConcreteValue::String("prod".to_string())))
+            );
         } else {
             panic!("Expected Map in tags list");
         }
@@ -3169,11 +3281,15 @@ fn parse_for_expression_over_list() {
     // Each resource should have the loop variable substituted
     assert_eq!(
         result.resources[0].get_attr("availability_zone"),
-        Some(&Value::String("ap-northeast-1a".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "ap-northeast-1a".to_string()
+        )))
     );
     assert_eq!(
         result.resources[1].get_attr("availability_zone"),
-        Some(&Value::String("ap-northeast-1c".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "ap-northeast-1c".to_string()
+        )))
     );
 }
 
@@ -3195,14 +3311,18 @@ fn parse_for_expression_with_index() {
     assert_eq!(result.resources[1].id.name_str(), "subnets[1]");
 
     // Check index variable is substituted
-    if let Some(Value::FunctionCall { args, .. }) = result.resources[0].get_attr("cidr_block") {
-        assert_eq!(args[2], Value::Int(0));
+    if let Some(Value::Deferred(DeferredValue::FunctionCall { args, .. })) =
+        result.resources[0].get_attr("cidr_block")
+    {
+        assert_eq!(args[2], Value::Concrete(ConcreteValue::Int(0)));
     } else {
         panic!("Expected FunctionCall for cidr_block");
     }
 
-    if let Some(Value::FunctionCall { args, .. }) = result.resources[1].get_attr("cidr_block") {
-        assert_eq!(args[2], Value::Int(1));
+    if let Some(Value::Deferred(DeferredValue::FunctionCall { args, .. })) =
+        result.resources[1].get_attr("cidr_block")
+    {
+        assert_eq!(args[2], Value::Concrete(ConcreteValue::Int(1)));
     } else {
         panic!("Expected FunctionCall for cidr_block");
     }
@@ -3253,9 +3373,11 @@ fn parse_for_expression_with_local_binding() {
     assert_eq!(result.resources.len(), 2);
 
     // Local binding should be resolved within each iteration
-    if let Some(Value::FunctionCall { name, args }) = result.resources[0].get_attr("cidr_block") {
+    if let Some(Value::Deferred(DeferredValue::FunctionCall { name, args })) =
+        result.resources[0].get_attr("cidr_block")
+    {
         assert_eq!(name, "cidr_subnet");
-        assert_eq!(args[2], Value::Int(0));
+        assert_eq!(args[2], Value::Concrete(ConcreteValue::Int(0)));
     } else {
         panic!("Expected FunctionCall for cidr_block");
     }
@@ -3305,7 +3427,9 @@ fn parse_for_expression_with_module_call() {
         .unwrap();
     assert_eq!(
         prod_call.arguments.get("vpc_cidr"),
-        Some(&Value::String("10.0.0.0/16".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "10.0.0.0/16".to_string()
+        )))
     );
 
     let staging_call = result
@@ -3315,7 +3439,9 @@ fn parse_for_expression_with_module_call() {
         .unwrap();
     assert_eq!(
         staging_call.arguments.get("vpc_cidr"),
-        Some(&Value::String("10.1.0.0/16".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "10.1.0.0/16".to_string()
+        )))
     );
 }
 
@@ -3346,11 +3472,15 @@ fn parse_for_expression_with_module_call_over_list() {
 
     assert_eq!(
         result.module_calls[0].arguments.get("vpc_cidr"),
-        Some(&Value::String("10.0.0.0/16".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "10.0.0.0/16".to_string()
+        )))
     );
     assert_eq!(
         result.module_calls[1].arguments.get("vpc_cidr"),
-        Some(&Value::String("10.1.0.0/16".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "10.1.0.0/16".to_string()
+        )))
     );
 }
 
@@ -3372,7 +3502,7 @@ fn test_chained_field_access_two_levels() {
     let subnet = &result.resources[1];
     let vpc_id = subnet.get_attr("vpc_id").expect("vpc_id attribute");
     match vpc_id {
-        Value::ResourceRef { path } => {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
             let binding_name = path.binding();
             let attribute_name = path.attribute();
             let field_path = path.field_path();
@@ -3402,7 +3532,7 @@ fn test_chained_field_access_three_levels() {
     let subnet = &result.resources[1];
     let vpc_id = subnet.get_attr("vpc_id").expect("vpc_id attribute");
     match vpc_id {
-        Value::ResourceRef { path } => {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
             let binding_name = path.binding();
             let attribute_name = path.attribute();
             let field_path = path.field_path();
@@ -3434,7 +3564,7 @@ fn parse_index_access_with_integer() {
     let rt = result.resources.last().expect("route_table resource");
     let subnet_id = rt.get_attr("subnet_id").expect("subnet_id attribute");
     match subnet_id {
-        Value::ResourceRef { path } => {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
             let binding_name = path.binding();
             let attribute_name = path.attribute();
             let field_path = path.field_path();
@@ -3474,7 +3604,7 @@ fn parse_index_access_with_string_key() {
     let subnet = result.resources.last().expect("subnet resource");
     let vpc_id = subnet.get_attr("vpc_id").expect("vpc_id attribute");
     match vpc_id {
-        Value::ResourceRef { path } => {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
             let binding_name = path.binding();
             let attribute_name = path.attribute();
             let field_path = path.field_path();
@@ -3511,7 +3641,7 @@ fn parse_index_access_with_chained_fields() {
     let subnet = result.resources.last().expect("subnet resource");
     let sg_id = subnet.get_attr("sg_id").expect("sg_id attribute");
     match sg_id {
-        Value::ResourceRef { path } => {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
             let binding_name = path.binding();
             let attribute_name = path.attribute();
             let field_path = path.field_path();
@@ -3539,7 +3669,7 @@ fn parse_subscript_after_field_access_with_integer() {
     let subnet = result.resources.last().expect("subnet");
     let value = subnet.get_attr("cidr_block").expect("cidr_block");
     match value {
-        Value::ResourceRef { path } => {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
             assert_eq!(path.binding(), "orgs");
             assert_eq!(path.attribute(), "accounts");
             assert!(path.field_path().is_empty());
@@ -3569,7 +3699,7 @@ fn parse_subscript_after_field_access_with_string_key() {
     let subnet = result.resources.last().expect("subnet");
     let value = subnet.get_attr("cidr_block").expect("cidr_block");
     match value {
-        Value::ResourceRef { path } => {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
             assert_eq!(path.binding(), "orgs");
             assert_eq!(path.attribute(), "accounts");
             assert!(path.field_path().is_empty());
@@ -3602,7 +3732,7 @@ fn parse_chained_subscripts_after_field_access() {
     let subnet = result.resources.last().expect("subnet");
     let value = subnet.get_attr("cidr_block").expect("cidr_block");
     match value {
-        Value::ResourceRef { path } => {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
             assert_eq!(path.binding(), "orgs");
             assert_eq!(path.attribute(), "matrix");
             assert!(path.field_path().is_empty());
@@ -3680,7 +3810,7 @@ fn parse_subscript_after_nested_field_access() {
     let subnet = result.resources.last().expect("subnet");
     let value = subnet.get_attr("cidr_block").expect("cidr_block");
     match value {
-        Value::ResourceRef { path } => {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
             assert_eq!(path.binding(), "orgs");
             assert_eq!(path.attribute(), "account");
             assert_eq!(path.field_path(), vec!["accounts"]);
@@ -3877,11 +4007,11 @@ fn parse_for_expression_with_keys_function_call() {
     assert_eq!(result.resources[1].id.name_str(), "resources[1]");
     assert_eq!(
         result.resources[0].get_attr("name"),
-        Some(&Value::String("Env".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String("Env".to_string())))
     );
     assert_eq!(
         result.resources[1].get_attr("name"),
-        Some(&Value::String("Name".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String("Name".to_string())))
     );
 }
 
@@ -3905,11 +4035,15 @@ fn parse_for_expression_with_values_function_call() {
     assert_eq!(result.resources.len(), 2);
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
-        Some(&Value::String("10.0.0.0/16".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "10.0.0.0/16".to_string()
+        )))
     );
     assert_eq!(
         result.resources[1].get_attr("cidr_block"),
-        Some(&Value::String("10.1.0.0/16".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "10.1.0.0/16".to_string()
+        )))
     );
 }
 
@@ -3929,11 +4063,15 @@ fn parse_for_expression_with_concat_function_call() {
     // So concat(["10.0.0.0/16"], ["10.1.0.0/16"]) => ["10.1.0.0/16", "10.0.0.0/16"]
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
-        Some(&Value::String("10.1.0.0/16".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "10.1.0.0/16".to_string()
+        )))
     );
     assert_eq!(
         result.resources[1].get_attr("cidr_block"),
-        Some(&Value::String("10.0.0.0/16".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "10.0.0.0/16".to_string()
+        )))
     );
 }
 
@@ -3979,7 +4117,9 @@ fn parse_if_true_condition_includes_resource() {
     assert_eq!(result.resources[0].id.name_str(), "alarm");
     assert_eq!(
         result.resources[0].get_attr("alarm_name"),
-        Some(&Value::String("cpu-high".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "cpu-high".to_string()
+        )))
     );
 }
 
@@ -4015,7 +4155,9 @@ fn parse_if_else_true_uses_if_branch() {
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
-        Some(&Value::String("10.0.0.0/16".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "10.0.0.0/16".to_string()
+        )))
     );
 }
 
@@ -4037,7 +4179,9 @@ fn parse_if_else_false_uses_else_branch() {
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
-        Some(&Value::String("172.16.0.0/16".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "172.16.0.0/16".to_string()
+        )))
     );
 }
 
@@ -4070,7 +4214,9 @@ fn parse_if_else_value_expression() {
     let result2 = parse(input2, &ProviderContext::default()).unwrap();
     assert_eq!(
         result2.resources[0].get_attr("instance_type"),
-        Some(&Value::String("m5.xlarge".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "m5.xlarge".to_string()
+        )))
     );
 }
 
@@ -4091,7 +4237,9 @@ fn parse_if_else_value_expression_false_branch() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.resources[0].get_attr("instance_type"),
-        Some(&Value::String("t3.micro".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "t3.micro".to_string()
+        )))
     );
 }
 
@@ -4199,7 +4347,9 @@ fn parse_if_with_local_binding() {
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("alarm_name"),
-        Some(&Value::String("cpu-high".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "cpu-high".to_string()
+        )))
     );
 }
 
@@ -4217,7 +4367,9 @@ fn parse_if_else_value_expr_in_attribute_true() {
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
-        Some(&Value::String("10.0.0.0/16".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "10.0.0.0/16".to_string()
+        )))
     );
 }
 
@@ -4235,7 +4387,9 @@ fn parse_if_else_value_expr_in_attribute_false() {
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
-        Some(&Value::String("172.16.0.0/16".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "172.16.0.0/16".to_string()
+        )))
     );
 }
 
@@ -4252,7 +4406,9 @@ fn parse_if_value_expr_no_else_true() {
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
-        Some(&Value::String("10.0.0.0/16".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "10.0.0.0/16".to_string()
+        )))
     );
 }
 
@@ -4291,11 +4447,15 @@ fn parse_top_level_for_expression() {
     // Each resource should have the loop variable substituted
     assert_eq!(
         result.resources[0].get_attr("availability_zone"),
-        Some(&Value::String("ap-northeast-1a".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "ap-northeast-1a".to_string()
+        )))
     );
     assert_eq!(
         result.resources[1].get_attr("availability_zone"),
-        Some(&Value::String("ap-northeast-1c".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "ap-northeast-1c".to_string()
+        )))
     );
 }
 
@@ -4314,7 +4474,9 @@ fn parse_top_level_if_expression() {
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("alarm_name"),
-        Some(&Value::String("cpu-high".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "cpu-high".to_string()
+        )))
     );
 }
 
@@ -4464,7 +4626,10 @@ fn parse_arguments_block_form_description_and_default() {
     assert_eq!(result.arguments.len(), 1);
     assert_eq!(result.arguments[0].name, "port");
     assert_eq!(result.arguments[0].type_expr, TypeExpr::Int);
-    assert_eq!(result.arguments[0].default, Some(Value::Int(8080)));
+    assert_eq!(
+        result.arguments[0].default,
+        Some(Value::Concrete(ConcreteValue::Int(8080)))
+    );
     assert_eq!(
         result.arguments[0].description.as_deref(),
         Some("Web server port")
@@ -4494,7 +4659,10 @@ fn parse_arguments_mixed_simple_and_block_form() {
     // Simple form (unchanged)
     assert_eq!(result.arguments[0].name, "enable_https");
     assert_eq!(result.arguments[0].type_expr, TypeExpr::Bool);
-    assert_eq!(result.arguments[0].default, Some(Value::Bool(true)));
+    assert_eq!(
+        result.arguments[0].default,
+        Some(Value::Concrete(ConcreteValue::Bool(true)))
+    );
     assert!(result.arguments[0].description.is_none());
 
     // Block form with description only
@@ -4512,7 +4680,10 @@ fn parse_arguments_mixed_simple_and_block_form() {
     // Block form with description and default
     assert_eq!(result.arguments[2].name, "port");
     assert_eq!(result.arguments[2].type_expr, TypeExpr::Int);
-    assert_eq!(result.arguments[2].default, Some(Value::Int(8080)));
+    assert_eq!(
+        result.arguments[2].default,
+        Some(Value::Concrete(ConcreteValue::Int(8080)))
+    );
     assert_eq!(
         result.arguments[2].description.as_deref(),
         Some("Web server port")
@@ -4700,7 +4871,10 @@ fn parse_arguments_block_form_default_only() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(result.arguments.len(), 1);
     assert_eq!(result.arguments[0].name, "port");
-    assert_eq!(result.arguments[0].default, Some(Value::Int(8080)));
+    assert_eq!(
+        result.arguments[0].default,
+        Some(Value::Concrete(ConcreteValue::Int(8080)))
+    );
     assert!(result.arguments[0].description.is_none());
 }
 
@@ -4740,7 +4914,9 @@ fn parse_arguments_block_form_string_default_not_confused_with_description() {
     );
     assert_eq!(
         result.arguments[0].default,
-        Some(Value::String("my-resource".to_string()))
+        Some(Value::Concrete(ConcreteValue::String(
+            "my-resource".to_string()
+        )))
     );
 }
 
@@ -4764,7 +4940,7 @@ fn parse_arguments_block_form_validation_block() {
     let arg = &result.arguments[0];
     assert_eq!(arg.name, "port");
     assert_eq!(arg.type_expr, TypeExpr::Int);
-    assert_eq!(arg.default, Some(Value::Int(8080)));
+    assert_eq!(arg.default, Some(Value::Concrete(ConcreteValue::Int(8080))));
     assert_eq!(arg.description.as_deref(), Some("Web server port"));
     assert_eq!(arg.validations.len(), 1);
     assert_eq!(
@@ -4947,7 +5123,7 @@ fn join_with_resolved_args_still_works() {
     let resource = &result.resources[0];
     assert_eq!(
         resource.get_attr("name"),
-        Some(&Value::String("a-b-c".to_string())),
+        Some(&Value::Concrete(ConcreteValue::String("a-b-c".to_string()))),
     );
 }
 
@@ -4969,7 +5145,9 @@ fn user_fn_simple_call() {
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("name"),
-        Some(&Value::String("hello world".to_string())),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "hello world".to_string()
+        ))),
     );
 }
 
@@ -4992,11 +5170,15 @@ fn user_fn_with_default_param() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
-        Some(&Value::String("prod-default".to_string())),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "prod-default".to_string()
+        ))),
     );
     assert_eq!(
         result.resources[1].get_attr("name"),
-        Some(&Value::String("prod-web".to_string())),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "prod-web".to_string()
+        ))),
     );
 }
 
@@ -5016,7 +5198,9 @@ fn user_fn_with_local_let() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
-        Some(&Value::String("prod-subnet-a".to_string())),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "prod-subnet-a".to_string()
+        ))),
     );
 }
 
@@ -5035,7 +5219,7 @@ fn user_fn_calling_builtin() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
-        Some(&Value::String("HELLO".to_string())),
+        Some(&Value::Concrete(ConcreteValue::String("HELLO".to_string()))),
     );
 }
 
@@ -5058,7 +5242,9 @@ fn user_fn_calling_another_fn() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
-        Some(&Value::String("prod-app-web".to_string())),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "prod-app-web".to_string()
+        ))),
     );
 }
 
@@ -5194,7 +5380,7 @@ fn user_fn_no_params() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
-        Some(&Value::String("hello".to_string())),
+        Some(&Value::Concrete(ConcreteValue::String("hello".to_string()))),
     );
 }
 
@@ -5255,7 +5441,9 @@ fn user_fn_with_pipe_operator() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
-        Some(&Value::String("hello-world".to_string())),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "hello-world".to_string()
+        ))),
     );
 }
 
@@ -5275,7 +5463,10 @@ fn user_fn_with_string_interpolation() {
     // the surrounding "-suffix" literal.
     let result = parse(input, &ProviderContext::default()).unwrap();
     let name = result.resources[0].get_attr("name").unwrap();
-    assert_eq!(name, &Value::String("hello world-suffix".to_string()));
+    assert_eq!(
+        name,
+        &Value::Concrete(ConcreteValue::String("hello world-suffix".to_string()))
+    );
 }
 
 #[test]
@@ -5294,7 +5485,9 @@ fn user_fn_typed_param_string() {
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("name"),
-        Some(&Value::String("hello world".to_string())),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "hello world".to_string()
+        ))),
     );
 }
 
@@ -5353,7 +5546,9 @@ fn user_fn_typed_param_with_default() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
-        Some(&Value::String("prod-default".to_string())),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "prod-default".to_string()
+        ))),
     );
 }
 
@@ -5372,7 +5567,9 @@ fn user_fn_mixed_typed_and_untyped() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
-        Some(&Value::String("prod-web".to_string())),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "prod-web".to_string()
+        ))),
     );
 }
 
@@ -5399,7 +5596,7 @@ fn user_fn_typed_param_bool_mismatch() {
 #[test]
 fn typed_user_fn_accepts_value_unknown_in_deferred_for_body() {
     // RFC #2371 stage 3: a deferred for-expression binds the loop var
-    // to `Value::Unknown(ForValue)` during template parsing. If a typed
+    // to `Value::Deferred(DeferredValue::Unknown(ForValue))` during template parsing. If a typed
     // user function is invoked with that placeholder, `check_fn_arg_type`
     // must skip the type check (the concrete type resolves at upstream
     // apply). Without the skip, parsing fails with `expects type 'String'`.
@@ -5431,7 +5628,7 @@ fn typed_user_fn_accepts_value_unknown_in_deferred_for_body() {
 fn typed_return_user_fn_accepts_value_unknown_in_deferred_for_body() {
     // Same skip rule must apply to return-type checking. The user fn
     // here has both a typed param and a typed return; both must let
-    // `Value::Unknown` pass through.
+    // `Value::Deferred(DeferredValue::Unknown)` pass through.
     let input = r#"
         fn label(s: String): String {
             s
@@ -5931,7 +6128,10 @@ fn parse_decrypt_uses_config_decryptor() {
     resolve_resource_refs_with_config(&mut parsed, &config).unwrap();
     assert_eq!(parsed.resources.len(), 1); // allow: direct — fixture test inspection
     let secret_val = parsed.resources[0].get_attr("secret").unwrap();
-    assert_eq!(*secret_val, Value::String("decrypted:AQICAHh".to_string()));
+    assert_eq!(
+        *secret_val,
+        Value::Concrete(ConcreteValue::String("decrypted:AQICAHh".to_string()))
+    );
 }
 
 #[test]
@@ -5980,7 +6180,7 @@ fn parse_custom_validator_accepts_valid() {
 
     let result = validate_custom_type(
         "custom_type",
-        &Value::String("valid-data".to_string()),
+        &Value::Concrete(ConcreteValue::String("valid-data".to_string())),
         &config,
     );
     assert!(result.is_ok());
@@ -5988,7 +6188,7 @@ fn parse_custom_validator_accepts_valid() {
     // Unknown type with no custom validator should also pass (permissive)
     let result = validate_custom_type(
         "unknown_type",
-        &Value::String("anything".to_string()),
+        &Value::Concrete(ConcreteValue::String("anything".to_string())),
         &config,
     );
     assert!(result.is_ok());
@@ -6023,14 +6223,14 @@ fn parse_custom_validator_rejects_invalid() {
     // arbitrary type names. This verifies the custom validator is called.
     let valid_result = validate_custom_type(
         "custom_type",
-        &Value::String("valid-data".to_string()),
+        &Value::Concrete(ConcreteValue::String("valid-data".to_string())),
         &config,
     );
     assert!(valid_result.is_ok());
 
     let invalid_result = validate_custom_type(
         "custom_type",
-        &Value::String("invalid".to_string()),
+        &Value::Concrete(ConcreteValue::String("invalid".to_string())),
         &config,
     );
     assert!(invalid_result.is_err());
@@ -6172,7 +6372,7 @@ fn parse_upstream_state_registers_binding() {
     assert_eq!(result.resources.len(), 1);
     let vpc_id_attr = result.resources[0].get_attr("vpc_id").unwrap();
     match vpc_id_attr {
-        Value::ResourceRef { path } => {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
             assert_eq!(path.binding(), "network");
             assert_eq!(path.attribute(), "vpc");
             assert_eq!(path.field_path(), vec!["vpc_id"]);
@@ -6323,7 +6523,7 @@ fn test_compose_operator_followed_by_pipe_consumes_closure() {
 
     assert_eq!(
         result.variables.get("result").unwrap(),
-        &Value::String("a,b".to_string())
+        &Value::Concrete(ConcreteValue::String("a,b".to_string()))
     );
     // `f` is a closure-only binding and does not appear in the
     // user-facing variable map.
@@ -6340,7 +6540,7 @@ fn test_compose_operator_with_pipe() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.variables.get("names").unwrap(),
-        &Value::String("alice, bob".to_string())
+        &Value::Concrete(ConcreteValue::String("alice, bob".to_string()))
     );
 }
 
@@ -6354,7 +6554,7 @@ fn test_compose_operator_two_step_chain() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.variables.get("result").unwrap(),
-        &Value::String("a-b-c".to_string())
+        &Value::Concrete(ConcreteValue::String("a-b-c".to_string()))
     );
 }
 
@@ -6401,7 +6601,7 @@ fn test_compose_operator_precedence_with_pipe() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.variables.get("result").unwrap(),
-        &Value::String("1-2".to_string())
+        &Value::Concrete(ConcreteValue::String("1-2".to_string()))
     );
 }
 
@@ -6433,7 +6633,9 @@ fn parse_single_quoted_string_literal() {
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
-        Some(&Value::String("my-vpc".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "my-vpc".to_string()
+        )))
     );
 }
 
@@ -6452,7 +6654,9 @@ fn parse_single_quoted_string_no_interpolation() {
     // Should be a plain string, not interpolated
     assert_eq!(
         vpc.get_attr("name"),
-        Some(&Value::String("vpc-${env}".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "vpc-${env}".to_string()
+        )))
     );
 }
 
@@ -6468,7 +6672,9 @@ fn parse_single_quoted_string_escape_sequences() {
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
-        Some(&Value::String("it's a test".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "it's a test".to_string()
+        )))
     );
 }
 
@@ -6483,11 +6689,11 @@ fn test_compose_three_functions_execution() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.variables.get("result").unwrap(),
-        &Value::List(vec![
-            Value::String("a".to_string()),
-            Value::String("b".to_string()),
-            Value::String("c".to_string()),
-        ])
+        &Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("a".to_string())),
+            Value::Concrete(ConcreteValue::String("b".to_string())),
+            Value::Concrete(ConcreteValue::String("c".to_string())),
+        ]))
     );
 }
 
@@ -6507,9 +6713,9 @@ EOT
     let resource = &result.resources[0];
     assert_eq!(
         resource.get_attr("policy"),
-        Some(&Value::String(
+        Some(&Value::Concrete(ConcreteValue::String(
             "{\n  \"Version\": \"2012-10-17\"\n}".to_string()
-        ))
+        )))
     );
 }
 
@@ -6521,7 +6727,9 @@ fn parse_heredoc_indented() {
     let resource = &result.resources[0];
     assert_eq!(
         resource.get_attr("policy"),
-        Some(&Value::String("line1\nline2\nline3".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "line1\nline2\nline3".to_string()
+        )))
     );
 }
 
@@ -6532,7 +6740,7 @@ fn parse_heredoc_empty() {
     let resource = &result.resources[0];
     assert_eq!(
         resource.get_attr("policy"),
-        Some(&Value::String("".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String("".to_string())))
     );
 }
 
@@ -6546,7 +6754,9 @@ EOF
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.variables.get("doc"),
-        Some(&Value::String("hello world".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "hello world".to_string()
+        )))
     );
 }
 
@@ -6559,14 +6769,18 @@ fn quoted_string_as_map_key() {
         }
     "#;
     let result = parse(input, &ProviderContext::default()).unwrap();
-    if let Some(Value::Map(map)) = result.variables.get("m") {
+    if let Some(Value::Concrete(ConcreteValue::Map(map))) = result.variables.get("m") {
         assert_eq!(
             map.get("token.actions.githubusercontent.com:aud"),
-            Some(&Value::String("sts.amazonaws.com".to_string()))
+            Some(&Value::Concrete(ConcreteValue::String(
+                "sts.amazonaws.com".to_string()
+            )))
         );
         assert_eq!(
             map.get("aws:SourceIp"),
-            Some(&Value::String("10.0.0.0/8".to_string()))
+            Some(&Value::Concrete(ConcreteValue::String(
+                "10.0.0.0/8".to_string()
+            )))
         );
     } else {
         panic!("Expected map, got {:?}", result.variables.get("m"));
@@ -6596,15 +6810,18 @@ fn quoted_string_as_attribute_key_in_block() {
     let resource = &result.resources[0];
     // Navigate: assume_role_policy_document -> statement[0] -> condition -> string_equals
     let doc = resource.get_attr("assume_role_policy_document").unwrap();
-    if let Value::Map(doc_map) = doc
-        && let Some(Value::List(statements)) = doc_map.get("statement")
-        && let Value::Map(stmt) = &statements[0]
-        && let Some(Value::Map(condition)) = stmt.get("condition")
-        && let Some(Value::Map(string_equals)) = condition.get("string_equals")
+    if let Value::Concrete(ConcreteValue::Map(doc_map)) = doc
+        && let Some(Value::Concrete(ConcreteValue::List(statements))) = doc_map.get("statement")
+        && let Value::Concrete(ConcreteValue::Map(stmt)) = &statements[0]
+        && let Some(Value::Concrete(ConcreteValue::Map(condition))) = stmt.get("condition")
+        && let Some(Value::Concrete(ConcreteValue::Map(string_equals))) =
+            condition.get("string_equals")
     {
         assert_eq!(
             string_equals.get("token.actions.githubusercontent.com:aud"),
-            Some(&Value::String("sts.amazonaws.com".to_string()))
+            Some(&Value::Concrete(ConcreteValue::String(
+                "sts.amazonaws.com".to_string()
+            )))
         );
     } else {
         panic!("Could not navigate to condition key");
@@ -6730,7 +6947,9 @@ awscc.ec2.Subnet {
     // Actually, resource refs remain as ResourceRef until resolution, so the left side IS a ResourceRef
     assert_eq!(
         cidr,
-        Some(&Value::String("10.0.1.0/24".to_string())),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "10.0.1.0/24".to_string()
+        ))),
         "?? should return default when left is an unresolved ResourceRef"
     );
 }
@@ -6749,7 +6968,7 @@ exports {
     // Check if the value is a ResourceRef
     let value = exports_parsed.export_params[0].value.as_ref().unwrap();
     eprintln!("value: {:?}", value);
-    let is_ref = matches!(value, Value::ResourceRef { .. });
+    let is_ref = matches!(value, Value::Deferred(DeferredValue::ResourceRef { .. }));
     eprintln!("is_ref: {}", is_ref);
 
     // Now simulate merged ParsedFile with binding from main.crn
@@ -6791,7 +7010,9 @@ awscc.ec2.Vpc {
     let cidr = parsed.resources[0].get_attr("cidr_block");
     assert_eq!(
         cidr,
-        Some(&Value::String("10.1.0.0/16".to_string())),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "10.1.0.0/16".to_string()
+        ))),
         "?? should return left when it's resolved"
     );
 }
@@ -6872,10 +7093,10 @@ fn expand_deferred_for_with_remote_bindings() {
     let mut orgs_attrs = HashMap::new();
     orgs_attrs.insert(
         "accounts".to_string(),
-        Value::List(vec![
-            Value::String("111111111111".to_string()),
-            Value::String("222222222222".to_string()),
-        ]),
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("111111111111".to_string())),
+            Value::Concrete(ConcreteValue::String("222222222222".to_string())),
+        ])),
     );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
@@ -6907,7 +7128,9 @@ fn expand_deferred_for_with_remote_bindings() {
     let target_id_0 = r0.get_attr("target_id");
     assert_eq!(
         target_id_0,
-        Some(&Value::String("111111111111".to_string())),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "111111111111".to_string()
+        ))),
         "target_id should be substituted with actual account ID"
     );
 
@@ -6915,7 +7138,9 @@ fn expand_deferred_for_with_remote_bindings() {
     let target_id_1 = r1.get_attr("target_id");
     assert_eq!(
         target_id_1,
-        Some(&Value::String("222222222222".to_string())),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "222222222222".to_string()
+        ))),
     );
 }
 
@@ -6973,11 +7198,17 @@ fn expand_deferred_for_map_binding_substitutes_key_and_value() {
     let mut accounts: IndexMap<String, Value> = IndexMap::new();
     accounts.insert(
         "prod".to_string(),
-        Value::String("111111111111".to_string()),
+        Value::Concrete(ConcreteValue::String("111111111111".to_string())),
     );
-    accounts.insert("dev".to_string(), Value::String("222222222222".to_string()));
+    accounts.insert(
+        "dev".to_string(),
+        Value::Concrete(ConcreteValue::String("222222222222".to_string())),
+    );
     let mut orgs_attrs = HashMap::new();
-    orgs_attrs.insert("accounts".to_string(), Value::Map(accounts));
+    orgs_attrs.insert(
+        "accounts".to_string(),
+        Value::Concrete(ConcreteValue::Map(accounts)),
+    );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
     parsed.expand_deferred_for_expressions(&remote_bindings);
@@ -6988,19 +7219,23 @@ fn expand_deferred_for_map_binding_substitutes_key_and_value() {
     // Verify both key and value are substituted.
     let mut by_name: HashMap<String, &Resource> = HashMap::new();
     for r in &parsed.resources {
-        if let Some(Value::String(s)) = r.get_attr("target_name") {
+        if let Some(Value::Concrete(ConcreteValue::String(s))) = r.get_attr("target_name") {
             by_name.insert(s.clone(), r);
         }
     }
     let prod = by_name.get("prod").expect("prod entry");
     assert_eq!(
         prod.get_attr("target_id"),
-        Some(&Value::String("111111111111".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "111111111111".to_string()
+        )))
     );
     let dev = by_name.get("dev").expect("dev entry");
     assert_eq!(
         dev.get_attr("target_id"),
-        Some(&Value::String("222222222222".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "222222222222".to_string()
+        )))
     );
 }
 
@@ -7029,10 +7264,10 @@ fn expand_deferred_for_indexed_binding_substitutes_index_and_value() {
     let mut orgs_attrs = HashMap::new();
     orgs_attrs.insert(
         "accounts".to_string(),
-        Value::List(vec![
-            Value::String("111111111111".to_string()),
-            Value::String("222222222222".to_string()),
-        ]),
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("111111111111".to_string())),
+            Value::Concrete(ConcreteValue::String("222222222222".to_string())),
+        ])),
     );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
@@ -7041,27 +7276,31 @@ fn expand_deferred_for_indexed_binding_substitutes_index_and_value() {
     assert_eq!(parsed.resources.len(), 2); // allow: direct — fixture test inspection
     assert_eq!(
         parsed.resources[0].get_attr("target_id"),
-        Some(&Value::String("111111111111".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "111111111111".to_string()
+        )))
     );
     assert_eq!(
         parsed.resources[0].get_attr("position"),
-        Some(&Value::Int(0)),
+        Some(&Value::Concrete(ConcreteValue::Int(0))),
         "index should be 0, not the item value"
     );
     assert_eq!(
         parsed.resources[1].get_attr("target_id"),
-        Some(&Value::String("222222222222".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "222222222222".to_string()
+        )))
     );
     assert_eq!(
         parsed.resources[1].get_attr("position"),
-        Some(&Value::Int(1))
+        Some(&Value::Concrete(ConcreteValue::Int(1)))
     );
 }
 
 #[test]
 fn expand_deferred_for_substitutes_placeholder_inside_interpolation() {
     // The loop var may appear inside a string interpolation like "acct-${id}".
-    // Placeholder substitution must recurse into Value::Interpolation parts,
+    // Placeholder substitution must recurse into Value::Deferred(DeferredValue::Interpolation) parts,
     // otherwise the rendered resource ships the raw placeholder string.
     let input = r#"
         let orgs = upstream_state {
@@ -7083,7 +7322,9 @@ fn expand_deferred_for_substitutes_placeholder_inside_interpolation() {
     let mut orgs_attrs = HashMap::new();
     orgs_attrs.insert(
         "accounts".to_string(),
-        Value::List(vec![Value::String("111111111111".to_string())]),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("111111111111".to_string()),
+        )])),
     );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
@@ -7093,18 +7334,20 @@ fn expand_deferred_for_substitutes_placeholder_inside_interpolation() {
     // label must have the placeholder substituted in the interpolation.
     let label = parsed.resources[0].get_attr("label");
     let rendered = match label {
-        Some(Value::Interpolation(parts)) => {
+        Some(Value::Deferred(DeferredValue::Interpolation(parts))) => {
             let mut s = String::new();
             for p in parts {
                 match p {
                     crate::resource::InterpolationPart::Literal(lit) => s.push_str(lit),
-                    crate::resource::InterpolationPart::Expr(Value::String(v)) => s.push_str(v),
+                    crate::resource::InterpolationPart::Expr(Value::Concrete(
+                        ConcreteValue::String(v),
+                    )) => s.push_str(v),
                     _ => s.push_str("<expr>"),
                 }
             }
             s
         }
-        Some(Value::String(s)) => s.clone(),
+        Some(Value::Concrete(ConcreteValue::String(s))) => s.clone(),
         other => panic!("unexpected label shape: {:?}", other),
     };
     assert!(
@@ -7112,23 +7355,25 @@ fn expand_deferred_for_substitutes_placeholder_inside_interpolation() {
         "interpolation should contain substituted account id, got: {}",
         rendered
     );
-    // After expansion no `Value::Unknown(ForValue)` placeholder must
+    // After expansion no `Value::Deferred(DeferredValue::Unknown(ForValue))` placeholder must
     // remain in the resource tree — every for-binding occurrence is
     // replaced by the resolved iterable element. RFC #2371 stage 3.
     fn contains_for_unknown(v: &Value) -> bool {
         use crate::resource::{InterpolationPart, UnknownReason};
         match v {
-            Value::Unknown(UnknownReason::ForValue)
-            | Value::Unknown(UnknownReason::ForKey)
-            | Value::Unknown(UnknownReason::ForIndex) => true,
-            Value::List(items) => items.iter().any(contains_for_unknown),
-            Value::Map(m) => m.values().any(contains_for_unknown),
-            Value::Interpolation(parts) => parts.iter().any(|p| match p {
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue))
+            | Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey))
+            | Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)) => true,
+            Value::Concrete(ConcreteValue::List(items)) => items.iter().any(contains_for_unknown),
+            Value::Concrete(ConcreteValue::Map(m)) => m.values().any(contains_for_unknown),
+            Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|p| match p {
                 InterpolationPart::Expr(inner) => contains_for_unknown(inner),
                 InterpolationPart::Literal(_) => false,
             }),
-            Value::FunctionCall { args, .. } => args.iter().any(contains_for_unknown),
-            Value::Secret(inner) => contains_for_unknown(inner),
+            Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+                args.iter().any(contains_for_unknown)
+            }
+            Value::Deferred(DeferredValue::Secret(inner)) => contains_for_unknown(inner),
             _ => false,
         }
     }
@@ -7138,7 +7383,7 @@ fn expand_deferred_for_substitutes_placeholder_inside_interpolation() {
         .any(contains_for_unknown);
     assert!(
         !leaked,
-        "for-binding Value::Unknown placeholder must not leak into expanded resource"
+        "for-binding Value::Deferred(DeferredValue::Unknown) placeholder must not leak into expanded resource"
     );
 }
 
@@ -7164,10 +7409,13 @@ fn expand_deferred_for_simple_binding_with_map_iterable_warns() {
     let mut accounts: IndexMap<String, Value> = IndexMap::new();
     accounts.insert(
         "prod".to_string(),
-        Value::String("111111111111".to_string()),
+        Value::Concrete(ConcreteValue::String("111111111111".to_string())),
     );
     let mut orgs_attrs = HashMap::new();
-    orgs_attrs.insert("accounts".to_string(), Value::Map(accounts));
+    orgs_attrs.insert(
+        "accounts".to_string(),
+        Value::Concrete(ConcreteValue::Map(accounts)),
+    );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
     parsed.expand_deferred_for_expressions(&remote_bindings);
@@ -7210,10 +7458,10 @@ fn expand_deferred_for_map_binding_with_list_iterable_warns() {
     let mut orgs_attrs = HashMap::new();
     orgs_attrs.insert(
         "accounts".to_string(),
-        Value::List(vec![
-            Value::String("111111111111".to_string()),
-            Value::String("222222222222".to_string()),
-        ]),
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("111111111111".to_string())),
+            Value::Concrete(ConcreteValue::String("222222222222".to_string())),
+        ])),
     );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
@@ -7865,7 +8113,7 @@ fn quoted_string_attrs_skipped_for_interpolated_strings() {
         .iter()
         .find(|r| r.binding.as_deref() == Some("r"))
         .expect("r resource present");
-    // Interpolations parse to `Value::Interpolation`, not a plain
+    // Interpolations parse to `Value::Deferred(DeferredValue::Interpolation)`, not a plain
     // string, so they are never recorded in `quoted_string_attrs`.
     assert!(
         !r.quoted_string_attrs.contains("name"),
@@ -7874,7 +8122,7 @@ fn quoted_string_attrs_skipped_for_interpolated_strings() {
     );
 }
 
-/// The payload of `Value::Map` must preserve the source order of the
+/// The payload of `Value::Concrete(ConcreteValue::Map)` must preserve the source order of the
 /// keys the user wrote — top-level map literals included.
 #[test]
 fn value_map_preserves_insertion_order() {
@@ -7887,20 +8135,20 @@ fn value_map_preserves_insertion_order() {
         }
     "#;
     let parsed = parse(input, &ProviderContext::default()).unwrap();
-    let Some(Value::Map(map)) = parsed.variables.get("m") else {
-        panic!("expected variables['m'] to be a Value::Map");
+    let Some(Value::Concrete(ConcreteValue::Map(map))) = parsed.variables.get("m") else {
+        panic!("expected variables['m'] to be a Value::Concrete(ConcreteValue::Map)");
     };
     let keys: Vec<&str> = map.keys().map(String::as_str).collect();
     assert_eq!(
         keys,
         vec!["z_first", "a_second", "m_third", "b_fourth"],
-        "Value::Map must preserve source key order; got {keys:?}"
+        "Value::Concrete(ConcreteValue::Map) must preserve source key order; got {keys:?}"
     );
 }
 
 /// `ProviderConfig.default_tags` must preserve the source order in
 /// which the user wrote tag keys. The map is extracted from a
-/// `default_tags = { ... }` block, so the same `Value::Map`
+/// `default_tags = { ... }` block, so the same `Value::Concrete(ConcreteValue::Map)`
 /// guarantee applies.
 #[test]
 fn provider_config_default_tags_preserve_insertion_order() {
@@ -7981,7 +8229,7 @@ fn parsed_file_variables_preserve_insertion_order() {
 }
 
 /// A nested block's attributes must surface in source order on the
-/// `Value::Map` payload, end-to-end through the parser.
+/// `Value::Concrete(ConcreteValue::Map)` payload, end-to-end through the parser.
 #[test]
 fn nested_block_value_map_preserves_insertion_order() {
     let input = r#"
@@ -8008,18 +8256,18 @@ fn nested_block_value_map_preserves_insertion_order() {
         .get_attr("nested")
         .expect("expected `nested` attribute");
     // Nested blocks are wrapped in a List<Map> by the parser.
-    let Value::List(blocks) = nested else {
+    let Value::Concrete(ConcreteValue::List(blocks)) = nested else {
         panic!("expected nested blocks to be a List, got {nested:?}");
     };
     let block = blocks.first().expect("expected one nested block");
-    let Value::Map(map) = block else {
-        panic!("expected nested block to be a Value::Map, got {block:?}");
+    let Value::Concrete(ConcreteValue::Map(map)) = block else {
+        panic!("expected nested block to be a Value::Concrete(ConcreteValue::Map), got {block:?}");
     };
     let keys: Vec<&str> = map.keys().map(String::as_str).collect();
     assert_eq!(
         keys,
         vec!["z_first", "a_second", "m_third"],
-        "nested block Value::Map must preserve source key order; got {keys:?}"
+        "nested block Value::Concrete(ConcreteValue::Map) must preserve source key order; got {keys:?}"
     );
 }
 
@@ -8119,7 +8367,7 @@ fn parse_subscript_on_upstream_state_in_sibling_file() {
         .expect("resource present");
     let v = res.attributes.get("account_id").unwrap();
     match v {
-        Value::ResourceRef { path } => {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
             assert_eq!(path.binding(), "orgs");
             assert_eq!(path.attribute(), "accounts");
             assert!(path.field_path().is_empty());
@@ -8175,12 +8423,15 @@ fn parse_subscript_on_upstream_state_inside_string_interpolation_sibling_file() 
         .expect("resource present");
     let v = res.attributes.get("arn").unwrap();
     match v {
-        Value::Interpolation(parts) => {
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
             // The middle Expr part should be the upstream ResourceRef
             // with a string subscript.
             let mut found_ref = false;
             for p in parts {
-                if let InterpolationPart::Expr(Value::ResourceRef { path }) = p {
+                if let InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
+                    path,
+                })) = p
+                {
                     assert_eq!(path.binding(), "orgs");
                     assert_eq!(path.attribute(), "accounts");
                     assert_eq!(
@@ -8197,7 +8448,7 @@ fn parse_subscript_on_upstream_state_inside_string_interpolation_sibling_file() 
                 "expected a ResourceRef expression part in the interpolation, got {parts:?}"
             );
         }
-        other => panic!("expected Value::Interpolation, got {other:?}"),
+        other => panic!("expected Value::Deferred(DeferredValue::Interpolation), got {other:?}"),
     }
 }
 
@@ -8205,9 +8456,9 @@ fn parse_subscript_on_upstream_state_inside_string_interpolation_sibling_file() 
 // #2447: dot-notation upstream_state field access across sibling files
 //
 // Symmetric with the #2435 subscript fixes above: `${orgs.accounts.k}` must
-// also lower to `Value::ResourceRef` when the `let orgs = upstream_state{...}`
+// also lower to `Value::Deferred(DeferredValue::ResourceRef)` when the `let orgs = upstream_state{...}`
 // declaration lives in a sibling .crn. Without this, the dotted form falls
-// through to a `Value::String("orgs.accounts.k")` literal and the literal
+// through to a `Value::Concrete(ConcreteValue::String("orgs.accounts.k"))` literal and the literal
 // flows through the resolver into the rendered plan.
 // ================================================================
 
@@ -8247,7 +8498,7 @@ fn parse_dot_notation_on_upstream_state_in_sibling_file() {
         .expect("resource present");
     let v = res.attributes.get("account_id").unwrap();
     match v {
-        Value::ResourceRef { path } => {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
             assert_eq!(path.binding(), "orgs");
             assert_eq!(path.attribute(), "accounts");
             assert_eq!(path.field_path(), ["registry_dev".to_string()]);
@@ -8260,7 +8511,7 @@ fn parse_dot_notation_on_upstream_state_in_sibling_file() {
 #[test]
 fn parse_dot_notation_on_upstream_state_inside_string_interpolation_sibling_file() {
     // `"prefix${orgs.accounts.registry_dev}suffix"` must lower the field
-    // access into a `Value::ResourceRef` so the resolver can substitute
+    // access into a `Value::Deferred(DeferredValue::ResourceRef)` so the resolver can substitute
     // the actual map value at plan time. Without this fix the embedded
     // ${...} renders the literal substring `orgs.accounts.registry_dev`
     // into the output.
@@ -8298,10 +8549,13 @@ fn parse_dot_notation_on_upstream_state_inside_string_interpolation_sibling_file
         .expect("resource present");
     let v = res.attributes.get("arn").unwrap();
     match v {
-        Value::Interpolation(parts) => {
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
             let mut found_ref = false;
             for p in parts {
-                if let InterpolationPart::Expr(Value::ResourceRef { path }) = p {
+                if let InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
+                    path,
+                })) = p
+                {
                     assert_eq!(path.binding(), "orgs");
                     assert_eq!(path.attribute(), "accounts");
                     assert_eq!(path.field_path(), ["registry_dev".to_string()]);
@@ -8313,7 +8567,7 @@ fn parse_dot_notation_on_upstream_state_inside_string_interpolation_sibling_file
                 "expected a ResourceRef expression part in the interpolation, got {parts:?}"
             );
         }
-        other => panic!("expected Value::Interpolation, got {other:?}"),
+        other => panic!("expected Value::Deferred(DeferredValue::Interpolation), got {other:?}"),
     }
 }
 
@@ -8368,8 +8622,8 @@ fn parse_directory_resolves_sibling_user_fn_with_static_args() {
         .expect("resource present");
     let v = res.attributes.get("created_at").unwrap();
     match v {
-        Value::String(s) if s == "2026-05-05" => {}
-        Value::FunctionCall { name, .. } if name == "timestamp" => {}
+        Value::Concrete(ConcreteValue::String(s)) if s == "2026-05-05" => {}
+        Value::Deferred(DeferredValue::FunctionCall { name, .. }) if name == "timestamp" => {}
         other => panic!(
             "expected timestamp() to resolve to a String or be kept as FunctionCall, got {other:?}"
         ),
@@ -8422,7 +8676,7 @@ fn parse_directory_resolves_sibling_user_fn_in_top_level_let() {
         .get("v")
         .expect("variable `v` should be present");
     assert!(
-        matches!(v, Value::String(s) if s == "2026-05-05"),
+        matches!(v, Value::Concrete(ConcreteValue::String(s)) if s == "2026-05-05"),
         "expected `v` to resolve to the user-fn body, got: {v:?}"
     );
 }
@@ -8473,15 +8727,15 @@ fn parse_directory_resolves_sibling_user_fn_in_let_list() {
         .expect("List containing sibling user-fn must parse");
     let v = parsed.variables.get("xs").expect("xs present");
     match v {
-        Value::List(items) => {
+        Value::Concrete(ConcreteValue::List(items)) => {
             assert_eq!(items.len(), 2);
             assert!(
-                matches!(&items[0], Value::String(s) if s == "2026"),
+                matches!(&items[0], Value::Concrete(ConcreteValue::String(s)) if s == "2026"),
                 "first item should resolve to user-fn body, got: {:?}",
                 items[0]
             );
         }
-        other => panic!("expected Value::List, got {other:?}"),
+        other => panic!("expected Value::Concrete(ConcreteValue::List), got {other:?}"),
     }
 }
 
@@ -8499,14 +8753,14 @@ fn parse_directory_resolves_sibling_user_fn_in_let_map() {
         .expect("Map containing sibling user-fn must parse");
     let v = parsed.variables.get("m").expect("m present");
     match v {
-        Value::Map(map) => {
+        Value::Concrete(ConcreteValue::Map(map)) => {
             let entry = map.get("created_at").expect("created_at key");
             assert!(
-                matches!(entry, Value::String(s) if s == "2026"),
+                matches!(entry, Value::Concrete(ConcreteValue::String(s)) if s == "2026"),
                 "map value should resolve to user-fn body, got: {entry:?}"
             );
         }
-        other => panic!("expected Value::Map, got {other:?}"),
+        other => panic!("expected Value::Concrete(ConcreteValue::Map), got {other:?}"),
     }
 }
 
@@ -8524,7 +8778,7 @@ fn parse_directory_resolves_sibling_user_fn_in_let_interpolation() {
         .expect("Interpolation containing sibling user-fn must parse");
     let v = parsed.variables.get("s").expect("s present");
     assert!(
-        matches!(v, Value::String(s) if s == "prefix-2026-suffix"),
+        matches!(v, Value::Concrete(ConcreteValue::String(s)) if s == "prefix-2026-suffix"),
         "interpolation should canonicalize to the joined string, got: {v:?}"
     );
 }
@@ -8614,7 +8868,7 @@ arguments {
     let arg = &parsed.arguments[0];
     assert_eq!(
         arg.default.as_ref().unwrap(),
-        &Value::String("prod".to_string())
+        &Value::Concrete(ConcreteValue::String("prod".to_string()))
     );
 }
 
@@ -8721,8 +8975,10 @@ fn parse_duration_literal_minutes() {
     let parsed = parse_and_resolve("let t = 75min").expect("parse should succeed");
     let v = parsed.variables.get("t").expect("t binding present");
     match v {
-        Value::Duration(d) => assert_eq!(*d, std::time::Duration::from_secs(75 * 60)),
-        other => panic!("expected Value::Duration, got {other:?}"),
+        Value::Concrete(ConcreteValue::Duration(d)) => {
+            assert_eq!(*d, std::time::Duration::from_secs(75 * 60))
+        }
+        other => panic!("expected Value::Concrete(ConcreteValue::Duration), got {other:?}"),
     }
 }
 
@@ -8749,8 +9005,10 @@ fn parse_duration_literal_all_units() {
             parse_and_resolve(&input).unwrap_or_else(|e| panic!("parse failed for {src}: {e}"));
         let v = parsed.variables.get("t").expect("t binding present");
         match v {
-            Value::Duration(d) => assert_eq!(d, expected, "case {src}"),
-            other => panic!("case {src}: expected Value::Duration, got {other:?}"),
+            Value::Concrete(ConcreteValue::Duration(d)) => assert_eq!(d, expected, "case {src}"),
+            other => panic!(
+                "case {src}: expected Value::Concrete(ConcreteValue::Duration), got {other:?}"
+            ),
         }
     }
 }
@@ -8758,12 +9016,12 @@ fn parse_duration_literal_all_units() {
 #[test]
 fn parse_bare_number_still_parses_as_int() {
     // Regression: an integer literal without a unit suffix must still
-    // be Value::Int, not interpreted as a malformed duration.
+    // be Value::Concrete(ConcreteValue::Int), not interpreted as a malformed duration.
     let parsed = parse_and_resolve("let n = 30").expect("parse should succeed");
     let v = parsed.variables.get("n").expect("n binding present");
     match v {
-        Value::Int(30) => {}
-        other => panic!("expected Value::Int(30), got {other:?}"),
+        Value::Concrete(ConcreteValue::Int(30)) => {}
+        other => panic!("expected Value::Concrete(ConcreteValue::Int(30)), got {other:?}"),
     }
 }
 
@@ -8781,11 +9039,11 @@ fn parse_duration_inside_list_and_map() {
     )
     .expect("list/map of Duration must parse");
     match parsed.variables.get("xs") {
-        Some(Value::List(items)) => {
+        Some(Value::Concrete(ConcreteValue::List(items))) => {
             let secs: Vec<u64> = items
                 .iter()
                 .map(|v| match v {
-                    Value::Duration(d) => d.as_secs(),
+                    Value::Concrete(ConcreteValue::Duration(d)) => d.as_secs(),
                     other => panic!("list element was not Duration: {other:?}"),
                 })
                 .collect();
@@ -8794,11 +9052,11 @@ fn parse_duration_inside_list_and_map() {
         other => panic!("expected list of Duration, got {other:?}"),
     }
     match parsed.variables.get("m") {
-        Some(Value::Map(map)) => {
+        Some(Value::Concrete(ConcreteValue::Map(map))) => {
             let a = map.get("a").expect("entry `a` present");
             let b = map.get("b").expect("entry `b` present");
-            assert!(matches!(a, Value::Duration(d) if d.as_secs() == 300));
-            assert!(matches!(b, Value::Duration(d) if d.as_secs() == 30));
+            assert!(matches!(a, Value::Concrete(ConcreteValue::Duration(d)) if d.as_secs() == 300));
+            assert!(matches!(b, Value::Concrete(ConcreteValue::Duration(d)) if d.as_secs() == 30));
         }
         other => panic!("expected map of Duration, got {other:?}"),
     }
@@ -8807,14 +9065,14 @@ fn parse_duration_inside_list_and_map() {
 #[test]
 fn parse_duration_rejects_internal_whitespace() {
     // `30 min` must NOT parse as a duration. Either the parse fails,
-    // or the value is something other than `Value::Duration` (most
-    // likely `Value::Int(30)` followed by a parse error from `min`).
+    // or the value is something other than `Value::Concrete(ConcreteValue::Duration)` (most
+    // likely `Value::Concrete(ConcreteValue::Int(30))` followed by a parse error from `min`).
     let result = parse_and_resolve("let t = 30 min");
     if let Ok(parsed) = result
         && let Some(v) = parsed.variables.get("t")
     {
         assert!(
-            !matches!(v, Value::Duration(_)),
+            !matches!(v, Value::Concrete(ConcreteValue::Duration(_))),
             "`30 min` must not parse as a Duration, got {v:?}"
         );
     }
@@ -8871,12 +9129,16 @@ fn parse_duration_in_directory_scoped_fixture() {
         .find(|r| r.attributes.contains_key("zero_time"))
         .expect("cert resource (with `zero_time`) present");
     match cert.attributes.get("wait_time") {
-        Some(Value::Duration(d)) => assert_eq!(*d, std::time::Duration::from_secs(4500)),
-        other => panic!("expected Value::Duration(4500), got {other:?}"),
+        Some(Value::Concrete(ConcreteValue::Duration(d))) => {
+            assert_eq!(*d, std::time::Duration::from_secs(4500))
+        }
+        other => panic!("expected Value::Concrete(ConcreteValue::Duration(4500)), got {other:?}"),
     }
     match cert.attributes.get("zero_time") {
-        Some(Value::Duration(d)) => assert_eq!(*d, std::time::Duration::ZERO),
-        other => panic!("expected Value::Duration(0), got {other:?}"),
+        Some(Value::Concrete(ConcreteValue::Duration(d))) => {
+            assert_eq!(*d, std::time::Duration::ZERO)
+        }
+        other => panic!("expected Value::Concrete(ConcreteValue::Duration(0)), got {other:?}"),
     }
     // The sibling file's resource is identifiable by lacking the
     // `zero_time` attribute that only `cert` carries.
@@ -8886,8 +9148,10 @@ fn parse_duration_in_directory_scoped_fixture() {
         .find(|r| r.attributes.contains_key("wait_time") && !r.attributes.contains_key("zero_time"))
         .expect("sibling-file resource present");
     match other.attributes.get("wait_time") {
-        Some(Value::Duration(d)) => assert_eq!(*d, std::time::Duration::from_secs(5 * 60)),
-        other => panic!("expected Value::Duration(300), got {other:?}"),
+        Some(Value::Concrete(ConcreteValue::Duration(d))) => {
+            assert_eq!(*d, std::time::Duration::from_secs(5 * 60))
+        }
+        other => panic!("expected Value::Concrete(ConcreteValue::Duration(300)), got {other:?}"),
     }
 }
 

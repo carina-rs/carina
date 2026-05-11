@@ -7,7 +7,7 @@ use super::ast::{AttributeParameter, ExportParameter, ModuleCall, ParsedFile};
 use super::error::{ParseError, undefined_identifier_error};
 use super::static_eval::is_static_value;
 use crate::eval_value::EvalValue;
-use crate::resource::{Resource, Value};
+use crate::resource::{ConcreteValue, DeferredValue, Resource, Value};
 use indexmap::IndexMap;
 use std::collections::HashMap;
 
@@ -31,7 +31,7 @@ pub(super) fn resolve_forward_references(
         // round-trip. The placeholder is overwritten on the next line,
         // so its identity doesn't matter.
         for (_, attr) in resource.attributes.iter_mut() {
-            let placeholder = Value::Bool(false);
+            let placeholder = Value::Concrete(ConcreteValue::Bool(false));
             let value = std::mem::replace(attr, placeholder);
             *attr = resolve_forward_ref_in_value(value, resource_bindings);
         }
@@ -67,7 +67,7 @@ fn resolve_forward_ref_in_value(
     resource_bindings: &HashMap<String, Resource>,
 ) -> Value {
     match value {
-        Value::String(ref s) => {
+        Value::Concrete(ConcreteValue::String(ref s)) => {
             // A dotted string like "vpc.vpc_id" or "vpc.attr.nested" may be a
             // forward reference that was stored as a string during single-pass
             // parsing. Resolve it to ResourceRef if the first segment is a known
@@ -82,20 +82,20 @@ fn resolve_forward_ref_in_value(
             }
             value
         }
-        Value::List(items) => Value::List(
+        Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
             items
                 .into_iter()
                 .map(|v| resolve_forward_ref_in_value(v, resource_bindings))
                 .collect(),
-        ),
-        Value::Map(map) => Value::Map(
+        )),
+        Value::Concrete(ConcreteValue::Map(map)) => Value::Concrete(ConcreteValue::Map(
             map.into_iter()
                 .map(|(k, v)| (k, resolve_forward_ref_in_value(v, resource_bindings)))
                 .collect(),
-        ),
-        Value::Interpolation(parts) => {
+        )),
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
             use crate::resource::InterpolationPart;
-            Value::Interpolation(
+            Value::Deferred(DeferredValue::Interpolation(
                 parts
                     .into_iter()
                     .map(|p| match p {
@@ -105,16 +105,18 @@ fn resolve_forward_ref_in_value(
                         other => other,
                     })
                     .collect(),
-            )
+            ))
             .canonicalize()
         }
-        Value::FunctionCall { name, args } => Value::FunctionCall {
-            name,
-            args: args
-                .into_iter()
-                .map(|v| resolve_forward_ref_in_value(v, resource_bindings))
-                .collect(),
-        },
+        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
+            Value::Deferred(DeferredValue::FunctionCall {
+                name,
+                args: args
+                    .into_iter()
+                    .map(|v| resolve_forward_ref_in_value(v, resource_bindings))
+                    .collect(),
+            })
+        }
         other => other,
     }
 }
@@ -127,7 +129,7 @@ pub fn resolve_resource_refs(parsed: &mut ParsedFile) -> Result<(), ParseError> 
 
 /// Resolve resource references with the given parser configuration.
 ///
-/// `parsed.user_functions` is consulted when resolving `Value::FunctionCall`
+/// `parsed.user_functions` is consulted when resolving `Value::Deferred(DeferredValue::FunctionCall)`
 /// values — a name that isn't a builtin but is a user-defined function in
 /// the merged directory parse triggers user-fn evaluation here, even when
 /// the per-file parse couldn't evaluate it because the `fn` declaration
@@ -183,7 +185,7 @@ pub fn resolve_resource_refs_with_config(
     }
 
     // Build a `ParseContext` once, populated with the merged
-    // directory's user functions so a `Value::FunctionCall` whose name
+    // directory's user functions so a `Value::Deferred(DeferredValue::FunctionCall)` whose name
     // is a sibling-defined user-fn (visible only in the merged parse —
     // #2444) is evaluated here rather than rejected as "Unknown
     // built-in function". The HashMap is small (typically a handful of
@@ -208,11 +210,11 @@ pub fn resolve_resource_refs_with_config(
     }
 
     // Resolve top-level `let v = ...` bindings that contain
-    // `Value::FunctionCall` placeholders deferred by the per-file
+    // `Value::Deferred(DeferredValue::FunctionCall)` placeholders deferred by the per-file
     // parse — typically `fn X(...)` lives in a sibling `.crn` (#2444).
     // The variant below only mutates `FunctionCall` arms, leaving
-    // other shapes (`Value::String("${vpc}")` placeholder,
-    // `Value::ResourceRef`, etc.) untouched so earlier passes
+    // other shapes (`Value::Concrete(ConcreteValue::String("${vpc}"))` placeholder,
+    // `Value::Deferred(DeferredValue::ResourceRef)`, etc.) untouched so earlier passes
     // (`upstream_exports`, `BindingNameSet`) keep seeing the raw
     // unresolved forms they expect.
     let var_keys: Vec<String> = parsed.variables.keys().cloned().collect();
@@ -224,7 +226,7 @@ pub fn resolve_resource_refs_with_config(
 
     // Resolve cross-file forward references in export_params.
     // During per-file parsing, "binding.attribute" strings from sibling files
-    // remain as Value::String. Convert them to ResourceRef now that the full
+    // remain as Value::Concrete(ConcreteValue::String). Convert them to ResourceRef now that the full
     // binding map is available.
     let resource_bindings: HashMap<String, Resource> = parsed
         .resources
@@ -375,36 +377,38 @@ fn resolve_value_with_config(
     fn_ctx: &super::ParseContext<'_>,
 ) -> Result<Value, ParseError> {
     match value {
-        Value::ResourceRef { path } => match binding_map.get(path.binding()) {
-            Some(attributes) => match attributes.get(path.attribute()) {
-                Some(attr_value) => {
-                    // Recursively resolve in case the attribute itself is a reference
-                    resolve_value_with_config(attr_value, binding_map, fn_ctx)
-                }
-                None => {
-                    // Attribute not found, keep as reference (might be resolved at runtime)
-                    Ok(value.clone())
-                }
-            },
-            // Binding not found in *this* file's binding_map. The same
-            // resolver runs both per-file (config_loader.rs L93) and on
-            // the merged `ParsedFile` (L178); a per-file miss may be a
-            // legitimate cross-file ref (`upstream_state` declared in a
-            // sibling `.crn`, resource binding from another file).
-            // Keep the ref as-is and let the post-merge
-            // `check_identifier_scope` walk surface any genuine
-            // undefined identifiers — that walk has full directory
-            // context plus did-you-mean suggestions.
-            None => Ok(value.clone()),
-        },
-        Value::List(items) => {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+            match binding_map.get(path.binding()) {
+                Some(attributes) => match attributes.get(path.attribute()) {
+                    Some(attr_value) => {
+                        // Recursively resolve in case the attribute itself is a reference
+                        resolve_value_with_config(attr_value, binding_map, fn_ctx)
+                    }
+                    None => {
+                        // Attribute not found, keep as reference (might be resolved at runtime)
+                        Ok(value.clone())
+                    }
+                },
+                // Binding not found in *this* file's binding_map. The same
+                // resolver runs both per-file (config_loader.rs L93) and on
+                // the merged `ParsedFile` (L178); a per-file miss may be a
+                // legitimate cross-file ref (`upstream_state` declared in a
+                // sibling `.crn`, resource binding from another file).
+                // Keep the ref as-is and let the post-merge
+                // `check_identifier_scope` walk surface any genuine
+                // undefined identifiers — that walk has full directory
+                // context plus did-you-mean suggestions.
+                None => Ok(value.clone()),
+            }
+        }
+        Value::Concrete(ConcreteValue::List(items)) => {
             let resolved: Result<Vec<Value>, ParseError> = items
                 .iter()
                 .map(|item| resolve_value_with_config(item, binding_map, fn_ctx))
                 .collect();
-            Ok(Value::List(resolved?))
+            Ok(Value::Concrete(ConcreteValue::List(resolved?)))
         }
-        Value::Map(map) => {
+        Value::Concrete(ConcreteValue::Map(map)) => {
             let mut resolved: IndexMap<String, Value> = IndexMap::new();
             for (k, v) in map {
                 resolved.insert(
@@ -412,9 +416,9 @@ fn resolve_value_with_config(
                     resolve_value_with_config(v, binding_map, fn_ctx)?,
                 );
             }
-            Ok(Value::Map(resolved))
+            Ok(Value::Concrete(ConcreteValue::Map(resolved)))
         }
-        Value::Interpolation(parts) => {
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
             use crate::resource::InterpolationPart;
             let resolved: Result<Vec<InterpolationPart>, ParseError> = parts
                 .iter()
@@ -425,9 +429,9 @@ fn resolve_value_with_config(
                     other => Ok(other.clone()),
                 })
                 .collect();
-            Ok(Value::Interpolation(resolved?).canonicalize())
+            Ok(Value::Deferred(DeferredValue::Interpolation(resolved?)).canonicalize())
         }
-        Value::FunctionCall { name, args } => {
+        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
             let resolved_args: Result<Vec<Value>, ParseError> = args
                 .iter()
                 .map(|a| resolve_value_with_config(a, binding_map, fn_ctx))
@@ -474,10 +478,10 @@ fn resolve_value_with_config(
                         })
                     } else {
                         // Args contain unresolved refs — keep as FunctionCall for later resolution
-                        Ok(Value::FunctionCall {
+                        Ok(Value::Deferred(DeferredValue::FunctionCall {
                             name: name.clone(),
                             args: resolved_args,
-                        })
+                        }))
                     }
                 }
             }
@@ -486,7 +490,7 @@ fn resolve_value_with_config(
     }
 }
 
-/// Walk a value tree and finalize any `Value::FunctionCall` placeholder
+/// Walk a value tree and finalize any `Value::Deferred(DeferredValue::FunctionCall)` placeholder
 /// that the per-file parse deferred (typically because the user-fn
 /// lives in a sibling `.crn` — #2444). Recurses through `List` / `Map`
 /// / `Interpolation` containers so deferred calls inside them surface
@@ -500,15 +504,17 @@ fn resolve_function_calls_only(
 ) -> Result<Value, ParseError> {
     use crate::resource::InterpolationPart;
     match value {
-        Value::FunctionCall { .. } => resolve_value_with_config(value, binding_map, fn_ctx),
-        Value::List(items) => {
+        Value::Deferred(DeferredValue::FunctionCall { .. }) => {
+            resolve_value_with_config(value, binding_map, fn_ctx)
+        }
+        Value::Concrete(ConcreteValue::List(items)) => {
             let resolved: Result<Vec<Value>, ParseError> = items
                 .iter()
                 .map(|v| resolve_function_calls_only(v, binding_map, fn_ctx))
                 .collect();
-            Ok(Value::List(resolved?))
+            Ok(Value::Concrete(ConcreteValue::List(resolved?)))
         }
-        Value::Map(map) => {
+        Value::Concrete(ConcreteValue::Map(map)) => {
             let mut resolved: IndexMap<String, Value> = IndexMap::new();
             for (k, v) in map {
                 resolved.insert(
@@ -516,9 +522,9 @@ fn resolve_function_calls_only(
                     resolve_function_calls_only(v, binding_map, fn_ctx)?,
                 );
             }
-            Ok(Value::Map(resolved))
+            Ok(Value::Concrete(ConcreteValue::Map(resolved)))
         }
-        Value::Interpolation(parts) => {
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
             let resolved: Result<Vec<InterpolationPart>, ParseError> = parts
                 .iter()
                 .map(|p| match p {
@@ -528,7 +534,7 @@ fn resolve_function_calls_only(
                     other => Ok(other.clone()),
                 })
                 .collect();
-            Ok(Value::Interpolation(resolved?).canonicalize())
+            Ok(Value::Deferred(DeferredValue::Interpolation(resolved?)).canonicalize())
         }
         _ => Ok(value.clone()),
     }
@@ -601,7 +607,7 @@ pub fn finalize_provider_configs<E>(parsed: &mut super::File<E>) -> Result<(), P
     for provider in parsed.providers.iter_mut() {
         if let Some(value) = provider.unresolved_attributes.shift_remove("default_tags") {
             match value {
-                Value::Map(tags) => {
+                Value::Concrete(ConcreteValue::Map(tags)) => {
                     provider.default_tags = tags;
                 }
                 other => {

@@ -117,7 +117,10 @@ fn region_schemas() -> SchemaRegistry {
     // `carina-aws-types::types::aws_region` does.
     fn validate_region(v: &carina_core::resource::Value) -> Result<(), String> {
         const VALID: &[&str] = &["ap-northeast-1", "us-west-2"];
-        if let carina_core::resource::Value::String(s) = v {
+        if let carina_core::resource::Value::Concrete(
+            carina_core::resource::ConcreteValue::String(s),
+        ) = v
+        {
             // Same shape as `aws_region()`: strip any namespace prefix
             // (DSL form) and rewrite `_` → `-` to get the AWS form.
             let normalized = carina_core::utils::extract_enum_value(s).replace('_', "-");

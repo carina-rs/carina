@@ -4,7 +4,7 @@ use crate::provider::{
     BoxFuture, CreateRequest, DeleteRequest, ProviderError, ProviderResult, ReadRequest,
     UpdateRequest,
 };
-use crate::resource::{Directives, Resource, Value};
+use crate::resource::{ConcreteValue, Directives, Resource, Value};
 use parallel::{build_dependency_levels, build_dependency_map};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -1197,7 +1197,10 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
     // VPC resource with binding "vpc"
     let mut vpc = Resource::new("test", "my-vpc");
     vpc.binding = Some("vpc".to_string());
-    vpc.set_attr("cidr_block", Value::String("10.0.0.0/16".to_string()));
+    vpc.set_attr(
+        "cidr_block",
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+    );
     let vpc_id = vpc.id.clone();
 
     // Subnet resource that references vpc.vpc_id
@@ -1206,7 +1209,10 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
         "vpc_id",
         Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
     );
-    subnet.set_attr("cidr_block", Value::String("10.0.1.0/24".to_string()));
+    subnet.set_attr(
+        "cidr_block",
+        Value::Concrete(ConcreteValue::String("10.0.1.0/24".to_string())),
+    );
     subnet.dependency_bindings = std::collections::BTreeSet::from(["vpc".to_string()]);
     let subnet_id = subnet.id.clone();
 
@@ -1217,9 +1223,12 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
     // VPC create returns state with vpc_id
     let vpc_state = State::existing(
         vpc_id.clone(),
-        vec![("vpc_id".to_string(), Value::String("vpc-12345".to_string()))]
-            .into_iter()
-            .collect(),
+        vec![(
+            "vpc_id".to_string(),
+            Value::Concrete(ConcreteValue::String("vpc-12345".to_string())),
+        )]
+        .into_iter()
+        .collect(),
     )
     .with_identifier("vpc-12345");
     provider.push_create(Ok(vpc_state));
@@ -1229,7 +1238,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
         subnet_id.clone(),
         vec![(
             "subnet_id".to_string(),
-            Value::String("subnet-67890".to_string()),
+            Value::Concrete(ConcreteValue::String("subnet-67890".to_string())),
         )]
         .into_iter()
         .collect(),
@@ -1262,7 +1271,9 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
     let subnet_attrs = &create_calls[1].1;
     assert_eq!(
         subnet_attrs.get("vpc_id"),
-        Some(&Value::String("vpc-12345".to_string())),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "vpc-12345".to_string()
+        ))),
         "Subnet's vpc_id should be resolved from VPC state, got: {:?}",
         subnet_attrs.get("vpc_id")
     );
@@ -1548,7 +1559,7 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
         target_identifier: None,
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
-            value: Value::String("ISSUED".to_string()),
+            value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
         },
         until_surface: "cert.status == ISSUED".to_string(),
         timeout: std::time::Duration::from_secs(60),
@@ -1562,7 +1573,7 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
     let mut create_attrs = HashMap::new();
     create_attrs.insert(
         "status".to_string(),
-        Value::String("PENDING_VALIDATION".to_string()),
+        Value::Concrete(ConcreteValue::String("PENDING_VALIDATION".to_string())),
     );
     provider.push_create(Ok(
         State::existing(cert_id.clone(), create_attrs).with_identifier("acm-cert-id")
@@ -1571,13 +1582,16 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
     let mut pending = HashMap::new();
     pending.insert(
         "status".to_string(),
-        Value::String("PENDING_VALIDATION".to_string()),
+        Value::Concrete(ConcreteValue::String("PENDING_VALIDATION".to_string())),
     );
     let mut issued = HashMap::new();
-    issued.insert("status".to_string(), Value::String("ISSUED".to_string()));
+    issued.insert(
+        "status".to_string(),
+        Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+    );
     issued.insert(
         "arn".to_string(),
-        Value::String("arn:aws:acm:...".to_string()),
+        Value::Concrete(ConcreteValue::String("arn:aws:acm:...".to_string())),
     );
     provider.push_read(Ok(State::existing(cert_id.clone(), pending.clone())));
     provider.push_read(Ok(State::existing(cert_id.clone(), pending)));
@@ -1630,7 +1644,7 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
         target_identifier: None,
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
-            value: Value::String("ISSUED".to_string()),
+            value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
         },
         until_surface: "cert.status == ISSUED".to_string(),
         timeout: std::time::Duration::from_secs(60),
@@ -1639,7 +1653,10 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
     });
 
     let mut issued = HashMap::new();
-    issued.insert("status".to_string(), Value::String("ISSUED".to_string()));
+    issued.insert(
+        "status".to_string(),
+        Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+    );
     provider.push_create(Ok(
         State::existing(cert_id.clone(), issued.clone()).with_identifier("acm-cert-id")
     ));

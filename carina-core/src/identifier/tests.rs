@@ -26,7 +26,7 @@ fn test_resolve_attr_prefixes_extracts_prefix_and_generates_name() {
     let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket");
     resource.set_attr(
         "bucket_name_prefix".to_string(),
-        Value::String("my-app-".to_string()),
+        Value::Concrete(ConcreteValue::String("my-app-".to_string())),
     );
 
     let schemas = registry_with_s3_bucket();
@@ -38,7 +38,7 @@ fn test_resolve_attr_prefixes_extracts_prefix_and_generates_name() {
 
     // bucket_name should be generated with the prefix
     let bucket_name = match resources[0].get_attr("bucket_name").unwrap() {
-        Value::String(s) => s.clone(),
+        Value::Concrete(ConcreteValue::String(s)) => s.clone(),
         _ => panic!("expected String"),
     };
     assert!(bucket_name.starts_with("my-app-"));
@@ -56,7 +56,7 @@ fn test_resolve_attr_prefixes_leaves_non_matching_prefix_alone() {
     let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket");
     resource.set_attr(
         "nonexistent_attr_prefix".to_string(),
-        Value::String("some-value".to_string()),
+        Value::Concrete(ConcreteValue::String("some-value".to_string())),
     );
 
     let schemas = registry_with_s3_bucket();
@@ -77,11 +77,11 @@ fn test_resolve_attr_prefixes_errors_when_both_prefix_and_attr_specified() {
     let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket");
     resource.set_attr(
         "bucket_name_prefix".to_string(),
-        Value::String("my-app-".to_string()),
+        Value::Concrete(ConcreteValue::String("my-app-".to_string())),
     );
     resource.set_attr(
         "bucket_name".to_string(),
-        Value::String("my-actual-bucket".to_string()),
+        Value::Concrete(ConcreteValue::String("my-actual-bucket".to_string())),
     );
 
     let schemas = registry_with_s3_bucket();
@@ -96,7 +96,7 @@ fn test_resolve_attr_prefixes_errors_on_empty_prefix() {
     let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket");
     resource.set_attr(
         "bucket_name_prefix".to_string(),
-        Value::String("".to_string()),
+        Value::Concrete(ConcreteValue::String("".to_string())),
     );
 
     let schemas = registry_with_s3_bucket();
@@ -114,7 +114,7 @@ fn test_reconcile_prefixed_names_reuses_state_name_when_prefix_matches() {
         .insert("bucket_name".to_string(), "my-app-".to_string());
     resource.set_attr(
         "bucket_name".to_string(),
-        Value::String("my-app-temporary".to_string()),
+        Value::Concrete(ConcreteValue::String("my-app-temporary".to_string())),
     );
 
     let mut resources = vec![resource];
@@ -132,7 +132,9 @@ fn test_reconcile_prefixed_names_reuses_state_name_when_prefix_matches() {
     // Should reuse the state name, not the temporary one
     assert_eq!(
         resources[0].get_attr("bucket_name"),
-        Some(&Value::String("my-app-existing1".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "my-app-existing1".to_string()
+        )))
     );
 }
 
@@ -144,7 +146,7 @@ fn test_reconcile_prefixed_names_generates_new_name_when_prefix_changes() {
         .insert("bucket_name".to_string(), "new-prefix-".to_string());
     resource.set_attr(
         "bucket_name".to_string(),
-        Value::String("new-prefix-abcd1234".to_string()),
+        Value::Concrete(ConcreteValue::String("new-prefix-abcd1234".to_string())),
     );
 
     let mut resources = vec![resource];
@@ -165,7 +167,9 @@ fn test_reconcile_prefixed_names_generates_new_name_when_prefix_changes() {
     // Should keep the newly generated name since prefix changed
     assert_eq!(
         resources[0].get_attr("bucket_name"),
-        Some(&Value::String("new-prefix-abcd1234".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "new-prefix-abcd1234".to_string()
+        )))
     );
 }
 
@@ -177,7 +181,7 @@ fn test_reconcile_prefixed_names_keeps_generated_name_when_no_state() {
         .insert("bucket_name".to_string(), "my-app-".to_string());
     resource.set_attr(
         "bucket_name".to_string(),
-        Value::String("my-app-abcd1234".to_string()),
+        Value::Concrete(ConcreteValue::String("my-app-abcd1234".to_string())),
     );
 
     let mut resources = vec![resource];
@@ -186,7 +190,9 @@ fn test_reconcile_prefixed_names_keeps_generated_name_when_no_state() {
     // No state, so keep the generated name
     assert_eq!(
         resources[0].get_attr("bucket_name"),
-        Some(&Value::String("my-app-abcd1234".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "my-app-abcd1234".to_string()
+        )))
     );
 }
 
@@ -214,9 +220,12 @@ fn test_reconcile_anonymous_id_partial_create_only_match() {
     let mut r1 = Resource::with_provider("awscc", "iam.role", "");
     r1.set_attr(
         "role_name".to_string(),
-        Value::String("my-role".to_string()),
+        Value::Concrete(ConcreteValue::String("my-role".to_string())),
     );
-    r1.set_attr("path".to_string(), Value::String("/".to_string()));
+    r1.set_attr(
+        "path".to_string(),
+        Value::Concrete(ConcreteValue::String("/".to_string())),
+    );
     let mut resources1 = vec![r1];
     compute_anonymous_identifiers(&mut resources1, &providers, &schemas, &identity_fn).unwrap();
     let step1_id = resources1[0].id.name_str().to_string();
@@ -225,9 +234,12 @@ fn test_reconcile_anonymous_id_partial_create_only_match() {
     let mut r2 = Resource::with_provider("awscc", "iam.role", "");
     r2.set_attr(
         "role_name".to_string(),
-        Value::String("my-role".to_string()),
+        Value::Concrete(ConcreteValue::String("my-role".to_string())),
     );
-    r2.set_attr("path".to_string(), Value::String("/carina/".to_string()));
+    r2.set_attr(
+        "path".to_string(),
+        Value::Concrete(ConcreteValue::String("/carina/".to_string())),
+    );
     let mut resources2 = vec![r2];
     compute_anonymous_identifiers(&mut resources2, &providers, &schemas, &identity_fn).unwrap();
     let step2_id = resources2[0].id.name_str().to_string();
@@ -265,9 +277,12 @@ fn test_reconcile_anonymous_id_no_match_when_all_differ() {
     let mut resource = Resource::with_provider("awscc", "iam.role", "iam_role_aabbccdd");
     resource.set_attr(
         "role_name".to_string(),
-        Value::String("new-role".to_string()),
+        Value::Concrete(ConcreteValue::String("new-role".to_string())),
     );
-    resource.set_attr("path".to_string(), Value::String("/new/".to_string()));
+    resource.set_attr(
+        "path".to_string(),
+        Value::Concrete(ConcreteValue::String("/new/".to_string())),
+    );
 
     let original_id = resource.id.name_str().to_string();
     let mut resources = vec![resource];
@@ -303,9 +318,12 @@ fn test_reconcile_anonymous_id_no_match_when_all_same() {
     let mut resource = Resource::with_provider("awscc", "iam.role", "iam_role_aabbccdd");
     resource.set_attr(
         "role_name".to_string(),
-        Value::String("my-role".to_string()),
+        Value::Concrete(ConcreteValue::String("my-role".to_string())),
     );
-    resource.set_attr("path".to_string(), Value::String("/".to_string()));
+    resource.set_attr(
+        "path".to_string(),
+        Value::Concrete(ConcreteValue::String("/".to_string())),
+    );
 
     let original_id = resource.id.name_str().to_string();
     let mut resources = vec![resource];
@@ -341,7 +359,7 @@ fn test_reconcile_anonymous_id_single_create_only_no_reconcile() {
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "ec2_vpc_aabbccdd");
     resource.set_attr(
         "cidr_block".to_string(),
-        Value::String("10.1.0.0/16".to_string()),
+        Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
     );
 
     let original_id = resource.id.name_str().to_string();
@@ -378,7 +396,7 @@ fn test_anonymous_resource_inside_module_keeps_instance_prefix() {
         name: "awscc".to_string(),
         attributes: vec![(
             "region".to_string(),
-            Value::String("ap-northeast-1".to_string()),
+            Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
         )]
         .into_iter()
         .collect(),
@@ -393,7 +411,7 @@ fn test_anonymous_resource_inside_module_keeps_instance_prefix() {
     let mut r = Resource::with_provider("awscc", "iam.RolePolicy", "");
     r.set_attr(
         "policy_name".to_string(),
-        Value::String("inline".to_string()),
+        Value::Concrete(ConcreteValue::String("inline".to_string())),
     );
     r.module_source = Some(ModuleSource::Module {
         name: "github_oidc".to_string(),
@@ -431,7 +449,7 @@ fn test_anonymous_resource_no_create_only_properties() {
         name: "awscc".to_string(),
         attributes: vec![(
             "region".to_string(),
-            Value::String("ap-northeast-1".to_string()),
+            Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
         )]
         .into_iter()
         .collect(),
@@ -444,7 +462,10 @@ fn test_anonymous_resource_no_create_only_properties() {
     let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
     let mut r = Resource::with_provider("awscc", "ec2.eip", "");
-    r.set_attr("domain".to_string(), Value::String("vpc".to_string()));
+    r.set_attr(
+        "domain".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc".to_string())),
+    );
 
     let mut resources = vec![r];
     compute_anonymous_identifiers(&mut resources, &providers, &schemas, &identity_fn).unwrap();
@@ -465,7 +486,7 @@ fn test_anonymous_resource_no_create_only_deterministic() {
         name: "awscc".to_string(),
         attributes: vec![(
             "region".to_string(),
-            Value::String("ap-northeast-1".to_string()),
+            Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
         )]
         .into_iter()
         .collect(),
@@ -479,7 +500,10 @@ fn test_anonymous_resource_no_create_only_deterministic() {
 
     let make_resource = || {
         let mut r = Resource::with_provider("awscc", "ec2.eip", "");
-        r.set_attr("domain".to_string(), Value::String("vpc".to_string()));
+        r.set_attr(
+            "domain".to_string(),
+            Value::Concrete(ConcreteValue::String("vpc".to_string())),
+        );
         r
     };
 
@@ -510,10 +534,16 @@ fn test_anonymous_resource_no_create_only_collision() {
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
     let mut r1 = Resource::with_provider("awscc", "ec2.eip", "");
-    r1.set_attr("domain".to_string(), Value::String("vpc".to_string()));
+    r1.set_attr(
+        "domain".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc".to_string())),
+    );
 
     let mut r2 = Resource::with_provider("awscc", "ec2.eip", "");
-    r2.set_attr("domain".to_string(), Value::String("vpc".to_string()));
+    r2.set_attr(
+        "domain".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc".to_string())),
+    );
 
     let mut resources = vec![r1, r2];
     let result = compute_anonymous_identifiers(&mut resources, &providers, &schemas, &identity_fn);
@@ -553,24 +583,30 @@ fn test_identity_attribute_prevents_collision() {
     let mut r1 = Resource::with_provider("awscc", "route53.record_set", "");
     r1.set_attr(
         "name".to_string(),
-        Value::String("carina-rs.dev".to_string()),
+        Value::Concrete(ConcreteValue::String("carina-rs.dev".to_string())),
     );
     r1.set_attr(
         "hosted_zone_id".to_string(),
-        Value::String("Z123".to_string()),
+        Value::Concrete(ConcreteValue::String("Z123".to_string())),
     );
-    r1.set_attr("type".to_string(), Value::String("A".to_string()));
+    r1.set_attr(
+        "type".to_string(),
+        Value::Concrete(ConcreteValue::String("A".to_string())),
+    );
 
     let mut r2 = Resource::with_provider("awscc", "route53.record_set", "");
     r2.set_attr(
         "name".to_string(),
-        Value::String("carina-rs.dev".to_string()),
+        Value::Concrete(ConcreteValue::String("carina-rs.dev".to_string())),
     );
     r2.set_attr(
         "hosted_zone_id".to_string(),
-        Value::String("Z123".to_string()),
+        Value::Concrete(ConcreteValue::String("Z123".to_string())),
     );
-    r2.set_attr("type".to_string(), Value::String("AAAA".to_string()));
+    r2.set_attr(
+        "type".to_string(),
+        Value::Concrete(ConcreteValue::String("AAAA".to_string())),
+    );
 
     let mut resources = vec![r1, r2];
     compute_anonymous_identifiers(&mut resources, &providers, &schemas, &identity_fn)
@@ -661,7 +697,7 @@ fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
         name: "awscc".to_string(),
         attributes: vec![(
             "region".to_string(),
-            Value::String("ap-northeast-1".to_string()),
+            Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
         )]
         .into_iter()
         .collect(),
@@ -675,11 +711,17 @@ fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
 
     // Step 1: compute identifier with tag_env="production"
     let mut r1 = Resource::with_provider("awscc", "ec2.eip", "");
-    r1.set_attr("domain".to_string(), Value::String("vpc".to_string()));
-    r1.set_attr("tag_name".to_string(), Value::String("my-eip".to_string()));
+    r1.set_attr(
+        "domain".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc".to_string())),
+    );
+    r1.set_attr(
+        "tag_name".to_string(),
+        Value::Concrete(ConcreteValue::String("my-eip".to_string())),
+    );
     r1.set_attr(
         "tag_env".to_string(),
-        Value::String("production".to_string()),
+        Value::Concrete(ConcreteValue::String("production".to_string())),
     );
     let mut resources1 = vec![r1];
     compute_anonymous_identifiers(&mut resources1, &providers, &schemas, &identity_fn).unwrap();
@@ -687,9 +729,18 @@ fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
 
     // Step 2: compute identifier with tag_env="staging" (one attribute changed)
     let mut r2 = Resource::with_provider("awscc", "ec2.eip", "");
-    r2.set_attr("domain".to_string(), Value::String("vpc".to_string()));
-    r2.set_attr("tag_name".to_string(), Value::String("my-eip".to_string()));
-    r2.set_attr("tag_env".to_string(), Value::String("staging".to_string()));
+    r2.set_attr(
+        "domain".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc".to_string())),
+    );
+    r2.set_attr(
+        "tag_name".to_string(),
+        Value::Concrete(ConcreteValue::String("my-eip".to_string())),
+    );
+    r2.set_attr(
+        "tag_env".to_string(),
+        Value::Concrete(ConcreteValue::String("staging".to_string())),
+    );
     let mut resources2 = vec![r2];
     compute_anonymous_identifiers(&mut resources2, &providers, &schemas, &identity_fn).unwrap();
     let new_id = resources2[0].id.name_str().to_string();
@@ -726,7 +777,10 @@ fn test_reconcile_anonymous_id_no_create_only_no_match_when_distant() {
 
     // Resource with a computed identifier
     let mut resource = Resource::with_provider("awscc", "ec2.eip", "ec2_eip_aabbccdd11223344");
-    resource.set_attr("domain".to_string(), Value::String("vpc".to_string()));
+    resource.set_attr(
+        "domain".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc".to_string())),
+    );
 
     let original_id = resource.id.name_str().to_string();
     let mut resources = vec![resource];
@@ -766,7 +820,10 @@ fn test_reconcile_anonymous_id_create_only_exists_but_none_set() {
 
     // Compute identifier without setting the create-only property
     let mut r1 = Resource::with_provider("awscc", "ec2.eip", "");
-    r1.set_attr("domain".to_string(), Value::String("vpc".to_string()));
+    r1.set_attr(
+        "domain".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc".to_string())),
+    );
     let mut resources = vec![r1];
     compute_anonymous_identifiers(&mut resources, &providers, &schemas, &identity_fn).unwrap();
 
@@ -949,10 +1006,22 @@ fn test_reconcile_no_create_only_picks_closest_among_multiple_state_entries() {
     // Compute 3 identifiers with different attributes
     let make_resource = |env: &str, team: &str| {
         let mut r = Resource::with_provider("awscc", "ec2.eip", "");
-        r.set_attr("domain".to_string(), Value::String("vpc".to_string()));
-        r.set_attr("tag_name".to_string(), Value::String("my-eip".to_string()));
-        r.set_attr("tag_env".to_string(), Value::String(env.to_string()));
-        r.set_attr("tag_team".to_string(), Value::String(team.to_string()));
+        r.set_attr(
+            "domain".to_string(),
+            Value::Concrete(ConcreteValue::String("vpc".to_string())),
+        );
+        r.set_attr(
+            "tag_name".to_string(),
+            Value::Concrete(ConcreteValue::String("my-eip".to_string())),
+        );
+        r.set_attr(
+            "tag_env".to_string(),
+            Value::Concrete(ConcreteValue::String(env.to_string())),
+        );
+        r.set_attr(
+            "tag_team".to_string(),
+            Value::Concrete(ConcreteValue::String(team.to_string())),
+        );
         r
     };
 
@@ -1043,7 +1112,10 @@ fn test_reconcile_no_create_only_same_id_in_state_no_change() {
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
     let mut r = Resource::with_provider("awscc", "ec2.eip", "");
-    r.set_attr("domain".to_string(), Value::String("vpc".to_string()));
+    r.set_attr(
+        "domain".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc".to_string())),
+    );
     let mut resources = vec![r];
     compute_anonymous_identifiers(&mut resources, &providers, &schemas, &identity_fn).unwrap();
     let id = resources[0].id.name_str().to_string();
@@ -1070,7 +1142,10 @@ fn test_reconcile_no_create_only_empty_state() {
     schemas.insert("awscc", schema);
 
     let mut resource = Resource::with_provider("awscc", "ec2.eip", "ec2_eip_aabbccdd11223344");
-    resource.set_attr("domain".to_string(), Value::String("vpc".to_string()));
+    resource.set_attr(
+        "domain".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc".to_string())),
+    );
     let original_id = resource.id.name_str().to_string();
     let mut resources = vec![resource];
 
@@ -1101,11 +1176,17 @@ fn test_compute_anonymous_id_uses_simhash_for_no_create_only() {
 
     let make_resource = |env: &str| {
         let mut r = Resource::with_provider("awscc", "ec2.internet_gateway", "");
-        r.set_attr("tag_name".to_string(), Value::String("my-igw".to_string()));
-        r.set_attr("tag_env".to_string(), Value::String(env.to_string()));
+        r.set_attr(
+            "tag_name".to_string(),
+            Value::Concrete(ConcreteValue::String("my-igw".to_string())),
+        );
+        r.set_attr(
+            "tag_env".to_string(),
+            Value::Concrete(ConcreteValue::String(env.to_string())),
+        );
         r.set_attr(
             "tag_team".to_string(),
-            Value::String("platform".to_string()),
+            Value::Concrete(ConcreteValue::String("platform".to_string())),
         );
         r
     };
@@ -1157,13 +1238,22 @@ fn test_compute_anonymous_id_simhash_vs_create_only_hash_independent() {
     let mut vpc = Resource::with_provider("awscc", "ec2.Vpc", "");
     vpc.set_attr(
         "cidr_block".to_string(),
-        Value::String("10.0.0.0/16".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
-    vpc.set_attr("tag_name".to_string(), Value::String("my-vpc".to_string()));
+    vpc.set_attr(
+        "tag_name".to_string(),
+        Value::Concrete(ConcreteValue::String("my-vpc".to_string())),
+    );
 
     let mut eip = Resource::with_provider("awscc", "ec2.eip", "");
-    eip.set_attr("domain".to_string(), Value::String("vpc".to_string()));
-    eip.set_attr("tag_name".to_string(), Value::String("my-eip".to_string()));
+    eip.set_attr(
+        "domain".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc".to_string())),
+    );
+    eip.set_attr(
+        "tag_name".to_string(),
+        Value::Concrete(ConcreteValue::String("my-eip".to_string())),
+    );
 
     let mut resources = vec![vpc, eip];
     compute_anonymous_identifiers(&mut resources, &providers, &schemas, &identity_fn).unwrap();
@@ -1193,9 +1283,12 @@ fn test_reconcile_create_only_path_unaffected_by_simhash_changes() {
     let mut resource = Resource::with_provider("awscc", "iam.role", "iam_role_aabbccdd");
     resource.set_attr(
         "role_name".to_string(),
-        Value::String("my-role".to_string()),
+        Value::Concrete(ConcreteValue::String("my-role".to_string())),
     );
-    resource.set_attr("path".to_string(), Value::String("/new/".to_string()));
+    resource.set_attr(
+        "path".to_string(),
+        Value::Concrete(ConcreteValue::String("/new/".to_string())),
+    );
 
     let original_id = resource.id.name_str().to_string();
     let mut resources = vec![resource];
@@ -1245,7 +1338,7 @@ fn test_compute_anonymous_id_stable_with_prefixed_create_only_attribute() {
         let mut r = Resource::with_provider("awscc", "s3.Bucket", "");
         r.set_attr(
             "bucket_name".to_string(),
-            Value::String(generated_name.to_string()),
+            Value::Concrete(ConcreteValue::String(generated_name.to_string())),
         );
         r.prefixes
             .insert("bucket_name".to_string(), "my-app-".to_string());
@@ -1287,7 +1380,7 @@ fn test_compute_anonymous_id_different_prefix_produces_different_id() {
         let mut r = Resource::with_provider("awscc", "s3.Bucket", "");
         r.set_attr(
             "bucket_name".to_string(),
-            Value::String(generated_name.to_string()),
+            Value::Concrete(ConcreteValue::String(generated_name.to_string())),
         );
         r.prefixes
             .insert("bucket_name".to_string(), prefix.to_string());
@@ -1324,12 +1417,15 @@ fn test_reconcile_skips_let_bound_resources() {
     ingress_new.binding = Some("ingress_new".to_string());
     ingress_new.set_attr(
         "cidr_ip".to_string(),
-        Value::String("0.0.0.0/0".to_string()),
+        Value::Concrete(ConcreteValue::String("0.0.0.0/0".to_string())),
     );
-    ingress_new.set_attr("ip_protocol".to_string(), Value::String("tcp".to_string()));
+    ingress_new.set_attr(
+        "ip_protocol".to_string(),
+        Value::Concrete(ConcreteValue::String("tcp".to_string())),
+    );
     ingress_new.set_attr(
         "description".to_string(),
-        Value::String("Allow HTTPS".to_string()),
+        Value::Concrete(ConcreteValue::String("Allow HTTPS".to_string())),
     );
 
     let mut resources = vec![ingress_new];
@@ -1379,12 +1475,15 @@ fn test_reconcile_skips_when_multiple_partial_matches() {
     );
     new_rule.set_attr(
         "cidr_ip".to_string(),
-        Value::String("0.0.0.0/0".to_string()),
+        Value::Concrete(ConcreteValue::String("0.0.0.0/0".to_string())),
     );
-    new_rule.set_attr("ip_protocol".to_string(), Value::String("tcp".to_string()));
+    new_rule.set_attr(
+        "ip_protocol".to_string(),
+        Value::Concrete(ConcreteValue::String("tcp".to_string())),
+    );
     new_rule.set_attr(
         "description".to_string(),
-        Value::String("Allow gRPC".to_string()),
+        Value::Concrete(ConcreteValue::String("Allow gRPC".to_string())),
     );
 
     let original_id = new_rule.id.name_str().to_string();
@@ -1451,7 +1550,9 @@ fn test_reconcile_eip_tag_update_with_unset_create_only_props() {
         name: "awscc".to_string(),
         attributes: vec![(
             "region".to_string(),
-            Value::String("awscc.Region.ap_northeast_1".to_string()),
+            Value::Concrete(ConcreteValue::String(
+                "awscc.Region.ap_northeast_1".to_string(),
+            )),
         )]
         .into_iter()
         .collect(),
@@ -1465,17 +1566,23 @@ fn test_reconcile_eip_tag_update_with_unset_create_only_props() {
 
     // Step 1: Create EIP with tags Environment=acceptance-test
     let mut r1 = Resource::with_provider("awscc", "ec2.eip", "");
-    r1.set_attr("domain".to_string(), Value::String("vpc".to_string()));
+    r1.set_attr(
+        "domain".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc".to_string())),
+    );
     let mut tags1 = indexmap::IndexMap::new();
     tags1.insert(
         "Environment".to_string(),
-        Value::String("acceptance-test".to_string()),
+        Value::Concrete(ConcreteValue::String("acceptance-test".to_string())),
     );
     tags1.insert(
         "Purpose".to_string(),
-        Value::String("simhash-test".to_string()),
+        Value::Concrete(ConcreteValue::String("simhash-test".to_string())),
     );
-    r1.set_attr("tags".to_string(), Value::Map(tags1));
+    r1.set_attr(
+        "tags".to_string(),
+        Value::Concrete(ConcreteValue::Map(tags1)),
+    );
 
     let mut resources1 = vec![r1];
     compute_anonymous_identifiers(&mut resources1, &providers, &schemas, &identity_fn).unwrap();
@@ -1483,17 +1590,23 @@ fn test_reconcile_eip_tag_update_with_unset_create_only_props() {
 
     // Step 2: Change tag Environment=staging (only tags changed)
     let mut r2 = Resource::with_provider("awscc", "ec2.eip", "");
-    r2.set_attr("domain".to_string(), Value::String("vpc".to_string()));
+    r2.set_attr(
+        "domain".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc".to_string())),
+    );
     let mut tags2 = indexmap::IndexMap::new();
     tags2.insert(
         "Environment".to_string(),
-        Value::String("staging".to_string()),
+        Value::Concrete(ConcreteValue::String("staging".to_string())),
     );
     tags2.insert(
         "Purpose".to_string(),
-        Value::String("simhash-test".to_string()),
+        Value::Concrete(ConcreteValue::String("simhash-test".to_string())),
     );
-    r2.set_attr("tags".to_string(), Value::Map(tags2));
+    r2.set_attr(
+        "tags".to_string(),
+        Value::Concrete(ConcreteValue::Map(tags2)),
+    );
 
     let mut resources2 = vec![r2];
     compute_anonymous_identifiers(&mut resources2, &providers, &schemas, &identity_fn).unwrap();
@@ -1547,24 +1660,30 @@ fn test_reconcile_does_not_swap_named_resources_with_overlapping_create_only() {
         Resource::with_provider("aws", "ec2.security_group_ingress", "ingress_http");
     ingress_http.set_attr(
         "cidr_ip".to_string(),
-        Value::String("0.0.0.0/0".to_string()),
+        Value::Concrete(ConcreteValue::String("0.0.0.0/0".to_string())),
     );
-    ingress_http.set_attr("ip_protocol".to_string(), Value::String("tcp".to_string()));
+    ingress_http.set_attr(
+        "ip_protocol".to_string(),
+        Value::Concrete(ConcreteValue::String("tcp".to_string())),
+    );
     ingress_http.set_attr(
         "description".to_string(),
-        Value::String("Allow HTTP".to_string()),
+        Value::Concrete(ConcreteValue::String("Allow HTTP".to_string())),
     );
 
     let mut ingress_https =
         Resource::with_provider("aws", "ec2.security_group_ingress", "ingress_https");
     ingress_https.set_attr(
         "cidr_ip".to_string(),
-        Value::String("0.0.0.0/0".to_string()),
+        Value::Concrete(ConcreteValue::String("0.0.0.0/0".to_string())),
     );
-    ingress_https.set_attr("ip_protocol".to_string(), Value::String("tcp".to_string()));
+    ingress_https.set_attr(
+        "ip_protocol".to_string(),
+        Value::Concrete(ConcreteValue::String("tcp".to_string())),
+    );
     ingress_https.set_attr(
         "description".to_string(),
-        Value::String("Allow HTTPS".to_string()),
+        Value::Concrete(ConcreteValue::String("Allow HTTPS".to_string())),
     );
 
     let mut resources = vec![ingress_http, ingress_https];
@@ -1628,7 +1747,10 @@ fn test_detect_rename_unique_match_by_create_only_attrs() {
 
     let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso");
     resource.binding = Some("sso".to_string());
-    resource.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
+    resource.set_attr(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("carina-rs".to_string())),
+    );
     let resources = vec![resource];
 
     let state_entries = vec![AnonymousIdStateInfo {
@@ -1658,7 +1780,10 @@ fn test_detect_rename_skips_when_binding_already_in_state() {
 
     let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso");
     resource.binding = Some("sso".to_string());
-    resource.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
+    resource.set_attr(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("carina-rs".to_string())),
+    );
     let resources = vec![resource];
 
     let state_entries = vec![AnonymousIdStateInfo {
@@ -1685,7 +1810,10 @@ fn test_detect_rename_ignores_anonymous_resources() {
 
     let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso_instance_new");
     // No binding set
-    resource.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
+    resource.set_attr(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("carina-rs".to_string())),
+    );
     let resources = vec![resource];
 
     let state_entries = vec![AnonymousIdStateInfo {
@@ -1712,7 +1840,10 @@ fn test_detect_rename_skips_ambiguous_matches() {
 
     let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso");
     resource.binding = Some("sso".to_string());
-    resource.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
+    resource.set_attr(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("carina-rs".to_string())),
+    );
     let resources = vec![resource];
 
     let state_entries = vec![
@@ -1748,7 +1879,10 @@ fn test_detect_rename_ignores_non_hash_state_names() {
 
     let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso");
     resource.binding = Some("sso".to_string());
-    resource.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
+    resource.set_attr(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("carina-rs".to_string())),
+    );
     let resources = vec![resource];
 
     let state_entries = vec![AnonymousIdStateInfo {
@@ -1791,7 +1925,10 @@ fn test_detect_rename_no_create_only_matches_by_simhash() {
     // Step 1: generate the anonymous ID the previous `apply` would have
     // written to state, using the same inputs and the same code path.
     let mut anon = Resource::with_provider("awscc", "sso.Instance", "");
-    anon.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
+    anon.set_attr(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("carina-rs".to_string())),
+    );
     let mut anon_vec = vec![anon];
     compute_anonymous_identifiers(&mut anon_vec, &providers, &schemas, &identity_fn).unwrap();
     let anonymous_name = anon_vec[0].id.name_str().to_string();
@@ -1803,7 +1940,10 @@ fn test_detect_rename_no_create_only_matches_by_simhash() {
     // Step 2: user wraps the same resource in a `let` binding.
     let mut let_bound = Resource::with_provider("awscc", "sso.Instance", "sso");
     let_bound.binding = Some("sso".to_string());
-    let_bound.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
+    let_bound.set_attr(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("carina-rs".to_string())),
+    );
     let resources = vec![let_bound];
 
     // Step 3: state still has the orphan anonymous entry.
@@ -1838,11 +1978,23 @@ fn test_detect_rename_no_create_only_skips_when_attributes_differ_too_much() {
 
     // Anonymous snapshot with many attributes.
     let mut anon = Resource::with_provider("awscc", "sso.Instance", "");
-    anon.set_attr("name".to_string(), Value::String("old-name".to_string()));
+    anon.set_attr(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("old-name".to_string())),
+    );
     let mut tags = indexmap::IndexMap::new();
-    tags.insert("k1".to_string(), Value::String("v1".to_string()));
-    tags.insert("k2".to_string(), Value::String("v2".to_string()));
-    anon.set_attr("tags".to_string(), Value::Map(tags));
+    tags.insert(
+        "k1".to_string(),
+        Value::Concrete(ConcreteValue::String("v1".to_string())),
+    );
+    tags.insert(
+        "k2".to_string(),
+        Value::Concrete(ConcreteValue::String("v2".to_string())),
+    );
+    anon.set_attr(
+        "tags".to_string(),
+        Value::Concrete(ConcreteValue::Map(tags)),
+    );
     let mut anon_vec = vec![anon];
     compute_anonymous_identifiers(&mut anon_vec, &providers, &schemas, &identity_fn).unwrap();
     let anonymous_name = anon_vec[0].id.name_str().to_string();
@@ -1852,13 +2004,25 @@ fn test_detect_rename_no_create_only_skips_when_attributes_differ_too_much() {
     let_bound.binding = Some("sso".to_string());
     let_bound.set_attr(
         "name".to_string(),
-        Value::String("completely-different".to_string()),
+        Value::Concrete(ConcreteValue::String("completely-different".to_string())),
     );
     let mut different_tags = indexmap::IndexMap::new();
-    different_tags.insert("other1".to_string(), Value::String("foo".to_string()));
-    different_tags.insert("other2".to_string(), Value::String("bar".to_string()));
-    different_tags.insert("other3".to_string(), Value::String("baz".to_string()));
-    let_bound.set_attr("tags".to_string(), Value::Map(different_tags));
+    different_tags.insert(
+        "other1".to_string(),
+        Value::Concrete(ConcreteValue::String("foo".to_string())),
+    );
+    different_tags.insert(
+        "other2".to_string(),
+        Value::Concrete(ConcreteValue::String("bar".to_string())),
+    );
+    different_tags.insert(
+        "other3".to_string(),
+        Value::Concrete(ConcreteValue::String("baz".to_string())),
+    );
+    let_bound.set_attr(
+        "tags".to_string(),
+        Value::Concrete(ConcreteValue::Map(different_tags)),
+    );
     let resources = vec![let_bound];
 
     let state_entries = vec![AnonymousIdStateInfo {
@@ -1891,7 +2055,10 @@ fn test_detect_rename_no_create_only_picks_closest_among_multiple_candidates() {
 
     // Compute the exact-match name.
     let mut anon = Resource::with_provider("awscc", "sso.Instance", "");
-    anon.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
+    anon.set_attr(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("carina-rs".to_string())),
+    );
     let mut anon_vec = vec![anon];
     compute_anonymous_identifiers(&mut anon_vec, &providers, &schemas, &identity_fn).unwrap();
     let exact_name = anon_vec[0].id.name_str().to_string();
@@ -1920,7 +2087,10 @@ fn test_detect_rename_no_create_only_picks_closest_among_multiple_candidates() {
 
     let mut let_bound = Resource::with_provider("awscc", "sso.Instance", "sso");
     let_bound.binding = Some("sso".to_string());
-    let_bound.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
+    let_bound.set_attr(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("carina-rs".to_string())),
+    );
     let resources = vec![let_bound];
 
     let renames = detect_anonymous_to_named_renames(
@@ -1950,7 +2120,10 @@ fn test_detect_rename_no_create_only_skips_8_char_hash_entries() {
 
     let mut let_bound = Resource::with_provider("awscc", "sso.Instance", "sso");
     let_bound.binding = Some("sso".to_string());
-    let_bound.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
+    let_bound.set_attr(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("carina-rs".to_string())),
+    );
     let resources = vec![let_bound];
 
     // 8-hex suffix (standard hash scheme), not a SimHash.
@@ -1983,7 +2156,10 @@ fn test_detect_rename_no_create_only_skips_when_two_orphans_tie_on_distance() {
 
     // Compute the target SimHash.
     let mut anon = Resource::with_provider("awscc", "sso.Instance", "");
-    anon.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
+    anon.set_attr(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("carina-rs".to_string())),
+    );
     let mut anon_vec = vec![anon];
     compute_anonymous_identifiers(&mut anon_vec, &providers, &schemas, &identity_fn).unwrap();
     let anonymous_name = anon_vec[0].id.name_str().to_string();
@@ -2002,7 +2178,10 @@ fn test_detect_rename_no_create_only_skips_when_two_orphans_tie_on_distance() {
 
     let mut let_bound = Resource::with_provider("awscc", "sso.Instance", "sso");
     let_bound.binding = Some("sso".to_string());
-    let_bound.set_attr("name".to_string(), Value::String("carina-rs".to_string()));
+    let_bound.set_attr(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("carina-rs".to_string())),
+    );
     let resources = vec![let_bound];
 
     let renames = detect_anonymous_to_named_renames(
@@ -2037,7 +2216,10 @@ fn anonymous_identifier_includes_provider_prefix() {
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
     let mut r = Resource::with_provider("awscc", "iam.RolePolicy", "");
-    r.set_attr("policy_name".to_string(), Value::String("foo".to_string()));
+    r.set_attr(
+        "policy_name".to_string(),
+        Value::Concrete(ConcreteValue::String("foo".to_string())),
+    );
     let mut resources = vec![r];
     compute_anonymous_identifiers(&mut resources, &providers, &schemas, &identity_fn).unwrap();
 
@@ -2072,7 +2254,7 @@ fn anonymous_identifier_provider_prefix_for_aws_provider() {
     let mut r = Resource::with_provider("aws", "s3.Bucket", "");
     r.set_attr(
         "bucket_name".to_string(),
-        Value::String("example".to_string()),
+        Value::Concrete(ConcreteValue::String("example".to_string())),
     );
     let mut resources = vec![r];
     compute_anonymous_identifiers(&mut resources, &providers, &schemas, &identity_fn).unwrap();
@@ -2106,7 +2288,7 @@ fn reconcile_simhash_match_keeps_new_format_identifier_and_emits_rename() {
     let mut r = Resource::with_provider("awscc", "iam.RolePolicy", "");
     r.set_attr(
         "policy_name".to_string(),
-        Value::String("inline".to_string()),
+        Value::Concrete(ConcreteValue::String("inline".to_string())),
     );
     let mut resources = vec![r];
     compute_anonymous_identifiers(&mut resources, &providers, &schemas, &identity_fn).unwrap();

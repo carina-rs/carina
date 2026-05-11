@@ -1,6 +1,6 @@
 //! `upper(string)` and `lower(string)` built-in functions
 
-use crate::resource::Value;
+use crate::resource::{ConcreteValue, Value};
 
 use super::value_type_name;
 
@@ -22,7 +22,9 @@ pub(crate) fn builtin_upper(args: &[Value]) -> Result<Value, String> {
     }
 
     match &args[0] {
-        Value::String(s) => Ok(Value::String(s.to_uppercase())),
+        Value::Concrete(ConcreteValue::String(s)) => {
+            Ok(Value::Concrete(ConcreteValue::String(s.to_uppercase())))
+        }
         other => Err(format!(
             "upper() argument must be a string, got {}",
             value_type_name(other)
@@ -48,7 +50,9 @@ pub(crate) fn builtin_lower(args: &[Value]) -> Result<Value, String> {
     }
 
     match &args[0] {
-        Value::String(s) => Ok(Value::String(s.to_lowercase())),
+        Value::Concrete(ConcreteValue::String(s)) => {
+            Ok(Value::Concrete(ConcreteValue::String(s.to_lowercase())))
+        }
         other => Err(format!(
             "lower() argument must be a string, got {}",
             value_type_name(other)
@@ -59,48 +63,67 @@ pub(crate) fn builtin_lower(args: &[Value]) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
-    use crate::resource::Value;
+    use crate::resource::{ConcreteValue, Value};
 
     #[test]
     fn upper_basic() {
-        let args = vec![Value::String("hello".to_string())];
+        let args = vec![Value::Concrete(ConcreteValue::String("hello".to_string()))];
         let result = evaluate_builtin("upper", &args).unwrap();
-        assert_eq!(result, Value::String("HELLO".to_string()));
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::String("HELLO".to_string()))
+        );
     }
 
     #[test]
     fn upper_already_uppercase() {
-        let args = vec![Value::String("HELLO".to_string())];
+        let args = vec![Value::Concrete(ConcreteValue::String("HELLO".to_string()))];
         let result = evaluate_builtin("upper", &args).unwrap();
-        assert_eq!(result, Value::String("HELLO".to_string()));
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::String("HELLO".to_string()))
+        );
     }
 
     #[test]
     fn upper_mixed_case() {
-        let args = vec![Value::String("Hello World".to_string())];
+        let args = vec![Value::Concrete(ConcreteValue::String(
+            "Hello World".to_string(),
+        ))];
         let result = evaluate_builtin("upper", &args).unwrap();
-        assert_eq!(result, Value::String("HELLO WORLD".to_string()));
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::String("HELLO WORLD".to_string()))
+        );
     }
 
     #[test]
     fn upper_empty_string() {
-        let args = vec![Value::String("".to_string())];
+        let args = vec![Value::Concrete(ConcreteValue::String("".to_string()))];
         let result = evaluate_builtin("upper", &args).unwrap();
-        assert_eq!(result, Value::String("".to_string()));
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::String("".to_string()))
+        );
     }
 
     #[test]
     fn upper_with_numbers_and_symbols() {
-        let args = vec![Value::String("abc-123_def".to_string())];
+        let args = vec![Value::Concrete(ConcreteValue::String(
+            "abc-123_def".to_string(),
+        ))];
         let result = evaluate_builtin("upper", &args).unwrap();
-        assert_eq!(result, Value::String("ABC-123_DEF".to_string()));
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::String("ABC-123_DEF".to_string()))
+        );
     }
 
     #[test]
     fn upper_wrong_arg_count() {
         let args = vec![
-            Value::String("a".to_string()),
-            Value::String("b".to_string()),
+            Value::Concrete(ConcreteValue::String("a".to_string())),
+            Value::Concrete(ConcreteValue::String("b".to_string())),
         ];
         let result = evaluate_builtin("upper", &args);
         assert!(result.is_err());
@@ -109,7 +132,7 @@ mod tests {
 
     #[test]
     fn upper_non_string_arg() {
-        let args = vec![Value::Int(42)];
+        let args = vec![Value::Concrete(ConcreteValue::Int(42))];
         let result = evaluate_builtin("upper", &args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("argument must be a string"));
@@ -117,37 +140,56 @@ mod tests {
 
     #[test]
     fn lower_basic() {
-        let args = vec![Value::String("HELLO".to_string())];
+        let args = vec![Value::Concrete(ConcreteValue::String("HELLO".to_string()))];
         let result = evaluate_builtin("lower", &args).unwrap();
-        assert_eq!(result, Value::String("hello".to_string()));
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::String("hello".to_string()))
+        );
     }
 
     #[test]
     fn lower_already_lowercase() {
-        let args = vec![Value::String("hello".to_string())];
+        let args = vec![Value::Concrete(ConcreteValue::String("hello".to_string()))];
         let result = evaluate_builtin("lower", &args).unwrap();
-        assert_eq!(result, Value::String("hello".to_string()));
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::String("hello".to_string()))
+        );
     }
 
     #[test]
     fn lower_mixed_case() {
-        let args = vec![Value::String("Hello World".to_string())];
+        let args = vec![Value::Concrete(ConcreteValue::String(
+            "Hello World".to_string(),
+        ))];
         let result = evaluate_builtin("lower", &args).unwrap();
-        assert_eq!(result, Value::String("hello world".to_string()));
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::String("hello world".to_string()))
+        );
     }
 
     #[test]
     fn lower_empty_string() {
-        let args = vec![Value::String("".to_string())];
+        let args = vec![Value::Concrete(ConcreteValue::String("".to_string()))];
         let result = evaluate_builtin("lower", &args).unwrap();
-        assert_eq!(result, Value::String("".to_string()));
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::String("".to_string()))
+        );
     }
 
     #[test]
     fn lower_with_numbers_and_symbols() {
-        let args = vec![Value::String("ABC-123_DEF".to_string())];
+        let args = vec![Value::Concrete(ConcreteValue::String(
+            "ABC-123_DEF".to_string(),
+        ))];
         let result = evaluate_builtin("lower", &args).unwrap();
-        assert_eq!(result, Value::String("abc-123_def".to_string()));
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::String("abc-123_def".to_string()))
+        );
     }
 
     #[test]
@@ -159,7 +201,7 @@ mod tests {
 
     #[test]
     fn lower_non_string_arg() {
-        let args = vec![Value::Bool(true)];
+        let args = vec![Value::Concrete(ConcreteValue::Bool(true))];
         let result = evaluate_builtin("lower", &args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("argument must be a string"));

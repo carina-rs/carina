@@ -6,7 +6,7 @@ use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Posi
 use crate::document::Document;
 use carina_core::builtins;
 use carina_core::parser::ArgumentParameter;
-use carina_core::resource::Value;
+use carina_core::resource::{ConcreteValue, Value};
 use carina_core::schema::{CompletionValue, ResourceSchema, SchemaRegistry};
 
 /// Find the `source` path of a `let <alias> = use {...}` declaration
@@ -50,13 +50,15 @@ fn find_use_import_path(
 /// Format a Value for hover display
 fn format_value_for_hover(value: &Value) -> String {
     match value {
-        Value::String(s) => format!("\"{}\"", s),
-        Value::Int(n) => n.to_string(),
-        Value::Float(f) => f.to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Duration(d) => carina_core::value::render_duration(*d),
-        Value::List(_) | Value::StringList(_) => "[...]".to_string(),
-        Value::Map(_) => "{...}".to_string(),
+        Value::Concrete(ConcreteValue::String(s)) => format!("\"{}\"", s),
+        Value::Concrete(ConcreteValue::Int(n)) => n.to_string(),
+        Value::Concrete(ConcreteValue::Float(f)) => f.to_string(),
+        Value::Concrete(ConcreteValue::Bool(b)) => b.to_string(),
+        Value::Concrete(ConcreteValue::Duration(d)) => carina_core::value::render_duration(*d),
+        Value::Concrete(ConcreteValue::List(_)) | Value::Concrete(ConcreteValue::StringList(_)) => {
+            "[...]".to_string()
+        }
+        Value::Concrete(ConcreteValue::Map(_)) => "{...}".to_string(),
         _ => format!("{:?}", value),
     }
 }
@@ -805,14 +807,16 @@ mod tests {
 
     #[test]
     fn format_value_for_hover_renders_duration_as_canonical_form() {
-        // Regression: Round 1 added the Value::Duration arm so editor
+        // Regression: Round 1 added the Value::Concrete(ConcreteValue::Duration) arm so editor
         // hover doesn't show the {:?} fall-through
         // `Duration { secs: 60, nanos: 0 }`. Pin the canonical surface
         // form here.
-        use carina_core::resource::Value;
-        let v = Value::Duration(std::time::Duration::from_secs(60));
+        use carina_core::resource::{ConcreteValue, Value};
+        let v = Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(60)));
         assert_eq!(format_value_for_hover(&v), "1min");
-        let v = Value::Duration(std::time::Duration::from_secs(4500));
+        let v = Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
+            4500,
+        )));
         assert_eq!(format_value_for_hover(&v), "75min");
     }
 
@@ -1259,7 +1263,7 @@ awscc.ec2.vpc_gateway_attachment {
         let arg = ArgumentParameter {
             name: "port".to_string(),
             type_expr: TypeExpr::Int,
-            default: Some(Value::Int(8080)),
+            default: Some(Value::Concrete(ConcreteValue::Int(8080))),
             description: Some("Web server port".to_string()),
             validations: vec![],
         };

@@ -4,7 +4,7 @@
 //! (interpolated) string forms, plus the related unescape routines.
 
 use crate::parser::{ParseContext, ParseError, Rule, first_inner, parse_expression};
-use crate::resource::{InterpolationPart, UnknownReason, Value};
+use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value};
 
 pub(crate) fn parse_string_literal(
     pair: pest::iterators::Pair<Rule>,
@@ -48,7 +48,7 @@ pub(crate) fn parse_string_value(
             .next()
             .map(|p| unescape_single_quoted(p.as_str()))
             .unwrap_or_default();
-        return Ok(Value::String(content));
+        return Ok(Value::Concrete(ConcreteValue::String(content)));
     }
 
     // Double-quoted string (original behavior)
@@ -67,12 +67,14 @@ pub(crate) fn parse_string_value(
                     has_interpolation = true;
                     // Grammar makes the inner expression optional so
                     // mid-edit `${}` doesn't poison the AST. An empty
-                    // interpolation lands as `Value::Unknown(EmptyInterpolation)`
+                    // interpolation lands as `Value::Deferred(DeferredValue::Unknown(EmptyInterpolation))`
                     // — the LSP surfaces it as a diagnostic; downstream
                     // resolvers carry it as an unresolved value. See #2480.
                     let value = match inner.into_inner().next() {
                         Some(expr_pair) => parse_expression(expr_pair, ctx)?,
-                        None => Value::Unknown(UnknownReason::EmptyInterpolation),
+                        None => Value::Deferred(DeferredValue::Unknown(
+                            UnknownReason::EmptyInterpolation,
+                        )),
                     };
                     parts.push(InterpolationPart::Expr(value));
                 }
@@ -85,11 +87,11 @@ pub(crate) fn parse_string_value(
         // Deliberately do *not* call `Value::canonicalize` here. The
         // deferred-for placeholder substitution in
         // `parser/ast.rs::substitute_placeholder` walks the `Expr`
-        // parts to replace `Value::Unknown(For*)` placeholders with the
+        // parts to replace `Value::Deferred(DeferredValue::Unknown(For*))` placeholders with the
         // resolved iterable element, so the parts must stay intact
         // through parse → for-expansion. Canonicalization runs later,
         // after resolution (see #2227).
-        Ok(Value::Interpolation(parts))
+        Ok(Value::Deferred(DeferredValue::Interpolation(parts)))
     } else {
         // No interpolation — collapse to a plain String
         let s = parts
@@ -99,7 +101,7 @@ pub(crate) fn parse_string_value(
                 _ => unreachable!(),
             })
             .collect::<String>();
-        Ok(Value::String(s))
+        Ok(Value::Concrete(ConcreteValue::String(s)))
     }
 }
 

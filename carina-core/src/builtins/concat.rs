@@ -1,6 +1,6 @@
 //! `concat(items, base_list)` built-in function
 
-use crate::resource::Value;
+use crate::resource::{ConcreteValue, Value};
 
 use super::value_type_name;
 
@@ -29,7 +29,7 @@ pub(crate) fn builtin_concat(args: &[Value]) -> Result<Value, String> {
     }
 
     let items = match &args[0] {
-        Value::List(items) => items,
+        Value::Concrete(ConcreteValue::List(items)) => items,
         other => {
             return Err(format!(
                 "concat() first argument must be a list, got {}",
@@ -39,7 +39,7 @@ pub(crate) fn builtin_concat(args: &[Value]) -> Result<Value, String> {
     };
 
     let base = match &args[1] {
-        Value::List(items) => items,
+        Value::Concrete(ConcreteValue::List(items)) => items,
         other => {
             return Err(format!(
                 "concat() second argument must be a list, got {}",
@@ -51,30 +51,36 @@ pub(crate) fn builtin_concat(args: &[Value]) -> Result<Value, String> {
     // base_list first, then items appended
     let mut result = base.clone();
     result.extend(items.iter().cloned());
-    Ok(Value::List(result))
+    Ok(Value::Concrete(ConcreteValue::List(result)))
 }
 
 #[cfg(test)]
 mod tests {
     use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
-    use crate::resource::Value;
+    use crate::resource::{ConcreteValue, Value};
 
     #[test]
     fn concat_basic() {
         // concat(items, base_list) => base_list ++ items
         let args = vec![
-            Value::List(vec![Value::Int(3), Value::Int(4)]),
-            Value::List(vec![Value::Int(1), Value::Int(2)]),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::Int(3)),
+                Value::Concrete(ConcreteValue::Int(4)),
+            ])),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::Int(1)),
+                Value::Concrete(ConcreteValue::Int(2)),
+            ])),
         ];
         let result = evaluate_builtin("concat", &args).unwrap();
         assert_eq!(
             result,
-            Value::List(vec![
-                Value::Int(1),
-                Value::Int(2),
-                Value::Int(3),
-                Value::Int(4),
-            ])
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::Int(1)),
+                Value::Concrete(ConcreteValue::Int(2)),
+                Value::Concrete(ConcreteValue::Int(3)),
+                Value::Concrete(ConcreteValue::Int(4)),
+            ]))
         );
     }
 
@@ -82,20 +88,22 @@ mod tests {
     fn concat_strings() {
         // concat(items=["c"], base=["a", "b"]) => ["a", "b", "c"]
         let args = vec![
-            Value::List(vec![Value::String("c".to_string())]),
-            Value::List(vec![
-                Value::String("a".to_string()),
-                Value::String("b".to_string()),
-            ]),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("c".to_string()),
+            )])),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("a".to_string())),
+                Value::Concrete(ConcreteValue::String("b".to_string())),
+            ])),
         ];
         let result = evaluate_builtin("concat", &args).unwrap();
         assert_eq!(
             result,
-            Value::List(vec![
-                Value::String("a".to_string()),
-                Value::String("b".to_string()),
-                Value::String("c".to_string()),
-            ])
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("a".to_string())),
+                Value::Concrete(ConcreteValue::String("b".to_string())),
+                Value::Concrete(ConcreteValue::String("c".to_string())),
+            ]))
         );
     }
 
@@ -103,17 +111,22 @@ mod tests {
     fn concat_mixed_types() {
         // concat(items=[true], base=[1, "two"]) => [1, "two", true]
         let args = vec![
-            Value::List(vec![Value::Bool(true)]),
-            Value::List(vec![Value::Int(1), Value::String("two".to_string())]),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Bool(true),
+            )])),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::Int(1)),
+                Value::Concrete(ConcreteValue::String("two".to_string())),
+            ])),
         ];
         let result = evaluate_builtin("concat", &args).unwrap();
         assert_eq!(
             result,
-            Value::List(vec![
-                Value::Int(1),
-                Value::String("two".to_string()),
-                Value::Bool(true),
-            ])
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::Int(1)),
+                Value::Concrete(ConcreteValue::String("two".to_string())),
+                Value::Concrete(ConcreteValue::Bool(true)),
+            ]))
         );
     }
 
@@ -121,35 +134,58 @@ mod tests {
     fn concat_empty_first() {
         // concat(items=[], base=[1, 2]) => [1, 2]
         let args = vec![
-            Value::List(vec![]),
-            Value::List(vec![Value::Int(1), Value::Int(2)]),
+            Value::Concrete(ConcreteValue::List(vec![])),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::Int(1)),
+                Value::Concrete(ConcreteValue::Int(2)),
+            ])),
         ];
         let result = evaluate_builtin("concat", &args).unwrap();
-        assert_eq!(result, Value::List(vec![Value::Int(1), Value::Int(2)]));
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::Int(1)),
+                Value::Concrete(ConcreteValue::Int(2))
+            ]))
+        );
     }
 
     #[test]
     fn concat_empty_second() {
         // concat(items=[1, 2], base=[]) => [1, 2]
         let args = vec![
-            Value::List(vec![Value::Int(1), Value::Int(2)]),
-            Value::List(vec![]),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::Int(1)),
+                Value::Concrete(ConcreteValue::Int(2)),
+            ])),
+            Value::Concrete(ConcreteValue::List(vec![])),
         ];
         let result = evaluate_builtin("concat", &args).unwrap();
-        assert_eq!(result, Value::List(vec![Value::Int(1), Value::Int(2)]));
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::Int(1)),
+                Value::Concrete(ConcreteValue::Int(2))
+            ]))
+        );
     }
 
     #[test]
     fn concat_both_empty() {
-        let args = vec![Value::List(vec![]), Value::List(vec![])];
+        let args = vec![
+            Value::Concrete(ConcreteValue::List(vec![])),
+            Value::Concrete(ConcreteValue::List(vec![])),
+        ];
         let result = evaluate_builtin("concat", &args).unwrap();
-        assert_eq!(result, Value::List(vec![]));
+        assert_eq!(result, Value::Concrete(ConcreteValue::List(vec![])));
     }
 
     #[test]
     fn concat_partial_application_one_arg() {
         use crate::builtins::evaluate_builtin_for_tests;
-        let args = vec![Value::List(vec![Value::Int(1)])];
+        let args = vec![Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Int(1),
+        )]))];
         let result = evaluate_builtin_for_tests("concat", &args).unwrap();
         assert!(result.is_closure());
     }
@@ -157,9 +193,9 @@ mod tests {
     #[test]
     fn concat_wrong_arg_count_three() {
         let args = vec![
-            Value::List(vec![]),
-            Value::List(vec![]),
-            Value::List(vec![]),
+            Value::Concrete(ConcreteValue::List(vec![])),
+            Value::Concrete(ConcreteValue::List(vec![])),
+            Value::Concrete(ConcreteValue::List(vec![])),
         ];
         let result = evaluate_builtin("concat", &args);
         assert!(result.is_err());
@@ -169,8 +205,10 @@ mod tests {
     #[test]
     fn concat_first_arg_not_list() {
         let args = vec![
-            Value::String("not a list".to_string()),
-            Value::List(vec![Value::Int(1)]),
+            Value::Concrete(ConcreteValue::String("not a list".to_string())),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Int(1),
+            )])),
         ];
         let result = evaluate_builtin("concat", &args);
         assert!(result.is_err());
@@ -184,8 +222,10 @@ mod tests {
     #[test]
     fn concat_second_arg_not_list() {
         let args = vec![
-            Value::List(vec![Value::Int(1)]),
-            Value::String("not a list".to_string()),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Int(1),
+            )])),
+            Value::Concrete(ConcreteValue::String("not a list".to_string())),
         ];
         let result = evaluate_builtin("concat", &args);
         assert!(result.is_err());

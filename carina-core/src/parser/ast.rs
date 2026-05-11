@@ -6,7 +6,7 @@ use super::error::ParseWarning;
 use super::expressions::for_expr::ForBinding;
 use super::expressions::validate_expr::CompareOp;
 use super::util::snake_to_pascal;
-use crate::resource::{Resource, ResourceId, UnknownReason, Value};
+use crate::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, UnknownReason, Value};
 use crate::version_constraint::VersionConstraint;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
@@ -101,7 +101,7 @@ pub enum TypeExpr {
     Int,
     Float,
     /// Time duration. Surface form: `<integer><unit>` literal (`75min`,
-    /// `1h`, `30s`); internal form: `Value::Duration(std::time::Duration)`.
+    /// `1h`, `30s`); internal form: `Value::Concrete(ConcreteValue::Duration(std::time::Duration))`.
     Duration,
     /// Schema type identified by name (e.g., "ipv4_cidr", "ipv4_address", "arn")
     Simple(std::string::String),
@@ -123,14 +123,14 @@ pub enum TypeExpr {
     ///
     /// Field order matches source order and participates in `PartialEq` —
     /// two struct types with the same fields in different order are not
-    /// equal. A `Value::Map` satisfies a struct type when every field
+    /// equal. A `Value::Concrete(ConcreteValue::Map)` satisfies a struct type when every field
     /// name appears as a key with a value that matches the field's type,
     /// with no extra keys.
     Struct {
         fields: Vec<(String, TypeExpr)>,
     },
     /// Singleton string literal type: `'dev'` accepts only the value
-    /// `Value::String("dev")` (carina-rs/carina#2611). Composes with
+    /// `Value::Concrete(ConcreteValue::String("dev"))` (carina-rs/carina#2611). Composes with
     /// [`TypeExpr::Union`] to produce closed-set string types like
     /// `'dev' | 'prod'`, and with [`TypeExpr::List`] / `Map` to nest
     /// (`list('dev' | 'prod')`).
@@ -645,7 +645,7 @@ impl<E> File<E> {
     ) -> Option<&Resource> {
         self.resources.iter().find(|r| {
             r.id.resource_type == resource_type
-                && matches!(r.get_attr(attr_name), Some(Value::String(n)) if n == attr_value)
+                && matches!(r.get_attr(attr_name), Some(Value::Concrete(ConcreteValue::String(n))) if n == attr_value)
         })
     }
 
@@ -692,7 +692,7 @@ impl<E> File<E> {
 
             match (&deferred.binding, iterable_value) {
                 // Simple binding: only the value var is bound
-                (ForBinding::Simple(_), Value::List(items)) => {
+                (ForBinding::Simple(_), Value::Concrete(ConcreteValue::List(items))) => {
                     for (i, item) in items.iter().enumerate() {
                         let address = format!("{}[{}]", deferred.binding_name, i);
                         let mut resource = deferred.template_resource.clone();
@@ -704,7 +704,7 @@ impl<E> File<E> {
                     resolved_indices.push(idx);
                 }
                 // Indexed binding: both index and value vars are bound
-                (ForBinding::Indexed(_, _), Value::List(items)) => {
+                (ForBinding::Indexed(_, _), Value::Concrete(ConcreteValue::List(items))) => {
                     for (i, item) in items.iter().enumerate() {
                         let address = format!("{}[{}]", deferred.binding_name, i);
                         let mut resource = deferred.template_resource.clone();
@@ -716,7 +716,7 @@ impl<E> File<E> {
                     resolved_indices.push(idx);
                 }
                 // Map binding expands over maps, substituting both key and value vars
-                (ForBinding::Map(_, _), Value::Map(map)) => {
+                (ForBinding::Map(_, _), Value::Concrete(ConcreteValue::Map(map))) => {
                     let mut keys: Vec<&String> = map.keys().collect();
                     keys.sort();
                     for key in keys {
@@ -732,7 +732,7 @@ impl<E> File<E> {
                 }
                 // Shape mismatch: replace the original "not yet available" warning
                 // with a specific shape-mismatch warning, leave entry deferred.
-                (ForBinding::Map(_, _), Value::List(_)) => {
+                (ForBinding::Map(_, _), Value::Concrete(ConcreteValue::List(_))) => {
                     mismatched_indices.push(idx);
                     new_warnings.push(ParseWarning {
                         file: deferred.file.clone(),
@@ -744,8 +744,8 @@ impl<E> File<E> {
                         ),
                     });
                 }
-                (ForBinding::Simple(_), Value::Map(_))
-                | (ForBinding::Indexed(_, _), Value::Map(_)) => {
+                (ForBinding::Simple(_), Value::Concrete(ConcreteValue::Map(_)))
+                | (ForBinding::Indexed(_, _), Value::Concrete(ConcreteValue::Map(_))) => {
                     mismatched_indices.push(idx);
                     new_warnings.push(ParseWarning {
                         file: deferred.file.clone(),
@@ -804,11 +804,11 @@ fn substitute_attrs(
 
 /// Substitute deferred-for-expression placeholders in a Value tree.
 ///
-/// Replaces `Value::Unknown(UnknownReason::ForValue)` with `value`. If
+/// Replaces `Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue))` with `value`. If
 /// `index` is supplied (indexed-binding expansion), replaces
-/// `Value::Unknown(UnknownReason::ForIndex)` with the integer index. If
+/// `Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex))` with the integer index. If
 /// `key` is supplied (map-binding expansion), replaces
-/// `Value::Unknown(UnknownReason::ForKey)` with the key string. Recurses
+/// `Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey))` with the key string. Recurses
 /// into all compound Value variants so placeholders nested inside
 /// interpolations / function calls / secrets are reached.
 ///
@@ -821,45 +821,45 @@ pub(super) fn substitute_placeholder(
     value: &Value,
 ) {
     match v {
-        Value::Unknown(UnknownReason::ForValue) => {
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)) => {
             *v = value.clone();
         }
-        Value::Unknown(UnknownReason::ForKey) => {
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey)) => {
             if let Some(k) = key {
-                *v = Value::String(k.to_string());
+                *v = Value::Concrete(ConcreteValue::String(k.to_string()));
             }
         }
-        Value::Unknown(UnknownReason::ForIndex) => {
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)) => {
             if let Some(i) = index {
-                *v = Value::Int(i);
+                *v = Value::Concrete(ConcreteValue::Int(i));
             }
         }
         // Explicit arm (not wildcard) so a new `UnknownReason` variant
         // forces a compile-error decision here.
-        Value::Unknown(UnknownReason::UpstreamRef { .. }) => {}
-        Value::List(items) => {
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef { .. })) => {}
+        Value::Concrete(ConcreteValue::List(items)) => {
             for item in items.iter_mut() {
                 substitute_placeholder(item, index, key, value);
             }
         }
-        Value::Map(map) => {
+        Value::Concrete(ConcreteValue::Map(map)) => {
             for val in map.values_mut() {
                 substitute_placeholder(val, index, key, value);
             }
         }
-        Value::FunctionCall { args, .. } => {
+        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
             for arg in args.iter_mut() {
                 substitute_placeholder(arg, index, key, value);
             }
         }
-        Value::Interpolation(parts) => {
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
             for part in parts.iter_mut() {
                 if let crate::resource::InterpolationPart::Expr(inner) = part {
                     substitute_placeholder(inner, index, key, value);
                 }
             }
         }
-        Value::Secret(inner) => {
+        Value::Deferred(DeferredValue::Secret(inner)) => {
             substitute_placeholder(inner, index, key, value);
         }
         _ => {}
@@ -869,74 +869,103 @@ pub(super) fn substitute_placeholder(
 #[cfg(test)]
 mod substitute_placeholder_tests {
     use super::*;
-    use crate::resource::{AccessPath, InterpolationPart, UnknownReason, Value};
+    use crate::resource::{
+        AccessPath, ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value,
+    };
 
     #[test]
     fn replaces_for_value_with_bound_value() {
-        let mut v = Value::Unknown(UnknownReason::ForValue);
-        substitute_placeholder(&mut v, None, None, &Value::String("acct-1".into()));
-        assert_eq!(v, Value::String("acct-1".into()));
+        let mut v = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue));
+        substitute_placeholder(
+            &mut v,
+            None,
+            None,
+            &Value::Concrete(ConcreteValue::String("acct-1".into())),
+        );
+        assert_eq!(v, Value::Concrete(ConcreteValue::String("acct-1".into())));
     }
 
     #[test]
     fn replaces_for_key_with_key_string() {
-        let mut v = Value::Unknown(UnknownReason::ForKey);
-        substitute_placeholder(&mut v, None, Some("east"), &Value::String("ignored".into()));
-        assert_eq!(v, Value::String("east".into()));
+        let mut v = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey));
+        substitute_placeholder(
+            &mut v,
+            None,
+            Some("east"),
+            &Value::Concrete(ConcreteValue::String("ignored".into())),
+        );
+        assert_eq!(v, Value::Concrete(ConcreteValue::String("east".into())));
     }
 
     #[test]
     fn replaces_for_index_with_integer_index() {
-        let mut v = Value::Unknown(UnknownReason::ForIndex);
-        substitute_placeholder(&mut v, Some(7), None, &Value::String("ignored".into()));
-        assert_eq!(v, Value::Int(7));
+        let mut v = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex));
+        substitute_placeholder(
+            &mut v,
+            Some(7),
+            None,
+            &Value::Concrete(ConcreteValue::String("ignored".into())),
+        );
+        assert_eq!(v, Value::Concrete(ConcreteValue::Int(7)));
     }
 
     #[test]
     fn leaves_upstream_ref_unchanged() {
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-        let mut v = Value::Unknown(UnknownReason::UpstreamRef { path: path.clone() });
+        let mut v = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+            path: path.clone(),
+        }));
         substitute_placeholder(
             &mut v,
             Some(0),
             Some("k"),
-            &Value::String("anything".into()),
+            &Value::Concrete(ConcreteValue::String("anything".into())),
         );
-        // `Value::Unknown` never compares equal (see `impl PartialEq for Value`),
+        // `Value::Deferred(DeferredValue::Unknown)` never compares equal (see `impl PartialEq for Value`),
         // so destructure to verify the path survives.
         match v {
-            Value::Unknown(UnknownReason::UpstreamRef { path: p }) => assert_eq!(p, path),
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef { path: p })) => {
+                assert_eq!(p, path)
+            }
             other => panic!("UpstreamRef must pass through unchanged, got {:?}", other),
         }
     }
 
     #[test]
     fn recurses_into_compound_values() {
-        let mut v = Value::List(vec![
-            Value::Unknown(UnknownReason::ForValue),
-            Value::Map({
+        let mut v = Value::Concrete(ConcreteValue::List(vec![
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+            Value::Concrete(ConcreteValue::Map({
                 let mut m = indexmap::IndexMap::new();
-                m.insert("k".into(), Value::Unknown(UnknownReason::ForValue));
+                m.insert(
+                    "k".into(),
+                    Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+                );
                 m
-            }),
-            Value::Interpolation(vec![InterpolationPart::Expr(Value::Unknown(
-                UnknownReason::ForValue,
-            ))]),
-        ]);
-        substitute_placeholder(&mut v, None, None, &Value::String("X".into()));
+            })),
+            Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
+                Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+            )])),
+        ]));
+        substitute_placeholder(
+            &mut v,
+            None,
+            None,
+            &Value::Concrete(ConcreteValue::String("X".into())),
+        );
         match &v {
-            Value::List(items) => {
-                assert_eq!(items[0], Value::String("X".into()));
+            Value::Concrete(ConcreteValue::List(items)) => {
+                assert_eq!(items[0], Value::Concrete(ConcreteValue::String("X".into())));
                 match &items[1] {
-                    Value::Map(m) => {
-                        assert_eq!(m["k"], Value::String("X".into()));
+                    Value::Concrete(ConcreteValue::Map(m)) => {
+                        assert_eq!(m["k"], Value::Concrete(ConcreteValue::String("X".into())));
                     }
                     other => panic!("expected Map, got {:?}", other),
                 }
                 match &items[2] {
-                    Value::Interpolation(parts) => match &parts[0] {
+                    Value::Deferred(DeferredValue::Interpolation(parts)) => match &parts[0] {
                         InterpolationPart::Expr(inner) => {
-                            assert_eq!(*inner, Value::String("X".into()));
+                            assert_eq!(*inner, Value::Concrete(ConcreteValue::String("X".into())));
                         }
                         _ => panic!("expected Expr part"),
                     },
@@ -949,10 +978,18 @@ mod substitute_placeholder_tests {
 
     #[test]
     fn legacy_string_sentinel_is_no_longer_recognised() {
-        // Only `Value::Unknown(For*)` is substituted. A bare string that
+        // Only `Value::Deferred(DeferredValue::Unknown(For*))` is substituted. A bare string that
         // happens to match the historical sentinel must be left alone.
-        let mut v = Value::String("(known after upstream apply)".into());
-        substitute_placeholder(&mut v, None, None, &Value::String("X".into()));
-        assert_eq!(v, Value::String("(known after upstream apply)".into()));
+        let mut v = Value::Concrete(ConcreteValue::String("(known after upstream apply)".into()));
+        substitute_placeholder(
+            &mut v,
+            None,
+            None,
+            &Value::Concrete(ConcreteValue::String("X".into())),
+        );
+        assert_eq!(
+            v,
+            Value::Concrete(ConcreteValue::String("(known after upstream apply)".into()))
+        );
     }
 }

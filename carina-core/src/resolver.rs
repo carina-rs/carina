@@ -9,7 +9,8 @@ use indexmap::IndexMap;
 
 use crate::binding_index::ResolvedBindings;
 use crate::resource::{
-    InterpolationPart, Resource, ResourceId, State, Value, contains_resource_ref,
+    ConcreteValue, DeferredValue, InterpolationPart, Resource, ResourceId, State, Value,
+    contains_resource_ref,
 };
 
 /// Resolve all ResourceRef values in resources using current state.
@@ -111,50 +112,61 @@ fn stamp_unresolved_upstream(
     upstream_binding_names: &std::collections::HashSet<&str>,
 ) -> Value {
     match value {
-        Value::ResourceRef { path } if upstream_binding_names.contains(path.binding()) => {
-            Value::Unknown(crate::resource::UnknownReason::UpstreamRef { path })
+        Value::Deferred(DeferredValue::ResourceRef { path })
+            if upstream_binding_names.contains(path.binding()) =>
+        {
+            Value::Deferred(DeferredValue::Unknown(
+                crate::resource::UnknownReason::UpstreamRef { path },
+            ))
         }
-        Value::BindingRef { binding } if upstream_binding_names.contains(binding.as_str()) => {
-            Value::Unknown(crate::resource::UnknownReason::UpstreamBareRef { binding })
+        Value::Deferred(DeferredValue::BindingRef { binding })
+            if upstream_binding_names.contains(binding.as_str()) =>
+        {
+            Value::Deferred(DeferredValue::Unknown(
+                crate::resource::UnknownReason::UpstreamBareRef { binding },
+            ))
         }
-        Value::List(items) => Value::List(
+        Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
             items
                 .into_iter()
                 .map(|v| stamp_unresolved_upstream(v, upstream_binding_names))
                 .collect(),
-        ),
-        Value::Map(map) => {
+        )),
+        Value::Concrete(ConcreteValue::Map(map)) => {
             let mut out: IndexMap<String, Value> = IndexMap::new();
             for (k, v) in map {
                 out.insert(k, stamp_unresolved_upstream(v, upstream_binding_names));
             }
-            Value::Map(out)
+            Value::Concrete(ConcreteValue::Map(out))
         }
-        Value::Interpolation(parts) => Value::Interpolation(
-            parts
-                .into_iter()
-                .map(|p| match p {
-                    InterpolationPart::Expr(v) => InterpolationPart::Expr(
-                        stamp_unresolved_upstream(v, upstream_binding_names),
-                    ),
-                    other => other,
-                })
-                .collect(),
-        ),
-        Value::FunctionCall { name, args } => Value::FunctionCall {
-            name,
-            args: args
-                .into_iter()
-                .map(|a| stamp_unresolved_upstream(a, upstream_binding_names))
-                .collect(),
-        },
-        Value::Secret(inner) => Value::Secret(Box::new(stamp_unresolved_upstream(
-            *inner,
-            upstream_binding_names,
-        ))),
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+            Value::Deferred(DeferredValue::Interpolation(
+                parts
+                    .into_iter()
+                    .map(|p| match p {
+                        InterpolationPart::Expr(v) => InterpolationPart::Expr(
+                            stamp_unresolved_upstream(v, upstream_binding_names),
+                        ),
+                        other => other,
+                    })
+                    .collect(),
+            ))
+        }
+        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
+            Value::Deferred(DeferredValue::FunctionCall {
+                name,
+                args: args
+                    .into_iter()
+                    .map(|a| stamp_unresolved_upstream(a, upstream_binding_names))
+                    .collect(),
+            })
+        }
+        Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
+            Box::new(stamp_unresolved_upstream(*inner, upstream_binding_names)),
+        )),
         // An already-stamped `Value::Unknown` (from an earlier pass)
         // is passed through unchanged — it cannot be resolved further.
-        other @ Value::Unknown(_) => other,
+        other @ Value::Deferred(DeferredValue::Unknown(_)) => other,
         other => other,
     }
 }
@@ -165,7 +177,7 @@ fn stamp_unresolved_upstream(
 /// Returns an error if a builtin function fails with fully-resolved arguments.
 pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<Value, String> {
     match value {
-        Value::ResourceRef { path } => {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
             let binding_name = path.binding();
             let attribute_name = path.attribute();
             let field_path = path.field_path();
@@ -193,7 +205,7 @@ pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<V
                     // `Secret(Map)` ref silently.
                     let (peeled, secret_depth) = peel_secrets(resolved);
                     let next = match peeled {
-                        Value::Map(ref map) => match map.get(field) {
+                        Value::Concrete(ConcreteValue::Map(ref map)) => match map.get(field) {
                             Some(nested) => resolve_ref_value(nested, bindings)?,
                             None if is_upstream && secret_depth > 0 => {
                                 return Err(missing_map_key_error_redacted(path, map.len()));
@@ -215,23 +227,25 @@ pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<V
                     // tag survives end-to-end. #2439.
                     let (peeled, secret_depth) = peel_secrets(resolved);
                     let next = match (peeled, sub) {
-                        (Value::List(items), Subscript::Int { index }) => {
+                        (Value::Concrete(ConcreteValue::List(items)), Subscript::Int { index }) => {
                             let idx = usize::try_from(*index).ok().filter(|i| *i < items.len());
                             match idx {
                                 Some(i) => resolve_ref_value(&items[i], bindings)?,
                                 None => return Ok(value.clone()),
                             }
                         }
-                        (Value::Map(map), Subscript::Str { key }) => match map.get(key) {
-                            Some(nested) => resolve_ref_value(nested, bindings)?,
-                            None if is_upstream && secret_depth > 0 => {
-                                return Err(missing_map_key_error_redacted(path, map.len()));
+                        (Value::Concrete(ConcreteValue::Map(map)), Subscript::Str { key }) => {
+                            match map.get(key) {
+                                Some(nested) => resolve_ref_value(nested, bindings)?,
+                                None if is_upstream && secret_depth > 0 => {
+                                    return Err(missing_map_key_error_redacted(path, map.len()));
+                                }
+                                None if is_upstream => {
+                                    return Err(missing_map_key_error(path, &map));
+                                }
+                                None => return Ok(value.clone()),
                             }
-                            None if is_upstream => {
-                                return Err(missing_map_key_error(path, &map));
-                            }
-                            None => return Ok(value.clone()),
-                        },
+                        }
                         _ => return Ok(value.clone()),
                     };
                     resolved = rewrap_secrets(next, secret_depth);
@@ -242,21 +256,21 @@ pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<V
             // Keep as-is if not found
             Ok(value.clone())
         }
-        Value::List(items) => {
+        Value::Concrete(ConcreteValue::List(items)) => {
             let resolved: Result<Vec<Value>, String> = items
                 .iter()
                 .map(|v| resolve_ref_value(v, bindings))
                 .collect();
-            Ok(Value::List(resolved?))
+            Ok(Value::Concrete(ConcreteValue::List(resolved?)))
         }
-        Value::Map(map) => {
+        Value::Concrete(ConcreteValue::Map(map)) => {
             let mut resolved: IndexMap<String, Value> = IndexMap::new();
             for (k, v) in map {
                 resolved.insert(k.clone(), resolve_ref_value(v, bindings)?);
             }
-            Ok(Value::Map(resolved))
+            Ok(Value::Concrete(ConcreteValue::Map(resolved)))
         }
-        Value::Interpolation(parts) => {
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
             let resolved_parts: Result<Vec<InterpolationPart>, String> = parts
                 .iter()
                 .map(|p| match p {
@@ -266,9 +280,9 @@ pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<V
                     other => Ok(other.clone()),
                 })
                 .collect();
-            Ok(Value::Interpolation(resolved_parts?).canonicalize())
+            Ok(Value::Deferred(DeferredValue::Interpolation(resolved_parts?)).canonicalize())
         }
-        Value::FunctionCall { name, args } => {
+        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
             // First, resolve all arguments
             let resolved_args: Result<Vec<Value>, String> = args
                 .iter()
@@ -305,19 +319,21 @@ pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<V
                 }
             } else {
                 // Keep as FunctionCall with partially resolved args
-                Ok(Value::FunctionCall {
+                Ok(Value::Deferred(DeferredValue::FunctionCall {
                     name: name.clone(),
                     args: resolved_args,
-                })
+                }))
             }
         }
-        Value::Secret(inner) => {
+        Value::Deferred(DeferredValue::Secret(inner)) => {
             let resolved_inner = resolve_ref_value(inner, bindings)?;
-            Ok(Value::Secret(Box::new(resolved_inner)))
+            Ok(Value::Deferred(DeferredValue::Secret(Box::new(
+                resolved_inner,
+            ))))
         }
         // `Value::Unknown` is the result of stamping a previously-
         // unresolved upstream ref; it cannot be resolved further.
-        Value::Unknown(_) => Ok(value.clone()),
+        Value::Deferred(DeferredValue::Unknown(_)) => Ok(value.clone()),
         _ => Ok(value.clone()),
     }
 }
@@ -329,7 +345,7 @@ pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<V
 /// the tag.
 fn peel_secrets(mut value: Value) -> (Value, usize) {
     let mut depth = 0;
-    while let Value::Secret(inner) = value {
+    while let Value::Deferred(DeferredValue::Secret(inner)) = value {
         value = *inner;
         depth += 1;
     }
@@ -339,7 +355,9 @@ fn peel_secrets(mut value: Value) -> (Value, usize) {
 /// Re-wrap `value` in `depth` layers of `Value::Secret`. Inverse of
 /// [`peel_secrets`].
 fn rewrap_secrets(value: Value, depth: usize) -> Value {
-    (0..depth).fold(value, |acc, _| Value::Secret(Box::new(acc)))
+    (0..depth).fold(value, |acc, _| {
+        Value::Deferred(DeferredValue::Secret(Box::new(acc)))
+    })
 }
 
 /// Format the "key not found; available keys: ..." error for a missing
@@ -403,10 +421,10 @@ mod tests {
             "orgs",
             vec![(
                 "accounts",
-                Value::List(vec![
-                    Value::String("alpha".to_string()),
-                    Value::String("beta".to_string()),
-                ]),
+                Value::Concrete(ConcreteValue::List(vec![
+                    Value::Concrete(ConcreteValue::String("alpha".to_string())),
+                    Value::Concrete(ConcreteValue::String("beta".to_string())),
+                ])),
             )],
         )]);
         let path = crate::resource::AccessPath::with_fields_and_subscripts(
@@ -415,9 +433,12 @@ mod tests {
             Vec::new(),
             vec![crate::resource::Subscript::Int { index: 0 }],
         );
-        let ref_value = Value::ResourceRef { path };
+        let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
         let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
-        assert_eq!(resolved, Value::String("alpha".to_string()));
+        assert_eq!(
+            resolved,
+            Value::Concrete(ConcreteValue::String("alpha".to_string()))
+        );
     }
 
     #[test]
@@ -425,12 +446,21 @@ mod tests {
         // `orgs.accounts["alpha"]` against `accounts: { alpha = "1", beta = "2" }`
         // resolves to `"1"`.
         let map: indexmap::IndexMap<String, Value> = vec![
-            ("alpha".to_string(), Value::String("1".to_string())),
-            ("beta".to_string(), Value::String("2".to_string())),
+            (
+                "alpha".to_string(),
+                Value::Concrete(ConcreteValue::String("1".to_string())),
+            ),
+            (
+                "beta".to_string(),
+                Value::Concrete(ConcreteValue::String("2".to_string())),
+            ),
         ]
         .into_iter()
         .collect();
-        let bindings = bindings_from(vec![("orgs", vec![("accounts", Value::Map(map))])]);
+        let bindings = bindings_from(vec![(
+            "orgs",
+            vec![("accounts", Value::Concrete(ConcreteValue::Map(map)))],
+        )]);
         let path = crate::resource::AccessPath::with_fields_and_subscripts(
             "orgs",
             "accounts",
@@ -439,9 +469,12 @@ mod tests {
                 key: "alpha".to_string(),
             }],
         );
-        let ref_value = Value::ResourceRef { path };
+        let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
         let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
-        assert_eq!(resolved, Value::String("1".to_string()));
+        assert_eq!(
+            resolved,
+            Value::Concrete(ConcreteValue::String("1".to_string()))
+        );
     }
 
     #[test]
@@ -449,14 +482,25 @@ mod tests {
         // #2439: subscript on `Secret(Map)` must descend and re-wrap
         // so plan-display redaction survives end-to-end.
         let map: indexmap::IndexMap<String, Value> = vec![
-            ("db_pwd".to_string(), Value::String("hunter2".to_string())),
-            ("api_key".to_string(), Value::String("xyz".to_string())),
+            (
+                "db_pwd".to_string(),
+                Value::Concrete(ConcreteValue::String("hunter2".to_string())),
+            ),
+            (
+                "api_key".to_string(),
+                Value::Concrete(ConcreteValue::String("xyz".to_string())),
+            ),
         ]
         .into_iter()
         .collect();
         let bindings = bindings_from(vec![(
             "creds_binding",
-            vec![("creds", Value::Secret(Box::new(Value::Map(map))))],
+            vec![(
+                "creds",
+                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                    ConcreteValue::Map(map),
+                )))),
+            )],
         )]);
         let path = crate::resource::AccessPath::with_fields_and_subscripts(
             "creds_binding",
@@ -466,11 +510,13 @@ mod tests {
                 key: "db_pwd".to_string(),
             }],
         );
-        let ref_value = Value::ResourceRef { path };
+        let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
         let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
         assert_eq!(
             resolved,
-            Value::Secret(Box::new(Value::String("hunter2".to_string()))),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("hunter2".to_string())
+            )))),
             "subscript on Secret(Map) must project the entry and re-wrap as Secret(String)"
         );
     }
@@ -484,10 +530,12 @@ mod tests {
             "secret_holder",
             vec![(
                 "tokens",
-                Value::Secret(Box::new(Value::List(vec![
-                    Value::String("alpha".to_string()),
-                    Value::String("beta".to_string()),
-                ]))),
+                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                    ConcreteValue::List(vec![
+                        Value::String("alpha".to_string()),
+                        Value::String("beta".to_string()),
+                    ]),
+                )))),
             )],
         )]);
         let path = crate::resource::AccessPath::with_fields_and_subscripts(
@@ -496,11 +544,13 @@ mod tests {
             Vec::new(),
             vec![crate::resource::Subscript::Int { index: 1 }],
         );
-        let ref_value = Value::ResourceRef { path };
+        let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
         let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
         assert_eq!(
             resolved,
-            Value::Secret(Box::new(Value::String("beta".to_string()))),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("beta".to_string())
+            )))),
         );
     }
 
@@ -510,24 +560,33 @@ mod tests {
         // the same blind spot as the subscript path. Pin the symmetric
         // fix so a regression that drops the field_path peel doesn't
         // silently keep the ref.
-        let map: indexmap::IndexMap<String, Value> =
-            vec![("db_pwd".to_string(), Value::String("hunter2".to_string()))]
-                .into_iter()
-                .collect();
+        let map: indexmap::IndexMap<String, Value> = vec![(
+            "db_pwd".to_string(),
+            Value::Concrete(ConcreteValue::String("hunter2".to_string())),
+        )]
+        .into_iter()
+        .collect();
         let bindings = bindings_from(vec![(
             "creds_binding",
-            vec![("creds", Value::Secret(Box::new(Value::Map(map))))],
+            vec![(
+                "creds",
+                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                    ConcreteValue::Map(map),
+                )))),
+            )],
         )]);
         let path = crate::resource::AccessPath::with_fields(
             "creds_binding",
             "creds",
             vec!["db_pwd".to_string()],
         );
-        let ref_value = Value::ResourceRef { path };
+        let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
         let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
         assert_eq!(
             resolved,
-            Value::Secret(Box::new(Value::String("hunter2".to_string()))),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("hunter2".to_string())
+            )))),
         );
     }
 
@@ -536,15 +595,19 @@ mod tests {
         // Defensive: stacked `Secret(Secret(Map))` (parser-rejected in
         // practice, but `peel_secrets` literally exists to handle it).
         // Re-wrap depth must match peel depth — pin the contract.
-        let map: indexmap::IndexMap<String, Value> =
-            vec![("k".to_string(), Value::String("v".to_string()))]
-                .into_iter()
-                .collect();
+        let map: indexmap::IndexMap<String, Value> = vec![(
+            "k".to_string(),
+            Value::Concrete(ConcreteValue::String("v".to_string())),
+        )]
+        .into_iter()
+        .collect();
         let bindings = bindings_from(vec![(
             "b",
             vec![(
                 "creds",
-                Value::Secret(Box::new(Value::Secret(Box::new(Value::Map(map))))),
+                Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
+                    DeferredValue::Secret(Box::new(Value::Map(map))),
+                )))),
             )],
         )]);
         let path = crate::resource::AccessPath::with_fields_and_subscripts(
@@ -555,13 +618,13 @@ mod tests {
                 key: "k".to_string(),
             }],
         );
-        let ref_value = Value::ResourceRef { path };
+        let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
         let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
         assert_eq!(
             resolved,
-            Value::Secret(Box::new(Value::Secret(Box::new(Value::String(
-                "v".to_string()
-            ))))),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
+                DeferredValue::Secret(Box::new(Value::String("v".to_string())))
+            )))),
         );
     }
 
@@ -576,9 +639,9 @@ mod tests {
             "h",
             vec![(
                 "tokens",
-                Value::Secret(Box::new(Value::List(vec![Value::String(
-                    "only".to_string(),
-                )]))),
+                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                    ConcreteValue::List(vec![Value::String("only".to_string())]),
+                )))),
             )],
         )]);
         let path = crate::resource::AccessPath::with_fields_and_subscripts(
@@ -587,7 +650,7 @@ mod tests {
             Vec::new(),
             vec![crate::resource::Subscript::Int { index: 5 }],
         );
-        let ref_value = Value::ResourceRef { path };
+        let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
         let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
         assert_eq!(resolved, ref_value);
     }
@@ -598,13 +661,20 @@ mod tests {
         // a missing key keeps the ref unchanged because the value may
         // not be resolved yet. Mirrors the non-secret local-missing
         // path, just with the Secret peel.
-        let map: indexmap::IndexMap<String, Value> =
-            vec![("known".to_string(), Value::String("v".to_string()))]
-                .into_iter()
-                .collect();
+        let map: indexmap::IndexMap<String, Value> = vec![(
+            "known".to_string(),
+            Value::Concrete(ConcreteValue::String("v".to_string())),
+        )]
+        .into_iter()
+        .collect();
         let bindings = bindings_from(vec![(
             "h",
-            vec![("creds", Value::Secret(Box::new(Value::Map(map))))],
+            vec![(
+                "creds",
+                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                    ConcreteValue::Map(map),
+                )))),
+            )],
         )]);
         let path = crate::resource::AccessPath::with_fields_and_subscripts(
             "h",
@@ -614,7 +684,7 @@ mod tests {
                 key: "missing".to_string(),
             }],
         );
-        let ref_value = Value::ResourceRef { path };
+        let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
         let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
         assert_eq!(resolved, ref_value);
     }
@@ -633,15 +703,21 @@ mod tests {
         let map: indexmap::IndexMap<String, Value> = vec![
             (
                 "db_pwd".to_string(),
-                Value::Secret(Box::new(Value::String("v".to_string()))),
+                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                    ConcreteValue::String("v".to_string()),
+                )))),
             ),
             (
                 "api_key".to_string(),
-                Value::Secret(Box::new(Value::String("v".to_string()))),
+                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                    ConcreteValue::String("v".to_string()),
+                )))),
             ),
             (
                 "slack_token".to_string(),
-                Value::Secret(Box::new(Value::String("v".to_string()))),
+                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                    ConcreteValue::String("v".to_string()),
+                )))),
             ),
         ]
         .into_iter()
@@ -649,7 +725,9 @@ mod tests {
         let mut attrs = HashMap::new();
         attrs.insert(
             "creds".to_string(),
-            Value::Secret(Box::new(Value::Map(map))),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::Map(map),
+            )))),
         );
         let mut bindings = ResolvedBindings::default();
         bindings.set("h", attrs, BindingValueSource::Upstream);
@@ -661,7 +739,7 @@ mod tests {
                 key: "missing".to_string(),
             }],
         );
-        let ref_value = Value::ResourceRef { path };
+        let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
         let result = resolve_ref_value(&ref_value, &bindings);
         let err = result.expect_err("missing key in concrete upstream Secret(Map) must error");
         assert!(
@@ -691,11 +769,15 @@ mod tests {
         let map: indexmap::IndexMap<String, Value> = vec![
             (
                 "db_pwd".to_string(),
-                Value::Secret(Box::new(Value::String("v".to_string()))),
+                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                    ConcreteValue::String("v".to_string()),
+                )))),
             ),
             (
                 "api_key".to_string(),
-                Value::Secret(Box::new(Value::String("v".to_string()))),
+                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                    ConcreteValue::String("v".to_string()),
+                )))),
             ),
         ]
         .into_iter()
@@ -703,7 +785,9 @@ mod tests {
         let mut attrs = HashMap::new();
         attrs.insert(
             "creds".to_string(),
-            Value::Secret(Box::new(Value::Map(map))),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::Map(map),
+            )))),
         );
         let mut bindings = ResolvedBindings::default();
         bindings.set("h", attrs, BindingValueSource::Upstream);
@@ -713,7 +797,7 @@ mod tests {
             vec!["missing".to_string()],
             Vec::new(),
         );
-        let ref_value = Value::ResourceRef { path };
+        let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
         let err = resolve_ref_value(&ref_value, &bindings)
             .expect_err("missing dot-form field in concrete upstream Secret(Map) must error");
         assert!(
@@ -739,7 +823,9 @@ mod tests {
         let mut attrs = HashMap::new();
         attrs.insert(
             "creds".to_string(),
-            Value::Secret(Box::new(Value::Map(indexmap::IndexMap::new()))),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::Map(indexmap::IndexMap::new()),
+            )))),
         );
         let mut bindings = ResolvedBindings::default();
         bindings.set("h", attrs, BindingValueSource::Upstream);
@@ -751,7 +837,7 @@ mod tests {
                 key: "missing".to_string(),
             }],
         );
-        let ref_value = Value::ResourceRef { path };
+        let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
         let err = resolve_ref_value(&ref_value, &bindings)
             .expect_err("missing key in empty upstream Secret(Map) must error");
         assert!(
@@ -772,11 +858,11 @@ mod tests {
         let mut h_attrs: HashMap<String, Value> = HashMap::new();
         h_attrs.insert(
             "creds".to_string(),
-            Value::Secret(Box::new(Value::resource_ref(
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::resource_ref(
                 "missing".to_string(),
                 "x".to_string(),
                 vec![],
-            ))),
+            )))),
         );
         let mut bindings = crate::binding_index::ResolvedBindings::default();
         bindings.set(
@@ -792,7 +878,7 @@ mod tests {
                 key: "k".to_string(),
             }],
         );
-        let ref_value = Value::ResourceRef { path };
+        let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
         let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
         assert_eq!(
             resolved, ref_value,
@@ -808,7 +894,9 @@ mod tests {
             "orgs",
             vec![(
                 "accounts",
-                Value::List(vec![Value::String("a".to_string())]),
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::String("a".to_string()),
+                )])),
             )],
         )]);
         let path = crate::resource::AccessPath::with_fields_and_subscripts(
@@ -817,7 +905,7 @@ mod tests {
             Vec::new(),
             vec![crate::resource::Subscript::Int { index: 5 }],
         );
-        let ref_value = Value::ResourceRef { path: path.clone() };
+        let ref_value = Value::Deferred(DeferredValue::ResourceRef { path: path.clone() });
         let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
         assert_eq!(resolved, ref_value);
     }
@@ -826,34 +914,43 @@ mod tests {
     fn test_resolve_simple_resource_ref() {
         let bindings = bindings_from(vec![(
             "my_vpc",
-            vec![("id", Value::String("vpc-123".to_string()))],
+            vec![(
+                "id",
+                Value::Concrete(ConcreteValue::String("vpc-123".to_string())),
+            )],
         )]);
 
         let ref_value = Value::resource_ref("my_vpc".to_string(), "id".to_string(), vec![]);
 
         let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
-        assert_eq!(resolved, Value::String("vpc-123".to_string()));
+        assert_eq!(
+            resolved,
+            Value::Concrete(ConcreteValue::String("vpc-123".to_string()))
+        );
     }
 
     #[test]
     fn test_resolve_nested_refs_in_list() {
         let bindings = bindings_from(vec![(
             "my_sg",
-            vec![("id", Value::String("sg-456".to_string()))],
+            vec![(
+                "id",
+                Value::Concrete(ConcreteValue::String("sg-456".to_string())),
+            )],
         )]);
 
-        let list = Value::List(vec![
-            Value::String("static".to_string()),
+        let list = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("static".to_string())),
             Value::resource_ref("my_sg".to_string(), "id".to_string(), vec![]),
-        ]);
+        ]));
 
         let resolved = resolve_ref_value(&list, &bindings).unwrap();
         assert_eq!(
             resolved,
-            Value::List(vec![
-                Value::String("static".to_string()),
-                Value::String("sg-456".to_string()),
-            ])
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("static".to_string())),
+                Value::Concrete(ConcreteValue::String("sg-456".to_string())),
+            ]))
         );
     }
 
@@ -861,23 +958,28 @@ mod tests {
     fn test_resolve_nested_refs_in_map() {
         let bindings = bindings_from(vec![(
             "my_subnet",
-            vec![("id", Value::String("subnet-789".to_string()))],
+            vec![(
+                "id",
+                Value::Concrete(ConcreteValue::String("subnet-789".to_string())),
+            )],
         )]);
 
-        let map = Value::Map(
+        let map = Value::Concrete(ConcreteValue::Map(
             vec![(
                 "subnet_id".to_string(),
                 Value::resource_ref("my_subnet".to_string(), "id".to_string(), vec![]),
             )]
             .into_iter()
             .collect(),
-        );
+        ));
 
         let resolved = resolve_ref_value(&map, &bindings).unwrap();
-        if let Value::Map(m) = resolved {
+        if let Value::Concrete(ConcreteValue::Map(m)) = resolved {
             assert_eq!(
                 m.get("subnet_id"),
-                Some(&Value::String("subnet-789".to_string()))
+                Some(&Value::Concrete(ConcreteValue::String(
+                    "subnet-789".to_string()
+                )))
             );
         } else {
             panic!("Expected Map");
@@ -898,55 +1000,64 @@ mod tests {
     fn test_resolve_interpolation_all_resolved() {
         let bindings = bindings_from(vec![(
             "my_vpc",
-            vec![("vpc_id", Value::String("vpc-123".to_string()))],
+            vec![(
+                "vpc_id",
+                Value::Concrete(ConcreteValue::String("vpc-123".to_string())),
+            )],
         )]);
 
-        let interp = Value::Interpolation(vec![
+        let interp = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("subnet-".to_string()),
             InterpolationPart::Expr(Value::resource_ref(
                 "my_vpc".to_string(),
                 "vpc_id".to_string(),
                 vec![],
             )),
-        ]);
+        ]));
 
         let resolved = resolve_ref_value(&interp, &bindings).unwrap();
-        assert_eq!(resolved, Value::String("subnet-vpc-123".to_string()));
+        assert_eq!(
+            resolved,
+            Value::Concrete(ConcreteValue::String("subnet-vpc-123".to_string()))
+        );
     }
 
     #[test]
     fn test_resolve_interpolation_partially_unresolved() {
         let bindings = ResolvedBindings::default();
 
-        let interp = Value::Interpolation(vec![
+        let interp = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("subnet-".to_string()),
             InterpolationPart::Expr(Value::resource_ref(
                 "my_vpc".to_string(),
                 "vpc_id".to_string(),
                 vec![],
             )),
-        ]);
+        ]));
 
         let resolved = resolve_ref_value(&interp, &bindings).unwrap();
         // Should remain as Interpolation since the ref couldn't be resolved
-        assert!(matches!(resolved, Value::Interpolation(_)));
+        assert!(matches!(
+            resolved,
+            Value::Deferred(DeferredValue::Interpolation(_))
+        ));
     }
 
     #[test]
     fn test_resolve_interpolation_with_non_string_types() {
         let bindings = ResolvedBindings::default();
 
-        let interp = Value::Interpolation(vec![
+        let interp = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("port-".to_string()),
-            InterpolationPart::Expr(Value::Int(8080)),
+            InterpolationPart::Expr(Value::Concrete(ConcreteValue::Int(8080))),
             InterpolationPart::Literal("-enabled-".to_string()),
-            InterpolationPart::Expr(Value::Bool(true)),
-        ]);
+            InterpolationPart::Expr(Value::Concrete(ConcreteValue::Bool(true))),
+        ]));
 
         let resolved = resolve_ref_value(&interp, &bindings).unwrap();
         assert_eq!(
             resolved,
-            Value::String("port-8080-enabled-true".to_string())
+            Value::Concrete(ConcreteValue::String("port-8080-enabled-true".to_string()))
         );
     }
 
@@ -957,7 +1068,10 @@ mod tests {
             make_resource(
                 "my-vpc",
                 Some("my_vpc"),
-                vec![("cidr_block", Value::String("10.0.0.0/16".to_string()))],
+                vec![(
+                    "cidr_block",
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                )],
             ),
             make_resource(
                 "my-subnet",
@@ -976,9 +1090,12 @@ mod tests {
                 id: rid,
                 identifier: None,
                 exists: true,
-                attributes: vec![("vpc_id".to_string(), Value::String("vpc-abc".to_string()))]
-                    .into_iter()
-                    .collect(),
+                attributes: vec![(
+                    "vpc_id".to_string(),
+                    Value::Concrete(ConcreteValue::String("vpc-abc".to_string())),
+                )]
+                .into_iter()
+                .collect(),
                 dependency_bindings: std::collections::BTreeSet::new(),
             },
         );
@@ -988,7 +1105,9 @@ mod tests {
         // The subnet's vpc_id should be resolved from state
         assert_eq!(
             resources[1].get_attr("vpc_id"),
-            Some(&Value::String("vpc-abc".to_string()))
+            Some(&Value::Concrete(ConcreteValue::String(
+                "vpc-abc".to_string()
+            )))
         );
     }
 
@@ -996,43 +1115,52 @@ mod tests {
     fn test_resolve_function_call_join() {
         let bindings = ResolvedBindings::default();
 
-        let func = Value::FunctionCall {
+        let func = Value::Deferred(DeferredValue::FunctionCall {
             name: "join".to_string(),
             args: vec![
-                Value::String("-".to_string()),
-                Value::List(vec![
+                Value::Concrete(ConcreteValue::String("-".to_string())),
+                Value::Concrete(ConcreteValue::List(vec![
                     Value::String("a".to_string()),
                     Value::String("b".to_string()),
                     Value::String("c".to_string()),
-                ]),
+                ])),
             ],
-        };
+        });
 
         let resolved = resolve_ref_value(&func, &bindings).unwrap();
-        assert_eq!(resolved, Value::String("a-b-c".to_string()));
+        assert_eq!(
+            resolved,
+            Value::Concrete(ConcreteValue::String("a-b-c".to_string()))
+        );
     }
 
     #[test]
     fn test_resolve_function_call_with_resource_ref() {
         let bindings = bindings_from(vec![(
             "vpc",
-            vec![("id", Value::String("vpc-123".to_string()))],
+            vec![(
+                "id",
+                Value::Concrete(ConcreteValue::String("vpc-123".to_string())),
+            )],
         )]);
 
         // join("-", ["prefix", vpc.id]) should resolve vpc.id first, then evaluate
-        let func = Value::FunctionCall {
+        let func = Value::Deferred(DeferredValue::FunctionCall {
             name: "join".to_string(),
             args: vec![
-                Value::String("-".to_string()),
-                Value::List(vec![
+                Value::Concrete(ConcreteValue::String("-".to_string())),
+                Value::Concrete(ConcreteValue::List(vec![
                     Value::String("prefix".to_string()),
                     Value::resource_ref("vpc".to_string(), "id".to_string(), vec![]),
-                ]),
+                ])),
             ],
-        };
+        });
 
         let resolved = resolve_ref_value(&func, &bindings).unwrap();
-        assert_eq!(resolved, Value::String("prefix-vpc-123".to_string()));
+        assert_eq!(
+            resolved,
+            Value::Concrete(ConcreteValue::String("prefix-vpc-123".to_string()))
+        );
     }
 
     #[test]
@@ -1040,28 +1168,37 @@ mod tests {
         let bindings = ResolvedBindings::default();
 
         // If a ResourceRef in the args can't be resolved, the FunctionCall is kept
-        let func = Value::FunctionCall {
+        let func = Value::Deferred(DeferredValue::FunctionCall {
             name: "join".to_string(),
             args: vec![
-                Value::String("-".to_string()),
-                Value::List(vec![Value::resource_ref(
+                Value::Concrete(ConcreteValue::String("-".to_string())),
+                Value::Concrete(ConcreteValue::List(vec![Value::resource_ref(
                     "unknown".to_string(),
                     "id".to_string(),
                     vec![],
-                )]),
+                )])),
             ],
-        };
+        });
 
         let resolved = resolve_ref_value(&func, &bindings).unwrap();
-        assert!(matches!(resolved, Value::FunctionCall { .. }));
+        assert!(matches!(
+            resolved,
+            Value::Deferred(DeferredValue::FunctionCall { .. })
+        ));
     }
 
     #[test]
     fn test_resolve_chained_field_access() {
         // web binding has a nested map: network = { vpc_id = "vpc-123" }
         let mut network_map = IndexMap::new();
-        network_map.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
-        let bindings = bindings_from(vec![("web", vec![("network", Value::Map(network_map))])]);
+        network_map.insert(
+            "vpc_id".to_string(),
+            Value::Concrete(ConcreteValue::String("vpc-123".to_string())),
+        );
+        let bindings = bindings_from(vec![(
+            "web",
+            vec![("network", Value::Concrete(ConcreteValue::Map(network_map)))],
+        )]);
 
         // web.network.vpc_id should resolve to "vpc-123"
         let ref_value = Value::resource_ref(
@@ -1071,17 +1208,29 @@ mod tests {
         );
 
         let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
-        assert_eq!(resolved, Value::String("vpc-123".to_string()));
+        assert_eq!(
+            resolved,
+            Value::Concrete(ConcreteValue::String("vpc-123".to_string()))
+        );
     }
 
     #[test]
     fn test_resolve_deeply_chained_field_access() {
         // web.output.network.vpc_id
         let mut inner_map = IndexMap::new();
-        inner_map.insert("vpc_id".to_string(), Value::String("vpc-456".to_string()));
+        inner_map.insert(
+            "vpc_id".to_string(),
+            Value::Concrete(ConcreteValue::String("vpc-456".to_string())),
+        );
         let mut output_map = IndexMap::new();
-        output_map.insert("network".to_string(), Value::Map(inner_map));
-        let bindings = bindings_from(vec![("web", vec![("output", Value::Map(output_map))])]);
+        output_map.insert(
+            "network".to_string(),
+            Value::Concrete(ConcreteValue::Map(inner_map)),
+        );
+        let bindings = bindings_from(vec![(
+            "web",
+            vec![("output", Value::Concrete(ConcreteValue::Map(output_map)))],
+        )]);
 
         let ref_value = Value::resource_ref(
             "web".to_string(),
@@ -1090,14 +1239,23 @@ mod tests {
         );
 
         let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
-        assert_eq!(resolved, Value::String("vpc-456".to_string()));
+        assert_eq!(
+            resolved,
+            Value::Concrete(ConcreteValue::String("vpc-456".to_string()))
+        );
     }
 
     #[test]
     fn test_resolve_chained_field_missing_key_keeps_ref() {
         let mut network_map = IndexMap::new();
-        network_map.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
-        let bindings = bindings_from(vec![("web", vec![("network", Value::Map(network_map))])]);
+        network_map.insert(
+            "vpc_id".to_string(),
+            Value::Concrete(ConcreteValue::String("vpc-123".to_string())),
+        );
+        let bindings = bindings_from(vec![(
+            "web",
+            vec![("network", Value::Concrete(ConcreteValue::Map(network_map)))],
+        )]);
 
         // web.network.nonexistent should keep original ref
         let ref_value = Value::resource_ref(
@@ -1114,12 +1272,12 @@ mod tests {
     fn resolve_builtin_error_propagated_when_args_resolved() {
         // env() with a var name that is extremely unlikely to be set should propagate error
         let bindings = ResolvedBindings::default();
-        let value = Value::FunctionCall {
+        let value = Value::Deferred(DeferredValue::FunctionCall {
             name: "env".to_string(),
-            args: vec![Value::String(
+            args: vec![Value::Concrete(ConcreteValue::String(
                 "CARINA_RESOLVER_TEST_NONEXISTENT_VAR_12345".to_string(),
-            )],
-        };
+            ))],
+        });
 
         let result = resolve_ref_value(&value, &bindings);
         assert!(
@@ -1139,18 +1297,18 @@ mod tests {
     fn resolve_builtin_with_unresolved_ref_stays_as_function_call() {
         // join("-", vpc.tags) should stay as FunctionCall when vpc.tags is unresolved
         let bindings = ResolvedBindings::default();
-        let value = Value::FunctionCall {
+        let value = Value::Deferred(DeferredValue::FunctionCall {
             name: "join".to_string(),
             args: vec![
-                Value::String("-".to_string()),
+                Value::Concrete(ConcreteValue::String("-".to_string())),
                 Value::resource_ref("vpc".to_string(), "tags".to_string(), vec![]),
             ],
-        };
+        });
 
         let result = resolve_ref_value(&value, &bindings);
         assert!(result.is_ok(), "Unresolved ref should not cause error");
         match result.unwrap() {
-            Value::FunctionCall { name, .. } => assert_eq!(name, "join"),
+            Value::Deferred(DeferredValue::FunctionCall { name, .. }) => assert_eq!(name, "join"),
             other => panic!("Expected FunctionCall, got: {:?}", other),
         }
     }
@@ -1162,12 +1320,12 @@ mod tests {
             None,
             vec![(
                 "value",
-                Value::FunctionCall {
+                Value::Deferred(DeferredValue::FunctionCall {
                     name: "env".to_string(),
-                    args: vec![Value::String(
+                    args: vec![Value::Concrete(ConcreteValue::String(
                         "CARINA_RESOLVER_STATE_TEST_NONEXISTENT_VAR_12345".to_string(),
-                    )],
-                },
+                    ))],
+                }),
             )],
         )];
 
@@ -1208,13 +1366,19 @@ mod tests {
         // Build remote bindings: network -> { vpc -> Map { vpc_id -> "vpc-123" } }
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         let mut vpc_attrs = IndexMap::new();
-        vpc_attrs.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
+        vpc_attrs.insert(
+            "vpc_id".to_string(),
+            Value::Concrete(ConcreteValue::String("vpc-123".to_string())),
+        );
         vpc_attrs.insert(
             "cidr_block".to_string(),
-            Value::String("10.0.0.0/16".to_string()),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
         );
         let mut network_map = HashMap::new();
-        network_map.insert("vpc".to_string(), Value::Map(vpc_attrs));
+        network_map.insert(
+            "vpc".to_string(),
+            Value::Concrete(ConcreteValue::Map(vpc_attrs)),
+        );
         remote_bindings.insert("network".to_string(), network_map);
 
         resolve_refs_with_state_and_remote(&mut resources, &current_states, &remote_bindings)
@@ -1222,7 +1386,9 @@ mod tests {
 
         assert_eq!(
             resources[0].get_attr("vpc_id"),
-            Some(&Value::String("vpc-123".to_string()))
+            Some(&Value::Concrete(ConcreteValue::String(
+                "vpc-123".to_string()
+            )))
         );
     }
 
@@ -1238,7 +1404,7 @@ mod tests {
             vec![(
                 "principal_arn",
                 // orgs.accounts["registry_dev"]
-                Value::ResourceRef {
+                Value::Deferred(DeferredValue::ResourceRef {
                     path: crate::resource::AccessPath::with_fields_and_subscripts(
                         "orgs",
                         "accounts",
@@ -1247,21 +1413,24 @@ mod tests {
                             key: "registry_dev".to_string(),
                         }],
                     ),
-                },
+                }),
             )],
         )];
 
         let mut accounts_map: IndexMap<String, Value> = IndexMap::new();
         accounts_map.insert(
             "registry_prod".to_string(),
-            Value::String("111111111111".to_string()),
+            Value::Concrete(ConcreteValue::String("111111111111".to_string())),
         );
         accounts_map.insert(
             "registry_dev".to_string(),
-            Value::String("222222222222".to_string()),
+            Value::Concrete(ConcreteValue::String("222222222222".to_string())),
         );
         let mut orgs_attrs = HashMap::new();
-        orgs_attrs.insert("accounts".to_string(), Value::Map(accounts_map));
+        orgs_attrs.insert(
+            "accounts".to_string(),
+            Value::Concrete(ConcreteValue::Map(accounts_map)),
+        );
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
@@ -1270,7 +1439,9 @@ mod tests {
 
         assert_eq!(
             resources[0].get_attr("principal_arn"),
-            Some(&Value::String("222222222222".to_string())),
+            Some(&Value::Concrete(ConcreteValue::String(
+                "222222222222".to_string()
+            ))),
         );
     }
 
@@ -1286,7 +1457,7 @@ mod tests {
             None,
             vec![(
                 "principal_arn",
-                Value::ResourceRef {
+                Value::Deferred(DeferredValue::ResourceRef {
                     path: crate::resource::AccessPath::with_fields_and_subscripts(
                         "orgs",
                         "accounts",
@@ -1295,21 +1466,24 @@ mod tests {
                             key: "registry_qa".to_string(),
                         }],
                     ),
-                },
+                }),
             )],
         )];
 
         let mut accounts_map: IndexMap<String, Value> = IndexMap::new();
         accounts_map.insert(
             "registry_prod".to_string(),
-            Value::String("111111111111".to_string()),
+            Value::Concrete(ConcreteValue::String("111111111111".to_string())),
         );
         accounts_map.insert(
             "registry_dev".to_string(),
-            Value::String("222222222222".to_string()),
+            Value::Concrete(ConcreteValue::String("222222222222".to_string())),
         );
         let mut orgs_attrs = HashMap::new();
-        orgs_attrs.insert("accounts".to_string(), Value::Map(accounts_map));
+        orgs_attrs.insert(
+            "accounts".to_string(),
+            Value::Concrete(ConcreteValue::Map(accounts_map)),
+        );
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
@@ -1333,7 +1507,10 @@ mod tests {
         // still fire and the available-keys list must say so explicitly
         // ("<no keys>") rather than render an empty string.
         let mut orgs_attrs = HashMap::new();
-        orgs_attrs.insert("accounts".to_string(), Value::Map(IndexMap::new()));
+        orgs_attrs.insert(
+            "accounts".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+        );
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
@@ -1342,7 +1519,7 @@ mod tests {
             None,
             vec![(
                 "principal_arn",
-                Value::ResourceRef {
+                Value::Deferred(DeferredValue::ResourceRef {
                     path: crate::resource::AccessPath::with_fields_and_subscripts(
                         "orgs",
                         "accounts",
@@ -1351,7 +1528,7 @@ mod tests {
                             key: "registry_dev".to_string(),
                         }],
                     ),
-                },
+                }),
             )],
         )];
         let err =
@@ -1376,7 +1553,7 @@ mod tests {
             None,
             vec![(
                 "principal_arn",
-                Value::ResourceRef {
+                Value::Deferred(DeferredValue::ResourceRef {
                     path: crate::resource::AccessPath::with_fields_and_subscripts(
                         "orgs",
                         "accounts",
@@ -1385,7 +1562,7 @@ mod tests {
                             key: "anything".to_string(),
                         }],
                     ),
-                },
+                }),
             )],
         )];
 
@@ -1395,7 +1572,7 @@ mod tests {
         assert!(
             matches!(
                 resources[0].get_attr("principal_arn"),
-                Some(Value::ResourceRef { .. })
+                Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
             ),
             "ref must stay as ResourceRef when upstream is not loaded"
         );
@@ -1405,14 +1582,17 @@ mod tests {
     fn test_resolve_upstream_state_chained_subscripts() {
         // `orgs.regions['us'][0]` against a `map(list(String))` should
         // walk the map, then index into the list, returning the leaf.
-        let inner_list = Value::List(vec![
-            Value::String("aza".to_string()),
-            Value::String("azb".to_string()),
-        ]);
+        let inner_list = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("aza".to_string())),
+            Value::Concrete(ConcreteValue::String("azb".to_string())),
+        ]));
         let mut regions_map: IndexMap<String, Value> = IndexMap::new();
         regions_map.insert("us".to_string(), inner_list);
         let mut orgs_attrs = HashMap::new();
-        orgs_attrs.insert("regions".to_string(), Value::Map(regions_map));
+        orgs_attrs.insert(
+            "regions".to_string(),
+            Value::Concrete(ConcreteValue::Map(regions_map)),
+        );
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
@@ -1421,7 +1601,7 @@ mod tests {
             None,
             vec![(
                 "az",
-                Value::ResourceRef {
+                Value::Deferred(DeferredValue::ResourceRef {
                     path: crate::resource::AccessPath::with_fields_and_subscripts(
                         "orgs",
                         "regions",
@@ -1433,14 +1613,14 @@ mod tests {
                             crate::resource::Subscript::Int { index: 0 },
                         ],
                     ),
-                },
+                }),
             )],
         )];
         resolve_refs_with_state_and_remote(&mut resources, &HashMap::new(), &remote_bindings)
             .unwrap();
         assert_eq!(
             resources[0].get_attr("az"),
-            Some(&Value::String("aza".to_string()))
+            Some(&Value::Concrete(ConcreteValue::String("aza".to_string())))
         );
     }
 
@@ -1452,10 +1632,15 @@ mod tests {
         let mut regions_map: IndexMap<String, Value> = IndexMap::new();
         regions_map.insert(
             "us".to_string(),
-            Value::List(vec![Value::String("aza".to_string())]),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("aza".to_string()),
+            )])),
         );
         let mut orgs_attrs = HashMap::new();
-        orgs_attrs.insert("regions".to_string(), Value::Map(regions_map));
+        orgs_attrs.insert(
+            "regions".to_string(),
+            Value::Concrete(ConcreteValue::Map(regions_map)),
+        );
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
@@ -1464,7 +1649,7 @@ mod tests {
             None,
             vec![(
                 "az",
-                Value::ResourceRef {
+                Value::Deferred(DeferredValue::ResourceRef {
                     path: crate::resource::AccessPath::with_fields_and_subscripts(
                         "orgs",
                         "regions",
@@ -1476,7 +1661,7 @@ mod tests {
                             crate::resource::Subscript::Int { index: 0 },
                         ],
                     ),
-                },
+                }),
             )],
         )];
         let err =
@@ -1514,7 +1699,7 @@ mod tests {
         // Should remain as ResourceRef since "nonexistent" binding is not found
         assert!(matches!(
             resources[0].get_attr("vpc_id"),
-            Some(Value::ResourceRef { .. })
+            Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
         ));
     }
 
@@ -1542,7 +1727,7 @@ mod tests {
         resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings).unwrap();
 
         match resources[0].get_attr("vpc_id") {
-            Some(Value::Unknown(UnknownReason::UpstreamRef { path })) => {
+            Some(Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef { path }))) => {
                 assert_eq!(path.to_dot_string(), "network.vpc.vpc_id");
             }
             other => panic!("expected Value::Unknown(UpstreamRef), got {:?}", other),
@@ -1575,7 +1760,7 @@ mod tests {
 
         assert!(matches!(
             resources[0].get_attr("vpc_id"),
-            Some(Value::ResourceRef { .. })
+            Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
         ));
     }
 
@@ -1594,9 +1779,9 @@ mod tests {
             None,
             vec![(
                 "raw",
-                Value::BindingRef {
+                Value::Deferred(DeferredValue::BindingRef {
                     binding: "bootstrap".to_string(),
-                },
+                }),
             )],
         )];
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -1605,7 +1790,9 @@ mod tests {
         resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings).unwrap();
 
         match resources[0].get_attr("raw") {
-            Some(Value::Unknown(UnknownReason::UpstreamBareRef { binding })) => {
+            Some(Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamBareRef {
+                binding,
+            }))) => {
                 assert_eq!(binding, "bootstrap");
             }
             other => panic!("expected Value::Unknown(UpstreamBareRef), got {:?}", other),
@@ -1624,14 +1811,14 @@ mod tests {
             None,
             vec![(
                 "raws",
-                Value::List(vec![
-                    Value::BindingRef {
+                Value::Concrete(ConcreteValue::List(vec![
+                    Value::Deferred(DeferredValue::BindingRef {
                         binding: "bootstrap".to_string(),
-                    },
-                    Value::BindingRef {
+                    }),
+                    Value::Deferred(DeferredValue::BindingRef {
                         binding: "secondary".to_string(),
-                    },
-                ]),
+                    }),
+                ])),
             )],
         )];
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -1641,14 +1828,14 @@ mod tests {
         resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings).unwrap();
 
         match resources[0].get_attr("raws") {
-            Some(Value::List(items)) => {
+            Some(Value::Concrete(ConcreteValue::List(items))) => {
                 assert_eq!(items.len(), 2);
                 let bindings: Vec<&str> = items
                     .iter()
                     .map(|v| match v {
-                        Value::Unknown(UnknownReason::UpstreamBareRef { binding }) => {
-                            binding.as_str()
-                        }
+                        Value::Deferred(DeferredValue::Unknown(
+                            UnknownReason::UpstreamBareRef { binding },
+                        )) => binding.as_str(),
                         other => panic!("expected UpstreamBareRef, got {:?}", other),
                     })
                     .collect();
@@ -1676,7 +1863,7 @@ mod tests {
 
         assert!(matches!(
             resources[0].get_attr("vpc_id"),
-            Some(Value::ResourceRef { .. })
+            Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
         ));
     }
 
@@ -1689,14 +1876,14 @@ mod tests {
             None,
             vec![(
                 "security_group_ids",
-                Value::List(vec![
+                Value::Concrete(ConcreteValue::List(vec![
                     Value::resource_ref("network".to_string(), "public_sg".to_string(), Vec::new()),
                     Value::resource_ref(
                         "network".to_string(),
                         "private_sg".to_string(),
                         Vec::new(),
                     ),
-                ]),
+                ])),
             )],
         )];
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -1705,11 +1892,11 @@ mod tests {
         resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings).unwrap();
 
         match resources[0].get_attr("security_group_ids") {
-            Some(Value::List(items)) => {
+            Some(Value::Concrete(ConcreteValue::List(items))) => {
                 assert_eq!(items.len(), 2);
                 for (idx, item) in items.iter().enumerate() {
                     assert!(
-                        matches!(item, Value::Unknown(_)),
+                        matches!(item, Value::Deferred(DeferredValue::Unknown(_))),
                         "list[{}] should be Value::Unknown, got {:?}",
                         idx,
                         item
@@ -1764,7 +1951,7 @@ mod tests {
         let mut resources = vec![make_resource(
             "web-sg",
             None,
-            vec![("tags", Value::Map(tag_map))],
+            vec![("tags", Value::Concrete(ConcreteValue::Map(tag_map)))],
         )];
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         remote_bindings.insert("network".to_string(), HashMap::new());
@@ -1772,8 +1959,8 @@ mod tests {
         resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings).unwrap();
 
         match resources[0].get_attr("tags") {
-            Some(Value::Map(m)) => match m.get("VpcId") {
-                Some(Value::Unknown(_)) => {}
+            Some(Value::Concrete(ConcreteValue::Map(m))) => match m.get("VpcId") {
+                Some(Value::Deferred(DeferredValue::Unknown(_))) => {}
                 other => panic!("nested entry should be Value::Unknown, got {:?}", other),
             },
             other => panic!("expected Map, got {:?}", other),

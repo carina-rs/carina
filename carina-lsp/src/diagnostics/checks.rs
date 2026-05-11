@@ -8,7 +8,7 @@ use crate::document::Document;
 use crate::position;
 use carina_core::builtins;
 use carina_core::parser::{ArgumentParameter, ParsedFile, TypeExpr};
-use carina_core::resource::{Resource, Value};
+use carina_core::resource::{ConcreteValue, DeferredValue, Resource, Value};
 use carina_core::schema::{ResourceSchema, suggest_similar_name};
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 
@@ -1030,13 +1030,17 @@ impl DiagnosticEngine {
         for attr_param in &parsed.attribute_params {
             if let Some(value) = &attr_param.value {
                 // Check for undefined binding references — both shapes
-                // (`Value::ResourceRef` for `name.attr`, `Value::BindingRef`
+                // (`Value::Deferred(DeferredValue::ResourceRef)` for `name.attr`, `Value::Deferred(DeferredValue::BindingRef)`
                 // for bare `name`, since #2847).
                 let undefined_binding = match value {
-                    Value::ResourceRef { path } if !defined_bindings.contains(path.binding()) => {
+                    Value::Deferred(DeferredValue::ResourceRef { path })
+                        if !defined_bindings.contains(path.binding()) =>
+                    {
                         Some(path.binding().to_string())
                     }
-                    Value::BindingRef { binding } if !defined_bindings.contains(binding) => {
+                    Value::Deferred(DeferredValue::BindingRef { binding })
+                        if !defined_bindings.contains(binding) =>
+                    {
                         Some(binding.clone())
                     }
                     _ => None,
@@ -1076,7 +1080,7 @@ impl DiagnosticEngine {
                 // ResourceRef type validation: check that the referenced attribute's
                 // schema type is compatible with the declared TypeExpr
                 if let Some(ref type_expr) = attr_param.type_expr
-                    && let Value::ResourceRef { path } = value
+                    && let Value::Deferred(DeferredValue::ResourceRef { path }) = value
                     && let Some(ref_type_error) = self.check_attribute_ref_type(
                         type_expr,
                         path,
@@ -1199,9 +1203,9 @@ impl DiagnosticEngine {
             // not produced by the .crn parser — synthetic test inputs
             // and any caller that hands us a raw `"binding.attr"` —
             // since the parser itself now lowers dotted IDs to
-            // `Value::ResourceRef` (#2447). The ResourceRef arm below
+            // `Value::Deferred(DeferredValue::ResourceRef)` (#2447). The ResourceRef arm below
             // is the parser-produced path; both must agree.
-            (_, Value::String(s)) if is_dot_notation_ref(s) => {
+            (_, Value::Concrete(ConcreteValue::String(s))) if is_dot_notation_ref(s) => {
                 let parts: Vec<&str> = s.split('.').collect();
                 self.check_cross_file_ref_type(type_expr, parts[0], parts[1], sibling_bindings)
             }
@@ -1211,7 +1215,7 @@ impl DiagnosticEngine {
             // against the receiver precisely (#2475); skip the
             // comparison rather than false-flag against the head's
             // outer type.
-            (_, Value::ResourceRef { path })
+            (_, Value::Deferred(DeferredValue::ResourceRef { path }))
                 if path.field_path().is_empty() && path.subscripts().is_empty() =>
             {
                 self.check_cross_file_ref_type(
@@ -1221,14 +1225,14 @@ impl DiagnosticEngine {
                     sibling_bindings,
                 )
             }
-            (_, Value::ResourceRef { .. }) => None,
+            (_, Value::Deferred(DeferredValue::ResourceRef { .. })) => None,
             // Bare-binding ref (#2847): no attribute selector means we
             // cannot localize the type at this checkpoint without a
             // separate let/argument lookup. Skip rather than false-flag
             // — same policy as the `ResourceRef` fallthrough above.
-            (_, Value::BindingRef { .. }) => None,
+            (_, Value::Deferred(DeferredValue::BindingRef { .. })) => None,
             // List: recurse into elements
-            (TypeExpr::List(inner), Value::List(items)) => {
+            (TypeExpr::List(inner), Value::Concrete(ConcreteValue::List(items))) => {
                 for (i, item) in items.iter().enumerate() {
                     if let Some(e) =
                         self.validate_type_with_ref_awareness(inner, item, sibling_bindings)
@@ -1239,7 +1243,7 @@ impl DiagnosticEngine {
                 None
             }
             // Map: recurse into values
-            (TypeExpr::Map(inner), Value::Map(map)) => {
+            (TypeExpr::Map(inner), Value::Concrete(ConcreteValue::Map(map))) => {
                 for (key, val) in map {
                     if let Some(e) =
                         self.validate_type_with_ref_awareness(inner, val, sibling_bindings)
@@ -1251,7 +1255,7 @@ impl DiagnosticEngine {
             }
             // Recurse through this ref-aware walker — not `validate_type_expr_value` —
             // so cross-file refs inside struct fields still resolve against sibling bindings.
-            (TypeExpr::Struct { fields }, Value::Map(map)) => {
+            (TypeExpr::Struct { fields }, Value::Concrete(ConcreteValue::Map(map))) => {
                 if let Some(e) = carina_core::validation::struct_field_shape_errors(fields, map) {
                     return Some(e);
                 }
@@ -1683,7 +1687,7 @@ impl DiagnosticEngine {
         diagnostics: &mut Vec<Diagnostic>,
     ) {
         match value {
-            Value::FunctionCall { name, args } => {
+            Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
                 if !builtins::is_known_builtin(name)
                     && !user_fns.contains(name)
                     && let Some((line, col)) = self.find_function_call_position(doc, name)
@@ -1701,17 +1705,17 @@ impl DiagnosticEngine {
                     self.collect_unknown_function_diagnostics(doc, arg, user_fns, diagnostics);
                 }
             }
-            Value::List(items) => {
+            Value::Concrete(ConcreteValue::List(items)) => {
                 for item in items {
                     self.collect_unknown_function_diagnostics(doc, item, user_fns, diagnostics);
                 }
             }
-            Value::Map(map) => {
+            Value::Concrete(ConcreteValue::Map(map)) => {
                 for v in map.values() {
                     self.collect_unknown_function_diagnostics(doc, v, user_fns, diagnostics);
                 }
             }
-            Value::Interpolation(parts) => {
+            Value::Deferred(DeferredValue::Interpolation(parts)) => {
                 for part in parts {
                     if let carina_core::resource::InterpolationPart::Expr(expr) = part {
                         self.collect_unknown_function_diagnostics(doc, expr, user_fns, diagnostics);
@@ -1884,7 +1888,7 @@ impl DiagnosticEngine {
     /// hint that the placeholder is unfilled. See #2480.
     ///
     /// Text scan rather than AST walk: the parser stamps the empty case as
-    /// `Value::Unknown(UnknownReason::EmptyInterpolation)` but discards the
+    /// `Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation))` but discards the
     /// source span, so the diagnostic range has to come from a source-level
     /// pass anyway.
     pub(super) fn check_empty_interpolations(&self, doc: &Document) -> Vec<Diagnostic> {

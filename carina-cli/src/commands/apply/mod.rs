@@ -15,7 +15,7 @@ use carina_core::executor::{ExecutionInput, ExecutionResult};
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ReadRequest};
 use carina_core::resolver::resolve_refs_with_state_and_remote;
-use carina_core::resource::{Resource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 use carina_core::value::format_value;
 use carina_state::{LockInfo, StateBackend, StateFile, resolve_backend};
 
@@ -158,7 +158,12 @@ mod upstream_snapshot_tests {
     fn binding(name: &str, attrs: &[(&str, &str)]) -> (String, HashMap<String, Value>) {
         let map = attrs
             .iter()
-            .map(|(k, v)| (k.to_string(), Value::String(v.to_string())))
+            .map(|(k, v)| {
+                (
+                    k.to_string(),
+                    Value::Concrete(ConcreteValue::String(v.to_string())),
+                )
+            })
             .collect();
         (name.to_string(), map)
     }
@@ -510,7 +515,7 @@ pub async fn run_apply(
                 .attributes
                 .get("bucket")
                 .and_then(|v| match v {
-                    Value::String(s) => Some(s.clone()),
+                    Value::Concrete(ConcreteValue::String(s)) => Some(s.clone()),
                     _ => None,
                 })
                 .ok_or("Missing bucket name in backend configuration")?;
@@ -569,7 +574,7 @@ pub async fn run_apply(
                     .attributes
                     .get("auto_create")
                     .and_then(|v| match v {
-                        Value::Bool(b) => Some(*b),
+                        Value::Concrete(ConcreteValue::Bool(b)) => Some(*b),
                         _ => None,
                     })
                     .unwrap_or(true);

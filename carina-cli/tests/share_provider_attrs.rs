@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use carina_core::config_loader::load_configuration;
-use carina_core::resource::Value;
+use carina_core::resource::{ConcreteValue, Value};
 
 #[test]
 fn share_provider_attrs_resolves_default_tags() {
@@ -47,22 +47,27 @@ fn share_provider_attrs_resolves_default_tags() {
     );
 
     let tags = &provider.default_tags;
-    assert_eq!(tags.get("ManagedBy"), Some(&Value::String("carina".into())),);
+    assert_eq!(
+        tags.get("ManagedBy"),
+        Some(&Value::Concrete(ConcreteValue::String("carina".into()))),
+    );
     assert_eq!(
         tags.get("Project"),
-        Some(&Value::String("carina-rs".into())),
+        Some(&Value::Concrete(ConcreteValue::String("carina-rs".into()))),
     );
     assert_eq!(
         tags.get("Repository"),
-        Some(&Value::String("carina-rs/infra".into())),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "carina-rs/infra".into()
+        ))),
     );
     assert_eq!(
         tags.get("Environment"),
-        Some(&Value::String("dev".into())),
+        Some(&Value::Concrete(ConcreteValue::String("dev".into()))),
         "Environment must come from the module-call argument; got {tags:?}",
     );
     assert_eq!(
         tags.get("Component"),
-        Some(&Value::String("registry".into())),
+        Some(&Value::Concrete(ConcreteValue::String("registry".into()))),
     );
 }

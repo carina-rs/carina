@@ -1,6 +1,6 @@
 //! Shared utility functions for value normalization and conversion
 
-use crate::resource::Value;
+use crate::resource::{ConcreteValue, Value};
 use crate::schema::NamespacedEnumParts;
 
 /// A namespaced DSL enum identifier, parsed once and reused.
@@ -218,11 +218,11 @@ fn is_intermediate_segment(s: &str) -> bool {
 /// pipeline so the two paths cannot drift.
 pub fn expand_enum_shorthand(value: &Value, name: &str, namespace: Option<&str>) -> Value {
     match value {
-        Value::String(s) if !s.contains('.') => match namespace {
-            Some(ns) => Value::String(format!("{}.{}.{}", ns, name, s)),
+        Value::Concrete(ConcreteValue::String(s)) if !s.contains('.') => match namespace {
+            Some(ns) => Value::Concrete(ConcreteValue::String(format!("{}.{}.{}", ns, name, s))),
             None => value.clone(),
         },
-        Value::String(s) => {
+        Value::Concrete(ConcreteValue::String(s)) => {
             if let Some(NamespacedId::TypeQualified {
                 type_name: ident,
                 value: member,
@@ -230,7 +230,10 @@ pub fn expand_enum_shorthand(value: &Value, name: &str, namespace: Option<&str>)
                 && let Some(ns) = namespace
                 && ident == name
             {
-                Value::String(format!("{}.{}.{}", ns, ident, member))
+                Value::Concrete(ConcreteValue::String(format!(
+                    "{}.{}.{}",
+                    ns, ident, member
+                )))
             } else {
                 value.clone()
             }
@@ -460,19 +463,25 @@ pub fn validate_enum_namespace(s: &str, type_name: &str, namespace: &str) -> Res
 pub fn resolve_enum_value(value: &Value, parts: &NamespacedEnumParts<'_>) -> Option<Value> {
     let (type_name, ns, dsl_map) = parts;
     match value {
-        Value::String(s) if !s.contains('.') => {
+        Value::Concrete(ConcreteValue::String(s)) if !s.contains('.') => {
             // bare identifier: "Enabled" -> ns.TypeName.Enabled
             let dsl_val = dsl_map.dsl_for(s);
-            Some(Value::String(format!("{}.{}.{}", ns, type_name, dsl_val)))
+            Some(Value::Concrete(ConcreteValue::String(format!(
+                "{}.{}.{}",
+                ns, type_name, dsl_val
+            ))))
         }
-        Value::String(s)
+        Value::Concrete(ConcreteValue::String(s))
             if s.split_once('.')
                 .is_some_and(|(ident, member)| ident == *type_name && !member.contains('.')) =>
         {
             // TypeName.value: "VersioningStatus.Enabled" -> ns.TypeName.Enabled
             let member = s.split_once('.').unwrap().1;
             let dsl_val = dsl_map.dsl_for(member);
-            Some(Value::String(format!("{}.{}.{}", ns, type_name, dsl_val)))
+            Some(Value::Concrete(ConcreteValue::String(format!(
+                "{}.{}.{}",
+                ns, type_name, dsl_val
+            ))))
         }
         _ => None,
     }
@@ -491,7 +500,7 @@ pub fn normalize_state_enum_value(
     string_enum_check: Option<&dyn Fn(&str) -> bool>,
 ) -> Option<Value> {
     let (type_name, ns, dsl_map) = parts;
-    if let Value::String(s) = value {
+    if let Value::Concrete(ConcreteValue::String(s)) = value {
         // Skip values already in namespaced DSL format.
         // A value that contains '.' but is not already namespaced is a raw enum value
         // like "ipsec.1" -- check if it matches a known valid enum value.
@@ -499,7 +508,10 @@ pub fn normalize_state_enum_value(
             s.contains('.') && !string_enum_check.is_some_and(|check| check(s));
         if !already_namespaced {
             let dsl_val = dsl_map.dsl_for(s);
-            return Some(Value::String(format!("{}.{}.{}", ns, type_name, dsl_val)));
+            return Some(Value::Concrete(ConcreteValue::String(format!(
+                "{}.{}.{}",
+                ns, type_name, dsl_val
+            ))));
         }
     }
     None
@@ -1191,53 +1203,61 @@ mod tests {
         let cases: &[(Value, &str, Option<&str>, Value)] = &[
             // bare member + namespace → fully qualified
             (
-                Value::String("dedicated".into()),
+                Value::Concrete(ConcreteValue::String("dedicated".into())),
                 "InstanceTenancy",
                 Some("awscc.ec2.Vpc"),
-                Value::String("awscc.ec2.Vpc.InstanceTenancy.dedicated".into()),
+                Value::Concrete(ConcreteValue::String(
+                    "awscc.ec2.Vpc.InstanceTenancy.dedicated".into(),
+                )),
             ),
             // bare member, no namespace → passthrough
             (
-                Value::String("dedicated".into()),
+                Value::Concrete(ConcreteValue::String("dedicated".into())),
                 "InstanceTenancy",
                 None,
-                Value::String("dedicated".into()),
+                Value::Concrete(ConcreteValue::String("dedicated".into())),
             ),
             // TypeName.member matching `name` → fully qualified
             (
-                Value::String("InstanceTenancy.dedicated".into()),
+                Value::Concrete(ConcreteValue::String("InstanceTenancy.dedicated".into())),
                 "InstanceTenancy",
                 Some("awscc.ec2.Vpc"),
-                Value::String("awscc.ec2.Vpc.InstanceTenancy.dedicated".into()),
+                Value::Concrete(ConcreteValue::String(
+                    "awscc.ec2.Vpc.InstanceTenancy.dedicated".into(),
+                )),
             ),
             // TypeName.member with foreign type name → passthrough
             (
-                Value::String("Tenancy.dedicated".into()),
+                Value::Concrete(ConcreteValue::String("Tenancy.dedicated".into())),
                 "InstanceTenancy",
                 Some("awscc.ec2.Vpc"),
-                Value::String("Tenancy.dedicated".into()),
+                Value::Concrete(ConcreteValue::String("Tenancy.dedicated".into())),
             ),
             // Already-fully-qualified → passthrough (parser returns
             // `FullyQualified`, helper only acts on `TypeQualified`)
             (
-                Value::String("awscc.ec2.Vpc.InstanceTenancy.dedicated".into()),
+                Value::Concrete(ConcreteValue::String(
+                    "awscc.ec2.Vpc.InstanceTenancy.dedicated".into(),
+                )),
                 "InstanceTenancy",
                 Some("awscc.ec2.Vpc"),
-                Value::String("awscc.ec2.Vpc.InstanceTenancy.dedicated".into()),
+                Value::Concrete(ConcreteValue::String(
+                    "awscc.ec2.Vpc.InstanceTenancy.dedicated".into(),
+                )),
             ),
             // Lowercase first segment → not a TypeName; passthrough
             (
-                Value::String("instanceTenancy.dedicated".into()),
+                Value::Concrete(ConcreteValue::String("instanceTenancy.dedicated".into())),
                 "InstanceTenancy",
                 Some("awscc.ec2.Vpc"),
-                Value::String("instanceTenancy.dedicated".into()),
+                Value::Concrete(ConcreteValue::String("instanceTenancy.dedicated".into())),
             ),
             // Non-string → passthrough
             (
-                Value::Bool(true),
+                Value::Concrete(ConcreteValue::Bool(true)),
                 "Whatever",
                 Some("aws"),
-                Value::Bool(true),
+                Value::Concrete(ConcreteValue::Bool(true)),
             ),
         ];
         for (input, name, ns, expected) in cases {

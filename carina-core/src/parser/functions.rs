@@ -9,7 +9,7 @@ use super::types::parse_type_expr;
 use super::util::{pascal_to_snake, value_type_name};
 use super::{ProviderContext, Rule, parse_expression};
 use crate::eval_value::EvalValue;
-use crate::resource::Value;
+use crate::resource::{ConcreteValue, DeferredValue, Value};
 use crate::schema::{
     validate_ipv4_address, validate_ipv4_cidr, validate_ipv6_address, validate_ipv6_cidr,
 };
@@ -90,7 +90,7 @@ pub(super) fn parse_fn_def(
     for p in &params {
         body_ctx.set_variable(
             p.name.clone(),
-            Value::String(format!("__fn_param_{}", p.name)),
+            Value::Concrete(ConcreteValue::String(format!("__fn_param_{}", p.name))),
         );
     }
 
@@ -107,7 +107,7 @@ pub(super) fn parse_fn_def(
                 )?;
                 body_ctx.set_variable(
                     let_name.clone(),
-                    Value::String(format!("__fn_local_{let_name}")),
+                    Value::Concrete(ConcreteValue::String(format!("__fn_local_{let_name}"))),
                 );
                 local_lets.push((let_name, let_expr));
             }
@@ -220,15 +220,15 @@ pub fn validate_custom_type(
     config: &ProviderContext,
 ) -> Result<(), String> {
     match (type_name, value) {
-        ("ipv4_cidr", Value::String(s)) => validate_ipv4_cidr(s),
-        ("ipv4_address", Value::String(s)) => validate_ipv4_address(s),
-        ("ipv6_cidr", Value::String(s)) => validate_ipv6_cidr(s),
-        ("ipv6_address", Value::String(s)) => validate_ipv6_address(s),
-        (_, Value::ResourceRef { .. }) => Ok(()), // will be resolved later
-        (_, Value::FunctionCall { .. }) => Ok(()), // will be resolved later
-        (_, Value::Interpolation(_)) => Ok(()),   // will be resolved later
-        (_, Value::Unknown(_)) => Ok(()),         // resolved at upstream apply
-        (name, Value::String(s)) => {
+        ("ipv4_cidr", Value::Concrete(ConcreteValue::String(s))) => validate_ipv4_cidr(s),
+        ("ipv4_address", Value::Concrete(ConcreteValue::String(s))) => validate_ipv4_address(s),
+        ("ipv6_cidr", Value::Concrete(ConcreteValue::String(s))) => validate_ipv6_cidr(s),
+        ("ipv6_address", Value::Concrete(ConcreteValue::String(s))) => validate_ipv6_address(s),
+        (_, Value::Deferred(DeferredValue::ResourceRef { .. })) => Ok(()), // will be resolved later
+        (_, Value::Deferred(DeferredValue::FunctionCall { .. })) => Ok(()), // will be resolved later
+        (_, Value::Deferred(DeferredValue::Interpolation(_))) => Ok(()), // will be resolved later
+        (_, Value::Deferred(DeferredValue::Unknown(_))) => Ok(()), // resolved at upstream apply
+        (name, Value::Concrete(ConcreteValue::String(s))) => {
             // Check custom validators from config (schema-extracted)
             if let Some(validator) = config.validators.get(name) {
                 validator(s)?;
@@ -256,28 +256,32 @@ fn check_fn_arg_type(
     value: &Value,
     ctx: &ParseContext,
 ) -> Result<(), ParseError> {
-    // `Value::Unknown` resolves at upstream apply; the concrete type
+    // `Value::Deferred(DeferredValue::Unknown)` resolves at upstream apply; the concrete type
     // is unknowable at parse time. Skip the type check — same convention
     // the schema validator follows.
-    if matches!(value, Value::Unknown(_)) {
+    if matches!(value, Value::Deferred(DeferredValue::Unknown(_))) {
         return Ok(());
     }
     let type_matches = match type_expr {
         TypeExpr::String => matches!(
             value,
-            Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
+            Value::Concrete(ConcreteValue::String(_))
+                | Value::Deferred(DeferredValue::Interpolation(_))
+                | Value::Deferred(DeferredValue::ResourceRef { .. })
         ),
-        TypeExpr::Int => matches!(value, Value::Int(_)),
-        TypeExpr::Float => matches!(value, Value::Float(_)),
-        TypeExpr::Bool => matches!(value, Value::Bool(_)),
-        TypeExpr::Duration => matches!(value, Value::Duration(_)),
-        TypeExpr::List(_) => matches!(value, Value::List(_)),
-        TypeExpr::Map(_) => matches!(value, Value::Map(_)),
+        TypeExpr::Int => matches!(value, Value::Concrete(ConcreteValue::Int(_))),
+        TypeExpr::Float => matches!(value, Value::Concrete(ConcreteValue::Float(_))),
+        TypeExpr::Bool => matches!(value, Value::Concrete(ConcreteValue::Bool(_))),
+        TypeExpr::Duration => matches!(value, Value::Concrete(ConcreteValue::Duration(_))),
+        TypeExpr::List(_) => matches!(value, Value::Concrete(ConcreteValue::List(_))),
+        TypeExpr::Map(_) => matches!(value, Value::Concrete(ConcreteValue::Map(_))),
         // Simple types (cidr, ipv4_address, arn, etc.) are string subtypes at runtime
         TypeExpr::Simple(name) => {
             if !matches!(
                 value,
-                Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
+                Value::Concrete(ConcreteValue::String(_))
+                    | Value::Deferred(DeferredValue::Interpolation(_))
+                    | Value::Deferred(DeferredValue::ResourceRef { .. })
             ) {
                 false
             } else {
@@ -295,7 +299,7 @@ fn check_fn_arg_type(
             // The argument is passed as a ResourceRef-like string "${binding_name}"
             // or as a direct ResourceRef. Check if it corresponds to a resource binding
             // of the expected type.
-            if let Value::String(s) = value
+            if let Value::Concrete(ConcreteValue::String(s)) = value
                 && let Some(ref_name) = s.strip_prefix("${").and_then(|s| s.strip_suffix('}'))
                 && let Some(resource) = ctx.resource_bindings.get(ref_name)
             {
@@ -316,7 +320,9 @@ fn check_fn_arg_type(
         TypeExpr::SchemaType { type_name, .. } => {
             if !matches!(
                 value,
-                Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
+                Value::Concrete(ConcreteValue::String(_))
+                    | Value::Deferred(DeferredValue::Interpolation(_))
+                    | Value::Deferred(DeferredValue::ResourceRef { .. })
             ) {
                 false
             } else {
@@ -330,13 +336,13 @@ fn check_fn_arg_type(
                 true
             }
         }
-        TypeExpr::Struct { .. } => matches!(value, Value::Map(_)),
+        TypeExpr::Struct { .. } => matches!(value, Value::Concrete(ConcreteValue::Map(_))),
         // Closed-set string literal: only the exact string matches.
         // Interpolations and ResourceRefs are rejected here because
         // their runtime expansion is not knowable at parse time.
         // See carina-rs/carina#2611.
         TypeExpr::StringLiteral(expected) => {
-            matches!(value, Value::String(s) if s == expected)
+            matches!(value, Value::Concrete(ConcreteValue::String(s)) if s == expected)
         }
         // Union: matches if at least one member's structural-shape
         // arm accepts the value. We only inspect literal/string-shape
@@ -346,11 +352,13 @@ fn check_fn_arg_type(
         // single point that needs updating then.
         TypeExpr::Union(members) => members.iter().any(|m| match m {
             TypeExpr::StringLiteral(expected) => {
-                matches!(value, Value::String(s) if s == expected)
+                matches!(value, Value::Concrete(ConcreteValue::String(s)) if s == expected)
             }
             TypeExpr::String => matches!(
                 value,
-                Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
+                Value::Concrete(ConcreteValue::String(_))
+                    | Value::Deferred(DeferredValue::Interpolation(_))
+                    | Value::Deferred(DeferredValue::ResourceRef { .. })
             ),
             _ => false,
         }),
@@ -373,27 +381,31 @@ fn check_fn_return_type(
     value: &Value,
     config: &ProviderContext,
 ) -> Result<(), ParseError> {
-    // Same skip as `check_fn_arg_type`: a `Value::Unknown` propagated
+    // Same skip as `check_fn_arg_type`: a `Value::Deferred(DeferredValue::Unknown)` propagated
     // through a typed user fn carries no concrete type at parse time.
-    if matches!(value, Value::Unknown(_)) {
+    if matches!(value, Value::Deferred(DeferredValue::Unknown(_))) {
         return Ok(());
     }
     let type_matches = match type_expr {
         TypeExpr::String => matches!(
             value,
-            Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
+            Value::Concrete(ConcreteValue::String(_))
+                | Value::Deferred(DeferredValue::Interpolation(_))
+                | Value::Deferred(DeferredValue::ResourceRef { .. })
         ),
-        TypeExpr::Int => matches!(value, Value::Int(_)),
-        TypeExpr::Float => matches!(value, Value::Float(_)),
-        TypeExpr::Bool => matches!(value, Value::Bool(_)),
-        TypeExpr::Duration => matches!(value, Value::Duration(_)),
-        TypeExpr::List(_) => matches!(value, Value::List(_)),
-        TypeExpr::Map(_) => matches!(value, Value::Map(_)),
+        TypeExpr::Int => matches!(value, Value::Concrete(ConcreteValue::Int(_))),
+        TypeExpr::Float => matches!(value, Value::Concrete(ConcreteValue::Float(_))),
+        TypeExpr::Bool => matches!(value, Value::Concrete(ConcreteValue::Bool(_))),
+        TypeExpr::Duration => matches!(value, Value::Concrete(ConcreteValue::Duration(_))),
+        TypeExpr::List(_) => matches!(value, Value::Concrete(ConcreteValue::List(_))),
+        TypeExpr::Map(_) => matches!(value, Value::Concrete(ConcreteValue::Map(_))),
         // Simple types (cidr, ipv4_address, arn, etc.) — validate the value
         TypeExpr::Simple(name) => {
             if !matches!(
                 value,
-                Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
+                Value::Concrete(ConcreteValue::String(_))
+                    | Value::Deferred(DeferredValue::Interpolation(_))
+                    | Value::Deferred(DeferredValue::ResourceRef { .. })
             ) {
                 false
             } else {
@@ -411,7 +423,9 @@ fn check_fn_return_type(
         TypeExpr::SchemaType { type_name, .. } => {
             if !matches!(
                 value,
-                Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
+                Value::Concrete(ConcreteValue::String(_))
+                    | Value::Deferred(DeferredValue::Interpolation(_))
+                    | Value::Deferred(DeferredValue::ResourceRef { .. })
             ) {
                 false
             } else {
@@ -424,22 +438,24 @@ fn check_fn_return_type(
                 true
             }
         }
-        TypeExpr::Struct { .. } => matches!(value, Value::Map(_)),
+        TypeExpr::Struct { .. } => matches!(value, Value::Concrete(ConcreteValue::Map(_))),
         // Closed-set string literal: only the exact string matches.
         // See carina-rs/carina#2611.
         TypeExpr::StringLiteral(expected) => {
-            matches!(value, Value::String(s) if s == expected)
+            matches!(value, Value::Concrete(ConcreteValue::String(s)) if s == expected)
         }
         // Union: matches if at least one member accepts the value.
         // Same shape as in `check_fn_arg_type` — only literal/string
         // members are inspected today.
         TypeExpr::Union(members) => members.iter().any(|m| match m {
             TypeExpr::StringLiteral(expected) => {
-                matches!(value, Value::String(s) if s == expected)
+                matches!(value, Value::Concrete(ConcreteValue::String(s)) if s == expected)
             }
             TypeExpr::String => matches!(
                 value,
-                Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
+                Value::Concrete(ConcreteValue::String(_))
+                    | Value::Deferred(DeferredValue::Interpolation(_))
+                    | Value::Deferred(DeferredValue::ResourceRef { .. })
             ),
             _ => false,
         }),
@@ -476,7 +492,7 @@ pub(crate) fn evaluate_user_function(
 /// Recursively substitute function parameter placeholders with actual values
 fn substitute_fn_params(value: &Value, substitutions: &HashMap<String, Value>) -> Value {
     match value {
-        Value::String(s) => {
+        Value::Concrete(ConcreteValue::String(s)) => {
             // Check if this is a parameter placeholder
             if let Some(param_name) = s.strip_prefix("__fn_param_")
                 && let Some(sub) = substitutions.get(param_name)
@@ -488,43 +504,49 @@ fn substitute_fn_params(value: &Value, substitutions: &HashMap<String, Value>) -
             {
                 return sub.clone();
             }
-            Value::String(s.clone())
+            Value::Concrete(ConcreteValue::String(s.clone()))
         }
-        Value::List(items) => Value::List(
+        Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
             items
                 .iter()
                 .map(|v| substitute_fn_params(v, substitutions))
                 .collect(),
-        ),
-        Value::Map(map) => Value::Map(
+        )),
+        Value::Concrete(ConcreteValue::Map(map)) => Value::Concrete(ConcreteValue::Map(
             map.iter()
                 .map(|(k, v)| (k.clone(), substitute_fn_params(v, substitutions)))
                 .collect(),
-        ),
-        Value::FunctionCall { name, args } => Value::FunctionCall {
-            name: name.clone(),
-            args: args
-                .iter()
-                .map(|a| substitute_fn_params(a, substitutions))
-                .collect(),
-        },
-        Value::Interpolation(parts) => Value::Interpolation(
-            parts
-                .iter()
-                .map(|p| match p {
-                    crate::resource::InterpolationPart::Expr(v) => {
-                        crate::resource::InterpolationPart::Expr(substitute_fn_params(
-                            v,
-                            substitutions,
-                        ))
-                    }
-                    other => other.clone(),
-                })
-                .collect(),
-        ),
-        Value::Secret(inner) => Value::Secret(Box::new(substitute_fn_params(inner, substitutions))),
-        // `Value::Unknown` is not a function-param placeholder. Pass through.
-        Value::Unknown(_) => value.clone(),
+        )),
+        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|a| substitute_fn_params(a, substitutions))
+                    .collect(),
+            })
+        }
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+            Value::Deferred(DeferredValue::Interpolation(
+                parts
+                    .iter()
+                    .map(|p| match p {
+                        crate::resource::InterpolationPart::Expr(v) => {
+                            crate::resource::InterpolationPart::Expr(substitute_fn_params(
+                                v,
+                                substitutions,
+                            ))
+                        }
+                        other => other.clone(),
+                    })
+                    .collect(),
+            ))
+        }
+        Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
+            Box::new(substitute_fn_params(inner, substitutions)),
+        )),
+        // `Value::Deferred(DeferredValue::Unknown)` is not a function-param placeholder. Pass through.
+        Value::Deferred(DeferredValue::Unknown(_)) => value.clone(),
         other => other.clone(),
     }
 }
@@ -532,7 +554,7 @@ fn substitute_fn_params(value: &Value, substitutions: &HashMap<String, Value>) -
 /// Try to evaluate a value (resolve function calls including user-defined ones)
 fn try_evaluate_fn_value(value: Value, ctx: &ParseContext) -> Result<Value, ParseError> {
     match value {
-        Value::FunctionCall { ref name, ref args } => {
+        Value::Deferred(DeferredValue::FunctionCall { ref name, ref args }) => {
             // First, recursively evaluate arguments
             let evaluated_args: Result<Vec<Value>, ParseError> = args
                 .iter()
@@ -610,29 +632,29 @@ fn try_evaluate_fn_value(value: Value, ctx: &ParseContext) -> Result<Value, Pars
                         // `resource_bindings` are seeded — so this
                         // defer path remains the route by which a
                         // sibling-defined user fn becomes resolvable.
-                        Ok(Value::FunctionCall {
+                        Ok(Value::Deferred(DeferredValue::FunctionCall {
                             name: name.clone(),
                             args: evaluated_args,
-                        })
+                        }))
                     }
                 }
             }
         }
-        Value::List(items) => {
+        Value::Concrete(ConcreteValue::List(items)) => {
             let evaluated: Result<Vec<Value>, ParseError> = items
                 .into_iter()
                 .map(|v| try_evaluate_fn_value(v, ctx))
                 .collect();
-            Ok(Value::List(evaluated?))
+            Ok(Value::Concrete(ConcreteValue::List(evaluated?)))
         }
-        Value::Map(map) => {
+        Value::Concrete(ConcreteValue::Map(map)) => {
             let evaluated: Result<IndexMap<String, Value>, ParseError> = map
                 .into_iter()
                 .map(|(k, v)| try_evaluate_fn_value(v, ctx).map(|ev| (k, ev)))
                 .collect();
-            Ok(Value::Map(evaluated?))
+            Ok(Value::Concrete(ConcreteValue::Map(evaluated?)))
         }
-        Value::Interpolation(parts) => {
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
             let evaluated: Result<Vec<crate::resource::InterpolationPart>, ParseError> = parts
                 .into_iter()
                 .map(|p| match p {
@@ -642,7 +664,7 @@ fn try_evaluate_fn_value(value: Value, ctx: &ParseContext) -> Result<Value, Pars
                     other => Ok(other),
                 })
                 .collect();
-            Ok(Value::Interpolation(evaluated?))
+            Ok(Value::Deferred(DeferredValue::Interpolation(evaluated?)))
         }
         other => Ok(other),
     }

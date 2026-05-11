@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::deps::get_resource_dependencies;
 use crate::effect::Effect;
 use crate::plan::Plan;
-use crate::resource::Value;
+use crate::resource::{ConcreteValue, DeferredValue, Value};
 use crate::utils::{convert_enum_value, is_dsl_enum_format};
 
 /// Intermediate data for tree-building: maps from effect indices to their
@@ -266,7 +266,7 @@ pub fn build_single_parent_tree(
 /// Extract a compact hint for anonymous resources.
 ///
 /// Collects the first distinguishing string attribute (like `service_name`) and ALL
-/// non-parent `Value::ResourceRef` attributes, then combines them into a comma-separated
+/// non-parent `Value::Deferred(DeferredValue::ResourceRef)` attributes, then combines them into a comma-separated
 /// hint. String hints appear first (most identifying), followed by ResourceRef hints.
 ///
 /// `parent_binding` is the binding name of the parent resource in the tree, used to
@@ -284,7 +284,7 @@ pub fn extract_compact_hint(
 
     // Priority 1: First distinguishing string attribute (most identifying)
     for key in &keys {
-        if let Some(Value::String(s)) = resource.get_attr(key)
+        if let Some(Value::Concrete(ConcreteValue::String(s))) = resource.get_attr(key)
             && !s.is_empty()
         {
             let short_key = shorten_attr_name(key);
@@ -302,16 +302,16 @@ pub fn extract_compact_hint(
     // Priority 2: First non-parent ResourceRef attribute (direct or inside a List)
     for key in &keys {
         match resource.get_attr(key) {
-            Some(Value::ResourceRef { path }) => {
+            Some(Value::Deferred(DeferredValue::ResourceRef { path })) => {
                 if parent_binding == Some(path.binding()) {
                     continue;
                 }
                 let short_key = shorten_attr_name(key);
                 return Some(format!("{}: {}", short_key, path.binding()));
             }
-            Some(Value::List(items)) => {
+            Some(Value::Concrete(ConcreteValue::List(items))) => {
                 for item in items {
-                    if let Value::ResourceRef { path } = item {
+                    if let Value::Deferred(DeferredValue::ResourceRef { path }) = item {
                         if parent_binding == Some(path.binding()) {
                             continue;
                         }

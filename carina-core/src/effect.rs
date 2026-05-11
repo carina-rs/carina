@@ -330,16 +330,18 @@ mod tests {
 
     #[test]
     fn binding_name_returns_none_without_binding() {
-        use crate::resource::Value;
-        let resource = Resource::new("test", "no_binding")
-            .with_attribute("name", Value::String("test".to_string()));
+        use crate::resource::{ConcreteValue, Value};
+        let resource = Resource::new("test", "no_binding").with_attribute(
+            "name",
+            Value::Concrete(ConcreteValue::String("test".to_string())),
+        );
         let effect = Effect::Create(resource);
         assert_eq!(effect.binding_name(), None);
     }
 
     #[test]
     fn effect_serde_round_trip() {
-        use crate::resource::Value;
+        use crate::resource::{ConcreteValue, Value};
         use std::collections::HashMap;
 
         let effects = vec![
@@ -353,11 +355,13 @@ mod tests {
                     ResourceId::new("s3.Bucket", "my-bucket"),
                     HashMap::from([(
                         "versioning".to_string(),
-                        Value::String("Disabled".to_string()),
+                        Value::Concrete(ConcreteValue::String("Disabled".to_string())),
                     )]),
                 )),
-                to: Resource::new("s3.Bucket", "my-bucket")
-                    .with_attribute("versioning", Value::String("Enabled".to_string())),
+                to: Resource::new("s3.Bucket", "my-bucket").with_attribute(
+                    "versioning",
+                    Value::Concrete(ConcreteValue::String("Enabled".to_string())),
+                ),
                 changed_attributes: vec!["versioning".to_string()],
             },
             Effect::Replace {
@@ -366,11 +370,13 @@ mod tests {
                     ResourceId::new("ec2.Vpc", "my-vpc"),
                     HashMap::from([(
                         "cidr_block".to_string(),
-                        Value::String("10.0.0.0/16".to_string()),
+                        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
                     )]),
                 )),
-                to: Resource::new("ec2.Vpc", "my-vpc")
-                    .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string())),
+                to: Resource::new("ec2.Vpc", "my-vpc").with_attribute(
+                    "cidr_block",
+                    Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+                ),
                 directives: Directives::default(),
                 changed_create_only: vec!["cidr_block".to_string()],
                 cascading_updates: vec![],
@@ -472,7 +478,7 @@ mod tests {
 
     #[test]
     fn wait_variant_constructs() {
-        use crate::resource::Value;
+        use crate::resource::{ConcreteValue, Value};
         use crate::wait::predicate::{AttrPath, WaitPredicate};
         use std::time::Duration;
 
@@ -482,7 +488,7 @@ mod tests {
             target_identifier: None,
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
-                value: Value::String("ISSUED".to_string()),
+                value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
             },
             until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
             timeout: Duration::from_secs(75 * 60),
@@ -493,7 +499,7 @@ mod tests {
 
     #[test]
     fn wait_binding_name_returns_wait_binding() {
-        use crate::resource::Value;
+        use crate::resource::{ConcreteValue, Value};
         use crate::wait::predicate::{AttrPath, WaitPredicate};
         use std::time::Duration;
 
@@ -503,7 +509,7 @@ mod tests {
             target_identifier: None,
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
-                value: Value::String("ISSUED".to_string()),
+                value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
             },
             until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
             timeout: Duration::from_secs(60),
@@ -515,7 +521,7 @@ mod tests {
 
     #[test]
     fn wait_is_not_mutating() {
-        use crate::resource::Value;
+        use crate::resource::{ConcreteValue, Value};
         use crate::wait::predicate::{AttrPath, WaitPredicate};
         use std::time::Duration;
 
@@ -525,7 +531,7 @@ mod tests {
             target_identifier: None,
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
-                value: Value::String("ISSUED".to_string()),
+                value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
             },
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: Duration::from_secs(60),
@@ -538,7 +544,7 @@ mod tests {
 
     #[test]
     fn wait_serde_round_trip() {
-        use crate::resource::Value;
+        use crate::resource::{ConcreteValue, Value};
         use crate::wait::predicate::{AttrPath, WaitPredicate};
         use std::time::Duration;
 
@@ -548,7 +554,7 @@ mod tests {
             target_identifier: None,
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
-                value: Value::String("ISSUED".to_string()),
+                value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
             },
             until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
             timeout: Duration::from_secs(4500),

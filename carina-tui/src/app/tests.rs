@@ -1,5 +1,5 @@
 use super::*;
-use carina_core::resource::{Directives, Resource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, Directives, Resource, ResourceId, State, Value};
 use carina_core::value::format_value;
 
 #[test]
@@ -71,13 +71,15 @@ fn update_effect_has_detail_rows() {
             ResourceId::new("s3.Bucket", "my-bucket"),
             [(
                 "versioning".to_string(),
-                Value::String("Disabled".to_string()),
+                Value::Concrete(ConcreteValue::String("Disabled".to_string())),
             )]
             .into_iter()
             .collect(),
         )),
-        to: Resource::new("s3.Bucket", "my-bucket")
-            .with_attribute("versioning", Value::String("Enabled".to_string())),
+        to: Resource::new("s3.Bucket", "my-bucket").with_attribute(
+            "versioning",
+            Value::Concrete(ConcreteValue::String("Enabled".to_string())),
+        ),
         changed_attributes: vec!["versioning".to_string()],
     });
 
@@ -97,7 +99,10 @@ fn internal_attributes_filtered() {
     let mut plan = Plan::new();
     plan.add(Effect::Create(
         Resource::new("s3.Bucket", "my-bucket")
-            .with_attribute("name", Value::String("test".to_string()))
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("test".to_string())),
+            )
             .with_binding("my_bucket")
             .with_module_source(carina_core::resource::ModuleSource::module("web", "web")),
     ));
@@ -116,13 +121,19 @@ fn internal_attributes_filtered() {
 #[test]
 fn format_value_display() {
     assert_eq!(
-        format_value(&Value::String("hello".to_string())),
+        format_value(&Value::Concrete(ConcreteValue::String("hello".to_string()))),
         "\"hello\""
     );
-    assert_eq!(format_value(&Value::Int(42)), "42");
-    assert_eq!(format_value(&Value::Bool(true)), "true");
+    assert_eq!(format_value(&Value::Concrete(ConcreteValue::Int(42))), "42");
     assert_eq!(
-        format_value(&Value::List(vec![Value::Int(1), Value::Int(2)])),
+        format_value(&Value::Concrete(ConcreteValue::Bool(true))),
+        "true"
+    );
+    assert_eq!(
+        format_value(&Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::Int(1)),
+            Value::Concrete(ConcreteValue::Int(2))
+        ]))),
         "[1, 2]"
     );
 }
@@ -132,9 +143,12 @@ fn replace_effect_symbols() {
     let mut plan = Plan::new();
     let from = Box::new(State::existing(
         ResourceId::new("ec2.Vpc", "my-vpc"),
-        [("cidr".to_string(), Value::String("10.0.0.0/16".to_string()))]
-            .into_iter()
-            .collect(),
+        [(
+            "cidr".to_string(),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+        )]
+        .into_iter()
+        .collect(),
     ));
 
     // create_before_destroy = true -> "+/-"
@@ -176,7 +190,10 @@ fn tree_structure_with_dependencies() {
     plan.add(Effect::Create(
         Resource::new("ec2.Vpc", "my-vpc")
             .with_binding("vpc")
-            .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string())),
+            .with_attribute(
+                "cidr_block",
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            ),
     ));
     plan.add(Effect::Create(
         Resource::new("ec2.Subnet", "my-subnet")
@@ -204,8 +221,10 @@ fn tree_structure_with_dependencies() {
 fn selected_node_returns_correct_node() {
     let mut plan = Plan::new();
     plan.add(Effect::Create(
-        Resource::new("s3.Bucket", "my-bucket")
-            .with_attribute("name", Value::String("test".to_string())),
+        Resource::new("s3.Bucket", "my-bucket").with_attribute(
+            "name",
+            Value::Concrete(ConcreteValue::String("test".to_string())),
+        ),
     ));
 
     let app = App::new(&plan, &SchemaRegistry::new());
@@ -344,7 +363,10 @@ fn make_tree_plan() -> Plan {
     plan.add(Effect::Create(
         Resource::new("ec2.Vpc", "my-vpc")
             .with_binding("vpc")
-            .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string())),
+            .with_attribute(
+                "cidr_block",
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            ),
     ));
     plan.add(Effect::Create(
         Resource::new("ec2.Subnet", "my-subnet")
@@ -565,29 +587,33 @@ fn tab_complete_with_provider_prefix() {
 fn format_value_resolves_dsl_enum_identifiers() {
     // 5-part DSL enum: should resolve to quoted value
     assert_eq!(
-        format_value(&Value::String(
+        format_value(&Value::Concrete(ConcreteValue::String(
             "awscc.ec2.vpc_endpoint.VpcEndpointType.Interface".to_string()
-        )),
+        ))),
         "\"Interface\""
     );
 
     // 4-part DSL enum
     assert_eq!(
-        format_value(&Value::String(
+        format_value(&Value::Concrete(ConcreteValue::String(
             "aws.s3.VersioningStatus.Enabled".to_string()
-        )),
+        ))),
         "\"Enabled\""
     );
 
     // 3-part DSL enum: namespace stripped, value returned as-is
     assert_eq!(
-        format_value(&Value::String("aws.Region.ap_northeast_1".to_string())),
+        format_value(&Value::Concrete(ConcreteValue::String(
+            "aws.Region.ap_northeast_1".to_string()
+        ))),
         "\"ap_northeast_1\""
     );
 
     // Regular string should be quoted as-is
     assert_eq!(
-        format_value(&Value::String("my-bucket".to_string())),
+        format_value(&Value::Concrete(ConcreteValue::String(
+            "my-bucket".to_string()
+        ))),
         "\"my-bucket\""
     );
 
@@ -609,7 +635,9 @@ fn create_effect_attributes_resolve_enum_values() {
         Resource::new("ec2.vpc_endpoint", "my-endpoint")
             .with_attribute(
                 "vpc_endpoint_type",
-                Value::String("awscc.ec2.vpc_endpoint.VpcEndpointType.Interface".to_string()),
+                Value::Concrete(ConcreteValue::String(
+                    "awscc.ec2.vpc_endpoint.VpcEndpointType.Interface".to_string(),
+                )),
             )
             .with_attribute(
                 "vpc_id",
@@ -652,13 +680,15 @@ fn move_suppressed_when_update_exists_for_same_target() {
             ResourceId::new("s3.Bucket", "new-name"),
             [(
                 "versioning".to_string(),
-                Value::String("Disabled".to_string()),
+                Value::Concrete(ConcreteValue::String("Disabled".to_string())),
             )]
             .into_iter()
             .collect(),
         )),
-        to: Resource::new("s3.Bucket", "new-name")
-            .with_attribute("versioning", Value::String("Enabled".to_string())),
+        to: Resource::new("s3.Bucket", "new-name").with_attribute(
+            "versioning",
+            Value::Concrete(ConcreteValue::String("Enabled".to_string())),
+        ),
         changed_attributes: vec!["versioning".to_string()],
     });
 
@@ -679,9 +709,12 @@ fn move_suppressed_when_replace_exists_for_same_target() {
         id: ResourceId::new("ec2.Vpc", "new-vpc"),
         from: Box::new(State::existing(
             ResourceId::new("ec2.Vpc", "new-vpc"),
-            [("cidr".to_string(), Value::String("10.0.0.0/16".to_string()))]
-                .into_iter()
-                .collect(),
+            [(
+                "cidr".to_string(),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            )]
+            .into_iter()
+            .collect(),
         )),
         to: Resource::new("ec2.Vpc", "new-vpc"),
         directives: Directives::default(),

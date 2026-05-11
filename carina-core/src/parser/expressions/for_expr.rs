@@ -13,7 +13,7 @@ use crate::parser::{
     evaluate_static_value, first_inner, next_pair, parse_expression, parse_module_call,
     parse_read_resource_expr, parse_resource_expr,
 };
-use crate::resource::{Resource, UnknownReason, Value};
+use crate::resource::{ConcreteValue, DeferredValue, Resource, UnknownReason, Value};
 
 /// Binding pattern for a for expression
 #[derive(Debug, Clone, PartialEq)]
@@ -64,7 +64,7 @@ fn identifier_appears_in(text: &str, name: &str) -> bool {
 
 /// Whether `s` is shaped like a bare Carina identifier — the first byte is
 /// `A-Za-z_` and the rest are `A-Za-z0-9_`. Used to recover from the
-/// parser's collapse of unresolved identifiers into `Value::String(s)`
+/// parser's collapse of unresolved identifiers into `Value::Concrete(ConcreteValue::String(s))`
 /// when we need to decide whether to render an error as "identifier" vs
 /// "string literal". See #2101.
 fn is_bare_identifier(s: &str) -> bool {
@@ -180,7 +180,7 @@ pub(crate) fn parse_for_expr(
 
     // Expand based on iterable type
     match (&binding, &iterable) {
-        (ForBinding::Simple(var), Value::List(items)) => {
+        (ForBinding::Simple(var), Value::Concrete(ConcreteValue::List(items))) => {
             for (i, item) in items.iter().enumerate() {
                 let address = format!("{}[{}]", binding_name, i);
                 let mut iter_ctx = ctx.clone();
@@ -189,17 +189,21 @@ pub(crate) fn parse_for_expr(
                 collect(result, &mut resources, &mut module_calls);
             }
         }
-        (ForBinding::Indexed(idx_var, val_var), Value::List(items)) => {
+        (ForBinding::Indexed(idx_var, val_var), Value::Concrete(ConcreteValue::List(items))) => {
             for (i, item) in items.iter().enumerate() {
                 let address = format!("{}[{}]", binding_name, i);
                 let mut iter_ctx = ctx.clone();
-                bind(&mut iter_ctx, idx_var, Value::Int(i as i64));
+                bind(
+                    &mut iter_ctx,
+                    idx_var,
+                    Value::Concrete(ConcreteValue::Int(i as i64)),
+                );
                 bind(&mut iter_ctx, val_var, item.clone());
                 let result = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
                 collect(result, &mut resources, &mut module_calls);
             }
         }
-        (ForBinding::Map(key_var, val_var), Value::Map(map)) => {
+        (ForBinding::Map(key_var, val_var), Value::Concrete(ConcreteValue::Map(map))) => {
             // Sort keys for deterministic output
             let mut keys: Vec<&String> = map.keys().collect();
             keys.sort();
@@ -207,7 +211,11 @@ pub(crate) fn parse_for_expr(
                 let val = &map[key];
                 let address = crate::utils::map_key_address(binding_name, key);
                 let mut iter_ctx = ctx.clone();
-                bind(&mut iter_ctx, key_var, Value::String(key.clone()));
+                bind(
+                    &mut iter_ctx,
+                    key_var,
+                    Value::Concrete(ConcreteValue::String(key.clone())),
+                );
                 bind(&mut iter_ctx, val_var, val.clone());
                 let result = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
                 collect(result, &mut resources, &mut module_calls);
@@ -218,7 +226,7 @@ pub(crate) fn parse_for_expr(
         // by `upstream_exports::check_upstream_state_field_references`; for
         // a valid field the deferral is an implementation detail the user
         // doesn't need to hear about at validate time.
-        (_, Value::ResourceRef { path }) => {
+        (_, Value::Deferred(DeferredValue::ResourceRef { path })) => {
             // Build the for-expression header string
             let header = match &binding {
                 ForBinding::Simple(var) => {
@@ -235,7 +243,7 @@ pub(crate) fn parse_for_expr(
             // Try to parse the body once with placeholder values for the loop
             // variable(s) to extract the resource type and attribute template.
             let mut template_ctx = ctx.clone();
-            let placeholder = || Value::Unknown(UnknownReason::ForValue);
+            let placeholder = || Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue));
             let bind = |c: &mut ParseContext, name: &str, v: Value| {
                 if name != "_" {
                     c.set_variable(name.to_string(), v);
@@ -249,12 +257,16 @@ pub(crate) fn parse_for_expr(
                     bind(
                         &mut template_ctx,
                         idx,
-                        Value::Unknown(UnknownReason::ForIndex),
+                        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)),
                     );
                     bind(&mut template_ctx, val, placeholder());
                 }
                 ForBinding::Map(k, v) => {
-                    bind(&mut template_ctx, k, Value::Unknown(UnknownReason::ForKey));
+                    bind(
+                        &mut template_ctx,
+                        k,
+                        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey)),
+                    );
                     bind(&mut template_ctx, v, placeholder());
                 }
             }
@@ -290,7 +302,7 @@ pub(crate) fn parse_for_expr(
         }
         _ => {
             // Special case: the parser collapses bare unresolved identifiers
-            // (e.g. `for _ in org { ... }`) into `Value::String("org")` — the
+            // (e.g. `for _ in org { ... }`) into `Value::Concrete(ConcreteValue::String("org"))` — the
             // same slot a quoted literal uses. Reporting those as
             // `iterable is string "org"` is misleading: the user wrote an
             // identifier, not a literal, and the likely fault is a typo for
@@ -300,7 +312,7 @@ pub(crate) fn parse_for_expr(
             // module bindings are visible) can emit a proper
             // UndefinedIdentifier with the did-you-mean machinery from
             // #2038 / #2100. See #2101 / #2138.
-            if let Value::String(s) = &iterable
+            if let Value::Concrete(ConcreteValue::String(s)) = &iterable
                 && is_bare_identifier(s)
             {
                 let header = match &binding {
@@ -309,7 +321,8 @@ pub(crate) fn parse_for_expr(
                     ForBinding::Map(k, v) => format!("for {}, {} in {}", k, v, s),
                 };
                 let mut template_ctx = ctx.clone();
-                let placeholder = || Value::Unknown(UnknownReason::ForValue);
+                let placeholder =
+                    || Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue));
                 let bind = |c: &mut ParseContext, name: &str, v: Value| {
                     if name != "_" {
                         c.set_variable(name.to_string(), v);
@@ -323,12 +336,16 @@ pub(crate) fn parse_for_expr(
                         bind(
                             &mut template_ctx,
                             idx,
-                            Value::Unknown(UnknownReason::ForIndex),
+                            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)),
                         );
                         bind(&mut template_ctx, val, placeholder());
                     }
                     ForBinding::Map(k, v) => {
-                        bind(&mut template_ctx, k, Value::Unknown(UnknownReason::ForKey));
+                        bind(
+                            &mut template_ctx,
+                            k,
+                            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey)),
+                        );
                         bind(&mut template_ctx, v, placeholder());
                     }
                 }
@@ -362,18 +379,20 @@ pub(crate) fn parse_for_expr(
                 return Ok((resources, module_calls));
             }
             let iterable_type = match &iterable {
-                Value::String(s) => {
+                Value::Concrete(ConcreteValue::String(s)) => {
                     format!("string \"{}\"", if s.len() > 50 { &s[..50] } else { s })
                 }
-                Value::Int(i) => format!("int {}", i),
-                Value::Float(f) => format!("float {}", f),
-                Value::Bool(b) => format!("bool {}", b),
-                Value::Duration(d) => format!("duration {}", crate::value::render_duration(*d)),
-                Value::ResourceRef { path } => {
+                Value::Concrete(ConcreteValue::Int(i)) => format!("int {}", i),
+                Value::Concrete(ConcreteValue::Float(f)) => format!("float {}", f),
+                Value::Concrete(ConcreteValue::Bool(b)) => format!("bool {}", b),
+                Value::Concrete(ConcreteValue::Duration(d)) => {
+                    format!("duration {}", crate::value::render_duration(*d))
+                }
+                Value::Deferred(DeferredValue::ResourceRef { path }) => {
                     format!("unresolved reference {}", path.to_dot_string())
                 }
-                Value::List(_) => "list".to_string(),
-                Value::Map(_) => "map".to_string(),
+                Value::Concrete(ConcreteValue::List(_)) => "list".to_string(),
+                Value::Concrete(ConcreteValue::Map(_)) => "map".to_string(),
                 other => format!("{:?}", other),
             };
             let binding_type = match &binding {

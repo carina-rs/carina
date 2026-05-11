@@ -9,7 +9,9 @@ fn test_resolve_enum_aliases_ip_protocol_all() {
     let mut resource = Resource::with_provider("awscc", "ec2.security_group_egress", "test-rule");
     resource.set_attr(
         "ip_protocol".to_string(),
-        Value::String("awscc.ec2.security_group_egress.IpProtocol.all".to_string()),
+        Value::Concrete(ConcreteValue::String(
+            "awscc.ec2.security_group_egress.IpProtocol.all".to_string(),
+        )),
     );
 
     let mut resources = vec![resource];
@@ -17,7 +19,7 @@ fn test_resolve_enum_aliases_ip_protocol_all() {
 
     assert_eq!(
         resources[0].get_attr("ip_protocol"),
-        Some(&Value::String("-1".to_string())),
+        Some(&Value::Concrete(ConcreteValue::String("-1".to_string()))),
         "Alias 'all' should be resolved to canonical AWS value '-1'"
     );
 }
@@ -29,7 +31,9 @@ fn test_resolve_enum_aliases_no_alias() {
     let mut resource = Resource::with_provider("awscc", "ec2.security_group_egress", "test-rule");
     resource.set_attr(
         "ip_protocol".to_string(),
-        Value::String("awscc.ec2.security_group_egress.IpProtocol.tcp".to_string()),
+        Value::Concrete(ConcreteValue::String(
+            "awscc.ec2.security_group_egress.IpProtocol.tcp".to_string(),
+        )),
     );
 
     let mut resources = vec![resource];
@@ -38,9 +42,9 @@ fn test_resolve_enum_aliases_no_alias() {
     // "tcp" has no alias, so it remains as the namespaced DSL value
     assert_eq!(
         resources[0].get_attr("ip_protocol"),
-        Some(&Value::String(
+        Some(&Value::Concrete(ConcreteValue::String(
             "awscc.ec2.security_group_egress.IpProtocol.tcp".to_string()
-        )),
+        ))),
     );
 }
 
@@ -51,7 +55,9 @@ fn test_resolve_enum_aliases_aws_provider() {
     let mut resource = Resource::with_provider("aws", "ec2.security_group_ingress", "test-rule");
     resource.set_attr(
         "ip_protocol".to_string(),
-        Value::String("aws.ec2.security_group_ingress.IpProtocol.all".to_string()),
+        Value::Concrete(ConcreteValue::String(
+            "aws.ec2.security_group_ingress.IpProtocol.all".to_string(),
+        )),
     );
 
     let mut resources = vec![resource];
@@ -59,7 +65,7 @@ fn test_resolve_enum_aliases_aws_provider() {
 
     assert_eq!(
         resources[0].get_attr("ip_protocol"),
-        Some(&Value::String("-1".to_string())),
+        Some(&Value::Concrete(ConcreteValue::String("-1".to_string()))),
     );
 }
 
@@ -72,7 +78,9 @@ fn test_resolve_enum_aliases_in_states() {
     let mut attrs = HashMap::new();
     attrs.insert(
         "ip_protocol".to_string(),
-        Value::String("awscc.ec2.security_group_egress.IpProtocol.all".to_string()),
+        Value::Concrete(ConcreteValue::String(
+            "awscc.ec2.security_group_egress.IpProtocol.all".to_string(),
+        )),
     );
     let state = State::existing(id.clone(), attrs);
     let mut current_states = HashMap::new();
@@ -82,7 +90,7 @@ fn test_resolve_enum_aliases_in_states() {
 
     assert_eq!(
         current_states[&id].attributes.get("ip_protocol"),
-        Some(&Value::String("-1".to_string())),
+        Some(&Value::Concrete(ConcreteValue::String("-1".to_string()))),
     );
 }
 
@@ -94,30 +102,38 @@ fn test_resolve_enum_aliases_in_struct_field() {
     let mut egress_map = IndexMap::new();
     egress_map.insert(
         "ip_protocol".to_string(),
-        Value::String("awscc.ec2.SecurityGroup.IpProtocol.all".to_string()),
+        Value::Concrete(ConcreteValue::String(
+            "awscc.ec2.SecurityGroup.IpProtocol.all".to_string(),
+        )),
     );
     egress_map.insert(
         "cidr_ip".to_string(),
-        Value::String("0.0.0.0/0".to_string()),
+        Value::Concrete(ConcreteValue::String("0.0.0.0/0".to_string())),
     );
     resource.set_attr(
         "security_group_egress".to_string(),
-        Value::List(vec![Value::Map(egress_map)]),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(egress_map),
+        )])),
     );
 
     let mut resources = vec![resource];
     resolve_enum_aliases(&mut resources);
 
-    if let Value::List(items) = resources[0].get_attr("security_group_egress").unwrap() {
-        if let Value::Map(m) = &items[0] {
+    if let Value::Concrete(ConcreteValue::List(items)) =
+        resources[0].get_attr("security_group_egress").unwrap()
+    {
+        if let Value::Concrete(ConcreteValue::Map(m)) = &items[0] {
             assert_eq!(
                 m.get("ip_protocol"),
-                Some(&Value::String("-1".to_string())),
+                Some(&Value::Concrete(ConcreteValue::String("-1".to_string()))),
                 "Alias in struct field should be resolved"
             );
             assert_eq!(
                 m.get("cidr_ip"),
-                Some(&Value::String("0.0.0.0/0".to_string())),
+                Some(&Value::Concrete(ConcreteValue::String(
+                    "0.0.0.0/0".to_string()
+                ))),
                 "Non-alias values should not be changed"
             );
         } else {
@@ -150,7 +166,9 @@ fn test_normalize_state_prevents_false_enum_diff() {
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "test-vpc");
     resource.set_attr(
         "instance_tenancy".to_string(),
-        Value::String("awscc.ec2.Vpc.InstanceTenancy.default".to_string()),
+        Value::Concrete(ConcreteValue::String(
+            "awscc.ec2.Vpc.InstanceTenancy.default".to_string(),
+        )),
     );
 
     // State with raw AWS value (as returned by provider.read())
@@ -158,7 +176,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
     let mut state_attrs = HashMap::new();
     state_attrs.insert(
         "instance_tenancy".to_string(),
-        Value::String("default".to_string()),
+        Value::Concrete(ConcreteValue::String("default".to_string())),
     );
     let state = State::existing(id.clone(), state_attrs);
     let mut current_states = HashMap::new();
@@ -240,9 +258,12 @@ fn test_merge_default_tags_prevents_false_diff() {
     let mut tags = IndexMap::new();
     tags.insert(
         "Environment".to_string(),
-        Value::String("production".to_string()),
+        Value::Concrete(ConcreteValue::String("production".to_string())),
     );
-    state_attrs.insert("tags".to_string(), Value::Map(tags));
+    state_attrs.insert(
+        "tags".to_string(),
+        Value::Concrete(ConcreteValue::Map(tags)),
+    );
     let state = State::existing(id.clone(), state_attrs);
     let mut current_states = HashMap::new();
     current_states.insert(id.clone(), state);
@@ -251,7 +272,7 @@ fn test_merge_default_tags_prevents_false_diff() {
         let mut m = IndexMap::new();
         m.insert(
             "Environment".to_string(),
-            Value::String("production".to_string()),
+            Value::Concrete(ConcreteValue::String("production".to_string())),
         );
         m
     };
@@ -328,20 +349,27 @@ fn test_resolve_enum_aliases_non_enum_values_unchanged() {
     let mut resource = Resource::with_provider("awscc", "ec2.SecurityGroup", "test-sg");
     resource.set_attr(
         "group_description".to_string(),
-        Value::String("My security group".to_string()),
+        Value::Concrete(ConcreteValue::String("My security group".to_string())),
     );
-    resource.set_attr("vpc_id".to_string(), Value::String("vpc-12345".to_string()));
+    resource.set_attr(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-12345".to_string())),
+    );
 
     let mut resources = vec![resource];
     resolve_enum_aliases(&mut resources);
 
     assert_eq!(
         resources[0].get_attr("group_description"),
-        Some(&Value::String("My security group".to_string())),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "My security group".to_string()
+        ))),
     );
     assert_eq!(
         resources[0].get_attr("vpc_id"),
-        Some(&Value::String("vpc-12345".to_string())),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "vpc-12345".to_string()
+        ))),
     );
 }
 
@@ -349,7 +377,7 @@ fn test_resolve_enum_aliases_non_enum_values_unchanged() {
 fn import_fallback_matches_anonymous_resource_by_name_attribute() {
     use carina_core::effect::Effect;
     use carina_core::plan::Plan;
-    use carina_core::resource::{Resource, ResourceId, Value};
+    use carina_core::resource::{ConcreteValue, Resource, ResourceId, Value};
     use carina_core::schema::ResourceSchema;
 
     // Schema with name_attribute = "bucket_name"
@@ -361,7 +389,7 @@ fn import_fallback_matches_anonymous_resource_by_name_attribute() {
     let mut resource = Resource::with_provider("awscc", "s3.Bucket", "s3_bucket_1d43a664");
     resource.set_attr(
         "bucket_name".to_string(),
-        Value::String("carina-rs-state".to_string()),
+        Value::Concrete(ConcreteValue::String("carina-rs-state".to_string())),
     );
     let mut plan = Plan::new();
     plan.add(Effect::Create(resource));
@@ -450,13 +478,13 @@ fn resolve_data_source_refs_replaces_resource_ref_with_concrete_value() {
     mizzy.kind = ResourceKind::DataSource;
     mizzy.attributes.insert(
         "identity_store_id".to_string(),
-        Value::ResourceRef {
+        Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::new("sso", "identity_store_id"),
-        },
+        }),
     );
     mizzy.attributes.insert(
         "user_name".to_string(),
-        Value::String("gosukenator@gmail.com".into()),
+        Value::Concrete(ConcreteValue::String("gosukenator@gmail.com".into())),
     );
 
     // current_states after phase 1: sso has been refreshed and its
@@ -466,7 +494,7 @@ fn resolve_data_source_refs_replaces_resource_ref_with_concrete_value() {
         sso.id.clone(),
         HashMap::from([(
             "identity_store_id".to_string(),
-            Value::String(identity_store_id.into()),
+            Value::Concrete(ConcreteValue::String(identity_store_id.into())),
         )]),
     );
     current_states.insert(sso.id.clone(), sso_state);
@@ -484,13 +512,17 @@ fn resolve_data_source_refs_replaces_resource_ref_with_concrete_value() {
     let resolved_mizzy = &resolved[0];
     assert_eq!(
         resolved_mizzy.get_attr("identity_store_id"),
-        Some(&Value::String(identity_store_id.into())),
+        Some(&Value::Concrete(ConcreteValue::String(
+            identity_store_id.into()
+        ))),
         "identity_store_id should be resolved to the concrete state value, \
          not a ResourceRef"
     );
     assert_eq!(
         resolved_mizzy.get_attr("user_name"),
-        Some(&Value::String("gosukenator@gmail.com".into())),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "gosukenator@gmail.com".into()
+        ))),
         "literal inputs should pass through untouched"
     );
 }
@@ -569,23 +601,33 @@ fn module_and_provider_wrappers_return_vec_app_error() {
 
 #[test]
 fn strip_and_restore_unknown_attributes_round_trip() {
-    use carina_core::resource::{AccessPath, UnknownReason, Value};
+    use carina_core::resource::{AccessPath, ConcreteValue, DeferredValue, UnknownReason, Value};
     use indexmap::IndexMap;
 
     let mut r = carina_core::resource::Resource::new("test.t", "n");
     let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-    r.attributes
-        .insert("group_description".into(), Value::String("web".into()));
+    r.attributes.insert(
+        "group_description".into(),
+        Value::Concrete(ConcreteValue::String("web".into())),
+    );
     r.attributes.insert(
         "vpc_id".into(),
-        Value::Unknown(UnknownReason::UpstreamRef { path: path.clone() }),
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+            path: path.clone(),
+        })),
     );
     let mut tags: IndexMap<String, Value> = IndexMap::new();
-    tags.insert("Name".into(), Value::String("web-sg".into()));
-    r.attributes.insert("tags".into(), Value::Map(tags));
+    tags.insert(
+        "Name".into(),
+        Value::Concrete(ConcreteValue::String("web-sg".into())),
+    );
+    r.attributes
+        .insert("tags".into(), Value::Concrete(ConcreteValue::Map(tags)));
     r.attributes.insert(
         "nested_unknown".into(),
-        Value::List(vec![Value::Unknown(UnknownReason::UpstreamRef { path })]),
+        Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
+            DeferredValue::Unknown(UnknownReason::UpstreamRef { path }),
+        )])),
     );
     let mut resources = vec![r];
     let order_before: Vec<String> = resources[0].attributes.keys().cloned().collect();
@@ -611,14 +653,17 @@ fn strip_and_restore_unknown_attributes_round_trip() {
     // The restored Unknown values are still typed (not coerced to string).
     assert!(matches!(
         resources[0].get_attr("vpc_id"),
-        Some(Value::Unknown(_))
+        Some(Value::Deferred(DeferredValue::Unknown(_)))
     ));
     match resources[0].get_attr("nested_unknown") {
-        Some(Value::List(items)) => {
-            assert!(matches!(items[0], Value::Unknown(_)));
+        Some(Value::Concrete(ConcreteValue::List(items))) => {
+            assert!(matches!(
+                items[0],
+                Value::Deferred(DeferredValue::Unknown(_))
+            ));
         }
         other => panic!(
-            "nested_unknown should still be Value::List, got {:?}",
+            "nested_unknown should still be Value::Concrete(ConcreteValue::List), got {:?}",
             other
         ),
     }
@@ -626,30 +671,46 @@ fn strip_and_restore_unknown_attributes_round_trip() {
 
 #[test]
 fn value_contains_unknown_recurses() {
-    use carina_core::resource::{AccessPath, InterpolationPart, UnknownReason, Value};
+    use carina_core::resource::{
+        AccessPath, ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value,
+    };
     let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-    let unknown = || Value::Unknown(UnknownReason::UpstreamRef { path: path.clone() });
+    let unknown = || {
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+            path: path.clone(),
+        }))
+    };
 
     assert!(super::value_contains_unknown(&unknown()));
-    assert!(super::value_contains_unknown(&Value::List(vec![unknown()])));
-    assert!(super::value_contains_unknown(&Value::Map({
-        let mut m = indexmap::IndexMap::new();
-        m.insert("k".into(), unknown());
-        m
-    })));
-    assert!(super::value_contains_unknown(&Value::Interpolation(vec![
-        InterpolationPart::Expr(unknown()),
-    ])));
-    assert!(super::value_contains_unknown(&Value::FunctionCall {
-        name: "f".into(),
-        args: vec![unknown()],
-    }));
-    assert!(super::value_contains_unknown(&Value::Secret(Box::new(
-        unknown()
-    ))));
+    assert!(super::value_contains_unknown(&Value::Concrete(
+        ConcreteValue::List(vec![unknown()])
+    )));
+    assert!(super::value_contains_unknown(&Value::Concrete(
+        ConcreteValue::Map({
+            let mut m = indexmap::IndexMap::new();
+            m.insert("k".into(), unknown());
+            m
+        })
+    )));
+    assert!(super::value_contains_unknown(&Value::Deferred(
+        DeferredValue::Interpolation(vec![InterpolationPart::Expr(unknown()),])
+    )));
+    assert!(super::value_contains_unknown(&Value::Deferred(
+        DeferredValue::FunctionCall {
+            name: "f".into(),
+            args: vec![unknown()],
+        }
+    )));
+    assert!(super::value_contains_unknown(&Value::Deferred(
+        DeferredValue::Secret(Box::new(unknown()))
+    )));
 
-    assert!(!super::value_contains_unknown(&Value::String("x".into())));
-    assert!(!super::value_contains_unknown(&Value::Int(1)));
+    assert!(!super::value_contains_unknown(&Value::Concrete(
+        ConcreteValue::String("x".into())
+    )));
+    assert!(!super::value_contains_unknown(&Value::Concrete(
+        ConcreteValue::Int(1)
+    )));
 }
 
 #[test]
@@ -659,25 +720,32 @@ fn restore_unknown_attributes_after_normalize_injection() {
     // their original `insert_index`; injected attributes end up
     // trailing them. Verifies that `min(len)` clamping doesn't reorder
     // the originals when the post-normalize map has different length.
-    use carina_core::resource::{AccessPath, UnknownReason, Value};
+    use carina_core::resource::{AccessPath, ConcreteValue, DeferredValue, UnknownReason, Value};
 
     let mut r = carina_core::resource::Resource::new("test.t", "n");
     let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-    r.attributes
-        .insert("a".into(), Value::String("a-val".into()));
+    r.attributes.insert(
+        "a".into(),
+        Value::Concrete(ConcreteValue::String("a-val".into())),
+    );
     r.attributes.insert(
         "b".into(),
-        Value::Unknown(UnknownReason::UpstreamRef { path: path.clone() }),
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+            path: path.clone(),
+        })),
     );
-    r.attributes
-        .insert("c".into(), Value::String("c-val".into()));
+    r.attributes.insert(
+        "c".into(),
+        Value::Concrete(ConcreteValue::String("c-val".into())),
+    );
     let mut resources = vec![r];
 
     let stripped = super::strip_attributes_matching(&mut resources, &super::value_contains_unknown);
     // After strip: ["a", "c"]. Simulate normalize injecting "z".
-    resources[0]
-        .attributes
-        .insert("z".into(), Value::String("z-val".into()));
+    resources[0].attributes.insert(
+        "z".into(),
+        Value::Concrete(ConcreteValue::String("z-val".into())),
+    );
     super::restore_stripped_attributes(&mut resources, stripped);
 
     let order: Vec<String> = resources[0].attributes.keys().cloned().collect();
@@ -697,20 +765,28 @@ fn restore_unknown_attributes_after_normalize_injection() {
 fn strip_and_restore_for_expression_unknowns_round_trip() {
     // The strip-and-restore helpers must cover every `UnknownReason`
     // variant — the WASM provider boundary must never see a
-    // `Value::Unknown` of any reason.
-    use carina_core::resource::{UnknownReason, Value};
+    // `Value::Deferred(DeferredValue::Unknown)` of any reason.
+    use carina_core::resource::{ConcreteValue, DeferredValue, UnknownReason, Value};
 
     let mut r = carina_core::resource::Resource::new("test.t", "n");
-    r.attributes
-        .insert("name".into(), Value::String("static".into()));
-    r.attributes
-        .insert("target_id".into(), Value::Unknown(UnknownReason::ForValue));
+    r.attributes.insert(
+        "name".into(),
+        Value::Concrete(ConcreteValue::String("static".into())),
+    );
+    r.attributes.insert(
+        "target_id".into(),
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+    );
     r.attributes.insert(
         "items".into(),
-        Value::List(vec![Value::Unknown(UnknownReason::ForKey)]),
+        Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
+            DeferredValue::Unknown(UnknownReason::ForKey),
+        )])),
     );
-    r.attributes
-        .insert("index".into(), Value::Unknown(UnknownReason::ForIndex));
+    r.attributes.insert(
+        "index".into(),
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)),
+    );
     let mut resources = vec![r];
     let order_before: Vec<String> = resources[0].attributes.keys().cloned().collect();
 
@@ -731,29 +807,35 @@ fn strip_and_restore_for_expression_unknowns_round_trip() {
     );
     assert!(matches!(
         resources[0].get_attr("target_id"),
-        Some(Value::Unknown(UnknownReason::ForValue))
+        Some(Value::Deferred(DeferredValue::Unknown(
+            UnknownReason::ForValue
+        )))
     ));
     assert!(matches!(
         resources[0].get_attr("index"),
-        Some(Value::Unknown(UnknownReason::ForIndex))
+        Some(Value::Deferred(DeferredValue::Unknown(
+            UnknownReason::ForIndex
+        )))
     ));
 }
 
 #[test]
 fn value_contains_unknown_covers_for_variants() {
-    use carina_core::resource::{UnknownReason, Value};
-    assert!(super::value_contains_unknown(&Value::Unknown(
-        UnknownReason::ForValue
+    use carina_core::resource::{ConcreteValue, DeferredValue, UnknownReason, Value};
+    assert!(super::value_contains_unknown(&Value::Deferred(
+        DeferredValue::Unknown(UnknownReason::ForValue)
     )));
-    assert!(super::value_contains_unknown(&Value::Unknown(
-        UnknownReason::ForKey
+    assert!(super::value_contains_unknown(&Value::Deferred(
+        DeferredValue::Unknown(UnknownReason::ForKey)
     )));
-    assert!(super::value_contains_unknown(&Value::Unknown(
-        UnknownReason::ForIndex
+    assert!(super::value_contains_unknown(&Value::Deferred(
+        DeferredValue::Unknown(UnknownReason::ForIndex)
     )));
-    assert!(super::value_contains_unknown(&Value::List(vec![
-        Value::Unknown(UnknownReason::ForValue),
-    ])));
+    assert!(super::value_contains_unknown(&Value::Concrete(
+        ConcreteValue::List(vec![Value::Deferred(DeferredValue::Unknown(
+            UnknownReason::ForValue
+        )),])
+    )));
 }
 
 // ----- #2387: strip-and-restore round trip for ResourceRef -----
@@ -761,42 +843,58 @@ fn value_contains_unknown_covers_for_variants() {
 #[test]
 fn strip_and_restore_resource_ref_round_trip() {
     // The strip-and-restore pass must remove any attribute that
-    // recursively contains a `Value::ResourceRef` so the WASM
+    // recursively contains a `Value::Deferred(DeferredValue::ResourceRef)` so the WASM
     // boundary's `core_to_wit_value` never sees one (#2387). This
-    // mirrors the stage-2 `Value::Unknown` round-trip test for the
+    // mirrors the stage-2 `Value::Deferred(DeferredValue::Unknown)` round-trip test for the
     // ResourceRef predicate.
-    use carina_core::resource::{AccessPath, InterpolationPart, Value, contains_resource_ref};
+    use carina_core::resource::{
+        AccessPath, ConcreteValue, DeferredValue, InterpolationPart, Value, contains_resource_ref,
+    };
     use indexmap::IndexMap;
 
     let mut r = carina_core::resource::Resource::new("test.t", "n");
     let path = AccessPath::with_fields("admins", "group_id", vec![]);
-    r.attributes
-        .insert("name".into(), Value::String("static".into()));
-    r.attributes
-        .insert("group_id".into(), Value::ResourceRef { path: path.clone() });
+    r.attributes.insert(
+        "name".into(),
+        Value::Concrete(ConcreteValue::String("static".into())),
+    );
+    r.attributes.insert(
+        "group_id".into(),
+        Value::Deferred(DeferredValue::ResourceRef { path: path.clone() }),
+    );
     let mut nested_map: IndexMap<String, Value> = IndexMap::new();
-    nested_map.insert("ref".into(), Value::ResourceRef { path: path.clone() });
-    r.attributes.insert("policy".into(), Value::Map(nested_map));
+    nested_map.insert(
+        "ref".into(),
+        Value::Deferred(DeferredValue::ResourceRef { path: path.clone() }),
+    );
+    r.attributes.insert(
+        "policy".into(),
+        Value::Concrete(ConcreteValue::Map(nested_map)),
+    );
     r.attributes.insert(
         "label".into(),
-        Value::Interpolation(vec![
+        Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("prefix-".into()),
-            InterpolationPart::Expr(Value::ResourceRef { path: path.clone() }),
-        ]),
+            InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
+                path: path.clone(),
+            })),
+        ])),
     );
     r.attributes.insert(
         "joined".into(),
-        Value::FunctionCall {
+        Value::Deferred(DeferredValue::FunctionCall {
             name: "join".into(),
             args: vec![
-                Value::String(",".into()),
-                Value::ResourceRef { path: path.clone() },
+                Value::Concrete(ConcreteValue::String(",".into())),
+                Value::Deferred(DeferredValue::ResourceRef { path: path.clone() }),
             ],
-        },
+        }),
     );
     r.attributes.insert(
         "secret_ref".into(),
-        Value::Secret(Box::new(Value::ResourceRef { path: path.clone() })),
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
+            DeferredValue::ResourceRef { path: path.clone() },
+        )))),
     );
     let mut resources = vec![r];
     let order_before: Vec<String> = resources[0].attributes.keys().cloned().collect();
@@ -821,19 +919,19 @@ fn strip_and_restore_resource_ref_round_trip() {
     // to a debug-format String — the failure mode #2387 prevents).
     assert!(matches!(
         resources[0].get_attr("group_id"),
-        Some(Value::ResourceRef { .. })
+        Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
     ));
     assert!(matches!(
         resources[0].get_attr("label"),
-        Some(Value::Interpolation(_))
+        Some(Value::Deferred(DeferredValue::Interpolation(_)))
     ));
     assert!(matches!(
         resources[0].get_attr("joined"),
-        Some(Value::FunctionCall { .. })
+        Some(Value::Deferred(DeferredValue::FunctionCall { .. }))
     ));
     assert!(matches!(
         resources[0].get_attr("secret_ref"),
-        Some(Value::Secret(_))
+        Some(Value::Deferred(DeferredValue::Secret(_)))
     ));
 }
 
@@ -842,20 +940,26 @@ fn strip_unified_predicate_covers_unknown_and_ref() {
     // The `prepare` pass uses the unified predicate
     // `value_contains_unknown(v) || contains_resource_ref(v)`. Verify
     // it strips both kinds in a single pass, in original order.
-    use carina_core::resource::{AccessPath, UnknownReason, Value, contains_resource_ref};
+    use carina_core::resource::{
+        AccessPath, ConcreteValue, DeferredValue, UnknownReason, Value, contains_resource_ref,
+    };
 
     let mut r = carina_core::resource::Resource::new("test.t", "n");
     let path = AccessPath::with_fields("admins", "group_id", vec![]);
-    r.attributes
-        .insert("name".into(), Value::String("static".into()));
+    r.attributes.insert(
+        "name".into(),
+        Value::Concrete(ConcreteValue::String("static".into())),
+    );
     r.attributes.insert(
         "vpc_id".into(),
-        Value::Unknown(UnknownReason::UpstreamRef {
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
             path: AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]),
-        }),
+        })),
     );
-    r.attributes
-        .insert("group_id".into(), Value::ResourceRef { path: path.clone() });
+    r.attributes.insert(
+        "group_id".into(),
+        Value::Deferred(DeferredValue::ResourceRef { path: path.clone() }),
+    );
     let mut resources = vec![r];
 
     let stripped = super::strip_attributes_matching(&mut resources, &|v| {
@@ -868,11 +972,11 @@ fn strip_unified_predicate_covers_unknown_and_ref() {
     super::restore_stripped_attributes(&mut resources, stripped);
     assert!(matches!(
         resources[0].get_attr("vpc_id"),
-        Some(Value::Unknown(_))
+        Some(Value::Deferred(DeferredValue::Unknown(_)))
     ));
     assert!(matches!(
         resources[0].get_attr("group_id"),
-        Some(Value::ResourceRef { .. })
+        Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
     ));
 }
 
@@ -896,13 +1000,15 @@ fn parsed_with_attr(attr_name: &str, attr_value: Value) -> ParsedFile {
 
 #[test]
 fn validate_rejects_top_level_empty_interpolation() {
-    use carina_core::resource::{InterpolationPart, UnknownReason, Value};
+    use carina_core::resource::{DeferredValue, InterpolationPart, UnknownReason, Value};
 
-    let value = Value::Interpolation(vec![
+    let value = Value::Deferred(DeferredValue::Interpolation(vec![
         InterpolationPart::Literal("arn:aws:iam::".to_string()),
-        InterpolationPart::Expr(Value::Unknown(UnknownReason::EmptyInterpolation)),
+        InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
+            UnknownReason::EmptyInterpolation,
+        ))),
         InterpolationPart::Literal(":root".to_string()),
-    ]);
+    ]));
     let parsed = parsed_with_attr("aws", value);
 
     let errors = validate_no_empty_interpolations(&parsed);
@@ -930,12 +1036,15 @@ fn validate_rejects_top_level_empty_interpolation() {
 
 #[test]
 fn validate_rejects_empty_interpolation_inside_secret() {
-    use carina_core::resource::{InterpolationPart, UnknownReason, Value};
+    use carina_core::resource::{DeferredValue, InterpolationPart, UnknownReason, Value};
 
-    let inner = Value::Interpolation(vec![InterpolationPart::Expr(Value::Unknown(
-        UnknownReason::EmptyInterpolation,
-    ))]);
-    let parsed = parsed_with_attr("password", Value::Secret(Box::new(inner)));
+    let inner = Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation)),
+    )]));
+    let parsed = parsed_with_attr(
+        "password",
+        Value::Deferred(DeferredValue::Secret(Box::new(inner))),
+    );
 
     let errors = validate_no_empty_interpolations(&parsed);
     assert_eq!(
@@ -948,15 +1057,17 @@ fn validate_rejects_empty_interpolation_inside_secret() {
 
 #[test]
 fn validate_rejects_empty_interpolation_inside_function_call() {
-    use carina_core::resource::{InterpolationPart, UnknownReason, Value};
-
-    let bad = Value::Interpolation(vec![InterpolationPart::Expr(Value::Unknown(
-        UnknownReason::EmptyInterpolation,
-    ))]);
-    let fn_call = Value::FunctionCall {
-        name: "join".to_string(),
-        args: vec![Value::String("-".to_string()), bad],
+    use carina_core::resource::{
+        ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value,
     };
+
+    let bad = Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation)),
+    )]));
+    let fn_call = Value::Deferred(DeferredValue::FunctionCall {
+        name: "join".to_string(),
+        args: vec![Value::Concrete(ConcreteValue::String("-".to_string())), bad],
+    });
     let parsed = parsed_with_attr("name", fn_call);
 
     let errors = validate_no_empty_interpolations(&parsed);
@@ -970,16 +1081,20 @@ fn validate_rejects_empty_interpolation_inside_function_call() {
 
 #[test]
 fn validate_rejects_empty_interpolation_nested_in_map() {
-    use carina_core::resource::{InterpolationPart, UnknownReason, Value};
+    use carina_core::resource::{
+        ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value,
+    };
     use indexmap::IndexMap;
 
-    let inner = Value::Interpolation(vec![
+    let inner = Value::Deferred(DeferredValue::Interpolation(vec![
         InterpolationPart::Literal("prefix-".to_string()),
-        InterpolationPart::Expr(Value::Unknown(UnknownReason::EmptyInterpolation)),
-    ]);
+        InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
+            UnknownReason::EmptyInterpolation,
+        ))),
+    ]));
     let mut map = IndexMap::new();
     map.insert("key".to_string(), inner);
-    let parsed = parsed_with_attr("tags", Value::Map(map));
+    let parsed = parsed_with_attr("tags", Value::Concrete(ConcreteValue::Map(map)));
 
     let errors = validate_no_empty_interpolations(&parsed);
     assert_eq!(
@@ -992,12 +1107,14 @@ fn validate_rejects_empty_interpolation_nested_in_map() {
 
 #[test]
 fn validate_rejects_empty_interpolation_nested_in_list() {
-    use carina_core::resource::{InterpolationPart, UnknownReason, Value};
+    use carina_core::resource::{
+        ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value,
+    };
 
-    let inner = Value::Interpolation(vec![InterpolationPart::Expr(Value::Unknown(
-        UnknownReason::EmptyInterpolation,
-    ))]);
-    let parsed = parsed_with_attr("items", Value::List(vec![inner]));
+    let inner = Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation)),
+    )]));
+    let parsed = parsed_with_attr("items", Value::Concrete(ConcreteValue::List(vec![inner])));
 
     let errors = validate_no_empty_interpolations(&parsed);
     assert_eq!(
@@ -1011,11 +1128,11 @@ fn validate_rejects_empty_interpolation_nested_in_list() {
 #[test]
 fn validate_rejects_empty_interpolation_in_export_value() {
     use carina_core::parser::ParsedExportParam;
-    use carina_core::resource::{InterpolationPart, UnknownReason, Value};
+    use carina_core::resource::{DeferredValue, InterpolationPart, UnknownReason, Value};
 
-    let bad = Value::Interpolation(vec![InterpolationPart::Expr(Value::Unknown(
-        UnknownReason::EmptyInterpolation,
-    ))]);
+    let bad = Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation)),
+    )]));
     let parsed = ParsedFile {
         export_params: vec![ParsedExportParam {
             name: "url".to_string(),
@@ -1046,11 +1163,11 @@ fn validate_rejects_empty_interpolation_in_export_value() {
 #[test]
 fn validate_rejects_empty_interpolation_in_attribute_param_default() {
     use carina_core::parser::AttributeParameter;
-    use carina_core::resource::{InterpolationPart, UnknownReason, Value};
+    use carina_core::resource::{DeferredValue, InterpolationPart, UnknownReason, Value};
 
-    let bad = Value::Interpolation(vec![InterpolationPart::Expr(Value::Unknown(
-        UnknownReason::EmptyInterpolation,
-    ))]);
+    let bad = Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation)),
+    )]));
     let parsed = ParsedFile {
         attribute_params: vec![AttributeParameter {
             name: "region".to_string(),
@@ -1071,13 +1188,15 @@ fn validate_rejects_empty_interpolation_in_attribute_param_default() {
 
 #[test]
 fn validate_passes_when_no_empty_interpolation() {
-    use carina_core::resource::{InterpolationPart, Value};
+    use carina_core::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
 
     // Non-empty interpolation: must not error.
-    let value = Value::Interpolation(vec![
+    let value = Value::Deferred(DeferredValue::Interpolation(vec![
         InterpolationPart::Literal("prefix-".to_string()),
-        InterpolationPart::Expr(Value::String("real-value".to_string())),
-    ]);
+        InterpolationPart::Expr(Value::Concrete(ConcreteValue::String(
+            "real-value".to_string(),
+        ))),
+    ]));
     let parsed = parsed_with_attr("aws", value);
 
     let errors = validate_no_empty_interpolations(&parsed);

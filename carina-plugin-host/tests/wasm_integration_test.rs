@@ -7,7 +7,7 @@ use carina_core::provider::{
     CreateRequest, DeleteRequest, PatchOp, PatchOpKind, Provider, ProviderFactory, ReadRequest,
     UpdatePatch, UpdateRequest,
 };
-use carina_core::resource::{Resource, ResourceId, Value};
+use carina_core::resource::{ConcreteValue, Resource, ResourceId, Value};
 use carina_plugin_host::WasmProviderFactory;
 
 fn wasm_path() -> Option<PathBuf> {
@@ -88,9 +88,15 @@ async fn test_wasm_mock_provider_create_and_read() {
     // Create a resource
     let mut resource = Resource::with_provider("mock", "test.resource", "my-resource");
     resource.attributes = indexmap::IndexMap::from([
-        ("name".into(), Value::String("my-resource".into())),
-        ("region".into(), Value::String("us-east-1".into())),
-        ("count".into(), Value::Int(42)),
+        (
+            "name".into(),
+            Value::Concrete(ConcreteValue::String("my-resource".into())),
+        ),
+        (
+            "region".into(),
+            Value::Concrete(ConcreteValue::String("us-east-1".into())),
+        ),
+        ("count".into(), Value::Concrete(ConcreteValue::Int(42))),
     ]);
 
     let created = provider
@@ -105,13 +111,18 @@ async fn test_wasm_mock_provider_create_and_read() {
     assert_eq!(created.identifier, Some("mock-id".into()));
     assert_eq!(
         created.attributes.get("name"),
-        Some(&Value::String("my-resource".into()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "my-resource".into()
+        )))
     );
     assert_eq!(
         created.attributes.get("region"),
-        Some(&Value::String("us-east-1".into()))
+        Some(&Value::Concrete(ConcreteValue::String("us-east-1".into())))
     );
-    assert_eq!(created.attributes.get("count"), Some(&Value::Int(42)));
+    assert_eq!(
+        created.attributes.get("count"),
+        Some(&Value::Concrete(ConcreteValue::Int(42)))
+    );
 
     // Read back - should return the created state
     let read_state = provider
@@ -121,13 +132,18 @@ async fn test_wasm_mock_provider_create_and_read() {
     assert_eq!(read_state.identifier, Some("mock-id".into()));
     assert_eq!(
         read_state.attributes.get("name"),
-        Some(&Value::String("my-resource".into()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "my-resource".into()
+        )))
     );
     assert_eq!(
         read_state.attributes.get("region"),
-        Some(&Value::String("us-east-1".into()))
+        Some(&Value::Concrete(ConcreteValue::String("us-east-1".into())))
     );
-    assert_eq!(read_state.attributes.get("count"), Some(&Value::Int(42)));
+    assert_eq!(
+        read_state.attributes.get("count"),
+        Some(&Value::Concrete(ConcreteValue::Int(42)))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -144,8 +160,11 @@ async fn test_wasm_mock_provider_update_and_delete() {
     // Create first
     let mut resource = Resource::with_provider("mock", "test.resource", "updatable");
     resource.attributes = indexmap::IndexMap::from([
-        ("color".into(), Value::String("red".into())),
-        ("size".into(), Value::Int(10)),
+        (
+            "color".into(),
+            Value::Concrete(ConcreteValue::String("red".into())),
+        ),
+        ("size".into(), Value::Concrete(ConcreteValue::Int(10))),
     ]);
 
     let created = provider
@@ -159,7 +178,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
         .expect("create should succeed");
     assert_eq!(
         created.attributes.get("color"),
-        Some(&Value::String("red".into()))
+        Some(&Value::Concrete(ConcreteValue::String("red".into())))
     );
 
     // Build an UpdatePatch describing the user's intended changes
@@ -170,12 +189,12 @@ async fn test_wasm_mock_provider_update_and_delete() {
             PatchOp {
                 kind: PatchOpKind::Replace,
                 key: "color".to_string(),
-                value: Some(Value::String("blue".into())),
+                value: Some(Value::Concrete(ConcreteValue::String("blue".into()))),
             },
             PatchOp {
                 kind: PatchOpKind::Replace,
                 key: "size".to_string(),
-                value: Some(Value::Int(20)),
+                value: Some(Value::Concrete(ConcreteValue::Int(20))),
             },
         ],
     };
@@ -193,9 +212,12 @@ async fn test_wasm_mock_provider_update_and_delete() {
         .expect("update should succeed");
     assert_eq!(
         updated.attributes.get("color"),
-        Some(&Value::String("blue".into()))
+        Some(&Value::Concrete(ConcreteValue::String("blue".into())))
     );
-    assert_eq!(updated.attributes.get("size"), Some(&Value::Int(20)));
+    assert_eq!(
+        updated.attributes.get("size"),
+        Some(&Value::Concrete(ConcreteValue::Int(20)))
+    );
     // The mock echoes the applied patch op kinds + keys as a sentinel
     // attribute so we can verify the patch round-tripped through the
     // WIT boundary in op order.
@@ -203,12 +225,18 @@ async fn test_wasm_mock_provider_update_and_delete() {
         .attributes
         .get("__mock_patch_ops__")
         .expect("mock should echo patch ops");
-    let Value::List(ops) = echoed else {
+    let Value::Concrete(ConcreteValue::List(ops)) = echoed else {
         panic!("__mock_patch_ops__ should be a list, got {echoed:?}");
     };
     assert_eq!(ops.len(), 2);
-    assert_eq!(ops[0], Value::String("replace:color".into()));
-    assert_eq!(ops[1], Value::String("replace:size".into()));
+    assert_eq!(
+        ops[0],
+        Value::Concrete(ConcreteValue::String("replace:color".into()))
+    );
+    assert_eq!(
+        ops[1],
+        Value::Concrete(ConcreteValue::String("replace:size".into()))
+    );
 
     // Read to verify update persisted in memory
     let read_state = provider
@@ -217,7 +245,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
         .expect("read should not error");
     assert_eq!(
         read_state.attributes.get("color"),
-        Some(&Value::String("blue".into()))
+        Some(&Value::Concrete(ConcreteValue::String("blue".into())))
     );
 
     // Delete
@@ -244,7 +272,10 @@ async fn test_wasm_mock_provider_normalizer() {
     // normalize_desired: mock provider returns resources unchanged
     let mut resources = vec![{
         let mut r = Resource::with_provider("mock", "test.resource", "norm-test");
-        r.attributes = indexmap::IndexMap::from([("key".into(), Value::String("value".into()))]);
+        r.attributes = indexmap::IndexMap::from([(
+            "key".into(),
+            Value::Concrete(ConcreteValue::String("value".into())),
+        )]);
         r
     }];
     let original_attrs = resources[0].resolved_attributes();
@@ -253,14 +284,17 @@ async fn test_wasm_mock_provider_normalizer() {
 
     // normalize_state: mock provider returns states unchanged
     let id = ResourceId::with_provider("mock", "test.resource", "norm-test");
-    let attrs = HashMap::from([("key".into(), Value::String("value".into()))]);
+    let attrs = HashMap::from([(
+        "key".into(),
+        Value::Concrete(ConcreteValue::String("value".into())),
+    )]);
     let state = carina_core::resource::State::existing(id.clone(), attrs.clone());
     let mut states = HashMap::from([(id.clone(), state)]);
     normalizer.normalize_state(&mut states);
     let result_state = states.values().next().unwrap();
     assert_eq!(
         result_state.attributes.get("key"),
-        Some(&Value::String("value".into()))
+        Some(&Value::Concrete(ConcreteValue::String("value".into())))
     );
 }
 
@@ -280,8 +314,14 @@ async fn test_wasm_mock_provider_merge_default_tags_dispatches_through_wit() {
     let registry = carina_core::schema::SchemaRegistry::new();
     let mut resources = vec![Resource::with_provider("mock", "test.resource", "tag-test")];
     let default_tags = indexmap::IndexMap::from([
-        ("Env".to_string(), Value::String("dev".to_string())),
-        ("Owner".to_string(), Value::String("platform".to_string())),
+        (
+            "Env".to_string(),
+            Value::Concrete(ConcreteValue::String("dev".to_string())),
+        ),
+        (
+            "Owner".to_string(),
+            Value::Concrete(ConcreteValue::String("platform".to_string())),
+        ),
     ]);
 
     normalizer.merge_default_tags(&mut resources, &default_tags, &registry);
@@ -289,7 +329,7 @@ async fn test_wasm_mock_provider_merge_default_tags_dispatches_through_wit() {
     let echoed = resources[0]
         .get_attr("__mock_merged_default_tags__")
         .expect("guest's merge_default_tags must run via the WIT bridge");
-    let Value::List(items) = echoed else {
+    let Value::Concrete(ConcreteValue::List(items)) = echoed else {
         panic!("expected list, got {echoed:?}");
     };
     assert_eq!(items.len(), 2, "both default_tags should arrive at guest");
@@ -331,8 +371,10 @@ async fn test_wasm_mock_provider_merge_default_tags_preserves_order() {
         Resource::with_provider("mock", "test.resource", "beta"),
         Resource::with_provider("mock", "test.resource", "gamma"),
     ];
-    let default_tags =
-        indexmap::IndexMap::from([("Env".to_string(), Value::String("dev".to_string()))]);
+    let default_tags = indexmap::IndexMap::from([(
+        "Env".to_string(),
+        Value::Concrete(ConcreteValue::String("dev".to_string())),
+    )]);
 
     normalizer.merge_default_tags(&mut resources, &default_tags, &registry);
 
@@ -367,11 +409,11 @@ async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
     resource.attributes = indexmap::IndexMap::from([
         (
             "identity_store_id".into(),
-            Value::String("d-1234567890".into()),
+            Value::Concrete(ConcreteValue::String("d-1234567890".into())),
         ),
         (
             "user_name".into(),
-            Value::String("alice@example.com".into()),
+            Value::Concrete(ConcreteValue::String("alice@example.com".into())),
         ),
     ]);
 
@@ -383,16 +425,20 @@ async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
     assert!(state.exists, "state should be marked as existing");
     assert_eq!(
         state.attributes.get("__mock_read_data_source__"),
-        Some(&Value::Bool(true)),
+        Some(&Value::Concrete(ConcreteValue::Bool(true))),
         "sentinel attribute must be present — proves the plugin override ran"
     );
     assert_eq!(
         state.attributes.get("identity_store_id"),
-        Some(&Value::String("d-1234567890".into())),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "d-1234567890".into()
+        ))),
         "input attributes must cross the WASM boundary unchanged"
     );
     assert_eq!(
         state.attributes.get("user_name"),
-        Some(&Value::String("alice@example.com".into())),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "alice@example.com".into()
+        ))),
     );
 }

@@ -3,20 +3,28 @@ use super::*;
 #[test]
 fn value_serde_round_trip() {
     let values = vec![
-        Value::String("hello".to_string()),
-        Value::Int(42),
-        Value::Float(2.5),
-        Value::Float(-0.5),
-        Value::Bool(true),
-        Value::List(vec![Value::String("a".to_string()), Value::Int(1)]),
-        Value::Map(IndexMap::from([
-            ("key".to_string(), Value::String("val".to_string())),
-            ("num".to_string(), Value::Int(10)),
+        Value::Concrete(ConcreteValue::String("hello".to_string())),
+        Value::Concrete(ConcreteValue::Int(42)),
+        Value::Concrete(ConcreteValue::Float(2.5)),
+        Value::Concrete(ConcreteValue::Float(-0.5)),
+        Value::Concrete(ConcreteValue::Bool(true)),
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("a".to_string())),
+            Value::Concrete(ConcreteValue::Int(1)),
         ])),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "key".to_string(),
+                Value::Concrete(ConcreteValue::String("val".to_string())),
+            ),
+            ("num".to_string(), Value::Concrete(ConcreteValue::Int(10))),
+        ]))),
         Value::resource_ref("vpc".to_string(), "id".to_string(), vec![]),
-        Value::String("dedicated".to_string()),
-        Value::String("InstanceTenancy.dedicated".to_string()),
-        Value::Interpolation(vec![
+        Value::Concrete(ConcreteValue::String("dedicated".to_string())),
+        Value::Concrete(ConcreteValue::String(
+            "InstanceTenancy.dedicated".to_string(),
+        )),
+        Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("prefix-".to_string()),
             InterpolationPart::Expr(Value::resource_ref(
                 "vpc".to_string(),
@@ -24,18 +32,20 @@ fn value_serde_round_trip() {
                 vec![],
             )),
             InterpolationPart::Literal("-suffix".to_string()),
-        ]),
-        Value::FunctionCall {
+        ])),
+        Value::Deferred(DeferredValue::FunctionCall {
             name: "join".to_string(),
             args: vec![
-                Value::String("-".to_string()),
-                Value::List(vec![
-                    Value::String("a".to_string()),
-                    Value::String("b".to_string()),
-                ]),
+                Value::Concrete(ConcreteValue::String("-".to_string())),
+                Value::Concrete(ConcreteValue::List(vec![
+                    Value::Concrete(ConcreteValue::String("a".to_string())),
+                    Value::Concrete(ConcreteValue::String("b".to_string())),
+                ])),
             ],
-        },
-        Value::Secret(Box::new(Value::String("my-password".to_string()))),
+        }),
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("my-password".to_string()),
+        )))),
     ];
 
     for value in values {
@@ -124,8 +134,14 @@ fn resource_id_rename_pending_to_bound() {
 #[test]
 fn state_serde_round_trip() {
     let mut attrs = HashMap::new();
-    attrs.insert("name".to_string(), Value::String("my-bucket".to_string()));
-    attrs.insert("versioning".to_string(), Value::Bool(true));
+    attrs.insert(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
+    );
+    attrs.insert(
+        "versioning".to_string(),
+        Value::Concrete(ConcreteValue::Bool(true)),
+    );
 
     let state = State::existing(
         ResourceId::with_provider("aws", "s3.Bucket", "my-bucket"),
@@ -214,88 +230,155 @@ fn directives_with_force_delete() {
 
 #[test]
 fn semantically_equal_lists_same_order() {
-    let a = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
-    let b = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+    let a = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::Int(1)),
+        Value::Concrete(ConcreteValue::Int(2)),
+        Value::Concrete(ConcreteValue::Int(3)),
+    ]));
+    let b = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::Int(1)),
+        Value::Concrete(ConcreteValue::Int(2)),
+        Value::Concrete(ConcreteValue::Int(3)),
+    ]));
     assert!(a.semantically_equal(&b));
 }
 
 #[test]
 fn semantically_equal_lists_different_order() {
-    let a = Value::List(vec![Value::Int(3), Value::Int(1), Value::Int(2)]);
-    let b = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+    let a = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::Int(3)),
+        Value::Concrete(ConcreteValue::Int(1)),
+        Value::Concrete(ConcreteValue::Int(2)),
+    ]));
+    let b = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::Int(1)),
+        Value::Concrete(ConcreteValue::Int(2)),
+        Value::Concrete(ConcreteValue::Int(3)),
+    ]));
     assert!(a.semantically_equal(&b));
 }
 
 #[test]
 fn semantically_equal_lists_different_content() {
-    let a = Value::List(vec![Value::Int(1), Value::Int(2)]);
-    let b = Value::List(vec![Value::Int(1), Value::Int(3)]);
+    let a = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::Int(1)),
+        Value::Concrete(ConcreteValue::Int(2)),
+    ]));
+    let b = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::Int(1)),
+        Value::Concrete(ConcreteValue::Int(3)),
+    ]));
     assert!(!a.semantically_equal(&b));
 }
 
 #[test]
 fn semantically_equal_lists_different_lengths() {
-    let a = Value::List(vec![Value::Int(1), Value::Int(2)]);
-    let b = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+    let a = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::Int(1)),
+        Value::Concrete(ConcreteValue::Int(2)),
+    ]));
+    let b = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::Int(1)),
+        Value::Concrete(ConcreteValue::Int(2)),
+        Value::Concrete(ConcreteValue::Int(3)),
+    ]));
     assert!(!a.semantically_equal(&b));
 }
 
 #[test]
 fn semantically_equal_lists_with_duplicates() {
-    let a = Value::List(vec![Value::Int(1), Value::Int(1), Value::Int(2)]);
-    let b = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(1)]);
+    let a = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::Int(1)),
+        Value::Concrete(ConcreteValue::Int(1)),
+        Value::Concrete(ConcreteValue::Int(2)),
+    ]));
+    let b = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::Int(1)),
+        Value::Concrete(ConcreteValue::Int(2)),
+        Value::Concrete(ConcreteValue::Int(1)),
+    ]));
     assert!(a.semantically_equal(&b));
 
     // Different multiplicities should not be equal
-    let c = Value::List(vec![Value::Int(1), Value::Int(1), Value::Int(2)]);
-    let d = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(2)]);
+    let c = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::Int(1)),
+        Value::Concrete(ConcreteValue::Int(1)),
+        Value::Concrete(ConcreteValue::Int(2)),
+    ]));
+    let d = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::Int(1)),
+        Value::Concrete(ConcreteValue::Int(2)),
+        Value::Concrete(ConcreteValue::Int(2)),
+    ]));
     assert!(!c.semantically_equal(&d));
 }
 
 #[test]
 fn semantically_equal_empty_lists() {
-    let a = Value::List(vec![]);
-    let b = Value::List(vec![]);
+    let a = Value::Concrete(ConcreteValue::List(vec![]));
+    let b = Value::Concrete(ConcreteValue::List(vec![]));
     assert!(a.semantically_equal(&b));
 }
 
 #[test]
 fn semantically_equal_lists_of_maps_different_order() {
     let mut map1 = IndexMap::new();
-    map1.insert("port".to_string(), Value::Int(80));
-    map1.insert("protocol".to_string(), Value::String("tcp".to_string()));
+    map1.insert("port".to_string(), Value::Concrete(ConcreteValue::Int(80)));
+    map1.insert(
+        "protocol".to_string(),
+        Value::Concrete(ConcreteValue::String("tcp".to_string())),
+    );
 
     let mut map2 = IndexMap::new();
-    map2.insert("port".to_string(), Value::Int(443));
-    map2.insert("protocol".to_string(), Value::String("tcp".to_string()));
+    map2.insert("port".to_string(), Value::Concrete(ConcreteValue::Int(443)));
+    map2.insert(
+        "protocol".to_string(),
+        Value::Concrete(ConcreteValue::String("tcp".to_string())),
+    );
 
-    let a = Value::List(vec![Value::Map(map1.clone()), Value::Map(map2.clone())]);
-    let b = Value::List(vec![Value::Map(map2), Value::Map(map1)]);
+    let a = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::Map(map1.clone())),
+        Value::Concrete(ConcreteValue::Map(map2.clone())),
+    ]));
+    let b = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::Map(map2)),
+        Value::Concrete(ConcreteValue::Map(map1)),
+    ]));
     assert!(a.semantically_equal(&b));
 }
 
 #[test]
 fn semantically_equal_lists_of_strings() {
-    let a = Value::List(vec![
-        Value::String("b".to_string()),
-        Value::String("a".to_string()),
-    ]);
-    let b = Value::List(vec![
-        Value::String("a".to_string()),
-        Value::String("b".to_string()),
-    ]);
+    let a = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::String("b".to_string())),
+        Value::Concrete(ConcreteValue::String("a".to_string())),
+    ]));
+    let b = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::String("a".to_string())),
+        Value::Concrete(ConcreteValue::String("b".to_string())),
+    ]));
     assert!(a.semantically_equal(&b));
 }
 
 #[test]
 fn semantically_equal_non_list_values() {
     // Non-list values should use regular equality
-    assert!(Value::Int(42).semantically_equal(&Value::Int(42)));
-    assert!(!Value::Int(42).semantically_equal(&Value::Int(43)));
     assert!(
-        Value::String("hello".to_string()).semantically_equal(&Value::String("hello".to_string()))
+        Value::Concrete(ConcreteValue::Int(42))
+            .semantically_equal(&Value::Concrete(ConcreteValue::Int(42)))
     );
-    assert!(Value::Bool(true).semantically_equal(&Value::Bool(true)));
+    assert!(
+        !Value::Concrete(ConcreteValue::Int(42))
+            .semantically_equal(&Value::Concrete(ConcreteValue::Int(43)))
+    );
+    assert!(
+        Value::Concrete(ConcreteValue::String("hello".to_string()))
+            .semantically_equal(&Value::Concrete(ConcreteValue::String("hello".to_string())))
+    );
+    assert!(
+        Value::Concrete(ConcreteValue::Bool(true))
+            .semantically_equal(&Value::Concrete(ConcreteValue::Bool(true)))
+    );
 }
 
 #[test]
@@ -304,119 +387,164 @@ fn semantically_equal_nested_lists() {
     let mut map1 = IndexMap::new();
     map1.insert(
         "ports".to_string(),
-        Value::List(vec![Value::Int(80), Value::Int(443)]),
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::Int(80)),
+            Value::Concrete(ConcreteValue::Int(443)),
+        ])),
     );
 
     let mut map2 = IndexMap::new();
     map2.insert(
         "ports".to_string(),
-        Value::List(vec![Value::Int(443), Value::Int(80)]),
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::Int(443)),
+            Value::Concrete(ConcreteValue::Int(80)),
+        ])),
     );
 
-    let a = Value::Map(map1);
-    let b = Value::Map(map2);
+    let a = Value::Concrete(ConcreteValue::Map(map1));
+    let b = Value::Concrete(ConcreteValue::Map(map2));
     assert!(a.semantically_equal(&b));
 }
 
 #[test]
 fn semantically_equal_maps_different_keys() {
     let mut map1 = IndexMap::new();
-    map1.insert("a".to_string(), Value::Int(1));
+    map1.insert("a".to_string(), Value::Concrete(ConcreteValue::Int(1)));
 
     let mut map2 = IndexMap::new();
-    map2.insert("b".to_string(), Value::Int(1));
+    map2.insert("b".to_string(), Value::Concrete(ConcreteValue::Int(1)));
 
-    assert!(!Value::Map(map1).semantically_equal(&Value::Map(map2)));
+    assert!(
+        !Value::Concrete(ConcreteValue::Map(map1))
+            .semantically_equal(&Value::Concrete(ConcreteValue::Map(map2)))
+    );
 }
 
 #[test]
 fn semantically_equal_maps_different_sizes() {
     let mut map1 = IndexMap::new();
-    map1.insert("a".to_string(), Value::Int(1));
+    map1.insert("a".to_string(), Value::Concrete(ConcreteValue::Int(1)));
 
     let mut map2 = IndexMap::new();
-    map2.insert("a".to_string(), Value::Int(1));
-    map2.insert("b".to_string(), Value::Int(2));
+    map2.insert("a".to_string(), Value::Concrete(ConcreteValue::Int(1)));
+    map2.insert("b".to_string(), Value::Concrete(ConcreteValue::Int(2)));
 
-    assert!(!Value::Map(map1).semantically_equal(&Value::Map(map2)));
+    assert!(
+        !Value::Concrete(ConcreteValue::Map(map1))
+            .semantically_equal(&Value::Concrete(ConcreteValue::Map(map2)))
+    );
 }
 
 #[test]
 fn merge_with_saved_map_fills_extra_keys() {
-    let desired = Value::Map(IndexMap::from([
+    let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "hostname_type".to_string(),
-            Value::String("ip-name".to_string()),
+            Value::Concrete(ConcreteValue::String("ip-name".to_string())),
         ),
-        ("a_record".to_string(), Value::Bool(true)),
-    ]));
-    let saved = Value::Map(IndexMap::from([
+        (
+            "a_record".to_string(),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        ),
+    ])));
+    let saved = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "hostname_type".to_string(),
-            Value::String("ip-name".to_string()),
+            Value::Concrete(ConcreteValue::String("ip-name".to_string())),
         ),
-        ("a_record".to_string(), Value::Bool(true)),
-        ("aaaa_record".to_string(), Value::Bool(false)),
-    ]));
+        (
+            "a_record".to_string(),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        ),
+        (
+            "aaaa_record".to_string(),
+            Value::Concrete(ConcreteValue::Bool(false)),
+        ),
+    ])));
 
     let merged = merge_with_saved(&desired, &saved);
-    let expected = Value::Map(IndexMap::from([
+    let expected = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "hostname_type".to_string(),
-            Value::String("ip-name".to_string()),
+            Value::Concrete(ConcreteValue::String("ip-name".to_string())),
         ),
-        ("a_record".to_string(), Value::Bool(true)),
-        ("aaaa_record".to_string(), Value::Bool(false)),
-    ]));
+        (
+            "a_record".to_string(),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        ),
+        (
+            "aaaa_record".to_string(),
+            Value::Concrete(ConcreteValue::Bool(false)),
+        ),
+    ])));
     assert!(merged.semantically_equal(&expected), "Merged: {:?}", merged);
 }
 
 #[test]
 fn merge_with_saved_desired_wins() {
-    let desired = Value::Map(IndexMap::from([("a".to_string(), Value::Int(10))]));
-    let saved = Value::Map(IndexMap::from([
-        ("a".to_string(), Value::Int(5)),
-        ("b".to_string(), Value::Int(20)),
-    ]));
+    let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "a".to_string(),
+        Value::Concrete(ConcreteValue::Int(10)),
+    )])));
+    let saved = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        ("a".to_string(), Value::Concrete(ConcreteValue::Int(5))),
+        ("b".to_string(), Value::Concrete(ConcreteValue::Int(20))),
+    ])));
 
     let merged = merge_with_saved(&desired, &saved);
-    let expected = Value::Map(IndexMap::from([
-        ("a".to_string(), Value::Int(10)),
-        ("b".to_string(), Value::Int(20)),
-    ]));
+    let expected = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        ("a".to_string(), Value::Concrete(ConcreteValue::Int(10))),
+        ("b".to_string(), Value::Concrete(ConcreteValue::Int(20))),
+    ])));
     assert!(merged.semantically_equal(&expected), "Merged: {:?}", merged);
 }
 
 #[test]
 fn merge_with_saved_list_of_maps() {
-    let desired = Value::List(vec![Value::Map(IndexMap::from([(
-        "port".to_string(),
-        Value::Int(80),
-    )]))]);
-    let saved = Value::List(vec![Value::Map(IndexMap::from([
-        ("port".to_string(), Value::Int(80)),
-        ("protocol".to_string(), Value::String("tcp".to_string())),
-    ]))]);
+    let desired = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+        ConcreteValue::Map(IndexMap::from([(
+            "port".to_string(),
+            Value::Concrete(ConcreteValue::Int(80)),
+        )])),
+    )]));
+    let saved = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+        ConcreteValue::Map(IndexMap::from([
+            ("port".to_string(), Value::Concrete(ConcreteValue::Int(80))),
+            (
+                "protocol".to_string(),
+                Value::Concrete(ConcreteValue::String("tcp".to_string())),
+            ),
+        ])),
+    )]));
 
     let merged = merge_with_saved(&desired, &saved);
-    let expected = Value::List(vec![Value::Map(IndexMap::from([
-        ("port".to_string(), Value::Int(80)),
-        ("protocol".to_string(), Value::String("tcp".to_string())),
-    ]))]);
+    let expected = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+        ConcreteValue::Map(IndexMap::from([
+            ("port".to_string(), Value::Concrete(ConcreteValue::Int(80))),
+            (
+                "protocol".to_string(),
+                Value::Concrete(ConcreteValue::String("tcp".to_string())),
+            ),
+        ])),
+    )]));
     assert!(merged.semantically_equal(&expected), "Merged: {:?}", merged);
 }
 
 #[test]
 fn merge_with_saved_non_map() {
-    let desired = Value::String("hello".to_string());
-    let saved = Value::String("world".to_string());
+    let desired = Value::Concrete(ConcreteValue::String("hello".to_string()));
+    let saved = Value::Concrete(ConcreteValue::String("world".to_string()));
     let merged = merge_with_saved(&desired, &saved);
-    assert_eq!(merged, Value::String("hello".to_string()));
+    assert_eq!(
+        merged,
+        Value::Concrete(ConcreteValue::String("hello".to_string()))
+    );
 
-    let desired = Value::Int(42);
-    let saved = Value::Int(99);
+    let desired = Value::Concrete(ConcreteValue::Int(42));
+    let saved = Value::Concrete(ConcreteValue::Int(99));
     let merged = merge_with_saved(&desired, &saved);
-    assert_eq!(merged, Value::Int(42));
+    assert_eq!(merged, Value::Concrete(ConcreteValue::Int(42)));
 }
 
 #[test]
@@ -429,7 +557,7 @@ fn lists_equal_large_list_correctness() {
 
     // Different content
     let mut c: Vec<Value> = (0..n).map(Value::Int).collect();
-    c[n as usize - 1] = Value::Int(n); // change last element
+    c[n as usize - 1] = Value::Concrete(ConcreteValue::Int(n)); // change last element
     assert!(!lists_equal(&a, &c));
 }
 
@@ -437,17 +565,27 @@ fn lists_equal_large_list_correctness() {
 fn lists_equal_large_list_with_duplicates() {
     let n = 100;
     let a: Vec<Value> = (0..n)
-        .flat_map(|i| vec![Value::Int(i), Value::Int(i)])
+        .flat_map(|i| {
+            vec![
+                Value::Concrete(ConcreteValue::Int(i)),
+                Value::Concrete(ConcreteValue::Int(i)),
+            ]
+        })
         .collect();
     let b: Vec<Value> = (0..n)
         .rev()
-        .flat_map(|i| vec![Value::Int(i), Value::Int(i)])
+        .flat_map(|i| {
+            vec![
+                Value::Concrete(ConcreteValue::Int(i)),
+                Value::Concrete(ConcreteValue::Int(i)),
+            ]
+        })
         .collect();
     assert!(lists_equal(&a, &b));
 
     // Different multiplicities
     let mut c = a.clone();
-    c[0] = Value::Int(999);
+    c[0] = Value::Concrete(ConcreteValue::Int(999));
     assert!(!lists_equal(&a, &c));
 }
 
@@ -456,14 +594,17 @@ fn lists_equal_large_list_of_maps() {
     // Simulates security group rules (100+ maps)
     let n = 150;
     let make_rule = |i: i64| {
-        Value::Map(IndexMap::from([
-            ("port".to_string(), Value::Int(i)),
-            ("protocol".to_string(), Value::String("tcp".to_string())),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("port".to_string(), Value::Concrete(ConcreteValue::Int(i))),
+            (
+                "protocol".to_string(),
+                Value::Concrete(ConcreteValue::String("tcp".to_string())),
+            ),
             (
                 "cidr".to_string(),
-                Value::String(format!("10.0.{}.0/24", i)),
+                Value::Concrete(ConcreteValue::String(format!("10.0.{}.0/24", i))),
             ),
-        ]))
+        ])))
     };
 
     let a: Vec<Value> = (0..n).map(make_rule).collect();
@@ -497,15 +638,23 @@ fn merge_lists_large_list_correctness() {
     // Verify merge_lists works correctly with large lists
     let n = 50;
     let desired: Vec<Value> = (0..n)
-        .map(|i| Value::Map(IndexMap::from([("port".to_string(), Value::Int(i))])))
+        .map(|i| {
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "port".to_string(),
+                Value::Concrete(ConcreteValue::Int(i)),
+            )])))
+        })
         .collect();
     let saved: Vec<Value> = (0..n)
         .rev()
         .map(|i| {
-            Value::Map(IndexMap::from([
-                ("port".to_string(), Value::Int(i)),
-                ("protocol".to_string(), Value::String("tcp".to_string())),
-            ]))
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                ("port".to_string(), Value::Concrete(ConcreteValue::Int(i))),
+                (
+                    "protocol".to_string(),
+                    Value::Concrete(ConcreteValue::String("tcp".to_string())),
+                ),
+            ])))
         })
         .collect();
 
@@ -514,7 +663,7 @@ fn merge_lists_large_list_correctness() {
 
     // Each merged element should have both port and protocol
     for item in &merged {
-        if let Value::Map(map) = item {
+        if let Value::Concrete(ConcreteValue::Map(map)) = item {
             assert!(map.contains_key("port"), "Missing port in merged item");
             assert!(
                 map.contains_key("protocol"),
@@ -529,23 +678,23 @@ fn merge_lists_large_list_correctness() {
 #[test]
 fn canonical_hash_consistency() {
     // Same value should produce same hash
-    let v1 = Value::Int(42);
-    let v2 = Value::Int(42);
+    let v1 = Value::Concrete(ConcreteValue::Int(42));
+    let v2 = Value::Concrete(ConcreteValue::Int(42));
     assert_eq!(v1.canonical_hash(), v2.canonical_hash());
 
     // Different values should (usually) produce different hashes
-    let v3 = Value::Int(43);
+    let v3 = Value::Concrete(ConcreteValue::Int(43));
     assert_ne!(v1.canonical_hash(), v3.canonical_hash());
 
     // Maps with same content should hash the same regardless of insertion order
-    let m1 = Value::Map(IndexMap::from([
-        ("a".to_string(), Value::Int(1)),
-        ("b".to_string(), Value::Int(2)),
-    ]));
-    let m2 = Value::Map(IndexMap::from([
-        ("b".to_string(), Value::Int(2)),
-        ("a".to_string(), Value::Int(1)),
-    ]));
+    let m1 = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        ("a".to_string(), Value::Concrete(ConcreteValue::Int(1))),
+        ("b".to_string(), Value::Concrete(ConcreteValue::Int(2))),
+    ])));
+    let m2 = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        ("b".to_string(), Value::Concrete(ConcreteValue::Int(2))),
+        ("a".to_string(), Value::Concrete(ConcreteValue::Int(1))),
+    ])));
     assert_eq!(m1.canonical_hash(), m2.canonical_hash());
 }
 
@@ -663,29 +812,41 @@ fn resource_kind_enum_data_source() {
 #[test]
 fn resource_attributes_use_value_type() {
     let resource = Resource::new("s3.Bucket", "test")
-        .with_attribute("name", Value::String("my-bucket".to_string()))
+        .with_attribute(
+            "name",
+            Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
+        )
         .with_attribute(
             "vpc_id",
             Value::resource_ref("vpc".to_string(), "id".to_string(), vec![]),
         );
-    assert!(matches!(resource.get_attr("name"), Some(Value::String(_))));
+    assert!(matches!(
+        resource.get_attr("name"),
+        Some(Value::Concrete(ConcreteValue::String(_)))
+    ));
     assert!(matches!(
         resource.get_attr("vpc_id"),
-        Some(Value::ResourceRef { .. })
+        Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
     ));
 }
 
 #[test]
 fn attrs_to_hashmap_clones_values() {
     let mut attrs = IndexMap::new();
-    attrs.insert("name".to_string(), Value::String("test".to_string()));
-    attrs.insert("count".to_string(), Value::Int(5));
+    attrs.insert(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("test".to_string())),
+    );
+    attrs.insert("count".to_string(), Value::Concrete(ConcreteValue::Int(5)));
     let resolved = attrs_to_hashmap(&attrs);
     assert_eq!(
         resolved.get("name"),
-        Some(&Value::String("test".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String("test".to_string())))
     );
-    assert_eq!(resolved.get("count"), Some(&Value::Int(5)));
+    assert_eq!(
+        resolved.get("count"),
+        Some(&Value::Concrete(ConcreteValue::Int(5)))
+    );
 }
 
 #[test]
@@ -785,7 +946,7 @@ fn value_ref_helpers() {
         Some(["nested".to_string()].as_slice())
     );
 
-    let non_ref = Value::String("hello".to_string());
+    let non_ref = Value::Concrete(ConcreteValue::String("hello".to_string()));
     assert_eq!(non_ref.ref_binding(), None);
 }
 
@@ -795,23 +956,27 @@ fn value_ref_helpers() {
 
 #[test]
 fn visit_refs_collects_from_all_nested_variants() {
-    let value = Value::List(vec![
+    let value = Value::Concrete(ConcreteValue::List(vec![
         Value::resource_ref("a", "id", vec![]),
-        Value::Map(IndexMap::from([(
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "k".to_string(),
             Value::resource_ref("b", "id", vec![]),
-        )])),
-        Value::Interpolation(vec![
+        )]))),
+        Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("x".to_string()),
             InterpolationPart::Expr(Value::resource_ref("c", "id", vec![])),
-        ]),
-        Value::FunctionCall {
+        ])),
+        Value::Deferred(DeferredValue::FunctionCall {
             name: "join".to_string(),
             args: vec![Value::resource_ref("d", "id", vec![])],
-        },
-        Value::Secret(Box::new(Value::resource_ref("e", "id", vec![]))),
-        Value::String("plain".to_string()),
-    ]);
+        }),
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::resource_ref(
+            "e",
+            "id",
+            vec![],
+        )))),
+        Value::Concrete(ConcreteValue::String("plain".to_string())),
+    ]));
 
     let mut collected: Vec<String> = Vec::new();
     value.visit_refs(&mut |path| {
@@ -824,10 +989,10 @@ fn visit_refs_collects_from_all_nested_variants() {
 #[test]
 fn visit_refs_on_leaf_variants_calls_nothing() {
     for v in [
-        Value::String("s".into()),
-        Value::Int(1),
-        Value::Float(1.0),
-        Value::Bool(true),
+        Value::Concrete(ConcreteValue::String("s".into())),
+        Value::Concrete(ConcreteValue::Int(1)),
+        Value::Concrete(ConcreteValue::Float(1.0)),
+        Value::Concrete(ConcreteValue::Bool(true)),
     ] {
         let mut count = 0;
         v.visit_refs(&mut |_| count += 1);
@@ -840,10 +1005,10 @@ fn visit_refs_on_leaf_variants_calls_nothing() {
 #[test]
 fn canonicalize_leaves_simple_values_alone() {
     for v in [
-        Value::String("s".into()),
-        Value::Int(1),
-        Value::Float(1.5),
-        Value::Bool(true),
+        Value::Concrete(ConcreteValue::String("s".into())),
+        Value::Concrete(ConcreteValue::Int(1)),
+        Value::Concrete(ConcreteValue::Float(1.5)),
+        Value::Concrete(ConcreteValue::Bool(true)),
         Value::resource_ref("vpc", "id", vec![]),
     ] {
         assert_eq!(v.clone().canonicalize(), v);
@@ -852,36 +1017,46 @@ fn canonicalize_leaves_simple_values_alone() {
 
 #[test]
 fn canonicalize_collapses_all_literal_interpolation_to_string() {
-    let v = Value::Interpolation(vec![
+    let v = Value::Deferred(DeferredValue::Interpolation(vec![
         InterpolationPart::Literal("foo".into()),
         InterpolationPart::Literal("bar".into()),
-    ]);
-    assert_eq!(v.canonicalize(), Value::String("foobar".into()));
+    ]));
+    assert_eq!(
+        v.canonicalize(),
+        Value::Concrete(ConcreteValue::String("foobar".into()))
+    );
 }
 
 #[test]
 fn canonicalize_collapses_single_literal_interpolation_to_string() {
-    let v = Value::Interpolation(vec![InterpolationPart::Literal("foo".into())]);
-    assert_eq!(v.canonicalize(), Value::String("foo".into()));
+    let v = Value::Deferred(DeferredValue::Interpolation(vec![
+        InterpolationPart::Literal("foo".into()),
+    ]));
+    assert_eq!(
+        v.canonicalize(),
+        Value::Concrete(ConcreteValue::String("foo".into()))
+    );
 }
 
 #[test]
 fn canonicalize_unwraps_single_scalar_expr_interpolation() {
     // Every string-shaped scalar (String / Int / Float / Bool) is
-    // folded into a flat `Value::String` when wrapped in a
+    // folded into a flat `Value::Concrete(ConcreteValue::String)` when wrapped in a
     // single-element interpolation.
     let cases: Vec<(Value, &str)> = vec![
-        (Value::String("foo".into()), "foo"),
-        (Value::Int(42), "42"),
-        (Value::Float(1.5), "1.5"),
-        (Value::Bool(true), "true"),
+        (Value::Concrete(ConcreteValue::String("foo".into())), "foo"),
+        (Value::Concrete(ConcreteValue::Int(42)), "42"),
+        (Value::Concrete(ConcreteValue::Float(1.5)), "1.5"),
+        (Value::Concrete(ConcreteValue::Bool(true)), "true"),
     ];
     for (inner, expected) in cases {
         let label = format!("{:?}", inner);
-        let v = Value::Interpolation(vec![InterpolationPart::Expr(inner)]);
+        let v = Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
+            inner,
+        )]));
         assert_eq!(
             v.canonicalize(),
-            Value::String(expected.into()),
+            Value::Concrete(ConcreteValue::String(expected.into())),
             "case {} failed",
             label
         );
@@ -890,32 +1065,35 @@ fn canonicalize_unwraps_single_scalar_expr_interpolation() {
 
 #[test]
 fn canonicalize_merges_adjacent_literals() {
-    let v = Value::Interpolation(vec![
+    let v = Value::Deferred(DeferredValue::Interpolation(vec![
         InterpolationPart::Literal("a".into()),
         InterpolationPart::Literal("b".into()),
         InterpolationPart::Expr(Value::resource_ref("vpc", "id", vec![])),
         InterpolationPart::Literal("c".into()),
         InterpolationPart::Literal("d".into()),
-    ]);
+    ]));
     assert_eq!(
         v.canonicalize(),
-        Value::Interpolation(vec![
+        Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("ab".into()),
             InterpolationPart::Expr(Value::resource_ref("vpc", "id", vec![])),
             InterpolationPart::Literal("cd".into()),
-        ])
+        ]))
     );
 }
 
 #[test]
 fn canonicalize_folds_simple_expr_into_literal_then_merges() {
     // ["prefix-", Expr(String("foo")), "-suffix"] -> "prefix-foo-suffix"
-    let v = Value::Interpolation(vec![
+    let v = Value::Deferred(DeferredValue::Interpolation(vec![
         InterpolationPart::Literal("prefix-".into()),
-        InterpolationPart::Expr(Value::String("foo".into())),
+        InterpolationPart::Expr(Value::Concrete(ConcreteValue::String("foo".into()))),
         InterpolationPart::Literal("-suffix".into()),
-    ]);
-    assert_eq!(v.canonicalize(), Value::String("prefix-foo-suffix".into()));
+    ]));
+    assert_eq!(
+        v.canonicalize(),
+        Value::Concrete(ConcreteValue::String("prefix-foo-suffix".into()))
+    );
 }
 
 #[test]
@@ -924,56 +1102,65 @@ fn canonicalize_keeps_resource_ref_expr_in_interpolation() {
         InterpolationPart::Literal("prefix-".into()),
         InterpolationPart::Expr(Value::resource_ref("vpc", "id", vec![])),
     ];
-    let v = Value::Interpolation(parts.clone());
-    assert_eq!(v.canonicalize(), Value::Interpolation(parts));
+    let v = Value::Deferred(DeferredValue::Interpolation(parts.clone()));
+    assert_eq!(
+        v.canonicalize(),
+        Value::Deferred(DeferredValue::Interpolation(parts))
+    );
 }
 
 #[test]
 fn canonicalize_recurses_into_list_and_map() {
-    let v = Value::List(vec![
-        Value::Interpolation(vec![InterpolationPart::Literal("foo".into())]),
-        Value::Map(IndexMap::from([(
+    let v = Value::Concrete(ConcreteValue::List(vec![
+        Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Literal("foo".into()),
+        ])),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "k".to_string(),
-            Value::Interpolation(vec![InterpolationPart::Literal("bar".into())]),
-        )])),
-    ]);
+            Value::Deferred(DeferredValue::Interpolation(vec![
+                InterpolationPart::Literal("bar".into()),
+            ])),
+        )]))),
+    ]));
     assert_eq!(
         v.canonicalize(),
-        Value::List(vec![
-            Value::String("foo".into()),
-            Value::Map(IndexMap::from([(
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("foo".into())),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
                 "k".to_string(),
-                Value::String("bar".into()),
-            )])),
-        ])
+                Value::Concrete(ConcreteValue::String("bar".into())),
+            )]))),
+        ]))
     );
 }
 
 #[test]
 fn canonicalize_recurses_into_function_call_args() {
-    let v = Value::FunctionCall {
+    let v = Value::Deferred(DeferredValue::FunctionCall {
         name: "upper".into(),
-        args: vec![Value::Interpolation(vec![InterpolationPart::Literal(
-            "foo".into(),
-        )])],
-    };
+        args: vec![Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Literal("foo".into()),
+        ]))],
+    });
     assert_eq!(
         v.canonicalize(),
-        Value::FunctionCall {
+        Value::Deferred(DeferredValue::FunctionCall {
             name: "upper".into(),
-            args: vec![Value::String("foo".into())],
-        }
+            args: vec![Value::Concrete(ConcreteValue::String("foo".into()))],
+        })
     );
 }
 
 #[test]
 fn canonicalize_recurses_into_secret() {
-    let v = Value::Secret(Box::new(Value::Interpolation(vec![
-        InterpolationPart::Literal("hidden".into()),
-    ])));
+    let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
+        DeferredValue::Interpolation(vec![InterpolationPart::Literal("hidden".into())]),
+    ))));
     assert_eq!(
         v.canonicalize(),
-        Value::Secret(Box::new(Value::String("hidden".into())))
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("hidden".into())
+        ))))
     );
 }
 
@@ -982,10 +1169,15 @@ fn canonicalize_collapses_nested_interpolation() {
     // Inner `Interpolation([Literal("foo")])` collapses to `String("foo")`,
     // its outer `Expr(String("foo"))` folds into a Literal, and the
     // single-literal Interpolation collapses to `String("foo")`.
-    let v = Value::Interpolation(vec![InterpolationPart::Expr(Value::Interpolation(vec![
-        InterpolationPart::Literal("foo".into()),
-    ]))]);
-    assert_eq!(v.canonicalize(), Value::String("foo".into()));
+    let v = Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
+        Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Literal("foo".into()),
+        ])),
+    )]));
+    assert_eq!(
+        v.canonicalize(),
+        Value::Concrete(ConcreteValue::String("foo".into()))
+    );
 }
 
 #[test]
@@ -993,19 +1185,28 @@ fn canonicalize_keeps_secret_expr_in_interpolation() {
     // A `Secret(_)` inside an `Expr` must NOT be folded into a Literal:
     // doing so would let the secret travel as plain text and bypass
     // redaction in plan display, state serialization, and logging.
-    let secret = Value::Secret(Box::new(Value::String("password".into())));
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String("password".into()),
+    ))));
     let parts = vec![
         InterpolationPart::Literal("db-".into()),
         InterpolationPart::Expr(secret.clone()),
     ];
-    let v = Value::Interpolation(parts.clone());
-    assert_eq!(v.canonicalize(), Value::Interpolation(parts));
+    let v = Value::Deferred(DeferredValue::Interpolation(parts.clone()));
+    assert_eq!(
+        v.canonicalize(),
+        Value::Deferred(DeferredValue::Interpolation(parts))
+    );
 
     // Even when the Secret is the only Expr part, it must stay wrapped.
-    let only_secret = Value::Interpolation(vec![InterpolationPart::Expr(secret.clone())]);
+    let only_secret = Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
+        secret.clone(),
+    )]));
     assert_eq!(
         only_secret.canonicalize(),
-        Value::Interpolation(vec![InterpolationPart::Expr(secret)]),
+        Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
+            secret
+        )])),
     );
 }
 
@@ -1013,37 +1214,43 @@ fn canonicalize_keeps_secret_expr_in_interpolation() {
 fn canonicalize_is_idempotent() {
     let inputs = vec![
         // All-Literal Interpolation collapses to String on first call.
-        Value::Interpolation(vec![
+        Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("foo".into()),
             InterpolationPart::Literal("bar".into()),
-        ]),
+        ])),
         // ResourceRef-bearing Interpolation stays as Interpolation.
-        Value::Interpolation(vec![
+        Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("a".into()),
             InterpolationPart::Expr(Value::resource_ref("x", "y", vec![])),
             InterpolationPart::Literal("b".into()),
-        ]),
+        ])),
         // Nested Interpolation inside an Expr.
-        Value::Interpolation(vec![InterpolationPart::Expr(Value::Interpolation(vec![
-            InterpolationPart::Literal("nested".into()),
-        ]))]),
+        Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
+            Value::Deferred(DeferredValue::Interpolation(vec![
+                InterpolationPart::Literal("nested".into()),
+            ])),
+        )])),
         // Secret-wrapped Interpolation: canonicalize recurses through
         // Secret at the Value level but keeps Secret(Expr) wrapped.
-        Value::Secret(Box::new(Value::Interpolation(vec![
-            InterpolationPart::Literal("hidden".into()),
-        ]))),
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
+            DeferredValue::Interpolation(vec![InterpolationPart::Literal("hidden".into())]),
+        )))),
         // List, Map, FunctionCall — recursion shapes.
-        Value::List(vec![Value::String("x".into())]),
-        Value::Map(IndexMap::from([(
-            "k".to_string(),
-            Value::Interpolation(vec![InterpolationPart::Literal("v".into())]),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("x".into()),
         )])),
-        Value::FunctionCall {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "k".to_string(),
+            Value::Deferred(DeferredValue::Interpolation(vec![
+                InterpolationPart::Literal("v".into()),
+            ])),
+        )]))),
+        Value::Deferred(DeferredValue::FunctionCall {
             name: "upper".into(),
-            args: vec![Value::Interpolation(vec![InterpolationPart::Literal(
-                "x".into(),
-            )])],
-        },
+            args: vec![Value::Deferred(DeferredValue::Interpolation(vec![
+                InterpolationPart::Literal("x".into()),
+            ]))],
+        }),
     ];
     for v in inputs {
         let once = v.clone().canonicalize();
@@ -1052,25 +1259,30 @@ fn canonicalize_is_idempotent() {
     }
 }
 
-// ----- RFC #2371 stage 2 (#2377): Value::Unknown semantics -----
+// ----- RFC #2371 stage 2 (#2377): Value::Deferred(DeferredValue::Unknown) semantics -----
 
 #[test]
 fn unknown_never_equals_unknown() {
-    // Two Value::Unknown must compare unequal even when their reasons
+    // Two Value::Deferred(DeferredValue::Unknown) must compare unequal even when their reasons
     // are identical — an unknown value is, by definition, not equal to
     // anything (including itself). Without this, the differ would
     // suppress real diffs between two attributes that both happen to
     // be "unresolved upstream" of the same binding.
     let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-    let a = Value::Unknown(UnknownReason::UpstreamRef { path: path.clone() });
-    let b = Value::Unknown(UnknownReason::UpstreamRef { path });
-    assert_ne!(a, b, "two `Value::Unknown`s must never compare equal");
+    let a = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+        path: path.clone(),
+    }));
+    let b = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef { path }));
+    assert_ne!(
+        a, b,
+        "two `Value::Deferred(DeferredValue::Unknown)`s must never compare equal"
+    );
 }
 
 #[test]
 fn unknown_never_equals_concrete() {
-    let a = Value::Unknown(UnknownReason::ForKey);
-    let b = Value::String("anything".into());
+    let a = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey));
+    let b = Value::Concrete(ConcreteValue::String("anything".into()));
     assert_ne!(a, b);
     assert_ne!(b, a);
 }
@@ -1078,12 +1290,12 @@ fn unknown_never_equals_concrete() {
 #[test]
 fn unknown_for_variants_never_equal() {
     assert_ne!(
-        Value::Unknown(UnknownReason::ForKey),
-        Value::Unknown(UnknownReason::ForKey)
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey)),
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey))
     );
     assert_ne!(
-        Value::Unknown(UnknownReason::ForIndex),
-        Value::Unknown(UnknownReason::ForValue)
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)),
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue))
     );
 }
 
@@ -1096,8 +1308,10 @@ fn unknown_hash_is_deterministic_per_path() {
         h.finish()
     }
     let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-    let a = Value::Unknown(UnknownReason::UpstreamRef { path: path.clone() });
-    let b = Value::Unknown(UnknownReason::UpstreamRef { path });
+    let a = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+        path: path.clone(),
+    }));
+    let b = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef { path }));
     assert_eq!(
         hash_of(&a),
         hash_of(&b),
@@ -1115,8 +1329,12 @@ fn unknown_hash_differs_per_path() {
     }
     let p1 = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
     let p2 = AccessPath::with_fields("network", "vpc", vec!["cidr_block".into()]);
-    let a = Value::Unknown(UnknownReason::UpstreamRef { path: p1 });
-    let b = Value::Unknown(UnknownReason::UpstreamRef { path: p2 });
+    let a = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+        path: p1,
+    }));
+    let b = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+        path: p2,
+    }));
     assert_ne!(hash_of(&a), hash_of(&b));
 }
 
@@ -1124,26 +1342,26 @@ fn unknown_hash_differs_per_path() {
 fn unknown_hash_does_not_panic_for_for_variants() {
     use std::hash::Hasher;
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    Value::Unknown(UnknownReason::ForKey).hash_into(&mut h);
-    Value::Unknown(UnknownReason::ForIndex).hash_into(&mut h);
-    Value::Unknown(UnknownReason::ForValue).hash_into(&mut h);
+    Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey)).hash_into(&mut h);
+    Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)).hash_into(&mut h);
+    Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)).hash_into(&mut h);
     let _ = h.finish();
 }
 
 #[test]
 fn unknown_cannot_round_trip_through_serde_json() {
-    // RFC #2371 constraint c: `Value::Unknown` must never reach state
+    // RFC #2371 constraint c: `Value::Deferred(DeferredValue::Unknown)` must never reach state
     // files / plan files / providers. The variant has `#[serde(skip)]`
     // so attempting to serialize it returns Err — even a hand-edited
     // JSON cannot resurrect the variant via deserialization.
     let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-    let v = Value::Unknown(UnknownReason::UpstreamRef { path });
+    let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef { path }));
 
     // Serialization must fail.
     let r = serde_json::to_string(&v);
     assert!(
         r.is_err(),
-        "serializing Value::Unknown must error, got Ok({:?})",
+        "serializing Value::Deferred(DeferredValue::Unknown) must error, got Ok({:?})",
         r
     );
 
@@ -1153,7 +1371,7 @@ fn unknown_cannot_round_trip_through_serde_json() {
     let r: Result<Value, _> = serde_json::from_str(payload);
     assert!(
         r.is_err(),
-        "deserializing Value::Unknown must error, got Ok({:?})",
+        "deserializing Value::Deferred(DeferredValue::Unknown) must error, got Ok({:?})",
         r
     );
 }
@@ -1207,17 +1425,20 @@ fn as_concrete_returns_projection_for_concrete_variants() {
     // is exhaustive so this is enough to catch a future variant added
     // to the wrong axis.
     let cases: Vec<(Value, &'static str)> = vec![
-        (Value::String("x".into()), "String"),
-        (Value::Int(1), "Int"),
-        (Value::Float(1.5), "Float"),
-        (Value::Bool(true), "Bool"),
+        (Value::Concrete(ConcreteValue::String("x".into())), "String"),
+        (Value::Concrete(ConcreteValue::Int(1)), "Int"),
+        (Value::Concrete(ConcreteValue::Float(1.5)), "Float"),
+        (Value::Concrete(ConcreteValue::Bool(true)), "Bool"),
         (
-            Value::Duration(std::time::Duration::from_secs(60)),
+            Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(60))),
             "Duration",
         ),
-        (Value::List(vec![]), "List"),
-        (Value::StringList(vec![]), "StringList"),
-        (Value::Map(IndexMap::new()), "Map"),
+        (Value::Concrete(ConcreteValue::List(vec![])), "List"),
+        (
+            Value::Concrete(ConcreteValue::StringList(vec![])),
+            "StringList",
+        ),
+        (Value::Concrete(ConcreteValue::Map(IndexMap::new())), "Map"),
     ];
     for (v, label) in cases {
         assert!(
@@ -1239,24 +1460,32 @@ fn as_deferred_returns_projection_for_deferred_variants() {
             "ResourceRef",
         ),
         (
-            Value::BindingRef {
+            Value::Deferred(DeferredValue::BindingRef {
                 binding: "bootstrap".to_string(),
-            },
+            }),
             "BindingRef",
         ),
-        (Value::Interpolation(vec![]), "Interpolation"),
         (
-            Value::FunctionCall {
+            Value::Deferred(DeferredValue::Interpolation(vec![])),
+            "Interpolation",
+        ),
+        (
+            Value::Deferred(DeferredValue::FunctionCall {
                 name: "join".to_string(),
                 args: vec![],
-            },
+            }),
             "FunctionCall",
         ),
         (
-            Value::Secret(Box::new(Value::String("inner".into()))),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("inner".into()),
+            )))),
             "Secret",
         ),
-        (Value::Unknown(UnknownReason::ForKey), "Unknown"),
+        (
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey)),
+            "Unknown",
+        ),
     ];
     for (v, label) in cases {
         assert!(
@@ -1274,24 +1503,27 @@ fn as_deferred_returns_projection_for_deferred_variants() {
 fn as_concrete_borrows_inner_string_without_clone() {
     // The accessor must hand out a &str pointing into the original
     // value, not a copy. Easy proof: pointer equality on the bytes.
-    let v = Value::String("hello".into());
+    let v = Value::Concrete(ConcreteValue::String("hello".into()));
     let Some(ConcreteValueRef::String(borrowed)) = v.as_concrete() else {
         panic!("expected String projection");
     };
-    let Value::String(ref original) = v else {
-        unreachable!("v constructed as Value::String");
+    let Value::Concrete(ConcreteValue::String(ref original)) = v else {
+        unreachable!("v constructed as Value::Concrete(ConcreteValue::String)");
     };
     assert_eq!(borrowed.as_ptr(), original.as_str().as_ptr());
 }
 
 #[test]
 fn as_concrete_list_borrows_underlying_slice() {
-    let v = Value::List(vec![Value::Int(1), Value::Int(2)]);
+    let v = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::Int(1)),
+        Value::Concrete(ConcreteValue::Int(2)),
+    ]));
     let Some(ConcreteValueRef::List(items)) = v.as_concrete() else {
         panic!("expected List projection");
     };
-    let Value::List(ref original) = v else {
-        unreachable!("v constructed as Value::List");
+    let Value::Concrete(ConcreteValue::List(ref original)) = v else {
+        unreachable!("v constructed as Value::Concrete(ConcreteValue::List)");
     };
     assert_eq!(items.as_ptr(), original.as_ptr());
     assert_eq!(items.len(), 2);

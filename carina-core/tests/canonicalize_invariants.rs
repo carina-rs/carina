@@ -1,10 +1,10 @@
 //! Invariants enforced by `Value::canonicalize` (#2227).
 //!
-//! After `parse + resolve`, every `Value::Interpolation` in the parsed
+//! After `parse + resolve`, every `Value::Deferred(DeferredValue::Interpolation)` in the parsed
 //! file must satisfy:
 //!
 //! 1. At least one part is an `Expr` (otherwise the value would be a
-//!    `Value::String`).
+//!    `Value::Concrete(ConcreteValue::String)`).
 //! 2. No two adjacent parts are both `Literal` (they would have been
 //!    merged).
 //! 3. The whole interpolation is not a single `Expr(scalar)` whose
@@ -15,11 +15,11 @@
 //! asserts the invariants hold for every interpolation found.
 
 use carina_core::parser::parse_and_resolve;
-use carina_core::resource::{InterpolationPart, Value};
+use carina_core::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
 
 fn check_value(v: &Value, path: &str) {
     match v {
-        Value::Interpolation(parts) => {
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
             // (1) at least one Expr
             let has_expr = parts
                 .iter()
@@ -44,7 +44,10 @@ fn check_value(v: &Value, path: &str) {
             {
                 let scalar = matches!(
                     inner,
-                    Value::String(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_)
+                    Value::Concrete(ConcreteValue::String(_))
+                        | Value::Concrete(ConcreteValue::Int(_))
+                        | Value::Concrete(ConcreteValue::Float(_))
+                        | Value::Concrete(ConcreteValue::Bool(_))
                 );
                 assert!(
                     !scalar,
@@ -59,18 +62,20 @@ fn check_value(v: &Value, path: &str) {
                 }
             }
         }
-        Value::List(items) => {
+        Value::Concrete(ConcreteValue::List(items)) => {
             for (i, item) in items.iter().enumerate() {
                 check_value(item, &format!("{}[{}]", path, i));
             }
         }
-        Value::Map(map) => {
+        Value::Concrete(ConcreteValue::Map(map)) => {
             for (k, vv) in map {
                 check_value(vv, &format!("{}.{}", path, k));
             }
         }
-        Value::Secret(inner) => check_value(inner, &format!("{}/<secret>", path)),
-        Value::FunctionCall { name, args } => {
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            check_value(inner, &format!("{}/<secret>", path))
+        }
+        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
             for (i, a) in args.iter().enumerate() {
                 check_value(a, &format!("{}/{}({})", path, name, i));
             }
@@ -135,8 +140,8 @@ fn parse_resolve_yields_canonical_interpolations() {
 #[test]
 fn double_quoted_literal_is_canonical_string() {
     // Pre-#2227 a double-quoted string with no `${...}` was
-    // `Value::Interpolation([Literal(...)])`; now it must be
-    // `Value::String(...)`.
+    // `Value::Deferred(DeferredValue::Interpolation([Literal(...)]))`; now it must be
+    // `Value::Concrete(ConcreteValue::String(...))`.
     let src = r#"
         mock.example.thing {
           name  = "no-interpolation-here"
@@ -146,7 +151,7 @@ fn double_quoted_literal_is_canonical_string() {
     let resource = &parsed.resources[0];
     let value = resource.attributes.get("name").expect("name attribute");
     assert!(
-        matches!(value, Value::String(_)),
+        matches!(value, Value::Concrete(ConcreteValue::String(_))),
         "literal-only double-quoted string must canonicalize to String, got {:?}",
         value
     );

@@ -128,14 +128,12 @@ pub(super) fn test_engine_with_custom_namespaced_attr() -> DiagnosticEngine {
 
     fn validate_mode(v: &carina_core::resource::Value) -> Result<(), String> {
         match v {
-            carina_core::resource::Value::String(s)
-                if s == "test.r.Mode.fast" || s == "test.r.Mode.slow" =>
-            {
-                Ok(())
-            }
-            carina_core::resource::Value::String(s) => {
-                Err(format!("invalid Mode '{}': expected fast or slow", s))
-            }
+            carina_core::resource::Value::Concrete(
+                carina_core::resource::ConcreteValue::String(s),
+            ) if s == "test.r.Mode.fast" || s == "test.r.Mode.slow" => Ok(()),
+            carina_core::resource::Value::Concrete(
+                carina_core::resource::ConcreteValue::String(s),
+            ) => Err(format!("invalid Mode '{}': expected fast or slow", s)),
             _ => Err("expected string".to_string()),
         }
     }

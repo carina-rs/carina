@@ -1,6 +1,6 @@
 //! `env(name)` built-in function
 
-use crate::resource::Value;
+use crate::resource::{ConcreteValue, Value};
 
 use super::value_type_name;
 
@@ -24,7 +24,7 @@ pub(crate) fn builtin_env(args: &[Value]) -> Result<Value, String> {
     }
 
     let name = match &args[0] {
-        Value::String(s) => s,
+        Value::Concrete(ConcreteValue::String(s)) => s,
         other => {
             return Err(format!(
                 "env() argument must be a string, got {}",
@@ -41,7 +41,7 @@ pub(crate) fn builtin_env(args: &[Value]) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
-    use crate::resource::Value;
+    use crate::resource::{ConcreteValue, Value};
 
     #[test]
     fn env_reads_set_variable() {
@@ -49,9 +49,12 @@ mod tests {
         unsafe {
             std::env::set_var(var_name, "hello_world");
         }
-        let args = vec![Value::String(var_name.to_string())];
+        let args = vec![Value::Concrete(ConcreteValue::String(var_name.to_string()))];
         let result = evaluate_builtin("env", &args).unwrap();
-        assert_eq!(result, Value::String("hello_world".to_string()));
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::String("hello_world".to_string()))
+        );
         unsafe {
             std::env::remove_var(var_name);
         }
@@ -64,7 +67,7 @@ mod tests {
         unsafe {
             std::env::remove_var(var_name);
         }
-        let args = vec![Value::String(var_name.to_string())];
+        let args = vec![Value::Concrete(ConcreteValue::String(var_name.to_string()))];
         let result = evaluate_builtin("env", &args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("is not set"));
@@ -72,7 +75,7 @@ mod tests {
 
     #[test]
     fn env_error_on_non_string_arg() {
-        let args = vec![Value::Int(42)];
+        let args = vec![Value::Concrete(ConcreteValue::Int(42))];
         let result = evaluate_builtin("env", &args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("argument must be a string"));
@@ -89,8 +92,8 @@ mod tests {
     #[test]
     fn env_error_on_too_many_args() {
         let args = vec![
-            Value::String("A".to_string()),
-            Value::String("B".to_string()),
+            Value::Concrete(ConcreteValue::String("A".to_string())),
+            Value::Concrete(ConcreteValue::String("B".to_string())),
         ];
         let result = evaluate_builtin("env", &args);
         assert!(result.is_err());
@@ -103,9 +106,12 @@ mod tests {
         unsafe {
             std::env::set_var(var_name, "");
         }
-        let args = vec![Value::String(var_name.to_string())];
+        let args = vec![Value::Concrete(ConcreteValue::String(var_name.to_string()))];
         let result = evaluate_builtin("env", &args).unwrap();
-        assert_eq!(result, Value::String("".to_string()));
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::String("".to_string()))
+        );
         unsafe {
             std::env::remove_var(var_name);
         }

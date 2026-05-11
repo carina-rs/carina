@@ -182,21 +182,34 @@ pub fn compute_string_list_diff(old: &[String], new: &[String]) -> StringListDif
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resource::ConcreteValue;
 
     #[test]
     fn test_compute_unchanged_count_basic() {
         let from: HashMap<String, Value> = [
-            ("name".to_string(), Value::String("test".to_string())),
-            ("region".to_string(), Value::String("us-east-1".to_string())),
-            ("size".to_string(), Value::Int(10)),
+            (
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("test".to_string())),
+            ),
+            (
+                "region".to_string(),
+                Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
+            ),
+            ("size".to_string(), Value::Concrete(ConcreteValue::Int(10))),
         ]
         .into_iter()
         .collect();
 
         let to: HashMap<String, Value> = [
-            ("name".to_string(), Value::String("test".to_string())),
-            ("region".to_string(), Value::String("us-west-2".to_string())),
-            ("size".to_string(), Value::Int(10)),
+            (
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("test".to_string())),
+            ),
+            (
+                "region".to_string(),
+                Value::Concrete(ConcreteValue::String("us-west-2".to_string())),
+            ),
+            ("size".to_string(), Value::Concrete(ConcreteValue::Int(10))),
         ]
         .into_iter()
         .collect();
@@ -207,15 +220,27 @@ mod tests {
     #[test]
     fn test_compute_unchanged_count_excludes_internal() {
         let from: HashMap<String, Value> = [
-            ("name".to_string(), Value::String("test".to_string())),
-            ("_internal".to_string(), Value::String("hidden".to_string())),
+            (
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("test".to_string())),
+            ),
+            (
+                "_internal".to_string(),
+                Value::Concrete(ConcreteValue::String("hidden".to_string())),
+            ),
         ]
         .into_iter()
         .collect();
 
         let to: HashMap<String, Value> = [
-            ("name".to_string(), Value::String("test".to_string())),
-            ("_internal".to_string(), Value::String("hidden".to_string())),
+            (
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("test".to_string())),
+            ),
+            (
+                "_internal".to_string(),
+                Value::Concrete(ConcreteValue::String("hidden".to_string())),
+            ),
         ]
         .into_iter()
         .collect();
@@ -226,15 +251,27 @@ mod tests {
     #[test]
     fn test_compute_unchanged_count_with_exclude_set() {
         let from: HashMap<String, Value> = [
-            ("name".to_string(), Value::String("test".to_string())),
-            ("region".to_string(), Value::String("us-east-1".to_string())),
+            (
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("test".to_string())),
+            ),
+            (
+                "region".to_string(),
+                Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
+            ),
         ]
         .into_iter()
         .collect();
 
         let to: HashMap<String, Value> = [
-            ("name".to_string(), Value::String("test".to_string())),
-            ("region".to_string(), Value::String("us-east-1".to_string())),
+            (
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("test".to_string())),
+            ),
+            (
+                "region".to_string(),
+                Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
+            ),
         ]
         .into_iter()
         .collect();
@@ -247,8 +284,14 @@ mod tests {
     fn test_compute_map_diff_added_only() {
         let old: IndexMap<String, Value> = IndexMap::new();
         let new: IndexMap<String, Value> = [
-            ("key1".to_string(), Value::String("val1".to_string())),
-            ("key2".to_string(), Value::String("val2".to_string())),
+            (
+                "key1".to_string(),
+                Value::Concrete(ConcreteValue::String("val1".to_string())),
+            ),
+            (
+                "key2".to_string(),
+                Value::Concrete(ConcreteValue::String("val2".to_string())),
+            ),
         ]
         .into_iter()
         .collect();
@@ -263,10 +306,12 @@ mod tests {
 
     #[test]
     fn test_compute_map_diff_removed_only() {
-        let old: IndexMap<String, Value> =
-            [("key1".to_string(), Value::String("val1".to_string()))]
-                .into_iter()
-                .collect();
+        let old: IndexMap<String, Value> = [(
+            "key1".to_string(),
+            Value::Concrete(ConcreteValue::String("val1".to_string())),
+        )]
+        .into_iter()
+        .collect();
         let new: IndexMap<String, Value> = IndexMap::new();
 
         let diff = compute_map_diff(&old, &new);
@@ -279,14 +324,26 @@ mod tests {
     #[test]
     fn test_compute_map_diff_changed() {
         let old: IndexMap<String, Value> = [
-            ("key1".to_string(), Value::String("old_val".to_string())),
-            ("key2".to_string(), Value::String("same".to_string())),
+            (
+                "key1".to_string(),
+                Value::Concrete(ConcreteValue::String("old_val".to_string())),
+            ),
+            (
+                "key2".to_string(),
+                Value::Concrete(ConcreteValue::String("same".to_string())),
+            ),
         ]
         .into_iter()
         .collect();
         let new: IndexMap<String, Value> = [
-            ("key1".to_string(), Value::String("new_val".to_string())),
-            ("key2".to_string(), Value::String("same".to_string())),
+            (
+                "key1".to_string(),
+                Value::Concrete(ConcreteValue::String("new_val".to_string())),
+            ),
+            (
+                "key2".to_string(),
+                Value::Concrete(ConcreteValue::String("same".to_string())),
+            ),
         ]
         .into_iter()
         .collect();
@@ -298,27 +355,45 @@ mod tests {
         assert_eq!(diff.changed[0].key, "key1");
         assert_eq!(
             diff.changed[0].old_value,
-            Value::String("old_val".to_string())
+            Value::Concrete(ConcreteValue::String("old_val".to_string()))
         );
         assert_eq!(
             diff.changed[0].new_value,
-            Value::String("new_val".to_string())
+            Value::Concrete(ConcreteValue::String("new_val".to_string()))
         );
     }
 
     #[test]
     fn test_compute_map_diff_mixed() {
         let old: IndexMap<String, Value> = [
-            ("keep".to_string(), Value::String("same".to_string())),
-            ("change".to_string(), Value::String("old".to_string())),
-            ("remove".to_string(), Value::String("gone".to_string())),
+            (
+                "keep".to_string(),
+                Value::Concrete(ConcreteValue::String("same".to_string())),
+            ),
+            (
+                "change".to_string(),
+                Value::Concrete(ConcreteValue::String("old".to_string())),
+            ),
+            (
+                "remove".to_string(),
+                Value::Concrete(ConcreteValue::String("gone".to_string())),
+            ),
         ]
         .into_iter()
         .collect();
         let new: IndexMap<String, Value> = [
-            ("keep".to_string(), Value::String("same".to_string())),
-            ("change".to_string(), Value::String("new".to_string())),
-            ("add".to_string(), Value::String("fresh".to_string())),
+            (
+                "keep".to_string(),
+                Value::Concrete(ConcreteValue::String("same".to_string())),
+            ),
+            (
+                "change".to_string(),
+                Value::Concrete(ConcreteValue::String("new".to_string())),
+            ),
+            (
+                "add".to_string(),
+                Value::Concrete(ConcreteValue::String("fresh".to_string())),
+            ),
         ]
         .into_iter()
         .collect();

@@ -2,7 +2,7 @@
 
 use carina_core::deps::get_resource_dependencies;
 use carina_core::explicit::{self, ExplicitFields};
-use carina_core::resource::{Directives, Resource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, Directives, Resource, ResourceId, State, Value};
 use carina_core::value::{
     SecretHashContext, contains_secret, json_to_dsl_value, merge_secrets_into_provider_json,
     value_to_json,
@@ -259,7 +259,10 @@ impl StateFile {
                     .collect();
                 // Inject _binding so orphan Delete effects can have tree structure
                 if let Some(ref binding) = rs.binding {
-                    attrs.insert("_binding".to_string(), Value::String(binding.clone()));
+                    attrs.insert(
+                        "_binding".to_string(),
+                        Value::Concrete(ConcreteValue::String(binding.clone())),
+                    );
                 }
                 let state = State {
                     id: id.clone(),
@@ -309,7 +312,7 @@ impl StateFile {
     /// Build a map of resource bindings for use as a remote state data source.
     ///
     /// Returns a map where each key is a resource binding name and the value is a
-    /// `Value::Map` containing that resource's attributes (converted from JSON to DSL values).
+    /// `Value::Concrete(ConcreteValue::Map)` containing that resource's attributes (converted from JSON to DSL values).
     /// Resources without a binding name are skipped.
     ///
     /// This is used by `remote_state` blocks to expose another project's state

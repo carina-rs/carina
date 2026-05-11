@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::resource::ConcreteValue;
 use indexmap::IndexMap;
 
 #[test]
@@ -13,13 +14,15 @@ fn diff_create_when_not_exists() {
 
 #[test]
 fn diff_no_change_when_same() {
-    let desired = Resource::new("bucket", "test")
-        .with_attribute("region", Value::String("ap-northeast-1".to_string()));
+    let desired = Resource::new("bucket", "test").with_attribute(
+        "region",
+        Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
+    );
 
     let mut attrs = HashMap::new();
     attrs.insert(
         "region".to_string(),
-        Value::String("ap-northeast-1".to_string()),
+        Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
     );
     let current = State::existing(ResourceId::new("bucket", "test"), attrs);
 
@@ -29,13 +32,15 @@ fn diff_no_change_when_same() {
 
 #[test]
 fn diff_update_when_different() {
-    let desired = Resource::new("bucket", "test")
-        .with_attribute("region", Value::String("us-east-1".to_string()));
+    let desired = Resource::new("bucket", "test").with_attribute(
+        "region",
+        Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
+    );
 
     let mut attrs = HashMap::new();
     attrs.insert(
         "region".to_string(),
-        Value::String("ap-northeast-1".to_string()),
+        Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
     );
     let current = State::existing(ResourceId::new("bucket", "test"), attrs);
 
@@ -54,12 +59,16 @@ fn diff_update_when_different() {
 fn create_plan_from_resources() {
     let resources = vec![
         Resource::new("bucket", "new-bucket"),
-        Resource::new("bucket", "existing-bucket").with_attribute("versioning", Value::Bool(true)),
+        Resource::new("bucket", "existing-bucket")
+            .with_attribute("versioning", Value::Concrete(ConcreteValue::Bool(true))),
     ];
 
     let mut current_states = HashMap::new();
     let mut attrs = HashMap::new();
-    attrs.insert("versioning".to_string(), Value::Bool(false));
+    attrs.insert(
+        "versioning".to_string(),
+        Value::Concrete(ConcreteValue::Bool(false)),
+    );
     current_states.insert(
         ResourceId::new("bucket", "existing-bucket"),
         State::existing(ResourceId::new("bucket", "existing-bucket"), attrs),
@@ -85,7 +94,10 @@ fn create_plan_from_resources() {
 fn create_plan_with_read_only_resource() {
     let resources = vec![
         Resource::new("bucket", "existing-bucket")
-            .with_attribute("name", Value::String("existing-bucket".to_string()))
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("existing-bucket".to_string())),
+            )
             .with_read_only(true),
         Resource::new("bucket", "new-bucket"),
     ];
@@ -111,24 +123,47 @@ fn create_plan_with_read_only_resource() {
 #[test]
 fn diff_update_when_list_of_maps_changed() {
     let mut ingress1 = IndexMap::new();
-    ingress1.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
-    ingress1.insert("from_port".to_string(), Value::Int(80));
-    ingress1.insert("to_port".to_string(), Value::Int(80));
+    ingress1.insert(
+        "ip_protocol".to_string(),
+        Value::Concrete(ConcreteValue::String("tcp".to_string())),
+    );
+    ingress1.insert(
+        "from_port".to_string(),
+        Value::Concrete(ConcreteValue::Int(80)),
+    );
+    ingress1.insert(
+        "to_port".to_string(),
+        Value::Concrete(ConcreteValue::Int(80)),
+    );
 
     let mut ingress2 = IndexMap::new();
-    ingress2.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
-    ingress2.insert("from_port".to_string(), Value::Int(443));
-    ingress2.insert("to_port".to_string(), Value::Int(443));
+    ingress2.insert(
+        "ip_protocol".to_string(),
+        Value::Concrete(ConcreteValue::String("tcp".to_string())),
+    );
+    ingress2.insert(
+        "from_port".to_string(),
+        Value::Concrete(ConcreteValue::Int(443)),
+    );
+    ingress2.insert(
+        "to_port".to_string(),
+        Value::Concrete(ConcreteValue::Int(443)),
+    );
 
     let desired = Resource::new("ec2_security_group", "test-sg").with_attribute(
         "security_group_ingress",
-        Value::List(vec![Value::Map(ingress1.clone()), Value::Map(ingress2)]),
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::Map(ingress1.clone())),
+            Value::Concrete(ConcreteValue::Map(ingress2)),
+        ])),
     );
 
     let mut current_attrs = HashMap::new();
     current_attrs.insert(
         "security_group_ingress".to_string(),
-        Value::List(vec![Value::Map(ingress1)]),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(ingress1),
+        )])),
     );
     let current = State::existing(
         ResourceId::new("ec2_security_group", "test-sg"),
@@ -165,7 +200,7 @@ fn create_plan_detects_orphaned_resources_for_deletion() {
     let mut orphan_attrs = HashMap::new();
     orphan_attrs.insert(
         "name".to_string(),
-        Value::String("orphaned-bucket".to_string()),
+        Value::Concrete(ConcreteValue::String("orphaned-bucket".to_string())),
     );
     current_states.insert(
         ResourceId::new("bucket", "orphaned-bucket"),
@@ -204,7 +239,10 @@ fn read_only_resource_always_generates_read_effect() {
     // Even if the resource "exists", read-only resources should only generate Read effect
     let resources = vec![
         Resource::new("bucket", "existing-bucket")
-            .with_attribute("name", Value::String("existing-bucket".to_string()))
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("existing-bucket".to_string())),
+            )
             .with_read_only(true),
     ];
 
@@ -212,7 +250,7 @@ fn read_only_resource_always_generates_read_effect() {
     let mut attrs = HashMap::new();
     attrs.insert(
         "name".to_string(),
-        Value::String("existing-bucket".to_string()),
+        Value::Concrete(ConcreteValue::String("existing-bucket".to_string())),
     );
     current_states.insert(
         ResourceId::new("bucket", "existing-bucket"),
@@ -241,14 +279,16 @@ fn read_only_resource_always_generates_read_effect() {
 #[test]
 fn no_false_update_without_name_attribute() {
     // Simulate AWSCC resource: desired has cidr_block but no "name"
-    let desired = Resource::new("ec2.Vpc", "vpc")
-        .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()));
+    let desired = Resource::new("ec2.Vpc", "vpc").with_attribute(
+        "cidr_block",
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+    );
 
     // Current state from provider read also has cidr_block but no "name"
     let mut attrs = HashMap::new();
     attrs.insert(
         "cidr_block".to_string(),
-        Value::String("10.0.0.0/16".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
     let current = State::existing(ResourceId::new("ec2.Vpc", "vpc"), attrs);
 
@@ -264,16 +304,16 @@ fn no_false_update_without_name_attribute() {
 fn replace_when_create_only_attr_changed() {
     use crate::schema::{AttributeSchema, AttributeType};
 
-    let resources = vec![
-        Resource::new("ec2.Vpc", "my-vpc")
-            .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string())),
-    ];
+    let resources = vec![Resource::new("ec2.Vpc", "my-vpc").with_attribute(
+        "cidr_block",
+        Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+    )];
 
     let mut current_states = HashMap::new();
     let mut attrs = HashMap::new();
     attrs.insert(
         "cidr_block".to_string(),
-        Value::String("10.0.0.0/16".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
     current_states.insert(
         ResourceId::new("ec2.Vpc", "my-vpc"),
@@ -315,13 +355,17 @@ fn replace_when_create_only_attr_changed() {
 fn normal_update_when_non_create_only_attr_changed() {
     use crate::schema::{AttributeSchema, AttributeType};
 
-    let resources = vec![
-        Resource::new("ec2.Vpc", "my-vpc").with_attribute("enable_dns_support", Value::Bool(true)),
-    ];
+    let resources = vec![Resource::new("ec2.Vpc", "my-vpc").with_attribute(
+        "enable_dns_support",
+        Value::Concrete(ConcreteValue::Bool(true)),
+    )];
 
     let mut current_states = HashMap::new();
     let mut attrs = HashMap::new();
-    attrs.insert("enable_dns_support".to_string(), Value::Bool(false));
+    attrs.insert(
+        "enable_dns_support".to_string(),
+        Value::Concrete(ConcreteValue::Bool(false)),
+    );
     current_states.insert(
         ResourceId::new("ec2.Vpc", "my-vpc"),
         State::existing(ResourceId::new("ec2.Vpc", "my-vpc"), attrs),
@@ -366,11 +410,14 @@ fn replace_when_schema_force_replace() {
     let resources = vec![
         Resource::new("ec2.internet_gateway", "my-igw").with_attribute(
             "tags",
-            Value::Map(
-                vec![("Name".to_string(), Value::String("new-name".to_string()))]
-                    .into_iter()
-                    .collect(),
-            ),
+            Value::Concrete(ConcreteValue::Map(
+                vec![(
+                    "Name".to_string(),
+                    Value::Concrete(ConcreteValue::String("new-name".to_string())),
+                )]
+                .into_iter()
+                .collect(),
+            )),
         ),
     ];
 
@@ -378,11 +425,14 @@ fn replace_when_schema_force_replace() {
     let mut attrs = HashMap::new();
     attrs.insert(
         "tags".to_string(),
-        Value::Map(
-            vec![("Name".to_string(), Value::String("old-name".to_string()))]
-                .into_iter()
-                .collect(),
-        ),
+        Value::Concrete(ConcreteValue::Map(
+            vec![(
+                "Name".to_string(),
+                Value::Concrete(ConcreteValue::String("old-name".to_string())),
+            )]
+            .into_iter()
+            .collect(),
+        )),
     );
     current_states.insert(
         ResourceId::new("ec2.internet_gateway", "my-igw"),
@@ -426,17 +476,26 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
 
     let resources = vec![
         Resource::new("ec2.Vpc", "my-vpc")
-            .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()))
-            .with_attribute("enable_dns_support", Value::Bool(true)),
+            .with_attribute(
+                "cidr_block",
+                Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+            )
+            .with_attribute(
+                "enable_dns_support",
+                Value::Concrete(ConcreteValue::Bool(true)),
+            ),
     ];
 
     let mut current_states = HashMap::new();
     let mut attrs = HashMap::new();
     attrs.insert(
         "cidr_block".to_string(),
-        Value::String("10.0.0.0/16".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
-    attrs.insert("enable_dns_support".to_string(), Value::Bool(false));
+    attrs.insert(
+        "enable_dns_support".to_string(),
+        Value::Concrete(ConcreteValue::Bool(false)),
+    );
     current_states.insert(
         ResourceId::new("ec2.Vpc", "my-vpc"),
         State::existing(ResourceId::new("ec2.Vpc", "my-vpc"), attrs),
@@ -480,8 +539,10 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
 fn replace_carries_create_before_destroy_directives() {
     use crate::schema::{AttributeSchema, AttributeType};
 
-    let mut resource = Resource::new("ec2.Vpc", "my-vpc")
-        .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
+    let mut resource = Resource::new("ec2.Vpc", "my-vpc").with_attribute(
+        "cidr_block",
+        Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+    );
     resource.directives.create_before_destroy = true;
 
     let resources = vec![resource];
@@ -490,7 +551,7 @@ fn replace_carries_create_before_destroy_directives() {
     let mut attrs = HashMap::new();
     attrs.insert(
         "cidr_block".to_string(),
-        Value::String("10.0.0.0/16".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
     current_states.insert(
         ResourceId::new("ec2.Vpc", "my-vpc"),
@@ -532,26 +593,50 @@ fn replace_carries_create_before_destroy_directives() {
 #[test]
 fn diff_no_change_when_list_of_maps_reordered() {
     let mut rule1 = IndexMap::new();
-    rule1.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
-    rule1.insert("from_port".to_string(), Value::Int(80));
-    rule1.insert("to_port".to_string(), Value::Int(80));
+    rule1.insert(
+        "ip_protocol".to_string(),
+        Value::Concrete(ConcreteValue::String("tcp".to_string())),
+    );
+    rule1.insert(
+        "from_port".to_string(),
+        Value::Concrete(ConcreteValue::Int(80)),
+    );
+    rule1.insert(
+        "to_port".to_string(),
+        Value::Concrete(ConcreteValue::Int(80)),
+    );
 
     let mut rule2 = IndexMap::new();
-    rule2.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
-    rule2.insert("from_port".to_string(), Value::Int(443));
-    rule2.insert("to_port".to_string(), Value::Int(443));
+    rule2.insert(
+        "ip_protocol".to_string(),
+        Value::Concrete(ConcreteValue::String("tcp".to_string())),
+    );
+    rule2.insert(
+        "from_port".to_string(),
+        Value::Concrete(ConcreteValue::Int(443)),
+    );
+    rule2.insert(
+        "to_port".to_string(),
+        Value::Concrete(ConcreteValue::Int(443)),
+    );
 
     // Desired: [rule1, rule2]
     let desired = Resource::new("ec2_security_group", "test-sg").with_attribute(
         "security_group_egress",
-        Value::List(vec![Value::Map(rule1.clone()), Value::Map(rule2.clone())]),
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::Map(rule1.clone())),
+            Value::Concrete(ConcreteValue::Map(rule2.clone())),
+        ])),
     );
 
     // Current (from AWS): [rule2, rule1] — same content, different order
     let mut current_attrs = HashMap::new();
     current_attrs.insert(
         "security_group_egress".to_string(),
-        Value::List(vec![Value::Map(rule2), Value::Map(rule1)]),
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::Map(rule2)),
+            Value::Concrete(ConcreteValue::Map(rule1)),
+        ])),
     );
     let current = State::existing(
         ResourceId::new("ec2_security_group", "test-sg"),
@@ -573,15 +658,17 @@ fn replace_with_provider_prefixed_schema_key() {
     // In production, schemas are keyed by "awscc.ec2.Vpc" but resource_type is "ec2.Vpc"
     // The resource must have provider set so the generic lookup works
     let resources = vec![
-        Resource::with_provider("awscc", "ec2.Vpc", "my-vpc")
-            .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string())),
+        Resource::with_provider("awscc", "ec2.Vpc", "my-vpc").with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+        ),
     ];
 
     let mut current_states = HashMap::new();
     let mut attrs = HashMap::new();
     attrs.insert(
         "cidr_block".to_string(),
-        Value::String("10.0.0.0/16".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
     current_states.insert(
         ResourceId::with_provider("awscc", "ec2.Vpc", "my-vpc"),
@@ -624,54 +711,54 @@ fn replace_with_provider_prefixed_schema_key() {
 fn diff_no_change_when_struct_has_extra_fields_with_saved() {
     let desired = Resource::new("ec2.Subnet", "test-subnet").with_attribute(
         "private_dns_name_options_on_launch",
-        Value::Map(IndexMap::from([
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
                 "hostname_type".to_string(),
-                Value::String("ip-name".to_string()),
+                Value::Concrete(ConcreteValue::String("ip-name".to_string())),
             ),
             (
                 "enable_resource_name_dns_a_record".to_string(),
-                Value::Bool(true),
+                Value::Concrete(ConcreteValue::Bool(true)),
             ),
-        ])),
+        ]))),
     );
 
     let current_attrs = HashMap::from([(
         "private_dns_name_options_on_launch".to_string(),
-        Value::Map(IndexMap::from([
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
                 "hostname_type".to_string(),
-                Value::String("ip-name".to_string()),
+                Value::Concrete(ConcreteValue::String("ip-name".to_string())),
             ),
             (
                 "enable_resource_name_dns_a_record".to_string(),
-                Value::Bool(true),
+                Value::Concrete(ConcreteValue::Bool(true)),
             ),
             (
                 "enable_resource_name_dns_aaaa_record".to_string(),
-                Value::Bool(false),
+                Value::Concrete(ConcreteValue::Bool(false)),
             ),
-        ])),
+        ]))),
     )]);
     let current = State::existing(ResourceId::new("ec2.Subnet", "test-subnet"), current_attrs);
 
     let saved = IndexMap::from([
         (
             "hostname_type".to_string(),
-            Value::String("ip-name".to_string()),
+            Value::Concrete(ConcreteValue::String("ip-name".to_string())),
         ),
         (
             "enable_resource_name_dns_a_record".to_string(),
-            Value::Bool(true),
+            Value::Concrete(ConcreteValue::Bool(true)),
         ),
         (
             "enable_resource_name_dns_aaaa_record".to_string(),
-            Value::Bool(false),
+            Value::Concrete(ConcreteValue::Bool(false)),
         ),
     ]);
     let saved_map = HashMap::from([(
         "private_dns_name_options_on_launch".to_string(),
-        Value::Map(saved),
+        Value::Concrete(ConcreteValue::Map(saved)),
     )]);
 
     let result = diff(&desired, &current, Some(&saved_map), None, None);
@@ -687,55 +774,55 @@ fn diff_no_change_when_struct_has_extra_fields_with_saved() {
 fn diff_detects_drift_on_unmanaged_field() {
     let desired = Resource::new("ec2.Subnet", "test-subnet").with_attribute(
         "private_dns_name_options_on_launch",
-        Value::Map(IndexMap::from([
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
                 "hostname_type".to_string(),
-                Value::String("ip-name".to_string()),
+                Value::Concrete(ConcreteValue::String("ip-name".to_string())),
             ),
             (
                 "enable_resource_name_dns_a_record".to_string(),
-                Value::Bool(true),
+                Value::Concrete(ConcreteValue::Bool(true)),
             ),
-        ])),
+        ]))),
     );
 
     // AWS returns aaaa_record: true (drifted from saved false)
     let current_attrs = HashMap::from([(
         "private_dns_name_options_on_launch".to_string(),
-        Value::Map(IndexMap::from([
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
                 "hostname_type".to_string(),
-                Value::String("ip-name".to_string()),
+                Value::Concrete(ConcreteValue::String("ip-name".to_string())),
             ),
             (
                 "enable_resource_name_dns_a_record".to_string(),
-                Value::Bool(true),
+                Value::Concrete(ConcreteValue::Bool(true)),
             ),
             (
                 "enable_resource_name_dns_aaaa_record".to_string(),
-                Value::Bool(true),
+                Value::Concrete(ConcreteValue::Bool(true)),
             ),
-        ])),
+        ]))),
     )]);
     let current = State::existing(ResourceId::new("ec2.Subnet", "test-subnet"), current_attrs);
 
     let saved = IndexMap::from([
         (
             "hostname_type".to_string(),
-            Value::String("ip-name".to_string()),
+            Value::Concrete(ConcreteValue::String("ip-name".to_string())),
         ),
         (
             "enable_resource_name_dns_a_record".to_string(),
-            Value::Bool(true),
+            Value::Concrete(ConcreteValue::Bool(true)),
         ),
         (
             "enable_resource_name_dns_aaaa_record".to_string(),
-            Value::Bool(false),
+            Value::Concrete(ConcreteValue::Bool(false)),
         ),
     ]);
     let saved_map = HashMap::from([(
         "private_dns_name_options_on_launch".to_string(),
-        Value::Map(saved),
+        Value::Concrete(ConcreteValue::Map(saved)),
     )]);
 
     let result = diff(&desired, &current, Some(&saved_map), None, None);
@@ -753,55 +840,55 @@ fn diff_detects_drift_on_unmanaged_field() {
 fn diff_no_change_when_bare_struct_with_extra_fields() {
     let desired = Resource::new("ec2.Subnet", "test-subnet").with_attribute(
         "private_dns_name_options_on_launch",
-        Value::Map(IndexMap::from([
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
                 "hostname_type".to_string(),
-                Value::String("ip-name".to_string()),
+                Value::Concrete(ConcreteValue::String("ip-name".to_string())),
             ),
             (
                 "enable_resource_name_dns_a_record".to_string(),
-                Value::Bool(true),
+                Value::Concrete(ConcreteValue::Bool(true)),
             ),
-        ])),
+        ]))),
     );
 
     // Provider read returns Map with extra fields not in desired
     let current_attrs = HashMap::from([(
         "private_dns_name_options_on_launch".to_string(),
-        Value::Map(IndexMap::from([
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
                 "hostname_type".to_string(),
-                Value::String("ip-name".to_string()),
+                Value::Concrete(ConcreteValue::String("ip-name".to_string())),
             ),
             (
                 "enable_resource_name_dns_a_record".to_string(),
-                Value::Bool(true),
+                Value::Concrete(ConcreteValue::Bool(true)),
             ),
             (
                 "enable_resource_name_dns_aaaa_record".to_string(),
-                Value::Bool(false),
+                Value::Concrete(ConcreteValue::Bool(false)),
             ),
-        ])),
+        ]))),
     )]);
     let current = State::existing(ResourceId::new("ec2.Subnet", "test-subnet"), current_attrs);
 
     // Saved state has the same Map with extra fields
     let saved_map = HashMap::from([(
         "private_dns_name_options_on_launch".to_string(),
-        Value::Map(IndexMap::from([
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
                 "hostname_type".to_string(),
-                Value::String("ip-name".to_string()),
+                Value::Concrete(ConcreteValue::String("ip-name".to_string())),
             ),
             (
                 "enable_resource_name_dns_a_record".to_string(),
-                Value::Bool(true),
+                Value::Concrete(ConcreteValue::Bool(true)),
             ),
             (
                 "enable_resource_name_dns_aaaa_record".to_string(),
-                Value::Bool(false),
+                Value::Concrete(ConcreteValue::Bool(false)),
             ),
-        ])),
+        ]))),
     )]);
 
     let result = diff(&desired, &current, Some(&saved_map), None, None);
@@ -820,19 +907,19 @@ fn diff_works_without_saved_state() {
     // desired keys against current (not the other direction).
     let desired = Resource::new("ec2.Subnet", "test-subnet").with_attribute(
         "opts",
-        Value::Map(IndexMap::from([
-            ("a".to_string(), Value::Int(1)),
-            ("b".to_string(), Value::Int(2)),
-        ])),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("a".to_string(), Value::Concrete(ConcreteValue::Int(1))),
+            ("b".to_string(), Value::Concrete(ConcreteValue::Int(2))),
+        ]))),
     );
 
     let current_attrs = HashMap::from([(
         "opts".to_string(),
-        Value::Map(IndexMap::from([
-            ("a".to_string(), Value::Int(1)),
-            ("b".to_string(), Value::Int(2)),
-            ("c".to_string(), Value::Int(3)),
-        ])),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("a".to_string(), Value::Concrete(ConcreteValue::Int(1))),
+            ("b".to_string(), Value::Concrete(ConcreteValue::Int(2))),
+            ("c".to_string(), Value::Concrete(ConcreteValue::Int(3))),
+        ]))),
     )]);
     let current = State::existing(ResourceId::new("ec2.Subnet", "test-subnet"), current_attrs);
 
@@ -857,7 +944,7 @@ fn orphan_delete_preserves_binding_and_dependencies() {
     let mut orphan_attrs = HashMap::new();
     orphan_attrs.insert(
         "_binding".to_string(),
-        Value::String("my_subnet".to_string()),
+        Value::Concrete(ConcreteValue::String("my_subnet".to_string())),
     );
     orphan_attrs.insert(
         "vpc_id".to_string(),
@@ -954,72 +1041,104 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
     // "all" -> "-1" (alias resolved), "tcp" stays as namespaced identifier
     let desired = Resource::with_provider("awscc", "ec2.SecurityGroup", "test-sg").with_attribute(
         "security_group_egress",
-        Value::List(vec![
-            Value::Map(IndexMap::from([
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
                 (
                     "ip_protocol".to_string(),
-                    Value::String("awscc.ec2.SecurityGroup.IpProtocol.tcp".to_string()),
+                    Value::Concrete(ConcreteValue::String(
+                        "awscc.ec2.SecurityGroup.IpProtocol.tcp".to_string(),
+                    )),
                 ),
-                ("from_port".to_string(), Value::Int(443)),
-                ("to_port".to_string(), Value::Int(443)),
+                (
+                    "from_port".to_string(),
+                    Value::Concrete(ConcreteValue::Int(443)),
+                ),
+                (
+                    "to_port".to_string(),
+                    Value::Concrete(ConcreteValue::Int(443)),
+                ),
                 (
                     "cidr_ip".to_string(),
-                    Value::String("0.0.0.0/0".to_string()),
+                    Value::Concrete(ConcreteValue::String("0.0.0.0/0".to_string())),
                 ),
                 (
                     "description".to_string(),
-                    Value::String("Allow HTTPS outbound".to_string()),
+                    Value::Concrete(ConcreteValue::String("Allow HTTPS outbound".to_string())),
                 ),
-            ])),
-            Value::Map(IndexMap::from([
-                ("ip_protocol".to_string(), Value::String("-1".to_string())),
+            ]))),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                (
+                    "ip_protocol".to_string(),
+                    Value::Concrete(ConcreteValue::String("-1".to_string())),
+                ),
                 (
                     "cidr_ip".to_string(),
-                    Value::String("10.0.0.0/8".to_string()),
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/8".to_string())),
                 ),
                 (
                     "description".to_string(),
-                    Value::String("Allow all to private ranges".to_string()),
+                    Value::Concrete(ConcreteValue::String(
+                        "Allow all to private ranges".to_string(),
+                    )),
                 ),
-            ])),
-        ]),
+            ]))),
+        ])),
     );
 
     // Current state (from AWS read, post-normalization, post-alias-resolution)
     // Same as desired, but the "all" rule also has from_port: -1, to_port: -1 from AWS
     let current_attrs = HashMap::from([(
         "security_group_egress".to_string(),
-        Value::List(vec![
-            Value::Map(IndexMap::from([
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
                 (
                     "ip_protocol".to_string(),
-                    Value::String("awscc.ec2.SecurityGroup.IpProtocol.tcp".to_string()),
+                    Value::Concrete(ConcreteValue::String(
+                        "awscc.ec2.SecurityGroup.IpProtocol.tcp".to_string(),
+                    )),
                 ),
-                ("from_port".to_string(), Value::Int(443)),
-                ("to_port".to_string(), Value::Int(443)),
+                (
+                    "from_port".to_string(),
+                    Value::Concrete(ConcreteValue::Int(443)),
+                ),
+                (
+                    "to_port".to_string(),
+                    Value::Concrete(ConcreteValue::Int(443)),
+                ),
                 (
                     "cidr_ip".to_string(),
-                    Value::String("0.0.0.0/0".to_string()),
+                    Value::Concrete(ConcreteValue::String("0.0.0.0/0".to_string())),
                 ),
                 (
                     "description".to_string(),
-                    Value::String("Allow HTTPS outbound".to_string()),
+                    Value::Concrete(ConcreteValue::String("Allow HTTPS outbound".to_string())),
                 ),
-            ])),
-            Value::Map(IndexMap::from([
-                ("ip_protocol".to_string(), Value::String("-1".to_string())),
-                ("from_port".to_string(), Value::Int(-1)),
-                ("to_port".to_string(), Value::Int(-1)),
+            ]))),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                (
+                    "ip_protocol".to_string(),
+                    Value::Concrete(ConcreteValue::String("-1".to_string())),
+                ),
+                (
+                    "from_port".to_string(),
+                    Value::Concrete(ConcreteValue::Int(-1)),
+                ),
+                (
+                    "to_port".to_string(),
+                    Value::Concrete(ConcreteValue::Int(-1)),
+                ),
                 (
                     "cidr_ip".to_string(),
-                    Value::String("10.0.0.0/8".to_string()),
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/8".to_string())),
                 ),
                 (
                     "description".to_string(),
-                    Value::String("Allow all to private ranges".to_string()),
+                    Value::Concrete(ConcreteValue::String(
+                        "Allow all to private ranges".to_string(),
+                    )),
                 ),
-            ])),
-        ]),
+            ]))),
+        ])),
     )]);
     let current = State::existing(
         ResourceId::with_provider("awscc", "ec2.SecurityGroup", "test-sg"),
@@ -1030,40 +1149,58 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
     // This is the state as written after apply: namespaced enum values, AWS-returned fields
     let saved = HashMap::from([(
         "security_group_egress".to_string(),
-        Value::List(vec![
-            Value::Map(IndexMap::from([
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
                 (
                     "ip_protocol".to_string(),
-                    Value::String("awscc.ec2.SecurityGroup.IpProtocol.tcp".to_string()),
+                    Value::Concrete(ConcreteValue::String(
+                        "awscc.ec2.SecurityGroup.IpProtocol.tcp".to_string(),
+                    )),
                 ),
-                ("from_port".to_string(), Value::Int(443)),
-                ("to_port".to_string(), Value::Int(443)),
+                (
+                    "from_port".to_string(),
+                    Value::Concrete(ConcreteValue::Int(443)),
+                ),
+                (
+                    "to_port".to_string(),
+                    Value::Concrete(ConcreteValue::Int(443)),
+                ),
                 (
                     "cidr_ip".to_string(),
-                    Value::String("0.0.0.0/0".to_string()),
+                    Value::Concrete(ConcreteValue::String("0.0.0.0/0".to_string())),
                 ),
                 (
                     "description".to_string(),
-                    Value::String("Allow HTTPS outbound".to_string()),
+                    Value::Concrete(ConcreteValue::String("Allow HTTPS outbound".to_string())),
                 ),
-            ])),
-            Value::Map(IndexMap::from([
+            ]))),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
                 (
                     "ip_protocol".to_string(),
-                    Value::String("awscc.ec2.SecurityGroup.IpProtocol.all".to_string()),
+                    Value::Concrete(ConcreteValue::String(
+                        "awscc.ec2.SecurityGroup.IpProtocol.all".to_string(),
+                    )),
                 ),
-                ("from_port".to_string(), Value::Int(-1)),
-                ("to_port".to_string(), Value::Int(-1)),
+                (
+                    "from_port".to_string(),
+                    Value::Concrete(ConcreteValue::Int(-1)),
+                ),
+                (
+                    "to_port".to_string(),
+                    Value::Concrete(ConcreteValue::Int(-1)),
+                ),
                 (
                     "cidr_ip".to_string(),
-                    Value::String("10.0.0.0/8".to_string()),
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/8".to_string())),
                 ),
                 (
                     "description".to_string(),
-                    Value::String("Allow all to private ranges".to_string()),
+                    Value::Concrete(ConcreteValue::String(
+                        "Allow all to private ranges".to_string(),
+                    )),
                 ),
-            ])),
-        ]),
+            ]))),
+        ])),
     )]);
 
     let result = diff(&desired, &current, Some(&saved), None, Some(&schema));
@@ -1106,40 +1243,61 @@ fn diff_false_positive_when_ordered_true_for_struct_list() {
     );
 
     // Same items in different order
-    let item_a = Value::Map(IndexMap::from([
-        ("ip_protocol".to_string(), Value::String("tcp".to_string())),
-        ("from_port".to_string(), Value::Int(443)),
-        ("to_port".to_string(), Value::Int(443)),
+    let item_a = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        (
+            "ip_protocol".to_string(),
+            Value::Concrete(ConcreteValue::String("tcp".to_string())),
+        ),
+        (
+            "from_port".to_string(),
+            Value::Concrete(ConcreteValue::Int(443)),
+        ),
+        (
+            "to_port".to_string(),
+            Value::Concrete(ConcreteValue::Int(443)),
+        ),
         (
             "cidr_ip".to_string(),
-            Value::String("0.0.0.0/0".to_string()),
+            Value::Concrete(ConcreteValue::String("0.0.0.0/0".to_string())),
         ),
         (
             "description".to_string(),
-            Value::String("HTTPS".to_string()),
+            Value::Concrete(ConcreteValue::String("HTTPS".to_string())),
         ),
-    ]));
-    let item_b = Value::Map(IndexMap::from([
-        ("ip_protocol".to_string(), Value::String("-1".to_string())),
+    ])));
+    let item_b = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        (
+            "ip_protocol".to_string(),
+            Value::Concrete(ConcreteValue::String("-1".to_string())),
+        ),
         (
             "cidr_ip".to_string(),
-            Value::String("10.0.0.0/8".to_string()),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/8".to_string())),
         ),
-        ("description".to_string(), Value::String("All".to_string())),
-        ("from_port".to_string(), Value::Int(-1)),
-        ("to_port".to_string(), Value::Int(-1)),
-    ]));
+        (
+            "description".to_string(),
+            Value::Concrete(ConcreteValue::String("All".to_string())),
+        ),
+        (
+            "from_port".to_string(),
+            Value::Concrete(ConcreteValue::Int(-1)),
+        ),
+        (
+            "to_port".to_string(),
+            Value::Concrete(ConcreteValue::Int(-1)),
+        ),
+    ])));
 
     let desired = Resource::with_provider("awscc", "ec2.SecurityGroup", "test-sg").with_attribute(
         "security_group_egress",
-        Value::List(vec![item_a.clone(), item_b.clone()]),
+        Value::Concrete(ConcreteValue::List(vec![item_a.clone(), item_b.clone()])),
     );
     let current = State::existing(
         ResourceId::with_provider("awscc", "ec2.SecurityGroup", "test-sg"),
         HashMap::from([(
             "security_group_egress".to_string(),
             // AWS returns items in reversed order
-            Value::List(vec![item_b.clone(), item_a.clone()]),
+            Value::Concrete(ConcreteValue::List(vec![item_b.clone(), item_a.clone()])),
         )]),
     );
 

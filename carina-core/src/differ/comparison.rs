@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use indexmap::IndexMap;
 
 use crate::explicit::{self, ExplicitFields};
-use crate::resource::{ResourceId, Value, merge_with_saved};
+use crate::resource::{ConcreteValue, DeferredValue, ResourceId, Value, merge_with_saved};
 use crate::schema::{AttributeType, ResourceSchema};
 use crate::value::{SECRET_PREFIX, SecretHashContext, argon2id_hash, value_to_json_with_context};
 
@@ -23,14 +23,14 @@ use crate::value::{SECRET_PREFIX, SecretHashContext, argon2id_hash, value_to_jso
 /// Without type information, falls back to `Value::semantically_equal()`.
 ///
 /// When `secret_ctx` is provided, it is used for context-specific salt when
-/// comparing `Value::Secret` against state hash strings.
+/// comparing `Value::Deferred(DeferredValue::Secret)` against state hash strings.
 ///
 /// # Invariant: `Union[String, list(String)]` is canonicalized upstream
 ///
 /// For attributes typed as `Union[String, list(String)]` (the IAM-style
 /// `string_or_list_of_strings` shape — see #2481), **both** `a` and
-/// `b` reach this function as the canonical `Value::StringList` form,
-/// never as a mix of `Value::String` and `Value::List([String])`. The
+/// `b` reach this function as the canonical `Value::Concrete(ConcreteValue::StringList)` form,
+/// never as a mix of `Value::Concrete(ConcreteValue::String)` and `Value::Concrete(ConcreteValue::List([String]))`. The
 /// canonicalization happens upstream in
 /// `value::canonicalize_resources_with_schemas` (#2511) for the
 /// desired side and `value::canonicalize_states_with_schemas` (#2513)
@@ -52,11 +52,11 @@ pub(super) fn type_aware_equal(
     secret_ctx: Option<&SecretHashContext>,
 ) -> bool {
     // Secret comparison: compare the hash of the desired secret with the state hash string.
-    // State stores secrets as "_secret:argon2:<hex>", desired has Value::Secret(inner).
-    if let Value::Secret(inner) = a {
+    // State stores secrets as "_secret:argon2:<hex>", desired has Value::Deferred(DeferredValue::Secret(inner)).
+    if let Value::Deferred(DeferredValue::Secret(inner)) = a {
         return secret_matches_state(inner, b, secret_ctx);
     }
-    if let Value::Secret(inner) = b {
+    if let Value::Deferred(DeferredValue::Secret(inner)) = b {
         return secret_matches_state(inner, a, secret_ctx);
     }
 
@@ -66,47 +66,65 @@ pub(super) fn type_aware_equal(
             // for Maps/Lists so that nested Secret values are compared via their hashes.
             // semantically_equal uses PartialEq which doesn't handle Secret↔hash comparison.
             match (a, b) {
-                (Value::Map(ma), Value::Map(mb)) => {
-                    type_aware_maps_equal(ma, mb, |_key| None, secret_ctx)
-                }
-                (Value::List(la), Value::List(lb)) => {
-                    type_aware_lists_equal(la, lb, None, false, secret_ctx)
-                }
+                (
+                    Value::Concrete(ConcreteValue::Map(ma)),
+                    Value::Concrete(ConcreteValue::Map(mb)),
+                ) => type_aware_maps_equal(ma, mb, |_key| None, secret_ctx),
+                (
+                    Value::Concrete(ConcreteValue::List(la)),
+                    Value::Concrete(ConcreteValue::List(lb)),
+                ) => type_aware_lists_equal(la, lb, None, false, secret_ctx),
                 _ => a.semantically_equal(b),
             }
         }
         Some(at) => match (a, b, at) {
             // Int/Float coercion for numeric types
-            (Value::Int(i), Value::Float(f), AttributeType::Float | AttributeType::Int) => {
-                (*i as f64) == *f && (*i as f64) as i64 == *i
-            }
-            (Value::Float(f), Value::Int(i), AttributeType::Float | AttributeType::Int) => {
-                *f == (*i as f64) && (*i as f64) as i64 == *i
-            }
+            (
+                Value::Concrete(ConcreteValue::Int(i)),
+                Value::Concrete(ConcreteValue::Float(f)),
+                AttributeType::Float | AttributeType::Int,
+            ) => (*i as f64) == *f && (*i as f64) as i64 == *i,
+            (
+                Value::Concrete(ConcreteValue::Float(f)),
+                Value::Concrete(ConcreteValue::Int(i)),
+                AttributeType::Float | AttributeType::Int,
+            ) => *f == (*i as f64) && (*i as f64) as i64 == *i,
 
             // Lists: ordered or multiset comparison with inner type awareness
-            (Value::List(la), Value::List(lb), AttributeType::List { inner, ordered }) => {
-                type_aware_lists_equal(la, lb, Some(inner), *ordered, secret_ctx)
-            }
+            (
+                Value::Concrete(ConcreteValue::List(la)),
+                Value::Concrete(ConcreteValue::List(lb)),
+                AttributeType::List { inner, ordered },
+            ) => type_aware_lists_equal(la, lb, Some(inner), *ordered, secret_ctx),
 
             // Maps: recursive comparison with inner value type
-            (Value::Map(ma), Value::Map(mb), AttributeType::Map { value: inner, .. }) => {
-                type_aware_maps_equal(ma, mb, |_key| Some(inner.as_ref()), secret_ctx)
-            }
+            (
+                Value::Concrete(ConcreteValue::Map(ma)),
+                Value::Concrete(ConcreteValue::Map(mb)),
+                AttributeType::Map { value: inner, .. },
+            ) => type_aware_maps_equal(ma, mb, |_key| Some(inner.as_ref()), secret_ctx),
 
             // Struct: per-field type-aware comparison with default-value tolerance
-            (Value::Map(ma), Value::Map(mb), AttributeType::Struct { fields, .. }) => {
-                type_aware_struct_equal(ma, mb, fields, secret_ctx)
-            }
+            (
+                Value::Concrete(ConcreteValue::Map(ma)),
+                Value::Concrete(ConcreteValue::Map(mb)),
+                AttributeType::Struct { fields, .. },
+            ) => type_aware_struct_equal(ma, mb, fields, secret_ctx),
 
             // Union: try each member type; if any says equal, they're equal
             (_, _, AttributeType::Union(types)) => {
                 // Also check Int/Float coercion for unions containing numeric types
                 match (a, b) {
-                    (Value::Int(i), Value::Float(f)) | (Value::Float(f), Value::Int(i))
-                        if types
-                            .iter()
-                            .any(|t| matches!(t, AttributeType::Float | AttributeType::Int)) =>
+                    (
+                        Value::Concrete(ConcreteValue::Int(i)),
+                        Value::Concrete(ConcreteValue::Float(f)),
+                    )
+                    | (
+                        Value::Concrete(ConcreteValue::Float(f)),
+                        Value::Concrete(ConcreteValue::Int(i)),
+                    ) if types
+                        .iter()
+                        .any(|t| matches!(t, AttributeType::Float | AttributeType::Int)) =>
                     {
                         (*i as f64) == *f && (*i as f64) as i64 == *i
                     }
@@ -117,9 +135,11 @@ pub(super) fn type_aware_equal(
             }
 
             // StringEnum: extract enum values from namespaced identifiers and compare
-            (Value::String(sa), Value::String(sb), AttributeType::StringEnum { values, .. })
-                if sa != sb =>
-            {
+            (
+                Value::Concrete(ConcreteValue::String(sa)),
+                Value::Concrete(ConcreteValue::String(sb)),
+                AttributeType::StringEnum { values, .. },
+            ) if sa != sb => {
                 let valid_values: Vec<&str> = values.iter().map(String::as_str).collect();
                 let va = crate::utils::extract_enum_value_with_values(sa, &valid_values);
                 let vb = crate::utils::extract_enum_value_with_values(sb, &valid_values);
@@ -255,18 +275,33 @@ fn type_aware_struct_equal(
 /// - Custom: delegates to the base type
 fn is_type_default(value: &Value, attr_type: Option<&AttributeType>) -> bool {
     match (value, attr_type) {
-        (Value::Bool(false), Some(AttributeType::Bool) | None) => true,
-        (Value::Int(0), Some(AttributeType::Int)) => true,
-        (Value::Float(f), Some(AttributeType::Float)) if *f == 0.0 => true,
-        (Value::Duration(d), Some(AttributeType::Duration)) if d.is_zero() => true,
-        (Value::String(s), Some(AttributeType::String)) if s.is_empty() => true,
-        (Value::String(s), Some(AttributeType::StringEnum { .. })) if s.is_empty() => true,
-        (Value::List(l), Some(AttributeType::List { .. })) if l.is_empty() => true,
-        (Value::Map(m), Some(AttributeType::Map { .. } | AttributeType::Struct { .. }))
-            if m.is_empty() =>
+        (Value::Concrete(ConcreteValue::Bool(false)), Some(AttributeType::Bool) | None) => true,
+        (Value::Concrete(ConcreteValue::Int(0)), Some(AttributeType::Int)) => true,
+        (Value::Concrete(ConcreteValue::Float(f)), Some(AttributeType::Float)) if *f == 0.0 => true,
+        (Value::Concrete(ConcreteValue::Duration(d)), Some(AttributeType::Duration))
+            if d.is_zero() =>
         {
             true
         }
+        (Value::Concrete(ConcreteValue::String(s)), Some(AttributeType::String))
+            if s.is_empty() =>
+        {
+            true
+        }
+        (Value::Concrete(ConcreteValue::String(s)), Some(AttributeType::StringEnum { .. }))
+            if s.is_empty() =>
+        {
+            true
+        }
+        (Value::Concrete(ConcreteValue::List(l)), Some(AttributeType::List { .. }))
+            if l.is_empty() =>
+        {
+            true
+        }
+        (
+            Value::Concrete(ConcreteValue::Map(m)),
+            Some(AttributeType::Map { .. } | AttributeType::Struct { .. }),
+        ) if m.is_empty() => true,
         // Custom types: delegate to the base type
         (_, Some(AttributeType::Custom { base, .. })) => is_type_default(value, Some(base)),
         _ => false,
@@ -289,7 +324,7 @@ fn secret_matches_state(
     state_value: &Value,
     context: Option<&SecretHashContext>,
 ) -> bool {
-    let Value::String(state_str) = state_value else {
+    let Value::Concrete(ConcreteValue::String(state_str)) = state_value else {
         return false;
     };
 
@@ -308,7 +343,7 @@ fn secret_matches_state(
     // Case 2: State has plain-text value (from provider read / --refresh=true).
     // Compare the inner secret value directly against the raw state string.
     match inner {
-        Value::String(inner_str) => inner_str == state_str,
+        Value::Concrete(ConcreteValue::String(inner_str)) => inner_str == state_str,
         _ => false,
     }
 }

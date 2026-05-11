@@ -729,13 +729,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_local_backend_custom_path() {
-        use carina_core::resource::Value;
+        use carina_core::resource::{ConcreteValue, Value};
         use std::collections::HashMap;
 
         let mut attributes = HashMap::new();
         attributes.insert(
             "path".to_string(),
-            Value::String("custom.state.json".to_string()),
+            Value::Concrete(ConcreteValue::String("custom.state.json".to_string())),
         );
 
         let config = BackendConfig {

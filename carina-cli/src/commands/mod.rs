@@ -468,14 +468,20 @@ fn split_validation_message(joined: &str) -> Vec<AppError> {
 mod tests {
     use super::*;
     use carina_core::parser::ProviderConfig;
-    use carina_core::resource::Value;
+    use carina_core::resource::{ConcreteValue, Value};
     use indexmap::IndexMap;
     use std::collections::HashMap;
 
     fn s3_backend_config(bucket: &str, region: &str) -> BackendConfig {
         let mut attributes = HashMap::new();
-        attributes.insert("bucket".to_string(), Value::String(bucket.to_string()));
-        attributes.insert("region".to_string(), Value::String(region.to_string()));
+        attributes.insert(
+            "bucket".to_string(),
+            Value::Concrete(ConcreteValue::String(bucket.to_string())),
+        );
+        attributes.insert(
+            "region".to_string(),
+            Value::Concrete(ConcreteValue::String(region.to_string())),
+        );
         BackendConfig {
             backend_type: "s3".to_string(),
             attributes,

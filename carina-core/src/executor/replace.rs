@@ -9,7 +9,7 @@ use crate::provider::{
     CreateRequest, DeleteRequest, PatchOp, PatchOpKind, Provider, UpdatePatch, UpdateRequest,
     build_update_patch,
 };
-use crate::resource::{Resource, ResourceId, State, Value};
+use crate::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 
 use super::basic::{BasicEffectResult, resolve_resource, resolve_resource_with_source};
 use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
@@ -238,7 +238,7 @@ pub(super) async fn execute_cbd_replace_parallel(
                         let new_identifier = state.identifier.as_deref().unwrap_or("");
                         let rename_patch = single_attribute_patch(
                             temp.attribute.clone(),
-                            Value::String(temp.original_value.clone()),
+                            Value::Concrete(ConcreteValue::String(temp.original_value.clone())),
                         );
                         let rename_request = UpdateRequest {
                             from: state.clone(),

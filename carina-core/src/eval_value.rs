@@ -107,11 +107,11 @@ impl From<Value> for EvalValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::Value;
+    use crate::resource::{ConcreteValue, Value};
 
     #[test]
     fn user_round_trips() {
-        let original = Value::String("hi".into());
+        let original = Value::Concrete(ConcreteValue::String("hi".into()));
         let eval = EvalValue::from_value(original.clone());
         assert_eq!(eval.into_value().unwrap(), original);
     }

@@ -7,7 +7,7 @@ use crate::parser::ast::UseStatement;
 use crate::parser::context::{ParseContext, next_pair};
 use crate::parser::error::ParseError;
 use crate::parser::parse_expression;
-use crate::resource::Value;
+use crate::resource::{ConcreteValue, Value};
 
 /// Parse import expression (RHS of `let name = use { source = "path" }`)
 pub(in crate::parser) fn parse_use_expr(
@@ -37,7 +37,7 @@ pub(in crate::parser) fn parse_use_expr(
             });
         }
         let value = parse_expression(value_pair, ctx)?;
-        let Value::String(path) = value else {
+        let Value::Concrete(ConcreteValue::String(path)) = value else {
             return Err(ParseError::InvalidExpression {
                 line: attr_line,
                 message: "`use` block `source` must be a string literal".to_string(),

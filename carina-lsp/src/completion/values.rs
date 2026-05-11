@@ -1027,7 +1027,10 @@ impl CompletionProvider {
                 // mid-edit upstream where the body hasn't parsed yet)
                 // also yields no candidates — silently, so cross-file
                 // completion stays online while the user types (#2490).
-                let Some(carina_core::resource::Value::Map(entries)) = &entry.value else {
+                let Some(carina_core::resource::Value::Concrete(
+                    carina_core::resource::ConcreteValue::Map(entries),
+                )) = &entry.value
+                else {
                     return Vec::new();
                 };
                 let value_type = value_type.to_string();

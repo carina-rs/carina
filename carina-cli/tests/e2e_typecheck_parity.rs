@@ -25,7 +25,7 @@ use std::sync::Arc;
 use carina_core::provider::{
     BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer,
 };
-use carina_core::resource::{Resource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField, legacy_validator,
     noop_validator,
@@ -335,7 +335,7 @@ test.r.mode_holder {
 fn region_schemas() -> SchemaRegistry {
     fn validate_region(v: &Value) -> Result<(), String> {
         const VALID: &[&str] = &["ap-northeast-1", "us-west-2"];
-        if let Value::String(s) = v {
+        if let Value::Concrete(ConcreteValue::String(s)) = v {
             let normalized = carina_core::utils::extract_enum_value(s).replace('_', "-");
             if VALID.contains(&normalized.as_str()) {
                 return Ok(());
@@ -1035,8 +1035,10 @@ awsccmock.ec2.subnet {
 // wrong reason).
 fn vpc_id_validate_2358(v: &Value) -> Result<(), String> {
     match v {
-        Value::String(s) if s.starts_with("vpc-") => Ok(()),
-        Value::String(s) => Err(format!("Invalid vpc_id '{}': must start with 'vpc-'", s)),
+        Value::Concrete(ConcreteValue::String(s)) if s.starts_with("vpc-") => Ok(()),
+        Value::Concrete(ConcreteValue::String(s)) => {
+            Err(format!("Invalid vpc_id '{}': must start with 'vpc-'", s))
+        }
         _ => Ok(()),
     }
 }
@@ -1169,7 +1171,7 @@ exports {
 fn literal_valid_string_assignment_to_custom_receiver_still_validates() {
     // Existing `awscc.ec2.SecurityGroup { vpc_id = 'vpc-12345678' }`
     // pattern remains valid: a literal string in source becomes
-    // `Value::String(...)`, which validation handles via the schema-
+    // `Value::Concrete(ConcreteValue::String(...))`, which validation handles via the schema-
     // attached `validate` closure on the Custom type — not via
     // `is_type_expr_compatible_with_schema`. The strictness fix must
     // not regress this path.

@@ -9,7 +9,7 @@ use indexmap::IndexMap;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::resource::{Directives, Resource, ResourceId, State, Value};
+use crate::resource::{ConcreteValue, Directives, Resource, ResourceId, State, Value};
 use crate::schema::SchemaRegistry;
 
 /// Contextual metadata attached to every [`ProviderError`] variant.
@@ -532,7 +532,7 @@ pub fn merge_default_tags_for_provider(
         // Merge default_tags into the resource's tags
         let mut default_tag_keys: Vec<String> = Vec::new();
         match resource.get_attr_mut("tags") {
-            Some(Value::Map(existing_tags)) => {
+            Some(Value::Concrete(ConcreteValue::Map(existing_tags))) => {
                 for (key, value) in default_tags {
                     if !existing_tags.contains_key(key) {
                         existing_tags.insert(key.clone(), value.clone());
@@ -542,7 +542,10 @@ pub fn merge_default_tags_for_provider(
             }
             None => {
                 default_tag_keys = default_tags.keys().cloned().collect();
-                resource.set_attr("tags".to_string(), Value::Map(default_tags.clone()));
+                resource.set_attr(
+                    "tags".to_string(),
+                    Value::Concrete(ConcreteValue::Map(default_tags.clone())),
+                );
             }
             _ => {
                 continue;
@@ -553,7 +556,9 @@ pub fn merge_default_tags_for_provider(
             default_tag_keys.sort();
             resource.set_attr(
                 "_default_tag_keys".to_string(),
-                Value::List(default_tag_keys.into_iter().map(Value::String).collect()),
+                Value::Concrete(ConcreteValue::List(
+                    default_tag_keys.into_iter().map(Value::String).collect(),
+                )),
             );
         }
     }
@@ -1157,22 +1162,26 @@ mod tests {
         let mut resource = Resource::new("identitystore.user", "mizzy");
         resource.set_attr(
             "identity_store_id".to_string(),
-            Value::String("d-9567916d09".to_string()),
+            Value::Concrete(ConcreteValue::String("d-9567916d09".to_string())),
         );
         resource.set_attr(
             "user_name".to_string(),
-            Value::String("gosukenator@gmail.com".to_string()),
+            Value::Concrete(ConcreteValue::String("gosukenator@gmail.com".to_string())),
         );
 
         let state = provider.read_data_source(&resource).await.unwrap();
         assert!(state.exists);
         assert_eq!(
             state.attributes.get("identity_store_id"),
-            Some(&Value::String("d-9567916d09".to_string()))
+            Some(&Value::Concrete(ConcreteValue::String(
+                "d-9567916d09".to_string()
+            )))
         );
         assert_eq!(
             state.attributes.get("user_name"),
-            Some(&Value::String("gosukenator@gmail.com".to_string()))
+            Some(&Value::Concrete(ConcreteValue::String(
+                "gosukenator@gmail.com".to_string()
+            )))
         );
     }
 
@@ -1183,12 +1192,15 @@ mod tests {
         // would use the trait's default impl and bypass the override.
         let provider: Box<dyn Provider> = Box::new(InputAwareProvider);
         let mut resource = Resource::new("identitystore.user", "mizzy");
-        resource.set_attr("user_name".to_string(), Value::String("x".to_string()));
+        resource.set_attr(
+            "user_name".to_string(),
+            Value::Concrete(ConcreteValue::String("x".to_string())),
+        );
         let state = provider.read_data_source(&resource).await.unwrap();
         assert!(state.exists);
         assert_eq!(
             state.attributes.get("user_name"),
-            Some(&Value::String("x".to_string()))
+            Some(&Value::Concrete(ConcreteValue::String("x".to_string())))
         );
     }
 
@@ -1200,12 +1212,15 @@ mod tests {
         router.add_provider("input-aware".to_string(), Box::new(InputAwareProvider));
 
         let mut resource = Resource::with_provider("input-aware", "identitystore.user", "mizzy");
-        resource.set_attr("user_name".to_string(), Value::String("x".to_string()));
+        resource.set_attr(
+            "user_name".to_string(),
+            Value::Concrete(ConcreteValue::String("x".to_string())),
+        );
         let state = router.read_data_source(&resource).await.unwrap();
         assert!(state.exists);
         assert_eq!(
             state.attributes.get("user_name"),
-            Some(&Value::String("x".to_string()))
+            Some(&Value::Concrete(ConcreteValue::String("x".to_string())))
         );
     }
 
@@ -1368,13 +1383,25 @@ mod tests {
     fn build_update_patch_classifies_ops() {
         let id = ResourceId::new("test", "example");
         let mut from_attrs = HashMap::new();
-        from_attrs.insert("a".to_string(), Value::String("old".into()));
-        from_attrs.insert("c".to_string(), Value::String("removed".into()));
+        from_attrs.insert(
+            "a".to_string(),
+            Value::Concrete(ConcreteValue::String("old".into())),
+        );
+        from_attrs.insert(
+            "c".to_string(),
+            Value::Concrete(ConcreteValue::String("removed".into())),
+        );
         let from = State::existing(id.clone(), from_attrs);
 
         let mut to = Resource::new("test", "example");
-        to.set_attr("a".to_string(), Value::String("new".into()));
-        to.set_attr("b".to_string(), Value::String("added".into()));
+        to.set_attr(
+            "a".to_string(),
+            Value::Concrete(ConcreteValue::String("new".into())),
+        );
+        to.set_attr(
+            "b".to_string(),
+            Value::Concrete(ConcreteValue::String("added".into())),
+        );
 
         let changed = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let patch = build_update_patch(&changed, &to, &from);
@@ -1384,10 +1411,16 @@ mod tests {
             patch.ops.iter().map(|op| (op.key.as_str(), op)).collect();
         let a = by_key["a"];
         assert_eq!(a.kind, PatchOpKind::Replace);
-        assert_eq!(a.value, Some(Value::String("new".into())));
+        assert_eq!(
+            a.value,
+            Some(Value::Concrete(ConcreteValue::String("new".into())))
+        );
         let b = by_key["b"];
         assert_eq!(b.kind, PatchOpKind::Add);
-        assert_eq!(b.value, Some(Value::String("added".into())));
+        assert_eq!(
+            b.value,
+            Some(Value::Concrete(ConcreteValue::String("added".into())))
+        );
         let c = by_key["c"];
         assert_eq!(c.kind, PatchOpKind::Remove);
         assert_eq!(c.value, None);
@@ -1513,7 +1546,7 @@ mod tests {
                 // Prefix all string attribute values with "normalized:"
                 for resource in resources.iter_mut() {
                     for value in resource.attributes.values_mut() {
-                        if let Value::String(s) = value {
+                        if let Value::Concrete(ConcreteValue::String(s)) = value {
                             *s = format!("normalized:{}", s);
                         }
                     }
@@ -1548,14 +1581,16 @@ mod tests {
 
         // Test normalize_desired
         let ext = SchemaOnlyProvider;
-        let mut resources = vec![
-            Resource::new("test", "example")
-                .with_attribute("key", Value::String("value".to_string())),
-        ];
+        let mut resources = vec![Resource::new("test", "example").with_attribute(
+            "key",
+            Value::Concrete(ConcreteValue::String("value".to_string())),
+        )];
         ext.normalize_desired(&mut resources);
         assert_eq!(
             resources[0].get_attr("key"),
-            Some(&Value::String("normalized:value".to_string()))
+            Some(&Value::Concrete(ConcreteValue::String(
+                "normalized:value".to_string()
+            )))
         );
 
         // Test hydrate_read_state
@@ -1565,12 +1600,15 @@ mod tests {
         let mut saved: SavedAttrs = HashMap::new();
         saved.insert(
             id.clone(),
-            HashMap::from([("restored".to_string(), Value::String("data".to_string()))]),
+            HashMap::from([(
+                "restored".to_string(),
+                Value::Concrete(ConcreteValue::String("data".to_string())),
+            )]),
         );
         ext.hydrate_read_state(&mut states, &saved);
         assert_eq!(
             states.get(&id).unwrap().attributes.get("restored"),
-            Some(&Value::String("data".to_string()))
+            Some(&Value::Concrete(ConcreteValue::String("data".to_string())))
         );
     }
 
@@ -1638,7 +1676,7 @@ mod tests {
                 for resource in resources.iter_mut() {
                     if resource.id.provider == "normalizing" {
                         for value in resource.attributes.values_mut() {
-                            if let Value::String(s) = value {
+                            if let Value::Concrete(ConcreteValue::String(s)) = value {
                                 *s = format!("norm:{}", s);
                             }
                         }
@@ -1660,13 +1698,17 @@ mod tests {
         router.add_normalizer(Box::new(TestNormalizer));
 
         let mut resources = vec![
-            Resource::with_provider("normalizing", "test", "example")
-                .with_attribute("key", Value::String("val".to_string())),
+            Resource::with_provider("normalizing", "test", "example").with_attribute(
+                "key",
+                Value::Concrete(ConcreteValue::String("val".to_string())),
+            ),
         ];
         router.normalize_desired(&mut resources);
         assert_eq!(
             resources[0].get_attr("key"),
-            Some(&Value::String("norm:val".to_string()))
+            Some(&Value::Concrete(ConcreteValue::String(
+                "norm:val".to_string()
+            )))
         );
     }
 }

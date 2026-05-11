@@ -7,25 +7,27 @@
 use super::ProviderContext;
 use super::error::ParseError;
 use crate::eval_value::EvalValue;
-use crate::resource::Value;
+use crate::resource::{ConcreteValue, DeferredValue, Value};
 
 /// Check whether a Value is fully static (no runtime dependencies).
 pub(crate) fn is_static_value(value: &Value) -> bool {
     match value {
-        Value::String(_)
-        | Value::Int(_)
-        | Value::Float(_)
-        | Value::Bool(_)
-        | Value::Duration(_)
-        | Value::StringList(_) => true,
-        Value::List(items) => items.iter().all(is_static_value),
-        Value::Map(map) => map.values().all(is_static_value),
-        Value::FunctionCall { args, .. } => args.iter().all(is_static_value),
-        Value::ResourceRef { .. }
-        | Value::BindingRef { .. }
-        | Value::Interpolation(_)
-        | Value::Unknown(_) => false,
-        Value::Secret(inner) => is_static_value(inner),
+        Value::Concrete(ConcreteValue::String(_))
+        | Value::Concrete(ConcreteValue::Int(_))
+        | Value::Concrete(ConcreteValue::Float(_))
+        | Value::Concrete(ConcreteValue::Bool(_))
+        | Value::Concrete(ConcreteValue::Duration(_))
+        | Value::Concrete(ConcreteValue::StringList(_)) => true,
+        Value::Concrete(ConcreteValue::List(items)) => items.iter().all(is_static_value),
+        Value::Concrete(ConcreteValue::Map(map)) => map.values().all(is_static_value),
+        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+            args.iter().all(is_static_value)
+        }
+        Value::Deferred(DeferredValue::ResourceRef { .. })
+        | Value::Deferred(DeferredValue::BindingRef { .. })
+        | Value::Deferred(DeferredValue::Interpolation(_))
+        | Value::Deferred(DeferredValue::Unknown(_)) => false,
+        Value::Deferred(DeferredValue::Secret(inner)) => is_static_value(inner),
     }
 }
 
@@ -47,7 +49,7 @@ pub(crate) fn evaluate_static_value(
     config: &ProviderContext,
 ) -> Result<Value, ParseError> {
     match value {
-        Value::FunctionCall { ref name, ref args } => {
+        Value::Deferred(DeferredValue::FunctionCall { ref name, ref args }) => {
             if !is_static_value(&value) {
                 return Err(ParseError::InvalidExpression {
                     line: 0,

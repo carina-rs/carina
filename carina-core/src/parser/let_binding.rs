@@ -21,7 +21,7 @@ use super::parse_expression;
 use super::static_eval::is_static_value;
 use super::util::eval_type_name;
 use crate::eval_value::EvalValue;
-use crate::resource::{Resource, Value};
+use crate::resource::{ConcreteValue, DeferredValue, Resource, Value};
 
 /// Tuple returned by the let-binding parser. The RHS is `EvalValue`
 /// rather than `Value` so partial applications (closures) can survive
@@ -65,7 +65,7 @@ pub(super) fn parse_let_binding_extended(
     // else it is a parse error.
     if rhs_pair.as_rule() == Rule::use_expr {
         let use_stmt = parse_use_expr(rhs_pair, &name, ctx)?;
-        let value = Value::String(format!("${{use:{}}}", use_stmt.path));
+        let value = Value::Concrete(ConcreteValue::String(format!("${{use:{}}}", use_stmt.path)));
         return Ok((
             name,
             EvalValue::from_value(value),
@@ -283,10 +283,10 @@ fn parse_pipe_expr_with_resource_or_module(
             continue;
         }
 
-        value = EvalValue::from_value(Value::FunctionCall {
+        value = EvalValue::from_value(Value::Deferred(DeferredValue::FunctionCall {
             name: func_name,
             args,
-        });
+        }));
     }
 
     Ok((value, expanded_resources, module_calls, maybe_import))
@@ -302,7 +302,8 @@ fn parse_primary_with_resource_or_module(
     match inner.as_rule() {
         Rule::read_resource_expr => {
             let resource = parse_read_resource_expr(inner, ctx, binding_name)?;
-            let ref_value = Value::String(format!("${{{}}}", binding_name));
+            let ref_value =
+                Value::Concrete(ConcreteValue::String(format!("${{{}}}", binding_name)));
             Ok((
                 EvalValue::from_value(ref_value),
                 vec![resource],
@@ -320,7 +321,8 @@ fn parse_primary_with_resource_or_module(
                 });
             }
             ctx.upstream_states.insert(us.binding.clone(), us);
-            let ref_value = Value::String(format!("${{{}}}", binding_name));
+            let ref_value =
+                Value::Concrete(ConcreteValue::String(format!("${{{}}}", binding_name)));
             Ok((EvalValue::from_value(ref_value), vec![], vec![], None))
         }
         Rule::wait_expr => {
@@ -338,12 +340,14 @@ fn parse_primary_with_resource_or_module(
             // `<wait-binding>.<attr>` as passthrough of `<target>.<attr>`.
             // For now we mirror the upstream_state_expr pattern and emit
             // a placeholder `${binding}` reference.
-            let ref_value = Value::String(format!("${{{}}}", binding_name));
+            let ref_value =
+                Value::Concrete(ConcreteValue::String(format!("${{{}}}", binding_name)));
             Ok((EvalValue::from_value(ref_value), vec![], vec![], None))
         }
         Rule::resource_expr => {
             let resource = parse_resource_expr(inner, ctx, binding_name)?;
-            let ref_value = Value::String(format!("${{{}}}", binding_name));
+            let ref_value =
+                Value::Concrete(ConcreteValue::String(format!("${{{}}}", binding_name)));
             Ok((
                 EvalValue::from_value(ref_value),
                 vec![resource],
@@ -353,7 +357,8 @@ fn parse_primary_with_resource_or_module(
         }
         Rule::for_expr => {
             let (resources, module_calls) = parse_for_expr(inner, ctx, binding_name)?;
-            let ref_value = Value::String(format!("${{for:{}}}", binding_name));
+            let ref_value =
+                Value::Concrete(ConcreteValue::String(format!("${{for:{}}}", binding_name)));
             Ok((
                 EvalValue::from_value(ref_value),
                 resources,
@@ -367,7 +372,10 @@ fn parse_primary_with_resource_or_module(
         }
         Rule::module_call => {
             let call = parse_module_call(inner, ctx)?;
-            let value = Value::String(format!("${{module:{}}}", call.module_name));
+            let value = Value::Concrete(ConcreteValue::String(format!(
+                "${{module:{}}}",
+                call.module_name
+            )));
             Ok((EvalValue::from_value(value), vec![], vec![call], None))
         }
         Rule::function_call => {

@@ -15,7 +15,7 @@ use crate::parser::{
     is_static_value, next_pair, parse_expression, parse_module_call, parse_read_resource_expr,
     parse_resource_expr,
 };
-use crate::resource::{Resource, Value};
+use crate::resource::{ConcreteValue, Resource, Value};
 
 /// Result of parsing an if expression body: a resource, a module call, or a value
 pub(crate) enum IfBodyResult {
@@ -55,7 +55,7 @@ pub(crate) fn parse_if_expr(
 
     // Condition must be a Bool
     let condition = match &condition_value {
-        Value::Bool(b) => *b,
+        Value::Concrete(ConcreteValue::Bool(b)) => *b,
         other => {
             return Err(ParseError::InvalidExpression {
                 line: 0,
@@ -79,7 +79,7 @@ pub(crate) fn parse_if_expr(
         parse_if_body_to_rhs(else_body, ctx, binding_name)
     } else {
         // No else clause and condition is false: produce nothing
-        let ref_value = Value::String(format!("${{if:{}}}", binding_name));
+        let ref_value = Value::Concrete(ConcreteValue::String(format!("${{if:{}}}", binding_name)));
         Ok((EvalValue::from_value(ref_value), vec![], vec![], None))
     }
 }
@@ -93,11 +93,15 @@ pub(crate) fn parse_if_body_to_rhs(
     let result = parse_if_body(pair, ctx, binding_name)?;
     match result {
         IfBodyResult::Resource(r) => {
-            let ref_value = Value::String(format!("${{{}}}", binding_name));
+            let ref_value =
+                Value::Concrete(ConcreteValue::String(format!("${{{}}}", binding_name)));
             Ok((EvalValue::from_value(ref_value), vec![*r], vec![], None))
         }
         IfBodyResult::ModuleCall(c) => {
-            let value = Value::String(format!("${{module:{}}}", c.module_name));
+            let value = Value::Concrete(ConcreteValue::String(format!(
+                "${{module:{}}}",
+                c.module_name
+            )));
             Ok((EvalValue::from_value(value), vec![], vec![c], None))
         }
         IfBodyResult::Value(v) => Ok((EvalValue::from_value(v), vec![], vec![], None)),
@@ -181,7 +185,7 @@ pub(crate) fn parse_if_value_expr(
 
     // Condition must be a Bool
     let condition = match &condition_value {
-        Value::Bool(b) => *b,
+        Value::Concrete(ConcreteValue::Bool(b)) => *b,
         other => {
             return Err(ParseError::InvalidExpression {
                 line: 0,

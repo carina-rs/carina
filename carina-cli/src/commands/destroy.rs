@@ -16,7 +16,7 @@ use carina_core::deps::{
 use carina_core::effect::Effect;
 use carina_core::plan::Plan;
 use carina_core::provider::Provider;
-use carina_core::resource::{Resource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 use carina_state::{LockInfo, StateBackend, resolve_backend};
 
 use carina_core::parser::ProviderContext;
@@ -75,7 +75,7 @@ pub async fn run_destroy(
     // Get the state bucket name for protection check (S3 backend only)
     if let Some(config) = backend_config {
         protected_bucket = config.attributes.get("bucket").and_then(|v| match v {
-            Value::String(s) => Some(s.clone()),
+            Value::Concrete(ConcreteValue::String(s)) => Some(s.clone()),
             _ => None,
         });
     }
@@ -297,7 +297,7 @@ async fn run_destroy_locked(
             if let Some(backend_rt) = backend.resource_type()
                 && r.id.resource_type == backend_rt
                 && let Some(ref bucket_name) = protected_bucket
-                && let Some(Value::String(name)) = r.get_attr("bucket")
+                && let Some(Value::Concrete(ConcreteValue::String(name))) = r.get_attr("bucket")
                 && name == bucket_name
             {
                 protected_resources.push(r);

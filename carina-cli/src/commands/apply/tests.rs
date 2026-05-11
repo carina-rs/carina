@@ -18,11 +18,11 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc");
     resource.set_attr(
         "cidr_block".to_string(),
-        Value::String("10.0.0.0/16".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
     resource.set_attr(
         "ipv4_netmask_length".to_string(),
-        Value::String("16".to_string()),
+        Value::Concrete(ConcreteValue::String("16".to_string())),
     );
 
     let sorted_resources = vec![resource];
@@ -31,7 +31,7 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
     let mut applied_attrs = HashMap::new();
     applied_attrs.insert(
         "cidr_block".to_string(),
-        Value::String("10.0.0.0/16".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
     let applied_state = State::existing(sorted_resources[0].id.clone(), applied_attrs);
     let mut applied_states = HashMap::new();
@@ -97,24 +97,26 @@ fn build_state_after_apply_preserves_block_name_attribute() {
     let mut resource = Resource::with_provider("awscc", "iam.role", "test-role");
     resource.set_attr(
         "role_name".to_string(),
-        Value::String("test-role".to_string()),
+        Value::Concrete(ConcreteValue::String("test-role".to_string())),
     );
     resource.set_attr(
         "policies".to_string(),
-        Value::List(vec![Value::Map(
-            vec![
-                (
-                    "policy_name".to_string(),
-                    Value::String("test-policy".to_string()),
-                ),
-                (
-                    "policy_document".to_string(),
-                    Value::String("{}".to_string()),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-        )]),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(
+                vec![
+                    (
+                        "policy_name".to_string(),
+                        Value::Concrete(ConcreteValue::String("test-policy".to_string())),
+                    ),
+                    (
+                        "policy_document".to_string(),
+                        Value::Concrete(ConcreteValue::String("{}".to_string())),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        )])),
     );
 
     let sorted_resources = vec![resource];
@@ -124,24 +126,26 @@ fn build_state_after_apply_preserves_block_name_attribute() {
     let mut applied_attrs = HashMap::new();
     applied_attrs.insert(
         "role_name".to_string(),
-        Value::String("test-role".to_string()),
+        Value::Concrete(ConcreteValue::String("test-role".to_string())),
     );
     applied_attrs.insert(
         "policies".to_string(),
-        Value::List(vec![Value::Map(
-            vec![
-                (
-                    "policy_name".to_string(),
-                    Value::String("test-policy".to_string()),
-                ),
-                (
-                    "policy_document".to_string(),
-                    Value::String("{}".to_string()),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-        )]),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(
+                vec![
+                    (
+                        "policy_name".to_string(),
+                        Value::Concrete(ConcreteValue::String("test-policy".to_string())),
+                    ),
+                    (
+                        "policy_document".to_string(),
+                        Value::Concrete(ConcreteValue::String("{}".to_string())),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        )])),
     );
     let applied_state = State::existing(sorted_resources[0].id.clone(), applied_attrs)
         .with_identifier("some-identifier");
@@ -231,48 +235,52 @@ fn block_name_attribute_no_diff_when_hydrated() {
     let mut resource = Resource::with_provider("awscc", "iam.role", "test-role");
     resource.set_attr(
         "role_name".to_string(),
-        Value::String("test-role".to_string()),
+        Value::Concrete(ConcreteValue::String("test-role".to_string())),
     );
     resource.set_attr(
         "policies".to_string(),
-        Value::List(vec![Value::Map(
-            vec![
-                (
-                    "policy_name".to_string(),
-                    Value::String("test-policy".to_string()),
-                ),
-                (
-                    "policy_document".to_string(),
-                    Value::String("{}".to_string()),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-        )]),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(
+                vec![
+                    (
+                        "policy_name".to_string(),
+                        Value::Concrete(ConcreteValue::String("test-policy".to_string())),
+                    ),
+                    (
+                        "policy_document".to_string(),
+                        Value::Concrete(ConcreteValue::String("{}".to_string())),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        )])),
     );
 
     // Current state: simulate hydration restoring the policies attribute
     let mut state_attrs = HashMap::new();
     state_attrs.insert(
         "role_name".to_string(),
-        Value::String("test-role".to_string()),
+        Value::Concrete(ConcreteValue::String("test-role".to_string())),
     );
     state_attrs.insert(
         "policies".to_string(),
-        Value::List(vec![Value::Map(
-            vec![
-                (
-                    "policy_name".to_string(),
-                    Value::String("test-policy".to_string()),
-                ),
-                (
-                    "policy_document".to_string(),
-                    Value::String("{}".to_string()),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-        )]),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(
+                vec![
+                    (
+                        "policy_name".to_string(),
+                        Value::Concrete(ConcreteValue::String("test-policy".to_string())),
+                    ),
+                    (
+                        "policy_document".to_string(),
+                        Value::Concrete(ConcreteValue::String("{}".to_string())),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        )])),
     );
     let current = State::existing(resource.id.clone(), state_attrs).with_identifier("some-id");
 
@@ -337,18 +345,20 @@ fn block_name_attribute_state_roundtrip() {
     let mut resource = Resource::with_provider("awscc", "ec2.ipam", "test-ipam");
     resource.set_attr(
         "operating_regions".to_string(),
-        Value::List(vec![Value::Map(
-            vec![(
-                "region_name".to_string(),
-                Value::String("ap-northeast-1".to_string()),
-            )]
-            .into_iter()
-            .collect(),
-        )]),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(
+                vec![(
+                    "region_name".to_string(),
+                    Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+        )])),
     );
     resource.set_attr(
         "description".to_string(),
-        Value::String("test IPAM".to_string()),
+        Value::Concrete(ConcreteValue::String("test IPAM".to_string())),
     );
 
     let sorted_resources = vec![resource];
@@ -357,18 +367,20 @@ fn block_name_attribute_state_roundtrip() {
     let mut applied_attrs = HashMap::new();
     applied_attrs.insert(
         "description".to_string(),
-        Value::String("test IPAM".to_string()),
+        Value::Concrete(ConcreteValue::String("test IPAM".to_string())),
     );
     applied_attrs.insert(
         "operating_regions".to_string(),
-        Value::List(vec![Value::Map(
-            vec![(
-                "region_name".to_string(),
-                Value::String("ap-northeast-1".to_string()),
-            )]
-            .into_iter()
-            .collect(),
-        )]),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(
+                vec![(
+                    "region_name".to_string(),
+                    Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+        )])),
     );
     let applied_state = State::existing(sorted_resources[0].id.clone(), applied_attrs)
         .with_identifier("ipam-12345");
@@ -419,12 +431,14 @@ fn block_name_attribute_state_roundtrip() {
         .expect("should have operating_regions");
 
     // Verify the value structure is preserved
-    if let Value::List(items) = operating_regions {
+    if let Value::Concrete(ConcreteValue::List(items)) = operating_regions {
         assert_eq!(items.len(), 1);
-        if let Value::Map(map) = &items[0] {
+        if let Value::Concrete(ConcreteValue::Map(map)) = &items[0] {
             assert_eq!(
                 map.get("region_name"),
-                Some(&Value::String("ap-northeast-1".to_string()))
+                Some(&Value::Concrete(ConcreteValue::String(
+                    "ap-northeast-1".to_string()
+                )))
             );
         } else {
             panic!("Expected Map in list, got {:?}", items[0]);
@@ -461,7 +475,7 @@ fn format_duration_zero() {
 #[test]
 fn resolve_exports_resolves_cross_file_dot_notation_strings() {
     use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
-    use carina_core::resource::Value;
+    use carina_core::resource::{ConcreteValue, Value};
     use carina_state::StateFile;
 
     // Build a state file with a resource that has a binding and attributes
@@ -494,7 +508,9 @@ fn resolve_exports_resolves_cross_file_dot_notation_strings() {
     let export_params = vec![ExportParameter {
         name: "account_id".to_string(),
         type_expr: TypeExpr::Unknown,
-        value: Some(Value::String("registry_prod.account_id".to_string())),
+        value: Some(Value::Concrete(ConcreteValue::String(
+            "registry_prod.account_id".to_string(),
+        ))),
     }];
 
     // Mirror production callers: the resource is in sorted_resources
@@ -524,7 +540,7 @@ fn resolve_exports_resolves_module_call_attribute_via_virtual_resource() {
     // referencing `<module_call>.<attr>` failed with
     // `unresolved reference <call>.<attr>`.
     use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
-    use carina_core::resource::{AccessPath, ResourceKind, Value};
+    use carina_core::resource::{AccessPath, DeferredValue, ResourceKind, Value};
     use carina_state::StateFile;
 
     let state = {
@@ -564,18 +580,18 @@ fn resolve_exports_resolves_module_call_attribute_via_virtual_resource() {
     };
     virtual_resource.attributes.insert(
         "role_arn".to_string(),
-        Value::ResourceRef {
+        Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::new("github_actions_carina.role", "arn"),
-        },
+        }),
     );
     let sorted_resources = vec![role_resource, virtual_resource];
 
     let export_params = vec![ExportParameter {
         name: "role_arn".to_string(),
         type_expr: TypeExpr::Unknown,
-        value: Some(Value::ResourceRef {
+        value: Some(Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::new("github_actions_carina", "role_arn"),
-        }),
+        })),
     }];
 
     let exports = resolve_exports(&export_params, &sorted_resources, &state).unwrap();
@@ -601,7 +617,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_virtuals() {
     // role's `arn` from state. Pins the resolver's transitive walk so a
     // regression that broke after a single hop would surface.
     use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
-    use carina_core::resource::{AccessPath, ResourceKind, Value};
+    use carina_core::resource::{AccessPath, DeferredValue, ResourceKind, Value};
     use carina_state::StateFile;
 
     let state = {
@@ -637,9 +653,9 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_virtuals() {
     };
     inner_virtual.attributes.insert(
         "role_arn".to_string(),
-        Value::ResourceRef {
+        Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::new("outer.inner.role", "arn"),
-        },
+        }),
     );
 
     let mut outer_virtual = Resource::new("_virtual", "outer");
@@ -650,9 +666,9 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_virtuals() {
     };
     outer_virtual.attributes.insert(
         "public_role_arn".to_string(),
-        Value::ResourceRef {
+        Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::new("outer.inner", "role_arn"),
-        },
+        }),
     );
 
     let sorted_resources = vec![role_resource, inner_virtual, outer_virtual];
@@ -660,9 +676,9 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_virtuals() {
     let export_params = vec![ExportParameter {
         name: "role_arn".to_string(),
         type_expr: TypeExpr::Unknown,
-        value: Some(Value::ResourceRef {
+        value: Some(Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::new("outer", "public_role_arn"),
-        }),
+        })),
     }];
 
     let exports = resolve_exports(&export_params, &sorted_resources, &state).unwrap();

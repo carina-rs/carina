@@ -18,7 +18,7 @@ use carina_core::plan_tree::shorten_attr_name;
 use carina_core::plan_tree::{
     build_dependency_graph, build_single_parent_tree, extract_compact_hint,
 };
-use carina_core::resource::{ResourceId, Value};
+use carina_core::resource::{ConcreteValue, DeferredValue, ResourceId, Value};
 use carina_core::schema::SchemaRegistry;
 use carina_core::value::format_value_pretty;
 #[cfg(test)]
@@ -52,7 +52,7 @@ fn format_compact_name(
 }
 
 /// Format a value in a deferred for-expression template.
-/// Placeholder values (`Value::Unknown`) are shown dimmed; resolved
+/// Placeholder values (`Value::Deferred(DeferredValue::Unknown)`) are shown dimmed; resolved
 /// values are shown normally.
 fn format_deferred_value(value: &Value) -> String {
     /// Catch-all placeholder text for value variants whose contents
@@ -63,24 +63,24 @@ fn format_deferred_value(value: &Value) -> String {
     const DEFERRED_FALLBACK: &str = "(known after upstream apply)";
 
     match value {
-        Value::Unknown(reason) => {
+        Value::Deferred(DeferredValue::Unknown(reason)) => {
             format!("{}", carina_core::value::render_unknown(reason).dimmed())
         }
-        Value::String(s) => format!("'{}'", s),
-        Value::Int(i) => i.to_string(),
-        Value::Float(f) => f.to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Duration(d) => carina_core::value::render_duration(*d),
-        Value::ResourceRef { path } => path.to_dot_string().to_string(),
-        Value::List(items) => {
+        Value::Concrete(ConcreteValue::String(s)) => format!("'{}'", s),
+        Value::Concrete(ConcreteValue::Int(i)) => i.to_string(),
+        Value::Concrete(ConcreteValue::Float(f)) => f.to_string(),
+        Value::Concrete(ConcreteValue::Bool(b)) => b.to_string(),
+        Value::Concrete(ConcreteValue::Duration(d)) => carina_core::value::render_duration(*d),
+        Value::Deferred(DeferredValue::ResourceRef { path }) => path.to_dot_string().to_string(),
+        Value::Concrete(ConcreteValue::List(items)) => {
             let formatted: Vec<String> = items.iter().map(format_deferred_value).collect();
             format!("[{}]", formatted.join(", "))
         }
-        Value::StringList(items) => {
+        Value::Concrete(ConcreteValue::StringList(items)) => {
             let formatted: Vec<String> = items.iter().map(|s| format!("'{}'", s)).collect();
             format!("[{}]", formatted.join(", "))
         }
-        Value::Map(map) => {
+        Value::Concrete(ConcreteValue::Map(map)) => {
             let formatted: Vec<String> = map
                 .iter()
                 .map(|(k, v)| format!("{} = {}", k, format_deferred_value(v)))
@@ -94,21 +94,21 @@ fn format_deferred_value(value: &Value) -> String {
 /// Format an export value for plan display.
 fn format_export_value(value: &Value) -> String {
     match value {
-        Value::String(s) => format!("'{}'", s),
-        Value::Int(i) => i.to_string(),
-        Value::Float(f) => f.to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Duration(d) => carina_core::value::render_duration(*d),
-        Value::ResourceRef { path } => path.to_dot_string().to_string(),
-        Value::List(items) => {
+        Value::Concrete(ConcreteValue::String(s)) => format!("'{}'", s),
+        Value::Concrete(ConcreteValue::Int(i)) => i.to_string(),
+        Value::Concrete(ConcreteValue::Float(f)) => f.to_string(),
+        Value::Concrete(ConcreteValue::Bool(b)) => b.to_string(),
+        Value::Concrete(ConcreteValue::Duration(d)) => carina_core::value::render_duration(*d),
+        Value::Deferred(DeferredValue::ResourceRef { path }) => path.to_dot_string().to_string(),
+        Value::Concrete(ConcreteValue::List(items)) => {
             let formatted: Vec<String> = items.iter().map(format_export_value).collect();
             format!("[{}]", formatted.join(", "))
         }
-        Value::StringList(items) => {
+        Value::Concrete(ConcreteValue::StringList(items)) => {
             let formatted: Vec<String> = items.iter().map(|s| format!("'{}'", s)).collect();
             format!("[{}]", formatted.join(", "))
         }
-        Value::Map(map) => {
+        Value::Concrete(ConcreteValue::Map(map)) => {
             let formatted: Vec<String> = map
                 .iter()
                 .map(|(k, v)| format!("{} = {}", k, format_export_value(v)))
@@ -1658,10 +1658,16 @@ pub fn format_effect(effect: &Effect) -> String {
     }
 }
 
-/// Check if both old and new values are `Value::Map`.
+/// Check if both old and new values are `Value::Concrete(ConcreteValue::Map)`.
 #[cfg(test)]
 fn is_both_maps(old_value: Option<&Value>, new_value: &Value) -> bool {
-    matches!((old_value, new_value), (Some(Value::Map(_)), Value::Map(_)))
+    matches!(
+        (old_value, new_value),
+        (
+            Some(Value::Concrete(ConcreteValue::Map(_))),
+            Value::Concrete(ConcreteValue::Map(_))
+        )
+    )
 }
 
 /// Format a key-level diff between two map values.
@@ -1675,11 +1681,11 @@ fn is_both_maps(old_value: Option<&Value>, new_value: &Value) -> bool {
 #[cfg(test)]
 fn format_map_diff(old_value: Option<&Value>, new_value: &Value, attr_prefix: &str) -> String {
     let new_map = match new_value {
-        Value::Map(m) => m,
+        Value::Concrete(ConcreteValue::Map(m)) => m,
         _ => return format_value(new_value),
     };
     let old_map = match old_value {
-        Some(Value::Map(m)) => m,
+        Some(Value::Concrete(ConcreteValue::Map(m))) => m,
         _ => {
             // No old map; treat all new keys as added
             let empty = indexmap::IndexMap::new();
@@ -1750,11 +1756,11 @@ fn format_map_diff(old_value: Option<&Value>, new_value: &Value, attr_prefix: &s
 #[cfg(test)]
 fn format_list_diff(old_value: Option<&Value>, new_value: &Value, attr_prefix: &str) -> String {
     let new_items = match new_value {
-        Value::List(items) => items,
+        Value::Concrete(ConcreteValue::List(items)) => items,
         _ => return format_value(new_value),
     };
     let old_items = match old_value {
-        Some(Value::List(items)) => items,
+        Some(Value::Concrete(ConcreteValue::List(items))) => items,
         _ => &vec![] as &Vec<Value>,
     };
 
@@ -1830,7 +1836,7 @@ fn format_list_diff(old_value: Option<&Value>, new_value: &Value, attr_prefix: &
 
     // Show unchanged items (exact matches from new list order)
     for (ni, new_item) in new_items.iter().enumerate() {
-        if let Value::Map(map) = new_item
+        if let Value::Concrete(ConcreteValue::Map(map)) = new_item
             && new_matched[ni]
         {
             let mut keys: Vec<_> = map.keys().collect();
@@ -1845,7 +1851,11 @@ fn format_list_diff(old_value: Option<&Value>, new_value: &Value, attr_prefix: &
 
     // Show modified items (paired by similarity)
     for &(oi, ni) in &paired {
-        if let (Value::Map(old_map), Value::Map(new_map)) = (&old_items[oi], &new_items[ni]) {
+        if let (
+            Value::Concrete(ConcreteValue::Map(old_map)),
+            Value::Concrete(ConcreteValue::Map(new_map)),
+        ) = (&old_items[oi], &new_items[ni])
+        {
             let mut keys: Vec<_> = new_map.keys().collect();
             keys.sort();
             let fields: Vec<String> = keys
@@ -1878,7 +1888,7 @@ fn format_list_diff(old_value: Option<&Value>, new_value: &Value, attr_prefix: &
 
     // Show added items
     for &ni in &added {
-        if let Value::Map(map) = &new_items[ni] {
+        if let Value::Concrete(ConcreteValue::Map(map)) = &new_items[ni] {
             let mut keys: Vec<_> = map.keys().collect();
             keys.sort();
             let fields: Vec<String> = keys
@@ -1896,7 +1906,7 @@ fn format_list_diff(old_value: Option<&Value>, new_value: &Value, attr_prefix: &
 
     // Show removed items
     for &oi in &removed {
-        if let Value::Map(map) = &old_items[oi] {
+        if let Value::Concrete(ConcreteValue::Map(map)) = &old_items[oi] {
             let mut keys: Vec<_> = map.keys().collect();
             keys.sort();
             let fields: Vec<String> = keys
@@ -2031,14 +2041,18 @@ fn format_cascading_update_diff(
 
 /// Check whether a Value references the given binding name.
 ///
-/// Returns true for `Value::ResourceRef` with matching `binding_name`,
-/// or `Value::List` / `Value::Map` containing such a reference.
+/// Returns true for `Value::Deferred(DeferredValue::ResourceRef)` with matching `binding_name`,
+/// or `Value::Concrete(ConcreteValue::List)` / `Value::Concrete(ConcreteValue::Map)` containing such a reference.
 #[cfg(test)]
 fn value_references_binding(value: &Value, binding: &str) -> bool {
     match value {
-        Value::ResourceRef { path } => path.binding() == binding,
-        Value::List(items) => items.iter().any(|v| value_references_binding(v, binding)),
-        Value::Map(map) => map.values().any(|v| value_references_binding(v, binding)),
+        Value::Deferred(DeferredValue::ResourceRef { path }) => path.binding() == binding,
+        Value::Concrete(ConcreteValue::List(items)) => {
+            items.iter().any(|v| value_references_binding(v, binding))
+        }
+        Value::Concrete(ConcreteValue::Map(map)) => {
+            map.values().any(|v| value_references_binding(v, binding))
+        }
         _ => false,
     }
 }

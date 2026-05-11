@@ -3370,7 +3370,7 @@ let main = awscc.ec2.Vpc {
 }
 
 /// Issue #2357 negative-acceptance. An export whose rhs is a
-/// `Value::FunctionCall` (e.g. `lookup`) cannot be statically typed —
+/// `Value::Deferred(DeferredValue::FunctionCall)` (e.g. `lookup`) cannot be statically typed —
 /// it must stay un-offered, matching the conservative behavior the
 /// stage-1 inference inherited.
 #[test]

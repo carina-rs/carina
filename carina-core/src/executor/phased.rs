@@ -9,7 +9,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use crate::deps::{find_failed_dependency, get_resource_dependencies};
 use crate::effect::Effect;
 use crate::provider::{CreateRequest, DeleteRequest, Provider, UpdateRequest};
-use crate::resource::{Resource, ResourceId, State, Value};
+use crate::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 
 use super::basic::{
     BasicEffectResult, ExecutionState, count_actionable_effects, execute_basic_effect,
@@ -1001,7 +1001,9 @@ pub(super) async fn execute_effects_phased(
                                 let new_identifier = state.identifier.as_deref().unwrap_or("");
                                 let rename_patch = single_attribute_patch(
                                     temp.attribute.clone(),
-                                    Value::String(temp.original_value.clone()),
+                                    Value::Concrete(ConcreteValue::String(
+                                        temp.original_value.clone(),
+                                    )),
                                 );
                                 let rename_request = UpdateRequest {
                                     from: state.clone(),

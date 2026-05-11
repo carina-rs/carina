@@ -7,7 +7,7 @@ use super::primary::parse_duration_secs;
 use crate::parser::ast::{UntilPredicateAst, WaitBinding};
 use crate::parser::error::ParseError;
 use crate::parser::{Rule, first_inner};
-use crate::resource::Value;
+use crate::resource::{ConcreteValue, Value};
 use pest::iterators::Pair;
 
 /// Parse a `wait` expression into a [`WaitBinding`].
@@ -288,7 +288,9 @@ fn lower_until_rhs(pair: Pair<'_, Rule>, line: usize) -> Result<Value, ParseErro
                     message: "`until`: malformed string literal".to_string(),
                 });
             }
-            Ok(Value::String(raw[1..raw.len() - 1].to_string()))
+            Ok(Value::Concrete(ConcreteValue::String(
+                raw[1..raw.len() - 1].to_string(),
+            )))
         }
         Rule::number => {
             let n: i64 = primary
@@ -298,7 +300,7 @@ fn lower_until_rhs(pair: Pair<'_, Rule>, line: usize) -> Result<Value, ParseErro
                     line,
                     message: format!("`until`: invalid integer: {}", e),
                 })?;
-            Ok(Value::Int(n))
+            Ok(Value::Concrete(ConcreteValue::Int(n)))
         }
         Rule::float => {
             let f: f64 = primary
@@ -308,12 +310,16 @@ fn lower_until_rhs(pair: Pair<'_, Rule>, line: usize) -> Result<Value, ParseErro
                     line,
                     message: format!("`until`: invalid float: {}", e),
                 })?;
-            Ok(Value::Float(f))
+            Ok(Value::Concrete(ConcreteValue::Float(f)))
         }
-        Rule::boolean => Ok(Value::Bool(primary.as_str() == "true")),
+        Rule::boolean => Ok(Value::Concrete(ConcreteValue::Bool(
+            primary.as_str() == "true",
+        ))),
         Rule::duration_literal => {
             let secs = parse_duration_secs(primary.as_str(), line)?;
-            Ok(Value::Duration(std::time::Duration::from_secs(secs)))
+            Ok(Value::Concrete(ConcreteValue::Duration(
+                std::time::Duration::from_secs(secs),
+            )))
         }
         Rule::variable_ref => {
             // Treat dotted variable refs as namespaced enum identifiers
@@ -346,7 +352,7 @@ fn lower_until_rhs(pair: Pair<'_, Rule>, line: usize) -> Result<Value, ParseErro
             // wrote it; the differ's enum-resolution pass converts it to
             // the AWS canonical value when the target attribute is
             // declared as an enum.
-            Ok(Value::String(segments.join(".")))
+            Ok(Value::Concrete(ConcreteValue::String(segments.join("."))))
         }
         Rule::null_literal => Err(ParseError::InvalidExpression {
             line,
@@ -391,7 +397,9 @@ mod tests {
         assert_eq!(we.until_predicate.lhs_segments, vec!["cert", "status"]);
         assert_eq!(
             we.until_predicate.rhs,
-            Value::String("aws.acm.Certificate.Status.Issued".to_string())
+            Value::Concrete(ConcreteValue::String(
+                "aws.acm.Certificate.Status.Issued".to_string()
+            ))
         );
         assert!(we.timeout_secs.is_none());
         assert!(we.depends_on.is_empty());
@@ -400,19 +408,28 @@ mod tests {
     #[test]
     fn parses_string_rhs() {
         let we = parse_one("wait cert {\n    until = cert.status == \"ISSUED\"\n}");
-        assert_eq!(we.until_predicate.rhs, Value::String("ISSUED".to_string()));
+        assert_eq!(
+            we.until_predicate.rhs,
+            Value::Concrete(ConcreteValue::String("ISSUED".to_string()))
+        );
     }
 
     #[test]
     fn parses_int_rhs() {
         let we = parse_one("wait job {\n    until = job.completed_steps == 10\n}");
-        assert_eq!(we.until_predicate.rhs, Value::Int(10));
+        assert_eq!(
+            we.until_predicate.rhs,
+            Value::Concrete(ConcreteValue::Int(10))
+        );
     }
 
     #[test]
     fn parses_bool_rhs() {
         let we = parse_one("wait flag {\n    until = flag.enabled == true\n}");
-        assert_eq!(we.until_predicate.rhs, Value::Bool(true));
+        assert_eq!(
+            we.until_predicate.rhs,
+            Value::Concrete(ConcreteValue::Bool(true))
+        );
     }
 
     #[test]

@@ -43,7 +43,7 @@ pub struct BackendLock {
 impl BackendLock {
     /// Build a lock snapshot from the current backend configuration.
     ///
-    /// Returns `Err` if any backend attribute holds a `Value::Unknown`
+    /// Returns `Err` if any backend attribute holds a `Value::Deferred(DeferredValue::Unknown)`
     /// — backend configurations cannot reference unresolved upstream
     /// values (RFC #2371 stage 4).
     pub fn from_config(
@@ -151,22 +151,26 @@ impl BackendLock {
 /// Convert a `carina_core::resource::Value` into a `serde_json::Value`
 /// for persistence in the lock file. Only scalar types are expected in
 /// backend configurations; complex types fall back to `null`. A
-/// `Value::Unknown` produces `Err` because backend configurations
+/// `Value::Deferred(DeferredValue::Unknown)` produces `Err` because backend configurations
 /// cannot reference unresolved upstream values.
 fn value_to_json(
     value: &carina_core::resource::Value,
 ) -> Result<serde_json::Value, carina_core::value::SerializationError> {
-    use carina_core::resource::Value;
+    use carina_core::resource::{ConcreteValue, DeferredValue, Value};
     use carina_core::value::{SerializationContext, SerializationError};
     match value {
-        Value::String(s) => Ok(serde_json::Value::String(s.clone())),
-        Value::Bool(b) => Ok(serde_json::Value::Bool(*b)),
-        Value::Int(i) => Ok(serde_json::Value::Number((*i).into())),
-        Value::Duration(d) => Ok(serde_json::Value::Number((d.as_secs() as i64).into())),
-        Value::Unknown(reason) => Err(SerializationError::UnknownNotAllowed {
-            reason: reason.clone(),
-            context: SerializationContext::BackendLock,
-        }),
+        Value::Concrete(ConcreteValue::String(s)) => Ok(serde_json::Value::String(s.clone())),
+        Value::Concrete(ConcreteValue::Bool(b)) => Ok(serde_json::Value::Bool(*b)),
+        Value::Concrete(ConcreteValue::Int(i)) => Ok(serde_json::Value::Number((*i).into())),
+        Value::Concrete(ConcreteValue::Duration(d)) => {
+            Ok(serde_json::Value::Number((d.as_secs() as i64).into()))
+        }
+        Value::Deferred(DeferredValue::Unknown(reason)) => {
+            Err(SerializationError::UnknownNotAllowed {
+                reason: reason.clone(),
+                context: SerializationContext::BackendLock,
+            })
+        }
         _ => Ok(serde_json::Value::Null),
     }
 }
@@ -174,13 +178,19 @@ fn value_to_json(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carina_core::resource::Value;
+    use carina_core::resource::{ConcreteValue, Value};
     use std::collections::HashMap;
 
     fn make_config(bucket: &str, region: &str) -> BackendConfig {
         let mut attributes = HashMap::new();
-        attributes.insert("bucket".to_string(), Value::String(bucket.to_string()));
-        attributes.insert("region".to_string(), Value::String(region.to_string()));
+        attributes.insert(
+            "bucket".to_string(),
+            Value::Concrete(ConcreteValue::String(bucket.to_string())),
+        );
+        attributes.insert(
+            "region".to_string(),
+            Value::Concrete(ConcreteValue::String(region.to_string())),
+        );
         BackendConfig {
             backend_type: "s3".to_string(),
             attributes,
@@ -304,15 +314,17 @@ mod tests {
     }
 
     /// RFC #2371 stage 4 contract pin: `value_to_json` returns
-    /// `Err(SerializationError::UnknownNotAllowed)` for `Value::Unknown`.
+    /// `Err(SerializationError::UnknownNotAllowed)` for `Value::Deferred(DeferredValue::Unknown)`.
     /// Backend lock files must never carry the variant (constraint b);
     /// a silent fallback would re-introduce v1-style corruption.
     #[test]
     fn unknown_returns_err_in_value_to_json() {
-        use carina_core::resource::{AccessPath, UnknownReason, Value};
+        use carina_core::resource::{AccessPath, DeferredValue, UnknownReason, Value};
         use carina_core::value::{SerializationContext, SerializationError};
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-        let v = Value::Unknown(UnknownReason::UpstreamRef { path: path.clone() });
+        let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+            path: path.clone(),
+        }));
         let err = value_to_json(&v).unwrap_err();
         match err {
             SerializationError::UnknownNotAllowed {

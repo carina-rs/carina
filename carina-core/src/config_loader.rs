@@ -142,7 +142,7 @@ pub fn load_configuration_with_config(
         // Per-file resolve_resource_refs_with_config (line 78) only sees
         // bindings within each file; cross-file dot-notation strings in
         // export_params (e.g., "registry_prod.account_id") remain as
-        // Value::String. This second pass converts them to ResourceRef.
+        // Value::Concrete(ConcreteValue::String). This second pass converts them to ResourceRef.
         if let Err(e) = parser::resolve_resource_refs_with_config(&mut merged, config) {
             return Err(e.to_string());
         }

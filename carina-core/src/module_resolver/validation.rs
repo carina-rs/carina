@@ -7,18 +7,18 @@
 use std::collections::HashMap;
 
 use crate::parser::{CompareOp, ValidateExpr};
-use crate::resource::Value;
+use crate::resource::{ConcreteValue, Value};
 
 /// Format a Value for use in error messages.
 pub(super) fn format_value_for_error(value: &Value) -> String {
     match value {
-        Value::String(s) => format!("\"{}\"", s),
-        Value::Int(n) => n.to_string(),
-        Value::Float(f) => f.to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Duration(d) => crate::value::render_duration(*d),
-        Value::List(items) => format!("[...] (length {})", items.len()),
-        Value::Map(map) => format!("{{...}} (length {})", map.len()),
+        Value::Concrete(ConcreteValue::String(s)) => format!("\"{}\"", s),
+        Value::Concrete(ConcreteValue::Int(n)) => n.to_string(),
+        Value::Concrete(ConcreteValue::Float(f)) => f.to_string(),
+        Value::Concrete(ConcreteValue::Bool(b)) => b.to_string(),
+        Value::Concrete(ConcreteValue::Duration(d)) => crate::value::render_duration(*d),
+        Value::Concrete(ConcreteValue::List(items)) => format!("[...] (length {})", items.len()),
+        Value::Concrete(ConcreteValue::Map(map)) => format!("{{...}} (length {})", map.len()),
         _ => format!("{:?}", value),
     }
 }
@@ -73,11 +73,13 @@ fn eval_validate(
         ValidateExpr::Var(name) => {
             if name == arg_name {
                 match arg_value {
-                    Value::Int(n) => Ok(ValidateValue::Int(*n)),
-                    Value::Float(f) => Ok(ValidateValue::Float(*f)),
-                    Value::Bool(b) => Ok(ValidateValue::Bool(*b)),
-                    Value::Duration(d) => Ok(ValidateValue::Duration(*d)),
-                    Value::String(s) => Ok(ValidateValue::String(s.clone())),
+                    Value::Concrete(ConcreteValue::Int(n)) => Ok(ValidateValue::Int(*n)),
+                    Value::Concrete(ConcreteValue::Float(f)) => Ok(ValidateValue::Float(*f)),
+                    Value::Concrete(ConcreteValue::Bool(b)) => Ok(ValidateValue::Bool(*b)),
+                    Value::Concrete(ConcreteValue::Duration(d)) => Ok(ValidateValue::Duration(*d)),
+                    Value::Concrete(ConcreteValue::String(s)) => {
+                        Ok(ValidateValue::String(s.clone()))
+                    }
                     other => Err(format!(
                         "unsupported value type for validation: {:?}",
                         other
@@ -224,9 +226,15 @@ fn eval_validate_function(
                 && var_name == arg_name
             {
                 return match arg_value {
-                    Value::String(s) => Ok(ValidateValue::Int(s.len() as i64)),
-                    Value::List(items) => Ok(ValidateValue::Int(items.len() as i64)),
-                    Value::Map(map) => Ok(ValidateValue::Int(map.len() as i64)),
+                    Value::Concrete(ConcreteValue::String(s)) => {
+                        Ok(ValidateValue::Int(s.len() as i64))
+                    }
+                    Value::Concrete(ConcreteValue::List(items)) => {
+                        Ok(ValidateValue::Int(items.len() as i64))
+                    }
+                    Value::Concrete(ConcreteValue::Map(map)) => {
+                        Ok(ValidateValue::Int(map.len() as i64))
+                    }
                     _ => Err(format!(
                         "{}() argument must be a string, list, or map",
                         name
@@ -292,11 +300,13 @@ fn eval_require(
         ValidateExpr::Var(name) => {
             if let Some(value) = args.get(name) {
                 match value {
-                    Value::Int(n) => Ok(RequireValue::Int(*n)),
-                    Value::Float(f) => Ok(RequireValue::Float(*f)),
-                    Value::Bool(b) => Ok(RequireValue::Bool(*b)),
-                    Value::Duration(d) => Ok(RequireValue::Duration(*d)),
-                    Value::String(s) => Ok(RequireValue::String(s.clone())),
+                    Value::Concrete(ConcreteValue::Int(n)) => Ok(RequireValue::Int(*n)),
+                    Value::Concrete(ConcreteValue::Float(f)) => Ok(RequireValue::Float(*f)),
+                    Value::Concrete(ConcreteValue::Bool(b)) => Ok(RequireValue::Bool(*b)),
+                    Value::Concrete(ConcreteValue::Duration(d)) => Ok(RequireValue::Duration(*d)),
+                    Value::Concrete(ConcreteValue::String(s)) => {
+                        Ok(RequireValue::String(s.clone()))
+                    }
                     other => Err(format!(
                         "unsupported value type for require expression: {:?}",
                         other
@@ -455,9 +465,15 @@ fn eval_require_function(
                 && let Some(value) = args.get(var_name)
             {
                 return match value {
-                    Value::String(s) => Ok(RequireValue::Int(s.len() as i64)),
-                    Value::List(items) => Ok(RequireValue::Int(items.len() as i64)),
-                    Value::Map(map) => Ok(RequireValue::Int(map.len() as i64)),
+                    Value::Concrete(ConcreteValue::String(s)) => {
+                        Ok(RequireValue::Int(s.len() as i64))
+                    }
+                    Value::Concrete(ConcreteValue::List(items)) => {
+                        Ok(RequireValue::Int(items.len() as i64))
+                    }
+                    Value::Concrete(ConcreteValue::Map(map)) => {
+                        Ok(RequireValue::Int(map.len() as i64))
+                    }
                     _ => Err(format!(
                         "{}() argument must be a string, list, or map",
                         name
