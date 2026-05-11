@@ -3852,6 +3852,135 @@ fn walk_custom_lookup_skips_value_unknown() {
 }
 
 // =====================================================================
+// awscc#217: `walk_custom_lookup` walked every Union member and pushed
+// every member's failure into the shared errors vec. A value that
+// validly matched one arm (an IPv4 CIDR like `10.0.0.0/8` matching the
+// `ipv4_cidr()` arm of `types::cidr()`) still surfaced the sibling
+// IPv6 arm's failure (`expected 8 groups, got 1`). Union semantics is
+// "any member accepts" — if one member emits no errors, the union
+// succeeds and sibling failures are discarded.
+// =====================================================================
+
+#[test]
+fn union_walk_custom_lookup_succeeds_when_any_member_accepts() {
+    // Custom-typed Union members: the host-side lookup approves one
+    // arm by name and rejects the other. The Union must succeed
+    // because the approving arm matches; the sibling's failure is
+    // discarded.
+    let custom = |name: &str| AttributeType::Custom {
+        base: Box::new(AttributeType::String),
+        validate: validator(|_v: &Value| Ok(())),
+        semantic_name: Some(name.to_string()),
+        namespace: None,
+        pattern: None,
+        length: None,
+        to_dsl: None,
+    };
+    let union = AttributeType::Union(vec![custom("ok_arm"), custom("fail_arm")]);
+
+    let lookup = |name: &str, _v: &Value| -> Result<(), TypeError> {
+        if name == "ok_arm" {
+            Ok(())
+        } else {
+            Err(TypeError::ValidationFailed {
+                message: format!("{name} rejects"),
+            })
+        }
+    };
+
+    let mut errors = Vec::new();
+    walk_custom_lookup(
+        &union,
+        &Value::Concrete(ConcreteValue::String("anything".to_string())),
+        "attr",
+        &lookup,
+        &mut errors,
+    );
+    assert!(
+        errors.is_empty(),
+        "Union must succeed when any member accepts; got errors: {errors:?}"
+    );
+}
+
+#[test]
+fn union_walk_custom_lookup_emits_smallest_error_set_when_all_fail() {
+    // Both arms fail. The Union must surface only one of the
+    // sibling failure sets (the smaller one if they differ), not the
+    // sum. Both arms emit a single error here, so the Union's error
+    // count must be 1, not 2.
+    let custom = |name: &str| AttributeType::Custom {
+        base: Box::new(AttributeType::String),
+        validate: validator(|_v: &Value| Ok(())),
+        semantic_name: Some(name.to_string()),
+        namespace: None,
+        pattern: None,
+        length: None,
+        to_dsl: None,
+    };
+    let union = AttributeType::Union(vec![custom("a"), custom("b")]);
+
+    let lookup = |name: &str, _v: &Value| -> Result<(), TypeError> {
+        Err(TypeError::ValidationFailed {
+            message: format!("{name} rejects"),
+        })
+    };
+
+    let mut errors = Vec::new();
+    walk_custom_lookup(
+        &union,
+        &Value::Concrete(ConcreteValue::String("anything".to_string())),
+        "attr",
+        &lookup,
+        &mut errors,
+    );
+    assert_eq!(
+        errors.len(),
+        1,
+        "Union must surface only the closest near-match, not the sum of all members"
+    );
+}
+
+#[test]
+fn union_walk_custom_lookup_cidr_accepts_ipv4_when_lookup_routes_correctly() {
+    // Regression for awscc#217. WASM-plugin schemas arrive with the
+    // schema-attached `Custom.validate` closure stripped (replaced by
+    // `noop_validator`); host-side validation runs through `lookup`
+    // by semantic_name. Models that: lookup approves `Ipv4Cidr` for
+    // `"10.0.0.0/8"` and rejects `Ipv6Cidr`. The Union must surface
+    // no errors — the previous loop would have pushed the IPv6
+    // rejection through anyway. This is the awscc#217 reproduction.
+    let cidr = AttributeType::Union(vec![types::ipv4_cidr(), types::ipv6_cidr()]);
+
+    let lookup = |name: &str, value: &Value| -> Result<(), TypeError> {
+        let Value::Concrete(ConcreteValue::String(s)) = value else {
+            return Ok(());
+        };
+        match name {
+            "Ipv4Cidr" => {
+                validate_ipv4_cidr(s).map_err(|message| TypeError::ValidationFailed { message })
+            }
+            "Ipv6Cidr" => {
+                validate_ipv6_cidr(s).map_err(|message| TypeError::ValidationFailed { message })
+            }
+            _ => Ok(()),
+        }
+    };
+
+    let mut errors = Vec::new();
+    walk_custom_lookup(
+        &cidr,
+        &Value::Concrete(ConcreteValue::String("10.0.0.0/8".to_string())),
+        "cidr",
+        &lookup,
+        &mut errors,
+    );
+    assert!(
+        errors.is_empty(),
+        "Union<ipv4_cidr, ipv6_cidr> must accept `10.0.0.0/8`; got: {errors:?}"
+    );
+}
+
+// =====================================================================
 // carina#2831: `StringEnum.dsl_aliases` is the data form that survives
 // the WASM-component boundary, replacing the closure-based `to_dsl`
 // pointer that could not. The validator must accept both the API
