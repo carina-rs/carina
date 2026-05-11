@@ -670,6 +670,7 @@ fn walk_value_against_type(
             }
         }
         Value::Concrete(ConcreteValue::String(_))
+        | Value::Concrete(ConcreteValue::EnumIdentifier(_))
         | Value::Concrete(ConcreteValue::Int(_))
         | Value::Concrete(ConcreteValue::Float(_))
         | Value::Concrete(ConcreteValue::Bool(_))

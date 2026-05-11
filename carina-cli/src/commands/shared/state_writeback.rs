@@ -161,7 +161,10 @@ pub(crate) fn dsl_value_to_json(
     use carina_core::value::{SerializationContext, SerializationError};
     let ctx = SerializationContext::StateWriteback;
     match value {
-        Value::Concrete(ConcreteValue::String(s)) => Ok(Some(serde_json::Value::String(s.clone()))),
+        Value::Concrete(ConcreteValue::String(s))
+        | Value::Concrete(ConcreteValue::EnumIdentifier(s)) => {
+            Ok(Some(serde_json::Value::String(s.clone())))
+        }
         Value::Concrete(ConcreteValue::Bool(b)) => Ok(Some(serde_json::Value::Bool(*b))),
         Value::Concrete(ConcreteValue::Int(i)) => Ok(Some(serde_json::Value::Number((*i).into()))),
         Value::Concrete(ConcreteValue::Float(f)) => {

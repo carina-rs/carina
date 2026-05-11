@@ -47,7 +47,13 @@ use crate::wasm_bindings::carina::provider::types as wit;
 /// equivalent to the pre-#2387 `ResourceRef` debug-string.
 pub fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, SerializationError> {
     match v {
-        CoreValue::Concrete(ConcreteValue::String(s)) => Ok(wit::Value::StrVal(s.clone())),
+        CoreValue::Concrete(ConcreteValue::String(s))
+        | CoreValue::Concrete(ConcreteValue::EnumIdentifier(s)) => {
+            // Enum identifiers lower to the WIT boundary as plain
+            // strings — the WASM plugin sees the same wire shape as
+            // any other string value. See carina#2986.
+            Ok(wit::Value::StrVal(s.clone()))
+        }
         CoreValue::Concrete(ConcreteValue::Int(i)) => Ok(wit::Value::IntVal(*i)),
         CoreValue::Concrete(ConcreteValue::Float(f)) => Ok(wit::Value::FloatVal(*f)),
         CoreValue::Concrete(ConcreteValue::Bool(b)) => Ok(wit::Value::BoolVal(*b)),
@@ -179,7 +185,10 @@ pub fn wit_to_core_value(v: &wit::Value) -> CoreValue {
 /// pass that keeps these arms unreachable in legitimate flows.
 fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationError> {
     match v {
-        CoreValue::Concrete(ConcreteValue::String(s)) => Ok(serde_json::Value::String(s.clone())),
+        CoreValue::Concrete(ConcreteValue::String(s))
+        | CoreValue::Concrete(ConcreteValue::EnumIdentifier(s)) => {
+            Ok(serde_json::Value::String(s.clone()))
+        }
         CoreValue::Concrete(ConcreteValue::Int(i)) => Ok(serde_json::Value::Number((*i).into())),
         CoreValue::Concrete(ConcreteValue::Float(f)) => Ok(serde_json::Number::from_f64(*f)
             .map(serde_json::Value::Number)
