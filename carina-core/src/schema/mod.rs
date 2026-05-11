@@ -197,8 +197,32 @@ fn walk_custom_lookup(
             }
         }
         AttributeType::Union(members) => {
+            // Union semantics: a value is valid if *any* member accepts
+            // it. The previous loop walked every member and pushed
+            // every error, so a value that legitimately matched one arm
+            // (e.g. an IPv4 CIDR like `"10.0.0.0/8"` matching
+            // `ipv4_cidr()` inside `types::cidr()`) still surfaced the
+            // failure from the sibling IPv6 arm's validator. See
+            // awscc#217.
+            //
+            // Walk every member into a local buffer; if any member
+            // emits no errors the Union succeeds and the sibling
+            // failures are discarded. If every member fails, keep the
+            // smallest error set so the user-facing diagnostic stays
+            // pointed at the closest near-match.
+            let mut best: Option<Vec<TypeError>> = None;
             for member in members {
-                walk_custom_lookup(member, value, attr_name, lookup, errors);
+                let mut local = Vec::new();
+                walk_custom_lookup(member, value, attr_name, lookup, &mut local);
+                if local.is_empty() {
+                    return;
+                }
+                if best.as_ref().is_none_or(|b| local.len() < b.len()) {
+                    best = Some(local);
+                }
+            }
+            if let Some(b) = best {
+                errors.extend(b);
             }
         }
         AttributeType::String
