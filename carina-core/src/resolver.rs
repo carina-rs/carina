@@ -524,7 +524,7 @@ mod tests {
     #[test]
     fn test_resolve_subscript_descends_into_secret_wrapped_list() {
         // Symmetric with the map test: `Value::Secret(Box::new(
-        // Value::List(...)))` + integer subscript projects the element
+        // Value::Concrete(ConcreteValue::List(...))))` + integer subscript projects the element
         // and re-wraps the leaf as `Value::Secret`.
         let bindings = bindings_from(vec![(
             "secret_holder",
@@ -532,8 +532,8 @@ mod tests {
                 "tokens",
                 Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
                     ConcreteValue::List(vec![
-                        Value::String("alpha".to_string()),
-                        Value::String("beta".to_string()),
+                        Value::Concrete(ConcreteValue::String("alpha".to_string())),
+                        Value::Concrete(ConcreteValue::String("beta".to_string())),
                     ]),
                 )))),
             )],
@@ -606,7 +606,7 @@ mod tests {
             vec![(
                 "creds",
                 Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
-                    DeferredValue::Secret(Box::new(Value::Map(map))),
+                    DeferredValue::Secret(Box::new(Value::Concrete(ConcreteValue::Map(map)))),
                 )))),
             )],
         )]);
@@ -623,7 +623,9 @@ mod tests {
         assert_eq!(
             resolved,
             Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
-                DeferredValue::Secret(Box::new(Value::String("v".to_string())))
+                DeferredValue::Secret(Box::new(Value::Concrete(ConcreteValue::String(
+                    "v".to_string()
+                ))))
             )))),
         );
     }
@@ -640,7 +642,9 @@ mod tests {
             vec![(
                 "tokens",
                 Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::List(vec![Value::String("only".to_string())]),
+                    ConcreteValue::List(vec![Value::Concrete(ConcreteValue::String(
+                        "only".to_string(),
+                    ))]),
                 )))),
             )],
         )]);
@@ -1120,9 +1124,9 @@ mod tests {
             args: vec![
                 Value::Concrete(ConcreteValue::String("-".to_string())),
                 Value::Concrete(ConcreteValue::List(vec![
-                    Value::String("a".to_string()),
-                    Value::String("b".to_string()),
-                    Value::String("c".to_string()),
+                    Value::Concrete(ConcreteValue::String("a".to_string())),
+                    Value::Concrete(ConcreteValue::String("b".to_string())),
+                    Value::Concrete(ConcreteValue::String("c".to_string())),
                 ])),
             ],
         });
@@ -1150,7 +1154,7 @@ mod tests {
             args: vec![
                 Value::Concrete(ConcreteValue::String("-".to_string())),
                 Value::Concrete(ConcreteValue::List(vec![
-                    Value::String("prefix".to_string()),
+                    Value::Concrete(ConcreteValue::String("prefix".to_string())),
                     Value::resource_ref("vpc".to_string(), "id".to_string(), vec![]),
                 ])),
             ],

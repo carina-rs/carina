@@ -24,7 +24,9 @@ pub(crate) fn builtin_keys(args: &[Value]) -> Result<Value, String> {
             let mut keys: Vec<String> = map.keys().cloned().collect();
             keys.sort();
             Ok(Value::Concrete(ConcreteValue::List(
-                keys.into_iter().map(Value::String).collect(),
+                keys.into_iter()
+                    .map(|s| Value::Concrete(ConcreteValue::String(s)))
+                    .collect(),
             )))
         }
         other => Err(format!(

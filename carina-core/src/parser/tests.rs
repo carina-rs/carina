@@ -1756,8 +1756,8 @@ fn join_with_multiple_pipes() {
                 args: vec![
                     Value::Concrete(ConcreteValue::String("-".to_string())),
                     Value::Concrete(ConcreteValue::List(vec![
-                        Value::String("a".to_string()),
-                        Value::String("b".to_string()),
+                        Value::Concrete(ConcreteValue::String("a".to_string())),
+                        Value::Concrete(ConcreteValue::String("b".to_string())),
                     ])),
                 ],
             })],

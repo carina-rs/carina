@@ -850,15 +850,15 @@ mod tests {
                 (
                     "tags".to_string(),
                     CoreValue::Concrete(ConcreteValue::List(vec![
-                        CoreValue::String("a".into()),
-                        CoreValue::String("b".into()),
+                        CoreValue::Concrete(ConcreteValue::String("a".into())),
+                        CoreValue::Concrete(ConcreteValue::String("b".into())),
                     ])),
                 ),
                 (
                     "counts".to_string(),
                     CoreValue::Concrete(ConcreteValue::List(vec![
-                        CoreValue::Int(1),
-                        CoreValue::Int(2),
+                        CoreValue::Concrete(ConcreteValue::Int(1)),
+                        CoreValue::Concrete(ConcreteValue::Int(2)),
                     ])),
                 ),
             ]
@@ -1004,7 +1004,9 @@ mod tests {
         // *attribute*-level secret signal goes through `secret-val` via
         // `core_to_wit_value`, not this path.
         let v = CoreValue::Concrete(ConcreteValue::List(vec![CoreValue::Deferred(
-            DeferredValue::Secret(Box::new(CoreValue::String("p".into()))),
+            DeferredValue::Secret(Box::new(CoreValue::Concrete(ConcreteValue::String(
+                "p".into(),
+            )))),
         )]));
         let wit_v = core_to_wit_value(&v).unwrap();
         match wit_v {
@@ -1200,12 +1202,12 @@ mod tests {
                 CorePatchOp {
                     kind: CorePatchOpKind::Add,
                     key: "a".to_string(),
-                    value: Some(CV::String("alpha".into())),
+                    value: Some(CV::Concrete(ConcreteValue::String("alpha".into()))),
                 },
                 CorePatchOp {
                     kind: CorePatchOpKind::Replace,
                     key: "b".to_string(),
-                    value: Some(CV::Int(42)),
+                    value: Some(CV::Concrete(ConcreteValue::Int(42))),
                 },
                 CorePatchOp {
                     kind: CorePatchOpKind::Remove,
@@ -1427,17 +1429,27 @@ mod tests {
                 ),
                 (
                     "statement".to_string(),
-                    CoreValue::Concrete(ConcreteValue::List(vec![CoreValue::Map(
-                        vec![
-                            ("effect".to_string(), CoreValue::String("Allow".into())),
-                            (
-                                "action".to_string(),
-                                CoreValue::String("logs:CreateLogGroup".into()),
-                            ),
-                            ("resource".to_string(), CoreValue::String("*".into())),
-                        ]
-                        .into_iter()
-                        .collect(),
+                    CoreValue::Concrete(ConcreteValue::List(vec![CoreValue::Concrete(
+                        ConcreteValue::Map(
+                            vec![
+                                (
+                                    "effect".to_string(),
+                                    CoreValue::Concrete(ConcreteValue::String("Allow".into())),
+                                ),
+                                (
+                                    "action".to_string(),
+                                    CoreValue::Concrete(ConcreteValue::String(
+                                        "logs:CreateLogGroup".into(),
+                                    )),
+                                ),
+                                (
+                                    "resource".to_string(),
+                                    CoreValue::Concrete(ConcreteValue::String("*".into())),
+                                ),
+                            ]
+                            .into_iter()
+                            .collect(),
+                        ),
                     )])),
                 ),
             ]
@@ -1449,7 +1461,7 @@ mod tests {
                 vec![
                     (
                         "policy_name".to_string(),
-                        CoreValue::String("test-policy".into()),
+                        CoreValue::Concrete(ConcreteValue::String("test-policy".into())),
                     ),
                     ("policy_document".to_string(), policy_document),
                 ]

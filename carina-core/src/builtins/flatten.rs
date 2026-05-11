@@ -150,7 +150,10 @@ mod tests {
         let args = vec![Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
             ConcreteValue::List(vec![
                 Value::Concrete(ConcreteValue::Int(1)),
-                Value::Concrete(ConcreteValue::List(vec![Value::Int(2), Value::Int(3)])),
+                Value::Concrete(ConcreteValue::List(vec![
+                    Value::Concrete(ConcreteValue::Int(2)),
+                    Value::Concrete(ConcreteValue::Int(3)),
+                ])),
             ]),
         )]))];
         let result = evaluate_builtin("flatten", &args).unwrap();

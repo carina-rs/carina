@@ -466,57 +466,6 @@ pub enum DeferredValue {
     Unknown(UnknownReason),
 }
 
-/// Backward-compatible variant constructors. Call sites can write
-/// `Value::String(s)` etc. exactly as in the pre-Phase-5 flat enum;
-/// pattern positions descend through `Value::Concrete(ConcreteValue::X(...))`.
-#[allow(non_snake_case)]
-impl Value {
-    #[inline]
-    pub fn String(s: String) -> Self {
-        Value::Concrete(ConcreteValue::String(s))
-    }
-    #[inline]
-    pub fn Int(n: i64) -> Self {
-        Value::Concrete(ConcreteValue::Int(n))
-    }
-    #[inline]
-    pub fn Float(f: f64) -> Self {
-        Value::Concrete(ConcreteValue::Float(f))
-    }
-    #[inline]
-    pub fn Bool(b: bool) -> Self {
-        Value::Concrete(ConcreteValue::Bool(b))
-    }
-    #[inline]
-    pub fn Duration(d: std::time::Duration) -> Self {
-        Value::Concrete(ConcreteValue::Duration(d))
-    }
-    #[inline]
-    pub fn List(items: Vec<Value>) -> Self {
-        Value::Concrete(ConcreteValue::List(items))
-    }
-    #[inline]
-    pub fn StringList(items: Vec<String>) -> Self {
-        Value::Concrete(ConcreteValue::StringList(items))
-    }
-    #[inline]
-    pub fn Map(map: IndexMap<String, Value>) -> Self {
-        Value::Concrete(ConcreteValue::Map(map))
-    }
-    #[inline]
-    pub fn Interpolation(parts: Vec<InterpolationPart>) -> Self {
-        Value::Deferred(DeferredValue::Interpolation(parts))
-    }
-    #[inline]
-    pub fn Secret(inner: Box<Value>) -> Self {
-        Value::Deferred(DeferredValue::Secret(inner))
-    }
-    #[inline]
-    pub fn Unknown(reason: UnknownReason) -> Self {
-        Value::Deferred(DeferredValue::Unknown(reason))
-    }
-}
-
 /// Borrowing projection of [`Value`] restricted to the **concrete** axis
 /// — variants that carry their own runtime type and are safe to type-check
 /// at validate time.

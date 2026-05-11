@@ -557,7 +557,10 @@ pub fn merge_default_tags_for_provider(
             resource.set_attr(
                 "_default_tag_keys".to_string(),
                 Value::Concrete(ConcreteValue::List(
-                    default_tag_keys.into_iter().map(Value::String).collect(),
+                    default_tag_keys
+                        .into_iter()
+                        .map(|s| Value::Concrete(ConcreteValue::String(s)))
+                        .collect(),
                 )),
             );
         }
@@ -875,8 +878,10 @@ fn collect_validators_from_type(
             validators.entry(snake_name).or_insert_with(|| {
                 let validate_fn = validate.clone();
                 Box::new(move |s: &str| {
-                    validate_fn(&crate::resource::Value::String(s.to_string()))
-                        .map_err(|e| e.to_string())
+                    validate_fn(&crate::resource::Value::Concrete(
+                        crate::resource::ConcreteValue::String(s.to_string()),
+                    ))
+                    .map_err(|e| e.to_string())
                 })
             });
         }
