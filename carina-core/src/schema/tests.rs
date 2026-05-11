@@ -3989,3 +3989,135 @@ fn dsl_aliases_empty_keeps_api_only_validation() {
             .is_err()
     );
 }
+
+// #2978 — collision between a `let` binding name and a `StringEnum`
+// DSL alias. The parser resolves a bare identifier to the binding
+// first (see parser/expressions/primary.rs:367-374), producing a
+// `Value::Deferred(DeferredValue::BindingRef { binding: "vpc" })` for
+// the attribute value. Without the dedicated check, the deferred value
+// flows past `validate` and only surfaces later as a `${vpc}`-style
+// error from the resolver, which is hard to diagnose. Pin the
+// behavior here so a regression on the `validate` side is visible
+// without round-tripping through plan execution.
+mod string_enum_binding_collision {
+    use super::*;
+    use crate::resource::DeferredValue;
+
+    fn flow_log_resource_type() -> AttributeType {
+        // Mirrors the awscc.ec2.FlowLog.ResourceType enum that
+        // surfaced the issue. The `"vpc"` alias is what collides with
+        // a `let vpc = ...` binding name in real fixtures.
+        AttributeType::StringEnum {
+            name: "ResourceType".to_string(),
+            values: vec![
+                "NetworkInterface".to_string(),
+                "Subnet".to_string(),
+                "VPC".to_string(),
+            ],
+            namespace: Some("awscc.ec2.FlowLog".to_string()),
+            dsl_aliases: vec![
+                (
+                    "NetworkInterface".to_string(),
+                    "network_interface".to_string(),
+                ),
+                ("Subnet".to_string(), "subnet".to_string()),
+                ("VPC".to_string(), "vpc".to_string()),
+            ],
+        }
+    }
+
+    #[test]
+    fn bare_binding_matching_dsl_alias_is_rejected() {
+        let t = flow_log_resource_type();
+        // `let vpc = ...` in scope → parser hands the validator a
+        // `BindingRef("vpc")` for `resource_type = vpc`.
+        let value = Value::Deferred(DeferredValue::BindingRef {
+            binding: "vpc".to_string(),
+        });
+        let err = t.validate(&value).unwrap_err();
+        let TypeError::ValidationFailed { message } = err else {
+            panic!("expected ValidationFailed, got {:?}", err);
+        };
+        assert!(
+            message.contains("shadowed by a `let` binding"),
+            "message did not mention the shadowing rule: {message}"
+        );
+        // Suggest the type-qualified form using the DSL spelling.
+        assert!(
+            message.contains("ResourceType.vpc"),
+            "missing type-qualified suggestion: {message}"
+        );
+        // And the fully qualified form.
+        assert!(
+            message.contains("awscc.ec2.FlowLog.ResourceType.vpc"),
+            "missing fully-qualified suggestion: {message}"
+        );
+        // And the quoted-string escape hatch.
+        assert!(
+            message.contains("'vpc'"),
+            "missing quoted-string suggestion: {message}"
+        );
+    }
+
+    #[test]
+    fn bare_binding_matching_canonical_value_is_rejected() {
+        // Same trap, hit through the canonical spelling rather than
+        // the alias: `let VPC = ...` would collide with the `"VPC"`
+        // value directly.
+        let t = flow_log_resource_type();
+        let value = Value::Deferred(DeferredValue::BindingRef {
+            binding: "VPC".to_string(),
+        });
+        let err = t.validate(&value).unwrap_err();
+        let TypeError::ValidationFailed { message } = err else {
+            panic!("expected ValidationFailed, got {:?}", err);
+        };
+        assert!(message.contains("shadowed by a `let` binding"), "{message}");
+    }
+
+    #[test]
+    fn bare_binding_not_matching_alias_passes_through_validate() {
+        // `let some_other_name = ...` does not match any DSL alias for
+        // ResourceType, so it is not the collision case. `validate`
+        // must stay quiet at this layer; the deferred-aware resolver
+        // can still surface other errors downstream.
+        let t = flow_log_resource_type();
+        let value = Value::Deferred(DeferredValue::BindingRef {
+            binding: "some_other_name".to_string(),
+        });
+        assert!(t.validate(&value).is_ok());
+    }
+
+    #[test]
+    fn collision_check_only_fires_on_string_enum() {
+        // Other AttributeType kinds (e.g., String) must not be
+        // affected by the collision check — many of them legitimately
+        // accept a `BindingRef`.
+        let t = AttributeType::String;
+        let value = Value::Deferred(DeferredValue::BindingRef {
+            binding: "vpc".to_string(),
+        });
+        assert!(t.validate(&value).is_ok());
+    }
+
+    #[test]
+    fn explicit_quoted_string_still_passes() {
+        // `attribute = 'vpc'` reaches the validator as a plain
+        // concrete string, unrelated to the binding-collision branch.
+        // Must validate as a normal DSL alias.
+        let t = flow_log_resource_type();
+        let value = Value::Concrete(ConcreteValue::String("vpc".to_string()));
+        assert!(t.validate(&value).is_ok());
+    }
+
+    #[test]
+    fn fully_qualified_form_still_passes() {
+        // `attribute = awscc.ec2.FlowLog.ResourceType.vpc` reaches the
+        // validator as a concrete string in fully-qualified form.
+        let t = flow_log_resource_type();
+        let value = Value::Concrete(ConcreteValue::String(
+            "awscc.ec2.FlowLog.ResourceType.vpc".to_string(),
+        ));
+        assert!(t.validate(&value).is_ok());
+    }
+}
