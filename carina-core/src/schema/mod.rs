@@ -974,7 +974,24 @@ impl AttributeType {
             let matches_alias = dsl_aliases
                 .iter()
                 .any(|(_api, dsl)| string_enum_value_matches(variant, dsl));
-            if matches_canonical || matches_alias {
+            // DSL surface convention is snake_case (see
+            // `feedback_dsl_enum_snake_case_convention.md`). When an
+            // enum has a `dsl_aliases` entry that rewrites its API
+            // spelling (e.g. `("-1", "all")`, `("VPC", "vpc")`,
+            // `("BucketOwnerEnforced", "bucket_owner_enforced")`),
+            // the validator must reject the API form on DSL input —
+            // the user is supposed to write the DSL spelling. An
+            // enum whose `dsl_aliases` table is empty (or whose
+            // matched value has no rewrite registered) keeps the
+            // canonical fall-through enabled, so the change is a
+            // no-op until codegen populates the table per enum.
+            //
+            // See carina#2980 for the full sweep plan.
+            let rewritten_by_alias = dsl_aliases
+                .iter()
+                .any(|(api, dsl)| api != dsl && string_enum_value_matches(variant, api));
+            let canonical_ok = matches_canonical && !rewritten_by_alias;
+            if matches_alias || canonical_ok {
                 Ok(())
             } else {
                 // Aliases from `dsl_aliases` are tagged `is_alias = true`

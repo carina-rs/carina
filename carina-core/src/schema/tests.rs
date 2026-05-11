@@ -92,10 +92,12 @@ fn validate_string_enum_accepts_dsl_alias() {
         namespace: Some("awscc.ec2.SecurityGroup".to_string()),
         dsl_aliases: vec![("-1".to_string(), "all".to_string())],
     };
-    // Canonical value "-1" should be accepted
+    // Canonical "-1" is rewritten to DSL "all" — the DSL surface must
+    // not accept the API form when an alias is registered. Users
+    // write `all`. Updated for carina#2980.
     assert!(
         t.validate(&Value::Concrete(ConcreteValue::String("-1".to_string())))
-            .is_ok()
+            .is_err()
     );
     // DSL alias "all" should be accepted
     assert!(
@@ -104,7 +106,9 @@ fn validate_string_enum_accepts_dsl_alias() {
         )))
         .is_ok()
     );
-    // Other canonical values should still work
+    // Other canonical values without an alias rewrite (e.g. `tcp`,
+    // which is already snake_case) keep working — the API spelling
+    // *is* the DSL spelling for them.
     assert!(
         t.validate(&Value::Concrete(ConcreteValue::String("tcp".to_string())))
             .is_ok()
@@ -3990,11 +3994,18 @@ fn union_walk_custom_lookup_cidr_accepts_ipv4_when_lookup_routes_correctly() {
 // =====================================================================
 
 #[test]
-fn dsl_aliases_validator_accepts_both_api_and_dsl_spellings() {
-    // Pinned to the awscc#199 / aws#247 reproducer:
-    // `object_ownership = bucket_owner_enforced` was rejected because
-    // the WASM-loaded schema lost the alias map. With the data form the
-    // host validator sees both spellings.
+fn dsl_aliases_validator_accepts_dsl_spellings_only() {
+    // Updated for carina#2980: once `dsl_aliases` is non-empty for an
+    // enum, the validator is strict — only the DSL (snake_case) side
+    // of an `(api, dsl)` pair is accepted on input. Pre-#2980 the
+    // bare API spelling (`BucketOwnerEnforced`) was also accepted;
+    // that path is gone so users cannot ship fixtures using the AWS
+    // canonical spelling and have CI pass anyway.
+    //
+    // Original awscc#199 / aws#247 case still works: the fully- and
+    // bare-DSL forms (`bucket_owner_enforced`,
+    // `awscc.s3.Bucket.ObjectOwnership.bucket_owner_enforced`) are
+    // accepted.
     let t = AttributeType::StringEnum {
         name: "ObjectOwnership".to_string(),
         values: vec![
@@ -4016,13 +4027,18 @@ fn dsl_aliases_validator_accepts_both_api_and_dsl_spellings() {
         ],
     };
 
-    // Bare API spelling: accepted (canonical).
-    assert!(
-        t.validate(&Value::Concrete(ConcreteValue::String(
-            "BucketOwnerEnforced".to_string()
+    // Bare API spelling: REJECTED under strict mode.
+    let err = t
+        .validate(&Value::Concrete(ConcreteValue::String(
+            "BucketOwnerEnforced".to_string(),
         )))
-        .is_ok()
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("bucket_owner_enforced"),
+        "diagnostic must point users at the DSL spelling, got: {msg}"
     );
+
     // Bare DSL spelling: accepted (alias).
     assert!(
         t.validate(&Value::Concrete(ConcreteValue::String(
@@ -4030,12 +4046,12 @@ fn dsl_aliases_validator_accepts_both_api_and_dsl_spellings() {
         )))
         .is_ok()
     );
-    // Fully-qualified API spelling: accepted.
+    // Fully-qualified API spelling: REJECTED under strict mode.
     assert!(
         t.validate(&Value::Concrete(ConcreteValue::String(
             "awscc.s3.Bucket.ObjectOwnership.BucketOwnerEnforced".to_string()
         )))
-        .is_ok()
+        .is_err()
     );
     // Fully-qualified DSL spelling: accepted (the awscc#199 case).
     assert!(
@@ -4044,7 +4060,10 @@ fn dsl_aliases_validator_accepts_both_api_and_dsl_spellings() {
         )))
         .is_ok()
     );
-    // An unrelated value: rejected, with both spellings listed.
+
+    // An unrelated value: rejected, with both spellings still
+    // listed for context (the API spelling is what the AWS docs show,
+    // the DSL spelling is what `validate` accepts).
     let err = t
         .validate(&Value::Concrete(ConcreteValue::String(
             "garbage".to_string(),
@@ -4058,6 +4077,31 @@ fn dsl_aliases_validator_accepts_both_api_and_dsl_spellings() {
     assert!(
         msg.contains("bucket_owner_enforced"),
         "diagnostic must list the DSL spelling, got: {msg}"
+    );
+}
+
+#[test]
+fn enum_without_dsl_aliases_accepts_api_spelling_as_before() {
+    // An enum where codegen has not yet populated `dsl_aliases`
+    // (e.g. a newly added resource pending the carina#2980 sweep)
+    // keeps the pre-#2980 behavior: API canonical spellings are
+    // accepted via the `values` list. This is the staged-migration
+    // hook — strictness flips on per enum as codegen populates the
+    // table, so a partial sweep never breaks compilation.
+    let t = AttributeType::StringEnum {
+        name: "TrafficType".to_string(),
+        values: vec![
+            "ACCEPT".to_string(),
+            "REJECT".to_string(),
+            "ALL".to_string(),
+        ],
+        namespace: Some("aws.ec2.FlowLog".to_string()),
+        dsl_aliases: vec![],
+    };
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String("ALL".to_string())))
+            .is_ok(),
+        "lax mode (empty dsl_aliases) accepts API canonical"
     );
 }
 
