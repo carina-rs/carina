@@ -2036,6 +2036,138 @@ fn validate_export_param_ref_types_against_inferred_inputs() {
     assert!(result.is_ok(), "got {:?}", result);
 }
 
+/// Issue #2954 acceptance. A `Value::ResourceRef` whose receiver is a
+/// `List<String>` attribute (e.g. `resource_records = registry_dev.nameservers`
+/// against `aws.route53.RecordSet.resource_records: List<String>`) must
+/// not be rejected by `validate_resources`. Pre-Phase-2 the schema-level
+/// `validate_list` returned `Type mismatch: expected List<String>, got
+/// ResourceRef(...)`. Phase 2 (RFC #2972) makes the validate dispatcher
+/// project `&Value` through `as_concrete()` so deferred values like
+/// `ResourceRef` cannot reach `validate_list` by construction — the
+/// type-fitness check for upstream-typed refs is the deferred-aware
+/// checker's job (`check_upstream_state_field_types`).
+#[test]
+fn validate_resources_accepts_resource_ref_in_list_position() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        make_schema(
+            "route53.RecordSet",
+            vec![(
+                "resource_records",
+                AttributeType::list(AttributeType::String),
+            )],
+        ),
+    );
+
+    let record_set = Resource::with_provider("aws", "route53.RecordSet", "ns").with_attribute(
+        "resource_records",
+        Value::resource_ref(
+            "registry_dev".to_string(),
+            "nameservers".to_string(),
+            vec![],
+        ),
+    );
+
+    let mut known = HashSet::new();
+    known.insert("aws".to_string());
+
+    let mut parsed = empty_parsed();
+    parsed.resources.push(record_set); // allow: direct — fixture test inspection
+    let result = validate_resources(&parsed, &schemas, &known, &ProviderContext::default());
+    assert!(
+        result.is_ok(),
+        "ResourceRef in List<String> position must not produce a schema-level \
+         type mismatch (#2954), got: {:?}",
+        result
+    );
+}
+
+/// Sibling of `..._in_list_position`: same invariant for a struct
+/// **field** position. `collect_struct` previously skipped
+/// `Value::ResourceRef` per-field with an explicit `matches!` guard;
+/// Phase 2 (RFC #2972) removed it because `collect_into` now projects
+/// each field through `as_concrete()` and short-circuits on `None`.
+/// This test pins the resulting behavior end-to-end.
+#[test]
+fn validate_resources_accepts_resource_ref_in_struct_field_position() {
+    use crate::schema::StructField;
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        make_schema(
+            "test.StructHolder",
+            vec![(
+                "config",
+                AttributeType::Struct {
+                    name: "Config".to_string(),
+                    fields: vec![StructField::new("name", AttributeType::String)],
+                },
+            )],
+        ),
+    );
+
+    let mut config = IndexMap::new();
+    config.insert(
+        "name".to_string(),
+        Value::resource_ref("vpc".to_string(), "name".to_string(), vec![]),
+    );
+
+    let holder = Resource::with_provider("aws", "test.StructHolder", "h")
+        .with_attribute("config", Value::Map(config));
+
+    let mut known = HashSet::new();
+    known.insert("aws".to_string());
+
+    let mut parsed = empty_parsed();
+    parsed.resources.push(holder); // allow: direct — fixture test inspection
+    let result = validate_resources(&parsed, &schemas, &known, &ProviderContext::default());
+    assert!(
+        result.is_ok(),
+        "ResourceRef in Struct field position must not produce a schema-level type \
+         mismatch (#2954), got: {:?}",
+        result
+    );
+}
+
+/// Sibling of `..._in_list_position`: same invariant for `Map<K,V>`.
+#[test]
+fn validate_resources_accepts_resource_ref_in_map_position() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        make_schema(
+            "test.MapHolder",
+            vec![(
+                "tags",
+                AttributeType::Map {
+                    key: Box::new(AttributeType::String),
+                    value: Box::new(AttributeType::String),
+                },
+            )],
+        ),
+    );
+
+    let holder = Resource::with_provider("aws", "test.MapHolder", "h").with_attribute(
+        "tags",
+        Value::resource_ref("orgs".to_string(), "tag_map".to_string(), vec![]),
+    );
+
+    let mut known = HashSet::new();
+    known.insert("aws".to_string());
+
+    let mut parsed = empty_parsed();
+    parsed.resources.push(holder); // allow: direct — fixture test inspection
+    let result = validate_resources(&parsed, &schemas, &known, &ProviderContext::default());
+    assert!(
+        result.is_ok(),
+        "ResourceRef in Map position must not produce a schema-level type mismatch \
+         (#2954), got: {:?}",
+        result
+    );
+}
+
 /// `validate_resources` must reject a resource whose schema declares an
 /// `exclusive_required` group that is not satisfied — mirrors
 /// `awscc.ec2.Vpc {}` with no cidr_block / ipam pool.

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 
-use crate::resource::{Resource, Value};
+use crate::resource::{ConcreteValueRef, Resource, Value};
 use crate::utils::{extract_enum_value_with_values, validate_enum_namespace};
 use crate::value::format_value_with_key;
 
@@ -500,11 +500,21 @@ impl AttributeType {
         }
     }
 
-    fn resolve_enum_input(name: &str, namespace: Option<&str>, value: &Value) -> Value {
-        if matches!(value, Value::ResourceRef { .. }) {
-            return value.clone();
-        }
-        crate::utils::expand_enum_shorthand(value, name, namespace)
+    /// Lift a [`ConcreteValueRef`] into an owned [`Value`] and run
+    /// `expand_enum_shorthand` on it. Returns `Value` because
+    /// `expand_enum_shorthand` is the existing backbone for namespaced
+    /// enum normalization and operates on owned `Value`.
+    ///
+    /// Phase 2 of RFC #2972: the pre-Phase-2 `ResourceRef` short-circuit
+    /// is gone — deferred values are filtered by the dispatcher in
+    /// [`Self::validate`] and cannot reach this path.
+    fn resolve_enum_input(
+        name: &str,
+        namespace: Option<&str>,
+        value: ConcreteValueRef<'_>,
+    ) -> Value {
+        let owned = value.to_owned_value();
+        crate::utils::expand_enum_shorthand(&owned, name, namespace)
     }
 
     pub fn string_enum_parts(&self) -> Option<StringEnumParts<'_>> {
@@ -544,22 +554,30 @@ impl AttributeType {
 
     /// Check if a value conforms to this type.
     ///
-    /// Top-level dispatcher: each `AttributeType` variant has its own
-    /// `validate_*` helper. Values that resolve at runtime
-    /// (`Value::FunctionCall`, `Value::Secret`) bypass validation here so
-    /// every per-variant helper can assume it is dealing with a concrete
-    /// value (or one of the variant-specific dynamic shapes like
-    /// `ResourceRef`/`Interpolation` that the helpers handle individually).
+    /// Top-level dispatcher (Phase 2 of RFC #2972):
+    /// 1. Project `value` through `Value::as_concrete()`. Deferred-axis
+    ///    values (`ResourceRef`, `BindingRef`, `Interpolation`,
+    ///    `FunctionCall`, `Secret`, `Unknown`) return `None` and are
+    ///    accepted unconditionally — type fitness for those is the
+    ///    deferred-aware checker's job (`check_upstream_state_field_types`,
+    ///    `validate_resource_ref_types`).
+    /// 2. Dispatch the projected `ConcreteValueRef<'_>` to the
+    ///    per-variant helper. Helpers cannot receive deferred values by
+    ///    construction — the projection is the single place that filter
+    ///    decision lives.
+    ///
+    /// Recursive descent into `List`/`Map`/`Struct` element types uses
+    /// `inner.validate(&Value)` again, so each nested element is
+    /// independently re-projected. Lists may legitimately mix concrete
+    /// and deferred elements (e.g. `[vpc.id, "literal"]`).
     pub fn validate(&self, value: &Value) -> Result<(), TypeError> {
-        // Deferred-resolution values carry no concrete type at plan
-        // time — skip them.
-        if matches!(
-            value,
-            Value::FunctionCall { .. } | Value::Secret(_) | Value::Unknown(_)
-        ) {
+        let Some(concrete) = value.as_concrete() else {
             return Ok(());
-        }
+        };
+        self.validate_concrete(concrete)
+    }
 
+    fn validate_concrete(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
         match self {
             AttributeType::StringEnum { .. } => self.validate_string_enum(value),
             AttributeType::Custom { .. } => self.validate_custom(value),
@@ -597,27 +615,26 @@ impl AttributeType {
     }
 
     fn collect_into(&self, path: &FieldPath, value: &Value, out: &mut Vec<(FieldPath, TypeError)>) {
-        // Same skip rule as `validate` — deferred-resolution values.
-        if matches!(
-            value,
-            Value::FunctionCall { .. } | Value::Secret(_) | Value::Unknown(_)
-        ) {
+        // Project to the concrete axis. Deferred values contribute no
+        // type-check errors at this layer — the deferred-aware checker
+        // covers them.
+        let Some(concrete) = value.as_concrete() else {
             return;
-        }
+        };
 
         match self {
             AttributeType::Struct { name, fields } => {
-                self.collect_struct(path, name, fields, value, out);
+                self.collect_struct(path, name, fields, concrete, out);
             }
             AttributeType::List { inner, .. } => {
-                self.collect_list(path, inner, value, out);
+                self.collect_list(path, inner, concrete, out);
             }
             // For everything else the existing single-shot validator is
             // already correct: it returns at most one error and there
             // is no nested structure to recurse into. Forward the error
             // (if any) under the current path.
             _ => {
-                if let Err(e) = self.validate(value) {
+                if let Err(e) = self.validate_concrete(concrete) {
                     out.push((path.clone(), e));
                 }
             }
@@ -629,12 +646,12 @@ impl AttributeType {
         path: &FieldPath,
         name: &str,
         fields: &[StructField],
-        value: &Value,
+        value: ConcreteValueRef<'_>,
         out: &mut Vec<(FieldPath, TypeError)>,
     ) {
-        // Block syntax → Value::List([Value::Map(...)])  for List<Struct>;
-        // bare Struct rejects List with `BlockSyntaxNotAllowed`.
-        if matches!(value, Value::List(_)) {
+        // Block syntax → List([Map(...)]) for List<Struct>; bare Struct
+        // rejects List with `BlockSyntaxNotAllowed`.
+        if matches!(value, ConcreteValueRef::List(_)) {
             out.push((
                 path.clone(),
                 TypeError::BlockSyntaxNotAllowed {
@@ -643,12 +660,12 @@ impl AttributeType {
             ));
             return;
         }
-        let Value::Map(map) = value else {
+        let ConcreteValueRef::Map(map) = value else {
             out.push((
                 path.clone(),
                 TypeError::TypeMismatch {
                     expected: self.type_name(),
-                    got: value.type_name(),
+                    got: value.type_name().to_string(),
                 },
             ));
             return;
@@ -676,17 +693,16 @@ impl AttributeType {
         }
 
         // Each present field — descend (for nested struct/list of
-        // struct) or run the leaf validator.
+        // struct) or run the leaf validator. `collect_into` projects
+        // the field value through `as_concrete()` again, so deferred
+        // field values silently contribute no errors here. Phase 2 of
+        // RFC #2972 makes this a single, type-aware filter point
+        // instead of the old per-site `matches!(v, Value::ResourceRef
+        // { .. })` skip.
         for (k, v) in map {
             match accepted.get(k.as_str()) {
                 Some(field) => {
                     let next_path = path.push_field(k.clone());
-                    // ResourceRef / Interpolation values are placeholders
-                    // resolved at apply time — skip type checking but
-                    // still descend into ResourceRef-free shapes.
-                    if matches!(v, Value::ResourceRef { .. }) {
-                        continue;
-                    }
                     field.field_type.collect_into(&next_path, v, out);
                 }
                 None => {
@@ -708,15 +724,15 @@ impl AttributeType {
         &self,
         path: &FieldPath,
         inner: &AttributeType,
-        value: &Value,
+        value: ConcreteValueRef<'_>,
         out: &mut Vec<(FieldPath, TypeError)>,
     ) {
-        let Value::List(items) = value else {
+        let ConcreteValueRef::List(items) = value else {
             out.push((
                 path.clone(),
                 TypeError::TypeMismatch {
                     expected: self.type_name(),
-                    got: value.type_name(),
+                    got: value.type_name().to_string(),
                 },
             ));
             return;
@@ -730,27 +746,31 @@ impl AttributeType {
         }
     }
 
-    /// Validate a primitive (`String`/`Int`/`Float`/`Bool`) value.
-    /// `ResourceRef` and `Interpolation` resolve to strings at runtime and
-    /// are accepted for `String`. `Float` accepts integers as valid numbers
-    /// and rejects non-finite floats explicitly.
-    fn validate_primitive(&self, value: &Value) -> Result<(), TypeError> {
+    /// Validate a primitive (`String`/`Int`/`Float`/`Bool`/`Duration`) value.
+    /// `Float` accepts integers as valid numbers and rejects non-finite
+    /// floats explicitly.
+    ///
+    /// Phase 2 of RFC #2972: takes [`ConcreteValueRef`], so deferred
+    /// values (`ResourceRef`, `Interpolation`, ...) cannot reach this
+    /// path — they were filtered at the dispatcher in [`Self::validate`].
+    /// The pre-Phase-2 `Value::String(_) | Value::ResourceRef { .. } |
+    /// Value::Interpolation(_)` arm is now structurally unrepresentable.
+    fn validate_primitive(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
         match (self, value) {
-            (
-                AttributeType::String,
-                Value::String(_) | Value::ResourceRef { .. } | Value::Interpolation(_),
-            ) => Ok(()),
-            (AttributeType::Int, Value::Int(_)) => Ok(()),
-            (AttributeType::Float, Value::Float(f)) if f.is_finite() => Ok(()),
-            (AttributeType::Float, Value::Float(f)) => Err(TypeError::ValidationFailed {
-                message: format!("non-finite float value: {f}"),
-            }),
-            (AttributeType::Float, Value::Int(_)) => Ok(()), // integers are valid numbers
-            (AttributeType::Bool, Value::Bool(_)) => Ok(()),
-            (AttributeType::Duration, Value::Duration(_)) => Ok(()),
+            (AttributeType::String, ConcreteValueRef::String(_)) => Ok(()),
+            (AttributeType::Int, ConcreteValueRef::Int(_)) => Ok(()),
+            (AttributeType::Float, ConcreteValueRef::Float(f)) if f.is_finite() => Ok(()),
+            (AttributeType::Float, ConcreteValueRef::Float(f)) => {
+                Err(TypeError::ValidationFailed {
+                    message: format!("non-finite float value: {f}"),
+                })
+            }
+            (AttributeType::Float, ConcreteValueRef::Int(_)) => Ok(()),
+            (AttributeType::Bool, ConcreteValueRef::Bool(_)) => Ok(()),
+            (AttributeType::Duration, ConcreteValueRef::Duration(_)) => Ok(()),
             _ => Err(TypeError::TypeMismatch {
                 expected: self.type_name(),
-                got: value.type_name(),
+                got: value.type_name().to_string(),
             }),
         }
     }
@@ -759,7 +779,11 @@ impl AttributeType {
     ///
     /// Panics if `self` is not a `StringEnum` — only called from the
     /// top-level dispatcher.
-    fn validate_string_enum(&self, value: &Value) -> Result<(), TypeError> {
+    ///
+    /// Phase 2 of RFC #2972: takes [`ConcreteValueRef`]. Pre-Phase-2
+    /// `Value::Interpolation` and `Value::ResourceRef` short-circuits
+    /// are gone — the dispatcher filters deferred values.
+    fn validate_string_enum(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
         let AttributeType::StringEnum {
             name,
             values,
@@ -770,14 +794,7 @@ impl AttributeType {
             unreachable!("validate_string_enum called on non-StringEnum");
         };
 
-        // Interpolation values resolve to strings at runtime, so accept them
-        if matches!(value, Value::Interpolation(_)) {
-            return Ok(());
-        }
         let resolved_value = Self::resolve_enum_input(name, namespace.as_deref(), value);
-        if matches!(resolved_value, Value::ResourceRef { .. }) {
-            return Ok(());
-        }
         // Capture the user's original input for diagnostics. The parser
         // collapses both quoted literals (`"aaa"`) and bare identifiers
         // (`dedicated`) into `Value::String`, and `resolve_enum_input`
@@ -786,7 +803,7 @@ impl AttributeType {
         // error messages should quote what the user actually typed.
         // See #2077.
         let user_input = match value {
-            Value::String(s) => Some(s.as_str()),
+            ConcreteValueRef::String(s) => Some(s),
             _ => None,
         };
         if let Value::String(s) = &resolved_value {
@@ -867,7 +884,11 @@ impl AttributeType {
 
     /// Validate against a `Custom` variant by delegating to its `validate`
     /// closure after expanding any enum-shorthand identifier in `value`.
-    fn validate_custom(&self, value: &Value) -> Result<(), TypeError> {
+    ///
+    /// Phase 2 of RFC #2972: takes [`ConcreteValueRef`]. The deferred-skip
+    /// guard for `Value::ResourceRef`/`Value::Interpolation` is gone —
+    /// the dispatcher filters them out in [`Self::validate`].
+    fn validate_custom(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
         let AttributeType::Custom {
             validate,
             semantic_name,
@@ -878,11 +899,6 @@ impl AttributeType {
             unreachable!("validate_custom called on non-Custom");
         };
 
-        // ResourceRef and Interpolation values resolve to strings at runtime,
-        // so they're valid for Custom types
-        if matches!(value, Value::ResourceRef { .. } | Value::Interpolation(_)) {
-            return Ok(());
-        }
         let name_for_resolve = semantic_name.as_deref().unwrap_or("");
         let resolved_value =
             Self::resolve_enum_input(name_for_resolve, namespace.as_deref(), value);
@@ -890,16 +906,24 @@ impl AttributeType {
     }
 
     /// Validate a `List` variant by validating each item with the inner type.
-    fn validate_list(&self, value: &Value) -> Result<(), TypeError> {
+    ///
+    /// Phase 2 of RFC #2972 (closes #2954): takes [`ConcreteValueRef`].
+    /// The pre-Phase-2 path was reachable from any `Value` and produced
+    /// a spurious `Type mismatch: expected List<T>, got ResourceRef(...)`
+    /// for upstream-typed list refs. After Phase 2, deferred values
+    /// cannot reach this helper — the dispatcher's `as_concrete()`
+    /// projection returns `None` for them and the dispatcher returns
+    /// `Ok(())` immediately. Type fitness for upstream list refs is
+    /// the deferred-aware checker's job.
+    fn validate_list(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
         let AttributeType::List { inner, .. } = self else {
             unreachable!("validate_list called on non-List");
         };
-        // `Value::StringList` is the canonicalized form for fields
-        // typed as `Union[String, list(String)]` (see #2510). When
-        // validated against a `list(String)` member of that Union, it
-        // is structurally equivalent to a `Value::List` of strings —
-        // accept it the same way.
-        if let Value::StringList(items) = value {
+        // `ConcreteValueRef::StringList` is the canonicalized form for
+        // fields typed as `Union[String, list(String)]` (see #2510).
+        // Structurally equivalent to a `List` of strings — accept the
+        // same way.
+        if let ConcreteValueRef::StringList(items) = value {
             for (i, s) in items.iter().enumerate() {
                 inner.validate(&Value::String(s.clone())).map_err(|e| {
                     TypeError::ListItemError {
@@ -910,10 +934,10 @@ impl AttributeType {
             }
             return Ok(());
         }
-        let Value::List(items) = value else {
+        let ConcreteValueRef::List(items) = value else {
             return Err(TypeError::TypeMismatch {
                 expected: self.type_name(),
-                got: value.type_name(),
+                got: value.type_name().to_string(),
             });
         };
         for (i, item) in items.iter().enumerate() {
@@ -926,7 +950,11 @@ impl AttributeType {
     }
 
     /// Validate a `Map` variant: keys against `key`, values against `value`.
-    fn validate_map(&self, value: &Value) -> Result<(), TypeError> {
+    ///
+    /// Phase 2 of RFC #2972: takes [`ConcreteValueRef`]. Mirrors the
+    /// `validate_list` migration — deferred values are filtered at the
+    /// dispatcher and cannot reach here.
+    fn validate_map(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
         let AttributeType::Map {
             key: key_type,
             value: inner,
@@ -934,10 +962,10 @@ impl AttributeType {
         else {
             unreachable!("validate_map called on non-Map");
         };
-        let Value::Map(map) = value else {
+        let ConcreteValueRef::Map(map) = value else {
             return Err(TypeError::TypeMismatch {
                 expected: self.type_name(),
-                got: value.type_name(),
+                got: value.type_name().to_string(),
             });
         };
         // Validate keys against key type
@@ -963,22 +991,25 @@ impl AttributeType {
     ///
     /// Block syntax produces `Value::List([Value::Map(...)])`, but bare
     /// `Struct` requires map assignment syntax (`attr = { ... }`); a
-    /// `Value::List` is rejected explicitly with `BlockSyntaxNotAllowed`.
-    fn validate_struct(&self, value: &Value) -> Result<(), TypeError> {
+    /// `List` is rejected explicitly with `BlockSyntaxNotAllowed`.
+    ///
+    /// Phase 2 of RFC #2972: takes [`ConcreteValueRef`]; deferred values
+    /// are filtered upstream by the dispatcher.
+    fn validate_struct(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
         let AttributeType::Struct { name, fields } = self else {
             unreachable!("validate_struct called on non-Struct");
         };
 
-        // Struct type rejects Value::List (block syntax)
-        if matches!(value, Value::List(_)) {
+        // Struct type rejects List (block syntax)
+        if matches!(value, ConcreteValueRef::List(_)) {
             return Err(TypeError::BlockSyntaxNotAllowed {
                 attribute: name.clone(),
             });
         }
-        let Value::Map(map) = value else {
+        let ConcreteValueRef::Map(map) = value else {
             return Err(TypeError::TypeMismatch {
                 expected: self.type_name(),
-                got: value.type_name(),
+                got: value.type_name().to_string(),
             });
         };
 
@@ -1032,13 +1063,13 @@ impl AttributeType {
     /// still holds when multiple Struct members tie. When no member
     /// shares any structural similarity, fall through to `TypeMismatch`.
     /// See #2219.
-    fn validate_union(&self, value: &Value) -> Result<(), TypeError> {
+    fn validate_union(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
         let AttributeType::Union(types) = self else {
             unreachable!("validate_union called on non-Union");
         };
         let mut best: Option<(u32, TypeError)> = None;
         for member in types {
-            match member.validate(value) {
+            match member.validate_concrete(value) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     let score = union_member_score(member, value);
@@ -1054,7 +1085,7 @@ impl AttributeType {
         }
         Err(best.map(|(_, e)| e).unwrap_or(TypeError::TypeMismatch {
             expected: self.type_name(),
-            got: value.type_name(),
+            got: value.type_name().to_string(),
         }))
     }
 
@@ -1217,29 +1248,33 @@ impl AttributeType {
 ///
 /// On a tie, the first member at the maximum wins — `validate_union`
 /// uses strict `>` so declaration order is preserved.
-fn union_member_score(member: &AttributeType, value: &Value) -> u32 {
+fn union_member_score(member: &AttributeType, value: ConcreteValueRef<'_>) -> u32 {
     use AttributeType as AT;
     match (member, value) {
         // Map↔Struct: the original heuristic. Highest score so a
         // Struct member's "Unknown field 'x'" wins over a sibling's
         // generic `TypeMismatch`.
-        (AT::Struct { .. }, Value::Map(_)) => 100,
+        (AT::Struct { .. }, ConcreteValueRef::Map(_)) => 100,
         // Same-constructor match — second tier.
-        (AT::Map { .. }, Value::Map(_))
-        | (AT::String, Value::String(_))
-        | (AT::Int, Value::Int(_))
-        | (AT::Float, Value::Float(_))
-        | (AT::Bool, Value::Bool(_))
-        | (AT::StringEnum { .. }, Value::String(_)) => 80,
+        (AT::Map { .. }, ConcreteValueRef::Map(_))
+        | (AT::String, ConcreteValueRef::String(_))
+        | (AT::Int, ConcreteValueRef::Int(_))
+        | (AT::Float, ConcreteValueRef::Float(_))
+        | (AT::Bool, ConcreteValueRef::Bool(_))
+        | (AT::StringEnum { .. }, ConcreteValueRef::String(_)) => 80,
         // List↔List: peek at the first element's structural match
         // against the member's inner type so `List<Struct>` outranks
         // `List<String>` for an input like `[{...}]`. The inner
         // contribution is halved so arbitrarily deep nesting can't
         // exceed the Map↔Struct tier (100). Empty lists fall back to
-        // the bare same-constructor score.
-        (AT::List { inner, .. }, Value::List(items)) => {
+        // the bare same-constructor score. Inner peek requires
+        // re-projecting the first element through `as_concrete()` —
+        // a deferred element contributes no bonus (the projection
+        // returns `None`).
+        (AT::List { inner, .. }, ConcreteValueRef::List(items)) => {
             let inner_bonus = items
                 .first()
+                .and_then(|first| first.as_concrete())
                 .map(|first| union_member_score(inner, first) / 2)
                 .unwrap_or(0);
             80 + inner_bonus
@@ -1721,6 +1756,40 @@ impl Value {
             Value::FunctionCall { name, .. } => format!("FunctionCall({})", name),
             Value::Secret(_) => "Secret".to_string(),
             Value::Unknown(_) => "Unknown".to_string(),
+        }
+    }
+}
+
+impl ConcreteValueRef<'_> {
+    /// Concrete-axis name used in type-mismatch diagnostics. Mirrors
+    /// the labels [`Value::type_name`] produces for the same axis.
+    fn type_name(&self) -> &'static str {
+        match self {
+            ConcreteValueRef::String(_) => "String",
+            ConcreteValueRef::Int(_) => "Int",
+            ConcreteValueRef::Float(_) => "Float",
+            ConcreteValueRef::Bool(_) => "Bool",
+            ConcreteValueRef::Duration(_) => "Duration",
+            ConcreteValueRef::List(_) => "List",
+            ConcreteValueRef::StringList(_) => "StringList",
+            ConcreteValueRef::Map(_) => "Map",
+        }
+    }
+
+    /// Materialize an owned [`Value`] from this borrow. Used at the
+    /// few helper boundaries (`expand_enum_shorthand`, list-of-string
+    /// inner re-validation) that still operate on `&Value` and cannot
+    /// be migrated to the projection without a wider API change.
+    fn to_owned_value(self) -> Value {
+        match self {
+            ConcreteValueRef::String(s) => Value::String(s.to_string()),
+            ConcreteValueRef::Int(n) => Value::Int(n),
+            ConcreteValueRef::Float(f) => Value::Float(f),
+            ConcreteValueRef::Bool(b) => Value::Bool(b),
+            ConcreteValueRef::Duration(d) => Value::Duration(d),
+            ConcreteValueRef::List(items) => Value::List(items.to_vec()),
+            ConcreteValueRef::StringList(items) => Value::StringList(items.to_vec()),
+            ConcreteValueRef::Map(map) => Value::Map(map.clone()),
         }
     }
 }
