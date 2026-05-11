@@ -1194,3 +1194,105 @@ fn human_display_handles_pending_name() {
     id.name = ResourceName::Pending;
     assert_eq!(format!("{}", id.human()), "awscc.ec2.Vpc ");
 }
+
+// ---------------------------------------------------------------------
+// Phase 1 of RFC #2972 — `Value::as_concrete` / `as_deferred`
+// borrowing projections. The full type-split happens later; for now we
+// only verify the accessors disambiguate the two axes correctly.
+// ---------------------------------------------------------------------
+
+#[test]
+fn as_concrete_returns_projection_for_concrete_variants() {
+    // Sample one variant per concrete arm; the match in `as_concrete`
+    // is exhaustive so this is enough to catch a future variant added
+    // to the wrong axis.
+    let cases: Vec<(Value, &'static str)> = vec![
+        (Value::String("x".into()), "String"),
+        (Value::Int(1), "Int"),
+        (Value::Float(1.5), "Float"),
+        (Value::Bool(true), "Bool"),
+        (
+            Value::Duration(std::time::Duration::from_secs(60)),
+            "Duration",
+        ),
+        (Value::List(vec![]), "List"),
+        (Value::StringList(vec![]), "StringList"),
+        (Value::Map(IndexMap::new()), "Map"),
+    ];
+    for (v, label) in cases {
+        assert!(
+            v.as_concrete().is_some(),
+            "{label} must project to ConcreteValueRef",
+        );
+        assert!(
+            v.as_deferred().is_none(),
+            "{label} must NOT project to DeferredValueRef",
+        );
+    }
+}
+
+#[test]
+fn as_deferred_returns_projection_for_deferred_variants() {
+    let cases: Vec<(Value, &'static str)> = vec![
+        (
+            Value::resource_ref("vpc".to_string(), "id".to_string(), vec![]),
+            "ResourceRef",
+        ),
+        (
+            Value::BindingRef {
+                binding: "bootstrap".to_string(),
+            },
+            "BindingRef",
+        ),
+        (Value::Interpolation(vec![]), "Interpolation"),
+        (
+            Value::FunctionCall {
+                name: "join".to_string(),
+                args: vec![],
+            },
+            "FunctionCall",
+        ),
+        (
+            Value::Secret(Box::new(Value::String("inner".into()))),
+            "Secret",
+        ),
+        (Value::Unknown(UnknownReason::ForKey), "Unknown"),
+    ];
+    for (v, label) in cases {
+        assert!(
+            v.as_deferred().is_some(),
+            "{label} must project to DeferredValueRef",
+        );
+        assert!(
+            v.as_concrete().is_none(),
+            "{label} must NOT project to ConcreteValueRef",
+        );
+    }
+}
+
+#[test]
+fn as_concrete_borrows_inner_string_without_clone() {
+    // The accessor must hand out a &str pointing into the original
+    // value, not a copy. Easy proof: pointer equality on the bytes.
+    let v = Value::String("hello".into());
+    let Some(ConcreteValueRef::String(borrowed)) = v.as_concrete() else {
+        panic!("expected String projection");
+    };
+    let Value::String(ref original) = v else {
+        unreachable!("v constructed as Value::String");
+    };
+    assert_eq!(borrowed.as_ptr(), original.as_str().as_ptr());
+}
+
+#[test]
+fn as_concrete_list_borrows_underlying_slice() {
+    let v = Value::List(vec![Value::Int(1), Value::Int(2)]);
+    let Some(ConcreteValueRef::List(items)) = v.as_concrete() else {
+        panic!("expected List projection");
+    };
+    let Value::List(ref original) = v else {
+        unreachable!("v constructed as Value::List");
+    };
+    assert_eq!(items.as_ptr(), original.as_ptr());
+    assert_eq!(items.len(), 2);
+}

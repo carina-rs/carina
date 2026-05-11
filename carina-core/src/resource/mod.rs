@@ -497,6 +497,112 @@ pub enum Value {
     Unknown(UnknownReason),
 }
 
+/// Borrowing projection of [`Value`] restricted to the **concrete** axis
+/// — variants that carry their own runtime type and are safe to type-check
+/// at validate time.
+///
+/// Phase 1 of [RFC #2972](https://github.com/carina-rs/carina/issues/2972).
+/// Sub-systems that only operate on resolved values (`validate`, the
+/// differ, the serializer) take `&ConcreteValueRef<'_>` so the deferred
+/// case is structurally unreachable rather than a runtime `matches!`
+/// guard. Today `Value` is still flat; once every concrete-only path
+/// has migrated to this view, the underlying `Value` enum will be
+/// physically split into `Value { Concrete(ConcreteValue), Deferred(DeferredValue) }`
+/// and this borrow type will become a thin wrapper over the inner
+/// `ConcreteValue`.
+///
+/// Recursive container variants (`List`, `Map`, `StringList`) borrow
+/// from the parent `Value`; the inner element / key types stay
+/// `Value` because lists and maps can mix concrete and deferred
+/// elements (e.g. `["literal", vpc.id]`).
+#[derive(Debug, Clone, Copy)]
+pub enum ConcreteValueRef<'a> {
+    String(&'a str),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Duration(std::time::Duration),
+    List(&'a [Value]),
+    StringList(&'a [String]),
+    Map(&'a IndexMap<String, Value>),
+}
+
+/// Borrowing projection of [`Value`] restricted to the **deferred** axis
+/// — placeholders that resolve later (apply time, upstream load,
+/// function evaluation).
+///
+/// Sub-systems that need to walk only deferred values (e.g.
+/// `check_upstream_state_field_types`, `validate_resource_ref_types`,
+/// dependency analysis) take `&DeferredValueRef<'_>` so they cannot
+/// accidentally consume a concrete value as a placeholder.
+///
+/// Phase 1 of [RFC #2972](https://github.com/carina-rs/carina/issues/2972).
+#[derive(Debug, Clone, Copy)]
+pub enum DeferredValueRef<'a> {
+    ResourceRef { path: &'a AccessPath },
+    BindingRef { binding: &'a str },
+    Interpolation(&'a [InterpolationPart]),
+    FunctionCall { name: &'a str, args: &'a [Value] },
+    Secret(&'a Value),
+    Unknown(&'a UnknownReason),
+}
+
+impl Value {
+    /// If this value is on the concrete axis, return a borrowing
+    /// projection. Returns `None` for deferred-resolution variants
+    /// ([`Value::ResourceRef`], [`Value::BindingRef`],
+    /// [`Value::Interpolation`], [`Value::FunctionCall`],
+    /// [`Value::Secret`], [`Value::Unknown`]).
+    ///
+    /// Concrete-only sub-systems should consume `Value` exclusively
+    /// through this accessor — the returned [`ConcreteValueRef`]
+    /// cannot represent a deferred value, so the "deferred leaked
+    /// into concrete-only path" bug class becomes structurally
+    /// unrepresentable. See RFC #2972.
+    pub fn as_concrete(&self) -> Option<ConcreteValueRef<'_>> {
+        match self {
+            Value::String(s) => Some(ConcreteValueRef::String(s)),
+            Value::Int(n) => Some(ConcreteValueRef::Int(*n)),
+            Value::Float(f) => Some(ConcreteValueRef::Float(*f)),
+            Value::Bool(b) => Some(ConcreteValueRef::Bool(*b)),
+            Value::Duration(d) => Some(ConcreteValueRef::Duration(*d)),
+            Value::List(items) => Some(ConcreteValueRef::List(items)),
+            Value::StringList(items) => Some(ConcreteValueRef::StringList(items)),
+            Value::Map(map) => Some(ConcreteValueRef::Map(map)),
+            Value::ResourceRef { .. }
+            | Value::BindingRef { .. }
+            | Value::Interpolation(_)
+            | Value::FunctionCall { .. }
+            | Value::Secret(_)
+            | Value::Unknown(_) => None,
+        }
+    }
+
+    /// If this value is on the deferred axis, return a borrowing
+    /// projection. Returns `None` for concrete variants. Mirror of
+    /// [`Self::as_concrete`].
+    pub fn as_deferred(&self) -> Option<DeferredValueRef<'_>> {
+        match self {
+            Value::ResourceRef { path } => Some(DeferredValueRef::ResourceRef { path }),
+            Value::BindingRef { binding } => Some(DeferredValueRef::BindingRef { binding }),
+            Value::Interpolation(parts) => Some(DeferredValueRef::Interpolation(parts)),
+            Value::FunctionCall { name, args } => {
+                Some(DeferredValueRef::FunctionCall { name, args })
+            }
+            Value::Secret(inner) => Some(DeferredValueRef::Secret(inner)),
+            Value::Unknown(reason) => Some(DeferredValueRef::Unknown(reason)),
+            Value::String(_)
+            | Value::Int(_)
+            | Value::Float(_)
+            | Value::Bool(_)
+            | Value::Duration(_)
+            | Value::List(_)
+            | Value::StringList(_)
+            | Value::Map(_) => None,
+        }
+    }
+}
+
 /// Why a `Value::Unknown` is unknown. Each variant carries only the
 /// information its own consumer needs — no shared "context" field invites
 /// drift across reasons. See RFC #2371.
